@@ -1,4 +1,4 @@
-# Zig SDL3 GPU Framework
+# Zig SDL3 GPU 2D Game Framework
 
 A Zig 0.16.0 + SDL3 starter framework for SDL_GPU-first 2D games.
 
