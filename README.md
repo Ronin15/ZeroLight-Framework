@@ -12,7 +12,7 @@ builds target-native shaders at build time and renders through SDL_GPU.
 - Batched sprite and rectangle drawing
 - Fixed 60Hz update loop with interpolation
 - Vsync-driven rendering with 60Hz background throttling
-- Optional F2-toggle debug FPS overlay rendered with SDL_ttf
+- Text rendering for UI and debug overlays
 - Policy-based state stack for gameplay, menus, tools, and overlays
 - Pause state for player-controlled and non-renderable window pauses
 - Keyboard action mapping with held gameplay input and latched frame commands
@@ -108,7 +108,6 @@ zig build -Dapp-name=my-game -Dwindow-title="My Game"
 ```
 
 Disable the debug overlay feature when you do not want debug UI in a build.
-SDL3_ttf remains a core dependency because game UI text uses the same text path.
 
 ```sh
 zig build -Ddebug-overlay=false
@@ -131,6 +130,7 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
   install steps.
 - `build.zig.zon` contains package metadata.
 - `src/main.zig` owns SDL startup, the window, event polling, and the main loop.
+- `src/sdl.zig` owns SDL startup and shared C imports.
 - `src/renderer.zig` owns SDL_GPU device setup, shader loading, texture upload,
   and the batched 2D draw API.
 - `src/state.zig` defines the borrowed state stack and stack policies.
@@ -145,7 +145,7 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
 - `src/time_loop.zig` provides a fixed-step update loop with interpolation.
 - `src/frame_pacer.zig` coordinates renderability checks and fallback loop
   pacing for hidden, minimized, background, or swapchain-unavailable frames.
-- `src/fps_counter.zig` owns SDL_ttf-backed FPS text for the debug overlay.
+- `src/fps_counter.zig` owns the FPS counter for the debug overlay.
 - `src/root.zig` contains reusable game-agnostic helpers.
 - `assets/` contains runtime assets and shader sources.
 
