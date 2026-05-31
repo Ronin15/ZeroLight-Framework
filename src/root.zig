@@ -22,15 +22,6 @@ pub fn lerpVec2(start: Vec2, end: Vec2, amount: f32) Vec2 {
     };
 }
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    const std = @import("std");
-    try std.testing.expect(add(3, 7) == 10);
-}
-
 test "clamp keeps values inside bounds" {
     const std = @import("std");
     try std.testing.expectEqual(@as(f32, 0), clamp(-4, 0, 10));

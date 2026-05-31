@@ -60,7 +60,7 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game and GPU smoke executable
 zig build test      # run Zig unit tests
 zig build verify    # run check, test, and shader compilation
-zig build package   # install binaries and runtime assets into zig-out/bin
+zig build package   # install selected-mode binaries and runtime assets
 ```
 
 Useful supporting commands:
@@ -70,6 +70,14 @@ zig build fmt       # format build.zig and src/
 zig build shaders   # compile GLSL shader sources to SPIR-V
 zig build gpu-smoke # create an SDL_GPU device and submit one hidden-window frame
 ```
+
+`zig build package` uses the currently selected optimize mode. Pass
+`-Doptimize=ReleaseFast` or another mode explicitly when producing a release
+candidate.
+
+`zig build gpu-smoke` uses a hidden window, but SDL still needs a usable video
+backend and display environment. Headless shells or CI runners may need platform
+setup before this check can run.
 
 The default optimize mode is `ReleaseSafe`. Override it when needed:
 

@@ -111,7 +111,6 @@ pub const Renderer = struct {
             .vertex_transfer_buffer = vertex_transfer_buffer,
             .batch_capacity_vertices = initial_batch_vertices,
         };
-        errdefer renderer.deinit();
 
         const white_pixel = [_]u8{ 255, 255, 255, 255 };
         renderer.white_texture = try renderer.createTextureFromPixels(white_pixel[0..], 1, 1, bytes_per_pixel);
@@ -127,7 +126,9 @@ pub const Renderer = struct {
         _ = c.SDL_WaitForGPUIdle(self.device);
 
         for (self.textures.items) |texture| {
-            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+            if (texture.alive) {
+                c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+            }
         }
         self.textures.deinit(self.allocator);
         self.commands.deinit(self.allocator);
@@ -200,7 +201,7 @@ pub const Renderer = struct {
     }
 
     pub fn createTextureFromPng(self: *Renderer, assets: AssetStore, relative_path: []const u8) !TextureHandle {
-        const path = try assets.resolvePath(relative_path);
+        const path = try assets.resolveReadablePath(relative_path);
         defer self.allocator.free(path);
 
         const path_z = try self.allocator.dupeZ(u8, path);
@@ -437,7 +438,7 @@ pub const Renderer = struct {
 
         for (self.commands.items) |command| {
             const first_vertex: u32 = @intCast(self.vertices.items.len);
-            try self.appendSpriteVertices(command.sprite);
+            if (!try self.appendSpriteVertices(command.sprite)) continue;
 
             if (active_texture == null or active_texture.?.index != command.sprite.texture.index) {
                 if (active_texture) |texture| {
@@ -464,10 +465,10 @@ pub const Renderer = struct {
         }
     }
 
-    fn appendSpriteVertices(self: *Renderer, sprite: Sprite) !void {
-        if (sprite.texture.index >= self.textures.items.len) return;
+    fn appendSpriteVertices(self: *Renderer, sprite: Sprite) !bool {
+        if (sprite.texture.index >= self.textures.items.len) return false;
         const texture = self.textures.items[sprite.texture.index];
-        if (!texture.alive) return;
+        if (!texture.alive) return false;
 
         const source = sprite.source orelse Rect{
             .x = 0,
@@ -514,6 +515,7 @@ pub const Renderer = struct {
                 .color = .{ sprite.tint.r, sprite.tint.g, sprite.tint.b, sprite.tint.a },
             });
         }
+        return true;
     }
 };
 
@@ -715,4 +717,64 @@ fn spriteCommandLessThan(_: void, lhs: SpriteCommand, rhs: SpriteCommand) bool {
 fn sdlError(comptime operation: []const u8) error{SdlError} {
     std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
     return error.SdlError;
+}
+
+test "batch builder skips invalid and destroyed texture handles" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .sampler = undefined,
+        .vertex_buffer = undefined,
+        .vertex_transfer_buffer = undefined,
+        .batch_capacity_vertices = 0,
+    };
+    defer renderer.textures.deinit(allocator);
+    defer renderer.commands.deinit(allocator);
+    defer renderer.vertices.deinit(allocator);
+    defer renderer.draw_groups.deinit(allocator);
+
+    try renderer.textures.append(allocator, .{
+        .texture = @ptrFromInt(1),
+        .width = 1,
+        .height = 1,
+    });
+    try renderer.textures.append(allocator, .{
+        .texture = @ptrFromInt(2),
+        .width = 1,
+        .height = 1,
+        .alive = false,
+    });
+
+    try renderer.commands.append(allocator, .{
+        .sprite = .{
+            .texture = .{ .index = 42 },
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        },
+        .sequence = 0,
+    });
+    try renderer.commands.append(allocator, .{
+        .sprite = .{
+            .texture = .{ .index = 1 },
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        },
+        .sequence = 1,
+    });
+    try renderer.commands.append(allocator, .{
+        .sprite = .{
+            .texture = .{ .index = 0 },
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        },
+        .sequence = 2,
+    });
+
+    try renderer.buildBatch();
+
+    try std.testing.expectEqual(@as(usize, 6), renderer.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 1), renderer.draw_groups.items.len);
+    try std.testing.expectEqual(@as(usize, 0), renderer.draw_groups.items[0].texture.index);
+    try std.testing.expectEqual(@as(u32, 0), renderer.draw_groups.items[0].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), renderer.draw_groups.items[0].vertex_count);
 }

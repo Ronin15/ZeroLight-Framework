@@ -147,7 +147,7 @@ pub fn build(b: *std.Build) void {
     const gpu_smoke_step = b.step("gpu-smoke", "Create an SDL_GPU device and submit one frame");
     gpu_smoke_step.dependOn(&gpu_smoke_run.step);
 
-    const package_step = b.step("package", "Build release-ready binary and installed assets");
+    const package_step = b.step("package", "Install binaries and runtime assets for the selected optimize mode");
     package_step.dependOn(b.getInstallStep());
 }
 
