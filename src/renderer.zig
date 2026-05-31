@@ -167,9 +167,7 @@ pub const Renderer = struct {
         }
 
         if (swapchain_texture == null) {
-            if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
-                return sdlError("SDL_SubmitGPUCommandBuffer");
-            }
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
             return false;
         }
 

@@ -16,7 +16,7 @@ pub const AppConfig = struct {
     logical_height: u32 = 720,
     resizable: bool = false,
     gpu_debug: bool = false,
-    frames_in_flight: u32 = 2,
+    frames_in_flight: u32 = 1,
     present_mode: PresentMode = .vsync,
     clear_color: Color = .{ .r = 0.071, .g = 0.125, .b = 0.173, .a = 1.0 },
 };

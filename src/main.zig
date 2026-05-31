@@ -7,6 +7,7 @@ const AssetStore = @import("assets.zig").AssetStore;
 const build_options = @import("build_options");
 const config = @import("config.zig");
 const DemoScene = @import("demo_scene.zig").DemoScene;
+const frame_pacer = @import("frame_pacer.zig");
 const InputState = @import("input.zig").InputState;
 const Renderer = @import("renderer.zig").Renderer;
 const Scene = @import("scene.zig").Scene;
@@ -55,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
     var time_loop = TimeLoop.init(c.SDL_GetTicksNS());
     var running = true;
     while (running) {
-        time_loop.beginFrame(c.SDL_GetTicksNS());
+        const fallback_frame_start_ns = c.SDL_GetTicksNS();
 
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
@@ -75,15 +76,23 @@ pub fn main(init: std.process.Init) !void {
                 else => scenes.handleEvent(&event),
             }
         }
+        if (!running) break;
+
+        const should_render = frame_pacer.windowCanRender(window);
+        const frame_started = if (should_render) try renderer.beginFrame(app_config.clear_color) else false;
+
+        time_loop.beginFrame(c.SDL_GetTicksNS());
 
         while (time_loop.shouldUpdate()) {
             scenes.update(&input, TimeLoop.fixed_delta_seconds);
             time_loop.finishUpdate();
         }
 
-        if (try renderer.beginFrame(app_config.clear_color)) {
+        if (frame_started) {
             try scenes.render(&renderer, time_loop.interpolationAlpha());
             try renderer.endFrame();
+        } else {
+            frame_pacer.paceFallbackFrame(fallback_frame_start_ns);
         }
     }
 }

@@ -11,6 +11,7 @@ builds GLSL shaders into SPIR-V at build time and renders through SDL_GPU.
 - SDL_GPU renderer with SPIR-V shaders
 - Batched sprite and rectangle drawing
 - Fixed 60Hz update loop with interpolation
+- Vsync-driven rendering with 60Hz fallback pacing when not renderable
 - Scene stack for gameplay, menus, tools, and overlays
 - Frame-stable input state
 - Runtime asset loading from the installed `assets/` directory
@@ -105,6 +106,8 @@ zig build shaders -Dshader-compiler=/path/to/glslc
 - `src/camera.zig` contains the 2D camera transform used by the renderer.
 - `src/config.zig` centralizes app/window/GPU configuration.
 - `src/time_loop.zig` provides a fixed-step update loop with interpolation.
+- `src/frame_pacer.zig` coordinates renderability checks and fallback loop
+  pacing for hidden, minimized, occluded, or swapchain-unavailable frames.
 - `src/root.zig` contains reusable game-agnostic helpers.
 - `assets/` contains runtime assets and shader sources.
 
@@ -127,6 +130,13 @@ The app uses SDL_GPU directly and does not call Vulkan APIs itself.
 
 Sprites and colored rectangles are collected into a CPU batch, uploaded to one
 GPU vertex buffer per frame, and submitted by texture/layer groups.
+
+The visible render loop is paced by SDL_GPU swapchain acquisition with the
+default vsync present mode. Simulation remains fixed at 60Hz through
+`TimeLoop`, while rendering may follow higher refresh displays and interpolate
+between fixed updates. When the window is hidden, minimized, occluded, or SDL
+cannot provide a swapchain texture, the app skips GPU rendering and uses
+`SDL_DelayNS` to keep the loop at a 60Hz fallback cadence.
 
 ## Testing
 

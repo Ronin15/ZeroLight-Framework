@@ -71,6 +71,11 @@ pub fn build(b: *std.Build) void {
         .root_module = scene_unit_tests_mod,
     });
 
+    const frame_pacer_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/frame_pacer.zig");
+    const frame_pacer_unit_tests = b.addTest(.{
+        .root_module = frame_pacer_unit_tests_mod,
+    });
+
     const time_loop_unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/time_loop.zig"),
@@ -128,6 +133,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(assets_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(camera_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(scene_unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(frame_pacer_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(time_loop_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
 
