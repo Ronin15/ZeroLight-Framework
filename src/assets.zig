@@ -25,6 +25,7 @@ pub const AssetStore = struct {
     }
 
     pub fn resolvePath(self: AssetStore, relative_path: []const u8) ![]u8 {
+        try validateRelativePath(relative_path);
         return std.fs.path.join(self.allocator, &.{ self.root, relative_path });
     }
 
@@ -33,7 +34,7 @@ pub const AssetStore = struct {
         std.Io.Dir.cwd().access(self.io, primary_path, .{ .read = true }) catch |err| switch (err) {
             error.FileNotFound => {
                 self.allocator.free(primary_path);
-                return self.resolveExeRelativePath(relative_path);
+                return self.resolveReadableExeRelativePath(relative_path);
             },
             else => {
                 self.allocator.free(primary_path);
@@ -43,13 +44,31 @@ pub const AssetStore = struct {
         return primary_path;
     }
 
-    fn resolveExeRelativePath(self: AssetStore, relative_path: []const u8) ![]u8 {
+    fn resolveReadableExeRelativePath(self: AssetStore, relative_path: []const u8) ![]u8 {
         const exe_dir = try std.process.executableDirPathAlloc(self.io, self.allocator);
         defer self.allocator.free(exe_dir);
 
-        return std.fs.path.join(self.allocator, &.{ exe_dir, self.root, relative_path });
+        const path = try std.fs.path.join(self.allocator, &.{ exe_dir, self.root, relative_path });
+        std.Io.Dir.cwd().access(self.io, path, .{ .read = true }) catch |err| {
+            self.allocator.free(path);
+            return err;
+        };
+        return path;
     }
 };
+
+pub fn validateRelativePath(relative_path: []const u8) !void {
+    if (relative_path.len == 0 or std.fs.path.isAbsolute(relative_path)) {
+        return error.InvalidAssetPath;
+    }
+
+    var components = std.fs.path.componentIterator(relative_path);
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
+            return error.InvalidAssetPath;
+        }
+    }
+}
 
 test "asset paths are rooted under configured asset directory" {
     const allocator = std.testing.allocator;
@@ -69,4 +88,29 @@ test "readable asset paths prefer configured asset directory" {
     defer allocator.free(path);
 
     try std.testing.expectEqualStrings("assets/shaders/sprite.vert.glsl", path);
+}
+
+test "asset paths reject empty absolute and parent traversal paths" {
+    const allocator = std.testing.allocator;
+    const assets = AssetStore.init(allocator, std.testing.io, "assets");
+
+    try std.testing.expectError(error.InvalidAssetPath, assets.resolvePath(""));
+    try std.testing.expectError(error.InvalidAssetPath, assets.resolvePath("/tmp/file.png"));
+    try std.testing.expectError(error.InvalidAssetPath, assets.resolvePath("../file.png"));
+    try std.testing.expectError(error.InvalidAssetPath, assets.resolvePath("sprites/../file.png"));
+    try std.testing.expectError(error.InvalidAssetPath, assets.resolvePath("./file.png"));
+}
+
+test "readable asset paths return missing file errors instead of unchecked fallbacks" {
+    const allocator = std.testing.allocator;
+    const assets = AssetStore.init(allocator, std.testing.io, "assets");
+
+    try std.testing.expectError(error.FileNotFound, assets.resolveReadablePath("missing/nope.bin"));
+}
+
+test "readAlloc enforces maximum byte limit" {
+    const allocator = std.testing.allocator;
+    const assets = AssetStore.init(allocator, std.testing.io, "assets");
+
+    try std.testing.expectError(error.StreamTooLong, assets.readAlloc("shaders/sprite.vert.glsl", 1));
 }

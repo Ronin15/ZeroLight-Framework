@@ -13,7 +13,8 @@ const Renderer = @import("renderer.zig").Renderer;
 const Scene = @import("scene.zig").Scene;
 const SceneStack = @import("scene.zig").SceneStack;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
-const c = @import("sdl.zig").c;
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 pub fn main(init: std.process.Init) !void {
     const app_config = config.AppConfig{
@@ -22,26 +23,22 @@ pub fn main(init: std.process.Init) !void {
         .asset_root = build_options.asset_root,
         .gpu_debug = build_options.gpu_debug,
     };
-    const window_title = app_config.window_title ++ "\x00";
+    const window_title: [:0]const u8 = app_config.window_title ++ "\x00";
 
-    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
-        return sdlError("SDL_Init");
-    }
-    defer c.SDL_Quit();
+    var sdl_context = try sdl.SdlContext.init(c.SDL_INIT_VIDEO);
+    defer sdl_context.deinit();
 
-    const window = c.SDL_CreateWindow(
-        window_title.ptr,
-        @intCast(app_config.logical_width),
-        @intCast(app_config.logical_height),
+    var window = try sdl.Window.create(
+        window_title,
+        app_config.logical_width,
+        app_config.logical_height,
         if (app_config.resizable) c.SDL_WINDOW_RESIZABLE else 0,
-    ) orelse {
-        return sdlError("SDL_CreateWindow");
-    };
-    defer c.SDL_DestroyWindow(window);
+    );
+    defer window.deinit();
 
     const allocator = init.gpa;
     const assets = AssetStore.init(allocator, init.io, app_config.asset_root);
-    var renderer = try Renderer.init(allocator, window, assets, app_config);
+    var renderer = try Renderer.init(allocator, window.handle, assets, app_config);
     defer renderer.deinit();
 
     var demo_scene = DemoScene.init(
@@ -78,9 +75,6 @@ pub fn main(init: std.process.Init) !void {
         }
         if (!running) break;
 
-        const should_render = frame_pacer.windowCanRender(window);
-        const frame_started = if (should_render) try renderer.beginFrame(app_config.clear_color) else false;
-
         time_loop.beginFrame(c.SDL_GetTicksNS());
 
         while (time_loop.shouldUpdate()) {
@@ -88,16 +82,15 @@ pub fn main(init: std.process.Init) !void {
             time_loop.finishUpdate();
         }
 
-        if (frame_started) {
+        if (frame_pacer.windowCanRender(window.handle)) {
+            renderer.beginFrame(app_config.clear_color);
             try scenes.render(&renderer, time_loop.interpolationAlpha());
-            try renderer.endFrame();
+            switch (try renderer.endFrame()) {
+                .submitted => {},
+                .skipped_no_swapchain => frame_pacer.paceFallbackFrame(fallback_frame_start_ns),
+            }
         } else {
             frame_pacer.paceFallbackFrame(fallback_frame_start_ns);
         }
     }
-}
-
-fn sdlError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
-    return error.SdlError;
 }

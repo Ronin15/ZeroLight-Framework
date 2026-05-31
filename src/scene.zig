@@ -18,6 +18,8 @@ pub const Scene = struct {
         render: *const fn (*anyopaque, *Renderer, f32) anyerror!void,
     };
 
+    /// Adapts a borrowed scene value. The caller owns the pointed-to scene and
+    /// must keep it alive until the SceneStack removes or deinitializes it.
     pub fn from(comptime T: type, ptr: *T) Scene {
         const Adapter = struct {
             fn adapterDeinit(scene_ptr: *anyopaque) void {
@@ -97,8 +99,9 @@ pub const SceneStack = struct {
     }
 
     pub fn replace(self: *SceneStack, scene: Scene) !void {
+        try self.scenes.ensureTotalCapacity(self.allocator, 1);
         self.clear();
-        try self.push(scene);
+        self.scenes.appendAssumeCapacity(scene);
     }
 
     pub fn active(self: *SceneStack) ?Scene {

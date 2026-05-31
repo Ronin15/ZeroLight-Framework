@@ -6,19 +6,15 @@ const std = @import("std");
 const AssetStore = @import("assets.zig").AssetStore;
 const config = @import("config.zig");
 const Renderer = @import("renderer.zig").Renderer;
-const c = @import("sdl.zig").c;
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 pub fn main(init: std.process.Init) !void {
-    if (!c.SDL_Init(c.SDL_INIT_VIDEO)) {
-        return sdlError("SDL_Init");
-    }
-    defer c.SDL_Quit();
+    var sdl_context = try sdl.SdlContext.init(c.SDL_INIT_VIDEO);
+    defer sdl_context.deinit();
 
-    const title = "SDL_GPU Smoke\x00";
-    const window = c.SDL_CreateWindow(title.ptr, 320, 180, c.SDL_WINDOW_HIDDEN) orelse {
-        return sdlError("SDL_CreateWindow");
-    };
-    defer c.SDL_DestroyWindow(window);
+    var window = try sdl.Window.create("SDL_GPU Smoke", 320, 180, 0);
+    defer window.deinit();
 
     const app_config = config.AppConfig{
         .app_name = "gpu-smoke",
@@ -27,16 +23,13 @@ pub fn main(init: std.process.Init) !void {
     };
     const assets = AssetStore.init(init.gpa, init.io, app_config.asset_root);
 
-    var renderer = try Renderer.init(init.gpa, window, assets, app_config);
+    var renderer = try Renderer.init(init.gpa, window.handle, assets, app_config);
     defer renderer.deinit();
 
-    if (try renderer.beginFrame(app_config.clear_color)) {
-        try renderer.drawRect(.{ .x = 32, .y = 32, .w = 64, .h = 64 }, .{ .r = 1, .g = 1, .b = 1, .a = 1 }, 0);
-        try renderer.endFrame();
+    renderer.beginFrame(app_config.clear_color);
+    try renderer.drawRect(.{ .x = 32, .y = 32, .w = 64, .h = 64 }, .{ .r = 1, .g = 1, .b = 1, .a = 1 }, 0);
+    switch (try renderer.endFrame()) {
+        .submitted => {},
+        .skipped_no_swapchain => return error.NoSwapchain,
     }
-}
-
-fn sdlError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
-    return error.SdlError;
 }

@@ -21,10 +21,11 @@ pub const TimeLoop = struct {
 
     pub fn beginFrame(self: *TimeLoop, now_ns: u64) void {
         const elapsed_ns = if (now_ns > self.last_time_ns) now_ns - self.last_time_ns else 0;
+        const max_elapsed_ns = fixed_delta_ns * max_updates_per_frame;
         self.last_time_ns = now_ns;
         self.updates_this_frame = 0;
-        self.hit_update_cap = false;
-        self.accumulator_ns += @min(elapsed_ns, fixed_delta_ns * max_updates_per_frame);
+        self.hit_update_cap = elapsed_ns > max_elapsed_ns;
+        self.accumulator_ns += @min(elapsed_ns, max_elapsed_ns);
     }
 
     pub fn shouldUpdate(self: *const TimeLoop) bool {
@@ -80,6 +81,7 @@ test "large elapsed frame is clamped" {
     }
 
     try std.testing.expectEqual(TimeLoop.max_updates_per_frame, updates);
+    try std.testing.expect(loop.hit_update_cap);
     try std.testing.expect(loop.accumulator_ns < TimeLoop.fixed_delta_ns);
 }
 

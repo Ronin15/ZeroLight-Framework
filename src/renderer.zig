@@ -7,8 +7,9 @@ const AssetStore = @import("assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("config.zig");
-const core = @import("sdl3_Template");
-const c = @import("sdl.zig").c;
+const math = @import("math.zig");
+const sdl = @import("sdl.zig");
+const c = sdl.c;
 
 const max_shader_bytes = 1024 * 1024;
 const initial_batch_vertices = 4096 * 6;
@@ -30,9 +31,14 @@ pub const Sprite = struct {
     source: ?Rect = null,
     dest: Rect,
     tint: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-    origin: core.Vec2 = .{},
+    origin: math.Vec2 = .{},
     rotation: f32 = 0,
     layer: i32 = 0,
+};
+
+pub const FrameResult = enum {
+    submitted,
+    skipped_no_swapchain,
 };
 
 pub const Renderer = struct {
@@ -50,8 +56,6 @@ pub const Renderer = struct {
     draw_groups: std.ArrayList(DrawGroup) = .empty,
     white_texture: TextureHandle = .{ .index = 0 },
     camera: Camera2D = .{},
-    command_buffer: ?*c.SDL_GPUCommandBuffer = null,
-    swapchain_texture: ?*c.SDL_GPUTexture = null,
     clear_color: config.Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
     viewport_width: u32 = 0,
     viewport_height: u32 = 0,
@@ -64,6 +68,14 @@ pub const Renderer = struct {
         assets: AssetStore,
         app_config: config.AppConfig,
     ) !Renderer {
+        validateConfig(app_config) catch |err| {
+            std.log.err(
+                "frames_in_flight must be between 1 and 3, got {}",
+                .{app_config.frames_in_flight},
+            );
+            return err;
+        };
+
         const device = c.SDL_CreateGPUDevice(@intCast(build_options.gpu_shader_formats), app_config.gpu_debug, null) orelse {
             return sdlError("SDL_CreateGPUDevice");
         };
@@ -80,6 +92,8 @@ pub const Renderer = struct {
         }
         errdefer c.SDL_ReleaseWindowFromGPUDevice(device, window);
 
+        const selected_present_mode = selectPresentMode(device, window, app_config.present_mode);
+
         if (!c.SDL_SetGPUAllowedFramesInFlight(device, app_config.frames_in_flight)) {
             return sdlError("SDL_SetGPUAllowedFramesInFlight");
         }
@@ -88,7 +102,7 @@ pub const Renderer = struct {
             device,
             window,
             c.SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-            presentMode(app_config.present_mode),
+            selected_present_mode,
         )) {
             return sdlError("SDL_SetGPUSwapchainParameters");
         }
@@ -126,11 +140,6 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        if (self.command_buffer) |command_buffer| {
-            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-            self.command_buffer = null;
-        }
-
         _ = c.SDL_WaitForGPUIdle(self.device);
 
         for (self.textures.items) |texture| {
@@ -154,37 +163,12 @@ pub const Renderer = struct {
         c.SDL_DestroyGPUDevice(self.device);
     }
 
-    pub fn beginFrame(self: *Renderer, clear_color: config.Color) !bool {
-        std.debug.assert(self.command_buffer == null);
-
+    pub fn beginFrame(self: *Renderer, clear_color: config.Color) void {
         self.commands.clearRetainingCapacity();
         self.vertices.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.command_sequence = 0;
         self.clear_color = clear_color;
-
-        const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
-            return sdlError("SDL_AcquireGPUCommandBuffer");
-        };
-        errdefer _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-
-        var swapchain_texture: ?*c.SDL_GPUTexture = null;
-        var width: u32 = 0;
-        var height: u32 = 0;
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, self.window, &swapchain_texture, &width, &height)) {
-            return sdlError("SDL_WaitAndAcquireGPUSwapchainTexture");
-        }
-
-        if (swapchain_texture == null) {
-            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-            return false;
-        }
-
-        self.viewport_width = width;
-        self.viewport_height = height;
-        self.command_buffer = command_buffer;
-        self.swapchain_texture = swapchain_texture;
-        return true;
     }
 
     pub fn drawSprite(self: *Renderer, sprite: Sprite) !void {
@@ -252,20 +236,42 @@ pub const Renderer = struct {
         }
     }
 
-    pub fn endFrame(self: *Renderer) !void {
-        const command_buffer = self.command_buffer orelse return;
-        const swapchain_texture = self.swapchain_texture orelse return;
-        self.command_buffer = null;
-        self.swapchain_texture = null;
-
+    pub fn endFrame(self: *Renderer) !FrameResult {
         try self.buildBatch();
         if (self.vertices.items.len > 0) {
             try self.ensureBatchCapacity(self.vertices.items.len);
+        }
+
+        const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
+            return sdlError("SDL_AcquireGPUCommandBuffer");
+        };
+        var command_submitted = false;
+        errdefer if (!command_submitted) {
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+        };
+
+        var swapchain_texture: ?*c.SDL_GPUTexture = null;
+        var width: u32 = 0;
+        var height: u32 = 0;
+        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, self.window, &swapchain_texture, &width, &height)) {
+            return sdlError("SDL_WaitAndAcquireGPUSwapchainTexture");
+        }
+
+        const acquired_swapchain_texture = swapchain_texture orelse {
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+            command_submitted = true;
+            return .skipped_no_swapchain;
+        };
+
+        self.viewport_width = width;
+        self.viewport_height = height;
+
+        if (self.vertices.items.len > 0) {
             try self.uploadVertices(command_buffer);
         }
 
         var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
-        color_target.texture = swapchain_texture;
+        color_target.texture = acquired_swapchain_texture;
         color_target.clear_color = .{
             .r = self.clear_color.r,
             .g = self.clear_color.g,
@@ -314,6 +320,8 @@ pub const Renderer = struct {
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
             return sdlError("SDL_SubmitGPUCommandBuffer");
         }
+        command_submitted = true;
+        return .submitted;
     }
 
     pub fn createTextureFromPixels(
@@ -356,7 +364,10 @@ pub const Renderer = struct {
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
             return sdlError("SDL_AcquireGPUCommandBuffer");
         };
-        errdefer _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+        var command_submitted = false;
+        errdefer if (!command_submitted) {
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+        };
 
         const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
             return sdlError("SDL_BeginGPUCopyPass");
@@ -384,6 +395,7 @@ pub const Renderer = struct {
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
             return sdlError("SDL_SubmitGPUCommandBuffer");
         }
+        command_submitted = true;
         _ = c.SDL_WaitForGPUIdle(self.device);
 
         const handle = TextureHandle{ .index = self.textures.items.len };
@@ -403,12 +415,18 @@ pub const Renderer = struct {
             new_capacity *= 2;
         }
 
+        const new_vertex_buffer = try createVertexBuffer(self.device, new_capacity);
+        errdefer c.SDL_ReleaseGPUBuffer(self.device, new_vertex_buffer);
+
+        const new_vertex_transfer_buffer = try createVertexTransferBuffer(self.device, new_capacity);
+        errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_vertex_transfer_buffer);
+
         _ = c.SDL_WaitForGPUIdle(self.device);
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
         c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
 
-        self.vertex_buffer = try createVertexBuffer(self.device, new_capacity);
-        self.vertex_transfer_buffer = try createVertexTransferBuffer(self.device, new_capacity);
+        self.vertex_buffer = new_vertex_buffer;
+        self.vertex_transfer_buffer = new_vertex_transfer_buffer;
         self.batch_capacity_vertices = new_capacity;
     }
 
@@ -490,7 +508,7 @@ pub const Renderer = struct {
         const tex_u1 = (source.x + source.w) / @as(f32, @floatFromInt(texture.width));
         const tex_v1 = (source.y + source.h) / @as(f32, @floatFromInt(texture.height));
 
-        const local = [_]core.Vec2{
+        const local = [_]math.Vec2{
             .{ .x = -sprite.origin.x, .y = -sprite.origin.y },
             .{ .x = sprite.dest.w - sprite.origin.x, .y = -sprite.origin.y },
             .{ .x = -sprite.origin.x, .y = sprite.dest.h - sprite.origin.y },
@@ -508,11 +526,11 @@ pub const Renderer = struct {
         const rotation_sin = @sin(sprite.rotation);
         for (indices) |index| {
             const point = local[index];
-            const rotated = core.Vec2{
+            const rotated = math.Vec2{
                 .x = point.x * rotation_cos - point.y * rotation_sin,
                 .y = point.x * rotation_sin + point.y * rotation_cos,
             };
-            const world = core.Vec2{
+            const world = math.Vec2{
                 .x = sprite.dest.x + sprite.origin.x + rotated.x,
                 .y = sprite.dest.y + sprite.origin.y + rotated.y,
             };
@@ -729,6 +747,26 @@ fn presentMode(mode: config.PresentMode) c.SDL_GPUPresentMode {
     };
 }
 
+fn validateConfig(app_config: config.AppConfig) !void {
+    if (app_config.frames_in_flight < 1 or app_config.frames_in_flight > 3) {
+        return error.InvalidConfig;
+    }
+}
+
+fn selectPresentMode(
+    device: *c.SDL_GPUDevice,
+    window: *c.SDL_Window,
+    requested_mode: config.PresentMode,
+) c.SDL_GPUPresentMode {
+    const requested_sdl_mode = presentMode(requested_mode);
+    if (requested_mode == .vsync or c.SDL_WindowSupportsGPUPresentMode(device, window, requested_sdl_mode)) {
+        return requested_sdl_mode;
+    }
+
+    std.log.warn("requested SDL_GPU present mode is unsupported; falling back to vsync", .{});
+    return c.SDL_GPU_PRESENTMODE_VSYNC;
+}
+
 fn selectShaderSet(device: *c.SDL_GPUDevice) error{UnsupportedShaderFormat}!ShaderSet {
     const device_formats = c.SDL_GetGPUShaderFormats(device);
     const app_formats: c.SDL_GPUShaderFormat = @intCast(build_options.gpu_shader_formats);
@@ -770,13 +808,11 @@ fn selectShaderSetFromFormats(
 
 fn spriteCommandLessThan(_: void, lhs: SpriteCommand, rhs: SpriteCommand) bool {
     if (lhs.sprite.layer != rhs.sprite.layer) return lhs.sprite.layer < rhs.sprite.layer;
-    if (lhs.sprite.texture.index != rhs.sprite.texture.index) return lhs.sprite.texture.index < rhs.sprite.texture.index;
     return lhs.sequence < rhs.sequence;
 }
 
 fn sdlError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
-    return error.SdlError;
+    return sdl.sdlError(operation);
 }
 
 test "batch builder skips invalid and destroyed texture handles" {
@@ -866,4 +902,39 @@ test "shader set selection rejects unsupported format combinations" {
         error.UnsupportedShaderFormat,
         selectShaderSetFromFormats(c.SDL_GPU_SHADERFORMAT_SPIRV, c.SDL_GPU_SHADERFORMAT_MSL),
     );
+}
+
+test "sprite sorting preserves submission order within each layer" {
+    const first = SpriteCommand{
+        .sprite = .{
+            .texture = .{ .index = 10 },
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .layer = 0,
+        },
+        .sequence = 0,
+    };
+    const second = SpriteCommand{
+        .sprite = .{
+            .texture = .{ .index = 3 },
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .layer = 0,
+        },
+        .sequence = 1,
+    };
+
+    try std.testing.expect(spriteCommandLessThan({}, first, second));
+    try std.testing.expect(!spriteCommandLessThan({}, second, first));
+}
+
+test "renderer config rejects invalid frame latency" {
+    try std.testing.expectError(error.InvalidConfig, validateConfig(.{
+        .app_name = "test",
+        .window_title = "test",
+        .frames_in_flight = 0,
+    }));
+    try std.testing.expectError(error.InvalidConfig, validateConfig(.{
+        .app_name = "test",
+        .window_title = "test",
+        .frames_in_flight = 4,
+    }));
 }

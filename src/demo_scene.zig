@@ -2,9 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-const core = @import("sdl3_Template");
 const config = @import("config.zig");
 const InputState = @import("input.zig").InputState;
+const math = @import("math.zig");
 const Renderer = @import("renderer.zig").Renderer;
 const c = @import("sdl.zig").c;
 
@@ -52,8 +52,8 @@ const Direction = enum {
 };
 
 const Player = struct {
-    position: core.Vec2 = .{ .x = 400, .y = 225 },
-    previous_position: core.Vec2 = .{ .x = 400, .y = 225 },
+    position: math.Vec2 = .{ .x = 400, .y = 225 },
+    previous_position: math.Vec2 = .{ .x = 400, .y = 225 },
     facing: Direction = .down,
 
     const size: f32 = 32;
@@ -67,7 +67,7 @@ const Player = struct {
     fn update(self: *Player, input: *const InputState, delta_seconds: f32, bounds_width: f32, bounds_height: f32) void {
         self.previous_position = self.position;
 
-        var direction = core.Vec2{};
+        var direction = math.Vec2{};
         if (input.left) direction.x -= 1;
         if (input.right) direction.x += 1;
         if (input.up) direction.y -= 1;
@@ -83,12 +83,12 @@ const Player = struct {
             self.facing = .down;
         }
 
-        self.position.x = core.clamp(
+        self.position.x = math.clamp(
             self.position.x + direction.x * speed * delta_seconds,
             0,
             bounds_width - size,
         );
-        self.position.y = core.clamp(
+        self.position.y = math.clamp(
             self.position.y + direction.y * speed * delta_seconds,
             0,
             bounds_height - size,
@@ -96,7 +96,7 @@ const Player = struct {
     }
 
     fn render(self: *const Player, renderer: *Renderer, interpolation_alpha: f32) !void {
-        const render_position = core.lerpVec2(self.previous_position, self.position, interpolation_alpha);
+        const render_position = math.lerpVec2(self.previous_position, self.position, interpolation_alpha);
         try renderer.drawRect(.{
             .x = render_position.x,
             .y = render_position.y,
@@ -106,7 +106,7 @@ const Player = struct {
         try renderer.drawRect(markerRect(render_position, self.facing), marker_color, 1);
     }
 
-    fn markerRect(position: core.Vec2, facing: Direction) @import("renderer.zig").Rect {
+    fn markerRect(position: math.Vec2, facing: Direction) @import("renderer.zig").Rect {
         const centered_offset = (size - marker_length) * 0.5;
 
         return switch (facing) {

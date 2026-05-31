@@ -21,7 +21,7 @@ builds target-native shaders at build time and renders through SDL_GPU.
 
 - Zig 0.16.0 or newer compatible 0.16.x build
 - SDL3 development headers and library discoverable by the compiler/linker
-- `glslc` for shader compilation when running, packaging, or verifying shaders
+- `glslc` for shader compilation during the default build/run/package flow
 - `spirv-cross` for macOS Metal shader generation
 
 Platform package notes:
@@ -64,7 +64,7 @@ runs the app.
 ## Commands
 
 ```sh
-zig build           # build and install the app into zig-out/bin
+zig build           # build and install a runnable app into zig-out/bin
 zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game and GPU smoke executable
@@ -78,16 +78,17 @@ Useful supporting commands:
 ```sh
 zig build fmt       # format build.zig and src/
 zig build shaders   # compile GLSL shader sources to platform GPU shaders
-zig build gpu-smoke # create an SDL_GPU device and submit one hidden-window frame
+zig build gpu-smoke # create an SDL_GPU device and submit one frame
 ```
 
-`zig build package` uses the currently selected optimize mode. Pass
-`-Doptimize=ReleaseFast` or another mode explicitly when producing a release
-candidate.
+`zig build package` installs the selected-mode game binary and runtime assets.
+It does not install the `gpu-smoke` development executable. Pass
+`--release=fast`, `--release=safe`, `--release=small`, or
+`-Doptimize=ReleaseFast` explicitly when producing a release candidate.
 
-`zig build gpu-smoke` uses a hidden window, but SDL still needs a usable video
-backend and display environment. Headless shells or CI runners may need platform
-setup before this check can run.
+`zig build gpu-smoke` opens a small window long enough to submit a frame. SDL
+still needs a usable video backend and display environment, so headless shells or
+CI runners may need platform setup before this check can run.
 
 The default optimize mode is `ReleaseSafe`. Override it when needed:
 
@@ -102,6 +103,10 @@ Customize app metadata at build time:
 ```sh
 zig build -Dapp-name=my-game -Dwindow-title="My Game"
 ```
+
+The default runtime asset directory is `assets`. If you pass
+`-Dasset-root=content`, generated shaders and copied runtime assets are installed
+under `zig-out/bin/content`, and the executable looks there at runtime.
 
 Use a non-default shader compiler path:
 
@@ -148,6 +153,8 @@ The app uses SDL_GPU directly and does not call Vulkan APIs itself.
 - SDL should select Metal on macOS when MSL shaders are available and Vulkan on
   Linux when SPIR-V shaders are available.
 - Game code should draw through `Renderer` instead of calling SDL_GPU directly.
+- The installed runtime asset tree excludes shader source files and build-only
+  shader formats; package source assets separately if your game needs them.
 - PNG texture loading uses core SDL3 `SDL_LoadPNG`/`SDL_LoadSurface` support;
   this project does not require `SDL3_image`.
 
@@ -192,10 +199,28 @@ pub fn render(self: *MyScene, renderer: *Renderer, alpha: f32) !void {}
 Use `try scenes.push(Scene.from(MyScene, &my_scene))` for overlays and
 `try scenes.replace(...)` for full state changes.
 
+`SceneStack` stores borrowed scene pointers. Keep each scene value alive until it
+is popped, replaced, or the stack is deinitialized. The starter creates
+`DemoScene` in `main.zig` before the stack and defers stack cleanup first so that
+the borrowed pointer remains valid.
+
+## Starting Your Game
+
+This repository is intended to be cloned and edited into a game:
+
+- Rename or replace `src/demo_scene.zig`, then update the `DemoScene` import and
+  initialization in `src/main.zig`.
+- Set your default app name and window title in `build.zig`, or pass
+  `-Dapp-name=... -Dwindow-title=...` while iterating.
+- Put reusable gameplay modules under `src/` and keep SDL/GPU ownership in
+  `main.zig` and `renderer.zig` unless you have a reason to split it.
+- When you publish a fork as a distinct package, regenerate the
+  `build.zig.zon` fingerprint per Zig's package identity guidance.
+
 ## Adding Art
 
-Put PNGs under `assets/`, then load them through the renderer after it is
-initialized:
+The starter demo draws primitives so it has no required PNG asset. Put PNGs
+under `assets/`, then load them through the renderer after it is initialized:
 
 ```zig
 const texture = try renderer.createTextureFromPng(assets, "sprites/player.png");

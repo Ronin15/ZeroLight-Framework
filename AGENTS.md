@@ -13,16 +13,21 @@ This is a Zig SDL3 template. The build entry point is `build.zig`, with package 
 ## Build, Test, and Development Commands
 
 - `zig build` builds the executable and installs it to `zig-out/bin/my-sdl3-game`.
-- `zig build run` builds and runs the SDL3 example window.
+- `zig build run` builds, installs runtime assets/shaders, and runs the SDL3 example window.
+- `zig build dev` builds shaders, installs assets, and runs the app.
 - `zig build test` runs reusable module tests plus SDL-linked compile coverage.
-- `zig build check` compiles the executable without installing.
-- `zig build fmt` formats `build.zig` and `src/`.
+- `zig build check` compiles the game and GPU smoke executable without installing.
+- `zig build verify` runs check, tests, and shader compilation.
+- `zig build package` installs selected-mode game binaries and runtime assets.
+- `zig build shaders` compiles platform GPU shaders.
+- `zig build gpu-smoke` runs a display-gated SDL_GPU frame submission check.
+- `zig build fmt` formats `build.zig`, `build.zig.zon`, and `src/`.
 
-Default optimize mode is `ReleaseSafe`; override with `zig build -Doptimize=ReleaseFast` when needed. SDL3 is a system dependency; install the platform SDL3 development package before building.
+Default optimize mode is `ReleaseSafe`; override with `zig build --release=fast` or `zig build -Doptimize=ReleaseFast` when needed. SDL3 is a system dependency; install the platform SDL3 development package before building. Shader tools are required for the default runnable build.
 
 ## Coding Style & Naming Conventions
 
-Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the formatter will rewrite. Use `snake_case` for variables and functions, `PascalCase` for types, and short, descriptive names. Keep error sets explicit when practical, as in `error{SdlError}`.
+Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the formatter will rewrite. Use Zig-style lowerCamelCase for variables and functions, `PascalCase` for types, and short, descriptive names. Keep error sets explicit when practical, as in `error{SdlError}`.
 
 Prefer small functions with clear ownership of SDL resources. Pair SDL creation calls with `defer` cleanup close to the creation site.
 

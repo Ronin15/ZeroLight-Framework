@@ -3,11 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-
-pub const Vec2 = struct {
-    x: f32 = 0,
-    y: f32 = 0,
-};
+pub const Vec2 = @import("math.zig").Vec2;
 
 pub const Camera2D = struct {
     position: Vec2 = .{},
