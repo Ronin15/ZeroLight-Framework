@@ -33,6 +33,8 @@ Prefer small functions with clear ownership of SDL resources. Pair SDL creation 
 
 For frame-loop policy, use SDL window flags as current state: throttle visible background windows, but only skip rendering or force pause for hidden, minimized, or no-swapchain frames.
 
+Keep scalable game boundaries explicit: map raw input to named actions, keep latched frame commands separate from held gameplay input, keep debug state in debug UI, and let stack policies decide whether lower states receive update, input, or render passes.
+
 ## Testing Guidelines
 
 Use Zig's built-in `test` blocks and `std.testing`. Name tests by behavior, for example `test "player movement clamps to window bounds"`. Put reusable module tests beside the code they cover. Run `zig build test` before submitting changes.

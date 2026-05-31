@@ -340,6 +340,45 @@ pub const Renderer = struct {
         height: u32,
         pitch: usize,
     ) !TextureHandle {
+        const texture = try self.uploadTextureFromPixels(pixels, width, height, pitch);
+        errdefer c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+
+        const handle = TextureHandle{ .index = self.textures.items.len };
+        try self.textures.append(self.allocator, texture);
+        return handle;
+    }
+
+    pub fn replaceTextureFromPixels(
+        self: *Renderer,
+        handle: TextureHandle,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) !void {
+        if (handle.index >= self.textures.items.len or handle.index == self.white_texture.index) {
+            return error.InvalidTexture;
+        }
+
+        const next_texture = try self.uploadTextureFromPixels(pixels, width, height, pitch);
+        errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
+
+        const texture = &self.textures.items[handle.index];
+        if (texture.alive) {
+            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+        }
+        texture.* = next_texture;
+    }
+
+    fn uploadTextureFromPixels(
+        self: *Renderer,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) !TextureResource {
+        try validateTexturePixels(pixels, width, height, pitch);
+
         var texture_info = std.mem.zeroes(c.SDL_GPUTextureCreateInfo);
         texture_info.type = c.SDL_GPU_TEXTURETYPE_2D;
         texture_info.format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
@@ -407,13 +446,11 @@ pub const Renderer = struct {
         command_submitted = true;
         _ = c.SDL_WaitForGPUIdle(self.device);
 
-        const handle = TextureHandle{ .index = self.textures.items.len };
-        try self.textures.append(self.allocator, .{
+        return .{
             .texture = texture,
             .width = width,
             .height = height,
-        });
-        return handle;
+        };
     }
 
     fn ensureBatchCapacity(self: *Renderer, needed_vertices: usize) !void {
@@ -620,6 +657,35 @@ fn createVertexTransferBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) 
     return c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
+}
+
+fn validateTexturePixels(pixels: []const u8, width: u32, height: u32, pitch: usize) !void {
+    if (width == 0 or height == 0) return error.InvalidTexturePixels;
+    if (pitch % bytes_per_pixel != 0) return error.InvalidTexturePixels;
+
+    const min_pitch = std.math.mul(usize, @intCast(width), bytes_per_pixel) catch return error.InvalidTexturePixels;
+    if (pitch < min_pitch) return error.InvalidTexturePixels;
+
+    const required_len = std.math.mul(usize, pitch, @intCast(height)) catch return error.InvalidTexturePixels;
+    if (pixels.len < required_len) return error.InvalidTexturePixels;
+}
+
+test "texture pixel validation rejects invalid dimensions pitch and length" {
+    const valid_pixels = [_]u8{255} ** 16;
+
+    try std.testing.expectError(error.InvalidTexturePixels, validateTexturePixels(valid_pixels[0..], 0, 1, 4));
+    try std.testing.expectError(error.InvalidTexturePixels, validateTexturePixels(valid_pixels[0..], 1, 0, 4));
+    try std.testing.expectError(error.InvalidTexturePixels, validateTexturePixels(valid_pixels[0..], 2, 2, 7));
+    try std.testing.expectError(error.InvalidTexturePixels, validateTexturePixels(valid_pixels[0..], 2, 2, 4));
+    try std.testing.expectError(error.InvalidTexturePixels, validateTexturePixels(valid_pixels[0..15], 2, 2, 8));
+}
+
+test "texture pixel validation accepts tightly packed and padded rows" {
+    const tight_pixels = [_]u8{255} ** 16;
+    const padded_pixels = [_]u8{255} ** 24;
+
+    try validateTexturePixels(tight_pixels[0..], 2, 2, 8);
+    try validateTexturePixels(padded_pixels[0..], 2, 2, 12);
 }
 
 fn createSpritePipeline(

@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const gpu_debug = b.option(bool, "gpu-debug", "Enable SDL_GPU debug validation") orelse (optimize == .Debug);
     const shader_compiler = b.option([]const u8, "shader-compiler", "GLSL to SPIR-V compiler") orelse "glslc";
     const shader_cross_compiler = b.option([]const u8, "shader-cross-compiler", "SPIR-V to platform shader compiler") orelse "spirv-cross";
+    const debug_overlay = b.option(bool, "debug-overlay", "Enable SDL_ttf debug overlay support") orelse true;
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
 
     const build_options = b.addOptions();
@@ -31,6 +32,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "window_title", window_title);
     build_options.addOption([]const u8, "asset_root", asset_root);
     build_options.addOption(bool, "gpu_debug", gpu_debug);
+    build_options.addOption(bool, "debug_overlay", debug_overlay);
     build_options.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const lib_mod = b.addModule("sdl3_Template", .{
@@ -39,7 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const exe_mod = createGameModule(b, target, optimize, lib_mod, build_options);
+    const exe_mod = createGameModule(b, target, optimize, lib_mod, build_options, debug_overlay);
 
     const exe = b.addExecutable(.{
         .name = app_name,
@@ -76,6 +78,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const input_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/input.zig");
+    const input_unit_tests = b.addTest(.{
+        .root_module = input_unit_tests_mod,
+    });
+
     const state_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/state.zig");
     const state_unit_tests = b.addTest(.{
         .root_module = state_unit_tests_mod,
@@ -94,7 +101,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const exe_unit_tests_mod = createGameModule(b, target, optimize, lib_mod, build_options);
+    const renderer_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/renderer.zig");
+    const renderer_unit_tests = b.addTest(.{
+        .root_module = renderer_unit_tests_mod,
+    });
+
+    const pause_controller_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/pause_controller.zig");
+    const pause_controller_unit_tests = b.addTest(.{
+        .root_module = pause_controller_unit_tests_mod,
+    });
+
+    const exe_unit_tests_mod = createGameModule(b, target, optimize, lib_mod, build_options, debug_overlay);
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_unit_tests_mod,
     });
@@ -144,9 +161,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(root_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(assets_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(camera_unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(input_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(state_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(frame_pacer_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(time_loop_unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(renderer_unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(pause_controller_unit_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
 
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
@@ -172,8 +192,13 @@ fn createGameModule(
     optimize: std.builtin.OptimizeMode,
     lib_mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
+    debug_overlay: bool,
 ) *std.Build.Module {
-    return createSdlModule(b, target, optimize, lib_mod, build_options, "src/main.zig");
+    const mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/main.zig");
+    if (debug_overlay) {
+        mod.linkSystemLibrary("SDL3_ttf", .{});
+    }
+    return mod;
 }
 
 fn createSdlModule(
@@ -193,7 +218,6 @@ fn createSdlModule(
     mod.addImport("sdl3_Template", lib_mod);
     mod.addOptions("build_options", build_options);
     mod.linkSystemLibrary("SDL3", .{});
-    mod.linkSystemLibrary("SDL3_ttf", .{});
     return mod;
 }
 

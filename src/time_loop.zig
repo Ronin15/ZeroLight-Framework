@@ -28,6 +28,13 @@ pub const TimeLoop = struct {
         self.accumulator_ns += @min(elapsed_ns, max_elapsed_ns);
     }
 
+    pub fn reset(self: *TimeLoop, now_ns: u64) void {
+        self.last_time_ns = now_ns;
+        self.accumulator_ns = 0;
+        self.updates_this_frame = 0;
+        self.hit_update_cap = false;
+    }
+
     pub fn shouldUpdate(self: *const TimeLoop) bool {
         return self.accumulator_ns >= fixed_delta_ns and
             self.updates_this_frame < max_updates_per_frame;
@@ -98,4 +105,16 @@ test "update cap prevents more than five fixed updates" {
     try std.testing.expectEqual(TimeLoop.max_updates_per_frame, updates);
     try std.testing.expect(loop.hit_update_cap);
     try std.testing.expect(loop.accumulator_ns < TimeLoop.fixed_delta_ns);
+}
+
+test "reset clears accumulated catch-up time" {
+    var loop = TimeLoop.init(0);
+    loop.beginFrame(TimeLoop.fixed_delta_ns * 3);
+
+    loop.reset(123);
+
+    try std.testing.expectEqual(@as(u64, 123), loop.last_time_ns);
+    try std.testing.expectEqual(@as(u64, 0), loop.accumulator_ns);
+    try std.testing.expect(!loop.shouldUpdate());
+    try std.testing.expect(!loop.hit_update_cap);
 }

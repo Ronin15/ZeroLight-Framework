@@ -24,9 +24,10 @@ pub const DemoState = struct {
         _ = self;
     }
 
-    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event) void {
+    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event) bool {
         _ = self;
         _ = event;
+        return false;
     }
 
     pub fn update(self: *DemoState, input: *const InputState, delta_seconds: f32) void {
@@ -41,6 +42,10 @@ pub const DemoState = struct {
             .w = self.bounds_width,
             .h = 4,
         }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, -1);
+    }
+
+    pub fn onPause(self: *DemoState) void {
+        self.player.onPause();
     }
 };
 
@@ -67,11 +72,7 @@ const Player = struct {
     fn update(self: *Player, input: *const InputState, delta_seconds: f32, bounds_width: f32, bounds_height: f32) void {
         self.previous_position = self.position;
 
-        var direction = math.Vec2{};
-        if (input.left) direction.x -= 1;
-        if (input.right) direction.x += 1;
-        if (input.up) direction.y -= 1;
-        if (input.down) direction.y += 1;
+        const direction = input.movementVector();
 
         if (direction.x < 0) {
             self.facing = .left;
@@ -104,6 +105,10 @@ const Player = struct {
             .h = size,
         }, color, 0);
         try renderer.drawRect(markerRect(render_position, self.facing), marker_color, 1);
+    }
+
+    fn onPause(self: *Player) void {
+        self.previous_position = self.position;
     }
 
     fn markerRect(position: math.Vec2, facing: Direction) @import("renderer.zig").Rect {
@@ -141,7 +146,9 @@ const Player = struct {
 test "player movement clamps to state bounds" {
     const std = @import("std");
     var player = Player{ .position = .{ .x = 790, .y = -4 }, .previous_position = .{ .x = 790, .y = -4 } };
-    const input = InputState{ .right = true, .up = true };
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+    input.setHeld(.moveUp, true);
 
     player.update(&input, 1.0, 800, 450);
 
@@ -153,7 +160,10 @@ test "player facing updates from movement and remains while idle" {
     const std = @import("std");
     var player = Player{};
 
-    player.update(&InputState{ .up = true }, 0.0, 800, 450);
+    var input = InputState{};
+    input.setHeld(.moveUp, true);
+
+    player.update(&input, 0.0, 800, 450);
     try std.testing.expectEqual(Direction.up, player.facing);
 
     player.update(&InputState{}, 0.0, 800, 450);
@@ -164,7 +174,11 @@ test "player horizontal facing wins for diagonal movement" {
     const std = @import("std");
     var player = Player{};
 
-    player.update(&InputState{ .right = true, .up = true }, 0.0, 800, 450);
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+    input.setHeld(.moveUp, true);
+
+    player.update(&input, 0.0, 800, 450);
 
     try std.testing.expectEqual(Direction.right, player.facing);
 }

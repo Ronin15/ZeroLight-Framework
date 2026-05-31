@@ -25,9 +25,10 @@ pub const PauseState = struct {
         _ = self;
     }
 
-    pub fn handleEvent(self: *PauseState, event: *const c.SDL_Event) void {
+    pub fn handleEvent(self: *PauseState, event: *const c.SDL_Event) bool {
         _ = self;
         _ = event;
+        return false;
     }
 
     pub fn update(self: *PauseState, input: *const InputState, delta_seconds: f32) void {
@@ -61,6 +62,10 @@ pub const PauseState = struct {
 
         try drawScreenRect(renderer, .{ .x = left_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
         try drawScreenRect(renderer, .{ .x = right_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
+    }
+
+    pub fn onPause(self: *PauseState) void {
+        _ = self;
     }
 };
 

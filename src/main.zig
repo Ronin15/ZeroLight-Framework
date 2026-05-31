@@ -6,14 +6,19 @@ const std = @import("std");
 const AssetStore = @import("assets.zig").AssetStore;
 const build_options = @import("build_options");
 const config = @import("config.zig");
+const DebugOverlay = if (build_options.debug_overlay) @import("debug_overlay.zig").DebugOverlay else @import("debug_overlay_stub.zig").DebugOverlay;
 const DemoState = @import("demo_state.zig").DemoState;
-const FpsCounter = @import("fps_counter.zig").FpsCounter;
 const frame_pacer = @import("frame_pacer.zig");
+const input_mod = @import("input.zig");
+const Action = input_mod.Action;
+const FrameCommands = input_mod.FrameCommands;
 const InputState = @import("input.zig").InputState;
+const PauseController = @import("pause_controller.zig").PauseController;
 const PauseState = @import("pause_state.zig").PauseState;
 const Renderer = @import("renderer.zig").Renderer;
-const State = @import("state.zig").State;
-const StateStack = @import("state.zig").StateStack;
+const state_mod = @import("state.zig");
+const State = state_mod.State;
+const StateStack = state_mod.StateStack;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
@@ -43,66 +48,62 @@ pub fn main(init: std.process.Init) !void {
     var renderer = try Renderer.init(allocator, window.handle, assets, app_config);
     defer renderer.deinit();
 
-    var fps_counter = try FpsCounter.init();
-    defer fps_counter.deinit(&renderer);
+    var debug_overlay = DebugOverlay.init();
+    defer debug_overlay.deinit(&renderer);
 
     var demo_state = DemoState.init(
         @floatFromInt(app_config.logical_width),
         @floatFromInt(app_config.logical_height),
     );
+    defer demo_state.deinit();
     var states = StateStack.init(allocator);
-    try states.replace(State.from(DemoState, &demo_state));
-    defer states.deinit();
+    _ = try states.replaceGameplay(State.from(DemoState, &demo_state));
 
     var pause_state = PauseState.init(
         @floatFromInt(app_config.logical_width),
         @floatFromInt(app_config.logical_height),
     );
-    var gameplay_paused = false;
+    defer pause_state.deinit();
+    defer states.deinit();
+    var pause = PauseController{};
 
     var input = InputState{};
+    var commands = FrameCommands{};
     var time_loop = TimeLoop.init(c.SDL_GetTicksNS());
     var running = true;
     while (running) {
         const frame_start_ns = c.SDL_GetTicksNS();
-        input.beginFrame();
+        commands.beginFrame();
 
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
+            commands.handleEvent(&event);
             switch (event.type) {
                 c.SDL_EVENT_QUIT => running = false,
-                c.SDL_EVENT_KEY_DOWN => {
-                    input.handleEvent(&event);
-                    states.handleEvent(&event);
-                },
-                c.SDL_EVENT_KEY_UP => {
-                    input.handleEvent(&event);
-                    states.handleEvent(&event);
-                },
-                else => states.handleEvent(&event),
+                else => {},
             }
+            if (!pause.isPaused()) {
+                input.handleEvent(&event);
+            }
+            states.handleEvent(&event);
         }
-        if (input.fps_toggle_requested) fps_counter.toggle();
-        if (input.quit_requested) running = false;
+        debug_overlay.applyCommands(&commands);
+        if (commands.wasPressed(.quit)) running = false;
         if (!running) break;
 
         const frame_policy = frame_pacer.windowFramePolicy(window.handle);
-        if (frame_policy.should_pause_gameplay and !gameplay_paused) {
-            input.releaseMovement();
-            try states.push(State.from(PauseState, &pause_state));
-            gameplay_paused = true;
-        } else if (gameplay_paused and (input.resume_requested or input.pause_toggle_requested) and !frame_policy.should_pause_gameplay) {
-            resumeGameplay(&states, &gameplay_paused);
-        } else if (!gameplay_paused and input.pause_toggle_requested and !frame_policy.should_pause_gameplay) {
-            input.releaseMovement();
-            try states.push(State.from(PauseState, &pause_state));
-            gameplay_paused = true;
+        try pause.applyWindowPolicy(frame_policy, &states, &input, &time_loop, &pause_state, c.SDL_GetTicksNS());
+        if (!frame_policy.should_pause_gameplay and pause.isPaused() and
+            (commands.wasPressed(Action.resumeGame) or commands.wasPressed(Action.pause)))
+        {
+            pause.exit(&states, &input, &time_loop, c.SDL_GetTicksNS());
+        } else if (!frame_policy.should_pause_gameplay and !pause.isPaused() and commands.wasPressed(Action.pause)) {
+            try pause.enter(&states, &input, &time_loop, &pause_state, c.SDL_GetTicksNS());
         }
 
         const frame_time_ns = c.SDL_GetTicksNS();
         const frame_delta_ns = if (frame_time_ns > time_loop.last_time_ns) frame_time_ns - time_loop.last_time_ns else 0;
         time_loop.beginFrame(frame_time_ns);
-        try fps_counter.update(&renderer, frame_delta_ns);
 
         while (time_loop.shouldUpdate()) {
             states.update(&input, TimeLoop.fixed_delta_seconds);
@@ -112,19 +113,16 @@ pub fn main(init: std.process.Init) !void {
         if (frame_policy.can_render) {
             renderer.beginFrame(app_config.clear_color);
             try states.render(&renderer, time_loop.interpolationAlpha());
-            try fps_counter.render(&renderer);
+            try debug_overlay.render(&renderer);
             switch (try renderer.endFrame()) {
                 .submitted => {
+                    try debug_overlay.recordSubmittedFrame(&renderer, frame_delta_ns);
                     if (frame_policy.target_frame_ns) |target_frame_ns| {
                         frame_pacer.paceTargetFrame(frame_start_ns, target_frame_ns);
                     }
                 },
                 .skipped_no_swapchain => {
-                    if (!gameplay_paused) {
-                        input.releaseMovement();
-                        try states.push(State.from(PauseState, &pause_state));
-                        gameplay_paused = true;
-                    }
+                    try pause.enter(&states, &input, &time_loop, &pause_state, c.SDL_GetTicksNS());
                     frame_pacer.paceFallbackFrame(frame_start_ns);
                 },
             }
@@ -132,9 +130,4 @@ pub fn main(init: std.process.Init) !void {
             frame_pacer.paceFallbackFrame(frame_start_ns);
         }
     }
-}
-
-fn resumeGameplay(states: *StateStack, gameplay_paused: *bool) void {
-    states.pop();
-    gameplay_paused.* = false;
 }

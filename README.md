@@ -12,10 +12,10 @@ builds target-native shaders at build time and renders through SDL_GPU.
 - Batched sprite and rectangle drawing
 - Fixed 60Hz update loop with interpolation
 - Vsync-driven rendering with 60Hz background throttling
-- F2-toggle FPS overlay rendered with SDL_ttf
-- State stack for gameplay, menus, tools, and overlays
-- Pause state for background, hidden, minimized, or swapchain-unavailable frames
-- Frame-stable input state
+- Optional F2-toggle debug FPS overlay rendered with SDL_ttf
+- Policy-based state stack for gameplay, menus, tools, and overlays
+- Pause state for player-controlled and non-renderable window pauses
+- Keyboard action mapping with held gameplay input and latched frame commands
 - Runtime asset loading from the installed `assets/` directory
 - GPU smoke executable for checking SDL_GPU device creation
 
@@ -23,7 +23,7 @@ builds target-native shaders at build time and renders through SDL_GPU.
 
 - Zig 0.16.0 or newer compatible 0.16.x build
 - SDL3 development headers and library discoverable by the compiler/linker
-- SDL3_ttf development headers and library discoverable by the compiler/linker
+- SDL3_ttf development headers and library when the debug overlay is enabled
 - `glslc` for shader compilation during the default build/run/package flow
 - `spirv-cross` for macOS Metal shader generation
 
@@ -31,13 +31,13 @@ Platform package notes:
 
 - macOS/Homebrew: install `sdl3`, `sdl3_ttf`, `shaderc`, and `spirv-cross`.
   SDL_GPU should select Metal when the build provides MSL shaders.
-- Linux/Arch: install `sdl3`, `sdl3_ttf`, `shaderc`, `spirv-cross`,
-  `vulkan-headers`, `vulkan-loader`, and a working Vulkan GPU driver. SDL_GPU
-  should select Vulkan when the build provides SPIR-V shaders.
+- Linux/Arch: install `sdl3`, `sdl3_ttf`, `shaderc`, `vulkan-headers`,
+  `vulkan-loader`, and a working Vulkan GPU driver. SDL_GPU should select
+  Vulkan when the build provides SPIR-V shaders.
 
 Other Linux distributions use different package names, but the required pieces
-are SDL3 and SDL3_ttf development files, `glslc`, `spirv-cross`, the Vulkan
-loader/headers, and a vendor Mesa or proprietary Vulkan driver.
+are SDL3 development files, optional SDL3_ttf development files, `glslc`, the
+Vulkan loader/headers, and a vendor Mesa or proprietary Vulkan driver.
 
 ## Quick Start
 
@@ -107,6 +107,12 @@ Customize app metadata at build time:
 zig build -Dapp-name=my-game -Dwindow-title="My Game"
 ```
 
+Disable the SDL_ttf debug overlay if a target does not ship it:
+
+```sh
+zig build -Ddebug-overlay=false
+```
+
 The default runtime asset directory is `assets`. If you pass
 `-Dasset-root=content`, generated shaders and copied runtime assets are installed
 under `zig-out/bin/content`, and the executable looks there at runtime.
@@ -126,17 +132,19 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
 - `src/main.zig` owns SDL startup, the window, event polling, and the main loop.
 - `src/renderer.zig` owns SDL_GPU device setup, shader loading, texture upload,
   and the batched 2D draw API.
-- `src/state.zig` defines the push/pop state stack.
+- `src/state.zig` defines the borrowed state stack and stack policies.
 - `src/demo_state.zig` contains the initial movable-player state.
 - `src/pause_state.zig` contains the background/inactive pause overlay.
-- `src/input.zig` converts SDL input events into a frame-stable input state.
+- `src/pause_controller.zig` owns pause enter/exit behavior and forced pause handling.
+- `src/input.zig` maps SDL key events to held input actions and latched frame commands.
+- `src/debug_overlay.zig` owns debug-only overlay state.
 - `src/assets.zig` resolves runtime asset paths and loads installed files.
 - `src/camera.zig` contains the 2D camera transform used by the renderer.
 - `src/config.zig` centralizes app/window/GPU configuration.
 - `src/time_loop.zig` provides a fixed-step update loop with interpolation.
 - `src/frame_pacer.zig` coordinates renderability checks and fallback loop
   pacing for hidden, minimized, background, or swapchain-unavailable frames.
-- `src/fps_counter.zig` owns the SDL_ttf-backed debug FPS overlay.
+- `src/fps_counter.zig` owns SDL_ttf-backed FPS text for the debug overlay.
 - `src/root.zig` contains reusable game-agnostic helpers.
 - `assets/` contains runtime assets and shader sources.
 
@@ -170,11 +178,11 @@ The visible render loop is paced by SDL_GPU swapchain acquisition with the
 default vsync present mode. Simulation remains fixed at 60Hz through
 `TimeLoop`, while rendering may follow higher refresh displays and interpolate
 between fixed updates. Hidden, minimized, or swapchain-unavailable frames skip
-GPU rendering, use `SDL_DelayNS` for a 60Hz fallback cadence, and push the pause
-state. Occluded or unfocused visible windows keep rendering but apply the same
-60Hz cap to avoid background render runaway. Press P during active play to
-toggle the pause state; forced pause resumes with P, Enter, or Space after the
-window is visible again.
+GPU rendering, use `SDL_DelayNS` for a 60Hz fallback cadence, and enter the
+pause controller so gameplay cannot advance while the player cannot see it.
+Occluded or unfocused visible windows keep rendering but apply the same 60Hz cap
+to avoid background render runaway. Press P during active play to toggle pause;
+after a forced pause, press P, Enter, or Space once the window is visible again.
 
 Press F2 to toggle the yellow FPS overlay. It reports render-loop cadence, not
 the fixed update tick rate.
@@ -201,19 +209,31 @@ test "player movement clamps to window bounds" {
 Create a struct with this shape and push or replace it through `StateStack`:
 
 ```zig
-pub fn deinit(self: *MyState) void {}
-pub fn handleEvent(self: *MyState, event: *const c.SDL_Event) void {}
+pub fn handleEvent(self: *MyState, event: *const c.SDL_Event) bool {}
 pub fn update(self: *MyState, input: *const InputState, delta_seconds: f32) void {}
 pub fn render(self: *MyState, renderer: *Renderer, alpha: f32) !void {}
+pub fn onPause(self: *MyState) void {}
 ```
 
-Use `try states.push(State.from(MyState, &my_state))` for overlays and
-`try states.replace(...)` for full state changes.
+Return `true` from `handleEvent` when the state consumes an event. Use
+`try states.pushModal(State.from(MyState, &my_state))` for blocking menus,
+`try states.pushOverlay(...)` for pass-through overlays, and
+`try states.replaceGameplay(...)` for full state changes.
 
-`StateStack` stores borrowed state pointers. Keep each state value alive until it
-is popped, replaced, or the stack is deinitialized. The starter creates
-`DemoState` in `main.zig` before the stack and defers stack cleanup first so that
-the borrowed pointer remains valid.
+`StateStack` stores borrowed state pointers and returns handles for removal.
+Keep each state value alive until its handle is removed or replaced. The stack
+does not deinitialize borrowed states; callers own state lifetime and should
+call state-specific `deinit` functions directly when needed.
+
+## Input Model
+
+Keyboard input maps to named `Action` values in `src/input.zig`. Gameplay code
+reads held actions through `InputState`, while app-level commands such as pause,
+resume, quit, and debug overlay toggle are latched for one frame through
+`FrameCommands`.
+
+The default bindings are WASD for movement, P for pause, Enter or Space for
+resume, Escape for quit, and F2 for the debug overlay.
 
 ## Starting Your Game
 
