@@ -6,7 +6,9 @@ comptime {
     _ = @import("assets/assets.zig");
     _ = @import("app/frame_pacer.zig");
     _ = @import("app/input.zig");
+    _ = @import("app/input_router.zig");
     _ = @import("app/pause_controller.zig");
+    _ = @import("app/resolution.zig");
     _ = @import("app/state.zig");
     _ = @import("app/time_loop.zig");
     _ = @import("core/math.zig");
@@ -14,5 +16,7 @@ comptime {
     _ = @import("main.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");
+    _ = @import("render/resources.zig");
+    _ = @import("render/text.zig");
     _ = @import("root.zig");
 }
