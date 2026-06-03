@@ -334,6 +334,127 @@ Acceptance checks:
 - [ ] `zig build verify` exercises shader compilation.
 - [ ] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
 
+## Slice 9: Platform-Neutral SIMD Helper Layer
+
+Goal: provide a small SIMD helper layer with clear project names so movement,
+particles, and other hot data processors can use vectors without exposing
+platform-specific intrinsic names throughout gameplay code.
+
+Current foundation:
+
+- `src/core/math.zig` contains small math primitives.
+- `ThreadSystem.parallelFor` already divides work into contiguous ranges.
+- Future movement and particle processors are expected to operate on SoA slices.
+
+Checklist:
+
+- [ ] Add `src/core/simd.zig` with friendly vector aliases such as `Float4`,
+      `Int4`, and `Mask4`.
+- [ ] Prefer portable Zig vector types first, hiding target-specific intrinsic
+      details behind the helper API.
+- [ ] Add load, store, splat, add, subtract, multiply, divide, min, max,
+      compare, select, and clamp helpers needed by movement and particle loops.
+- [ ] Add scalar-tail helpers for item counts that are not a multiple of the
+      vector lane count.
+- [ ] Keep the helper free of game-specific entity, particle, SDL, renderer, or
+      thread-system dependencies.
+- [ ] Document when scalar code should be preferred for tiny batches or clarity.
+
+Acceptance checks:
+
+- [ ] SIMD helper tests prove lane order is stable.
+- [ ] SIMD and scalar implementations produce identical results for representative
+      float and integer operations.
+- [ ] Tail handling covers empty, partial, exact-lane, and multi-lane inputs.
+- [ ] `zig build test` passes on targets where the helper is expected to compile.
+
+## Slice 10: DataSystem And SoA Composition Foundation
+
+Goal: introduce `DataSystem` as the state-owned persistent gameplay data
+container and save/load streaming boundary, with dense SoA storage designed for
+fast systems, threading, and SIMD.
+
+Current foundation:
+
+- `StateStack` owns active state lifetimes.
+- `UpdateContext` exposes `ThreadSystem` to states.
+- Game-specific runtime data currently lives inside demo state/player structs.
+
+Architecture notes:
+
+- `DataSystem` is intentionally the unique name for the persistent data
+  container.
+- `DataSystem` persists for the lifetime of the owning gameplay state, not as a
+  global app singleton.
+- Systems are processors that borrow or view `DataSystem`; they do not own
+  persistent gameplay data.
+- Save/load should stream `DataSystem`, not `Engine`, `StateStack`, renderer,
+  thread system, input, or transient frame state.
+- Composition comes from meaningful data membership in typed stores, not from a
+  free-form component soup where arbitrary behavior combinations are implied.
+
+Checklist:
+
+- [ ] Add a game data module with `DataSystem` and an entity ID/generation
+      registry.
+- [ ] Add dense SoA stores for initial persistent gameplay data such as transform
+      and movement.
+- [ ] Use stable handles or dense indices so stores can remain compact while
+      rejecting stale IDs.
+- [ ] Keep SDL handles, GPU handles, input frame state, renderer state,
+      `ThreadSystem`, transient events, and scratch buffers outside `DataSystem`.
+- [ ] Store persistent asset references as stable IDs or relative paths, not
+      live renderer texture handles.
+- [ ] Add explicit init/deinit and clear/reset behavior for state lifecycle and
+      save/load preparation.
+
+Acceptance checks:
+
+- [ ] Entity IDs reject stale generations after removal and reuse.
+- [ ] Dense SoA stores keep arrays length-aligned and compact after add/remove.
+- [ ] `DataSystem` can be initialized and deinitialized without leaks.
+- [ ] Tests cover which data belongs inside `DataSystem` versus transient runtime
+      services that must stay outside it.
+
+## Slice 11: SIMD-Aware Data Processor Systems
+
+Goal: add high-performance systems that process `DataSystem` slices with the
+thread system and SIMD helpers while preserving deterministic fixed-step update
+behavior.
+
+Current foundation:
+
+- `ThreadSystem.parallelFor` runs synchronous range batches and returns only
+  after all workers finish.
+- `UpdateContext` passes `thread_system` into states.
+- `DataSystem` will provide persistent SoA slices for systems to process.
+- `src/core/simd.zig` will provide portable vector helpers.
+
+Checklist:
+
+- [ ] Define systems as data processors that accept `DataSystem`, `ThreadSystem`,
+      and fixed-step delta time rather than owning persistent data.
+- [ ] Add movement and particle processors that split dense SoA slices through
+      `parallelFor`.
+- [ ] Use SIMD inside each worker range and scalar-tail code for remainder
+      elements.
+- [ ] Ensure worker jobs write only to assigned disjoint ranges.
+- [ ] Keep state transitions, entity creation/removal, SDL calls, GPU calls,
+      asset loading, and save/load streaming on the main thread.
+- [ ] Merge any per-worker output, event counts, or deferred structural changes
+      on the main thread after the batch completes.
+- [ ] Keep normal 60Hz update paths allocation-free after initialization.
+
+Acceptance checks:
+
+- [ ] Scalar and SIMD movement results match for representative data sets.
+- [ ] Serial and threaded processor results match for the same initial
+      `DataSystem`.
+- [ ] Worker jobs do not write outside their assigned `ParallelRange`.
+- [ ] Update processors perform no allocations during steady-state simulation.
+- [ ] Fixed-step update order remains deterministic: later systems always see
+      completed output from earlier systems.
+
 ## Suggested Order
 
 1. Input routing.
@@ -344,7 +465,12 @@ Acceptance checks:
 6. Renderer composition.
 7. Preallocated thread system and parallel render prep.
 8. Shader and platform expansion.
+9. Platform-neutral SIMD helper layer.
+10. DataSystem and SoA composition foundation.
+11. SIMD-aware data processor systems.
 
 This order keeps gameplay/menu correctness ahead of larger renderer work, then
 builds resource ownership before text/UI, renderer composition, and parallel
-render preparation depend on it.
+render preparation depend on it. SIMD helpers land before the DataSystem and
+processor slices so the storage and system APIs can be designed around the hot
+loop shape from the start.
