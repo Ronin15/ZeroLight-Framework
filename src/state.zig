@@ -377,8 +377,10 @@ pub const StateStack = struct {
     }
 
     fn destroyAllStates(self: *StateStack) void {
-        for (self.states.items) |entry| {
-            entry.state.destroy(self.allocator);
+        var index = self.states.items.len;
+        while (index > 0) {
+            index -= 1;
+            self.states.items[index].state.destroy(self.allocator);
         }
     }
 
@@ -444,9 +446,10 @@ test "state stack owns pushed states and destroys removed states" {
     try std.testing.expectEqual(@as(u32, 2), deinit_count);
 }
 
-test "state stack deinit destroys remaining states" {
+test "state stack deinit destroys remaining states from top to bottom" {
     const TestingState = struct {
-        deinit_count: *u32,
+        id: u32,
+        deinit_order: *std.ArrayList(u32),
 
         fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
@@ -473,19 +476,70 @@ test "state stack deinit destroys remaining states" {
         }
 
         fn deinit(self: *@This()) void {
-            self.deinit_count.* += 1;
+            self.deinit_order.append(std.testing.allocator, self.id) catch unreachable;
         }
     };
 
-    var deinit_count: u32 = 0;
+    var deinit_order: std.ArrayList(u32) = .empty;
+    defer deinit_order.deinit(std.testing.allocator);
     {
         var stack = StateStack.init(std.testing.allocator);
         defer stack.deinit();
-        _ = try stack.replaceGameplay(TestingState, .{ .deinit_count = &deinit_count });
-        _ = try stack.pushModal(TestingState, .{ .deinit_count = &deinit_count });
+        _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_order = &deinit_order });
+        _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_order = &deinit_order });
+        _ = try stack.pushOverlay(TestingState, .{ .id = 3, .deinit_order = &deinit_order });
     }
 
-    try std.testing.expectEqual(@as(u32, 2), deinit_count);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, deinit_order.items);
+}
+
+test "state stack replace destroys existing states from top to bottom" {
+    const TestingState = struct {
+        id: u32,
+        deinit_order: *std.ArrayList(u32),
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+            _ = self;
+            _ = input;
+            _ = delta_seconds;
+            _ = transitions;
+        }
+
+        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+            _ = self;
+            _ = renderer;
+            _ = interpolation_alpha;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_order.append(std.testing.allocator, self.id) catch unreachable;
+        }
+    };
+
+    var deinit_order: std.ArrayList(u32) = .empty;
+    defer deinit_order.deinit(std.testing.allocator);
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_order = &deinit_order });
+    _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_order = &deinit_order });
+    _ = try stack.pushOverlay(TestingState, .{ .id = 3, .deinit_order = &deinit_order });
+
+    _ = try stack.replaceGameplay(TestingState, .{ .id = 4, .deinit_order = &deinit_order });
+
+    try std.testing.expectEqualSlices(u32, &.{ 3, 2, 1 }, deinit_order.items);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
 }
 
 test "state stack removeIfPresent clears live handles and leaves stale handles alone" {
@@ -585,7 +639,7 @@ test "modal state blocks updates below and pass-through state allows them" {
     try std.testing.expectEqual(@as(u32, 2), top_updates);
 }
 
-test "state event handling stops at consumed or modal state" {
+test "state event handling stops at consumed state" {
     const TestingState = struct {
         handled_count: *u32,
         consume: bool = false,
@@ -637,6 +691,56 @@ test "state event handling stops at consumed or modal state" {
     try std.testing.expectEqual(@as(u32, 0), bottom_count);
     try std.testing.expectEqual(@as(u32, 0), middle_count);
     try std.testing.expectEqual(@as(u32, 1), top_count);
+}
+
+test "modal state blocks event handling below it" {
+    const TestingState = struct {
+        handled_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = event;
+            _ = transitions;
+            self.handled_count.* += 1;
+            return false;
+        }
+
+        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+            _ = self;
+            _ = input;
+            _ = delta_seconds;
+            _ = transitions;
+        }
+
+        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+            _ = self;
+            _ = renderer;
+            _ = interpolation_alpha;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var bottom_count: u32 = 0;
+    var modal_count: u32 = 0;
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(TestingState, .{ .handled_count = &bottom_count });
+    _ = try stack.pushModal(TestingState, .{ .handled_count = &modal_count });
+
+    const event = c.SDL_Event{ .type = c.SDL_EVENT_QUIT };
+    try stack.handleEvent(&event, &transitions);
+
+    try std.testing.expectEqual(@as(u32, 0), bottom_count);
+    try std.testing.expectEqual(@as(u32, 1), modal_count);
 }
 
 test "opaque state render policy hides states below it" {
@@ -692,8 +796,158 @@ test "opaque state render policy hides states below it" {
 
 test "transition requests apply after dispatch and preserve FIFO order" {
     const TestingState = struct {
-        deinit_count: *u32,
+        id: u32,
+        render_order: *std.ArrayList(u32),
 
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+            _ = self;
+            _ = input;
+            _ = delta_seconds;
+            _ = transitions;
+        }
+
+        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+            _ = renderer;
+            _ = interpolation_alpha;
+            self.render_order.append(std.testing.allocator, self.id) catch unreachable;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var render_order: std.ArrayList(u32) = .empty;
+    defer render_order.deinit(std.testing.allocator);
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .render_order = &render_order });
+    try transitions.pushModal(TestingState, .{ .id = 2, .render_order = &render_order });
+    try transitions.pushOverlay(TestingState, .{ .id = 3, .render_order = &render_order });
+    const result = try stack.applyTransitions(&transitions);
+
+    try std.testing.expect(!result.quit_requested);
+    try std.testing.expectEqual(@as(usize, 3), stack.len());
+    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
+
+    var renderer: Renderer = undefined;
+    try stack.render(&renderer, 0.0);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, render_order.items);
+}
+
+test "queued transition from update waits until applyTransitions" {
+    const QueuingState = struct {
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+            _ = self;
+            _ = input;
+            _ = delta_seconds;
+            try transitions.pushModal(@This(), .{});
+        }
+
+        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+            _ = self;
+            _ = renderer;
+            _ = interpolation_alpha;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(QueuingState, .{});
+    try stack.update(&InputState{}, 0.0, &transitions);
+
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+
+    _ = try stack.applyTransitions(&transitions);
+
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
+}
+
+test "queued transition from handleEvent waits until applyTransitions" {
+    const QueuingState = struct {
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            try transitions.pushModal(@This(), .{});
+            return true;
+        }
+
+        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+            _ = self;
+            _ = input;
+            _ = delta_seconds;
+            _ = transitions;
+        }
+
+        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+            _ = self;
+            _ = renderer;
+            _ = interpolation_alpha;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(QueuingState, .{});
+    const event = c.SDL_Event{ .type = c.SDL_EVENT_QUIT };
+    try stack.handleEvent(&event, &transitions);
+
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+
+    _ = try stack.applyTransitions(&transitions);
+
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
+}
+
+test "stale duplicate and remove after replace transitions are no-ops" {
+    const TestingState = struct {
         fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
             _ = event;
@@ -719,25 +973,27 @@ test "transition requests apply after dispatch and preserve FIFO order" {
         }
 
         fn deinit(self: *@This()) void {
-            self.deinit_count.* += 1;
+            _ = self;
         }
     };
 
-    var deinit_count: u32 = 0;
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
-    _ = try stack.replaceGameplay(TestingState, .{ .deinit_count = &deinit_count });
-    try transitions.pushModal(TestingState, .{ .deinit_count = &deinit_count });
-    try transitions.pushOverlay(TestingState, .{ .deinit_count = &deinit_count });
+    const stale_handle = StateHandle{ .id = 999 };
+    const live_handle = try stack.replaceGameplay(TestingState, .{});
+
+    try transitions.remove(stale_handle);
+    try transitions.remove(stale_handle);
+    try transitions.replaceGameplay(TestingState, .{});
+    try transitions.remove(live_handle);
     const result = try stack.applyTransitions(&transitions);
 
     try std.testing.expect(!result.quit_requested);
-    try std.testing.expectEqual(@as(usize, 3), stack.len());
-    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
-    try std.testing.expectEqual(@as(u32, 0), deinit_count);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expect(!stack.contains(live_handle));
 }
 
 test "transition queue destroys unapplied owned states" {

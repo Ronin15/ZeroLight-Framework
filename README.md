@@ -79,7 +79,7 @@ zig build package   # install selected-mode binaries and runtime assets
 Useful supporting commands:
 
 ```sh
-zig build fmt       # format build.zig and src/
+zig build fmt       # format build.zig, build.zig.zon, and src/
 zig build shaders   # compile GLSL shader sources to platform GPU shaders
 zig build gpu-smoke # create an SDL_GPU device and submit one frame
 ```
@@ -211,11 +211,33 @@ test "player movement clamps to window bounds" {
 Create a struct with this shape and push or replace it through `StateStack`:
 
 ```zig
-pub fn handleEvent(self: *MyState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {}
-pub fn update(self: *MyState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {}
-pub fn render(self: *MyState, renderer: *Renderer, alpha: f32) !void {}
-pub fn onPause(self: *MyState) void {}
-pub fn deinit(self: *MyState) void {}
+pub fn handleEvent(self: *MyState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+    _ = self;
+    _ = event;
+    _ = transitions;
+    return false;
+}
+
+pub fn update(self: *MyState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+    _ = self;
+    _ = input;
+    _ = delta_seconds;
+    _ = transitions;
+}
+
+pub fn render(self: *MyState, renderer: *Renderer, alpha: f32) !void {
+    _ = self;
+    _ = renderer;
+    _ = alpha;
+}
+
+pub fn onPause(self: *MyState) void {
+    _ = self;
+}
+
+pub fn deinit(self: *MyState) void {
+    _ = self;
+}
 ```
 
 Return `true` from `handleEvent` when the state consumes an event. Use
