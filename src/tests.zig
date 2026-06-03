@@ -10,6 +10,7 @@ comptime {
     _ = @import("app/state.zig");
     _ = @import("app/time_loop.zig");
     _ = @import("core/math.zig");
+    _ = @import("game/player.zig");
     _ = @import("main.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");
