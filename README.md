@@ -13,8 +13,9 @@ It builds target-native shaders at build time and renders through SDL_GPU.
 - Fixed 60Hz simulation with interpolation for varying-refresh rendering
 - Vsync-paced visible rendering with 60Hz background throttling
 - Player-controlled pause and forced pause for hidden, minimized, or no-swapchain frames
-- Owned state stack for gameplay, screens, and overlays
+- State stack for gameplay, screens, and overlays
 - Held gameplay input plus one-frame commands
+- Pre-spawned thread system for parallel CPU batches that finish before the next engine step
 - Runtime asset loading from the installed `assets/` directory
 - F2 debug FPS overlay using SDL3_ttf
 - GPU smoke executable for SDL_GPU device and frame-submission checks
@@ -67,12 +68,12 @@ build options, formatting, shader commands, and GPU smoke details.
 
 - `build.zig` defines executables, tests, formatting, shader compilation, and install steps.
 - `build.zig.zon` contains package metadata.
-- `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
-- `src/app/` owns SDL app coordination, input, timing, pause policy, frame pacing, and state stack flow.
-- `src/render/` owns SDL_GPU rendering, camera transforms, GPU resources, and debug overlay rendering.
+- `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
+- `src/app/` contains SDL app coordination, input, timing, pause policy, frame pacing, thread system, and state stack flow.
+- `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, and debug overlay rendering.
 - `src/game/` contains game/application states such as the temporary demo and pause overlay.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
-- `src/assets/` resolves runtime asset paths and loads installed files.
+- `src/assets/` contains runtime asset path resolution and installed-file loading.
 - `src/core/` contains small shared starter helpers.
 - `assets/` contains runtime assets and shader sources.
 

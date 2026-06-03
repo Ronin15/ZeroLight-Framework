@@ -32,7 +32,7 @@ The default executable name is `my-sdl3-game`, and the default window title is
 ## Add Gameplay Code
 
 Put reusable gameplay modules under the matching `src/` area. Keep SDL window
-and GPU ownership in `src/app/` and `src/render/`, and keep game-specific state
+and GPU coordination code in `src/app/` and `src/render/`, and keep game-specific state
 under `src/game/`.
 
 The current demo renders a movable primitive player, so there is no required PNG
