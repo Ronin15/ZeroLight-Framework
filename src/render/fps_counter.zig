@@ -5,7 +5,7 @@
 const std = @import("std");
 const Renderer = @import("renderer.zig").Renderer;
 const TextureHandle = @import("renderer.zig").TextureHandle;
-const c = @import("sdl.zig").c;
+const c = @import("../platform/sdl.zig").c;
 
 const yellow = c.SDL_Color{ .r = 255, .g = 230, .b = 40, .a = 255 };
 const sample_window_ns = std.time.ns_per_s / 4;

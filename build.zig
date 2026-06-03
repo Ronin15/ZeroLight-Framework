@@ -9,15 +9,7 @@ const shader_format_msl: u32 = 1 << 4;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize: std.builtin.OptimizeMode = b.option(
-        std.builtin.OptimizeMode,
-        "optimize",
-        "Prioritize performance, safety, or binary size",
-    ) orelse switch (b.release_mode) {
-        .off, .any, .safe => .ReleaseSafe,
-        .fast => .ReleaseFast,
-        .small => .ReleaseSmall,
-    };
+    const optimize = b.standardOptimizeOption(.{});
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
@@ -35,85 +27,22 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "debug_overlay", debug_overlay);
     build_options.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
-    const lib_mod = b.addModule("sdl3_Template", .{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe_mod = createGameModule(b, target, optimize, lib_mod, build_options);
+    const exe_mod = createGameModule(b, target, optimize, build_options);
 
     const exe = b.addExecutable(.{
         .name = app_name,
         .root_module = exe_mod,
     });
 
-    const gpu_smoke_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/gpu_smoke.zig");
+    const gpu_smoke_mod = createSdlModule(b, target, optimize, build_options, "src/gpu_smoke.zig");
     const gpu_smoke_exe = b.addExecutable(.{
         .name = "gpu-smoke",
         .root_module = gpu_smoke_mod,
     });
 
-    const root_unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const assets_unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/assets.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const camera_unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/camera.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const input_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/input.zig");
-    const input_unit_tests = b.addTest(.{
-        .root_module = input_unit_tests_mod,
-    });
-
-    const state_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/state.zig");
-    const state_unit_tests = b.addTest(.{
-        .root_module = state_unit_tests_mod,
-    });
-
-    const frame_pacer_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/frame_pacer.zig");
-    const frame_pacer_unit_tests = b.addTest(.{
-        .root_module = frame_pacer_unit_tests_mod,
-    });
-
-    const time_loop_unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/time_loop.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    const renderer_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/renderer.zig");
-    const renderer_unit_tests = b.addTest(.{
-        .root_module = renderer_unit_tests_mod,
-    });
-
-    const pause_controller_unit_tests_mod = createSdlModule(b, target, optimize, lib_mod, build_options, "src/pause_controller.zig");
-    const pause_controller_unit_tests = b.addTest(.{
-        .root_module = pause_controller_unit_tests_mod,
-    });
-
-    const exe_unit_tests_mod = createGameModule(b, target, optimize, lib_mod, build_options);
-    const exe_unit_tests = b.addTest(.{
-        .root_module = exe_unit_tests_mod,
+    const unit_tests_mod = createSdlModule(b, target, optimize, build_options, "src/tests.zig");
+    const unit_tests = b.addTest(.{
+        .root_module = unit_tests_mod,
     });
 
     b.installArtifact(exe);
@@ -158,16 +87,7 @@ pub fn build(b: *std.Build) void {
     dev_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(root_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(assets_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(camera_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(input_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(state_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(frame_pacer_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(time_loop_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(renderer_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(pause_controller_unit_tests).step);
-    test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);
@@ -190,17 +110,15 @@ fn createGameModule(
     b: *std.Build,
     target: anytype,
     optimize: std.builtin.OptimizeMode,
-    lib_mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
 ) *std.Build.Module {
-    return createSdlModule(b, target, optimize, lib_mod, build_options, "src/main.zig");
+    return createSdlModule(b, target, optimize, build_options, "src/main.zig");
 }
 
 fn createSdlModule(
     b: *std.Build,
     target: anytype,
     optimize: std.builtin.OptimizeMode,
-    lib_mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
     root_source_file: []const u8,
 ) *std.Build.Module {
@@ -210,7 +128,6 @@ fn createSdlModule(
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addImport("sdl3_Template", lib_mod);
     mod.addOptions("build_options", build_options);
     mod.linkSystemLibrary("SDL3", .{});
     mod.linkSystemLibrary("SDL3_ttf", .{});

@@ -3,12 +3,12 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const AssetStore = @import("assets.zig").AssetStore;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
-const config = @import("config.zig");
-const math = @import("math.zig");
-const sdl = @import("sdl.zig");
+const config = @import("../config.zig");
+const math = @import("../core/math.zig");
+const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
 
 const max_shader_bytes = 1024 * 1024;

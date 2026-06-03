@@ -2,52 +2,12 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-const config = @import("config.zig");
-const InputState = @import("input.zig").InputState;
-const math = @import("math.zig");
-const Renderer = @import("renderer.zig").Renderer;
-const c = @import("sdl.zig").c;
-
-pub const DemoState = struct {
-    player: Player = .{},
-    bounds_width: f32 = 800,
-    bounds_height: f32 = 450,
-
-    pub fn init(bounds_width: f32, bounds_height: f32) DemoState {
-        return .{
-            .bounds_width = bounds_width,
-            .bounds_height = bounds_height,
-        };
-    }
-
-    pub fn deinit(self: *DemoState) void {
-        _ = self;
-    }
-
-    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event) bool {
-        _ = self;
-        _ = event;
-        return false;
-    }
-
-    pub fn update(self: *DemoState, input: *const InputState, delta_seconds: f32) void {
-        self.player.update(input, delta_seconds, self.bounds_width, self.bounds_height);
-    }
-
-    pub fn render(self: *DemoState, renderer: *Renderer, interpolation_alpha: f32) !void {
-        try self.player.render(renderer, interpolation_alpha);
-        try renderer.drawRect(.{
-            .x = 0,
-            .y = self.bounds_height - 4,
-            .w = self.bounds_width,
-            .h = 4,
-        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, -1);
-    }
-
-    pub fn onPause(self: *DemoState) void {
-        self.player.onPause();
-    }
-};
+const config = @import("../config.zig");
+const InputState = @import("../app/input.zig").InputState;
+const math = @import("../core/math.zig");
+const renderer = @import("../render/renderer.zig");
+const Renderer = renderer.Renderer;
+const Rect = renderer.Rect;
 
 const Direction = enum {
     up,
@@ -56,7 +16,7 @@ const Direction = enum {
     right,
 };
 
-const Player = struct {
+pub const Player = struct {
     position: math.Vec2 = .{ .x = 400, .y = 225 },
     previous_position: math.Vec2 = .{ .x = 400, .y = 225 },
     facing: Direction = .down,
@@ -69,7 +29,7 @@ const Player = struct {
     const color = config.Color{ .r = 1.0, .g = 0.8, .b = 0.36, .a = 1.0 };
     const marker_color = config.Color{ .r = 0.8, .g = 0.56, .b = 0.22, .a = 1.0 };
 
-    fn update(self: *Player, input: *const InputState, delta_seconds: f32, bounds_width: f32, bounds_height: f32) void {
+    pub fn update(self: *Player, input: *const InputState, delta_seconds: f32, bounds_width: f32, bounds_height: f32) void {
         self.previous_position = self.position;
 
         const direction = input.movementVector();
@@ -96,22 +56,22 @@ const Player = struct {
         );
     }
 
-    fn render(self: *const Player, renderer: *Renderer, interpolation_alpha: f32) !void {
+    pub fn render(self: *const Player, renderer_instance: *Renderer, interpolation_alpha: f32) !void {
         const render_position = math.lerpVec2(self.previous_position, self.position, interpolation_alpha);
-        try renderer.drawRect(.{
+        try renderer_instance.drawRect(.{
             .x = render_position.x,
             .y = render_position.y,
             .w = size,
             .h = size,
         }, color, 0);
-        try renderer.drawRect(markerRect(render_position, self.facing), marker_color, 1);
+        try renderer_instance.drawRect(markerRect(render_position, self.facing), marker_color, 1);
     }
 
-    fn onPause(self: *Player) void {
+    pub fn onPause(self: *Player) void {
         self.previous_position = self.position;
     }
 
-    fn markerRect(position: math.Vec2, facing: Direction) @import("renderer.zig").Rect {
+    fn markerRect(position: math.Vec2, facing: Direction) Rect {
         const centered_offset = (size - marker_length) * 0.5;
 
         return switch (facing) {

@@ -3,7 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const TimeLoop = @import("time_loop.zig").TimeLoop;
-const c = @import("sdl.zig").c;
+const c = @import("../platform/sdl.zig").c;
 
 pub const fallback_frame_ns = TimeLoop.fixed_delta_ns;
 

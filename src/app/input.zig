@@ -2,8 +2,8 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-const math = @import("math.zig");
-const c = @import("sdl.zig").c;
+const math = @import("../core/math.zig");
+const c = @import("../platform/sdl.zig").c;
 
 pub const Action = enum(usize) {
     moveLeft,

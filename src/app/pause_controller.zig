@@ -4,14 +4,22 @@
 
 const FramePolicy = @import("frame_pacer.zig").FramePolicy;
 const InputState = @import("input.zig").InputState;
-const PauseState = @import("pause_state.zig").PauseState;
-const State = @import("state.zig").State;
+const PauseState = @import("../game/pause_state.zig").PauseState;
 const StateHandle = @import("state.zig").StateHandle;
 const StateStack = @import("state.zig").StateStack;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 
 pub const PauseController = struct {
     handle: ?StateHandle = null,
+    width: f32,
+    height: f32,
+
+    pub fn init(width: f32, height: f32) PauseController {
+        return .{
+            .width = width,
+            .height = height,
+        };
+    }
 
     pub fn isPaused(self: *const PauseController) bool {
         return self.handle != null;
@@ -22,14 +30,13 @@ pub const PauseController = struct {
         states: *StateStack,
         input: *InputState,
         time_loop: *TimeLoop,
-        pause_state: *PauseState,
         now_ns: u64,
     ) !void {
         if (self.isPaused()) return;
 
         states.pauseActive();
         input.releaseMovement();
-        self.handle = try states.pushModal(State.from(PauseState, pause_state));
+        self.handle = try states.pushModal(PauseState, PauseState.init(self.width, self.height));
         time_loop.reset(now_ns);
     }
 
@@ -53,11 +60,10 @@ pub const PauseController = struct {
         states: *StateStack,
         input: *InputState,
         time_loop: *TimeLoop,
-        pause_state: *PauseState,
         now_ns: u64,
     ) !void {
         if (policy.should_pause_gameplay) {
-            try self.enter(states, input, time_loop, pause_state, now_ns);
+            try self.enter(states, input, time_loop, now_ns);
         }
     }
 };
@@ -68,19 +74,21 @@ test "pause controller enter and exit are idempotent" {
     const TestingState = struct {
         pause_count: *u32,
 
-        pub fn handleEvent(self: *@This(), event: *const @import("sdl.zig").c.SDL_Event) bool {
+        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *@import("state.zig").StateTransitions) !bool {
             _ = self;
             _ = event;
+            _ = transitions;
             return false;
         }
 
-        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32) void {
+        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *@import("state.zig").StateTransitions) !void {
             _ = self;
             _ = input;
             _ = delta_seconds;
+            _ = transitions;
         }
 
-        pub fn render(self: *@This(), renderer: *@import("renderer.zig").Renderer, interpolation_alpha: f32) !void {
+        pub fn render(self: *@This(), renderer: *@import("../render/renderer.zig").Renderer, interpolation_alpha: f32) !void {
             _ = self;
             _ = renderer;
             _ = interpolation_alpha;
@@ -89,22 +97,24 @@ test "pause controller enter and exit are idempotent" {
         pub fn onPause(self: *@This()) void {
             self.pause_count.* += 1;
         }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
     };
 
     var pause_count: u32 = 0;
-    var gameplay = TestingState{ .pause_count = &pause_count };
-    var pause_state = PauseState.init(800, 450);
     var input = InputState{};
     input.setHeld(.moveRight, true);
     var time_loop = TimeLoop.init(0);
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns * 2;
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(State.from(TestingState, &gameplay));
-    var pause = PauseController{};
+    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count });
+    var pause = PauseController.init(800, 450);
 
-    try pause.enter(&states, &input, &time_loop, &pause_state, 10);
-    try pause.enter(&states, &input, &time_loop, &pause_state, 20);
+    try pause.enter(&states, &input, &time_loop, 10);
+    try pause.enter(&states, &input, &time_loop, 20);
 
     try std.testing.expect(pause.isPaused());
     try std.testing.expectEqual(@as(usize, 2), states.len());
@@ -126,19 +136,21 @@ test "pause controller applies forced pause policy once" {
     const std = @import("std");
 
     const TestingState = struct {
-        pub fn handleEvent(self: *@This(), event: *const @import("sdl.zig").c.SDL_Event) bool {
+        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *@import("state.zig").StateTransitions) !bool {
             _ = self;
             _ = event;
+            _ = transitions;
             return false;
         }
 
-        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32) void {
+        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *@import("state.zig").StateTransitions) !void {
             _ = self;
             _ = input;
             _ = delta_seconds;
+            _ = transitions;
         }
 
-        pub fn render(self: *@This(), renderer: *@import("renderer.zig").Renderer, interpolation_alpha: f32) !void {
+        pub fn render(self: *@This(), renderer: *@import("../render/renderer.zig").Renderer, interpolation_alpha: f32) !void {
             _ = self;
             _ = renderer;
             _ = interpolation_alpha;
@@ -147,24 +159,26 @@ test "pause controller applies forced pause policy once" {
         pub fn onPause(self: *@This()) void {
             _ = self;
         }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
     };
 
-    var gameplay = TestingState{};
-    var pause_state = PauseState.init(800, 450);
     var input = InputState{};
     var time_loop = TimeLoop.init(0);
     var states = StateStack.init(std.testing.allocator);
     defer states.deinit();
-    _ = try states.replaceGameplay(State.from(TestingState, &gameplay));
-    var pause = PauseController{};
+    _ = try states.replaceGameplay(TestingState, .{});
+    var pause = PauseController.init(800, 450);
     const policy = FramePolicy{
         .can_render = false,
         .target_frame_ns = TimeLoop.fixed_delta_ns,
         .should_pause_gameplay = true,
     };
 
-    try pause.applyWindowPolicy(policy, &states, &input, &time_loop, &pause_state, 10);
-    try pause.applyWindowPolicy(policy, &states, &input, &time_loop, &pause_state, 20);
+    try pause.applyWindowPolicy(policy, &states, &input, &time_loop, 10);
+    try pause.applyWindowPolicy(policy, &states, &input, &time_loop, 20);
 
     try std.testing.expect(pause.isPaused());
     try std.testing.expectEqual(@as(usize, 2), states.len());
