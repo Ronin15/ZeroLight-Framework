@@ -4,7 +4,8 @@
 
 This is a Zig SDL3 template. The build entry point is `build.zig`, with package metadata in `build.zig.zon`.
 
-- `src/main.zig` contains the executable entry point and SDL3 window/render loop.
+- `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
+- `src/engine.zig` owns SDL3 screen setup and coordinates event, update, and render phases through the state stack.
 - `src/root.zig` is the reusable package module with library helpers and tests.
 - `assets/` contains runtime assets and is installed to `zig-out/bin/assets`.
 - `zig-out/` is generated build output and should not be edited by hand.

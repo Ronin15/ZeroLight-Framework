@@ -129,7 +129,8 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
 - `build.zig` defines executables, tests, formatting, shader compilation, and
   install steps.
 - `build.zig.zon` contains package metadata.
-- `src/main.zig` owns SDL startup, the window, event polling, and the main loop.
+- `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
+- `src/engine.zig` owns SDL startup, the window, event polling, and event/update/render coordination through the state stack.
 - `src/sdl.zig` owns SDL startup and shared C imports.
 - `src/renderer.zig` owns SDL_GPU device setup, shader loading, texture upload,
   and the batched 2D draw API.
@@ -241,11 +242,11 @@ resume, Escape for quit, and F2 for the debug overlay.
 This repository is intended to be cloned and edited into a game:
 
 - Rename or replace `src/demo_state.zig`, then update the `DemoState` import and
-  initialization in `src/main.zig`.
+  initialization in `src/engine.zig`.
 - Set your default app name and window title in `build.zig`, or pass
   `-Dapp-name=... -Dwindow-title=...` while iterating.
 - Put reusable gameplay modules under `src/` and keep SDL/GPU ownership in
-  `main.zig` and `renderer.zig` unless you have a reason to split it.
+  `engine.zig` and `renderer.zig` unless you have a reason to split it further.
 - When you publish a fork as a distinct package, regenerate the
   `build.zig.zon` fingerprint per Zig's package identity guidance.
 
