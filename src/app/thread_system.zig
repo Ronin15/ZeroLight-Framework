@@ -41,12 +41,6 @@ pub const ThreadSystemConfig = struct {
     /// Number of items assigned to each range before another participant takes
     /// more work.
     grain_size: usize = 64,
-    /// Reserved for a future multi-batch queue; current implementation accepts
-    /// one synchronous batch at a time.
-    queue_capacity: usize = 1,
-    /// Reserved for future spin-before-park tuning. Workers currently park on a
-    /// condition variable when idle.
-    short_spin_count: u32 = 64,
 };
 
 pub const JobFn = *const fn (*anyopaque, ParallelRange, WorkerId) void;
@@ -150,13 +144,13 @@ pub const ThreadSystem = struct {
             .item_count = item_count,
             .grain_size = grain_size,
             .range_count = range_count,
-            .next_range = active_background_workers,
+            .next_range = .init(active_background_workers),
             .active_background_worker_count = active_background_workers,
             .pending_workers = active_background_workers,
             .context = context,
             .job_fn = job_fn,
-            .main_thread_ranges = 0,
-            .background_worker_ranges = 0,
+            .main_thread_ranges = .init(0),
+            .background_worker_ranges = .init(0),
         };
         stats.background_worker_count = active_background_workers;
         stats.ran_inline = false;
@@ -170,8 +164,8 @@ pub const ThreadSystem = struct {
         while (self.shared.batch.pending_workers != 0) {
             self.shared.batch_complete.waitUncancelable(self.shared.io, &self.shared.mutex);
         }
-        stats.main_thread_ranges = self.shared.batch.main_thread_ranges;
-        stats.background_worker_ranges = self.shared.batch.background_worker_ranges;
+        stats.main_thread_ranges = self.shared.batch.main_thread_ranges.load(.monotonic);
+        stats.background_worker_ranges = self.shared.batch.background_worker_ranges.load(.monotonic);
         self.shared.batch = .{};
         self.shared.mutex.unlock(self.shared.io);
 
@@ -224,39 +218,31 @@ const Shared = struct {
 
     fn runBatchRanges(self: *Shared, id: WorkerId) void {
         while (true) {
-            self.mutex.lockUncancelable(self.io);
-            const range_index = self.batch.next_range;
-            if (range_index >= self.batch.range_count) {
-                self.mutex.unlock(self.io);
-                return;
-            }
+            const range_index = self.batch.next_range.fetchAdd(1, .monotonic);
+            if (range_index >= self.batch.range_count) return;
 
-            self.batch.next_range += 1;
             const range = rangeForIndex(self.batch.item_count, self.batch.grain_size, range_index);
             const job_fn = self.batch.job_fn.?;
             const context = self.batch.context.?;
             if (id.index == 0) {
-                self.batch.main_thread_ranges += 1;
+                _ = self.batch.main_thread_ranges.fetchAdd(1, .monotonic);
             } else {
-                self.batch.background_worker_ranges += 1;
+                _ = self.batch.background_worker_ranges.fetchAdd(1, .monotonic);
             }
-            self.mutex.unlock(self.io);
 
             job_fn(context, range, id);
         }
     }
 
     fn runBatchRangeIndex(self: *Shared, id: WorkerId, range_index: usize) void {
-        self.mutex.lockUncancelable(self.io);
         const range = rangeForIndex(self.batch.item_count, self.batch.grain_size, range_index);
         const job_fn = self.batch.job_fn.?;
         const context = self.batch.context.?;
         if (id.index == 0) {
-            self.batch.main_thread_ranges += 1;
+            _ = self.batch.main_thread_ranges.fetchAdd(1, .monotonic);
         } else {
-            self.batch.background_worker_ranges += 1;
+            _ = self.batch.background_worker_ranges.fetchAdd(1, .monotonic);
         }
-        self.mutex.unlock(self.io);
 
         job_fn(context, range, id);
     }
@@ -273,13 +259,13 @@ const Batch = struct {
     item_count: usize = 0,
     grain_size: usize = 1,
     range_count: usize = 0,
-    next_range: usize = 0,
+    next_range: std.atomic.Value(usize) = .init(0),
     active_background_worker_count: usize = 0,
     pending_workers: usize = 0,
     context: ?*anyopaque = null,
     job_fn: ?JobFn = null,
-    main_thread_ranges: usize = 0,
-    background_worker_ranges: usize = 0,
+    main_thread_ranges: std.atomic.Value(usize) = .init(0),
+    background_worker_ranges: std.atomic.Value(usize) = .init(0),
 };
 
 fn workerMain(worker: *WorkerRecord) void {
@@ -289,7 +275,6 @@ fn workerMain(worker: *WorkerRecord) void {
 fn normalizeConfig(config: ThreadSystemConfig) ThreadSystemConfig {
     var normalized = config;
     normalized.grain_size = @max(normalized.grain_size, @as(usize, 1));
-    normalized.queue_capacity = @max(normalized.queue_capacity, @as(usize, 1));
     return normalized;
 }
 

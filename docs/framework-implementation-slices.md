@@ -207,6 +207,20 @@ Current foundation:
 - Zig 0.16 provides `std.Thread.spawn`, atomics, and `std.Io` blocking
   primitives; this checkout does not rely on a std thread-pool abstraction.
 
+Architecture notes:
+
+- This is a synchronous frame-batch system, not a general async job scheduler.
+  It is for systems that need CPU work completed before the frame can continue.
+- There is one active batch at a time. A batch exposes an atomic range queue:
+  participants claim the next `ParallelRange` with an atomic cursor.
+- Background workers park when idle. Do not add spin-wait configuration unless
+  measurement proves condition-variable wake latency is the bottleneck.
+- `max_background_workers` counts only pre-spawned background threads. The
+  main/render thread may also process ranges, so the default `cpu_count - 1`
+  background workers uses all normal CPU participants without oversubscription.
+- Long-lived async work such as asset streaming or file IO should use a
+  separate service later instead of sharing this frame-bounded barrier path.
+
 Thread-system design:
 
 - [x] Add `src/app/thread_system.zig` with `ThreadSystem`,
@@ -220,14 +234,13 @@ Thread-system design:
 - [x] Default background worker count to one fewer than
       `std.Thread.getCpuCount()` when possible, reserving the main/render thread
       as an additional batch participant; allow config override for background
-      worker count, stack size, minimum parallel item count, grain size, queue
-      capacity, and short spin-before-park behavior.
-- [ ] Use preallocated worker records, batch descriptors, completion counters,
-      per-worker scratch, and fixed-capacity queues. No frame-batch submission
-      may allocate after initialization or explicit reserve calls.
-- [ ] Use atomics for hot counters and wake state; use `std.Io.Mutex`,
-      `std.Io.Condition`, or `std.Io.Semaphore` only for parking and shutdown
-      paths where blocking is expected.
+      worker count, stack size, minimum parallel item count, and grain size.
+- [x] Use preallocated worker records, one synchronous batch descriptor, and an
+      atomic range cursor. No frame-batch submission may allocate after
+      initialization.
+- [x] Use atomics for hot range claiming and range stats; use `std.Io.Mutex` and
+      `std.Io.Condition` only for batch publication, worker parking, completion,
+      and shutdown paths where blocking is expected.
 - [x] Let the main thread participate in submitted batches while waiting so it
       does useful work instead of only acting as a coordinator.
 - [ ] Dynamically scale active workers only at batch boundaries based on prior
@@ -243,7 +256,9 @@ Engine/system integration:
 - [x] Keep systems ordered: each system may use the whole worker set, but all
       of its jobs must complete before the next system starts.
 - [x] Allow worker jobs to read immutable snapshots and write only disjoint
-      output ranges or per-worker scratch.
+      output ranges.
+- [ ] Add explicit per-worker scratch storage keyed by `WorkerId` before systems
+      need temporary output buffers.
 - [x] Keep `StateTransitions`, state-stack mutation, SDL events, SDL window
       calls, and renderer ownership on the main thread.
 - [x] Record batch stats in a lightweight struct that debug overlay or logs can
@@ -278,6 +293,8 @@ Acceptance checks:
 - [x] System barriers are deterministic: later systems always see completed
       output from earlier systems.
 - [x] Shutdown wakes and joins parked workers without leaking or deadlocking.
+- [x] Worker idle policy parks on a condition variable; no spin loop or unused
+      spin configuration remains in the public config.
 - [ ] Serial and parallel render prep produce identical vertex order, draw
       group order, layer ordering, and invalid-texture skipping for the same
       command input.
