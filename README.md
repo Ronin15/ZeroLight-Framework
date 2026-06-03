@@ -87,18 +87,22 @@ zig build gpu-smoke # create an SDL_GPU device and submit one frame
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable. Pass
 `--release=fast`, `--release=safe`, `--release=small`, or
-`-Doptimize=ReleaseFast` explicitly when producing a release candidate.
+`-Doptimize=ReleaseFast` explicitly when producing a release candidate or
+shipping build.
 
 `zig build gpu-smoke` opens a small window long enough to submit a frame. SDL
 still needs a usable video backend and display environment, so headless shells or
 CI runners may need platform setup before this check can run.
 
-The default optimize mode is `ReleaseSafe`. Override it when needed:
+The default optimize mode is `Debug`, matching standard Zig build behavior.
+Use an explicit release mode only when preparing a release candidate or shipping
+build:
 
 ```sh
-zig build -Doptimize=Debug
+zig build
+zig build --release=safe
+zig build --release=fast
 zig build -Doptimize=ReleaseFast
-zig build -Doptimize=ReleaseSmall
 ```
 
 Customize app metadata at build time:

@@ -28,7 +28,7 @@ This is a Zig SDL3 template. The build entry point is `build.zig`, with package 
 - `zig build gpu-smoke` runs a display-gated SDL_GPU frame submission check.
 - `zig build fmt` formats `build.zig`, `build.zig.zon`, and `src/`.
 
-Default optimize mode is `ReleaseSafe`; override with `zig build --release=fast` or `zig build -Doptimize=ReleaseFast` when needed. SDL3 is a system dependency; install the platform SDL3 development package before building. Shader tools are required for the default runnable build.
+Default optimize mode is `Debug`, matching standard Zig build behavior. Use `zig build --release=safe`, `zig build --release=fast`, or `zig build -Doptimize=ReleaseFast` only for release candidates or shipping builds. SDL3 is a system dependency; install the platform SDL3 development package before building. Shader tools are required for the default runnable build.
 
 ## Coding Style & Naming Conventions
 

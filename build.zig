@@ -9,15 +9,7 @@ const shader_format_msl: u32 = 1 << 4;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize: std.builtin.OptimizeMode = b.option(
-        std.builtin.OptimizeMode,
-        "optimize",
-        "Prioritize performance, safety, or binary size",
-    ) orelse switch (b.release_mode) {
-        .off, .any, .safe => .ReleaseSafe,
-        .fast => .ReleaseFast,
-        .small => .ReleaseSmall,
-    };
+    const optimize = b.standardOptimizeOption(.{});
     const app_name = b.option([]const u8, "app-name", "Executable name") orelse "my-sdl3-game";
     const window_title = b.option([]const u8, "window-title", "SDL window title") orelse "SDL3 Zig Game";
     const asset_root = b.option([]const u8, "asset-root", "Runtime asset directory") orelse "assets";
