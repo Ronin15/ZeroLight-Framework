@@ -135,7 +135,7 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
 - `src/renderer.zig` owns SDL_GPU device setup, shader loading, texture upload,
   and the batched 2D draw API.
 - `src/state.zig` defines the borrowed state stack and stack policies.
-- `src/demo_state.zig` contains the initial movable-player state.
+- `src/demo_state.zig` contains the temporary startup state for the template.
 - `src/pause_state.zig` contains the background/inactive pause overlay.
 - `src/pause_controller.zig` owns pause enter/exit behavior and forced pause handling.
 - `src/input.zig` maps SDL key events to held input actions and latched frame commands.
@@ -241,8 +241,9 @@ resume, Escape for quit, and F2 for the debug overlay.
 
 This repository is intended to be cloned and edited into a game:
 
-- Rename or replace `src/demo_state.zig`, then update the `DemoState` import and
-  initialization in `src/engine.zig`.
+- Rename or replace `src/demo_state.zig`, then update the startup-state
+  bootstrap in `src/engine.zig`. A real game will usually replace the demo
+  with a `MainMenuState` that transitions into gameplay.
 - Set your default app name and window title in `build.zig`, or pass
   `-Dapp-name=... -Dwindow-title=...` while iterating.
 - Put reusable gameplay modules under `src/` and keep SDL/GPU ownership in

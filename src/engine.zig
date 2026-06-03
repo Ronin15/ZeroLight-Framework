@@ -84,7 +84,7 @@ pub const Engine = struct {
 
         var states = StateStack.init(allocator);
         errdefer states.deinit();
-        _ = try states.replaceGameplay(State.from(DemoState, demo_state));
+        try bootstrapStartupState(&states, demo_state);
 
         return .{
             .allocator = allocator,
@@ -197,3 +197,8 @@ pub const Engine = struct {
         }
     }
 };
+
+fn bootstrapStartupState(states: *StateStack, demo_state: *DemoState) !void {
+    // DemoState is the template startup state until a real MainMenuState exists.
+    _ = try states.replaceGameplay(State.from(DemoState, demo_state));
+}
