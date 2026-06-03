@@ -246,7 +246,7 @@ pub const Renderer = struct {
     }
 
     pub fn endFrame(self: *Renderer) !FrameResult {
-        try self.buildBatch();
+        try self.prepareFrameCommands();
         if (self.vertices.items.len > 0) {
             try self.ensureBatchCapacity(self.vertices.items.len);
         }
@@ -501,7 +501,11 @@ pub const Renderer = struct {
         c.SDL_EndGPUCopyPass(copy_pass);
     }
 
-    fn buildBatch(self: *Renderer) !void {
+    fn prepareFrameCommands(self: *Renderer) !void {
+        try self.buildBatchSerial();
+    }
+
+    fn buildBatchSerial(self: *Renderer) !void {
         std.mem.sort(SpriteCommand, self.commands.items, {}, spriteCommandLessThan);
 
         var active_texture: ?TextureHandle = null;
@@ -941,7 +945,7 @@ test "batch builder skips invalid and destroyed texture handles" {
         .sequence = 2,
     });
 
-    try renderer.buildBatch();
+    try renderer.prepareFrameCommands();
 
     try std.testing.expectEqual(@as(usize, 6), renderer.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), renderer.draw_groups.items.len);

@@ -3,9 +3,11 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const config = @import("../config.zig");
-const InputState = @import("../app/input.zig").InputState;
 const Renderer = @import("../render/renderer.zig").Renderer;
-const StateTransitions = @import("../app/state.zig").StateTransitions;
+const state_mod = @import("../app/state.zig");
+const RenderContext = state_mod.RenderContext;
+const StateTransitions = state_mod.StateTransitions;
+const UpdateContext = state_mod.UpdateContext;
 const c = @import("../platform/sdl.zig").c;
 
 pub const PauseState = struct {
@@ -33,23 +35,22 @@ pub const PauseState = struct {
         return false;
     }
 
-    pub fn update(self: *PauseState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+    pub fn update(self: *PauseState, context: UpdateContext) !void {
         _ = self;
-        _ = input;
-        _ = delta_seconds;
-        _ = transitions;
+        _ = context;
     }
 
-    pub fn render(self: *PauseState, renderer: *Renderer, interpolation_alpha: f32) !void {
-        _ = interpolation_alpha;
+    pub fn render(self: *PauseState, context: RenderContext) !void {
+        _ = context.interpolation_alpha;
+        _ = context.thread_system;
 
-        try drawScreenRect(renderer, .{ .x = 0, .y = 0, .w = self.width, .h = self.height }, overlay_color, overlay_layer);
+        try drawScreenRect(context.renderer, .{ .x = 0, .y = 0, .w = self.width, .h = self.height }, overlay_color, overlay_layer);
 
         const panel_width: f32 = 220;
         const panel_height: f32 = 132;
         const panel_x = (self.width - panel_width) * 0.5;
         const panel_y = (self.height - panel_height) * 0.5;
-        try drawScreenRect(renderer, .{
+        try drawScreenRect(context.renderer, .{
             .x = panel_x,
             .y = panel_y,
             .w = panel_width,
@@ -63,8 +64,8 @@ pub const PauseState = struct {
         const right_x = (self.width + gap) * 0.5;
         const bar_y = (self.height - bar_height) * 0.5;
 
-        try drawScreenRect(renderer, .{ .x = left_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
-        try drawScreenRect(renderer, .{ .x = right_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
+        try drawScreenRect(context.renderer, .{ .x = left_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
+        try drawScreenRect(context.renderer, .{ .x = right_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
     }
 
     pub fn onPause(self: *PauseState) void {

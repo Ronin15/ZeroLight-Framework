@@ -5,8 +5,12 @@
 const FramePolicy = @import("frame_pacer.zig").FramePolicy;
 const InputState = @import("input.zig").InputState;
 const PauseState = @import("../game/pause_state.zig").PauseState;
+const state_mod = @import("state.zig");
+const RenderContext = state_mod.RenderContext;
 const StateHandle = @import("state.zig").StateHandle;
 const StateStack = @import("state.zig").StateStack;
+const StateTransitions = state_mod.StateTransitions;
+const UpdateContext = state_mod.UpdateContext;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 
 pub const PauseController = struct {
@@ -74,24 +78,21 @@ test "pause controller enter and exit are idempotent" {
     const TestingState = struct {
         pause_count: *u32,
 
-        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *@import("state.zig").StateTransitions) !bool {
+        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
             _ = event;
             _ = transitions;
             return false;
         }
 
-        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *@import("state.zig").StateTransitions) !void {
+        pub fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        pub fn render(self: *@This(), renderer: *@import("../render/renderer.zig").Renderer, interpolation_alpha: f32) !void {
+        pub fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         pub fn onPause(self: *@This()) void {
@@ -136,24 +137,21 @@ test "pause controller applies forced pause policy once" {
     const std = @import("std");
 
     const TestingState = struct {
-        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *@import("state.zig").StateTransitions) !bool {
+        pub fn handleEvent(self: *@This(), event: *const @import("../platform/sdl.zig").c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
             _ = event;
             _ = transitions;
             return false;
         }
 
-        pub fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *@import("state.zig").StateTransitions) !void {
+        pub fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        pub fn render(self: *@This(), renderer: *@import("../render/renderer.zig").Renderer, interpolation_alpha: f32) !void {
+        pub fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         pub fn onPause(self: *@This()) void {

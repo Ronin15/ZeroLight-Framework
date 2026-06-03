@@ -2,6 +2,8 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const ThreadSystemConfig = @import("app/thread_system.zig").ThreadSystemConfig;
+
 pub const PresentMode = enum {
     vsync,
     immediate,
@@ -19,6 +21,7 @@ pub const AppConfig = struct {
     frames_in_flight: u32 = 2,
     present_mode: PresentMode = .vsync,
     clear_color: Color = .{ .r = 0.071, .g = 0.125, .b = 0.173, .a = 1.0 },
+    threading: ThreadSystemConfig = .{},
 };
 
 pub const Color = extern struct {

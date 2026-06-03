@@ -3,10 +3,11 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const config = @import("../config.zig");
-const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
-const Renderer = @import("../render/renderer.zig").Renderer;
-const StateTransitions = @import("../app/state.zig").StateTransitions;
+const state_mod = @import("../app/state.zig");
+const RenderContext = state_mod.RenderContext;
+const StateTransitions = state_mod.StateTransitions;
+const UpdateContext = state_mod.UpdateContext;
 const c = @import("../platform/sdl.zig").c;
 
 pub const DemoState = struct {
@@ -32,14 +33,16 @@ pub const DemoState = struct {
         return false;
     }
 
-    pub fn update(self: *DemoState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
-        _ = transitions;
-        self.player.update(input, delta_seconds, self.bounds_width, self.bounds_height);
+    pub fn update(self: *DemoState, context: UpdateContext) !void {
+        _ = context.transitions;
+        _ = context.thread_system;
+        self.player.update(context.input, context.delta_seconds, self.bounds_width, self.bounds_height);
     }
 
-    pub fn render(self: *DemoState, renderer: *Renderer, interpolation_alpha: f32) !void {
-        try self.player.render(renderer, interpolation_alpha);
-        try renderer.drawRect(.{
+    pub fn render(self: *DemoState, context: RenderContext) !void {
+        _ = context.thread_system;
+        try self.player.render(context.renderer, context.interpolation_alpha);
+        try context.renderer.drawRect(.{
             .x = 0,
             .y = self.bounds_height - 4,
             .w = self.bounds_width,

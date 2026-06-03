@@ -17,8 +17,11 @@ const PauseController = @import("pause_controller.zig").PauseController;
 const PauseState = @import("../game/pause_state.zig").PauseState;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const state_mod = @import("state.zig");
+const RenderContext = state_mod.RenderContext;
 const StateStack = state_mod.StateStack;
 const StateTransitions = state_mod.StateTransitions;
+const UpdateContext = state_mod.UpdateContext;
+const ThreadSystem = @import("thread_system.zig").ThreadSystem;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
@@ -33,6 +36,7 @@ pub const Engine = struct {
     debug_overlay: DebugOverlay,
     states: StateStack,
     transitions: StateTransitions,
+    thread_system: ThreadSystem,
     pause: PauseController,
     input: InputState = .{},
     commands: FrameCommands = .{},
@@ -68,6 +72,9 @@ pub const Engine = struct {
         var transitions = StateTransitions.init(allocator);
         errdefer transitions.deinit();
 
+        var thread_system = try ThreadSystem.init(allocator, process_init.io, app_config.threading);
+        errdefer thread_system.deinit();
+
         return .{
             .allocator = allocator,
             .app_config = app_config,
@@ -78,6 +85,7 @@ pub const Engine = struct {
             .debug_overlay = debug_overlay,
             .states = states,
             .transitions = transitions,
+            .thread_system = thread_system,
             .pause = PauseController.init(
                 @floatFromInt(app_config.logical_width),
                 @floatFromInt(app_config.logical_height),
@@ -86,6 +94,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        self.thread_system.deinit();
         self.transitions.deinit();
         self.states.deinit();
         self.debug_overlay.deinit(&self.renderer);
@@ -148,7 +157,12 @@ pub const Engine = struct {
     }
 
     pub fn update(self: *Engine, delta_seconds: f32) !void {
-        try self.states.update(&self.input, delta_seconds, &self.transitions);
+        try self.states.update(UpdateContext{
+            .input = &self.input,
+            .delta_seconds = delta_seconds,
+            .transitions = &self.transitions,
+            .thread_system = &self.thread_system,
+        });
         try self.applyTransitions();
     }
 
@@ -162,7 +176,11 @@ pub const Engine = struct {
     ) !void {
         if (frame_policy.can_render) {
             self.renderer.beginFrame(self.app_config.clear_color);
-            try self.states.render(&self.renderer, interpolation_alpha);
+            try self.states.render(RenderContext{
+                .renderer = &self.renderer,
+                .interpolation_alpha = interpolation_alpha,
+                .thread_system = &self.thread_system,
+            });
             try self.debug_overlay.render(&self.renderer);
             switch (try self.renderer.endFrame()) {
                 .submitted => {

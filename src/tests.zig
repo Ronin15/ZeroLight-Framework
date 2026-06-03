@@ -10,6 +10,7 @@ comptime {
     _ = @import("app/pause_controller.zig");
     _ = @import("app/resolution.zig");
     _ = @import("app/state.zig");
+    _ = @import("app/thread_system.zig");
     _ = @import("app/time_loop.zig");
     _ = @import("core/math.zig");
     _ = @import("game/player.zig");
