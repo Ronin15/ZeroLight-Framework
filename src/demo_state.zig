@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const InputState = @import("input.zig").InputState;
 const math = @import("math.zig");
 const Renderer = @import("renderer.zig").Renderer;
+const StateTransitions = @import("state.zig").StateTransitions;
 const c = @import("sdl.zig").c;
 
 pub const DemoState = struct {
@@ -24,13 +25,15 @@ pub const DemoState = struct {
         _ = self;
     }
 
-    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event) bool {
+    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
         _ = self;
         _ = event;
+        _ = transitions;
         return false;
     }
 
-    pub fn update(self: *DemoState, input: *const InputState, delta_seconds: f32) void {
+    pub fn update(self: *DemoState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        _ = transitions;
         self.player.update(input, delta_seconds, self.bounds_width, self.bounds_height);
     }
 

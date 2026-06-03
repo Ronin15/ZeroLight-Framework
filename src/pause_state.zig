@@ -5,6 +5,7 @@
 const config = @import("config.zig");
 const InputState = @import("input.zig").InputState;
 const Renderer = @import("renderer.zig").Renderer;
+const StateTransitions = @import("state.zig").StateTransitions;
 const c = @import("sdl.zig").c;
 
 pub const PauseState = struct {
@@ -25,16 +26,18 @@ pub const PauseState = struct {
         _ = self;
     }
 
-    pub fn handleEvent(self: *PauseState, event: *const c.SDL_Event) bool {
+    pub fn handleEvent(self: *PauseState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
         _ = self;
         _ = event;
+        _ = transitions;
         return false;
     }
 
-    pub fn update(self: *PauseState, input: *const InputState, delta_seconds: f32) void {
+    pub fn update(self: *PauseState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
         _ = self;
         _ = input;
         _ = delta_seconds;
+        _ = transitions;
     }
 
     pub fn render(self: *PauseState, renderer: *Renderer, interpolation_alpha: f32) !void {

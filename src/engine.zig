@@ -17,8 +17,8 @@ const PauseController = @import("pause_controller.zig").PauseController;
 const PauseState = @import("pause_state.zig").PauseState;
 const Renderer = @import("renderer.zig").Renderer;
 const state_mod = @import("state.zig");
-const State = state_mod.State;
 const StateStack = state_mod.StateStack;
+const StateTransitions = state_mod.StateTransitions;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
@@ -31,10 +31,9 @@ pub const Engine = struct {
     assets: AssetStore,
     renderer: Renderer,
     debug_overlay: DebugOverlay,
-    demo_state: *DemoState,
-    pause_state: *PauseState,
     states: StateStack,
-    pause: PauseController = .{},
+    transitions: StateTransitions,
+    pause: PauseController,
     input: InputState = .{},
     commands: FrameCommands = .{},
     running: bool = true,
@@ -62,29 +61,12 @@ pub const Engine = struct {
         var debug_overlay = DebugOverlay.init();
         errdefer debug_overlay.deinit(&renderer);
 
-        const demo_state = try allocator.create(DemoState);
-        demo_state.* = DemoState.init(
-            @floatFromInt(app_config.logical_width),
-            @floatFromInt(app_config.logical_height),
-        );
-        errdefer {
-            demo_state.deinit();
-            allocator.destroy(demo_state);
-        }
-
-        const pause_state = try allocator.create(PauseState);
-        pause_state.* = PauseState.init(
-            @floatFromInt(app_config.logical_width),
-            @floatFromInt(app_config.logical_height),
-        );
-        errdefer {
-            pause_state.deinit();
-            allocator.destroy(pause_state);
-        }
-
         var states = StateStack.init(allocator);
         errdefer states.deinit();
-        try bootstrapStartupState(&states, demo_state);
+        try bootstrapStartupState(&states, app_config);
+
+        var transitions = StateTransitions.init(allocator);
+        errdefer transitions.deinit();
 
         return .{
             .allocator = allocator,
@@ -94,18 +76,18 @@ pub const Engine = struct {
             .assets = assets,
             .renderer = renderer,
             .debug_overlay = debug_overlay,
-            .demo_state = demo_state,
-            .pause_state = pause_state,
             .states = states,
+            .transitions = transitions,
+            .pause = PauseController.init(
+                @floatFromInt(app_config.logical_width),
+                @floatFromInt(app_config.logical_height),
+            ),
         };
     }
 
     pub fn deinit(self: *Engine) void {
+        self.transitions.deinit();
         self.states.deinit();
-        self.pause_state.deinit();
-        self.allocator.destroy(self.pause_state);
-        self.demo_state.deinit();
-        self.allocator.destroy(self.demo_state);
         self.debug_overlay.deinit(&self.renderer);
         self.renderer.deinit();
         self.window.deinit();
@@ -127,7 +109,7 @@ pub const Engine = struct {
         return frame_start_ns;
     }
 
-    pub fn handleEvents(self: *Engine) void {
+    pub fn handleEvents(self: *Engine) !void {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
             self.commands.handleEvent(&event);
@@ -138,7 +120,8 @@ pub const Engine = struct {
             if (!self.pause.isPaused()) {
                 self.input.handleEvent(&event);
             }
-            self.states.handleEvent(&event);
+            try self.states.handleEvent(&event, &self.transitions);
+            try self.applyTransitions();
         }
 
         self.debug_overlay.applyCommands(&self.commands);
@@ -154,18 +137,19 @@ pub const Engine = struct {
         frame_policy: frame_pacer.FramePolicy,
         time_loop: *TimeLoop,
     ) !void {
-        try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.pause_state, self.nowNs());
+        try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.nowNs());
         if (!frame_policy.should_pause_gameplay and self.pause.isPaused() and
             (self.commands.wasPressed(Action.resumeGame) or self.commands.wasPressed(Action.pause)))
         {
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());
         } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause)) {
-            try self.pause.enter(&self.states, &self.input, time_loop, self.pause_state, self.nowNs());
+            try self.pause.enter(&self.states, &self.input, time_loop, self.nowNs());
         }
     }
 
-    pub fn update(self: *Engine, delta_seconds: f32) void {
-        self.states.update(&self.input, delta_seconds);
+    pub fn update(self: *Engine, delta_seconds: f32) !void {
+        try self.states.update(&self.input, delta_seconds, &self.transitions);
+        try self.applyTransitions();
     }
 
     pub fn renderFrame(
@@ -188,7 +172,7 @@ pub const Engine = struct {
                     }
                 },
                 .skipped_no_swapchain => {
-                    try self.pause.enter(&self.states, &self.input, time_loop, self.pause_state, self.nowNs());
+                    try self.pause.enter(&self.states, &self.input, time_loop, self.nowNs());
                     frame_pacer.paceFallbackFrame(frame_start_ns);
                 },
             }
@@ -196,9 +180,19 @@ pub const Engine = struct {
             frame_pacer.paceFallbackFrame(frame_start_ns);
         }
     }
+
+    fn applyTransitions(self: *Engine) !void {
+        const result = try self.states.applyTransitions(&self.transitions);
+        if (result.quit_requested) {
+            self.running = false;
+        }
+    }
 };
 
-fn bootstrapStartupState(states: *StateStack, demo_state: *DemoState) !void {
+fn bootstrapStartupState(states: *StateStack, app_config: config.AppConfig) !void {
     // DemoState is the template startup state until a real MainMenuState exists.
-    _ = try states.replaceGameplay(State.from(DemoState, demo_state));
+    _ = try states.replaceGameplay(DemoState, DemoState.init(
+        @floatFromInt(app_config.logical_width),
+        @floatFromInt(app_config.logical_height),
+    ));
 }

@@ -134,7 +134,7 @@ zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
 - `src/sdl.zig` owns SDL startup and shared C imports.
 - `src/renderer.zig` owns SDL_GPU device setup, shader loading, texture upload,
   and the batched 2D draw API.
-- `src/state.zig` defines the borrowed state stack and stack policies.
+- `src/state.zig` defines the owned state stack, stack policies, and queued transitions.
 - `src/demo_state.zig` contains the temporary startup state for the template.
 - `src/pause_state.zig` contains the background/inactive pause overlay.
 - `src/pause_controller.zig` owns pause enter/exit behavior and forced pause handling.
@@ -211,21 +211,23 @@ test "player movement clamps to window bounds" {
 Create a struct with this shape and push or replace it through `StateStack`:
 
 ```zig
-pub fn handleEvent(self: *MyState, event: *const c.SDL_Event) bool {}
-pub fn update(self: *MyState, input: *const InputState, delta_seconds: f32) void {}
+pub fn handleEvent(self: *MyState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {}
+pub fn update(self: *MyState, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {}
 pub fn render(self: *MyState, renderer: *Renderer, alpha: f32) !void {}
 pub fn onPause(self: *MyState) void {}
+pub fn deinit(self: *MyState) void {}
 ```
 
 Return `true` from `handleEvent` when the state consumes an event. Use
-`try states.pushModal(State.from(MyState, &my_state))` for blocking menus,
+`try states.pushModal(MyState, MyState.init(...))` for blocking menus,
 `try states.pushOverlay(...)` for pass-through overlays, and
 `try states.replaceGameplay(...)` for full state changes.
 
-`StateStack` stores borrowed state pointers and returns handles for removal.
-Keep each state value alive until its handle is removed or replaced. The stack
-does not deinitialize borrowed states; callers own state lifetime and should
-call state-specific `deinit` functions directly when needed.
+`StateStack` owns state allocation and destruction. It returns handles for
+targeted removal, calls `deinit` when states are removed or replaced, and
+destroys any remaining states when the stack shuts down. States can request
+changes through `StateTransitions`; queued transitions are applied after the
+current event or update dispatch completes.
 
 ## Input Model
 

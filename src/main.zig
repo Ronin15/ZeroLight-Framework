@@ -22,7 +22,7 @@ pub fn main(init: std.process.Init) !void {
     var time_loop = TimeLoop.init(engine.nowNs());
     while (engine.isRunning()) {
         const frame_start_ns = engine.beginFrame();
-        engine.handleEvents();
+        try engine.handleEvents();
         if (!engine.isRunning()) break;
 
         const frame_policy = engine.framePolicy();
@@ -33,9 +33,11 @@ pub fn main(init: std.process.Init) !void {
         time_loop.beginFrame(frame_time_ns);
 
         while (time_loop.shouldUpdate()) {
-            engine.update(TimeLoop.fixed_delta_seconds);
+            try engine.update(TimeLoop.fixed_delta_seconds);
             time_loop.finishUpdate();
+            if (!engine.isRunning()) break;
         }
+        if (!engine.isRunning()) break;
 
         try engine.renderFrame(frame_policy, time_loop.interpolationAlpha(), frame_start_ns, frame_delta_ns, &time_loop);
     }
