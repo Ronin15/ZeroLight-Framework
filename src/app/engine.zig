@@ -209,7 +209,7 @@ pub const Engine = struct {
 };
 
 fn bootstrapStartupState(states: *StateStack, app_config: config.AppConfig) !void {
-    // DemoState is the template startup state until a real MainMenuState exists.
+    // DemoState is the startup state until a real MainMenuState exists.
     _ = try states.replaceGameplay(DemoState, DemoState.init(
         @floatFromInt(app_config.logical_width),
         @floatFromInt(app_config.logical_height),

@@ -7,11 +7,13 @@ description: Zig game engine implementation specialist for SDL3/SDL_GPU-style pr
 
 ## Operating Mode
 
-Start by reading the relevant files and current behavior before proposing or editing. Treat the codebase as a clone-and-edit 2D game starter, not a public library API. Prefer existing patterns over new abstractions unless the change clearly removes real complexity or unlocks an intended extension point.
+Start by reading the relevant files and current behavior before proposing or editing. Treat the codebase as a normal 2D game project. Prefer existing patterns over new abstractions unless the change clearly removes real complexity or unlocks an intended extension point.
 
 Keep changes scoped, performance-conscious, and SDL_GPU-first. Do not introduce new dependencies unless the user explicitly asks or the existing standard library/SDL3 path cannot reasonably solve the task.
 
 For engine conventions, commands, and pitfalls, read `references/framework-guide.md` when a task touches more than one ownership boundary, build/test behavior, rendering, state flow, assets, or shaders.
+
+When implementing a roadmap slice, treat it as a full feature. Do not mark a slice complete unless runtime behavior, docs, tests, and acceptance checks are all integrated. If a dependency does not exist yet, call the work foundation or preparation and leave the feature checklist incomplete.
 
 ## Coordination
 

@@ -7,6 +7,7 @@ const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
+const log = @import("../core/logging.zig").render;
 const math = @import("../core/math.zig");
 const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
@@ -71,7 +72,7 @@ pub const Renderer = struct {
         app_config: config.AppConfig,
     ) !Renderer {
         validateConfig(app_config) catch |err| {
-            std.log.err(
+            log.err(
                 "frames_in_flight must be between 1 and 3, got {}",
                 .{app_config.frames_in_flight},
             );
@@ -84,9 +85,9 @@ pub const Renderer = struct {
         errdefer c.SDL_DestroyGPUDevice(device);
 
         if (c.SDL_GetGPUDeviceDriver(device)) |driver| {
-            std.log.info("SDL_GPU driver: {s}", .{driver});
+            log.debug("SDL_GPU driver: {s}", .{driver});
         } else {
-            std.log.info("SDL_GPU driver: unknown", .{});
+            log.debug("SDL_GPU driver: unknown", .{});
         }
 
         if (!c.SDL_ClaimWindowForGPUDevice(device, window)) {
@@ -863,7 +864,7 @@ fn selectPresentMode(
         return requested_sdl_mode;
     }
 
-    std.log.warn("requested SDL_GPU present mode is unsupported; falling back to vsync", .{});
+    log.warn("requested SDL_GPU present mode is unsupported; falling back to vsync", .{});
     return c.SDL_GPU_PRESENTMODE_VSYNC;
 }
 
@@ -871,7 +872,7 @@ fn selectShaderSet(device: *c.SDL_GPUDevice) error{UnsupportedShaderFormat}!Shad
     const device_formats = c.SDL_GetGPUShaderFormats(device);
     const app_formats: c.SDL_GPUShaderFormat = @intCast(build_options.gpu_shader_formats);
     return selectShaderSetFromFormats(device_formats, app_formats) catch |err| {
-        std.log.err(
+        log.err(
             "SDL_GPU selected device supports shader formats 0x{x}, but app provides 0x{x}",
             .{ device_formats, app_formats },
         );

@@ -2,9 +2,9 @@
 
 ## Project Intent
 
-This is a Zig 0.16 + SDL3/SDL_GPU clone-and-edit 2D game starter, not a public
-library API. Keep the base lean, dependency-light, and SDL_GPU-first. The build
-entry point is `build.zig`, with package metadata in `build.zig.zon`.
+This is a Zig 0.16 + SDL3/SDL_GPU 2D game project. Keep the base lean,
+dependency-light, and SDL_GPU-first. The build entry point is `build.zig`, with
+project metadata in `build.zig.zon`.
 
 Use the existing docs as source of truth for deeper details:
 
@@ -21,8 +21,8 @@ Use the existing docs as source of truth for deeper details:
 - `src/game/` owns game/application states and gameplay behavior such as the demo state, pause state, and player.
 - `src/platform/` owns SDL C imports, small platform wrappers, and GPU smoke-test implementation.
 - `src/assets/` owns runtime asset path resolution and safe installed asset loading.
-- `src/core/` owns small shared starter helpers such as math primitives.
-- `src/root.zig` is the minimal package root for shared starter helpers and tests.
+- `src/core/` owns small shared helpers such as math primitives.
+- `src/root.zig` is the minimal test/root file for math aliases and compile coverage.
 - `assets/` contains runtime assets and shader sources. Runtime assets install under `zig-out/bin/assets` by default.
 
 Add new code under the matching owner directory. Keep executable-only code near
@@ -42,6 +42,13 @@ Add new code under the matching owner directory. Keep executable-only code near
 - Use core SDL3 PNG loading for textures. Do not add `SDL3_image` unless that dependency is explicitly chosen.
 - SDL3 and SDL3_ttf are system dependencies; avoid vendoring or half-adopting external dependencies.
 - Pair SDL resource creation with cleanup close to the creation site.
+
+## Slice Implementation Rules
+
+- Treat implementation slices as full features, not partial scaffolds.
+- Do not mark a slice complete until its runtime behavior, docs, tests, and acceptance checks are integrated.
+- If a dependent system does not exist yet, label the work as foundation or preparation, and leave the actual feature checklist incomplete.
+- Avoid half-wired states: either finish the feature end to end or keep the roadmap honest about what remains.
 
 ## Build, Test, And Development Commands
 
@@ -87,4 +94,4 @@ decisions. Keep display/GPU checks in `gpu-smoke`.
 hand. Do not commit generated binaries or local machine paths.
 
 If adding dependencies to `build.zig.zon`, keep hashes accurate and review the
-package fingerprint carefully because it affects package identity.
+fingerprint carefully because it affects project identity.

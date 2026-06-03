@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const log = @import("../core/logging.zig").platform;
 
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -39,6 +40,6 @@ pub const Window = struct {
 };
 
 pub fn sdlError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
+    log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
     return error.SdlError;
 }

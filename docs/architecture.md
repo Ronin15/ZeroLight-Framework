@@ -1,8 +1,8 @@
 # Architecture
 
-The starter is organized for clone-and-edit game work. Keep executable timing
-thin, app coordination under `src/app/`, GPU work under `src/render/`, and
-game-specific behavior under `src/game/`.
+The project is organized for 2D game work. Keep executable timing thin, app
+coordination under `src/app/`, GPU work under `src/render/`, and game-specific
+behavior under `src/game/`.
 
 ## Source Layout
 
@@ -14,7 +14,7 @@ game-specific behavior under `src/game/`.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/render/renderer.zig` manages the SDL_GPU device, window claim, swapchain setup, sprite pipeline, textures, and frame submission.
 - `src/render/debug_overlay.zig` and `src/render/fps_counter.zig` draw the F2 FPS overlay.
-- `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current starter states.
+- `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
 - `src/assets/assets.zig` resolves safe runtime asset paths.
 - `src/core/` contains small shared helpers such as math primitives.

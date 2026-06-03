@@ -2,7 +2,7 @@
 
 ## Project Intent
 
-Use this guidance for lean Zig SDL3/SDL_GPU game-engine starters. Treat the codebase as a clone-and-edit 2D game foundation, not a public library API. Keep the base Linux-friendly, SDL_GPU-first, and dependency-conscious. Prefer SDL3 plus Zig standard library facilities unless the user explicitly chooses a dependency.
+Use this guidance for lean Zig SDL3/SDL_GPU 2D game projects. Treat the codebase as a normal game project. Keep the base Linux-friendly, SDL_GPU-first, and dependency-conscious. Prefer SDL3 plus Zig standard library facilities unless the user explicitly chooses a dependency.
 
 ## Ownership Boundaries
 
@@ -12,10 +12,14 @@ Use this guidance for lean Zig SDL3/SDL_GPU game-engine starters. Treat the code
 - `src/game/` owns game/application states such as the demo state, pause state, and gameplay-specific behavior.
 - `src/platform/` owns SDL/platform integration helpers and GPU smoke-test implementation.
 - `src/assets/` owns runtime asset path resolution and installed asset lookup.
-- `src/core/` owns small shared starter helpers such as math primitives.
-- `src/root.zig` should stay minimal; feature code should live under the matching `src/` area.
+- `src/core/` owns small shared helpers such as math primitives.
+- `src/root.zig` should stay limited to math aliases and compile coverage; feature code should live under the matching `src/` area.
 
 Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and transition application. Keep renderer APIs as the path game code uses for drawing instead of calling SDL_GPU directly from game states.
+
+## Slice Completion
+
+Roadmap slices are full features. Runtime behavior, docs, tests, and acceptance checks must all be integrated before a slice is complete. If a needed dependency does not exist yet, label the result as foundation or preparation and leave the feature checklist incomplete.
 
 ## Build And Validation Commands
 

@@ -46,7 +46,7 @@ try renderer.drawRect(.{
 
 ## Runtime Assets
 
-The starter demo draws primitives, so it has no required PNG asset. Put PNGs
+The current demo draws primitives, so it has no required PNG asset. Put PNGs
 under `assets/`, then load them through the renderer after it is initialized.
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default

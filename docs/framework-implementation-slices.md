@@ -1,19 +1,55 @@
 # Framework Implementation Slices
 
-This roadmap keeps the repo focused as a clone-and-edit 2D game starter. Each
-slice should land as a small, verified step that improves a real extension point
-without turning the project into a public library API.
+This roadmap keeps the repo focused as a 2D game project. Each slice should
+land as a small, verified step that improves a real extension point without
+adding broad abstraction.
 
 ## Ground Rules
 
 - Preserve runnable defaults: `zig build`, `zig build run`, and installed assets
   should keep working after every slice.
+- A slice means a full feature: runtime behavior, docs, tests, and acceptance
+  checks must be integrated before it is complete.
 - Keep hot paths simple: prefer enums, bitsets, arrays, and generational slot IDs
   over dynamic dispatch, string lookup, or hash maps during input/update/draw.
-- Integrate scaffolds only when the first runtime feature needs them.
+- If a dependent system does not exist yet, label the work as foundation or
+  preparation and leave the feature checklist incomplete.
+- Avoid half-wired states; either finish the feature end to end or keep the
+  roadmap explicit about what remains.
 - Keep `src/root.zig` minimal; feature modules should live in their matching
   `src/` area and import each other directly when needed.
 - Run `zig build verify` before considering a slice complete.
+
+## Slice 0: Runtime Diagnostics Policy
+
+Goal: use Zig's compile-time `std.log` filtering so debug builds can show useful
+diagnostics while release builds stay quiet except for warnings and errors.
+
+Current foundation:
+
+- [x] Add `-Dlog-level=auto|err|warn|info|debug`.
+- [x] Default `auto` to `debug` for Debug and `warn` for release modes.
+- [x] Apply the policy through root `std_options` for the app, tests, and GPU smoke executable.
+- [x] Add project log scopes for app, assets, core, game, render, platform, and debug overlay.
+- [x] Use scoped logs for current render, platform, and debug-overlay diagnostics.
+- [x] Keep routine startup facts such as the SDL_GPU driver at debug level.
+- [x] Keep warnings for recovered degraded behavior and errors for real failure context.
+- [x] Keep shader/config helper functions log-free where tests use pure logic.
+
+Checklist:
+
+- [ ] Audit app, assets, game, core, render, and platform code for actionable diagnostics.
+- [ ] Add scoped logs only where they report startup facts, recovered degraded behavior, or real failure context.
+- [ ] Keep normal frame/update/render hot paths free of per-frame string formatting.
+- [ ] Keep pure helpers and validation helpers log-free unless they are runtime wrappers.
+- [ ] Keep release builds quiet by default while preserving warnings and errors.
+
+Acceptance checks:
+
+- [x] `zig build test` compiles the test root with the shared log policy.
+- [x] `zig build check` compiles the app and GPU smoke executable.
+- [x] `zig build check --release=safe` verifies the release log-level default.
+- [ ] Project-wide diagnostic audit confirms no meaningful subsystem still uses default-scope logging or noisy warning/error severity.
 
 ## Slice 1: Input Routing
 
@@ -185,7 +221,7 @@ Checklist:
 - [ ] Move sprite batching internals behind a `SpriteBatch` or equivalent module.
 - [ ] Introduce static material/pipeline records for the current sprite pipeline.
 - [ ] Keep draw command sorting stable by layer and submission order.
-- [ ] Preserve `drawSprite` and `drawRect` as the starter-facing API during the
+- [ ] Preserve `drawSprite` and `drawRect` as the game-facing API during the
       first split.
 - [ ] Add tests for batch grouping, invalid texture skipping, and ordering.
 - [ ] Re-run `gpu-smoke` when display access is available.
@@ -300,7 +336,7 @@ Acceptance checks:
       output from earlier systems.
 - [x] Shutdown wakes and joins parked workers without leaking or deadlocking.
 - [x] Worker idle policy parks on a condition variable; no spin loop or unused
-      spin configuration remains in the public config.
+      spin configuration remains in the config.
 - [ ] Serial and parallel render prep produce identical vertex order, draw
       group order, layer ordering, and invalid-texture skipping for the same
       command input.
@@ -463,6 +499,7 @@ Acceptance checks:
 
 ## Suggested Order
 
+0. Runtime diagnostics policy.
 1. Input routing.
 2. Logical resolution and viewport policy.
 3. Render resource layer.

@@ -1,13 +1,13 @@
-# Zig SDL3 GPU 2D Game Starter
+# Zig SDL3 GPU 2D Game
 
-A Zig 0.16.0 + SDL3 clone-and-edit starter for SDL_GPU-first 2D games.
+A Zig 0.16.0 + SDL3 project for SDL_GPU-first 2D games.
 
 The project uses SDL3 for windowing, input, core PNG loading, and GPU rendering.
 It builds target-native shaders at build time and renders through SDL_GPU.
 
 ## Features
 
-- Clone-and-edit 2D game structure with app, game, render, asset, and platform layers
+- 2D game structure with app, game, render, asset, and platform layers
 - SDL_GPU-first rendering with sprites, primitive rectangles, batching, and shader build steps
 - Fixed-step 60Hz simulation with interpolated rendering for high-refresh displays
 - State-stack flow for gameplay screens, modal overlays, and pause behavior
@@ -63,14 +63,14 @@ build options, formatting, shader commands, and GPU smoke details.
 ## Project Layout
 
 - `build.zig` defines executables, tests, formatting, shader compilation, and install steps.
-- `build.zig.zon` contains package metadata.
+- `build.zig.zon` contains project metadata.
 - `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
 - `src/app/` contains SDL app coordination, input, timing, pause policy, frame pacing, thread system, and state stack flow.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, and debug overlay rendering.
 - `src/game/` contains game/application states such as the temporary demo and pause overlay.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
 - `src/assets/` contains runtime asset path resolution and installed-file loading.
-- `src/core/` contains small shared starter helpers.
+- `src/core/` contains small shared helpers.
 - `assets/` contains runtime assets and shader sources.
 
 Generated build output goes under `zig-out/` and should not be committed.
@@ -82,7 +82,6 @@ Generated build output goes under `zig-out/` and should not be committed.
 - [Architecture](docs/architecture.md)
 - [State Stack And Input](docs/state-stack-and-input.md)
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
-- [Clone And Edit](docs/clone-and-edit.md)
 
 ## License
 

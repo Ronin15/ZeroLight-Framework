@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const log = @import("../core/logging.zig").debug_overlay;
 const Renderer = @import("renderer.zig").Renderer;
 const TextureHandle = @import("renderer.zig").TextureHandle;
 const c = @import("../platform/sdl.zig").c;
@@ -36,12 +37,12 @@ pub const FpsCounter = struct {
 
     pub fn init() FpsCounter {
         if (!c.TTF_Init()) {
-            std.log.warn("debug overlay disabled: TTF_Init failed: {s}", .{c.SDL_GetError()});
+            log.debug("debug overlay disabled: TTF_Init failed: {s}", .{c.SDL_GetError()});
             return .{};
         }
 
         const font = openSystemFont() catch {
-            std.log.warn("debug overlay disabled: failed to open a system font", .{});
+            log.debug("debug overlay disabled: failed to open a system font", .{});
             c.TTF_Quit();
             return .{};
         };
@@ -165,7 +166,7 @@ fn openSystemFont() !*c.TTF_Font {
 }
 
 fn ttfError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
+    log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
     return error.SdlError;
 }
 

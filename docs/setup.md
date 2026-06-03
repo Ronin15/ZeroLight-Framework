@@ -1,6 +1,6 @@
 # Setup
 
-This starter expects system SDL3 libraries and local shader tools. Zig package
+This project expects system SDL3 libraries and local shader tools. Zig package
 dependencies are intentionally empty in `build.zig.zon`.
 
 ## Required Tools

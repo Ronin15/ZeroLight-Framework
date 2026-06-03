@@ -10,7 +10,7 @@ Tip: `46e846c` (`fixed agents.md`)
 
 ## Summary
 
-`reshape` reorganizes the starter around clearer app, render, game, platform,
+`reshape` reorganizes the project around clearer app, render, game, platform,
 asset, and core folders. It also moves high-level SDL coordination out of
 `main.zig`, gives the state stack explicit ownership of state lifetimes, and
 keeps fixed-step timing behavior centered in the executable loop.
@@ -27,12 +27,12 @@ keeps fixed-step timing behavior centered in the executable loop.
   `src/platform/`, `src/assets/`, and `src/core/`.
 - Split the demo player out of the demo state and moved game-specific state code
   under `src/game/`.
-- Added aggregate test coverage through `src/tests.zig` and kept the package root
-  focused on shared starter helpers.
+- Added aggregate test coverage through `src/tests.zig` and kept `src/root.zig`
+  limited to math aliases and compile coverage.
 - Moved GPU smoke implementation details under `src/platform/` while keeping
   `src/gpu_smoke.zig` as the executable wrapper.
-- Updated build/package metadata and repo guidance to match the reorganized
-  source layout.
+- Updated project metadata and repo guidance to match the reorganized source
+  layout.
 
 ## Commit List
 

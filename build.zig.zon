@@ -3,14 +3,13 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 .{
-    // Template identity for this starter. Rename this when you clone the repo
-    // into a distinct game project.
+    // Project identity.
     .name = .sdl3_Template,
-    // Starter version for fresh clones.
+    // Project version.
     .version = "0.0.0",
-    // Regenerate this when publishing a clone as a distinct game/template.
+    // Regenerate this when renaming the project.
     .fingerprint = 0x5ccb1060f78de346, // Changing this has security and trust implications.
-    // Earliest Zig version this starter supports.
+    // Earliest Zig version this project supports.
     .minimum_zig_version = "0.16.0",
     // Add project dependencies here as the game grows.
     .dependencies = .{},

@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
     const shader_compiler = b.option([]const u8, "shader-compiler", "GLSL to SPIR-V compiler") orelse "glslc";
     const shader_cross_compiler = b.option([]const u8, "shader-cross-compiler", "SPIR-V to platform shader compiler") orelse "spirv-cross";
     const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay rendering") orelse true;
+    const log_level = parseLogLevel(
+        b.option([]const u8, "log-level", "Log level: auto, err, warn, info, or debug") orelse "auto",
+        optimize,
+    );
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
     const force_llvm_lld = forceLlvmLldForTarget(target);
 
@@ -44,6 +48,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "asset_root", asset_root);
     build_options.addOption(bool, "gpu_debug", gpu_debug);
     build_options.addOption(bool, "debug_overlay", debug_overlay);
+    build_options.addOption(u8, "log_level", @intFromEnum(log_level));
     build_options.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const exe_mod = createGameModule(b, target, optimize, build_options);
@@ -211,6 +216,21 @@ fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
     }
 
     return null;
+}
+
+fn parseLogLevel(value: []const u8, optimize: std.builtin.OptimizeMode) std.log.Level {
+    if (std.mem.eql(u8, value, "auto")) {
+        return switch (optimize) {
+            .Debug => .debug,
+            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .warn,
+        };
+    }
+    if (std.mem.eql(u8, value, "err")) return .err;
+    if (std.mem.eql(u8, value, "warn")) return .warn;
+    if (std.mem.eql(u8, value, "info")) return .info;
+    if (std.mem.eql(u8, value, "debug")) return .debug;
+
+    std.debug.panic("unsupported -Dlog-level={s}; expected auto, err, warn, info, or debug", .{value});
 }
 
 fn addShaderSteps(
