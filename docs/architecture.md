@@ -21,7 +21,7 @@ behavior under `src/game/`.
 - `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
 - `src/assets/assets.zig` resolves safe runtime asset paths, and `src/assets/cache.zig` caches renderer-backed runtime assets.
-- `src/core/` contains small shared helpers such as math primitives.
+- `src/core/` contains small shared helpers such as math primitives and portable SIMD aliases.
 
 ## Frame Flow
 
@@ -73,3 +73,17 @@ Workers are pre-spawned at startup. The default background worker count is based
 on CPU count, with the main/render thread participating as an additional worker
 while it waits. Small batches run inline on the main thread, and batch
 submission does not allocate after initialization.
+
+## SIMD Helpers
+
+`src/core/simd.zig` provides project-named four-lane vector aliases and helper
+functions for future SoA movement, particle, and data processor loops. The
+helpers use Zig `@Vector` operations as the portable abstraction so LLVM can
+lower vector math to the target CPU features, such as SSE-family instructions on
+x86 targets or NEON on ARM targets, when the target and optimization mode make
+that profitable. Platform intrinsics such as x86 or ARM-specific calls stay
+hidden from gameplay and are not part of the first implementation.
+
+Prefer scalar code for tiny batches or simple logic where vectorization would
+make the code harder to read. Use the SIMD helpers when a processor already
+operates over dense slices and can handle vector ranges plus a scalar tail.

@@ -439,28 +439,32 @@ Current foundation:
 - `src/core/math.zig` contains small math primitives.
 - `ThreadSystem.parallelFor` already divides work into contiguous ranges.
 - Future movement and particle processors are expected to operate on SoA slices.
+- The v1 helper uses Zig `@Vector` as the project abstraction; LLVM may lower the
+  resulting vector operations to SSE-family or NEON instructions for suitable
+  targets and optimize modes, but this slice does not hand-write target-specific
+  intrinsics.
 
 Checklist:
 
-- [ ] Add `src/core/simd.zig` with friendly vector aliases such as `Float4`,
+- [x] Add `src/core/simd.zig` with friendly vector aliases such as `Float4`,
       `Int4`, and `Mask4`.
-- [ ] Prefer portable Zig vector types first, hiding target-specific intrinsic
+- [x] Prefer portable Zig vector types first, hiding target-specific intrinsic
       details behind the helper API.
-- [ ] Add load, store, splat, add, subtract, multiply, divide, min, max,
+- [x] Add load, store, splat, add, subtract, multiply, divide, min, max,
       compare, select, and clamp helpers needed by movement and particle loops.
-- [ ] Add scalar-tail helpers for item counts that are not a multiple of the
+- [x] Add scalar-tail helpers for item counts that are not a multiple of the
       vector lane count.
-- [ ] Keep the helper free of game-specific entity, particle, SDL, renderer, or
+- [x] Keep the helper free of game-specific entity, particle, SDL, renderer, or
       thread-system dependencies.
-- [ ] Document when scalar code should be preferred for tiny batches or clarity.
+- [x] Document when scalar code should be preferred for tiny batches or clarity.
 
 Acceptance checks:
 
-- [ ] SIMD helper tests prove lane order is stable.
-- [ ] SIMD and scalar implementations produce identical results for representative
+- [x] SIMD helper tests prove lane order is stable.
+- [x] SIMD and scalar implementations produce identical results for representative
       float and integer operations.
-- [ ] Tail handling covers empty, partial, exact-lane, and multi-lane inputs.
-- [ ] `zig build test` passes on targets where the helper is expected to compile.
+- [x] Tail handling covers empty, partial, exact-lane, and multi-lane inputs.
+- [x] `zig build test` passes on targets where the helper is expected to compile.
 
 ## Slice 10: DataSystem And SoA Composition Foundation
 
