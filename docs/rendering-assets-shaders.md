@@ -25,10 +25,15 @@ deterministically during batch prep.
 Use `drawSprite` for textured quads:
 
 ```zig
-const texture = try renderer.createTextureFromPng(assets, "sprites/player.png");
+if (self.player_texture == null) {
+    self.player_texture = try context.asset_cache.acquireTexture(
+        context.renderer,
+        "sprites/player.png",
+    );
+}
 
-try renderer.drawSprite(.{
-    .texture = texture,
+try context.renderer.drawSprite(.{
+    .texture = self.player_texture.?.id,
     .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
     .layer = 0,
 });
@@ -89,7 +94,8 @@ Sprite coordinate spaces:
 ## Runtime Assets
 
 The current demo draws primitives, so it has no required PNG asset. Put PNGs
-under `assets/`, then load them through the renderer after it is initialized.
+under `assets/`, then acquire them through the app-owned asset cache from a
+render context.
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default
 asset root is `assets`; change it with `-Dasset-root=content`.
@@ -102,6 +108,14 @@ absolute paths, `.` components, and `..` traversal.
 
 PNG texture loading uses core SDL3 `SDL_LoadPNG`/`SDL_LoadSurface` support; this
 project does not require `SDL3_image`.
+
+The asset cache maps validated relative PNG paths to renderer `TextureId` values.
+Loading the same path more than once reuses the existing texture and increments a
+retain count. Store the returned `TextureLease` in the owning state or service,
+draw with `lease.id`, and call `release` from that owner's `deinit`. When the
+last lease is released, the cache destroys the renderer texture. Cache lookup and
+retain/release are setup-time operations; per-frame rendering should keep using
+the retained `TextureId` directly.
 
 ## Adding A Shader
 

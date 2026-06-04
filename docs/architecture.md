@@ -7,7 +7,7 @@ behavior under `src/game/`.
 ## Source Layout
 
 - `src/main.zig` creates `AppConfig`, initializes `Engine`, and runs the fixed-step loop.
-- `src/app/engine.zig` coordinates SDL app flow, the window, assets, renderer, state stack, pause controller, input, debug overlay, and thread system.
+- `src/app/engine.zig` coordinates SDL app flow, the window, asset cache, renderer, state stack, pause controller, input, debug overlay, and thread system.
 - `src/app/time_loop.zig` keeps simulation fixed at 60Hz.
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
@@ -17,7 +17,7 @@ behavior under `src/game/`.
 - `src/render/debug_overlay.zig` and `src/render/fps_counter.zig` draw the F2 FPS overlay.
 - `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
-- `src/assets/assets.zig` resolves safe runtime asset paths.
+- `src/assets/assets.zig` resolves safe runtime asset paths, and `src/assets/cache.zig` caches renderer-backed runtime assets.
 - `src/core/` contains small shared helpers such as math primitives.
 
 ## Frame Flow

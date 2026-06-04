@@ -87,7 +87,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, and debug overlay rendering.
 - `src/game/` contains game/application states such as the temporary demo and pause overlay.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
-- `src/assets/` contains runtime asset path resolution and installed-file loading.
+- `src/assets/` contains runtime asset path resolution, installed-file loading, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
 - `assets/` contains runtime assets and shader sources.
 

@@ -184,22 +184,27 @@ Current foundation:
 - `AssetStore` resolves safe relative paths from repo root or executable-relative
   install location.
 - Renderer can load PNGs directly through `createTextureFromPng`.
+- `AssetCache` maps validated relative PNG paths to retained renderer
+  `TextureId` values.
+- `Engine` owns the cache and exposes it to states through `RenderContext`.
+- `assets/test/cache_probe.png` provides a tiny installed PNG fixture for cache
+  and asset-root checks.
 
 Checklist:
 
-- [ ] Add an asset/resource cache module that maps stable asset paths to
+- [x] Add an asset/resource cache module that maps stable asset paths to
       renderer resource IDs.
-- [ ] Keep path validation in `AssetStore`; do not duplicate traversal checks.
-- [ ] Decide cache ownership: app-level service owned by `Engine` is the default.
-- [ ] Add explicit load/unload or retain/release policy before adding hot reload.
-- [ ] Keep synchronous load first; defer async/staged loading until needed.
-- [ ] Add tests for duplicate path reuse, unload behavior, and invalid paths.
+- [x] Keep path validation in `AssetStore`; do not duplicate traversal checks.
+- [x] Decide cache ownership: app-level service owned by `Engine` is the default.
+- [x] Add explicit load/unload or retain/release policy before adding hot reload.
+- [x] Keep synchronous load first; defer async/staged loading until needed.
+- [x] Add tests for duplicate path reuse, unload behavior, and invalid paths.
 
 Acceptance checks:
 
-- [ ] Loading the same PNG twice can reuse the existing texture.
-- [ ] Asset paths remain relative and traversal-safe.
-- [ ] Installed-binary asset lookup still works with `-Dasset-root`.
+- [x] Loading the same PNG twice can reuse the existing texture.
+- [x] Asset paths remain relative and traversal-safe.
+- [x] Installed-binary asset lookup still works with `-Dasset-root`.
 
 ## Slice 5: Text And Font Service
 

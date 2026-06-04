@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const AssetCache = @import("../assets/cache.zig").AssetCache;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const config = @import("../config.zig");
@@ -36,6 +37,7 @@ pub const Engine = struct {
     window: sdl.Window,
     assets: AssetStore,
     renderer: Renderer,
+    asset_cache: AssetCache,
     debug_overlay: DebugOverlay,
     states: StateStack,
     transitions: StateTransitions,
@@ -73,6 +75,8 @@ pub const Engine = struct {
         const assets = AssetStore.init(allocator, process_init.io, app_config.asset_root);
         var renderer = try Renderer.init(allocator, window.handle, assets, app_config);
         errdefer renderer.deinit();
+        var asset_cache = AssetCache.init(allocator, assets);
+        errdefer asset_cache.deinit(&renderer);
 
         var debug_overlay = DebugOverlay.init();
         errdefer debug_overlay.deinit(&renderer);
@@ -110,6 +114,7 @@ pub const Engine = struct {
             .window = window,
             .assets = assets,
             .renderer = renderer,
+            .asset_cache = asset_cache,
             .debug_overlay = debug_overlay,
             .states = states,
             .transitions = transitions,
@@ -126,6 +131,7 @@ pub const Engine = struct {
         self.transitions.deinit();
         self.states.deinit();
         self.debug_overlay.deinit(&self.renderer);
+        self.asset_cache.deinit(&self.renderer);
         self.renderer.deinit();
         self.window.deinit();
         self.sdl_context.deinit();
@@ -214,6 +220,7 @@ pub const Engine = struct {
             self.renderer.beginFrame(self.app_config.clear_color);
             try self.states.render(RenderContext{
                 .renderer = &self.renderer,
+                .asset_cache = &self.asset_cache,
                 .interpolation_alpha = interpolation_alpha,
                 .thread_system = &self.thread_system,
             });

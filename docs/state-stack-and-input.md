@@ -42,6 +42,7 @@ pub const MyState = struct {
     pub fn render(self: *MyState, context: RenderContext) !void {
         _ = self;
         _ = context.renderer;
+        _ = context.asset_cache;
         _ = context.interpolation_alpha;
         _ = context.thread_system;
     }

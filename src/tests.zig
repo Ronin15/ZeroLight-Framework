@@ -8,6 +8,7 @@ pub const std_options = logging.std_options;
 
 comptime {
     _ = @import("assets/assets.zig");
+    _ = @import("assets/cache.zig");
     _ = @import("app/frame_pacer.zig");
     _ = @import("app/input.zig");
     _ = @import("app/input_router.zig");
