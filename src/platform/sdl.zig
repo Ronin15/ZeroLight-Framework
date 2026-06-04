@@ -48,7 +48,20 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         c.SDL_DestroyWindow(self.handle);
     }
+
+    pub fn setMinimumSize(self: *Window, width: u32, height: u32) !void {
+        if (!c.SDL_SetWindowMinimumSize(self.handle, @intCast(width), @intCast(height))) {
+            return sdlError("SDL_SetWindowMinimumSize");
+        }
+    }
 };
+
+pub fn composeWindowFlags(resizable: bool, high_pixel_density: bool) c.SDL_WindowFlags {
+    var flags: c.SDL_WindowFlags = 0;
+    if (resizable) flags |= c.SDL_WINDOW_RESIZABLE;
+    if (high_pixel_density) flags |= c.SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    return flags;
+}
 
 pub fn sdlError(comptime operation: []const u8) error{SdlError} {
     log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
@@ -182,5 +195,15 @@ test "SDL window flags format as names" {
             &buffer,
             c.SDL_WINDOW_HIDDEN | c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY,
         ),
+    );
+}
+
+test "window flag composition follows app config booleans" {
+    try std.testing.expectEqual(@as(c.SDL_WindowFlags, 0), composeWindowFlags(false, false));
+    try std.testing.expectEqual(c.SDL_WINDOW_RESIZABLE, composeWindowFlags(true, false));
+    try std.testing.expectEqual(c.SDL_WINDOW_HIGH_PIXEL_DENSITY, composeWindowFlags(false, true));
+    try std.testing.expectEqual(
+        c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY,
+        composeWindowFlags(true, true),
     );
 }

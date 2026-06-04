@@ -18,6 +18,7 @@ const InputState = input_mod.InputState;
 const PauseController = @import("pause_controller.zig").PauseController;
 const PauseState = @import("../game/pause_state.zig").PauseState;
 const Renderer = @import("../render/renderer.zig").Renderer;
+const resolution = @import("resolution.zig");
 const state_mod = @import("state.zig");
 const RenderContext = state_mod.RenderContext;
 const StateStack = state_mod.StateStack;
@@ -45,6 +46,11 @@ pub const Engine = struct {
     running: bool = true,
 
     pub fn init(process_init: std.process.Init, app_config: config.AppConfig) !Engine {
+        validateConfig(app_config) catch |err| {
+            logInvalidConfig(app_config, err);
+            return err;
+        };
+
         const allocator = process_init.gpa;
         const window_title = try allocator.dupeZ(u8, app_config.window_title);
         defer allocator.free(window_title);
@@ -52,13 +58,17 @@ pub const Engine = struct {
         var sdl_context = try sdl.SdlContext.init(c.SDL_INIT_VIDEO);
         errdefer sdl_context.deinit();
 
+        const logical_size = app_config.resolution_policy.logical_size;
         var window = try sdl.Window.create(
             window_title,
-            app_config.logical_width,
-            app_config.logical_height,
-            if (app_config.resizable) c.SDL_WINDOW_RESIZABLE else 0,
+            logical_size.width,
+            logical_size.height,
+            sdl.composeWindowFlags(app_config.resizable, app_config.high_pixel_density),
         );
         errdefer window.deinit();
+        if (minimumWindowSizeForPolicy(app_config.resolution_policy)) |minimum_size| {
+            try window.setMinimumSize(minimum_size.width, minimum_size.height);
+        }
 
         const assets = AssetStore.init(allocator, process_init.io, app_config.asset_root);
         var renderer = try Renderer.init(allocator, window.handle, assets, app_config);
@@ -78,12 +88,15 @@ pub const Engine = struct {
         errdefer thread_system.deinit();
 
         log.debug(
-            "engine initialized: app=\"{s}\" logical={}x{} asset_root=\"{s}\" gpu_debug={} debug_overlay={} background_workers={}",
+            "engine initialized: app=\"{s}\" logical={}x{} scale_mode={s} asset_root=\"{s}\" resizable={} high_pixel_density={} gpu_debug={} debug_overlay={} background_workers={}",
             .{
                 app_config.app_name,
-                app_config.logical_width,
-                app_config.logical_height,
+                logical_size.width,
+                logical_size.height,
+                @tagName(app_config.resolution_policy.scale_mode),
                 app_config.asset_root,
+                app_config.resizable,
+                app_config.high_pixel_density,
                 app_config.gpu_debug,
                 build_options.debug_overlay,
                 thread_system.backgroundWorkerCount(),
@@ -102,8 +115,8 @@ pub const Engine = struct {
             .transitions = transitions,
             .thread_system = thread_system,
             .pause = PauseController.init(
-                @floatFromInt(app_config.logical_width),
-                @floatFromInt(app_config.logical_height),
+                @floatFromInt(logical_size.width),
+                @floatFromInt(logical_size.height),
             ),
         };
     }
@@ -241,10 +254,52 @@ pub const Engine = struct {
     }
 };
 
+fn validateConfig(app_config: config.AppConfig) !void {
+    try app_config.validate();
+}
+
+fn logInvalidConfig(app_config: config.AppConfig, err: anyerror) void {
+    switch (err) {
+        error.InvalidLogicalSize => log.err(
+            "logical resolution must be nonzero, got {}x{}",
+            .{ app_config.resolution_policy.logical_size.width, app_config.resolution_policy.logical_size.height },
+        ),
+        error.InvalidConfig => log.err(
+            "frames_in_flight must be between 1 and 3, got {}",
+            .{app_config.frames_in_flight},
+        ),
+        else => {},
+    }
+}
+
+fn minimumWindowSizeForPolicy(policy: resolution.ResolutionPolicy) ?resolution.LogicalSize {
+    return switch (policy.scale_mode) {
+        .integer_fit => policy.logical_size,
+        .fit, .stretch, .overscan => null,
+    };
+}
+
 fn bootstrapStartupState(states: *StateStack, app_config: config.AppConfig) !void {
+    const logical_size = app_config.resolution_policy.logical_size;
     // DemoState is the startup state until a real MainMenuState exists.
     _ = try states.replaceGameplay(DemoState, DemoState.init(
-        @floatFromInt(app_config.logical_width),
-        @floatFromInt(app_config.logical_height),
+        @floatFromInt(logical_size.width),
+        @floatFromInt(logical_size.height),
     ));
+}
+
+test "integer fit requests logical minimum window size" {
+    const minimum_size = minimumWindowSizeForPolicy(.{
+        .logical_size = .{ .width = 1280, .height = 720 },
+        .scale_mode = .integer_fit,
+    }).?;
+
+    try std.testing.expectEqual(@as(u32, 1280), minimum_size.width);
+    try std.testing.expectEqual(@as(u32, 720), minimum_size.height);
+}
+
+test "non integer fit policies do not request minimum window size" {
+    try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .fit }));
+    try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .stretch }));
+    try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .overscan }));
 }

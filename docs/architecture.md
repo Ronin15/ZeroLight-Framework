@@ -12,7 +12,8 @@ behavior under `src/game/`.
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
-- `src/render/renderer.zig` manages the SDL_GPU device, window claim, swapchain setup, sprite pipeline, textures, and frame submission.
+- `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
+- `src/render/renderer.zig` manages the SDL_GPU device, window claim, swapchain setup, logical presentation, sprite pipeline, textures, and frame submission.
 - `src/render/debug_overlay.zig` and `src/render/fps_counter.zig` draw the F2 FPS overlay.
 - `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
@@ -33,6 +34,12 @@ Visible rendering is paced by SDL_GPU swapchain acquisition with the configured
 present mode. Hidden, minimized, or no-swapchain frames skip GPU rendering,
 enter pause, and use `SDL_DelayNS` fallback pacing. Occluded or unfocused visible
 windows keep rendering but apply a 60Hz cap to avoid background render runaway.
+
+Each submitted frame computes presentation from the acquired SDL_GPU swapchain
+texture size and current SDL window size. World and logical UI draws use the
+configured logical size and SDL_GPU viewport/scissor state; drawable overlays use
+raw swapchain pixels. The project does not use `SDL_Renderer` logical
+presentation.
 
 ## Coordination Boundaries
 

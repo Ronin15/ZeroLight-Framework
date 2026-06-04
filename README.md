@@ -9,6 +9,7 @@ It builds target-native shaders at build time and renders through SDL_GPU.
 
 - 2D game structure with app, game, render, asset, and platform layers
 - SDL_GPU-first rendering with sprites, primitive rectangles, batching, and shader build steps
+- 1280x720 logical game coordinates with resizable, high-DPI, aspect-preserving fit presentation
 - Fixed-step 60Hz simulation with interpolated rendering for high-refresh displays
 - State-stack flow for gameplay screens, modal overlays, and pause behavior
 - Policy-based input routing for gameplay, app commands, UI, and debug actions
@@ -44,6 +45,22 @@ zig build dev
 
 `zig build dev` compiles shaders, installs assets, builds the executable, and
 runs the app.
+
+## Logical Resolution
+
+The app starts as a resizable, high-pixel-density SDL window with a 1280x720
+logical game size. The default presentation mode is aspect-preserving fit:
+gameplay and logical UI keep their proportions, and letterbox or pillarbox bars
+use the configured clear color.
+
+SDL_GPU swapchain textures can be larger than the window on high-DPI displays.
+The renderer recomputes presentation from the acquired drawable size every
+submitted frame. World and logical draws use logical coordinates; drawable
+overlays use raw swapchain pixels.
+
+Integer-fit presentation is intended for strict pixel scaling. When enabled, the
+app requests a minimum SDL window size equal to the logical size so user resizing
+does not normally crop the game below 1x scale.
 
 ## Commands
 

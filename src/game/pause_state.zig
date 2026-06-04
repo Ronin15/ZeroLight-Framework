@@ -79,6 +79,6 @@ fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").R
         .dest = rect,
         .tint = color,
         .layer = layer,
-        .screen_space = true,
+        .coordinate_space = .logical,
     });
 }

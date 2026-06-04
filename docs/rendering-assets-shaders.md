@@ -18,7 +18,7 @@ matching `SDL_GetGPUShaderFormats()`.
 
 Sprites and colored rectangles are collected into a CPU batch, uploaded to one
 GPU vertex buffer per frame, sorted by layer and submission order, and submitted
-by texture/layer groups.
+by texture and coordinate-presentation groups.
 
 Use `drawSprite` for textured quads:
 
@@ -43,6 +43,35 @@ try renderer.drawRect(.{
     .h = 64,
 }, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, 0);
 ```
+
+## Logical Presentation
+
+The default logical game size is 1280x720. Windows are resizable and request
+high pixel density, so SDL window coordinates and SDL_GPU drawable pixels can
+differ on macOS Retina and similar displays.
+
+The renderer does not use `SDL_Renderer` or SDL's renderer-only logical
+presentation helpers. After each successful SDL_GPU swapchain acquisition it
+computes presentation from the acquired drawable size and current SDL window
+size, then applies `SDL_SetGPUViewport` and `SDL_SetGPUScissor` for draw
+submission.
+
+Default scale mode is aspect-preserving fit. If the drawable aspect differs from
+1280x720, the configured clear color shows through the letterbox or pillarbox
+bars.
+
+Integer fit keeps strict whole-number scaling. The app requests a minimum SDL
+window size equal to the logical size when integer fit is configured, so normal
+user resizing should not produce sub-1x cropped presentation.
+
+Sprite coordinate spaces:
+
+- `.world`: gameplay/world coordinates. The camera is applied, then drawing uses
+  the logical viewport.
+- `.logical`: logical UI coordinates. The camera is ignored, and drawing uses
+  the logical viewport.
+- `.drawable`: raw swapchain pixel coordinates. The camera and logical viewport
+  are ignored; this is for debug overlays that should stay pixel-exact.
 
 ## Runtime Assets
 
@@ -79,5 +108,7 @@ for macOS through `spirv-cross`.
 ## Debug Overlay
 
 Press F2 to toggle the yellow FPS overlay. It reports render-loop cadence, not
-the fixed update tick rate. The current overlay uses SDL3_ttf and probes common
-system monospace font paths.
+the fixed update tick rate. The overlay uses drawable coordinates so its
+SDL3_ttf texture remains independent of game scaling, and it scales font size by
+the drawable-to-window pixel ratio for high-DPI displays. The current overlay
+probes common system monospace font paths.

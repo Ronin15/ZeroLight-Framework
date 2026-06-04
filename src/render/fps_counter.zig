@@ -11,6 +11,7 @@ const c = @import("../platform/sdl.zig").c;
 const yellow = c.SDL_Color{ .r = 255, .g = 230, .b = 40, .a = 255 };
 const sample_window_ns = std.time.ns_per_s / 4;
 const font_size: f32 = 18;
+const font_size_epsilon: f32 = 0.1;
 const overlay_layer: i32 = 10_000;
 const bytes_per_pixel = 4;
 
@@ -34,6 +35,7 @@ pub const FpsCounter = struct {
     accumulated_ns: u64 = 0,
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
+    active_font_size: f32 = font_size,
 
     pub fn init() FpsCounter {
         if (!c.TTF_Init()) {
@@ -50,6 +52,7 @@ pub const FpsCounter = struct {
         return .{
             .font = font,
             .ttf_initialized = true,
+            .active_font_size = font_size,
         };
     }
 
@@ -75,8 +78,10 @@ pub const FpsCounter = struct {
 
         self.sampled_frames += 1;
         self.accumulated_ns += frame_delta_ns;
+        const target_font_size = overlayFontSize(renderer.drawablePixelScale());
+        const font_size_changed = !approxEqAbs(self.active_font_size, target_font_size, font_size_epsilon);
 
-        if (self.texture == null or self.accumulated_ns >= sample_window_ns) {
+        if (self.texture == null or self.accumulated_ns >= sample_window_ns or font_size_changed) {
             var next_fps = self.displayed_fps;
             if (self.accumulated_ns > 0) {
                 next_fps = @intFromFloat(@round(
@@ -86,9 +91,12 @@ pub const FpsCounter = struct {
             }
             self.sampled_frames = 0;
             self.accumulated_ns = 0;
-            if (self.texture != null and next_fps == self.displayed_fps) return;
+            if (self.texture != null and next_fps == self.displayed_fps and !font_size_changed) return;
 
             self.displayed_fps = next_fps;
+            if (font_size_changed) {
+                try self.setFontSize(target_font_size);
+            }
             try self.rebuildTexture(renderer);
         }
     }
@@ -104,7 +112,7 @@ pub const FpsCounter = struct {
                 .h = @floatFromInt(self.texture_height),
             },
             .layer = overlay_layer,
-            .screen_space = true,
+            .coordinate_space = .drawable,
         });
     }
 
@@ -153,6 +161,14 @@ pub const FpsCounter = struct {
             self.texture_height = 0;
         }
     }
+
+    fn setFontSize(self: *FpsCounter, next_font_size: f32) !void {
+        const font = self.font orelse return;
+        if (!c.TTF_SetFontSize(font, next_font_size)) {
+            return ttfError("TTF_SetFontSize");
+        }
+        self.active_font_size = next_font_size;
+    }
 };
 
 fn openSystemFont() !*c.TTF_Font {
@@ -165,6 +181,14 @@ fn openSystemFont() !*c.TTF_Font {
     return error.SdlError;
 }
 
+fn overlayFontSize(drawable_pixel_scale: f32) f32 {
+    return font_size * @max(1.0, drawable_pixel_scale);
+}
+
+fn approxEqAbs(a: f32, b: f32, tolerance: f32) bool {
+    return @abs(a - b) <= tolerance;
+}
+
 fn ttfError(comptime operation: []const u8) error{SdlError} {
     log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
     return error.SdlError;
@@ -175,6 +199,12 @@ test "system font paths include common Linux monospace locations" {
     try std.testing.expect(hasSystemFontPath("/usr/share/fonts/TTF/DejaVuSansMono.ttf"));
     try std.testing.expect(hasSystemFontPath("/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf"));
     try std.testing.expect(hasSystemFontPath("/usr/share/fonts/noto/NotoSansMono-Regular.ttf"));
+}
+
+test "overlay font size follows drawable pixel scale" {
+    try std.testing.expectEqual(@as(f32, 18), overlayFontSize(1));
+    try std.testing.expectEqual(@as(f32, 36), overlayFontSize(2));
+    try std.testing.expectEqual(@as(f32, 18), overlayFontSize(0.5));
 }
 
 fn hasSystemFontPath(expected: []const u8) bool {

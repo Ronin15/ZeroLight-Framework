@@ -7,8 +7,10 @@ const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
+const logging = @import("../core/logging.zig");
 const log = @import("../core/logging.zig").render;
 const math = @import("../core/math.zig");
+const resolution = @import("../app/resolution.zig");
 const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
 
@@ -28,6 +30,12 @@ pub const Rect = extern struct {
     h: f32,
 };
 
+pub const CoordinateSpace = enum {
+    world,
+    logical,
+    drawable,
+};
+
 pub const Sprite = struct {
     texture: TextureHandle,
     source: ?Rect = null,
@@ -36,7 +44,7 @@ pub const Sprite = struct {
     origin: math.Vec2 = .{},
     rotation: f32 = 0,
     layer: i32 = 0,
-    screen_space: bool = false,
+    coordinate_space: CoordinateSpace = .world,
 };
 
 pub const FrameResult = enum {
@@ -59,6 +67,9 @@ pub const Renderer = struct {
     draw_groups: std.ArrayList(DrawGroup) = .empty,
     white_texture: TextureHandle = .{ .index = 0 },
     camera: Camera2D = .{},
+    resolution_policy: resolution.ResolutionPolicy = .{},
+    current_presentation: ?resolution.Presentation = null,
+    last_logged_presentation: ?resolution.Presentation = null,
     clear_color: config.Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 },
     viewport_width: u32 = 0,
     viewport_height: u32 = 0,
@@ -71,13 +82,7 @@ pub const Renderer = struct {
         assets: AssetStore,
         app_config: config.AppConfig,
     ) !Renderer {
-        validateConfig(app_config) catch |err| {
-            log.err(
-                "frames_in_flight must be between 1 and 3, got {}",
-                .{app_config.frames_in_flight},
-            );
-            return err;
-        };
+        try validateConfig(app_config);
 
         const device = c.SDL_CreateGPUDevice(@intCast(build_options.gpu_shader_formats), app_config.gpu_debug, null) orelse {
             return sdlError("SDL_CreateGPUDevice");
@@ -140,6 +145,7 @@ pub const Renderer = struct {
             .vertex_buffer = vertex_buffer,
             .vertex_transfer_buffer = vertex_transfer_buffer,
             .batch_capacity_vertices = initial_batch_vertices,
+            .resolution_policy = app_config.resolution_policy,
         };
         try renderer.reserveBatchStorage(initial_batch_commands, initial_batch_vertices, initial_batch_commands);
         errdefer renderer.deinitBatchStorage();
@@ -202,6 +208,15 @@ pub const Renderer = struct {
 
     pub fn setCamera(self: *Renderer, camera: Camera2D) void {
         self.camera = camera;
+    }
+
+    pub fn drawablePixelScale(self: *const Renderer) f32 {
+        const presentation = self.current_presentation orelse return 1.0;
+        const scale_x = @as(f32, @floatFromInt(presentation.drawable_size.width)) /
+            @as(f32, @floatFromInt(presentation.window_size.width));
+        const scale_y = @as(f32, @floatFromInt(presentation.drawable_size.height)) /
+            @as(f32, @floatFromInt(presentation.window_size.height));
+        return @max(1.0, @max(scale_x, scale_y));
     }
 
     pub fn createTextureFromPng(self: *Renderer, assets: AssetStore, relative_path: []const u8) !TextureHandle {
@@ -277,14 +292,16 @@ pub const Renderer = struct {
             return sdlError("SDL_WaitAndAcquireGPUSwapchainTexture");
         }
 
-        const acquired_swapchain_texture = swapchain_texture orelse {
+        if (swapchainUnavailable(swapchain_texture)) {
             _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
             command_submitted = true;
             return .skipped_no_swapchain;
-        };
+        }
+        const acquired_swapchain_texture = swapchain_texture.?;
 
         self.viewport_width = width;
         self.viewport_height = height;
+        const presentation = try self.updatePresentation(width, height);
 
         if (self.vertices.items.len > 0) {
             try self.uploadVertices(command_buffer);
@@ -307,25 +324,20 @@ pub const Renderer = struct {
         c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
         if (self.vertices.items.len > 0) {
-            var frame_uniform = FrameUniform{
-                .viewport_size = .{
-                    @floatFromInt(self.viewport_width),
-                    @floatFromInt(self.viewport_height),
-                },
-                .padding = .{ 0, 0 },
-            };
-            c.SDL_PushGPUVertexUniformData(command_buffer, 0, &frame_uniform, @sizeOf(FrameUniform));
-
             var vertex_binding = c.SDL_GPUBufferBinding{
                 .buffer = self.vertex_buffer,
                 .offset = 0,
             };
             c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
 
+            var active_presentation: ?CoordinatePresentation = null;
             for (self.draw_groups.items) |group| {
                 const texture = self.textures.items[group.texture.index];
                 if (!texture.alive) continue;
 
+                if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
+                    applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation);
+                }
                 var sampler_binding = c.SDL_GPUTextureSamplerBinding{
                     .texture = texture.texture,
                     .sampler = self.sampler,
@@ -342,6 +354,61 @@ pub const Renderer = struct {
         }
         command_submitted = true;
         return .submitted;
+    }
+
+    fn updatePresentation(self: *Renderer, drawable_width: u32, drawable_height: u32) !resolution.Presentation {
+        var window_width: c_int = 0;
+        var window_height: c_int = 0;
+        if (!c.SDL_GetWindowSize(self.window, &window_width, &window_height)) {
+            return sdlError("SDL_GetWindowSize");
+        }
+
+        const presentation = try resolution.computePresentation(
+            self.resolution_policy,
+            .{
+                .width = @intCast(window_width),
+                .height = @intCast(window_height),
+            },
+            .{
+                .width = drawable_width,
+                .height = drawable_height,
+            },
+        );
+        self.current_presentation = presentation;
+        self.logPresentationChange(presentation);
+        return presentation;
+    }
+
+    fn logPresentationChange(self: *Renderer, presentation: resolution.Presentation) void {
+        if (!logging.enabled(.debug)) return;
+        if (self.last_logged_presentation) |last| {
+            if (presentationsMatch(last, presentation)) return;
+        }
+
+        const pixel_density = c.SDL_GetWindowPixelDensity(self.window);
+        const display_scale = c.SDL_GetWindowDisplayScale(self.window);
+        const viewport = presentation.viewport;
+        log.debug(
+            "presentation changed: window={}x{} drawable={}x{} logical={}x{} scale_mode={s} viewport=({}, {}) {}x{} scale={d:.3}x{d:.3} pixel_density={d:.3} display_scale={d:.3}",
+            .{
+                presentation.window_size.width,
+                presentation.window_size.height,
+                presentation.drawable_size.width,
+                presentation.drawable_size.height,
+                presentation.policy.logical_size.width,
+                presentation.policy.logical_size.height,
+                @tagName(presentation.policy.scale_mode),
+                viewport.x,
+                viewport.y,
+                viewport.width,
+                viewport.height,
+                viewport.scale_x,
+                viewport.scale_y,
+                pixel_density,
+                display_scale,
+            },
+        );
+        self.last_logged_presentation = presentation;
     }
 
     pub fn createTextureFromPixels(
@@ -540,22 +607,26 @@ pub const Renderer = struct {
         std.mem.sort(SpriteCommand, self.commands.items, {}, spriteCommandLessThan);
 
         var active_texture: ?TextureHandle = null;
+        var active_presentation: CoordinatePresentation = .logical;
         var active_first_vertex: u32 = 0;
         var active_vertex_count: u32 = 0;
 
         for (self.commands.items) |command| {
             const first_vertex: u32 = @intCast(self.vertices.items.len);
             if (!try self.appendSpriteVertices(command.sprite)) continue;
+            const presentation = presentationForCoordinateSpace(command.sprite.coordinate_space);
 
-            if (active_texture == null or active_texture.?.index != command.sprite.texture.index) {
+            if (active_texture == null or active_texture.?.index != command.sprite.texture.index or active_presentation != presentation) {
                 if (active_texture) |texture| {
                     try self.draw_groups.append(self.allocator, .{
                         .texture = texture,
+                        .presentation = active_presentation,
                         .first_vertex = active_first_vertex,
                         .vertex_count = active_vertex_count,
                     });
                 }
                 active_texture = command.sprite.texture;
+                active_presentation = presentation;
                 active_first_vertex = first_vertex;
                 active_vertex_count = 6;
             } else {
@@ -566,6 +637,7 @@ pub const Renderer = struct {
         if (active_texture) |texture| {
             try self.draw_groups.append(self.allocator, .{
                 .texture = texture,
+                .presentation = active_presentation,
                 .first_vertex = active_first_vertex,
                 .vertex_count = active_vertex_count,
             });
@@ -615,7 +687,10 @@ pub const Renderer = struct {
                 .x = sprite.dest.x + sprite.origin.x + rotated.x,
                 .y = sprite.dest.y + sprite.origin.y + rotated.y,
             };
-            const screen = if (sprite.screen_space) world else self.camera.worldToScreen(world);
+            const screen = switch (sprite.coordinate_space) {
+                .world => self.camera.worldToScreen(world),
+                .logical, .drawable => world,
+            };
             try self.vertices.append(self.allocator, .{
                 .position = .{ screen.x, screen.y },
                 .uv = uv[index],
@@ -640,8 +715,14 @@ const SpriteCommand = struct {
 
 const DrawGroup = struct {
     texture: TextureHandle,
+    presentation: CoordinatePresentation,
     first_vertex: u32,
     vertex_count: u32,
+};
+
+const CoordinatePresentation = enum {
+    logical,
+    drawable,
 };
 
 const Vertex = extern struct {
@@ -703,6 +784,98 @@ fn validateTexturePixels(pixels: []const u8, width: u32, height: u32, pitch: usi
 
     const required_len = std.math.mul(usize, pitch, @intCast(height)) catch return error.InvalidTexturePixels;
     if (pixels.len < required_len) return error.InvalidTexturePixels;
+}
+
+fn presentationForCoordinateSpace(coordinate_space: CoordinateSpace) CoordinatePresentation {
+    return switch (coordinate_space) {
+        .world, .logical => .logical,
+        .drawable => .drawable,
+    };
+}
+
+fn applyGroupPresentation(
+    render_pass: *c.SDL_GPURenderPass,
+    command_buffer: *c.SDL_GPUCommandBuffer,
+    presentation: resolution.Presentation,
+    coordinate_presentation: CoordinatePresentation,
+) void {
+    switch (coordinate_presentation) {
+        .logical => {
+            const viewport = presentation.viewport;
+            var gpu_viewport = c.SDL_GPUViewport{
+                .x = @floatFromInt(viewport.x),
+                .y = @floatFromInt(viewport.y),
+                .w = @floatFromInt(viewport.width),
+                .h = @floatFromInt(viewport.height),
+                .min_depth = 0,
+                .max_depth = 1,
+            };
+            var scissor = scissorForViewport(viewport, presentation.drawable_size);
+            c.SDL_SetGPUViewport(render_pass, &gpu_viewport);
+            c.SDL_SetGPUScissor(render_pass, &scissor);
+            pushFrameUniform(command_buffer, presentation.policy.logical_size.width, presentation.policy.logical_size.height);
+        },
+        .drawable => {
+            var gpu_viewport = c.SDL_GPUViewport{
+                .x = 0,
+                .y = 0,
+                .w = @floatFromInt(presentation.drawable_size.width),
+                .h = @floatFromInt(presentation.drawable_size.height),
+                .min_depth = 0,
+                .max_depth = 1,
+            };
+            var scissor = c.SDL_Rect{
+                .x = 0,
+                .y = 0,
+                .w = @intCast(presentation.drawable_size.width),
+                .h = @intCast(presentation.drawable_size.height),
+            };
+            c.SDL_SetGPUViewport(render_pass, &gpu_viewport);
+            c.SDL_SetGPUScissor(render_pass, &scissor);
+            pushFrameUniform(command_buffer, presentation.drawable_size.width, presentation.drawable_size.height);
+        },
+    }
+}
+
+fn pushFrameUniform(command_buffer: *c.SDL_GPUCommandBuffer, width: u32, height: u32) void {
+    var frame_uniform = FrameUniform{
+        .viewport_size = .{
+            @floatFromInt(width),
+            @floatFromInt(height),
+        },
+        .padding = .{ 0, 0 },
+    };
+    c.SDL_PushGPUVertexUniformData(command_buffer, 0, &frame_uniform, @sizeOf(FrameUniform));
+}
+
+fn scissorForViewport(viewport: resolution.Viewport, drawable_size: resolution.DrawableSize) c.SDL_Rect {
+    const left = @max(@as(i64, 0), @as(i64, viewport.x));
+    const top = @max(@as(i64, 0), @as(i64, viewport.y));
+    const right = @min(
+        @as(i64, @intCast(drawable_size.width)),
+        @as(i64, viewport.x) + @as(i64, @intCast(viewport.width)),
+    );
+    const bottom = @min(
+        @as(i64, @intCast(drawable_size.height)),
+        @as(i64, viewport.y) + @as(i64, @intCast(viewport.height)),
+    );
+
+    return .{
+        .x = @intCast(left),
+        .y = @intCast(top),
+        .w = @intCast(@max(@as(i64, 0), right - left)),
+        .h = @intCast(@max(@as(i64, 0), bottom - top)),
+    };
+}
+
+fn presentationsMatch(lhs: resolution.Presentation, rhs: resolution.Presentation) bool {
+    return lhs.window_size.width == rhs.window_size.width and
+        lhs.window_size.height == rhs.window_size.height and
+        lhs.drawable_size.width == rhs.drawable_size.width and
+        lhs.drawable_size.height == rhs.drawable_size.height and
+        lhs.policy.logical_size.width == rhs.policy.logical_size.width and
+        lhs.policy.logical_size.height == rhs.policy.logical_size.height and
+        lhs.policy.scale_mode == rhs.policy.scale_mode;
 }
 
 test "texture pixel validation rejects invalid dimensions pitch and length" {
@@ -861,9 +1034,17 @@ fn presentMode(mode: config.PresentMode) c.SDL_GPUPresentMode {
 }
 
 fn validateConfig(app_config: config.AppConfig) !void {
-    if (app_config.frames_in_flight < 1 or app_config.frames_in_flight > 3) {
-        return error.InvalidConfig;
-    }
+    try app_config.validate();
+}
+
+fn swapchainUnavailable(swapchain_texture: ?*c.SDL_GPUTexture) bool {
+    return swapchain_texture == null;
+}
+
+fn shouldApplyPresentationState(active_presentation: *?CoordinatePresentation, next_presentation: CoordinatePresentation) bool {
+    if (active_presentation.* == next_presentation) return false;
+    active_presentation.* = next_presentation;
+    return true;
 }
 
 fn selectPresentMode(
@@ -934,6 +1115,33 @@ fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
 }
 
+fn initBatchTestRenderer(allocator: std.mem.Allocator) !Renderer {
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .sampler = undefined,
+        .vertex_buffer = undefined,
+        .vertex_transfer_buffer = undefined,
+        .batch_capacity_vertices = 0,
+    };
+    errdefer renderer.deinitBatchStorage();
+    errdefer renderer.textures.deinit(allocator);
+
+    try renderer.textures.append(allocator, .{
+        .texture = @ptrFromInt(1),
+        .width = 8,
+        .height = 8,
+    });
+    return renderer;
+}
+
+fn deinitBatchTestRenderer(renderer: *Renderer, allocator: std.mem.Allocator) void {
+    renderer.textures.deinit(allocator);
+    renderer.deinitBatchStorage();
+}
+
 test "batch builder skips invalid and destroyed texture handles" {
     const allocator = std.testing.allocator;
     var renderer = Renderer{
@@ -990,8 +1198,174 @@ test "batch builder skips invalid and destroyed texture handles" {
     try std.testing.expectEqual(@as(usize, 6), renderer.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), renderer.draw_groups.items.len);
     try std.testing.expectEqual(@as(usize, 0), renderer.draw_groups.items[0].texture.index);
+    try std.testing.expectEqual(CoordinatePresentation.logical, renderer.draw_groups.items[0].presentation);
     try std.testing.expectEqual(@as(u32, 0), renderer.draw_groups.items[0].first_vertex);
     try std.testing.expectEqual(@as(u32, 6), renderer.draw_groups.items[0].vertex_count);
+}
+
+test "batch builder groups by texture and coordinate presentation" {
+    const allocator = std.testing.allocator;
+    var renderer = try initBatchTestRenderer(allocator);
+    defer deinitBatchTestRenderer(&renderer, allocator);
+
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        .coordinate_space = .world,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 2, .y = 0, .w = 1, .h = 1 },
+        .coordinate_space = .logical,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 4, .y = 0, .w = 1, .h = 1 },
+        .coordinate_space = .drawable,
+    });
+
+    try renderer.prepareFrameCommands();
+
+    try std.testing.expectEqual(@as(usize, 18), renderer.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 2), renderer.draw_groups.items.len);
+    try std.testing.expectEqual(CoordinatePresentation.logical, renderer.draw_groups.items[0].presentation);
+    try std.testing.expectEqual(@as(u32, 0), renderer.draw_groups.items[0].first_vertex);
+    try std.testing.expectEqual(@as(u32, 12), renderer.draw_groups.items[0].vertex_count);
+    try std.testing.expectEqual(CoordinatePresentation.drawable, renderer.draw_groups.items[1].presentation);
+    try std.testing.expectEqual(@as(u32, 12), renderer.draw_groups.items[1].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), renderer.draw_groups.items[1].vertex_count);
+}
+
+test "world sprites apply camera while logical and drawable sprites ignore camera" {
+    const allocator = std.testing.allocator;
+    var renderer = try initBatchTestRenderer(allocator);
+    defer deinitBatchTestRenderer(&renderer, allocator);
+    renderer.camera = .{
+        .position = .{ .x = 5, .y = 10 },
+        .zoom = 2,
+    };
+
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
+        .coordinate_space = .world,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
+        .coordinate_space = .logical,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
+        .coordinate_space = .drawable,
+    });
+
+    try renderer.prepareFrameCommands();
+
+    try std.testing.expectEqual(@as(f32, 30), renderer.vertices.items[0].position[0]);
+    try std.testing.expectEqual(@as(f32, 40), renderer.vertices.items[0].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), renderer.vertices.items[6].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), renderer.vertices.items[6].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), renderer.vertices.items[12].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), renderer.vertices.items[12].position[1]);
+    try std.testing.expectEqual(CoordinatePresentation.drawable, renderer.draw_groups.items[1].presentation);
+}
+
+test "batch builder orders layers before submission sequence" {
+    const allocator = std.testing.allocator;
+    var renderer = try initBatchTestRenderer(allocator);
+    defer deinitBatchTestRenderer(&renderer, allocator);
+
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 20, .y = 0, .w = 1, .h = 1 },
+        .layer = 5,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 10, .y = 0, .w = 1, .h = 1 },
+        .layer = 1,
+    });
+    try renderer.drawSprite(.{
+        .texture = .{ .index = 0 },
+        .dest = .{ .x = 30, .y = 0, .w = 1, .h = 1 },
+        .layer = 5,
+    });
+
+    try renderer.prepareFrameCommands();
+
+    try std.testing.expectEqual(@as(f32, 10), renderer.vertices.items[0].position[0]);
+    try std.testing.expectEqual(@as(f32, 20), renderer.vertices.items[6].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), renderer.vertices.items[12].position[0]);
+}
+
+test "drawable presentation uses full drawable scissor and overscan scissor clamps to drawable bounds" {
+    const presentation = try resolution.computePresentation(.{}, .{ .width = 1280, .height = 720 }, .{ .width = 2560, .height = 1440 });
+    const drawable_scissor = scissorForViewport(.{
+        .x = 0,
+        .y = 0,
+        .width = presentation.drawable_size.width,
+        .height = presentation.drawable_size.height,
+        .scale_x = 1,
+        .scale_y = 1,
+    }, presentation.drawable_size);
+    try std.testing.expectEqual(@as(c_int, 0), drawable_scissor.x);
+    try std.testing.expectEqual(@as(c_int, 0), drawable_scissor.y);
+    try std.testing.expectEqual(@as(c_int, 2560), drawable_scissor.w);
+    try std.testing.expectEqual(@as(c_int, 1440), drawable_scissor.h);
+
+    const overscan = try resolution.computeViewport(.{
+        .logical_size = .{ .width = 1280, .height = 720 },
+        .scale_mode = .overscan,
+    }, .{ .width = 1024, .height = 768 });
+    const overscan_scissor = scissorForViewport(overscan, .{ .width = 1024, .height = 768 });
+    try std.testing.expectEqual(@as(c_int, 0), overscan_scissor.x);
+    try std.testing.expectEqual(@as(c_int, 0), overscan_scissor.y);
+    try std.testing.expectEqual(@as(c_int, 1024), overscan_scissor.w);
+    try std.testing.expectEqual(@as(c_int, 768), overscan_scissor.h);
+}
+
+test "null swapchain texture preserves skipped no swapchain result path" {
+    try std.testing.expect(swapchainUnavailable(null));
+    try std.testing.expect(!swapchainUnavailable(@ptrFromInt(1)));
+    try std.testing.expectEqual(FrameResult.skipped_no_swapchain, FrameResult.skipped_no_swapchain);
+}
+
+test "presentation state applies first group and changes only" {
+    var active_presentation: ?CoordinatePresentation = null;
+
+    try std.testing.expect(shouldApplyPresentationState(&active_presentation, .logical));
+    try std.testing.expectEqual(CoordinatePresentation.logical, active_presentation.?);
+    try std.testing.expect(!shouldApplyPresentationState(&active_presentation, .logical));
+    try std.testing.expect(shouldApplyPresentationState(&active_presentation, .drawable));
+    try std.testing.expectEqual(CoordinatePresentation.drawable, active_presentation.?);
+    try std.testing.expect(!shouldApplyPresentationState(&active_presentation, .drawable));
+    try std.testing.expect(shouldApplyPresentationState(&active_presentation, .logical));
+}
+
+test "renderer drawable pixel scale follows current presentation" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .sampler = undefined,
+        .vertex_buffer = undefined,
+        .vertex_transfer_buffer = undefined,
+        .batch_capacity_vertices = 0,
+    };
+
+    try std.testing.expectEqual(@as(f32, 1), renderer.drawablePixelScale());
+
+    renderer.current_presentation = try resolution.computePresentation(
+        .{},
+        .{ .width = 1280, .height = 720 },
+        .{ .width = 2560, .height = 1440 },
+    );
+
+    try std.testing.expectEqual(@as(f32, 2), renderer.drawablePixelScale());
 }
 
 test "warmed sprite batch prep does not allocate" {
