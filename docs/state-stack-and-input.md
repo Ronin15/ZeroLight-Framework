@@ -81,6 +81,19 @@ when the stack shuts down.
 - `pushOverlay` allows updates, events, and rendering below it.
 - `pushOpaque` blocks rendering below it for full-screen replacement views.
 
+Policies also control named-action routing:
+
+- Gameplay states allow held gameplay input, app commands, and debug commands.
+- Modal overlays block held gameplay input while keeping app and debug commands
+  available.
+- Pass-through overlays allow gameplay, UI, app, and debug action contexts unless
+  a modal or opaque state in the active event path blocks held gameplay input.
+- Opaque screens block gameplay input and keep app and debug commands available.
+
+The top state controls command availability. Held gameplay input is also gated
+by modal and opaque states in the active event path, so pass-through overlays do
+not tunnel movement through a modal state beneath them.
+
 ## Input Model
 
 Keyboard input maps to named `Action` values in `src/app/input.zig`.
@@ -99,6 +112,9 @@ One-frame commands:
 - `quit`
 - `toggleDebugOverlay`
 
+`pause`, `resumeGame`, and `quit` are app commands. `toggleDebugOverlay` is a
+debug command.
+
 Default bindings are:
 
 - WASD for movement
@@ -109,4 +125,6 @@ Default bindings are:
 
 Gameplay code should read movement through `InputState`, usually from the
 `UpdateContext`. App-level commands should stay in `FrameCommands` and engine
-coordination code.
+coordination code. `State.handleEvent` still receives raw SDL events according
+to `events_below`; input routing only decides whether named actions mutate
+`InputState` or `FrameCommands`.

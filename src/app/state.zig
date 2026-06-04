@@ -3,7 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
+const input_router = @import("input_router.zig");
+const InputRoutingPolicy = input_router.InputRoutingPolicy;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const ThreadSystem = @import("thread_system.zig").ThreadSystem;
 const c = @import("../platform/sdl.zig").c;
@@ -16,18 +19,26 @@ pub const StatePolicy = struct {
     update_below: bool = false,
     events_below: bool = false,
     render_below: bool = true,
+    input_routing: InputRoutingPolicy = InputRoutingPolicy.gameplay(),
+    blocks_held_gameplay_input: bool = false,
 };
 
 pub const state_policy = struct {
     pub const gameplay = StatePolicy{};
-    pub const modal_overlay = StatePolicy{};
+    pub const modal_overlay = StatePolicy{
+        .input_routing = InputRoutingPolicy.modalUi(),
+        .blocks_held_gameplay_input = true,
+    };
     pub const pass_through_overlay = StatePolicy{
         .update_below = true,
         .events_below = true,
         .render_below = true,
+        .input_routing = InputRoutingPolicy.passThroughOverlay(),
     };
     pub const opaque_screen = StatePolicy{
         .render_below = false,
+        .input_routing = InputRoutingPolicy.opaqueScreen(),
+        .blocks_held_gameplay_input = true,
     };
 };
 
@@ -294,6 +305,22 @@ pub const StateStack = struct {
         return self.states.items[self.states.items.len - 1].state;
     }
 
+    pub fn inputRoutingPolicy(self: *const StateStack) InputRoutingPolicy {
+        if (self.states.items.len == 0) return state_policy.gameplay.input_routing;
+
+        var index = self.states.items.len - 1;
+        var routing = self.states.items[index].policy.input_routing;
+        while (true) {
+            const policy = self.states.items[index].policy;
+            if (policy.blocks_held_gameplay_input) {
+                routing = routing.withContext(.gameplay, false);
+            }
+            if (!policy.events_below or index == 0) break;
+            index -= 1;
+        }
+        return routing;
+    }
+
     pub fn pauseActive(self: *StateStack) void {
         if (self.active()) |state| {
             state.onPause();
@@ -429,6 +456,22 @@ fn testRenderContext(renderer: *Renderer, interpolation_alpha: f32, thread_syste
         .interpolation_alpha = interpolation_alpha,
         .thread_system = thread_system,
     };
+}
+
+fn testKeyEvent(event_type: u32, key: c.SDL_Keycode, repeat: bool) c.SDL_Event {
+    return c.SDL_Event{ .key = .{
+        .type = event_type,
+        .reserved = 0,
+        .timestamp = 0,
+        .windowID = 0,
+        .which = 0,
+        .scancode = 0,
+        .key = key,
+        .mod = 0,
+        .raw = 0,
+        .down = event_type == c.SDL_EVENT_KEY_DOWN,
+        .repeat = repeat,
+    } };
 }
 
 test "state stack owns pushed states and destroys removed states" {
@@ -762,6 +805,77 @@ test "modal state blocks event handling below it" {
 
     try std.testing.expectEqual(@as(u32, 0), bottom_count);
     try std.testing.expectEqual(@as(u32, 1), modal_count);
+}
+
+test "state stack input routing follows active state policy" {
+    const TestingState = struct {
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.ui));
+
+    _ = try stack.replaceGameplay(TestingState, .{});
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+
+    const modal_handle = try stack.pushModal(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+
+    _ = try stack.pushOverlay(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.quit));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+
+    var input = InputState{};
+    var commands = FrameCommands{};
+    var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    try std.testing.expect(!input.isHeld(.moveLeft));
+
+    try std.testing.expect(stack.remove(modal_handle));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    try std.testing.expect(input.isHeld(.moveLeft));
+
+    _ = try stack.pushOpaque(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
 }
 
 test "opaque state render policy hides states below it" {

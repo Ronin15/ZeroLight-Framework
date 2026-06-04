@@ -11,6 +11,7 @@ It builds target-native shaders at build time and renders through SDL_GPU.
 - SDL_GPU-first rendering with sprites, primitive rectangles, batching, and shader build steps
 - Fixed-step 60Hz simulation with interpolated rendering for high-refresh displays
 - State-stack flow for gameplay screens, modal overlays, and pause behavior
+- Policy-based input routing for gameplay, app commands, UI, and debug actions
 - Runtime asset loading from the installed asset directory with safe relative paths
 - Linux and macOS shader pipeline: SPIR-V on Linux, Metal shaders on macOS
 - Development workflow with `run`, `dev`, `test`, `check`, `verify`, `gpu-smoke`, and `package`
@@ -65,7 +66,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `build.zig` defines executables, tests, formatting, shader compilation, and install steps.
 - `build.zig.zon` contains project metadata.
 - `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
-- `src/app/` contains SDL app coordination, input, timing, pause policy, frame pacing, thread system, and state stack flow.
+- `src/app/` contains SDL app coordination, input routing, timing, pause policy, frame pacing, thread system, and state stack flow.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, and debug overlay rendering.
 - `src/game/` contains game/application states such as the temporary demo and pause overlay.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.

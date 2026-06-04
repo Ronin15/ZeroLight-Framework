@@ -58,32 +58,40 @@ input without broad special cases in `Engine`.
 
 Current foundation:
 
-- `InputState` tracks held gameplay actions.
-- `FrameCommands` tracks one-frame commands.
-- `input_router.zig` defines context-oriented routing contracts.
-- Current pause behavior intentionally resets gameplay movement; this slice should
-  decide how key-down/key-up events received while gameplay input is blocked
-  reconcile with held movement on resume.
+- [x] `InputState` tracks held gameplay actions.
+- [x] `FrameCommands` tracks one-frame commands.
+- [x] `input_router.zig` defines context-oriented routing contracts.
+- [x] `StatePolicy` carries the active named-action routing policy.
+- [x] `StatePolicy` explicitly marks modal and opaque states that block held
+      gameplay input in the active event path.
+- [x] Pause and modal routing intentionally release held gameplay movement; keys
+      pressed while gameplay is blocked are not synthesized on resume.
+- [x] Engine logs the low-frequency gameplay-routing block transition at app
+      debug scope when held movement is released.
 
 Checklist:
 
-- [ ] Add a routing policy field to the active state policy or derive it from the
+- [x] Add a routing policy field to the active state policy or derive it from the
       active state stack entry.
-- [ ] Route SDL key events through `InputRoutingPolicy` before mutating
+- [x] Route SDL key events through `InputRoutingPolicy` before mutating
       `InputState` or `FrameCommands`.
-- [ ] Keep debug commands available unless explicitly disabled.
-- [ ] Ensure modal overlays can block gameplay held input.
-- [ ] Release held gameplay movement when a modal policy starts blocking gameplay.
-- [ ] Add tests for gameplay-only, modal UI, pass-through overlay, and debug
+- [x] Keep debug commands available unless explicitly disabled.
+- [x] Ensure modal overlays can block gameplay held input.
+- [x] Ensure pass-through overlays do not tunnel gameplay input through modal or
+      opaque blockers in the active event path.
+- [x] Release held gameplay movement when a modal policy starts blocking gameplay.
+- [x] Add tests for gameplay-only, modal UI, pass-through overlay, and debug
       command behavior.
-- [ ] Update README input guidance after behavior is wired.
+- [x] Update README input guidance after behavior is wired.
 
 Acceptance checks:
 
-- [ ] A gameplay state still receives WASD movement by default.
-- [ ] A modal state can prevent gameplay movement from being latched underneath.
-- [ ] F2 debug overlay toggle still works while gameplay is active.
-- [ ] `zig build test` covers routing behavior without opening a window.
+- [x] A gameplay state still receives WASD movement by default.
+- [x] A modal state can prevent gameplay movement from being latched underneath.
+- [x] A pass-through overlay above a modal state still leaves gameplay movement
+      blocked.
+- [x] F2 debug overlay toggle still works while gameplay is active.
+- [x] `zig build test` covers routing behavior without opening a window.
 
 ## Slice 2: Logical Resolution And Viewport Policy
 

@@ -10,6 +10,7 @@ const DebugOverlay = if (build_options.debug_overlay) @import("../render/debug_o
 const DemoState = @import("../game/demo_state.zig").DemoState;
 const frame_pacer = @import("frame_pacer.zig");
 const input_mod = @import("input.zig");
+const input_router = @import("input_router.zig");
 const log = @import("../core/logging.zig").app;
 const Action = input_mod.Action;
 const FrameCommands = input_mod.FrameCommands;
@@ -135,16 +136,13 @@ pub const Engine = struct {
     pub fn handleEvents(self: *Engine) !void {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
-            self.commands.handleEvent(&event);
+            input_router.routeEvent(self.states.inputRoutingPolicy(), &event, &self.input, &self.commands);
             switch (event.type) {
                 c.SDL_EVENT_QUIT => {
                     log.debug("quit requested by SDL event", .{});
                     self.running = false;
                 },
                 else => {},
-            }
-            if (!self.pause.isPaused()) {
-                self.input.handleEvent(&event);
             }
             try self.states.handleEvent(&event, &self.transitions);
             try self.applyTransitions();
@@ -228,8 +226,14 @@ pub const Engine = struct {
     }
 
     fn applyTransitions(self: *Engine) !void {
+        const previous_routing = self.states.inputRoutingPolicy();
         const result = try self.states.applyTransitions(&self.transitions);
         self.pause.reconcileWithStateStack(&self.states);
+        const current_routing = self.states.inputRoutingPolicy();
+        if (previous_routing.allowsContext(.gameplay) and !current_routing.allowsContext(.gameplay)) {
+            log.debug("releasing held gameplay input because active state routing blocks gameplay", .{});
+            self.input.releaseMovement();
+        }
         if (result.quit_requested) {
             log.debug("quit requested by state transition", .{});
             self.running = false;
