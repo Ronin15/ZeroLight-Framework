@@ -21,9 +21,14 @@ comptime {
     _ = @import("core/logging.zig");
     _ = @import("game/player.zig");
     _ = @import("main.zig");
+    _ = @import("render/gpu/buffer.zig");
+    _ = @import("render/gpu/device.zig");
+    _ = @import("render/gpu/sprite_pipeline.zig");
+    _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");
     _ = @import("render/resources.zig");
+    _ = @import("render/sprite_batch.zig");
     _ = @import("render/text.zig");
     _ = @import("root.zig");
 }

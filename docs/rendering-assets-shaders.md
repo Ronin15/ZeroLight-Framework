@@ -10,9 +10,10 @@ Shader sources live in `assets/shaders/*.glsl`.
 - On Linux, `glslc` emits installed SPIR-V files under `zig-out/bin/assets/shaders/*.spv`.
 - On macOS, `glslc` emits temporary SPIR-V and `spirv-cross` converts it to installed MSL files under `zig-out/bin/assets/shaders/*.msl`.
 
-`src/render/renderer.zig` tells SDL which shader formats the build produced,
-passes a null driver name so SDL chooses the backend, and loads the shader files
-matching `SDL_GetGPUShaderFormats()`.
+The renderer tells SDL which shader formats the build produced and passes a null
+driver name so SDL chooses the backend. Sprite material and pipeline creation
+live under `src/render/gpu/` and load the shader files matching
+`SDL_GetGPUShaderFormats()`.
 
 ## Sprite Rendering
 
@@ -21,6 +22,11 @@ GPU vertex buffer per frame, sorted by layer and submission order, and submitted
 by texture and coordinate-presentation groups. Texture ownership is tracked with
 generational `TextureId` values so stale or destroyed IDs are rejected
 deterministically during batch prep.
+
+`Renderer` remains the game-facing facade. `src/render/sprite_batch.zig` owns
+sprite command storage, stable ordering, vertex expansion, and draw group
+construction so later UI, tilemap, or effect batchers can be added without
+rewriting SDL_GPU device setup.
 
 Use `drawSprite` for textured quads:
 

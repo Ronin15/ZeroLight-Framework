@@ -13,7 +13,9 @@ behavior under `src/game/`.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
-- `src/render/renderer.zig` manages the SDL_GPU device, window claim, swapchain setup, logical presentation, sprite pipeline, textures, and frame submission.
+- `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
+- `src/render/sprite_batch.zig` owns sprite draw command sorting, vertex construction, draw grouping, and allocation-free warmed batch prep.
+- `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig` and `src/render/fps_counter.zig` draw the F2 FPS overlay.
 - `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
@@ -47,6 +49,11 @@ state stays in the SDL_GPU renderer path.
 Game states draw through `Renderer`; they should not call SDL_GPU directly.
 Window, GPU device, swapchain, shader, texture, text, and frame submission code
 stays under `src/render/` and `src/app/`.
+
+`Renderer` preserves the public `drawSprite` and `drawRect` API while delegating
+sprite-specific CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition,
+swapchain acquisition, vertex upload, render-pass encoding, and submit remain
+coordinated by `Renderer` on the main/render thread.
 
 Raw keyboard input maps to named actions in `src/app/input.zig`. Gameplay code
 reads held actions from `InputState`; app-level actions such as pause, resume,
