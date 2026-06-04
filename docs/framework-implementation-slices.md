@@ -233,10 +233,24 @@ Current foundation:
   sprite batching.
 - Build now has a shader-program table for the existing sprite shader pair.
 
+Architecture notes:
+
+- Prefer landing Slice 3 resource IDs before physically splitting
+  `renderer.zig`, so texture ownership does not migrate across several files at
+  the same time as the handle model changes.
+- A likely first split is `src/render/gpu/` for SDL_GPU device/window claim,
+  swapchain setup, shader/pipeline creation, buffers, and texture upload, with
+  sprite command sorting and vertex expansion moved to `sprite_batch.zig`.
+- Keep `Renderer` as the game-facing facade and frame coordinator; the split
+  should hide GPU details behind narrower render-owned modules, not expose more
+  SDL_GPU surface area to game states.
+
 Checklist:
 
 - [ ] Keep `Renderer` as the device/frame coordinator.
 - [ ] Move sprite batching internals behind a `SpriteBatch` or equivalent module.
+- [ ] If `renderer.zig` remains too broad after resource IDs land, split GPU
+      setup, pipeline, buffer, and texture helpers under `src/render/gpu/`.
 - [ ] Introduce static material/pipeline records for the current sprite pipeline.
 - [ ] Keep draw command sorting stable by layer and submission order.
 - [ ] Preserve `drawSprite` and `drawRect` as the game-facing API during the
