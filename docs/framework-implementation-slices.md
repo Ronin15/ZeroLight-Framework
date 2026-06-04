@@ -142,29 +142,37 @@ into caching, reload, and ownership tracking.
 
 Current foundation:
 
-- Renderer owns GPU textures in an array.
-- `TextureHandle` is currently a raw index.
+- Renderer owns GPU textures in a generational slot table.
+- Public renderer APIs use `TextureId` instead of long-lived raw texture indices.
 - `resources.zig` defines generational `TextureId` and resource descriptors.
+
+Architecture notes:
+
+- Future atlas and tile rendering should reuse one atlas `TextureId` with
+  per-sprite or per-tile source rectangles. Slice 3 intentionally stops at
+  stable texture identity, descriptor lookup, and stale-ID rejection; it does not
+  add atlas metadata, tilemap storage, or tile renderer batching.
 
 Checklist:
 
-- [ ] Add a slot table for textures with generation, alive state, and descriptor.
-- [ ] Add `TextureId` creation, validation, lookup, and destruction helpers.
-- [ ] Keep draw submission lookup array-backed and allocation-free.
-- [ ] Preserve the white texture as an internal renderer resource.
-- [ ] Keep `createTextureFromPng`, `createTextureFromPixels`, and
+- [x] Add a slot table for textures with generation, alive state, and descriptor.
+- [x] Add `TextureId` creation, validation, lookup, and destruction helpers.
+- [x] Keep draw submission lookup array-backed and allocation-free.
+- [x] Preserve the white texture as an internal renderer resource.
+- [x] Keep `createTextureFromPng`, `createTextureFromPixels`, and
       `replaceTextureFromPixels` behavior compatible during migration.
-- [ ] Add tests for stale IDs, destroyed IDs, invalid generation, and descriptor
+- [x] Add tests for stale IDs, destroyed IDs, invalid generation, and descriptor
       validation.
-- [ ] Add a focused compatibility note if `TextureHandle` is renamed or aliased.
+- [x] Add a focused compatibility note for the `TextureHandle` to `TextureId`
+      rename.
 
 Acceptance checks:
 
-- [ ] Destroyed or stale texture IDs are skipped or rejected deterministically.
-- [ ] Existing demo and debug text still render.
-- [ ] Texture upload validation still rejects bad dimensions, pitch, and buffer
+- [x] Destroyed or stale texture IDs are skipped or rejected deterministically.
+- [x] Existing demo and debug text still render.
+- [x] Texture upload validation still rejects bad dimensions, pitch, and buffer
       lengths before GPU work.
-- [ ] No hash map lookup is introduced into per-sprite draw submission.
+- [x] No hash map lookup is introduced into per-sprite draw submission.
 
 ## Slice 4: Asset Cache
 

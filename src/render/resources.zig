@@ -14,6 +14,7 @@ pub const TextureId = struct {
     pub const invalid = TextureId{ .index = std.math.maxInt(u32), .generation = 0 };
 
     pub fn init(index: u32, generation: u32) !TextureId {
+        if (index == std.math.maxInt(u32)) return error.InvalidTextureIndex;
         if (generation == 0) return error.InvalidGeneration;
         return .{ .index = index, .generation = generation };
     }
@@ -64,6 +65,7 @@ pub fn nextGeneration(generation: u32) u32 {
 }
 
 test "texture ids reject generation zero and match slots exactly" {
+    try std.testing.expectError(error.InvalidTextureIndex, TextureId.init(std.math.maxInt(u32), 1));
     try std.testing.expectError(error.InvalidGeneration, TextureId.init(3, 0));
 
     const id = try TextureId.init(3, 7);

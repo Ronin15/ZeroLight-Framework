@@ -10,6 +10,7 @@ const config = @import("../config.zig");
 const logging = @import("../core/logging.zig");
 const log = @import("../core/logging.zig").render;
 const math = @import("../core/math.zig");
+const resources = @import("resources.zig");
 const resolution = @import("../app/resolution.zig");
 const sdl = @import("../platform/sdl.zig");
 const c = sdl.c;
@@ -19,9 +20,7 @@ const initial_batch_vertices = 4096 * 6;
 const initial_batch_commands = initial_batch_vertices / 6;
 const bytes_per_pixel = 4;
 
-pub const TextureHandle = struct {
-    index: usize,
-};
+pub const TextureId = resources.TextureId;
 
 pub const Rect = extern struct {
     x: f32,
@@ -37,7 +36,7 @@ pub const CoordinateSpace = enum {
 };
 
 pub const Sprite = struct {
-    texture: TextureHandle,
+    texture: TextureId,
     source: ?Rect = null,
     dest: Rect,
     tint: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
@@ -61,11 +60,12 @@ pub const Renderer = struct {
     vertex_buffer: *c.SDL_GPUBuffer,
     vertex_transfer_buffer: *c.SDL_GPUTransferBuffer,
     batch_capacity_vertices: usize,
-    textures: std.ArrayList(TextureResource) = .empty,
+    texture_slots: std.ArrayList(TextureSlot) = .empty,
     commands: std.ArrayList(SpriteCommand) = .empty,
     vertices: std.ArrayList(Vertex) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
-    white_texture: TextureHandle = .{ .index = 0 },
+    white_texture: TextureId = TextureId.invalid,
+    first_free_texture_slot: ?u32 = null,
     camera: Camera2D = .{},
     resolution_policy: resolution.ResolutionPolicy = .{},
     current_presentation: ?resolution.Presentation = null,
@@ -151,19 +151,19 @@ pub const Renderer = struct {
         errdefer renderer.deinitBatchStorage();
 
         const white_pixel = [_]u8{ 255, 255, 255, 255 };
-        renderer.white_texture = try renderer.createTextureFromPixels(white_pixel[0..], 1, 1, bytes_per_pixel);
+        renderer.white_texture = try renderer.createInternalTextureFromPixels(white_pixel[0..], 1, 1, bytes_per_pixel);
         return renderer;
     }
 
     pub fn deinit(self: *Renderer) void {
         self.waitForIdle();
 
-        for (self.textures.items) |texture| {
-            if (texture.alive) {
-                c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+        for (self.texture_slots.items) |slot| {
+            if (slot.alive) {
+                c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
             }
         }
-        self.textures.deinit(self.allocator);
+        self.texture_slots.deinit(self.allocator);
         self.deinitBatchStorage();
 
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
@@ -219,7 +219,7 @@ pub const Renderer = struct {
         return @max(1.0, @max(scale_x, scale_y));
     }
 
-    pub fn createTextureFromPng(self: *Renderer, assets: AssetStore, relative_path: []const u8) !TextureHandle {
+    pub fn createTextureFromPng(self: *Renderer, assets: AssetStore, relative_path: []const u8) !TextureId {
         const path = assets.resolveReadablePath(relative_path) catch |err| {
             log.err("failed to resolve PNG texture asset \"{s}\": {}", .{ relative_path, err });
             return err;
@@ -238,7 +238,7 @@ pub const Renderer = struct {
         return try self.createTextureFromSurface(loaded);
     }
 
-    pub fn createTextureFromSurface(self: *Renderer, surface: *c.SDL_Surface) !TextureHandle {
+    pub fn createTextureFromSurface(self: *Renderer, surface: *c.SDL_Surface) !TextureId {
         const converted = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_RGBA32) orelse {
             return sdlError("SDL_ConvertSurface");
         };
@@ -260,15 +260,16 @@ pub const Renderer = struct {
         );
     }
 
-    pub fn destroyTexture(self: *Renderer, handle: TextureHandle) void {
-        if (handle.index >= self.textures.items.len) return;
-        if (handle.index == self.white_texture.index) return;
+    pub fn destroyTexture(self: *Renderer, id: TextureId) void {
+        const slot = self.resolveTextureSlot(id) orelse return;
+        if (slot.internal) return;
 
-        const texture = &self.textures.items[handle.index];
-        if (texture.alive) {
-            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
-            texture.alive = false;
-        }
+        self.retireTextureSlot(id.index, slot);
+    }
+
+    pub fn textureDesc(self: *const Renderer, id: TextureId) ?resources.TextureDesc {
+        const slot = self.resolveTextureSlotConst(id) orelse return null;
+        return slot.desc;
     }
 
     pub fn endFrame(self: *Renderer) !FrameResult {
@@ -353,14 +354,13 @@ pub const Renderer = struct {
 
             var active_presentation: ?CoordinatePresentation = null;
             for (self.draw_groups.items) |group| {
-                const texture = self.textures.items[group.texture.index];
-                if (!texture.alive) continue;
+                const texture = self.resolveTextureSlot(group.texture) orelse continue;
 
                 if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
                     applyGroupScissor(render_pass, presentation, group.presentation);
                 }
                 var sampler_binding = c.SDL_GPUTextureSamplerBinding{
-                    .texture = texture.texture,
+                    .texture = texture.texture.?,
                     .sampler = self.sampler,
                 };
                 c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
@@ -445,35 +445,108 @@ pub const Renderer = struct {
         width: u32,
         height: u32,
         pitch: usize,
-    ) !TextureHandle {
+    ) !TextureId {
+        return try self.createTextureFromPixelsInternal(pixels, width, height, pitch, false);
+    }
+
+    fn createInternalTextureFromPixels(
+        self: *Renderer,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        pitch: usize,
+    ) !TextureId {
+        return try self.createTextureFromPixelsInternal(pixels, width, height, pitch, true);
+    }
+
+    fn createTextureFromPixelsInternal(
+        self: *Renderer,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        pitch: usize,
+        internal: bool,
+    ) !TextureId {
         const texture = try self.uploadTextureFromPixels(pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, texture.texture);
-
-        const handle = TextureHandle{ .index = self.textures.items.len };
-        try self.textures.append(self.allocator, texture);
-        return handle;
+        return try self.registerTexture(texture, internal);
     }
 
     pub fn replaceTextureFromPixels(
         self: *Renderer,
-        handle: TextureHandle,
+        id: TextureId,
         pixels: []const u8,
         width: u32,
         height: u32,
         pitch: usize,
     ) !void {
-        if (handle.index >= self.textures.items.len or handle.index == self.white_texture.index) {
-            return error.InvalidTexture;
-        }
+        const slot = self.resolveTextureSlot(id) orelse return error.InvalidTexture;
+        if (slot.internal) return error.InvalidTexture;
 
         const next_texture = try self.uploadTextureFromPixels(pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
 
-        const texture = &self.textures.items[handle.index];
-        if (texture.alive) {
-            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+        c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
+        slot.texture = next_texture.texture;
+        slot.desc = next_texture.desc;
+    }
+
+    fn registerTexture(self: *Renderer, texture: UploadedTexture, internal: bool) !TextureId {
+        if (self.first_free_texture_slot) |index| {
+            const slot = &self.texture_slots.items[@intCast(index)];
+            const generation = slot.generation;
+            self.first_free_texture_slot = slot.next_free;
+            slot.* = .{
+                .texture = texture.texture,
+                .desc = texture.desc,
+                .generation = generation,
+                .alive = true,
+                .internal = internal,
+                .next_free = null,
+            };
+            return TextureId.init(index, generation) catch unreachable;
         }
-        texture.* = next_texture;
+
+        if (self.texture_slots.items.len >= std.math.maxInt(u32)) return error.TooManyTextures;
+        const index: u32 = @intCast(self.texture_slots.items.len);
+        try self.texture_slots.append(self.allocator, .{
+            .texture = texture.texture,
+            .desc = texture.desc,
+            .generation = 1,
+            .alive = true,
+            .internal = internal,
+            .next_free = null,
+        });
+        return TextureId.init(index, 1) catch unreachable;
+    }
+
+    fn resolveTextureSlot(self: *Renderer, id: TextureId) ?*TextureSlot {
+        if (!id.isValid()) return null;
+        const index: usize = @intCast(id.index);
+        if (index >= self.texture_slots.items.len) return null;
+
+        const slot = &self.texture_slots.items[index];
+        if (!slot.alive) return null;
+        if (!id.matches(id.index, slot.generation)) return null;
+        return slot;
+    }
+
+    fn resolveTextureSlotConst(self: *const Renderer, id: TextureId) ?*const TextureSlot {
+        if (!id.isValid()) return null;
+        const index: usize = @intCast(id.index);
+        if (index >= self.texture_slots.items.len) return null;
+
+        const slot = &self.texture_slots.items[index];
+        if (!slot.alive) return null;
+        if (!id.matches(id.index, slot.generation)) return null;
+        return slot;
+    }
+
+    fn retireTextureSlot(self: *Renderer, index: u32, slot: *TextureSlot) void {
+        std.debug.assert(slot.alive);
+        c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
+        retireTextureSlotForReuse(slot, self.first_free_texture_slot);
+        self.first_free_texture_slot = index;
     }
 
     fn uploadTextureFromPixels(
@@ -482,8 +555,13 @@ pub const Renderer = struct {
         width: u32,
         height: u32,
         pitch: usize,
-    ) !TextureResource {
+    ) !UploadedTexture {
         try validateTexturePixels(pixels, width, height, pitch);
+        const desc = resources.TextureDesc{
+            .width = width,
+            .height = height,
+        };
+        try desc.validate();
 
         var texture_info = std.mem.zeroes(c.SDL_GPUTextureCreateInfo);
         texture_info.type = c.SDL_GPU_TEXTURETYPE_2D;
@@ -553,8 +631,7 @@ pub const Renderer = struct {
 
         return .{
             .texture = texture,
-            .width = width,
-            .height = height,
+            .desc = desc,
         };
     }
 
@@ -648,7 +725,7 @@ pub const Renderer = struct {
         std.debug.assert(self.vertices.capacity >= self.commands.items.len * 6);
         std.debug.assert(self.draw_groups.capacity >= self.commands.items.len);
 
-        var active_texture: ?TextureHandle = null;
+        var active_texture: ?TextureId = null;
         var active_presentation: CoordinatePresentation = .logical;
         var active_first_vertex: u32 = 0;
         var active_vertex_count: u32 = 0;
@@ -658,7 +735,7 @@ pub const Renderer = struct {
             if (!self.appendSpriteVertices(command.sprite, frame_presentation)) continue;
             const group_presentation = presentationForCoordinateSpace(command.sprite.coordinate_space);
 
-            if (active_texture == null or active_texture.?.index != command.sprite.texture.index or active_presentation != group_presentation) {
+            if (active_texture == null or !textureIdsEqual(active_texture.?, command.sprite.texture) or active_presentation != group_presentation) {
                 if (active_texture) |texture| {
                     self.draw_groups.appendAssumeCapacity(.{
                         .texture = texture,
@@ -687,21 +764,19 @@ pub const Renderer = struct {
     }
 
     fn appendSpriteVertices(self: *Renderer, sprite: Sprite, presentation: resolution.Presentation) bool {
-        if (sprite.texture.index >= self.textures.items.len) return false;
-        const texture = self.textures.items[sprite.texture.index];
-        if (!texture.alive) return false;
+        const texture = self.resolveTextureSlot(sprite.texture) orelse return false;
 
         const source = sprite.source orelse Rect{
             .x = 0,
             .y = 0,
-            .w = @floatFromInt(texture.width),
-            .h = @floatFromInt(texture.height),
+            .w = @floatFromInt(texture.desc.width),
+            .h = @floatFromInt(texture.desc.height),
         };
 
-        const tex_u0 = source.x / @as(f32, @floatFromInt(texture.width));
-        const tex_v0 = source.y / @as(f32, @floatFromInt(texture.height));
-        const tex_u1 = (source.x + source.w) / @as(f32, @floatFromInt(texture.width));
-        const tex_v1 = (source.y + source.h) / @as(f32, @floatFromInt(texture.height));
+        const tex_u0 = source.x / @as(f32, @floatFromInt(texture.desc.width));
+        const tex_v0 = source.y / @as(f32, @floatFromInt(texture.desc.height));
+        const tex_u1 = (source.x + source.w) / @as(f32, @floatFromInt(texture.desc.width));
+        const tex_v1 = (source.y + source.h) / @as(f32, @floatFromInt(texture.desc.height));
 
         const local = [_]math.Vec2{
             .{ .x = -sprite.origin.x, .y = -sprite.origin.y },
@@ -752,11 +827,18 @@ pub const Renderer = struct {
     }
 };
 
-const TextureResource = struct {
+const UploadedTexture = struct {
     texture: *c.SDL_GPUTexture,
-    width: u32,
-    height: u32,
-    alive: bool = true,
+    desc: resources.TextureDesc,
+};
+
+const TextureSlot = struct {
+    texture: ?*c.SDL_GPUTexture = null,
+    desc: resources.TextureDesc = .{ .width = 0, .height = 0 },
+    generation: u32 = 1,
+    alive: bool = false,
+    internal: bool = false,
+    next_free: ?u32 = null,
 };
 
 const SpriteCommand = struct {
@@ -765,7 +847,7 @@ const SpriteCommand = struct {
 };
 
 const DrawGroup = struct {
-    texture: TextureHandle,
+    texture: TextureId,
     presentation: CoordinatePresentation,
     first_vertex: u32,
     vertex_count: u32,
@@ -1176,6 +1258,19 @@ fn spriteCommandLessThan(_: void, lhs: SpriteCommand, rhs: SpriteCommand) bool {
     return lhs.sequence < rhs.sequence;
 }
 
+fn textureIdsEqual(lhs: TextureId, rhs: TextureId) bool {
+    return lhs.index == rhs.index and lhs.generation == rhs.generation;
+}
+
+fn retireTextureSlotForReuse(slot: *TextureSlot, next_free: ?u32) void {
+    slot.texture = null;
+    slot.desc = .{ .width = 0, .height = 0 };
+    slot.generation = resources.nextGeneration(slot.generation);
+    slot.alive = false;
+    slot.internal = false;
+    slot.next_free = next_free;
+}
+
 fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
 }
@@ -1192,19 +1287,29 @@ fn initBatchTestRenderer(allocator: std.mem.Allocator) !Renderer {
         .batch_capacity_vertices = 0,
     };
     errdefer renderer.deinitBatchStorage();
-    errdefer renderer.textures.deinit(allocator);
+    errdefer renderer.texture_slots.deinit(allocator);
 
-    try renderer.textures.append(allocator, .{
-        .texture = @ptrFromInt(1),
-        .width = 8,
-        .height = 8,
-    });
+    try renderer.texture_slots.append(allocator, testTextureSlot(@ptrFromInt(1), 8, 8, 1, false));
     return renderer;
 }
 
 fn deinitBatchTestRenderer(renderer: *Renderer, allocator: std.mem.Allocator) void {
-    renderer.textures.deinit(allocator);
+    renderer.texture_slots.deinit(allocator);
     renderer.deinitBatchStorage();
+}
+
+fn testTextureId(index: u32, generation: u32) TextureId {
+    return TextureId.init(index, generation) catch unreachable;
+}
+
+fn testTextureSlot(texture: *c.SDL_GPUTexture, width: u32, height: u32, generation: u32, internal: bool) TextureSlot {
+    return .{
+        .texture = texture,
+        .desc = .{ .width = width, .height = height },
+        .generation = generation,
+        .alive = true,
+        .internal = internal,
+    };
 }
 
 fn batchTestPresentation() !resolution.Presentation {
@@ -1221,7 +1326,7 @@ fn prepareBatchTestFrame(renderer: *Renderer, allocator: std.mem.Allocator, pres
     renderer.prepareFrameCommands(presentation);
 }
 
-test "batch builder skips invalid and destroyed texture handles" {
+test "texture slots reuse retired slots with fresh generations" {
     const allocator = std.testing.allocator;
     var renderer = Renderer{
         .allocator = allocator,
@@ -1233,50 +1338,115 @@ test "batch builder skips invalid and destroyed texture handles" {
         .vertex_transfer_buffer = undefined,
         .batch_capacity_vertices = 0,
     };
-    defer renderer.textures.deinit(allocator);
+    defer renderer.texture_slots.deinit(allocator);
+
+    const first = try renderer.registerTexture(.{
+        .texture = @ptrFromInt(1),
+        .desc = .{ .width = 16, .height = 16 },
+    }, false);
+
+    retireTextureSlotForReuse(&renderer.texture_slots.items[@intCast(first.index)], renderer.first_free_texture_slot);
+    renderer.first_free_texture_slot = first.index;
+
+    const second = try renderer.registerTexture(.{
+        .texture = @ptrFromInt(2),
+        .desc = .{ .width = 32, .height = 8 },
+    }, false);
+
+    try std.testing.expectEqual(first.index, second.index);
+    try std.testing.expectEqual(resources.nextGeneration(first.generation), second.generation);
+    try std.testing.expect(renderer.resolveTextureSlot(first) == null);
+
+    const desc = renderer.textureDesc(second).?;
+    try std.testing.expectEqual(@as(u32, 32), desc.width);
+    try std.testing.expectEqual(@as(u32, 8), desc.height);
+}
+
+test "internal texture slots cannot be destroyed or replaced through public APIs" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .sampler = undefined,
+        .vertex_buffer = undefined,
+        .vertex_transfer_buffer = undefined,
+        .batch_capacity_vertices = 0,
+    };
+    defer renderer.texture_slots.deinit(allocator);
+
+    const texture = try renderer.registerTexture(.{
+        .texture = @ptrFromInt(1),
+        .desc = .{ .width = 1, .height = 1 },
+    }, true);
+    renderer.white_texture = texture;
+
+    renderer.destroyTexture(texture);
+    try std.testing.expect(renderer.resolveTextureSlot(texture) != null);
+    try std.testing.expectError(error.InvalidTexture, renderer.replaceTextureFromPixels(texture, &.{ 255, 255, 255, 255 }, 1, 1, 4));
+}
+
+test "batch builder skips invalid stale and destroyed texture ids" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .sampler = undefined,
+        .vertex_buffer = undefined,
+        .vertex_transfer_buffer = undefined,
+        .batch_capacity_vertices = 0,
+    };
+    defer renderer.texture_slots.deinit(allocator);
     defer renderer.commands.deinit(allocator);
     defer renderer.vertices.deinit(allocator);
     defer renderer.draw_groups.deinit(allocator);
 
-    try renderer.textures.append(allocator, .{
-        .texture = @ptrFromInt(1),
-        .width = 1,
-        .height = 1,
-    });
-    try renderer.textures.append(allocator, .{
-        .texture = @ptrFromInt(2),
-        .width = 1,
-        .height = 1,
+    try renderer.texture_slots.append(allocator, testTextureSlot(@ptrFromInt(1), 1, 1, 1, false));
+    try renderer.texture_slots.append(allocator, .{
+        .texture = null,
+        .desc = .{ .width = 0, .height = 0 },
+        .generation = 2,
         .alive = false,
     });
+    try renderer.texture_slots.append(allocator, testTextureSlot(@ptrFromInt(3), 1, 1, 4, false));
 
     try renderer.commands.append(allocator, .{
         .sprite = .{
-            .texture = .{ .index = 42 },
+            .texture = testTextureId(42, 1),
             .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
         },
         .sequence = 0,
     });
     try renderer.commands.append(allocator, .{
         .sprite = .{
-            .texture = .{ .index = 1 },
+            .texture = testTextureId(1, 1),
             .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
         },
         .sequence = 1,
     });
     try renderer.commands.append(allocator, .{
         .sprite = .{
-            .texture = .{ .index = 0 },
+            .texture = testTextureId(2, 3),
             .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
         },
         .sequence = 2,
+    });
+    try renderer.commands.append(allocator, .{
+        .sprite = .{
+            .texture = testTextureId(0, 1),
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        },
+        .sequence = 3,
     });
 
     try prepareBatchTestFrame(&renderer, allocator, try batchTestPresentation());
 
     try std.testing.expectEqual(@as(usize, 6), renderer.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), renderer.draw_groups.items.len);
-    try std.testing.expectEqual(@as(usize, 0), renderer.draw_groups.items[0].texture.index);
+    try std.testing.expectEqual(@as(u32, 0), renderer.draw_groups.items[0].texture.index);
     try std.testing.expectEqual(CoordinatePresentation.logical, renderer.draw_groups.items[0].presentation);
     try std.testing.expectEqual(@as(u32, 0), renderer.draw_groups.items[0].first_vertex);
     try std.testing.expectEqual(@as(u32, 6), renderer.draw_groups.items[0].vertex_count);
@@ -1288,17 +1458,17 @@ test "batch builder groups by texture and coordinate presentation" {
     defer deinitBatchTestRenderer(&renderer, allocator);
 
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
         .coordinate_space = .world,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 2, .y = 0, .w = 1, .h = 1 },
         .coordinate_space = .logical,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 4, .y = 0, .w = 1, .h = 1 },
         .coordinate_space = .drawable,
     });
@@ -1325,17 +1495,17 @@ test "world sprites apply camera while logical and drawable sprites ignore camer
     };
 
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .world,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .logical,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .drawable,
     });
@@ -1357,17 +1527,17 @@ test "batch builder orders layers before submission sequence" {
     defer deinitBatchTestRenderer(&renderer, allocator);
 
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 0, .w = 1, .h = 1 },
         .layer = 5,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 10, .y = 0, .w = 1, .h = 1 },
         .layer = 1,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 30, .y = 0, .w = 1, .h = 1 },
         .layer = 5,
     });
@@ -1417,17 +1587,17 @@ test "world and logical vertices are submitted in drawable pixels" {
     );
 
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .world,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .logical,
     });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .drawable,
     });
@@ -1458,7 +1628,7 @@ test "world vertices include camera then letterbox viewport offset" {
     );
 
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .world,
     });
@@ -1523,14 +1693,10 @@ test "warmed sprite batch prep does not allocate" {
         .vertex_transfer_buffer = undefined,
         .batch_capacity_vertices = 0,
     };
-    defer renderer.textures.deinit(allocator);
+    defer renderer.texture_slots.deinit(allocator);
     defer renderer.deinitBatchStorage();
 
-    try renderer.textures.append(allocator, .{
-        .texture = @ptrFromInt(1),
-        .width = 1,
-        .height = 1,
-    });
+    try renderer.texture_slots.append(allocator, testTextureSlot(@ptrFromInt(1), 1, 1, 1, false));
     try renderer.reserveBatchStorage(1, 6, 1);
 
     var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
@@ -1539,7 +1705,7 @@ test "warmed sprite batch prep does not allocate" {
 
     renderer.beginFrame(.{ .r = 0, .g = 0, .b = 0, .a = 1 });
     try renderer.drawSprite(.{
-        .texture = .{ .index = 0 },
+        .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
     renderer.prepareFrameCommands(try batchTestPresentation());
@@ -1581,7 +1747,7 @@ test "shader set selection rejects unsupported format combinations" {
 test "sprite sorting preserves submission order within each layer" {
     const first = SpriteCommand{
         .sprite = .{
-            .texture = .{ .index = 10 },
+            .texture = testTextureId(10, 1),
             .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
             .layer = 0,
         },
@@ -1589,7 +1755,7 @@ test "sprite sorting preserves submission order within each layer" {
     };
     const second = SpriteCommand{
         .sprite = .{
-            .texture = .{ .index = 3 },
+            .texture = testTextureId(3, 1),
             .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
             .layer = 0,
         },

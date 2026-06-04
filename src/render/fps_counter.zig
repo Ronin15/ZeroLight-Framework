@@ -5,7 +5,7 @@
 const std = @import("std");
 const log = @import("../core/logging.zig").debug_overlay;
 const Renderer = @import("renderer.zig").Renderer;
-const TextureHandle = @import("renderer.zig").TextureHandle;
+const TextureId = @import("renderer.zig").TextureId;
 const c = @import("../platform/sdl.zig").c;
 
 const yellow = c.SDL_Color{ .r = 255, .g = 230, .b = 40, .a = 255 };
@@ -29,7 +29,7 @@ const system_font_paths = [_][:0]const u8{
 pub const FpsCounter = struct {
     font: ?*c.TTF_Font = null,
     ttf_initialized: bool = false,
-    texture: ?TextureHandle = null,
+    texture: ?TextureId = null,
     texture_width: u32 = 0,
     texture_height: u32 = 0,
     accumulated_ns: u64 = 0,

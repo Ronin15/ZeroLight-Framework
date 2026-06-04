@@ -18,7 +18,9 @@ matching `SDL_GetGPUShaderFormats()`.
 
 Sprites and colored rectangles are collected into a CPU batch, uploaded to one
 GPU vertex buffer per frame, sorted by layer and submission order, and submitted
-by texture and coordinate-presentation groups.
+by texture and coordinate-presentation groups. Texture ownership is tracked with
+generational `TextureId` values so stale or destroyed IDs are rejected
+deterministically during batch prep.
 
 Use `drawSprite` for textured quads:
 
@@ -32,6 +34,11 @@ try renderer.drawSprite(.{
 });
 ```
 
+`TextureId` values are stable while the texture is alive. Destroying a texture
+retires its slot and advances the generation before the slot can be reused, so
+old IDs do not accidentally bind a later texture. The built-in white texture is
+renderer-internal and backs `drawRect`.
+
 Use `drawRect` for debug or simple primitive rendering. It goes through the same
 sprite batch via a built-in white texture:
 
@@ -43,6 +50,11 @@ try renderer.drawRect(.{
     .h = 64,
 }, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, 0);
 ```
+
+For atlases or future tile rendering, keep one `TextureId` for the atlas texture
+and draw individual sprites or tiles with `Sprite.source` rectangles. Tilemap
+batching should build on the same texture ID plus source-rect model rather than
+creating one texture per tile.
 
 ## Logical Presentation
 
