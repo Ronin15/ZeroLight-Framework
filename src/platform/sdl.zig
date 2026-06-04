@@ -3,7 +3,8 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const log = @import("../core/logging.zig").platform;
+const logging = @import("../core/logging.zig");
+const log = logging.platform;
 
 pub const c = @cImport({
     @cInclude("SDL3/SDL.h");
@@ -15,9 +16,11 @@ pub const SdlContext = struct {
         if (!c.SDL_Init(flags)) {
             return sdlError("SDL_Init");
         }
-        var flag_names_buffer: [160]u8 = undefined;
-        const flag_names = initFlagNames(&flag_names_buffer, flags);
-        log.debug("SDL initialized with subsystems={s}", .{flag_names});
+        if (logging.enabled(.debug)) {
+            var flag_names_buffer: [160]u8 = undefined;
+            const flag_names = initFlagNames(&flag_names_buffer, flags);
+            log.debug("SDL initialized with requested_subsystems={s}", .{flag_names});
+        }
         return .{};
     }
 
@@ -34,9 +37,11 @@ pub const Window = struct {
         const handle = c.SDL_CreateWindow(title.ptr, @intCast(width), @intCast(height), flags) orelse {
             return sdlError("SDL_CreateWindow");
         };
-        var flag_names_buffer: [256]u8 = undefined;
-        const flag_names = windowFlagNames(&flag_names_buffer, flags);
-        log.debug("SDL window created: title=\"{s}\" size={}x{} flags={s}", .{ title, width, height, flag_names });
+        if (logging.enabled(.debug)) {
+            var flag_names_buffer: [256]u8 = undefined;
+            const flag_names = windowFlagNames(&flag_names_buffer, flags);
+            log.debug("SDL window created: title=\"{s}\" size={}x{} requested_flags={s}", .{ title, width, height, flag_names });
+        }
         return .{ .handle = handle };
     }
 

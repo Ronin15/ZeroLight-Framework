@@ -9,6 +9,10 @@ pub const std_options = std.Options{
     .log_level = @enumFromInt(build_options.log_level),
 };
 
+pub fn enabled(comptime level: std.log.Level) bool {
+    return @intFromEnum(level) <= build_options.log_level;
+}
+
 pub const app = std.log.scoped(.app);
 pub const assets = std.log.scoped(.assets);
 pub const core = std.log.scoped(.core);
