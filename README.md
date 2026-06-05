@@ -1,5 +1,7 @@
 # 2D SDL_GPU Game Framework in Zig
 
+![Zig SDL3 GPU Framework repo showcase](docs/images/repo-showcase.png)
+
 This is a lean 2D game framework built with Zig 0.16.0, SDL3, and SDL_GPU. It
 is organized around predictable frame flow, SDL_GPU rendering, explicit
 state/input policy, runtime assets and text, data-oriented architecture,
