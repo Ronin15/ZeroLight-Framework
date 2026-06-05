@@ -480,7 +480,7 @@ Current foundation:
 
 - `StateStack` owns active state lifetimes.
 - `UpdateContext` exposes `ThreadSystem` to states.
-- `DemoState` owns a `DataSystem` for state-local persistent game-world data.
+- `GameDemoState` owns a `DataSystem` for state-local persistent game-world data.
 - `Player` remains a player-specific behavior facade, backed by entity data in
   `DataSystem`.
 
@@ -554,9 +554,9 @@ Current foundation:
 - `ParticleSystem` owns a state-local fixed-capacity transient SoA pool and
   updates particle rows through a serial path or
   `ThreadSystem.parallelForWithOptions`.
-- `DemoState` spawns a few colored moving square entities so the processor has
+- `GameDemoState` spawns a few colored moving square entities so the processor has
   visible non-player runtime coverage.
-- `DemoState` emits and renders transient particle rectangles through its state
+- `GameDemoState` emits and renders transient particle rectangles through its state
   update/render functions.
 
 Performance notes:

@@ -21,6 +21,7 @@ comptime {
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");
     _ = @import("game/data_system.zig");
+    _ = @import("game/game_demo_state.zig");
     _ = @import("game/player.zig");
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/particle.zig");

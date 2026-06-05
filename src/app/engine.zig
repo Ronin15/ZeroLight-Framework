@@ -8,7 +8,7 @@ const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const config = @import("../config.zig");
 const DebugOverlay = if (build_options.debug_overlay) @import("../render/debug_overlay.zig").DebugOverlay else @import("../render/debug_overlay_stub.zig").DebugOverlay;
-const DemoState = @import("../game/demo_state.zig").DemoState;
+const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
 const frame_pacer = @import("frame_pacer.zig");
 const input_mod = @import("input.zig");
 const input_router = @import("input_router.zig");
@@ -297,17 +297,17 @@ fn minimumWindowSizeForPolicy(policy: resolution.ResolutionPolicy) ?resolution.L
 
 fn bootstrapStartupState(states: *StateStack, allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
     const logical_size = app_config.resolution_policy.logical_size;
-    // DemoState is the startup state until a real MainMenuState exists.
-    const demo_state_ptr = try allocator.create(DemoState);
+    // GameDemoState is the startup state until a real MainMenuState exists.
+    const game_demo_state_ptr = try allocator.create(GameDemoState);
     var owned_by_state = false;
-    errdefer if (!owned_by_state) allocator.destroy(demo_state_ptr);
-    demo_state_ptr.* = try DemoState.init(
+    errdefer if (!owned_by_state) allocator.destroy(game_demo_state_ptr);
+    game_demo_state_ptr.* = try GameDemoState.init(
         allocator,
         @floatFromInt(logical_size.width),
         @floatFromInt(logical_size.height),
     );
 
-    const state = State.fromOwnedPtr(DemoState, demo_state_ptr);
+    const state = State.fromOwnedPtr(GameDemoState, game_demo_state_ptr);
     owned_by_state = true;
     _ = try states.replaceOwnedGameplay(state);
 }

@@ -19,7 +19,7 @@ const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 4;
 
-pub const DemoState = struct {
+pub const GameDemoState = struct {
     data: DataSystem,
     player: Player,
     particles: ParticleSystem,
@@ -27,7 +27,7 @@ pub const DemoState = struct {
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
 
-    pub fn init(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !DemoState {
+    pub fn init(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
         const player = try Player.spawn(&data);
@@ -45,19 +45,19 @@ pub const DemoState = struct {
         };
     }
 
-    pub fn deinit(self: *DemoState) void {
+    pub fn deinit(self: *GameDemoState) void {
         self.particles.deinit();
         self.data.deinit();
     }
 
-    pub fn handleEvent(self: *DemoState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+    pub fn handleEvent(self: *GameDemoState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
         _ = self;
         _ = event;
         _ = transitions;
         return false;
     }
 
-    pub fn update(self: *DemoState, context: UpdateContext) !void {
+    pub fn update(self: *GameDemoState, context: UpdateContext) !void {
         _ = context.transitions;
         try self.player.applyInput(&self.data, context.input);
         _ = movement_system.update(&self.data, context.thread_system, context.delta_seconds, .{});
@@ -66,7 +66,7 @@ pub const DemoState = struct {
         _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
     }
 
-    pub fn render(self: *DemoState, context: RenderContext) !void {
+    pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
         for (self.test_squares) |entity| {
             try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
@@ -81,12 +81,12 @@ pub const DemoState = struct {
         }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, -1);
     }
 
-    pub fn onPause(self: *DemoState) void {
+    pub fn onPause(self: *GameDemoState) void {
         movement_system.syncPreviousPositions(&self.data);
         self.particles.syncPreviousPositions();
     }
 
-    fn emitPlayerTrail(self: *DemoState) void {
+    fn emitPlayerTrail(self: *GameDemoState) void {
         const body = self.data.movementBodyConst(self.player.entity) orelse return;
         const position = body.position;
         _ = self.particles.emitBurst(.{
@@ -188,7 +188,7 @@ const TestSquareSpec = struct {
 };
 
 test "demo spawns colored moving test squares" {
-    var demo = try DemoState.init(std.testing.allocator, 800, 450);
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + 1), demo.data.movementBodySliceConst().entities.len);

@@ -88,7 +88,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
 - `src/app/` contains SDL app coordination, input routing, timing, pause policy, frame pacing, thread system, and state stack flow.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and debug overlay rendering.
-- `src/game/` contains game/application states such as the temporary demo and pause overlay.
+- `src/game/` contains game/application states such as `GameDemoState` and the pause overlay.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
 - `src/assets/` contains runtime asset path resolution, installed-file loading, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
