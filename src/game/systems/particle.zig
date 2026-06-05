@@ -166,11 +166,13 @@ pub const ParticleSystem = struct {
     end_color_b: HotF32List = .empty,
     end_color_a: HotF32List = .empty,
     layers: std.ArrayList(i32) = .empty,
+    grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator, system_config: ParticleSystemConfig) !ParticleSystem {
         var self = ParticleSystem{
             .allocator = allocator,
             .capacity = system_config.capacity,
+            .grain_tuner = AdaptiveGrainTuner.init(.{}),
         };
         errdefer self.deinit();
         try self.reserveStorage(system_config.capacity);
@@ -344,7 +346,11 @@ pub const ParticleSystem = struct {
             .particles = particles,
             .delta_seconds = delta_seconds,
         };
-        const grain_size = if (update_config.grain_tuner) |tuner|
+        const active_tuner = if (update_config.grain_size == null)
+            update_config.grain_tuner orelse &self.grain_tuner
+        else
+            null;
+        const grain_size = if (active_tuner) |tuner|
             tuner.grainSize(active_before, particle_range_alignment_items)
         else
             update_config.grain_size;
@@ -355,7 +361,7 @@ pub const ParticleSystem = struct {
             .range_alignment_items = particle_range_alignment_items,
             .adaptive = update_config.adaptive,
         });
-        if (update_config.grain_tuner) |tuner| {
+        if (active_tuner) |tuner| {
             tuner.record(batch);
         }
         const removed = self.removeExpiredSwap();
@@ -840,6 +846,63 @@ test "threaded particle update matches serial update" {
     try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(particle_range_alignment_items, stats.batch.grain_size);
     try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
+}
+
+test "particle explicit grain bypasses tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
+    defer particles.deinit();
+    fillParticles(&particles, particle_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    var grain_tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = particle_range_alignment_items * 2,
+        .min_grain_size = particle_range_alignment_items,
+        .max_grain_size = particle_range_alignment_items * 4,
+    });
+    const stats = particles.update(&threads, 0.25, .{
+        .min_parallel_items = 1,
+        .grain_size = particle_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .grain_tuner = &grain_tuner,
+    });
+
+    try std.testing.expectEqual(particle_range_alignment_items, stats.batch.grain_size);
+    try std.testing.expectEqual(@as(usize, 0), grain_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(u64, 0), grain_tuner.report().best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(usize, 0), particles.grain_tuner.report().sample_count);
+}
+
+test "particle system owns tuner for default update" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
+    defer particles.deinit();
+    fillParticles(&particles, particle_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    const stats = particles.update(&threads, 0.25, .{
+        .min_parallel_items = 1,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), particles.grain_tuner.report().sample_count);
 }
 
 test "particle range only writes assigned rows" {

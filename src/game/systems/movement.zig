@@ -25,7 +25,42 @@ pub const MovementStats = struct {
     batch: thread_mod.BatchStats = .{},
 };
 
+pub const Runtime = struct {
+    grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
+
+    pub fn init() Runtime {
+        return .{ .grain_tuner = AdaptiveGrainTuner.init(.{}) };
+    }
+
+    pub fn update(
+        self: *Runtime,
+        data: *DataSystem,
+        thread_system: *ThreadSystem,
+        delta_seconds: f32,
+        config: MovementConfig,
+    ) MovementStats {
+        var runtime_config = config;
+        if (runtime_config.grain_size == null and runtime_config.grain_tuner == null) {
+            runtime_config.grain_tuner = &self.grain_tuner;
+        }
+        return movementUpdate(data, thread_system, delta_seconds, runtime_config);
+    }
+
+    pub fn syncPreviousPositions(_: *Runtime, data: *DataSystem) void {
+        movementSyncPreviousPositions(data);
+    }
+};
+
 pub fn update(
+    data: *DataSystem,
+    thread_system: *ThreadSystem,
+    delta_seconds: f32,
+    config: MovementConfig,
+) MovementStats {
+    return movementUpdate(data, thread_system, delta_seconds, config);
+}
+
+fn movementUpdate(
     data: *DataSystem,
     thread_system: *ThreadSystem,
     delta_seconds: f32,
@@ -38,7 +73,8 @@ pub fn update(
         .slice = slice,
         .delta_seconds = delta_seconds,
     };
-    const grain_size = if (config.grain_tuner) |tuner|
+    const active_tuner = if (config.grain_size == null) config.grain_tuner else null;
+    const grain_size = if (active_tuner) |tuner|
         tuner.grainSize(slice.entities.len, data_mod.movement_range_alignment_items)
     else
         config.grain_size;
@@ -49,7 +85,7 @@ pub fn update(
         .range_alignment_items = data_mod.movement_range_alignment_items,
         .adaptive = config.adaptive,
     });
-    if (config.grain_tuner) |tuner| {
+    if (active_tuner) |tuner| {
         tuner.record(batch);
     }
     return .{
@@ -64,6 +100,10 @@ pub fn updateSerial(data: *DataSystem, delta_seconds: f32) void {
 }
 
 pub fn syncPreviousPositions(data: *DataSystem) void {
+    movementSyncPreviousPositions(data);
+}
+
+fn movementSyncPreviousPositions(data: *DataSystem) void {
     var slice = data.movementBodySlice();
     for (0..slice.entities.len) |index| {
         slice.previous_x[index] = slice.position_x[index];
@@ -211,6 +251,63 @@ test "threaded movement matches serial movement" {
     try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(data_mod.movement_range_alignment_items, stats.batch.grain_size);
     try expectMovementDataApproxEqual(&threaded_data, &serial_data);
+}
+
+test "movement explicit grain bypasses tuner" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try fillMovementData(&data, data_mod.movement_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = data_mod.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    var grain_tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = data_mod.movement_range_alignment_items * 2,
+        .min_grain_size = data_mod.movement_range_alignment_items,
+        .max_grain_size = data_mod.movement_range_alignment_items * 4,
+    });
+    const stats = update(&data, &threads, 0.5, .{
+        .min_parallel_items = 1,
+        .grain_size = data_mod.movement_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .grain_tuner = &grain_tuner,
+    });
+
+    try std.testing.expectEqual(data_mod.movement_range_alignment_items, stats.batch.grain_size);
+    try std.testing.expectEqual(@as(usize, 0), grain_tuner.report().sample_count);
+    try std.testing.expectEqual(@as(u64, 0), grain_tuner.report().best_mean_batch_duration_ns);
+}
+
+test "movement runtime owns tuner for default update" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try fillMovementData(&data, data_mod.movement_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = data_mod.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    var runtime = Runtime.init();
+    const stats = runtime.update(&data, &threads, 0.5, .{
+        .min_parallel_items = 1,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), runtime.grain_tuner.report().sample_count);
 }
 
 test "movement range only writes assigned items" {

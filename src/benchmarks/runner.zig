@@ -26,9 +26,15 @@ pub fn main(init: std.process.Init) !void {
         try parsed_args.append(init.gpa, arg);
     }
 
-    const options = suite.parseOptions(parsed_args.items) catch |err| {
-        suite.printUsage();
-        return err;
+    const options = suite.parseOptions(parsed_args.items) catch |err| switch (err) {
+        error.HelpRequested => {
+            suite.printUsage();
+            return;
+        },
+        else => {
+            suite.printUsage();
+            return err;
+        },
     };
 
     try suite.runAll(init.gpa, init.io, &benchmark_groups, options);

@@ -12,7 +12,6 @@ const Player = @import("player.zig").Player;
 const movement_system = @import("systems/movement.zig");
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const state_mod = @import("../app/state.zig");
-const AdaptiveGrainTuner = @import("../app/thread_system.zig").AdaptiveGrainTuner;
 const RenderContext = state_mod.RenderContext;
 const StateTransitions = state_mod.StateTransitions;
 const UpdateContext = state_mod.UpdateContext;
@@ -23,9 +22,8 @@ const test_square_count = 4;
 pub const GameDemoState = struct {
     data: DataSystem,
     player: Player,
+    movement: movement_system.Runtime,
     particles: ParticleSystem,
-    movement_grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
-    particle_grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
     test_squares: [test_square_count]EntityId,
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
@@ -41,9 +39,8 @@ pub const GameDemoState = struct {
         return .{
             .data = data,
             .player = player,
+            .movement = movement_system.Runtime.init(),
             .particles = particles,
-            .movement_grain_tuner = AdaptiveGrainTuner.init(.{}),
-            .particle_grain_tuner = AdaptiveGrainTuner.init(.{}),
             .test_squares = test_squares,
             .bounds_width = bounds_width,
             .bounds_height = bounds_height,
@@ -65,14 +62,10 @@ pub const GameDemoState = struct {
     pub fn update(self: *GameDemoState, context: UpdateContext) !void {
         _ = context.transitions;
         try self.player.applyInput(&self.data, context.input);
-        _ = movement_system.update(&self.data, context.thread_system, context.delta_seconds, .{
-            .grain_tuner = &self.movement_grain_tuner,
-        });
+        _ = self.movement.update(&self.data, context.thread_system, context.delta_seconds, .{});
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
         self.emitPlayerTrail();
-        _ = self.particles.update(context.thread_system, context.delta_seconds, .{
-            .grain_tuner = &self.particle_grain_tuner,
-        });
+        _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -91,7 +84,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn onPause(self: *GameDemoState) void {
-        movement_system.syncPreviousPositions(&self.data);
+        self.movement.syncPreviousPositions(&self.data);
         self.particles.syncPreviousPositions();
     }
 

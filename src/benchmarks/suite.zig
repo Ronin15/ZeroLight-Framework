@@ -321,6 +321,9 @@ pub fn parseOptions(args: []const []const u8) !Options {
             return error.InvalidArgument;
         }
     }
+    if (options.case_filter) |filter| {
+        if (findBenchmarkCase(filter) == null) return error.InvalidArgument;
+    }
     return options;
 }
 
@@ -333,7 +336,7 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
 
             for (default_cases) |case| {
                 if (options.case_filter) |filter| {
-                    if (!std.mem.eql(u8, filter, case.name)) continue;
+                    if (!std.mem.eql(u8, filter, case.name) and !shouldIncludeBaselineForFilter(filter, case)) continue;
                 }
                 const stats = try group.runCase(allocator, io, options, case, item_count);
                 results[result_count] = .{ .case = case, .stats = stats };
@@ -415,6 +418,17 @@ fn parsePositiveUsize(value: []const u8) !usize {
 fn stripPrefix(value: []const u8, prefix: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, value, prefix)) return null;
     return value[prefix.len..];
+}
+
+fn findBenchmarkCase(name: []const u8) ?BenchmarkCase {
+    for (default_cases) |case| {
+        if (std.mem.eql(u8, name, case.name)) return case;
+    }
+    return null;
+}
+
+fn shouldIncludeBaselineForFilter(filter: []const u8, case: BenchmarkCase) bool {
+    return !std.mem.eql(u8, filter, "serial-direct") and std.mem.eql(u8, case.name, "serial-direct");
 }
 
 fn printHeader(options: Options) void {
@@ -855,6 +869,17 @@ test "benchmark options parse scaling and filtering arguments" {
 test "benchmark options reject zero iterations" {
     const args = [_][]const u8{ "--iterations", "0" };
     try std.testing.expectError(error.InvalidArgument, parseOptions(&args));
+}
+
+test "benchmark options reject unknown case filter" {
+    const args = [_][]const u8{ "--case", "does-not-exist" };
+    try std.testing.expectError(error.InvalidArgument, parseOptions(&args));
+}
+
+test "benchmark case filter includes serial baseline for non-serial cases" {
+    try std.testing.expect(shouldIncludeBaselineForFilter("thread-adaptive", default_cases[0]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("serial-direct", default_cases[0]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive", default_cases[5]));
 }
 
 test "grain tuning summary preserves settled phase" {

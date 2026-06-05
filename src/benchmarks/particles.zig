@@ -121,11 +121,17 @@ fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suit
 
     return particles.update(thread_system.?, delta_seconds, .{
         .min_parallel_items = 1,
-        .grain_size = case.grainSize(particle_mod.particle_range_alignment_items),
+        .grain_size = benchmarkGrainSize(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .grain_tuner = grain_tuner,
     }).batch;
+}
+
+fn benchmarkGrainSize(case: suite.BenchmarkCase) ?usize {
+    if (case.tuned_grain) return case.grainSize(particle_mod.particle_range_alignment_items);
+    return case.grainSize(particle_mod.particle_range_alignment_items) orelse
+        suite.alignItemCount(suite.default_grain_size, particle_mod.particle_range_alignment_items);
 }
 
 fn benchmarkTunerConfig(range_alignment_items: usize) thread_mod.AdaptiveGrainTunerConfig {
@@ -155,6 +161,15 @@ test "particle benchmark tiny inline case runs without display" {
     const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[1], 16_384);
     try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
     try std.testing.expect(stats.batch.ran_inline);
+}
+
+test "particle benchmark fixed cases use explicit grain controls" {
+    try std.testing.expectEqual(
+        suite.alignItemCount(suite.default_grain_size, particle_mod.particle_range_alignment_items),
+        benchmarkGrainSize(suite.default_cases[4]).?,
+    );
+    try std.testing.expectEqual(@as(?usize, null), benchmarkGrainSize(suite.default_cases[6]));
+    try std.testing.expectEqual(suite.default_cases[7].grainSize(particle_mod.particle_range_alignment_items).?, benchmarkGrainSize(suite.default_cases[7]).?);
 }
 
 test "particle benchmark fixture keeps long-lived particles active after update" {
