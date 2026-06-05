@@ -551,8 +551,13 @@ Current foundation:
 - `src/core/simd.zig` provides portable vector helpers.
 - `MovementSystem` integrates movement-body SoA columns through a serial path or
   `ThreadSystem.parallelForWithOptions`.
+- `ParticleSystem` owns a state-local fixed-capacity transient SoA pool and
+  updates particle rows through a serial path or
+  `ThreadSystem.parallelForWithOptions`.
 - `DemoState` spawns a few colored moving square entities so the processor has
   visible non-player runtime coverage.
+- `DemoState` emits and renders transient particle rectangles through its state
+  update/render functions.
 
 Performance notes:
 
@@ -587,30 +592,35 @@ First system shape:
 - `MovementSystem` must not create, destroy, add, or remove entities/components
   inside worker ranges. Any structural change needed by future systems should be
   deferred to a later command-buffer design.
-- The first implementation proves the movement system contract before broadening
-  into AI, collision, pathfinding, or render-prep processors.
+- `ParticleSystem` is a state-owned transient effect system rather than a
+  `DataSystem` entity processor. It keeps emission and expired row swap-removal
+  on the main thread, while worker ranges only mutate assigned particle rows.
+- These implementations prove the threaded/SIMD system contract before
+  broadening into AI, collision, pathfinding, or render-prep processors.
 
 Checklist:
 
-- [x] Define systems as data processors that accept `DataSystem`, `ThreadSystem`,
-      and fixed-step delta time rather than owning persistent data.
+- [x] Define ECS systems as data processors that accept `DataSystem`,
+      `ThreadSystem`, and fixed-step delta time; document `ParticleSystem` as
+      the state-owned transient effect exception.
 - [x] Add a movement processor that splits dense SoA slices through
       `parallelFor`.
-- [ ] Add particle processors that split dense SoA slices through `parallelFor`.
+- [x] Add particle processors that split dense SoA slices through `parallelFor`.
 - [x] Wire `MovementSystem` through `ThreadSystem.parallelFor` with a serial path
       for small counts and deterministic tests.
 - [x] Use SIMD inside each worker range and scalar-tail code for remainder
       elements.
 - [x] Add an explicit alignment strategy for hot SoA columns before introducing
       wider or target-specific vector loads.
-- [ ] Audit thread-shared processor data for false sharing and add 64-byte
+- [x] Audit thread-shared processor data for false sharing and add 64-byte
       padding only where concurrent writes justify it.
 - [x] Ensure worker jobs write only to assigned disjoint ranges.
 - [x] Ensure worker ranges avoid sharing writable cache lines in hot SoA columns.
-- [ ] Keep state transitions, entity creation/removal, SDL calls, GPU calls,
+- [x] Keep state transitions, entity creation/removal, SDL calls, GPU calls,
       asset loading, and save/load streaming on the main thread.
-- [ ] Merge any per-worker output, event counts, or deferred structural changes
-      on the main thread after the batch completes.
+- [x] Keep particle expired-row removal on the main thread after the worker
+      batch completes. Future systems that produce per-worker output buffers
+      will need an explicit deterministic merge step.
 - [x] Keep normal 60Hz update paths allocation-free after initialization.
 
 Acceptance checks:
@@ -622,17 +632,18 @@ Acceptance checks:
       `ThreadSystem.parallelFor` path.
 - [x] Worker jobs do not write outside their assigned `ParallelRange`.
 - [x] Hot SoA columns used by SIMD processors have documented alignment behavior.
-- [ ] Thread-shared processor records that are concurrently written are either
+- [x] Thread-shared processor records that are concurrently written are either
       disjoint by design or padded/aligned to avoid false sharing.
 - [x] Update processors perform no allocations during steady-state simulation.
 - [x] Fixed-step update order remains deterministic: later systems always see
       completed output from earlier systems.
 
-Movement pass landed: the demo maps player input to movement velocity, runs
-`MovementSystem` once over all movement bodies, and then applies player-only
-bounds clamping. A few colored moving squares are spawned as non-player
-processor coverage. Particle processors, per-worker output merging, and broader
-system expansion remain future Slice 11 work.
+Movement and particle passes landed: the demo maps player input to movement
+velocity, runs `MovementSystem` once over all movement bodies, applies
+player-only bounds clamping, emits a small particle trail, updates particles,
+and renders transient particle rectangles. A few colored moving squares remain
+as non-player movement processor coverage. AI, collision, pathfinding, and
+parallel render-prep processors remain future Slice 11 work.
 
 ## Suggested Order
 

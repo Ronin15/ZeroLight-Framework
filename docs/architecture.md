@@ -25,6 +25,8 @@ behavior under `src/game/`.
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges.
+- `src/game/systems/particle.zig` owns state-local transient particle effects
+  in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
 - `src/assets/assets.zig` resolves safe runtime asset paths, and `src/assets/cache.zig` caches renderer-backed runtime assets.
 - `src/core/` contains small shared helpers such as math primitives and portable SIMD aliases.
@@ -117,6 +119,12 @@ The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Future enemies and other world
 objects should normally be plain entities processed by enemy, movement,
 collision, AI, or render systems rather than copies of player behavior.
+
+`ParticleSystem` is the current transient visual-effect exception. It is owned
+by the game state instead of `DataSystem`, because particles are short-lived
+effect rows rather than persistent world entities. Particle emission and expired
+row swap-removal run on the state/main thread; threaded jobs only update
+assigned SoA ranges and render submits rectangles through `Renderer`.
 
 ## SIMD Helpers
 

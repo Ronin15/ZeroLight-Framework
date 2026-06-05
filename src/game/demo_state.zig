@@ -10,6 +10,7 @@ const DataSystem = data_mod.DataSystem;
 const EntityId = data_mod.EntityId;
 const Player = @import("player.zig").Player;
 const movement_system = @import("systems/movement.zig");
+const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const state_mod = @import("../app/state.zig");
 const RenderContext = state_mod.RenderContext;
 const StateTransitions = state_mod.StateTransitions;
@@ -21,6 +22,7 @@ const test_square_count = 4;
 pub const DemoState = struct {
     data: DataSystem,
     player: Player,
+    particles: ParticleSystem,
     test_squares: [test_square_count]EntityId,
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
@@ -30,10 +32,13 @@ pub const DemoState = struct {
         errdefer data.deinit();
         const player = try Player.spawn(&data);
         const test_squares = try spawnTestSquares(&data);
+        var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
+        errdefer particles.deinit();
 
         return .{
             .data = data,
             .player = player,
+            .particles = particles,
             .test_squares = test_squares,
             .bounds_width = bounds_width,
             .bounds_height = bounds_height,
@@ -41,6 +46,7 @@ pub const DemoState = struct {
     }
 
     pub fn deinit(self: *DemoState) void {
+        self.particles.deinit();
         self.data.deinit();
     }
 
@@ -56,6 +62,8 @@ pub const DemoState = struct {
         try self.player.applyInput(&self.data, context.input);
         _ = movement_system.update(&self.data, context.thread_system, context.delta_seconds, .{});
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
+        self.emitPlayerTrail();
+        _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
     }
 
     pub fn render(self: *DemoState, context: RenderContext) !void {
@@ -63,6 +71,7 @@ pub const DemoState = struct {
         for (self.test_squares) |entity| {
             try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
         }
+        try self.particles.render(context.renderer, context.interpolation_alpha);
         try self.player.render(&self.data, context.renderer, context.interpolation_alpha);
         try context.renderer.drawRect(.{
             .x = 0,
@@ -74,6 +83,26 @@ pub const DemoState = struct {
 
     pub fn onPause(self: *DemoState) void {
         movement_system.syncPreviousPositions(&self.data);
+        self.particles.syncPreviousPositions();
+    }
+
+    fn emitPlayerTrail(self: *DemoState) void {
+        const body = self.data.movementBodyConst(self.player.entity) orelse return;
+        const position = body.position;
+        _ = self.particles.emitBurst(.{
+            .count = 2,
+            .position = .{ .x = position.x + 16, .y = position.y + 16 },
+            .base_velocity = .{ .x = -24, .y = -36 },
+            .velocity_step = .{ .x = 48, .y = -4 },
+            .acceleration = .{ .x = 0, .y = 80 },
+            .lifetime = 0.55,
+            .lifetime_step = 0.04,
+            .start_size = 7,
+            .end_size = 1,
+            .start_color = .{ .r = 1.0, .g = 0.78, .b = 0.28, .a = 0.85 },
+            .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
+            .layer = 0,
+        });
     }
 };
 
@@ -163,6 +192,7 @@ test "demo spawns colored moving test squares" {
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + 1), demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, data_mod.component_masks.movement_body | data_mod.component_masks.primitive_visual));
         const body = demo.data.movementBodyConst(entity).?;

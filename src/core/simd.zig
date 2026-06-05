@@ -39,6 +39,14 @@ pub fn storeFloat4(values: *[lane_count]f32, vector: Float4) void {
     values.* = toFloatArray(vector);
 }
 
+pub fn storeFloat4Slice(values: []f32, vector: Float4) void {
+    std.debug.assert(values.len >= lane_count);
+    const stored = toFloatArray(vector);
+    inline for (0..lane_count) |index| {
+        values[index] = stored[index];
+    }
+}
+
 pub fn storeInt4(values: *[lane_count]i32, vector: Int4) void {
     values.* = toIntArray(vector);
 }
@@ -176,6 +184,11 @@ test "float load store and conversion keep stable lane order" {
     var stored: [lane_count]f32 = undefined;
     storeFloat4(&stored, vector);
     try expectFloatArrayApprox(stored, source);
+
+    var stored_slice = [_]f32{ 0, 0, 0, 0, 99 };
+    storeFloat4Slice(stored_slice[0..], vector);
+    try expectFloatArrayApprox(stored_slice[0..lane_count].*, source);
+    try std.testing.expectEqual(@as(f32, 99), stored_slice[lane_count]);
 }
 
 test "int load store and conversion keep stable lane order" {
