@@ -9,7 +9,7 @@ Use this guidance for lean Zig SDL3/SDL_GPU 2D game projects. Treat the codebase
 - `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
 - `src/app/` owns SDL3 app coordination, input, timing, frame pacing, pause policy, and state stack flow.
 - `src/render/` owns SDL_GPU rendering, camera transforms, renderer resources, text, FPS counter, and debug overlay rendering.
-- `src/game/` owns game/application states such as the demo state, pause state, and gameplay-specific behavior.
+- `src/game/` owns game/application states, `DataSystem`, gameplay-specific behavior, and ECS-style gameplay systems/processors.
 - `src/platform/` owns SDL/platform integration helpers and GPU smoke-test implementation.
 - `src/assets/` owns runtime asset path resolution and installed asset lookup.
 - `src/core/` owns small shared helpers such as math primitives.
@@ -65,3 +65,28 @@ Use Zig `test` blocks and `std.testing`. Put reusable module tests beside the co
 Prefer tests that validate contracts directly: input routing behavior, state policy flow, resource ID validation, viewport math, descriptor validation, or timing decisions. Do not require a window for ordinary unit tests.
 
 Use an aggregate test root when nested imports would otherwise cross module paths. Keep GPU smoke checks separate from non-interactive unit behavior because they require a usable display and GPU backend.
+
+## ECS And Data Processing
+
+Treat `DataSystem` as the persistent gameplay data owner and ECS storage
+foundation. It owns entity IDs, component masks, and dense typed SoA component
+stores. Do not make app, render, SDL/GPU, input-frame, thread-system, or
+transient event services persistent fields of `DataSystem`.
+
+Gameplay systems are processors over `DataSystem`, not owners of persistent
+gameplay data. Movement, AI, collision, pathfinding, and render preparation
+should borrow `DataSystem` slices and any required runtime services, run in a
+deterministic order, and complete before later systems consume their output.
+
+Hot processors should iterate dense SoA columns directly. Component masks are
+for membership/query decisions; they should not turn hot loops into dynamic
+component joins, string lookup, or hash-map dispatch. Threaded/SIMD processors
+must keep structural entity changes, state transitions, SDL/GPU calls, asset
+loading, save/load streaming, and renderer resource ownership behind an explicit
+deferred or main-thread boundary.
+
+For threaded/SIMD ECS work, treat cache-line behavior as part of the contract.
+Document hot SoA column alignment before relying on wider or target-specific
+loads, choose worker ranges so workers do not write the same cache line, and use
+64-byte padding only for concurrently written thread-shared records where false
+sharing is a real risk. Do not pad cold entity slot metadata by default.

@@ -26,7 +26,7 @@ Place code in the layer that owns the behavior:
 - `src/main.zig`: executable entry and high-level fixed-step timing loop only.
 - `src/app/`: engine coordination, state stack, input routing, pause policy, timing, and frame pacing.
 - `src/render/`: SDL_GPU renderer, camera, resources, text, and debug overlay.
-- `src/game/`: game/demo states and gameplay behavior.
+- `src/game/`: game/demo states, gameplay behavior, `DataSystem`, and ECS-style gameplay systems/processors.
 - `src/platform/`: SDL/platform integration helpers and smoke-test implementation.
 - `src/assets/`: runtime asset path resolution and installed asset loading.
 - `src/core/`: small shared primitives only.
@@ -54,6 +54,10 @@ asset loading, state transitions, configuration, or an explicit cache.
 
 - Keep hot paths allocation-free unless the allocation is measured, bounded, and intentionally isolated.
 - Prefer enums, bitsets, arrays, slices, direct indices, ring buffers, and generational IDs for runtime dispatch and resource lookup.
+- Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation. Entity IDs, component masks, and dense typed SoA component stores live there; ECS systems/processors such as movement, AI, collision, pathfinding, and render preparation should be mostly stateless processors over `DataSystem` slices.
+- Keep hot ECS component data in dense SoA columns. Component masks are for membership/query decisions, not a replacement for direct slice iteration in hot processors.
+- Keep entity structural changes, state transitions, SDL/GPU calls, asset loading, save/load streaming, and renderer resource ownership out of threaded SIMD processors unless an explicit deferred/main-thread boundary is designed.
+- For threaded/SIMD ECS work, document hot SoA column alignment, split worker ranges so workers do not write the same cache line, and use 64-byte padding only for thread-shared records where false sharing is a real risk. Do not pad cold entity slot metadata by default.
 - Avoid string-key lookup, hash-map dispatch, broad dynamic dispatch, callback chains, repeated descriptor validation, and formatted logging in hot paths unless justified by measured behavior.
 - Preserve fixed-step simulation with varying-refresh rendering; do not add broad frame-rate caps that harm high-refresh displays.
 - Keep renderer-facing data prepared, batchable, and handle-based rather than reconstructing resources or lookup state each frame.

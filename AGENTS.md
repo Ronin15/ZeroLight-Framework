@@ -18,7 +18,7 @@ Use the existing docs as source of truth for deeper details:
 - `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
 - `src/app/` owns SDL app coordination, input, time loop, frame pacing, pause policy, state stack flow, and the thread system.
 - `src/render/` owns SDL_GPU rendering, camera transforms, renderer resources, text, FPS/debug overlay, and frame submission.
-- `src/game/` owns game/application states and gameplay behavior such as the demo state, pause state, and player.
+- `src/game/` owns game/application states, gameplay behavior, `DataSystem`, and ECS-style gameplay systems/processors.
 - `src/platform/` owns SDL C imports, small platform wrappers, and GPU smoke-test implementation.
 - `src/assets/` owns runtime asset path resolution and safe installed asset loading.
 - `src/core/` owns small shared helpers such as math primitives.
@@ -37,6 +37,17 @@ Add new code under the matching owner directory. Keep executable-only code near
 - Game states draw through `Renderer`; keep SDL_GPU device, swapchain, shader, texture, and command submission details in render/platform layers.
 - Map raw input to named actions. Keep held gameplay input in `InputState` separate from one-frame app commands in `FrameCommands`.
 - Let stack policies decide whether lower states receive update, input, or render passes.
+- Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation:
+  entity IDs, component masks, and dense typed SoA component stores live there.
+- Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
+  render preparation as mostly stateless processors over `DataSystem` slices;
+  they borrow data and services, but do not own persistent gameplay state.
+- Keep hot ECS component data in dense SoA columns. Component masks are for
+  membership/query decisions, not a replacement for direct slice iteration in
+  hot processors.
+- Keep state transitions, entity structural changes, SDL/GPU calls, asset
+  loading, save/load streaming, and renderer resource ownership out of threaded
+  SIMD processors unless an explicit deferred/main-thread boundary is designed.
 - Keep debug UI state in the debug overlay path, not in gameplay state.
 - Keep runtime asset paths relative and traversal-safe.
 - Use core SDL3 PNG loading for textures. Do not add `SDL3_image` unless that dependency is explicitly chosen.
@@ -46,6 +57,11 @@ Add new code under the matching owner directory. Keep executable-only code near
   input dispatch, render submission, asset lookup, and text/debug overlay.
 - Prefer allocation-free hot paths with enums, bitsets, arrays, slices, direct
   indices, prepared resources, and stable handles.
+- For threaded/SIMD ECS work, treat cache-line behavior as part of correctness:
+  document hot SoA column alignment, split worker ranges so workers do not write
+  the same cache line, and use 64-byte padding only for thread-shared records
+  where false sharing is a real risk. Do not pad cold entity slot metadata by
+  default.
 - Avoid per-frame string lookup, hash-map dispatch, dynamic dispatch, resource
   churn, formatted logging, and broad frame-rate caps unless measured and
   justified.
