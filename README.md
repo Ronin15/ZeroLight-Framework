@@ -1,25 +1,49 @@
 # Zig SDL3 GPU 2D Game
 
-A Zig 0.16.0 + SDL3 project for SDL_GPU-first 2D games.
+A performance-focused Zig 0.16.0 + SDL3/SDL_GPU 2D game project.
 
-The project uses SDL3 for windowing, input, core PNG loading, and GPU rendering.
-It builds target-native shaders at build time and renders through SDL_GPU.
+The project keeps SDL_GPU at the center of rendering, uses SDL3 for windowing,
+input, text, and core PNG loading, and builds target-native shaders as part of
+the Zig build. It is structured as a lean framework for deterministic state
+flow, fixed-step gameplay, high-refresh rendering, safe runtime assets, and
+data-oriented update systems.
 
 ## Features
 
-- 2D game structure with app, game, render, asset, and platform layers
-- SDL_GPU-first rendering with sprites, primitive rectangles, batching, and shader build steps
-- 1280x720 logical game coordinates with resizable, high-DPI, aspect-preserving fit presentation
-- Fixed-step 60Hz simulation with interpolated rendering for high-refresh displays
-- State-stack flow for gameplay screens, modal overlays, and pause behavior
-- Policy-based input routing for gameplay, app commands, UI, and debug actions
-- State-owned `DataSystem` storage with a SIMD-aware movement processor
-- State-owned transient particles with fixed-capacity SoA storage and SIMD/threaded update
-- Runtime asset loading from the installed asset directory with safe relative paths
-- Asset-backed SDL3_ttf text rendering with cached renderer textures
-- Linux and macOS shader pipeline: SPIR-V on Linux, Metal shaders on macOS
-- Development workflow with `run`, `dev`, `test`, `check`, `verify`, `gpu-smoke`, and `package`
+### SDL_GPU Rendering
+
+- SDL_GPU-first sprite and rectangle rendering through a game-facing `Renderer`
+- Batched sprite commands with stable layer/submission ordering and renderer-owned GPU resources
+- Generational `TextureId` handles so stale or destroyed texture IDs are rejected deterministically
+- 1280x720 logical coordinates with resizable, high-DPI, aspect-preserving presentation
+- Build-time shader output for supported targets: SPIR-V on Linux and Metal shaders on macOS
+
+### Runtime Flow
+
+- Fixed-step 60Hz gameplay updates with interpolated rendering for high-refresh displays
+- State-stack flow for gameplay screens, modal overlays, pause behavior, and transition ordering
+- Named input routing that separates held gameplay actions from one-frame app and debug commands
+- Visibility-aware frame pacing so hidden or minimized windows do not keep advancing gameplay
+
+### Performance-Focused Systems
+
+- Pre-spawned worker threads for synchronous `parallelFor` CPU batches
+- Main-thread participation in worker batches without creating threads during gameplay frames
+- State-owned `DataSystem` with dense SoA storage for persistent gameplay data
+- SIMD-aware movement processor over aligned SoA columns with serial and threaded paths
+- Fixed-capacity particle system with SoA storage, SIMD updates, threaded ranges, and no steady-state allocation
+
+### Assets, Text, And Debugging
+
+- Runtime asset loading from the installed asset directory with traversal-safe relative paths
+- Cached PNG texture leases backed by SDL3 core PNG loading
+- Asset-backed SDL3_ttf text service with cached renderer textures
 - Optional F2 FPS overlay for local debugging
+
+Technical details live in the docs:
+[architecture](docs/architecture.md),
+[state stack and input](docs/state-stack-and-input.md), and
+[rendering, assets, and shaders](docs/rendering-assets-shaders.md).
 
 ## Requirements
 
@@ -49,21 +73,20 @@ zig build dev
 `zig build dev` compiles shaders, installs assets, builds the executable, and
 runs the app.
 
-## Logical Resolution
+## Runtime Shape
 
 The app starts as a resizable, high-pixel-density SDL window with a 1280x720
-logical game size. The default presentation mode is aspect-preserving fit:
-gameplay and logical UI keep their proportions, and letterbox or pillarbox bars
-use the configured clear color.
+logical game size. The renderer recomputes presentation from the acquired
+SDL_GPU drawable size each submitted frame, so world and logical UI drawing stay
+in game coordinates while debug overlays can use raw drawable pixels.
 
-SDL_GPU swapchain textures can be larger than the window on high-DPI displays.
-The renderer recomputes presentation from the acquired drawable size every
-submitted frame. World and logical draws use logical coordinates; drawable
-overlays use raw swapchain pixels.
+The main loop stays timing-centric. SDL events, input routing, pause policy,
+state dispatch, fixed updates, interpolation, rendering, assets, text, and worker
+batches are coordinated through `src/app/`, `src/render/`, and `src/game/`.
 
-Integer-fit presentation is intended for strict pixel scaling. When enabled, the
-app requests a minimum SDL window size equal to the logical size so user resizing
-does not normally crop the game below 1x scale.
+See [architecture](docs/architecture.md) and
+[rendering, assets, and shaders](docs/rendering-assets-shaders.md) for the full
+frame flow and rendering model.
 
 ## Commands
 
@@ -88,7 +111,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
 - `src/app/` contains SDL app coordination, input routing, timing, pause policy, frame pacing, thread system, and state stack flow.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and debug overlay rendering.
-- `src/game/` contains game/application states such as `GameDemoState` and the pause overlay.
+- `src/game/` contains game/application states, gameplay data, and ECS-style processors.
 - `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
 - `src/assets/` contains runtime asset path resolution, installed-file loading, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
