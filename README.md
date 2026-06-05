@@ -1,11 +1,23 @@
 # Zig SDL3 GPU 2D Game
 
-A performance-focused Zig 0.16.0 + SDL3/SDL_GPU 2D game project with an
-SDL_GPU renderer, deterministic game loop, state stack, runtime asset services,
-and multi-threaded data-oriented gameplay systems.
+A performance-focused Zig 0.16.0 + SDL3/SDL_GPU 2D game project built around
+explicit systems, deterministic frame flow, and testable game-framework
+contracts.
+
+Zig is part of the architecture here: `build.zig` owns the development loop,
+shader generation, asset installation, unit tests, compile checks, GPU smoke
+checks, and packaging. Testable framework logic carries inline Zig tests beside
+the code it verifies, then `src/tests.zig` collects those modules into one fast
+suite. That gives the project a strong contract layer for input, state flow,
+timing, resources, threading, renderer batching, SIMD helpers, and gameplay
+processors before full-game playtesting takes over.
 
 ## Highlights
 
+- **Zig-native development loop:** `zig build dev`, `zig build test`,
+  `zig build check`, `zig build verify`, shader compilation, asset installation,
+  and packaging all run through the project build. Debug builds stay direct and
+  test-heavy; release modes are explicit.
 - **SDL_GPU-first rendering:** game code draws through a small renderer API while
   GPU device setup, shader loading, batching, texture ownership, and frame
   submission stay in the render layer. The build emits platform shader outputs:
