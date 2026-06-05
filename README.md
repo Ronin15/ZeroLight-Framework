@@ -1,51 +1,36 @@
-# Zig SDL3 GPU 2D Game
+# 2D SDL_GPU Game Framework in Zig
 
-Zig SDL3 GPU 2D Game is a lean real-time 2D project built on Zig 0.16.0,
-SDL3, and SDL_GPU. Games are hard because every frame has to process input,
-advance simulation, manage state, prepare rendering, and stay within a tight
-time budget. This project keeps those responsibilities explicit instead of
-letting them blur together in the main loop.
+This is a lean 2D game framework built with Zig 0.16.0, SDL3, and SDL_GPU. It
+keeps the main loop small while app flow, state/input policy, rendering, assets,
+text, and gameplay data each have clear places in the source tree.
 
-The runtime is organized around a small fixed-step loop, a policy-driven state
-stack, an SDL_GPU sprite renderer, asset-backed text and texture services, and
-gameplay data stored for direct processor iteration. Movement and particle
-systems use dense SoA columns, SIMD paths, and worker-thread batches when there
-is enough work to split.
+The framework includes a fixed-step update loop, policy-driven game
+states, named input actions, an SDL_GPU sprite renderer, safe runtime asset
+loading, SDL3_ttf text, and data-oriented gameplay processors. Focused Zig tests
+cover core runtime behavior, and `zig build gpu-smoke` is available when you
+want to verify SDL_GPU frame submission.
 
-The test suite targets deterministic engine behavior before playtesting takes
-over. It verifies state dispatch and queued transitions, modal input gating,
-resource and cache lifetime, viewport and sprite batch math, thread scheduling,
-worker range splitting, SoA alignment, and SIMD results against scalar updates.
+## What Is Here
 
-## Design Focus
+- **SDL_GPU rendering:** game states draw through `Renderer`; GPU setup,
+  shader loading, texture ownership, batching, and frame submission stay in the
+  render/platform layers.
+- **Fixed-step game flow:** gameplay updates run at 60Hz, rendering interpolates
+  between simulation ticks, and hidden or minimized windows do not keep
+  advancing gameplay.
+- **State and input policy:** `StateStack` handles gameplay screens, overlays,
+  modal states, pause behavior, and queued transitions. Keyboard input maps to
+  named actions for gameplay movement, app commands, and debug commands.
+- **Runtime assets and text:** assets load from traversal-safe relative paths,
+  PNG textures use core SDL3 loading, SDL3_ttf renders asset-backed text, and F2
+  toggles the local FPS overlay.
+- **Gameplay data systems:** `DataSystem` owns persistent entity data in dense
+  stores for direct processor iteration, with movement and particle updates
+  using serial, SIMD, and worker-thread paths where appropriate.
+- **Project checks:** `zig build test` covers app, render, asset, and gameplay
+  behavior. `zig build verify` adds compile coverage and shader compilation.
 
-- **Runtime flow:** `src/main.zig` owns the high-level fixed-step loop, while
-  `Engine` coordinates SDL services, pause/frame visibility policy, input,
-  state dispatch, and rendering. Gameplay updates run at 60Hz and rendering
-  interpolates between simulation ticks.
-- **State and input policy:** `StateStack` owns state lifetimes, queued
-  transitions, overlays, modal screens, opaque screens, and pass-through rules.
-  Raw keyboard input maps to named actions so gameplay input, app commands, and
-  debug commands can be routed by the active state policy.
-- **SDL_GPU rendering:** game code draws through `Renderer`. GPU device setup,
-  swapchain handling, shader loading, texture ownership, batching, presentation,
-  and command submission stay in the rendering layers. Shader builds emit SPIR-V
-  on Linux and Metal shader output on macOS.
-- **Data-oriented processors:** `DataSystem` uses generational entity IDs,
-  component masks, and dense typed SoA stores. Movement and particle processors
-  have serial paths, SIMD paths, and threaded paths that split rows into owned
-  worker ranges.
-- **Tested engine contracts:** `zig build test` exercises app, render, asset,
-  and gameplay modules. The suite checks behavior such as state transition
-  ordering, input gating, stale ID rejection, cache release, viewport math,
-  sprite batch grouping, thread scheduling, and SIMD/scalar equivalence.
-- **Runtime services:** asset paths are relative and traversal-safe, PNG
-  textures load through core SDL3, retained texture leases keep ownership
-  explicit, SDL3_ttf text is asset-backed and cached, scoped Zig logging keeps
-  diagnostics organized, and F2 toggles the local FPS overlay.
-
-For deeper implementation details, see
-[architecture](docs/architecture.md),
+For deeper details, see [architecture](docs/architecture.md),
 [state stack and input](docs/state-stack-and-input.md), and
 [rendering, assets, and shaders](docs/rendering-assets-shaders.md).
 
@@ -68,7 +53,7 @@ zig build
 zig build run
 ```
 
-For the normal edit/run loop:
+For the normal edit and run loop:
 
 ```sh
 zig build dev
@@ -95,14 +80,14 @@ build options, formatting, shader commands, and GPU smoke details.
 
 ## Project Layout
 
-- `build.zig` defines executables, tests, formatting, shader compilation, and install steps.
+- `build.zig` defines executables, tests, formatting, shaders, and install steps.
 - `build.zig.zon` contains project metadata.
-- `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
-- `src/app/` contains SDL app coordination, input routing, timing, pause policy, frame pacing, thread system, and state stack flow.
-- `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and debug overlay rendering.
-- `src/game/` contains game/application states, gameplay data, and ECS-style processors.
-- `src/platform/` contains SDL/platform integration helpers and GPU smoke-test code.
-- `src/assets/` contains runtime asset path resolution, installed-file loading, and cache-backed texture ownership.
+- `src/main.zig` contains the entry point and high-level fixed-step loop.
+- `src/app/` contains SDL coordination, input, timing, pause policy, frame pacing, threads, and state stack flow.
+- `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and the debug overlay.
+- `src/game/` contains game states, gameplay data, and ECS-style processors.
+- `src/platform/` contains SDL/platform helpers and GPU smoke-test code.
+- `src/assets/` contains runtime path resolution, installed-file loading, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
 - `assets/` contains runtime assets, bundled fonts, and shader sources.
 
