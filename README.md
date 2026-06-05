@@ -1,40 +1,46 @@
 # Zig SDL3 GPU 2D Game
 
-A performance-focused Zig 0.16.0 + SDL3/SDL_GPU 2D game project built around
-explicit systems, deterministic frame flow, and testable game-framework
-contracts.
+Zig SDL3 GPU 2D Game is a lean real-time 2D project built on Zig 0.16.0,
+SDL3, and SDL_GPU. The architecture keeps the main loop small and separates app
+coordination, state/input policy, SDL_GPU rendering, asset ownership, and
+gameplay data processing into clear runtime boundaries.
 
-Zig is part of the architecture here: `build.zig` owns the development loop,
-shader generation, asset installation, unit tests, compile checks, GPU smoke
-checks, and packaging. Testable framework logic carries inline Zig tests beside
-the code it verifies, then `src/tests.zig` collects those modules into one fast
-suite. That gives the project a strong contract layer for input, state flow,
-timing, resources, threading, renderer batching, SIMD helpers, and gameplay
-processors before full-game playtesting takes over.
+The project is strongest where engine work usually becomes fragile: fixed-step
+updates, queued state transitions, modal input routing, logical-to-drawable
+presentation, renderer resource identity, sprite batch construction,
+multi-threaded SoA processors, and SIMD/scalar parity. Those behaviors are
+covered by focused Zig tests so refactors can be checked against runtime rules
+before playtesting.
 
-## Highlights
+## Design Focus
 
-- **Zig-native development loop:** `zig build dev`, `zig build test`,
-  `zig build check`, `zig build verify`, shader compilation, asset installation,
-  and packaging all run through the project build. Debug builds stay direct and
-  test-heavy; release modes are explicit.
-- **SDL_GPU-first rendering:** game code draws through a small renderer API while
-  GPU device setup, shader loading, batching, texture ownership, and frame
-  submission stay in the render layer. The build emits platform shader outputs:
-  SPIR-V on Linux and Metal shaders on macOS.
-- **Stable frame and state flow:** gameplay updates run at a fixed 60Hz while
-  rendering interpolates for high-refresh displays. A policy-driven state stack
-  handles gameplay screens, overlays, pause behavior, input routing, and ordered
-  transitions.
-- **Multi-threaded data processing:** gameplay state owns dense data columns for
-  processor-friendly iteration. The shared thread system scales to the host CPU,
-  adapts worker use per batch, and is already used by SIMD-aware movement and
-  particle updates with serial paths for small workloads.
-- **Practical runtime services:** installed assets use traversal-safe relative
-  paths, PNG textures are cached through SDL3 core loading, text rendering uses
-  asset-backed SDL3_ttf textures, and F2 toggles a local FPS overlay.
+- **Executable contracts:** `zig build test` covers the rules that make the
+  runtime dependable: state lifetime and dispatch policy, named input routing,
+  transition ordering, frame timing, resource generations, asset cache lifetime,
+  text cache identity, renderer batch construction, viewport math, thread batch
+  scheduling, SIMD/scalar equivalence, SoA alignment, and gameplay processors.
+- **SDL_GPU rendering boundary:** game code draws through `Renderer`; GPU device
+  setup, swapchain handling, shader loading, texture ownership, batching, and
+  command submission stay in the rendering layers. Shader builds emit SPIR-V on
+  Linux and Metal shader output on macOS.
+- **Deterministic app flow:** `src/main.zig` keeps the high-level fixed-step
+  loop thin. `Engine` coordinates SDL services, pause/frame visibility policy,
+  input, state dispatch, and rendering. Gameplay updates run at a fixed 60Hz,
+  with interpolation used for rendering.
+- **Policy-driven states and input:** `StateStack` owns state lifetimes,
+  queued transitions, overlays, modal behavior, opaque screens, and pass-through
+  rules. Raw input maps to named actions so held gameplay input and one-frame
+  app/debug commands can be routed by active state policy.
+- **Data-oriented gameplay systems:** `DataSystem` uses generational entity IDs,
+  component masks, and dense typed SoA stores. Hot movement columns are aligned
+  for SIMD loads, and worker ranges are split so processors own the rows they
+  mutate.
+- **Practical runtime services:** runtime asset paths are relative and
+  traversal-safe, PNG textures load through core SDL3, retained texture leases
+  keep renderer resources explicit, SDL3_ttf text is asset-backed and cached,
+  diagnostics use scoped Zig logging, and F2 toggles the local FPS overlay.
 
-For technical details, see
+For deeper implementation details, see
 [architecture](docs/architecture.md),
 [state stack and input](docs/state-stack-and-input.md), and
 [rendering, assets, and shaders](docs/rendering-assets-shaders.md).
@@ -66,10 +72,6 @@ zig build dev
 
 `zig build dev` compiles shaders, installs assets, builds the executable, and
 runs the app.
-
-See [architecture](docs/architecture.md) and
-[rendering, assets, and shaders](docs/rendering-assets-shaders.md) for the full
-frame flow and rendering model.
 
 ## Commands
 
