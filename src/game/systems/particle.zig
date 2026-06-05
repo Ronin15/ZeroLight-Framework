@@ -7,9 +7,11 @@
 //! particles are visual effect state, not persistent DataSystem entities.
 
 const std = @import("std");
-const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
-const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
-const BatchStats = @import("../../app/thread_system.zig").BatchStats;
+const thread_mod = @import("../../app/thread_system.zig");
+const ThreadSystem = thread_mod.ThreadSystem;
+const ParallelRange = thread_mod.ParallelRange;
+const BatchStats = thread_mod.BatchStats;
+const AdaptiveGrainTuner = thread_mod.AdaptiveGrainTuner;
 const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
@@ -32,6 +34,7 @@ pub const ParticleUpdateConfig = struct {
     grain_size: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
+    grain_tuner: ?*AdaptiveGrainTuner = null,
 };
 
 pub const ParticleUpdateStats = struct {
@@ -341,13 +344,20 @@ pub const ParticleSystem = struct {
             .particles = particles,
             .delta_seconds = delta_seconds,
         };
+        const grain_size = if (update_config.grain_tuner) |tuner|
+            tuner.grainSize(active_before, particle_range_alignment_items)
+        else
+            update_config.grain_size;
         const batch = thread_system.parallelForWithOptions(active_before, &context, particleJob, .{
             .min_parallel_items = update_config.min_parallel_items,
-            .grain_size = update_config.grain_size,
+            .grain_size = grain_size,
             .max_worker_threads = update_config.max_worker_threads,
             .range_alignment_items = particle_range_alignment_items,
             .adaptive = update_config.adaptive,
         });
+        if (update_config.grain_tuner) |tuner| {
+            tuner.record(batch);
+        }
         const removed = self.removeExpiredSwap();
         return .{
             .active_before = active_before,
@@ -814,15 +824,21 @@ test "threaded particle update matches serial update" {
     });
     defer threads.deinit();
 
+    var grain_tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = particle_range_alignment_items,
+        .min_grain_size = particle_range_alignment_items,
+        .max_grain_size = particle_range_alignment_items * 4,
+    });
     const stats = threaded_particles.update(&threads, 0.25, .{
         .min_parallel_items = 1,
-        .grain_size = particle_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
+        .grain_tuner = &grain_tuner,
     });
     _ = serial_particles.updateSerial(0.25);
 
     try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(particle_range_alignment_items, stats.batch.grain_size);
     try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
 }
 

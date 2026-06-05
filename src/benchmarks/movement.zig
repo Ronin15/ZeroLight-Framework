@@ -3,13 +3,16 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const thread_mod = @import("../app/thread_system.zig");
+const ThreadSystem = thread_mod.ThreadSystem;
+const AdaptiveGrainTuner = thread_mod.AdaptiveGrainTuner;
 const data_mod = @import("../game/data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const MovementSystem = @import("../game/systems/movement.zig");
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
+const benchmark_tuner_settle_warmup_cap: usize = 64;
 
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
@@ -72,22 +75,41 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
     defer if (threads) |*thread_system| thread_system.deinit();
 
+    var grain_tuner: ?AdaptiveGrainTuner = if (case.tuned_grain)
+        AdaptiveGrainTuner.init(benchmarkTunerConfig(data_mod.movement_range_alignment_items))
+    else
+        null;
+
     for (0..options.warmup_iterations) |_| {
-        _ = runOnce(&data, if (threads) |*thread_system| thread_system else null, case);
+        _ = runOnce(&data, if (threads) |*thread_system| thread_system else null, case, if (grain_tuner) |*tuner| tuner else null);
+    }
+    var settled_before_measurement = false;
+    if (grain_tuner) |*tuner| {
+        var extra_warmup: usize = 0;
+        while (!tuner.isSettled() and extra_warmup < benchmark_tuner_settle_warmup_cap) : (extra_warmup += 1) {
+            _ = runOnce(&data, if (threads) |*thread_system| thread_system else null, case, tuner);
+        }
+        settled_before_measurement = tuner.isSettled();
     }
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&data, if (threads) |*thread_system| thread_system else null, case);
+        const batch = runOnce(&data, if (threads) |*thread_system| thread_system else null, case, if (grain_tuner) |*tuner| tuner else null);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
     }
 
-    return accumulator.finish();
+    var stats = accumulator.finish();
+    if (grain_tuner) |*tuner| {
+        var summary = suite.grainTuningSummary(tuner.report());
+        summary.settled_before_measurement = settled_before_measurement;
+        stats.grain_tuning = summary;
+    }
+    return stats;
 }
 
-fn runOnce(data: *DataSystem, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) @import("../app/thread_system.zig").BatchStats {
+fn runOnce(data: *DataSystem, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, grain_tuner: ?*AdaptiveGrainTuner) thread_mod.BatchStats {
     if (!case.usesThreadSystem()) {
         MovementSystem.updateSerial(data, delta_seconds);
         return suite.serialBatch(data.movementBodySliceConst().entities.len, data_mod.movement_range_alignment_items);
@@ -98,8 +120,21 @@ fn runOnce(data: *DataSystem, thread_system: ?*ThreadSystem, case: suite.Benchma
         .grain_size = case.grainSize(data_mod.movement_range_alignment_items),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
+        .grain_tuner = grain_tuner,
     });
     return stats.batch;
+}
+
+fn benchmarkTunerConfig(range_alignment_items: usize) thread_mod.AdaptiveGrainTunerConfig {
+    return .{
+        .initial_grain_size = suite.default_grain_size,
+        .min_grain_size = range_alignment_items,
+        .max_grain_size = suite.default_grain_size * 64,
+        .sample_window = 2,
+        .improvement_threshold_percent = 5,
+        .settle_after_failed_probes = 2,
+        .retune_after_settled_windows = 10_000,
+    };
 }
 
 test "movement benchmark fixture creates requested movement bodies" {

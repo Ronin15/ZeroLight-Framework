@@ -34,6 +34,7 @@ pub const BenchmarkCase = struct {
     worker_mode: WorkerMode,
     adaptive: bool = false,
     grain_mode: GrainMode = .default,
+    tuned_grain: bool = false,
     required_worker_count: usize = 0,
 
     pub fn maxWorkerThreads(self: BenchmarkCase) ?usize {
@@ -115,6 +116,13 @@ pub const default_cases = [_]BenchmarkCase{
         .required_worker_count = 1,
     },
     .{
+        .name = "thread-adaptive-tuned-grain",
+        .worker_mode = .fixed_auto,
+        .adaptive = true,
+        .tuned_grain = true,
+        .required_worker_count = 1,
+    },
+    .{
         .name = "thread-small-grain",
         .worker_mode = .fixed_auto,
         .grain_mode = .small,
@@ -143,6 +151,7 @@ pub const RunStats = struct {
     max_ns: u64 = 0,
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
+    grain_tuning: ?GrainTuningSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -170,6 +179,24 @@ pub const BatchSummary = struct {
     batch_duration_ns: u64 = 0,
     main_thread_wait_ns: u64 = 0,
     ran_inline: bool = true,
+};
+
+pub const GrainTuningSummary = struct {
+    phase: thread_mod.AdaptiveGrainPhase = .learning,
+    initial_grain_size: usize = 0,
+    final_grain_size: usize = 0,
+    best_grain_size: usize = 0,
+    candidate_grain_size: ?usize = null,
+    sample_count: usize = 0,
+    sample_window: usize = 0,
+    failed_probe_count: usize = 0,
+    settled_window_count: usize = 0,
+    settle_after_failed_probes: usize = 0,
+    retune_after_settled_windows: usize = 0,
+    settled_before_measurement: bool = false,
+    best_mean_batch_duration_ns: u64 = 0,
+    baseline_mean_batch_duration_ns: u64 = 0,
+    probing: bool = false,
 };
 
 pub const StatsAccumulator = struct {
@@ -236,6 +263,26 @@ pub const StatsAccumulator = struct {
         };
     }
 };
+
+pub fn grainTuningSummary(report: thread_mod.AdaptiveGrainReport) GrainTuningSummary {
+    return .{
+        .phase = report.phase,
+        .initial_grain_size = report.initial_grain_size,
+        .final_grain_size = report.current_grain_size,
+        .best_grain_size = report.best_grain_size,
+        .candidate_grain_size = report.candidate_grain_size,
+        .sample_count = report.sample_count,
+        .sample_window = report.sample_window,
+        .failed_probe_count = report.failed_probe_count,
+        .settled_window_count = report.settled_window_count,
+        .settle_after_failed_probes = report.settle_after_failed_probes,
+        .retune_after_settled_windows = report.retune_after_settled_windows,
+        .settled_before_measurement = report.phase == .settled,
+        .best_mean_batch_duration_ns = report.best_mean_batch_duration_ns,
+        .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
+        .probing = report.probing,
+    };
+}
 
 pub fn parseOptions(args: []const []const u8) !Options {
     var options = Options{};
@@ -399,12 +446,13 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     const inline_case = measured(findResult(results, "thread-inline"));
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
     const adaptive = measured(findResult(results, "thread-adaptive"));
+    const tuned_grain = measured(findResult(results, "thread-adaptive-tuned-grain"));
     const limited_best = bestOfMeasured(&.{ findResult(results, "thread-fixed-1"), findResult(results, "thread-fixed-2") });
-    const best_grain = bestOfMeasured(&.{ findResult(results, "thread-fixed-auto"), findResult(results, "thread-small-grain"), findResult(results, "thread-large-grain") });
+    const best_grain = bestOfMeasured(&.{ findResult(results, "thread-fixed-auto"), findResult(results, "thread-adaptive-tuned-grain"), findResult(results, "thread-small-grain"), findResult(results, "thread-large-grain") });
 
     printVerdict(group, item_count, baseline, best, fixed_auto, limited_best);
-    printTuning(baseline, best, fixed_auto, adaptive, limited_best, best_grain);
-    printEvidence(baseline, best, inline_case, fixed_auto, adaptive, limited_best, best_grain);
+    printTuning(baseline, best, fixed_auto, adaptive, tuned_grain, limited_best, best_grain);
+    printEvidence(baseline, best, inline_case, fixed_auto, adaptive, tuned_grain, limited_best, best_grain);
     if (options.details) {
         printCaseDetails(results, baseline);
     } else {
@@ -458,6 +506,7 @@ fn printTuning(
     best: CaseResult,
     fixed_auto: ?CaseResult,
     adaptive: ?CaseResult,
+    tuned_grain: ?CaseResult,
     limited_best: ?CaseResult,
     best_grain: ?CaseResult,
 ) void {
@@ -513,9 +562,49 @@ fn printTuning(
         }
     }
 
+    if (tuned_grain) |tuned| {
+        if (tuned.stats.grain_tuning) |summary| {
+            if (adaptive) |adaptive_case| {
+                const delta = percentDelta(tuned.stats.mean_ns, adaptive_case.stats.mean_ns);
+                if (delta < -10) {
+                    std.debug.print(
+                        "    - dynamic grain: adaptive+tuned beat adaptive-only by {f}; best grain_size={}.\n",
+                        .{ signedPercent(delta), summary.best_grain_size },
+                    );
+                } else if (delta > 10) {
+                    std.debug.print(
+                        "    - dynamic grain: adaptive+tuned is slower than adaptive-only by {f}; do not adopt grain_size={} from this run.\n",
+                        .{ signedPercent(delta), summary.best_grain_size },
+                    );
+                } else {
+                    std.debug.print(
+                        "    - dynamic grain: adaptive+tuned and adaptive-only are close ({f}); best grain_size={}.\n",
+                        .{ signedPercent(delta), summary.best_grain_size },
+                    );
+                }
+                if (!summary.settled_before_measurement) {
+                    std.debug.print("    - dynamic grain warning: tuner did not settle before measurement; increase warmup before trusting this case.\n", .{});
+                }
+            } else if (fixed_auto) |auto| {
+                const delta = percentDelta(tuned.stats.mean_ns, auto.stats.mean_ns);
+                std.debug.print(
+                    "    - dynamic grain: tuned vs fixed-auto {f}; best grain_size={}.\n",
+                    .{ signedPercent(delta), summary.best_grain_size },
+                );
+            }
+        }
+    }
+
     if (best_grain) |grain| {
         if (std.mem.eql(u8, grain.case.name, "thread-fixed-auto")) {
             std.debug.print("    - batching: default grain_size={} is fine for this run.\n", .{grain.stats.batch.grain_size});
+        } else if (std.mem.eql(u8, grain.case.name, "thread-adaptive-tuned-grain")) {
+            if (grain.stats.grain_tuning) |summary| {
+                std.debug.print(
+                    "    - batching: dynamic tuner beat fixed grain probes; try starting near grain_size={} for this processor.\n",
+                    .{summary.best_grain_size},
+                );
+            }
         } else {
             std.debug.print(
                 "    - batching: test grain_size={} in the real processor config; this case beat the default grain test.\n",
@@ -531,6 +620,7 @@ fn printEvidence(
     inline_case: ?CaseResult,
     fixed_auto: ?CaseResult,
     adaptive: ?CaseResult,
+    tuned_grain: ?CaseResult,
     limited_best: ?CaseResult,
     best_grain: ?CaseResult,
 ) void {
@@ -567,8 +657,31 @@ fn printEvidence(
             );
         }
     }
+    if (tuned_grain) |tuned| {
+        if (tuned.stats.grain_tuning) |summary| {
+            std.debug.print(
+                "    - tuned grain phase={s} settled_before_measurement={} initial={} final={} best={} candidate={?}; best window {f}.\n",
+                .{
+                    @tagName(summary.phase),
+                    summary.settled_before_measurement,
+                    summary.initial_grain_size,
+                    summary.final_grain_size,
+                    summary.best_grain_size,
+                    summary.candidate_grain_size,
+                    formatDuration(summary.best_mean_batch_duration_ns),
+                },
+            );
+        }
+    }
     if (best_grain) |grain| {
-        std.debug.print("    - best grain test: {s} with grain_size={}.\n", .{ grain.case.name, grain.stats.batch.grain_size });
+        if (grain.stats.grain_tuning) |summary| {
+            std.debug.print(
+                "    - best grain test: {s} with tuner best={} final={}.\n",
+                .{ grain.case.name, summary.best_grain_size, summary.final_grain_size },
+            );
+        } else {
+            std.debug.print("    - best grain test: {s} with grain_size={}.\n", .{ grain.case.name, grain.stats.batch.grain_size });
+        }
     }
 }
 
@@ -591,7 +704,7 @@ fn printCaseDetails(results: []const CaseResult, baseline: ?CaseResult) void {
         else
             100;
         std.debug.print(
-            "    {s}: {f}, {d}.{d:0>2}x serial, workers {}/{}, ranges main/worker {}/{}, wait {f}\n",
+            "    {s}: {f}, {d}.{d:0>2}x serial, workers {}/{}, ranges main/worker {}/{}, wait {f}",
             .{
                 result.case.name,
                 formatDuration(result.stats.mean_ns),
@@ -604,6 +717,13 @@ fn printCaseDetails(results: []const CaseResult, baseline: ?CaseResult) void {
                 formatDuration(result.stats.batch.main_thread_wait_ns),
             },
         );
+        if (result.stats.grain_tuning) |summary| {
+            std.debug.print(
+                ", tuned grain phase={s} settled={} {}/{} best {}",
+                .{ @tagName(summary.phase), summary.settled_before_measurement, summary.initial_grain_size, summary.final_grain_size, summary.best_grain_size },
+            );
+        }
+        std.debug.print("\n", .{});
     }
 }
 
@@ -701,15 +821,16 @@ fn u128ToUsizeSaturated(value: u128) usize {
 }
 
 test "default benchmark cases cover required thread modes" {
-    try std.testing.expectEqual(@as(usize, 8), default_cases.len);
+    try std.testing.expectEqual(@as(usize, 9), default_cases.len);
     try std.testing.expectEqualStrings("serial-direct", default_cases[0].name);
     try std.testing.expectEqualStrings("thread-inline", default_cases[1].name);
     try std.testing.expectEqualStrings("thread-fixed-1", default_cases[2].name);
     try std.testing.expectEqualStrings("thread-fixed-2", default_cases[3].name);
     try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[4].name);
     try std.testing.expectEqualStrings("thread-adaptive", default_cases[5].name);
-    try std.testing.expectEqualStrings("thread-small-grain", default_cases[6].name);
-    try std.testing.expectEqualStrings("thread-large-grain", default_cases[7].name);
+    try std.testing.expectEqualStrings("thread-adaptive-tuned-grain", default_cases[6].name);
+    try std.testing.expectEqualStrings("thread-small-grain", default_cases[7].name);
+    try std.testing.expectEqualStrings("thread-large-grain", default_cases[8].name);
 }
 
 test "benchmark options parse scaling and filtering arguments" {
@@ -736,9 +857,29 @@ test "benchmark options reject zero iterations" {
     try std.testing.expectError(error.InvalidArgument, parseOptions(&args));
 }
 
+test "grain tuning summary preserves settled phase" {
+    var summary = grainTuningSummary(.{
+        .phase = .settled,
+        .initial_grain_size = 64,
+        .current_grain_size = 256,
+        .best_grain_size = 256,
+        .sample_window = 2,
+        .failed_probe_count = 0,
+        .settled_window_count = 4,
+        .settle_after_failed_probes = 2,
+        .retune_after_settled_windows = 10_000,
+        .best_mean_batch_duration_ns = 42,
+    });
+    summary.settled_before_measurement = summary.phase == .settled;
+
+    try std.testing.expectEqual(thread_mod.AdaptiveGrainPhase.settled, summary.phase);
+    try std.testing.expect(summary.settled_before_measurement);
+    try std.testing.expectEqual(@as(usize, 256), summary.best_grain_size);
+}
+
 test "grain modes align to cache-line item boundaries" {
-    const small = default_cases[6].grainSize(16).?;
-    const large = default_cases[7].grainSize(16).?;
+    const small = default_cases[7].grainSize(16).?;
+    const large = default_cases[8].grainSize(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
 }

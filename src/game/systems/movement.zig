@@ -3,8 +3,10 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
-const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
+const thread_mod = @import("../../app/thread_system.zig");
+const ThreadSystem = thread_mod.ThreadSystem;
+const ParallelRange = thread_mod.ParallelRange;
+const AdaptiveGrainTuner = thread_mod.AdaptiveGrainTuner;
 const data_mod = @import("../data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const MovementBodySlice = data_mod.MovementBodySlice;
@@ -15,11 +17,12 @@ pub const MovementConfig = struct {
     grain_size: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
+    grain_tuner: ?*AdaptiveGrainTuner = null,
 };
 
 pub const MovementStats = struct {
     body_count: usize = 0,
-    batch: @import("../../app/thread_system.zig").BatchStats = .{},
+    batch: thread_mod.BatchStats = .{},
 };
 
 pub fn update(
@@ -35,13 +38,20 @@ pub fn update(
         .slice = slice,
         .delta_seconds = delta_seconds,
     };
+    const grain_size = if (config.grain_tuner) |tuner|
+        tuner.grainSize(slice.entities.len, data_mod.movement_range_alignment_items)
+    else
+        config.grain_size;
     const batch = thread_system.parallelForWithOptions(slice.entities.len, &context, movementJob, .{
         .min_parallel_items = config.min_parallel_items,
-        .grain_size = config.grain_size,
+        .grain_size = grain_size,
         .max_worker_threads = config.max_worker_threads,
         .range_alignment_items = data_mod.movement_range_alignment_items,
         .adaptive = config.adaptive,
     });
+    if (config.grain_tuner) |tuner| {
+        tuner.record(batch);
+    }
     return .{
         .body_count = slice.entities.len,
         .batch = batch,
@@ -61,7 +71,7 @@ pub fn syncPreviousPositions(data: *DataSystem) void {
     }
 }
 
-fn movementJob(context: *anyopaque, range: ParallelRange, _: @import("../../app/thread_system.zig").WorkerId) void {
+fn movementJob(context: *anyopaque, range: ParallelRange, _: thread_mod.WorkerId) void {
     const job: *MovementJobContext = @ptrCast(@alignCast(context));
     processRange(&job.slice, range, job.delta_seconds);
 }
@@ -184,16 +194,22 @@ test "threaded movement matches serial movement" {
     });
     defer threads.deinit();
 
+    var grain_tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = data_mod.movement_range_alignment_items,
+        .min_grain_size = data_mod.movement_range_alignment_items,
+        .max_grain_size = data_mod.movement_range_alignment_items * 4,
+    });
     const stats = update(&threaded_data, &threads, 0.5, .{
         .min_parallel_items = 1,
-        .grain_size = data_mod.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
+        .grain_tuner = &grain_tuner,
     });
     updateSerial(&serial_data, 0.5);
 
     try std.testing.expectEqual(serial_data.movementBodySliceConst().entities.len, stats.body_count);
     try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(data_mod.movement_range_alignment_items, stats.batch.grain_size);
     try expectMovementDataApproxEqual(&threaded_data, &serial_data);
 }
 

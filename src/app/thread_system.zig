@@ -60,6 +60,232 @@ pub const ParallelForOptions = struct {
     adaptive: bool = true,
 };
 
+pub const AdaptiveGrainTunerConfig = struct {
+    initial_grain_size: usize = (ThreadSystemConfig{}).grain_size,
+    min_grain_size: usize = 16,
+    max_grain_size: usize = (ThreadSystemConfig{}).grain_size * 64,
+    sample_window: usize = 8,
+    improvement_threshold_percent: u8 = 8,
+    item_count_reset_percent: u8 = 25,
+    settle_after_failed_probes: usize = 2,
+    retune_after_settled_windows: usize = 120,
+};
+
+pub const AdaptiveGrainPhase = enum {
+    learning,
+    probing,
+    settled,
+};
+
+pub const AdaptiveGrainReport = struct {
+    phase: AdaptiveGrainPhase = .learning,
+    initial_grain_size: usize = (ThreadSystemConfig{}).grain_size,
+    current_grain_size: usize = (ThreadSystemConfig{}).grain_size,
+    best_grain_size: usize = (ThreadSystemConfig{}).grain_size,
+    candidate_grain_size: ?usize = null,
+    sample_count: usize = 0,
+    sample_window: usize = 1,
+    failed_probe_count: usize = 0,
+    settled_window_count: usize = 0,
+    settle_after_failed_probes: usize = 1,
+    retune_after_settled_windows: usize = 1,
+    best_mean_batch_duration_ns: u64 = 0,
+    baseline_mean_batch_duration_ns: u64 = 0,
+    probing: bool = false,
+};
+
+pub const AdaptiveGrainTuner = struct {
+    config: AdaptiveGrainTunerConfig,
+    phase: AdaptiveGrainPhase = .learning,
+    initial_grain_size: usize,
+    current_grain_size: usize,
+    best_grain_size: usize,
+    best_mean_batch_duration_ns: u64 = 0,
+    baseline_mean_batch_duration_ns: u64 = 0,
+    sample_count: usize = 0,
+    sample_total_ns: u128 = 0,
+    candidate_grain_size: ?usize = null,
+    probe_direction: ProbeDirection = .grow,
+    failed_probe_count: usize = 0,
+    settled_window_count: usize = 0,
+    last_item_count: usize = 0,
+    last_range_alignment_items: usize = 1,
+
+    const ProbeDirection = enum { grow, shrink };
+
+    pub fn init(config: AdaptiveGrainTunerConfig) AdaptiveGrainTuner {
+        const normalized = normalizeTunerConfig(config);
+        const initial = clampItemCount(normalized.initial_grain_size, normalized.min_grain_size, normalized.max_grain_size);
+        return .{
+            .config = normalized,
+            .initial_grain_size = initial,
+            .current_grain_size = initial,
+            .best_grain_size = initial,
+        };
+    }
+
+    pub fn grainSize(self: *AdaptiveGrainTuner, item_count: usize, range_alignment_items: usize) usize {
+        self.last_range_alignment_items = @max(range_alignment_items, @as(usize, 1));
+        if (self.last_item_count != 0 and itemCountShifted(self.last_item_count, item_count, self.config.item_count_reset_percent)) {
+            self.resetForLearning();
+        }
+        self.last_item_count = item_count;
+
+        const selected = switch (self.phase) {
+            .learning, .settled => self.current_grain_size,
+            .probing => self.candidate_grain_size orelse self.current_grain_size,
+        };
+        return self.normalizedGrainSize(selected);
+    }
+
+    pub fn record(self: *AdaptiveGrainTuner, stats: BatchStats) void {
+        if (stats.item_count == 0 or stats.ran_inline or stats.active_worker_threads == 0 or stats.batch_duration_ns == 0) return;
+
+        self.sample_count += 1;
+        self.sample_total_ns += stats.batch_duration_ns;
+        if (self.sample_count < self.config.sample_window) return;
+
+        const sample_mean_ns: u64 = @intCast(self.sample_total_ns / self.sample_count);
+        switch (self.phase) {
+            .learning => self.finishLearningWindow(sample_mean_ns),
+            .probing => self.finishProbeWindow(sample_mean_ns),
+            .settled => self.finishSettledWindow(sample_mean_ns),
+        }
+        self.resetSamples();
+    }
+
+    pub fn report(self: *const AdaptiveGrainTuner) AdaptiveGrainReport {
+        return .{
+            .phase = self.phase,
+            .initial_grain_size = self.initial_grain_size,
+            .current_grain_size = self.current_grain_size,
+            .best_grain_size = self.best_grain_size,
+            .candidate_grain_size = self.candidate_grain_size,
+            .sample_count = self.sample_count,
+            .sample_window = self.config.sample_window,
+            .failed_probe_count = self.failed_probe_count,
+            .settled_window_count = self.settled_window_count,
+            .settle_after_failed_probes = self.config.settle_after_failed_probes,
+            .retune_after_settled_windows = self.config.retune_after_settled_windows,
+            .best_mean_batch_duration_ns = self.best_mean_batch_duration_ns,
+            .baseline_mean_batch_duration_ns = self.baseline_mean_batch_duration_ns,
+            .probing = self.phase == .probing,
+        };
+    }
+
+    pub fn isSettled(self: *const AdaptiveGrainTuner) bool {
+        return self.phase == .settled;
+    }
+
+    fn finishLearningWindow(self: *AdaptiveGrainTuner, sample_mean_ns: u64) void {
+        self.baseline_mean_batch_duration_ns = sample_mean_ns;
+        self.recordBest(self.current_grain_size, sample_mean_ns);
+        self.startProbe(.grow);
+    }
+
+    fn finishProbeWindow(self: *AdaptiveGrainTuner, sample_mean_ns: u64) void {
+        const candidate = self.candidate_grain_size orelse {
+            self.settle();
+            return;
+        };
+
+        if (isMeaningfullyFaster(sample_mean_ns, self.best_mean_batch_duration_ns, self.config.improvement_threshold_percent)) {
+            self.current_grain_size = candidate;
+            self.baseline_mean_batch_duration_ns = sample_mean_ns;
+            self.recordBest(candidate, sample_mean_ns);
+            self.failed_probe_count = 0;
+            self.startProbe(self.probe_direction);
+            return;
+        }
+
+        self.failed_probe_count += 1;
+        if (self.failed_probe_count >= self.config.settle_after_failed_probes) {
+            self.settle();
+            return;
+        }
+
+        self.startProbe(oppositeDirection(self.probe_direction));
+    }
+
+    fn finishSettledWindow(self: *AdaptiveGrainTuner, sample_mean_ns: u64) void {
+        self.baseline_mean_batch_duration_ns = sample_mean_ns;
+        self.recordBest(self.current_grain_size, sample_mean_ns);
+        self.settled_window_count += 1;
+        if (self.settled_window_count >= self.config.retune_after_settled_windows) {
+            self.startProbe(.grow);
+        }
+    }
+
+    fn startProbe(self: *AdaptiveGrainTuner, direction: ProbeDirection) void {
+        self.probe_direction = direction;
+        self.candidate_grain_size = self.nextCandidate(direction);
+        if (self.candidate_grain_size == null and direction == .grow) {
+            self.probe_direction = .shrink;
+            self.candidate_grain_size = self.nextCandidate(.shrink);
+        } else if (self.candidate_grain_size == null and direction == .shrink) {
+            self.probe_direction = .grow;
+            self.candidate_grain_size = self.nextCandidate(.grow);
+        }
+        if (self.candidate_grain_size == null) {
+            self.settle();
+        } else {
+            self.phase = .probing;
+        }
+    }
+
+    fn settle(self: *AdaptiveGrainTuner) void {
+        self.phase = .settled;
+        self.current_grain_size = self.best_grain_size;
+        self.candidate_grain_size = null;
+        self.failed_probe_count = 0;
+        self.settled_window_count = 0;
+    }
+
+    fn resetForLearning(self: *AdaptiveGrainTuner) void {
+        self.phase = .learning;
+        self.current_grain_size = self.best_grain_size;
+        self.baseline_mean_batch_duration_ns = 0;
+        self.candidate_grain_size = null;
+        self.probe_direction = .grow;
+        self.failed_probe_count = 0;
+        self.settled_window_count = 0;
+        self.resetSamples();
+    }
+
+    fn normalizedGrainSize(self: *const AdaptiveGrainTuner, grain_size: usize) usize {
+        const clamped = clampItemCount(grain_size, self.config.min_grain_size, self.config.max_grain_size);
+        return alignItemCount(clamped, self.last_range_alignment_items);
+    }
+
+    fn nextCandidate(self: *const AdaptiveGrainTuner, direction: ProbeDirection) ?usize {
+        const candidate = switch (direction) {
+            .grow => if (self.current_grain_size >= self.config.max_grain_size / 2)
+                self.config.max_grain_size
+            else
+                self.current_grain_size * 2,
+            .shrink => if (self.current_grain_size <= self.config.min_grain_size * 2)
+                self.config.min_grain_size
+            else
+                self.current_grain_size / 2,
+        };
+        const normalized = self.normalizedGrainSize(candidate);
+        const current = self.normalizedGrainSize(self.current_grain_size);
+        return if (normalized == current) null else normalized;
+    }
+
+    fn recordBest(self: *AdaptiveGrainTuner, grain_size: usize, mean_ns: u64) void {
+        if (self.best_mean_batch_duration_ns == 0 or mean_ns < self.best_mean_batch_duration_ns) {
+            self.best_mean_batch_duration_ns = mean_ns;
+            self.best_grain_size = self.normalizedGrainSize(grain_size);
+        }
+    }
+
+    fn resetSamples(self: *AdaptiveGrainTuner) void {
+        self.sample_count = 0;
+        self.sample_total_ns = 0;
+    }
+};
+
 pub const JobFn = *const fn (*anyopaque, ParallelRange, WorkerId) void;
 
 pub const ThreadSystem = struct {
@@ -377,6 +603,48 @@ fn alignItemCount(item_count: usize, alignment: usize) usize {
     return item_count + (alignment - remainder);
 }
 
+fn clampItemCount(value: usize, min_value: usize, max_value: usize) usize {
+    return @min(@max(value, min_value), max_value);
+}
+
+fn normalizeTunerConfig(config: AdaptiveGrainTunerConfig) AdaptiveGrainTunerConfig {
+    var normalized = config;
+    normalized.min_grain_size = @max(normalized.min_grain_size, @as(usize, 1));
+    normalized.max_grain_size = @max(normalized.max_grain_size, normalized.min_grain_size);
+    normalized.initial_grain_size = clampItemCount(normalized.initial_grain_size, normalized.min_grain_size, normalized.max_grain_size);
+    normalized.sample_window = @max(normalized.sample_window, @as(usize, 1));
+    normalized.improvement_threshold_percent = @min(normalized.improvement_threshold_percent, @as(u8, 100));
+    normalized.item_count_reset_percent = @min(normalized.item_count_reset_percent, @as(u8, 100));
+    normalized.settle_after_failed_probes = @max(normalized.settle_after_failed_probes, @as(usize, 1));
+    normalized.retune_after_settled_windows = @max(normalized.retune_after_settled_windows, @as(usize, 1));
+    return normalized;
+}
+
+fn oppositeDirection(direction: AdaptiveGrainTuner.ProbeDirection) AdaptiveGrainTuner.ProbeDirection {
+    return switch (direction) {
+        .grow => .shrink,
+        .shrink => .grow,
+    };
+}
+
+fn isMeaningfullyFaster(candidate_ns: u64, baseline_ns: u64, improvement_threshold_percent: u8) bool {
+    if (baseline_ns == 0) return true;
+    if (candidate_ns >= baseline_ns) return false;
+    const improvement_ns: u64 = @intCast((@as(u128, baseline_ns) * improvement_threshold_percent) / 100);
+    const required_ns = baseline_ns - improvement_ns;
+    return candidate_ns <= required_ns;
+}
+
+fn itemCountShifted(previous: usize, current: usize, threshold_percent: u8) bool {
+    if (previous == current) return false;
+    const larger = @max(previous, current);
+    const smaller = @min(previous, current);
+    const delta = larger - smaller;
+    const scaled_delta: u128 = @as(u128, delta) * 100;
+    const threshold: u128 = @as(u128, previous) * threshold_percent;
+    return scaled_delta >= threshold;
+}
+
 fn rangeForIndex(item_count: usize, grain_size: usize, range_index: usize) ParallelRange {
     const start = range_index * grain_size;
     return .{
@@ -620,6 +888,117 @@ test "scheduler reduces active workers after cheap underutilized batch" {
     try std.testing.expectEqual(@as(usize, 4), scheduler.chooseActiveWorkerThreads(4, 8, false));
 }
 
+test "adaptive grain tuner aligns and clamps selected grain" {
+    var tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = 17,
+        .min_grain_size = 16,
+        .max_grain_size = 256,
+    });
+
+    try std.testing.expectEqual(@as(usize, 32), tuner.grainSize(1024, 16));
+
+    const report = tuner.report();
+    try std.testing.expectEqual(@as(usize, 17), report.current_grain_size);
+    try std.testing.expectEqual(@as(usize, 17), report.best_grain_size);
+}
+
+test "adaptive grain tuner commits faster candidate" {
+    var tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = 64,
+        .min_grain_size = 16,
+        .max_grain_size = 256,
+        .sample_window = 1,
+        .improvement_threshold_percent = 5,
+    });
+
+    try std.testing.expectEqual(@as(usize, 64), tuner.grainSize(1024, 16));
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+    try std.testing.expectEqual(AdaptiveGrainPhase.probing, tuner.report().phase);
+    try std.testing.expectEqual(@as(?usize, 128), tuner.report().candidate_grain_size);
+    try std.testing.expectEqual(@as(usize, 128), tuner.grainSize(1024, 16));
+
+    tuner.record(tunerTestBatch(1024, 128, 800));
+
+    const report = tuner.report();
+    try std.testing.expectEqual(AdaptiveGrainPhase.probing, report.phase);
+    try std.testing.expectEqual(@as(usize, 128), report.current_grain_size);
+    try std.testing.expectEqual(@as(usize, 128), report.best_grain_size);
+    try std.testing.expectEqual(@as(?usize, 256), report.candidate_grain_size);
+    try std.testing.expectEqual(@as(u64, 800), report.best_mean_batch_duration_ns);
+}
+
+test "adaptive grain tuner settles after rejected probes" {
+    var tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = 64,
+        .min_grain_size = 16,
+        .max_grain_size = 256,
+        .sample_window = 1,
+        .improvement_threshold_percent = 5,
+        .settle_after_failed_probes = 2,
+    });
+
+    _ = tuner.grainSize(1024, 16);
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+    try std.testing.expectEqual(@as(usize, 128), tuner.grainSize(1024, 16));
+
+    tuner.record(tunerTestBatch(1024, 128, 1200));
+    try std.testing.expectEqual(AdaptiveGrainPhase.probing, tuner.report().phase);
+    try std.testing.expectEqual(@as(?usize, 32), tuner.report().candidate_grain_size);
+    try std.testing.expectEqual(@as(usize, 32), tuner.grainSize(1024, 16));
+    tuner.record(tunerTestBatch(1024, 32, 1200));
+
+    const report = tuner.report();
+    try std.testing.expectEqual(AdaptiveGrainPhase.settled, report.phase);
+    try std.testing.expectEqual(@as(usize, 64), report.current_grain_size);
+    try std.testing.expectEqual(@as(usize, 64), report.best_grain_size);
+    try std.testing.expectEqual(@as(?usize, null), report.candidate_grain_size);
+    try std.testing.expect(tuner.isSettled());
+}
+
+test "adaptive grain tuner resets sample window after item count shift" {
+    var tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = 64,
+        .sample_window = 4,
+        .item_count_reset_percent = 25,
+    });
+
+    _ = tuner.grainSize(1024, 16);
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+    try std.testing.expectEqual(@as(usize, 1), tuner.report().sample_count);
+
+    _ = tuner.grainSize(2048, 16);
+    try std.testing.expectEqual(@as(usize, 0), tuner.report().sample_count);
+    try std.testing.expectEqual(AdaptiveGrainPhase.learning, tuner.report().phase);
+}
+
+test "adaptive grain tuner reopens probing after settled cooldown" {
+    var tuner = AdaptiveGrainTuner.init(.{
+        .initial_grain_size = 64,
+        .min_grain_size = 16,
+        .max_grain_size = 256,
+        .sample_window = 1,
+        .settle_after_failed_probes = 1,
+        .retune_after_settled_windows = 2,
+    });
+
+    _ = tuner.grainSize(1024, 16);
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+    try std.testing.expectEqual(@as(usize, 128), tuner.grainSize(1024, 16));
+    tuner.record(tunerTestBatch(1024, 128, 1200));
+    try std.testing.expect(tuner.isSettled());
+
+    try std.testing.expectEqual(@as(usize, 64), tuner.grainSize(1024, 16));
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+    try std.testing.expect(tuner.isSettled());
+
+    try std.testing.expectEqual(@as(usize, 64), tuner.grainSize(1024, 16));
+    tuner.record(tunerTestBatch(1024, 64, 1000));
+
+    const report = tuner.report();
+    try std.testing.expectEqual(AdaptiveGrainPhase.probing, report.phase);
+    try std.testing.expectEqual(@as(?usize, 128), report.candidate_grain_size);
+}
+
 test "worker scratch slots include main thread and worker threads" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -652,4 +1031,19 @@ test "batch submission does not allocate after init" {
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
+}
+
+fn tunerTestBatch(item_count: usize, grain_size: usize, duration_ns: u64) BatchStats {
+    return .{
+        .item_count = item_count,
+        .range_count = rangeCount(item_count, grain_size),
+        .grain_size = grain_size,
+        .available_worker_threads = 1,
+        .active_worker_threads = 1,
+        .main_thread_ranges = 1,
+        .worker_thread_ranges = 1,
+        .worker_utilization = 0.5,
+        .batch_duration_ns = duration_ns,
+        .ran_inline = false,
+    };
 }

@@ -102,13 +102,17 @@ zig build verify
 
 `zig build bench` runs non-interactive CPU benchmarks for the movement entity
 processor and transient particle processor. The default run automatically
-exercises serial, inline, fixed-worker, adaptive, small-grain, and large-grain
-thread-system cases. Movement runs a count sweep so threshold changes can be
-compared across entity counts; particles use one representative count per
-profile. Output is grouped by workload and count, then explains what to tune:
-per-system parallel thresholds, worker fanout, adaptive scheduling, and batch
-grain size. Use `--details` only when you need the supporting per-case timings.
-Use other optional arguments only to narrow or scale the run:
+exercises serial, inline, fixed-worker, adaptive scheduler, adaptive+tuned grain,
+small-grain, and large-grain thread-system cases. Movement runs a count sweep so
+threshold changes can be compared across entity counts; particles use one
+representative count per profile. Output is grouped by workload and count, then
+explains what to tune: per-system parallel thresholds, worker fanout, adaptive
+scheduling, and batch grain size. The adaptive+tuned case keeps adaptive worker
+scheduling enabled, layers an external grain tuner on top, settles on the best
+measured grain before timing when possible, and reports phase, initial, final,
+best, and candidate grain sizes. Use `--details` only when you need the
+supporting per-case timings. Use other optional arguments only to narrow or
+scale the run:
 
 ```sh
 zig build bench -- --profile quick
