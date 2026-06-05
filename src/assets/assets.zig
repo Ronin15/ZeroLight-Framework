@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const log = @import("../core/logging.zig").assets;
 
 pub const AssetStore = struct {
     allocator: std.mem.Allocator,
@@ -53,6 +54,7 @@ pub const AssetStore = struct {
             self.allocator.free(path);
             return err;
         };
+        log.debug("resolved asset via executable-relative fallback: {s}", .{relative_path});
         return path;
     }
 };

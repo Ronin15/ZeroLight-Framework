@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zig Debug Specialist"
+  short_description: "Debug Zig game engine and performance failures"
+  default_prompt: "Use $zig-debug-specialist to diagnose a Zig game engine build, test, shader, SDL, runtime, or performance failure."

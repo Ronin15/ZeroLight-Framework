@@ -1,55 +1,120 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
+## Project Intent
 
-This is a Zig SDL3 clone-and-edit 2D game starter, not a public library API. The build entry point is `build.zig`, with package metadata in `build.zig.zon`.
+This is a Zig 0.16 + SDL3/SDL_GPU 2D game project. Keep the base lean,
+dependency-light, and SDL_GPU-first. The build entry point is `build.zig`, with
+project metadata in `build.zig.zon`.
 
-- `src/main.zig` contains the executable entry point and high-level fixed-step timing loop.
-- `src/app/` owns SDL3 app coordination, input, timing, frame pacing, pause policy, and state stack flow.
-- `src/render/` owns SDL_GPU rendering, camera transforms, and debug overlay rendering.
-- `src/game/` contains game/application states such as the temporary demo and pause overlay.
-- `src/platform/` contains SDL/platform integration helpers and smoke-test implementation.
-- `src/core/` contains small shared starter helpers such as math primitives.
-- `src/root.zig` is the minimal package root for shared starter helpers and tests.
-- `assets/` contains runtime assets and is installed to `zig-out/bin/assets`.
-- `zig-out/` is generated build output and should not be edited by hand.
-- Add modules under the matching `src/` subdirectory; keep executable-only code near `main.zig`, app flow under `src/app/`, rendering under `src/render/`, and game-specific code under `src/game/`.
+Use the existing docs as source of truth for deeper details:
 
-## Build, Test, and Development Commands
+- `docs/architecture.md` for frame flow, source layout, and engine boundaries.
+- `docs/state-stack-and-input.md` for state contracts, transition policies, and input mapping.
+- `docs/rendering-assets-shaders.md` for SDL_GPU rendering, assets, PNG loading, shaders, and debug overlay.
+- `docs/development-workflow.md` for build options, release modes, testing, and GPU smoke usage.
 
-- `zig build` builds the executable and installs it to `zig-out/bin/my-sdl3-game`.
-- `zig build run` builds, installs runtime assets/shaders, and runs the SDL3 example window.
-- `zig build dev` builds shaders, installs assets, and runs the app.
+## Ownership Boundaries
+
+- `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
+- `src/app/` owns SDL app coordination, input, time loop, frame pacing, pause policy, state stack flow, and the thread system.
+- `src/render/` owns SDL_GPU rendering, camera transforms, renderer resources, text, FPS/debug overlay, and frame submission.
+- `src/game/` owns game/application states, gameplay behavior, `DataSystem`, and ECS-style gameplay systems/processors.
+- `src/platform/` owns SDL C imports, small platform wrappers, and GPU smoke-test implementation.
+- `src/assets/` owns runtime asset path resolution and safe installed asset loading.
+- `src/core/` owns small shared helpers such as math primitives.
+- `src/root.zig` is the minimal test/root file for math aliases and compile coverage.
+- `assets/` contains runtime assets and shader sources. Runtime assets install under `zig-out/bin/assets` by default.
+
+Add new code under the matching owner directory. Keep executable-only code near
+`main.zig`, app flow under `src/app/`, rendering and GPU resource code under
+`src/render/`, and game-specific behavior under `src/game/`.
+
+## Durable Architecture Rules
+
+- Keep `src/main.zig` timing-centric; move coordination details into `src/app/`.
+- `StateStack` owns state lifetimes, state destruction, policies, and transition application.
+- Queue state transitions through `StateTransitions` from state dispatch, then apply them after dispatch completes.
+- Game states draw through `Renderer`; keep SDL_GPU device, swapchain, shader, texture, and command submission details in render/platform layers.
+- Map raw input to named actions. Keep held gameplay input in `InputState` separate from one-frame app commands in `FrameCommands`.
+- Let stack policies decide whether lower states receive update, input, or render passes.
+- Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation:
+  entity IDs, component masks, and dense typed SoA component stores live there.
+- Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
+  render preparation as mostly stateless processors over `DataSystem` slices;
+  they borrow data and services, but do not own persistent gameplay state.
+- Keep hot ECS component data in dense SoA columns. Component masks are for
+  membership/query decisions, not a replacement for direct slice iteration in
+  hot processors.
+- Keep state transitions, entity structural changes, SDL/GPU calls, asset
+  loading, save/load streaming, and renderer resource ownership out of threaded
+  SIMD processors unless an explicit deferred/main-thread boundary is designed.
+- Keep debug UI state in the debug overlay path, not in gameplay state.
+- Keep runtime asset paths relative and traversal-safe.
+- Use core SDL3 PNG loading for textures. Do not add `SDL3_image` unless that dependency is explicitly chosen.
+- SDL3 and SDL3_ttf are system dependencies; avoid vendoring or half-adopting external dependencies.
+- Pair SDL resource creation with cleanup close to the creation site.
+- Treat performance as a correctness constraint in hot paths: fixed-step update,
+  input dispatch, render submission, asset lookup, and text/debug overlay.
+- Prefer allocation-free hot paths with enums, bitsets, arrays, slices, direct
+  indices, prepared resources, and stable handles.
+- For threaded/SIMD ECS work, treat cache-line behavior as part of correctness:
+  document hot SoA column alignment, split worker ranges so workers do not write
+  the same cache line, and use 64-byte padding only for thread-shared records
+  where false sharing is a real risk. Do not pad cold entity slot metadata by
+  default.
+- Avoid per-frame string lookup, hash-map dispatch, dynamic dispatch, resource
+  churn, formatted logging, and broad frame-rate caps unless measured and
+  justified.
+
+## Slice Implementation Rules
+
+- Treat implementation slices as full features, not partial scaffolds.
+- Do not mark a slice complete until its runtime behavior, docs, tests, and acceptance checks are integrated.
+- If a dependent system does not exist yet, label the work as foundation or preparation, and leave the actual feature checklist incomplete.
+- Avoid half-wired states: either finish the feature end to end or keep the roadmap honest about what remains.
+
+## Build, Test, And Development Commands
+
+- `zig build` builds and installs the game executable to `zig-out/bin/my-sdl3-game`.
+- `zig build run` builds, installs runtime assets/shaders, and runs the app.
+- `zig build dev` builds shaders, installs assets, and runs the app for normal development.
 - `zig build test` runs reusable module tests plus SDL-linked compile coverage.
 - `zig build check` compiles the game and GPU smoke executable without installing.
 - `zig build verify` runs check, tests, and shader compilation.
-- `zig build package` installs selected-mode game binaries and runtime assets.
 - `zig build shaders` compiles platform GPU shaders.
 - `zig build gpu-smoke` runs a display-gated SDL_GPU frame submission check.
 - `zig build fmt` formats `build.zig`, `build.zig.zon`, and `src/`.
+- `zig build package` installs selected-mode game binaries and runtime assets.
 
-Default optimize mode is `Debug`, matching standard Zig build behavior. Use `zig build --release=safe`, `zig build --release=fast`, or `zig build -Doptimize=ReleaseFast` only for release candidates or shipping builds. SDL3 is a system dependency; install the platform SDL3 development package before building. Shader tools are required for the default runnable build.
+Default optimize mode is `Debug`. Use explicit release modes such as
+`zig build --release=safe`, `zig build --release=fast`, or
+`zig build -Doptimize=ReleaseFast` only for release candidates or shipping
+builds.
 
-## Coding Style & Naming Conventions
+Shader tools are required for runnable builds. Linux emits SPIR-V shader files;
+macOS emits Metal shader files through `spirv-cross`. `zig build gpu-smoke`
+requires a usable display, video backend, and GPU.
 
-Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the formatter will rewrite. Use Zig-style lowerCamelCase for variables and functions, `PascalCase` for types, and short, descriptive names. Keep error sets explicit when practical, as in `error{SdlError}`.
+## Coding And Testing Standards
 
-Prefer small functions with clear ownership of SDL resources. Pair SDL creation calls with `defer` cleanup close to the creation site.
+Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the
+formatter will rewrite. Use Zig-style lowerCamelCase for variables and
+functions, `PascalCase` for types, and short descriptive names. Keep error sets
+explicit when practical, as in `error{SdlError}`.
 
-For frame-loop policy, use SDL window flags as current state: throttle visible background windows, but only skip rendering or force pause for hidden, minimized, or no-swapchain frames.
+Use Zig `test` blocks and `std.testing`. Put reusable module tests beside the
+code they cover, and name tests by behavior, such as
+`test "player movement clamps to window bounds"`.
 
-Keep scalable game boundaries explicit: map raw input to named actions, keep latched frame commands separate from held gameplay input, keep debug state in debug UI, and let stack policies decide whether lower states receive update, input, or render passes.
+Prefer focused tests for contracts that do not require opening a window: input
+routing, state policy flow, transition ordering, resource ID validation,
+viewport math, descriptor validation, asset path validation, and timing
+decisions. Keep display/GPU checks in `gpu-smoke`.
 
-## Testing Guidelines
+## Generated Output And Configuration
 
-Use Zig's built-in `test` blocks and `std.testing`. Name tests by behavior, for example `test "player movement clamps to window bounds"`. Put reusable module tests beside the code they cover. Run `zig build test` before submitting changes.
+`zig-out/` and `.zig-cache/` are generated output and should not be edited by
+hand. Do not commit generated binaries or local machine paths.
 
-## Commit & Pull Request Guidelines
-
-This checkout does not include Git history, so no repository-specific commit convention is established. Use concise, imperative commit messages such as `Add SDL input handling` or `Fix renderer cleanup`.
-
-Pull requests should include a short description, testing performed, and any platform details relevant to SDL3 linking or runtime behavior. For visual changes, include a screenshot or short recording of the SDL window when useful.
-
-## Security & Configuration Tips
-
-Do not commit generated binaries from `zig-out/` or local machine paths. If adding dependencies to `build.zig.zon`, keep hashes accurate and review changes to the package fingerprint carefully because it affects package identity.
+If adding dependencies to `build.zig.zon`, keep hashes accurate and review the
+fingerprint carefully because it affects project identity.

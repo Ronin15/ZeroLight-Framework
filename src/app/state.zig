@@ -3,8 +3,14 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
+const AssetCache = @import("../assets/cache.zig").AssetCache;
+const input_router = @import("input_router.zig");
+const InputRoutingPolicy = input_router.InputRoutingPolicy;
 const Renderer = @import("../render/renderer.zig").Renderer;
+const TextService = @import("../render/text.zig").TextService;
+const ThreadSystem = @import("thread_system.zig").ThreadSystem;
 const c = @import("../platform/sdl.zig").c;
 
 pub const StateHandle = struct {
@@ -15,23 +21,46 @@ pub const StatePolicy = struct {
     update_below: bool = false,
     events_below: bool = false,
     render_below: bool = true,
+    input_routing: InputRoutingPolicy = InputRoutingPolicy.gameplay(),
+    blocks_held_gameplay_input: bool = false,
 };
 
 pub const state_policy = struct {
     pub const gameplay = StatePolicy{};
-    pub const modal_overlay = StatePolicy{};
+    pub const modal_overlay = StatePolicy{
+        .input_routing = InputRoutingPolicy.modalUi(),
+        .blocks_held_gameplay_input = true,
+    };
     pub const pass_through_overlay = StatePolicy{
         .update_below = true,
         .events_below = true,
         .render_below = true,
+        .input_routing = InputRoutingPolicy.passThroughOverlay(),
     };
     pub const opaque_screen = StatePolicy{
         .render_below = false,
+        .input_routing = InputRoutingPolicy.opaqueScreen(),
+        .blocks_held_gameplay_input = true,
     };
 };
 
 pub const TransitionApplyResult = struct {
     quit_requested: bool = false,
+};
+
+pub const UpdateContext = struct {
+    input: *const InputState,
+    delta_seconds: f32,
+    transitions: *StateTransitions,
+    thread_system: *ThreadSystem,
+};
+
+pub const RenderContext = struct {
+    renderer: *Renderer,
+    asset_cache: *AssetCache,
+    text_service: ?*TextService,
+    interpolation_alpha: f32,
+    thread_system: *ThreadSystem,
 };
 
 pub const State = struct {
@@ -40,8 +69,8 @@ pub const State = struct {
 
     pub const VTable = struct {
         handle_event: *const fn (*anyopaque, *const c.SDL_Event, *StateTransitions) anyerror!bool,
-        update: *const fn (*anyopaque, *const InputState, f32, *StateTransitions) anyerror!void,
-        render: *const fn (*anyopaque, *Renderer, f32) anyerror!void,
+        update: *const fn (*anyopaque, UpdateContext) anyerror!void,
+        render: *const fn (*anyopaque, RenderContext) anyerror!void,
         on_pause: *const fn (*anyopaque) void,
         destroy: *const fn (*anyopaque, std.mem.Allocator) void,
     };
@@ -59,14 +88,14 @@ pub const State = struct {
                 return try self.handleEvent(event, transitions);
             }
 
-            fn adapterUpdate(state_ptr: *anyopaque, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) anyerror!void {
+            fn adapterUpdate(state_ptr: *anyopaque, context: UpdateContext) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(state_ptr));
-                try self.update(input, delta_seconds, transitions);
+                try self.update(context);
             }
 
-            fn adapterRender(state_ptr: *anyopaque, renderer: *Renderer, interpolation_alpha: f32) anyerror!void {
+            fn adapterRender(state_ptr: *anyopaque, context: RenderContext) anyerror!void {
                 const self: *T = @ptrCast(@alignCast(state_ptr));
-                try self.render(renderer, interpolation_alpha);
+                try self.render(context);
             }
 
             fn adapterOnPause(state_ptr: *anyopaque) void {
@@ -99,12 +128,12 @@ pub const State = struct {
         return try self.vtable.handle_event(self.ptr, event, transitions);
     }
 
-    pub fn update(self: State, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
-        try self.vtable.update(self.ptr, input, delta_seconds, transitions);
+    pub fn update(self: State, context: UpdateContext) !void {
+        try self.vtable.update(self.ptr, context);
     }
 
-    pub fn render(self: State, renderer: *Renderer, interpolation_alpha: f32) !void {
-        try self.vtable.render(self.ptr, renderer, interpolation_alpha);
+    pub fn render(self: State, context: RenderContext) !void {
+        try self.vtable.render(self.ptr, context);
     }
 
     pub fn onPause(self: State) void {
@@ -241,6 +270,15 @@ pub const StateStack = struct {
         return self.replace(T, value, state_policy.gameplay);
     }
 
+    pub fn replaceOwnedState(self: *StateStack, state: State, policy: StatePolicy) !StateHandle {
+        errdefer state.destroy(self.allocator);
+        return try self.replaceOwned(state, policy);
+    }
+
+    pub fn replaceOwnedGameplay(self: *StateStack, state: State) !StateHandle {
+        return self.replaceOwnedState(state, state_policy.gameplay);
+    }
+
     pub fn remove(self: *StateStack, handle: StateHandle) bool {
         for (self.states.items, 0..) |entry, index| {
             if (entry.handle.id == handle.id) {
@@ -280,6 +318,22 @@ pub const StateStack = struct {
         return self.states.items[self.states.items.len - 1].state;
     }
 
+    pub fn inputRoutingPolicy(self: *const StateStack) InputRoutingPolicy {
+        if (self.states.items.len == 0) return state_policy.gameplay.input_routing;
+
+        var index = self.states.items.len - 1;
+        var routing = self.states.items[index].policy.input_routing;
+        while (true) {
+            const policy = self.states.items[index].policy;
+            if (policy.blocks_held_gameplay_input) {
+                routing = routing.withContext(.gameplay, false);
+            }
+            if (!policy.events_below or index == 0) break;
+            index -= 1;
+        }
+        return routing;
+    }
+
     pub fn pauseActive(self: *StateStack) void {
         if (self.active()) |state| {
             state.onPause();
@@ -296,7 +350,7 @@ pub const StateStack = struct {
         }
     }
 
-    pub fn update(self: *StateStack, input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+    pub fn update(self: *StateStack, context: UpdateContext) !void {
         if (self.states.items.len == 0) return;
 
         var first_updated: usize = self.states.items.len - 1;
@@ -308,11 +362,11 @@ pub const StateStack = struct {
         }
 
         for (self.states.items[first_updated..]) |entry| {
-            try entry.state.update(input, delta_seconds, transitions);
+            try entry.state.update(context);
         }
     }
 
-    pub fn render(self: *StateStack, renderer: *Renderer, interpolation_alpha: f32) !void {
+    pub fn render(self: *StateStack, context: RenderContext) !void {
         if (self.states.items.len == 0) return;
 
         var first_rendered: usize = 0;
@@ -324,7 +378,7 @@ pub const StateStack = struct {
         }
 
         for (self.states.items[first_rendered..]) |entry| {
-            try entry.state.render(renderer, interpolation_alpha);
+            try entry.state.render(context);
         }
     }
 
@@ -391,6 +445,55 @@ pub const StateStack = struct {
     }
 };
 
+fn initTestThreadSystem() !ThreadSystem {
+    return try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+}
+
+fn testUpdateContext(
+    input: *const InputState,
+    delta_seconds: f32,
+    transitions: *StateTransitions,
+    thread_system: *ThreadSystem,
+) UpdateContext {
+    return .{
+        .input = input,
+        .delta_seconds = delta_seconds,
+        .transitions = transitions,
+        .thread_system = thread_system,
+    };
+}
+
+fn testRenderContext(
+    renderer: *Renderer,
+    asset_cache: *AssetCache,
+    interpolation_alpha: f32,
+    thread_system: *ThreadSystem,
+) RenderContext {
+    return .{
+        .renderer = renderer,
+        .asset_cache = asset_cache,
+        .text_service = null,
+        .interpolation_alpha = interpolation_alpha,
+        .thread_system = thread_system,
+    };
+}
+
+fn testKeyEvent(event_type: u32, key: c.SDL_Keycode, repeat: bool) c.SDL_Event {
+    return c.SDL_Event{ .key = .{
+        .type = event_type,
+        .reserved = 0,
+        .timestamp = 0,
+        .windowID = 0,
+        .which = 0,
+        .scancode = 0,
+        .key = key,
+        .mod = 0,
+        .raw = 0,
+        .down = event_type == c.SDL_EVENT_KEY_DOWN,
+        .repeat = repeat,
+    } };
+}
+
 test "state stack owns pushed states and destroys removed states" {
     const TestingState = struct {
         id: u32,
@@ -403,17 +506,14 @@ test "state stack owns pushed states and destroys removed states" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -458,17 +558,14 @@ test "state stack deinit destroys remaining states from top to bottom" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -505,17 +602,14 @@ test "state stack replace destroys existing states from top to bottom" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -551,17 +645,14 @@ test "state stack removeIfPresent clears live handles and leaves stale handles a
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -597,17 +688,14 @@ test "modal state blocks updates below and pass-through state allows them" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = context;
             self.update_count.* += 1;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -623,18 +711,20 @@ test "modal state blocks updates below and pass-through state allows them" {
     var top_updates: u32 = 0;
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
+    var threads = try initTestThreadSystem();
+    defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
     _ = try stack.replaceGameplay(TestingState, .{ .update_count = &bottom_updates });
     const modal_handle = try stack.pushModal(TestingState, .{ .update_count = &top_updates });
-    try stack.update(&InputState{}, 0.0, &transitions);
+    try stack.update(testUpdateContext(&InputState{}, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 0), bottom_updates);
     try std.testing.expectEqual(@as(u32, 1), top_updates);
 
     try std.testing.expect(stack.remove(modal_handle));
     _ = try stack.pushOverlay(TestingState, .{ .update_count = &top_updates });
-    try stack.update(&InputState{}, 0.0, &transitions);
+    try stack.update(testUpdateContext(&InputState{}, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 1), bottom_updates);
     try std.testing.expectEqual(@as(u32, 2), top_updates);
 }
@@ -651,17 +741,14 @@ test "state event handling stops at consumed state" {
             return self.consume;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -704,17 +791,14 @@ test "modal state blocks event handling below it" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -743,6 +827,77 @@ test "modal state blocks event handling below it" {
     try std.testing.expectEqual(@as(u32, 1), modal_count);
 }
 
+test "state stack input routing follows active state policy" {
+    const TestingState = struct {
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.ui));
+
+    _ = try stack.replaceGameplay(TestingState, .{});
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+
+    const modal_handle = try stack.pushModal(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+
+    _ = try stack.pushOverlay(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.quit));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+
+    var input = InputState{};
+    var commands = FrameCommands{};
+    var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    try std.testing.expect(!input.isHeld(.moveLeft));
+
+    try std.testing.expect(stack.remove(modal_handle));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
+    input_router.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
+    try std.testing.expect(input.isHeld(.moveLeft));
+
+    _ = try stack.pushOpaque(TestingState, .{});
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+}
+
 test "opaque state render policy hides states below it" {
     const TestingState = struct {
         render_count: *u32,
@@ -754,16 +909,13 @@ test "opaque state render policy hides states below it" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
-            _ = renderer;
-            _ = interpolation_alpha;
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = context;
             self.render_count.* += 1;
         }
 
@@ -779,15 +931,22 @@ test "opaque state render policy hides states below it" {
     var bottom_count: u32 = 0;
     var opaque_count: u32 = 0;
     var overlay_count: u32 = 0;
+    var threads = try initTestThreadSystem();
+    defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
+    var asset_cache = AssetCache.init(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .root = "assets",
+    });
 
     _ = try stack.replaceGameplay(TestingState, .{ .render_count = &bottom_count });
     _ = try stack.pushOpaque(TestingState, .{ .render_count = &opaque_count });
     _ = try stack.pushOverlay(TestingState, .{ .render_count = &overlay_count });
 
     var renderer: Renderer = undefined;
-    try stack.render(&renderer, 0.0);
+    try stack.render(testRenderContext(&renderer, &asset_cache, 0.0, &threads));
 
     try std.testing.expectEqual(@as(u32, 0), bottom_count);
     try std.testing.expectEqual(@as(u32, 1), opaque_count);
@@ -806,16 +965,13 @@ test "transition requests apply after dispatch and preserve FIFO order" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
-            _ = renderer;
-            _ = interpolation_alpha;
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = context;
             self.render_order.append(std.testing.allocator, self.id) catch unreachable;
         }
 
@@ -832,8 +988,15 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     defer render_order.deinit(std.testing.allocator);
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
+    var threads = try initTestThreadSystem();
+    defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
+    var asset_cache = AssetCache.init(std.testing.allocator, .{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .root = "assets",
+    });
 
     _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .render_order = &render_order });
     try transitions.pushModal(TestingState, .{ .id = 2, .render_order = &render_order });
@@ -845,7 +1008,7 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
 
     var renderer: Renderer = undefined;
-    try stack.render(&renderer, 0.0);
+    try stack.render(testRenderContext(&renderer, &asset_cache, 0.0, &threads));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, render_order.items);
 }
 
@@ -858,17 +1021,14 @@ test "queued transition from update waits until applyTransitions" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            try transitions.pushModal(@This(), .{});
+            try context.transitions.pushModal(@This(), .{});
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -882,11 +1042,13 @@ test "queued transition from update waits until applyTransitions" {
 
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
+    var threads = try initTestThreadSystem();
+    defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
     _ = try stack.replaceGameplay(QueuingState, .{});
-    try stack.update(&InputState{}, 0.0, &transitions);
+    try stack.update(testUpdateContext(&InputState{}, 0.0, &transitions, &threads));
 
     try std.testing.expectEqual(@as(usize, 1), stack.len());
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
@@ -906,17 +1068,14 @@ test "queued transition from handleEvent waits until applyTransitions" {
             return true;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -955,17 +1114,14 @@ test "stale duplicate and remove after replace transitions are no-ops" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {
@@ -1007,17 +1163,14 @@ test "transition queue destroys unapplied owned states" {
             return false;
         }
 
-        fn update(self: *@This(), input: *const InputState, delta_seconds: f32, transitions: *StateTransitions) !void {
+        fn update(self: *@This(), context: UpdateContext) !void {
             _ = self;
-            _ = input;
-            _ = delta_seconds;
-            _ = transitions;
+            _ = context;
         }
 
-        fn render(self: *@This(), renderer: *Renderer, interpolation_alpha: f32) !void {
+        fn render(self: *@This(), context: RenderContext) !void {
             _ = self;
-            _ = renderer;
-            _ = interpolation_alpha;
+            _ = context;
         }
 
         fn onPause(self: *@This()) void {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zig Review Specialist"
+  short_description: "Review performance-critical Zig game changes"
+  default_prompt: "Use $zig-review-specialist to review a Zig game engine change for correctness, ownership, performance, and tests."

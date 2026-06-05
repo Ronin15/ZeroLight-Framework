@@ -5,6 +5,7 @@
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const config = @import("../config.zig");
+const log = @import("../core/logging.zig").platform;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const sdl = @import("sdl.zig");
 const c = sdl.c;
@@ -29,7 +30,10 @@ pub fn main(init: std.process.Init) !void {
     renderer.beginFrame(app_config.clear_color);
     try renderer.drawRect(.{ .x = 32, .y = 32, .w = 64, .h = 64 }, .{ .r = 1, .g = 1, .b = 1, .a = 1 }, 0);
     switch (try renderer.endFrame()) {
-        .submitted => {},
-        .skipped_no_swapchain => return error.NoSwapchain,
+        .submitted => log.debug("SDL_GPU smoke submitted one frame", .{}),
+        .skipped_no_swapchain => {
+            log.err("SDL_GPU smoke could not acquire a swapchain texture", .{});
+            return error.NoSwapchain;
+        },
     }
 }

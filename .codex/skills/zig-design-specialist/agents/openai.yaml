@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zig Design Specialist"
+  short_description: "Plan DOD Zig game systems before implementation"
+  default_prompt: "Use $zig-design-specialist to design a DOD-oriented Zig gameplay or engine system before implementation."

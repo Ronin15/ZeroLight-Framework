@@ -1,0 +1,4 @@
+interface:
+  display_name: "Zig Specialist"
+  short_description: "Implement performance-aware Zig SDL3 game changes"
+  default_prompt: "Use $zig-specialist to implement a performance-aware Zig game engine change while respecting engine ownership boundaries."

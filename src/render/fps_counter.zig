@@ -3,79 +3,50 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const config = @import("../config.zig");
 const Renderer = @import("renderer.zig").Renderer;
-const TextureHandle = @import("renderer.zig").TextureHandle;
-const c = @import("../platform/sdl.zig").c;
+const text_mod = @import("text.zig");
+const FontId = text_mod.FontId;
+const TextService = text_mod.TextService;
+const TextTextureLease = text_mod.TextTextureLease;
 
-const yellow = c.SDL_Color{ .r = 255, .g = 230, .b = 40, .a = 255 };
+const yellow = config.Color{ .r = 1.0, .g = 0.902, .b = 0.157, .a = 1.0 };
 const sample_window_ns = std.time.ns_per_s / 4;
 const font_size: f32 = 18;
+const font_size_epsilon: f32 = 0.1;
 const overlay_layer: i32 = 10_000;
-const bytes_per_pixel = 4;
-
-const system_font_paths = [_][:0]const u8{
-    "/System/Library/Fonts/SFNSMono.ttf",
-    "/System/Library/Fonts/Menlo.ttc",
-    "/Library/Fonts/Arial.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSansMono.ttf",
-    "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
-    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
-};
 
 pub const FpsCounter = struct {
-    font: ?*c.TTF_Font = null,
-    ttf_initialized: bool = false,
-    texture: ?TextureHandle = null,
-    texture_width: u32 = 0,
-    texture_height: u32 = 0,
+    font: FontId = FontId.invalid,
+    texture: TextTextureLease = .{},
     accumulated_ns: u64 = 0,
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
+    active_font_size: f32 = font_size,
 
-    pub fn init() FpsCounter {
-        if (!c.TTF_Init()) {
-            std.log.warn("debug overlay disabled: TTF_Init failed: {s}", .{c.SDL_GetError()});
-            return .{};
-        }
-
-        const font = openSystemFont() catch {
-            std.log.warn("debug overlay disabled: failed to open a system font", .{});
-            c.TTF_Quit();
-            return .{};
-        };
-
+    pub fn init(text_service: *TextService) FpsCounter {
         return .{
-            .font = font,
-            .ttf_initialized = true,
+            .font = text_service.defaultFont(),
+            .active_font_size = font_size,
         };
     }
 
-    pub fn deinit(self: *FpsCounter, renderer: *Renderer) void {
-        renderer.waitForIdle();
-        self.destroyTexture(renderer);
-        if (self.font) |font| {
-            c.TTF_CloseFont(font);
-            self.font = null;
-        }
-        if (self.ttf_initialized) {
-            c.TTF_Quit();
-            self.ttf_initialized = false;
-        }
+    pub fn deinit(self: *FpsCounter) void {
+        self.texture.release();
     }
 
-    pub fn available(self: *const FpsCounter) bool {
-        return self.font != null;
-    }
-
-    pub fn recordSubmittedFrame(self: *FpsCounter, renderer: *Renderer, frame_delta_ns: u64) !void {
-        if (!self.available()) return;
-
+    pub fn recordSubmittedFrame(
+        self: *FpsCounter,
+        text_service: *TextService,
+        renderer: *Renderer,
+        frame_delta_ns: u64,
+    ) !void {
         self.sampled_frames += 1;
         self.accumulated_ns += frame_delta_ns;
+        const target_font_size = overlayFontSize(renderer.drawablePixelScale());
+        const font_size_changed = !approxEqAbs(self.active_font_size, target_font_size, font_size_epsilon);
 
-        if (self.texture == null or self.accumulated_ns >= sample_window_ns) {
+        if (!self.texture.isAlive() or self.accumulated_ns >= sample_window_ns or font_size_changed) {
             var next_fps = self.displayed_fps;
             if (self.accumulated_ns > 0) {
                 next_fps = @intFromFloat(@round(
@@ -85,100 +56,58 @@ pub const FpsCounter = struct {
             }
             self.sampled_frames = 0;
             self.accumulated_ns = 0;
-            if (self.texture != null and next_fps == self.displayed_fps) return;
+            if (self.texture.isAlive() and next_fps == self.displayed_fps and !font_size_changed) return;
 
             self.displayed_fps = next_fps;
-            try self.rebuildTexture(renderer);
+            if (font_size_changed) {
+                self.font = try text_service.loadFont(text_mod.defaultFontDesc(target_font_size));
+                self.active_font_size = target_font_size;
+            }
+            try self.rebuildTexture(text_service, renderer);
         }
     }
 
     pub fn render(self: *const FpsCounter, renderer: *Renderer) !void {
-        const texture = self.texture orelse return;
+        if (!self.texture.isAlive()) return;
         try renderer.drawSprite(.{
-            .texture = texture,
+            .texture = self.texture.texture,
             .dest = .{
                 .x = 12,
                 .y = 10,
-                .w = @floatFromInt(self.texture_width),
-                .h = @floatFromInt(self.texture_height),
+                .w = @floatFromInt(self.texture.width),
+                .h = @floatFromInt(self.texture.height),
             },
             .layer = overlay_layer,
-            .screen_space = true,
+            .coordinate_space = .drawable,
         });
     }
 
-    fn rebuildTexture(self: *FpsCounter, renderer: *Renderer) !void {
-        const font = self.font orelse return;
-
+    fn rebuildTexture(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
         var text_buffer: [32]u8 = undefined;
-        const text = try std.fmt.bufPrintZ(&text_buffer, "FPS {d}", .{self.displayed_fps});
+        const text = try std.fmt.bufPrint(&text_buffer, "FPS {d}", .{self.displayed_fps});
 
-        const surface = c.TTF_RenderText_Blended(font, text.ptr, text.len, yellow) orelse {
-            return ttfError("TTF_RenderText_Blended");
-        };
-        defer c.SDL_DestroySurface(surface);
-
-        const converted = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_RGBA32) orelse {
-            return ttfError("SDL_ConvertSurface");
-        };
-        defer c.SDL_DestroySurface(converted);
-
-        if (!c.SDL_LockSurface(converted)) {
-            return ttfError("SDL_LockSurface");
-        }
-        defer c.SDL_UnlockSurface(converted);
-
-        const pixels_ptr: [*]const u8 = @ptrCast(converted.*.pixels.?);
-        const pitch: usize = @intCast(converted.*.pitch);
-        const byte_len = pitch * @as(usize, @intCast(converted.*.h));
-        const pixels = pixels_ptr[0..byte_len];
-        const width: u32 = @intCast(converted.*.w);
-        const height: u32 = @intCast(converted.*.h);
-
-        if (self.texture) |texture| {
-            try renderer.replaceTextureFromPixels(texture, pixels, width, height, pitch);
-        } else {
-            self.texture = try renderer.createTextureFromPixels(pixels, width, height, pitch);
-        }
-        self.texture_width = width;
-        self.texture_height = height;
-    }
-
-    fn destroyTexture(self: *FpsCounter, renderer: *Renderer) void {
-        if (self.texture) |texture| {
-            renderer.destroyTexture(texture);
-            self.texture = null;
-            self.texture_width = 0;
-            self.texture_height = 0;
-        }
+        const next_texture = try text_service.acquireText(renderer, .{
+            .text = text,
+            .style = .{
+                .font = self.font,
+                .color = yellow,
+            },
+        });
+        self.texture.release();
+        self.texture = next_texture;
     }
 };
 
-fn openSystemFont() !*c.TTF_Font {
-    for (system_font_paths) |path| {
-        if (c.TTF_OpenFont(path.ptr, font_size)) |font| {
-            return font;
-        }
-    }
-
-    return error.SdlError;
+fn overlayFontSize(drawable_pixel_scale: f32) f32 {
+    return font_size * @max(1.0, drawable_pixel_scale);
 }
 
-fn ttfError(comptime operation: []const u8) error{SdlError} {
-    std.log.err("{s} failed: {s}", .{ operation, c.SDL_GetError() });
-    return error.SdlError;
+fn approxEqAbs(a: f32, b: f32, tolerance: f32) bool {
+    return @abs(a - b) <= tolerance;
 }
 
-test "system font paths include common Linux monospace locations" {
-    try std.testing.expect(hasSystemFontPath("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"));
-    try std.testing.expect(hasSystemFontPath("/usr/share/fonts/TTF/DejaVuSansMono.ttf"));
-    try std.testing.expect(hasSystemFontPath("/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf"));
-    try std.testing.expect(hasSystemFontPath("/usr/share/fonts/noto/NotoSansMono-Regular.ttf"));
-}
-
-fn hasSystemFontPath(expected: []const u8) bool {
-    for (system_font_paths) |path| {
-        if (std.mem.eql(u8, path, expected)) return true;
-    }
-    return false;
+test "overlay font size follows drawable pixel scale" {
+    try std.testing.expectEqual(@as(f32, 18), overlayFontSize(1));
+    try std.testing.expectEqual(@as(f32, 36), overlayFontSize(2));
+    try std.testing.expectEqual(@as(f32, 18), overlayFontSize(0.5));
 }

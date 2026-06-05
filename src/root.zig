@@ -2,7 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Minimal package root for shared starter helpers and tests.
+//! Minimal root file for math aliases and compile coverage.
 
 const math = @import("core/math.zig");
 
