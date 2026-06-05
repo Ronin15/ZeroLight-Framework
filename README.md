@@ -1,34 +1,34 @@
 # 2D SDL_GPU Game Framework in Zig
 
 This is a lean 2D game framework built with Zig 0.16.0, SDL3, and SDL_GPU. It
-keeps the main loop small while app flow, state/input policy, rendering, assets,
-text, and gameplay data each have clear places in the source tree.
+is organized around predictable frame flow, SDL_GPU rendering, explicit
+state/input policy, runtime assets and text, data-oriented architecture,
+multi-threaded processing, and tests that keep those systems reliable as the
+framework grows.
 
-The framework includes a fixed-step update loop, policy-driven game
-states, named input actions, an SDL_GPU sprite renderer, safe runtime asset
-loading, SDL3_ttf text, and data-oriented gameplay processors. Focused Zig tests
-cover core runtime behavior, and `zig build gpu-smoke` is available when you
-want to verify SDL_GPU frame submission.
+The goal is a framework that stays easy to reason about while still covering the
+hard parts of a real-time 2D game: state flow, input routing, rendering,
+resource ownership, fixed-step simulation, and processor-friendly gameplay data.
 
-## What Is Here
+## Strengths
 
-- **SDL_GPU rendering:** game states draw through `Renderer`; GPU setup,
-  shader loading, texture ownership, batching, and frame submission stay in the
-  render/platform layers.
-- **Fixed-step game flow:** gameplay updates run at 60Hz, rendering interpolates
-  between simulation ticks, and hidden or minimized windows do not keep
-  advancing gameplay.
-- **State and input policy:** `StateStack` handles gameplay screens, overlays,
-  modal states, pause behavior, and queued transitions. Keyboard input maps to
-  named actions for gameplay movement, app commands, and debug commands.
-- **Runtime assets and text:** assets load from traversal-safe relative paths,
+- **Predictable runtime flow:** a thin fixed-step main loop delegates app
+  coordination, state dispatch, pause policy, input, and rendering to clear
+  framework layers.
+- **SDL_GPU-first rendering:** game states draw through `Renderer`, while GPU
+  setup, shader loading, texture ownership, batching, and frame submission stay
+  in the rendering and platform code.
+- **Data-oriented architecture:** gameplay data lives in dense stores built for
+  direct processor iteration, so systems can work over clear, cache-friendly
+  component data instead of scattered state.
+- **Threaded and SIMD processors:** movement and particle updates use serial,
+  SIMD, and worker-thread paths where those execution modes fit the workload.
+- **Strong test coverage:** the test suite protects behavior that needs to stay
+  stable as the framework grows, including state transitions, input routing,
+  resource lifetime, renderer math, threaded batches, and SIMD/scalar parity.
+- **Practical runtime services:** assets load from traversal-safe relative paths,
   PNG textures use core SDL3 loading, SDL3_ttf renders asset-backed text, and F2
   toggles the local FPS overlay.
-- **Gameplay data systems:** `DataSystem` owns persistent entity data in dense
-  stores for direct processor iteration, with movement and particle updates
-  using serial, SIMD, and worker-thread paths where appropriate.
-- **Project checks:** `zig build test` covers app, render, asset, and gameplay
-  behavior. `zig build verify` adds compile coverage and shader compilation.
 
 For deeper details, see [architecture](docs/architecture.md),
 [state stack and input](docs/state-stack-and-input.md), and
