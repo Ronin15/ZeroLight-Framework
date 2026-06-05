@@ -22,6 +22,7 @@ const Renderer = @import("../render/renderer.zig").Renderer;
 const resolution = @import("resolution.zig");
 const state_mod = @import("state.zig");
 const RenderContext = state_mod.RenderContext;
+const State = state_mod.State;
 const StateStack = state_mod.StateStack;
 const StateTransitions = state_mod.StateTransitions;
 const TextService = @import("../render/text.zig").TextService;
@@ -88,7 +89,7 @@ pub const Engine = struct {
 
         var states = StateStack.init(allocator);
         errdefer states.deinit();
-        try bootstrapStartupState(&states, app_config);
+        try bootstrapStartupState(&states, allocator, app_config);
 
         var transitions = StateTransitions.init(allocator);
         errdefer transitions.deinit();
@@ -294,13 +295,21 @@ fn minimumWindowSizeForPolicy(policy: resolution.ResolutionPolicy) ?resolution.L
     };
 }
 
-fn bootstrapStartupState(states: *StateStack, app_config: config.AppConfig) !void {
+fn bootstrapStartupState(states: *StateStack, allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
     const logical_size = app_config.resolution_policy.logical_size;
     // DemoState is the startup state until a real MainMenuState exists.
-    _ = try states.replaceGameplay(DemoState, DemoState.init(
+    const demo_state_ptr = try allocator.create(DemoState);
+    var owned_by_state = false;
+    errdefer if (!owned_by_state) allocator.destroy(demo_state_ptr);
+    demo_state_ptr.* = try DemoState.init(
+        allocator,
         @floatFromInt(logical_size.width),
         @floatFromInt(logical_size.height),
-    ));
+    );
+
+    const state = State.fromOwnedPtr(DemoState, demo_state_ptr);
+    owned_by_state = true;
+    _ = try states.replaceOwnedGameplay(state);
 }
 
 test "integer fit requests logical minimum window size" {

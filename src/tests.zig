@@ -20,6 +20,7 @@ comptime {
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");
+    _ = @import("game/data_system.zig");
     _ = @import("game/player.zig");
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");

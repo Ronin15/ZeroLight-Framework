@@ -270,6 +270,15 @@ pub const StateStack = struct {
         return self.replace(T, value, state_policy.gameplay);
     }
 
+    pub fn replaceOwnedState(self: *StateStack, state: State, policy: StatePolicy) !StateHandle {
+        errdefer state.destroy(self.allocator);
+        return try self.replaceOwned(state, policy);
+    }
+
+    pub fn replaceOwnedGameplay(self: *StateStack, state: State) !StateHandle {
+        return self.replaceOwnedState(state, state_policy.gameplay);
+    }
+
     pub fn remove(self: *StateStack, handle: StateHandle) bool {
         for (self.states.items, 0..) |entry, index| {
             if (entry.handle.id == handle.id) {

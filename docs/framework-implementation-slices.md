@@ -476,7 +476,9 @@ Current foundation:
 
 - `StateStack` owns active state lifetimes.
 - `UpdateContext` exposes `ThreadSystem` to states.
-- Game-specific runtime data currently lives inside demo state/player structs.
+- `DemoState` owns a `DataSystem` for state-local persistent game-world data.
+- `Player` remains a player-specific behavior facade, backed by entity data in
+  `DataSystem`.
 
 Architecture notes:
 
@@ -490,29 +492,42 @@ Architecture notes:
   thread system, input, or transient frame state.
 - Composition comes from meaningful data membership in typed stores, not from a
   free-form component soup where arbitrary behavior combinations are implied.
+- Per-entity component masks are the membership/query layer. Hot system data is
+  still exposed through aligned scalar SoA slices, not joined dynamically in the
+  update or render loop.
 
 Checklist:
 
-- [ ] Add a game data module with `DataSystem` and an entity ID/generation
+- [x] Add a game data module with `DataSystem` and an entity ID/generation
       registry.
-- [ ] Add dense SoA stores for initial persistent gameplay data such as transform
-      and movement.
-- [ ] Use stable handles or dense indices so stores can remain compact while
+- [x] Add dense scalar-column SoA stores for initial persistent gameplay data
+      such as movement bodies and renderable primitive visual intent.
+- [x] Use stable handles or dense indices so stores can remain compact while
       rejecting stale IDs.
-- [ ] Keep SDL handles, GPU handles, input frame state, renderer state,
+- [x] Keep SDL handles, GPU handles, input frame state, renderer state,
       `ThreadSystem`, transient events, and scratch buffers outside `DataSystem`.
-- [ ] Store persistent asset references as stable IDs or relative paths, not
+- [x] Store persistent asset references as stable IDs or relative paths, not
       live renderer texture handles.
-- [ ] Add explicit init/deinit and clear/reset behavior for state lifecycle and
+- [x] Add explicit init/deinit and clear/reset behavior for state lifecycle and
       save/load preparation.
 
 Acceptance checks:
 
-- [ ] Entity IDs reject stale generations after removal and reuse.
-- [ ] Dense SoA stores keep arrays length-aligned and compact after add/remove.
-- [ ] `DataSystem` can be initialized and deinitialized without leaks.
-- [ ] Tests cover which data belongs inside `DataSystem` versus transient runtime
+- [x] Entity IDs reject stale generations after removal and reuse.
+- [x] Dense SoA stores keep arrays length-aligned and compact after add/remove.
+- [x] Movement-body columns can be loaded directly with `src/core/simd.zig`
+      helpers and handle vector ranges plus scalar tails.
+- [x] Component masks track entity membership for future system queries without
+      replacing the SIMD-ready SoA storage.
+- [x] `DataSystem` can be initialized and deinitialized without leaks.
+- [x] Tests cover which data belongs inside `DataSystem` versus transient runtime
       services that must stay outside it.
+
+Slice 10 landed as a state-owned data foundation. Update systems mutate
+`DataSystem` slices, render systems read immutable slices and submit through
+`Renderer`, and live engine/runtime services stay outside persistent data. The
+movement-body store is SIMD-ready scalar SoA storage; threaded/SIMD processors
+remain Slice 11 work.
 
 ## Slice 11: SIMD-Aware Data Processor Systems
 
@@ -528,6 +543,23 @@ Current foundation:
 - `DataSystem` will provide persistent SoA slices for systems to process.
 - `src/core/simd.zig` will provide portable vector helpers.
 
+Performance notes:
+
+- Hot processors should iterate SoA columns directly, not per-entity AoS structs
+  or dynamically joined component records.
+- Treat cache-line behavior as part of the processor contract. SoA columns used
+  by SIMD processors should have an explicit alignment policy before relying on
+  wider loads or target-specific vector behavior.
+- Padding to 64-byte cache lines should be applied deliberately to thread-shared
+  records, worker scratch, counters, queues, and other concurrently written
+  coordination data where false sharing is a real risk.
+- Do not pad the cold entity slot metadata by default. Entity slots hold
+  generation, component masks, free-list state, and dense store indices; they
+  should stay out of hot movement/render processor loops unless profiling proves
+  otherwise.
+- Worker ranges should be chosen so two workers do not write the same cache line
+  of a hot SoA column during normal fixed-step processing.
+
 Checklist:
 
 - [ ] Define systems as data processors that accept `DataSystem`, `ThreadSystem`,
@@ -536,7 +568,12 @@ Checklist:
       `parallelFor`.
 - [ ] Use SIMD inside each worker range and scalar-tail code for remainder
       elements.
+- [ ] Add an explicit alignment strategy for hot SoA columns before introducing
+      wider or target-specific vector loads.
+- [ ] Audit thread-shared processor data for false sharing and add 64-byte
+      padding only where concurrent writes justify it.
 - [ ] Ensure worker jobs write only to assigned disjoint ranges.
+- [ ] Ensure worker ranges avoid sharing writable cache lines in hot SoA columns.
 - [ ] Keep state transitions, entity creation/removal, SDL calls, GPU calls,
       asset loading, and save/load streaming on the main thread.
 - [ ] Merge any per-worker output, event counts, or deferred structural changes
@@ -549,6 +586,9 @@ Acceptance checks:
 - [ ] Serial and threaded processor results match for the same initial
       `DataSystem`.
 - [ ] Worker jobs do not write outside their assigned `ParallelRange`.
+- [ ] Hot SoA columns used by SIMD processors have documented alignment behavior.
+- [ ] Thread-shared processor records that are concurrently written are either
+      disjoint by design or padded/aligned to avoid false sharing.
 - [ ] Update processors perform no allocations during steady-state simulation.
 - [ ] Fixed-step update order remains deterministic: later systems always see
       completed output from earlier systems.

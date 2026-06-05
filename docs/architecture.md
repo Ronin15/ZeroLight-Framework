@@ -19,6 +19,10 @@ behavior under `src/game/`.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig` and `src/render/fps_counter.zig` draw the F2 FPS overlay.
 - `src/game/demo_state.zig` and `src/game/pause_state.zig` are the current game states.
+- `src/game/data_system.zig` owns state-local persistent entity data in dense
+  SoA stores for gameplay and render systems.
+- `src/game/player.zig` keeps player-specific input and facing behavior while
+  storing persistent player data in `DataSystem`.
 - `src/platform/` contains shared SDL C imports and GPU smoke-test code.
 - `src/assets/assets.zig` resolves safe runtime asset paths, and `src/assets/cache.zig` caches renderer-backed runtime assets.
 - `src/core/` contains small shared helpers such as math primitives and portable SIMD aliases.
@@ -73,6 +77,30 @@ Workers are pre-spawned at startup. The default background worker count is based
 on CPU count, with the main/render thread participating as an additional worker
 while it waits. Small batches run inline on the main thread, and batch
 submission does not allocate after initialization.
+
+## Gameplay Data
+
+Gameplay states own their own `DataSystem`; it is not an app singleton. The
+system stores persistent world entities, per-entity component masks for system
+membership queries, and typed SoA data such as movement bodies, facing,
+primitive visual intent, and relative asset references.
+
+Hot gameplay data is stored as scalar columns. The movement-body store exposes
+aligned `position_x`, `position_y`, `previous_x`, `previous_y`, `velocity_x`,
+`velocity_y`, and `speed` slices so update processors can load lanes directly
+with `src/core/simd.zig`. Component masks decide whether an entity belongs to a
+system; hot processors iterate already aligned SoA slices.
+
+Update systems mutate `DataSystem` slices during fixed-step updates. Render
+systems read immutable `DataSystem` slices during state render and submit draw
+calls through `Renderer`. `DataSystem` does not own SDL handles, GPU handles,
+live renderer texture IDs, asset leases, input frame state, thread-system state,
+transient events, or scratch buffers.
+
+The demo player is intentionally a special-case facade for player input and
+facing rules, backed by `DataSystem` data. Future enemies and other world
+objects should normally be plain entities processed by enemy, movement,
+collision, AI, or render systems rather than copies of player behavior.
 
 ## SIMD Helpers
 
