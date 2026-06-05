@@ -12,8 +12,8 @@ data-oriented update systems.
 
 ### SDL_GPU Rendering Foundation
 
-- A renderer built around SDL_GPU, not SDL's 2D renderer path
-- Sprite and rectangle drawing through a small game-facing renderer API
+- A renderer built around SDL_GPU
+- Sprite drawing through a small game-facing renderer API
 - Batched draw submission with stable layer ordering and renderer-owned GPU resources
 - Resizable high-DPI presentation that keeps gameplay in 1280x720 logical coordinates
 - Build-time shader outputs for supported targets: SPIR-V on Linux and Metal shaders on macOS
@@ -57,7 +57,7 @@ See [setup](docs/setup.md) for platform package notes.
 ## Quick Start
 
 ```sh
-git clone git@github.com:Ronin15/Zig_SDL3_GPU_FrameWork.git
+git clone git@github.com:Ronin15/Zig_SDL3_GPU_Framework.git
 cd Zig_SDL3_GPU_FrameWork
 zig build
 zig build run
@@ -71,17 +71,6 @@ zig build dev
 
 `zig build dev` compiles shaders, installs assets, builds the executable, and
 runs the app.
-
-## Runtime Shape
-
-The app starts as a resizable, high-pixel-density SDL window with a 1280x720
-logical game size. The renderer recomputes presentation from the acquired
-SDL_GPU drawable size each submitted frame, so world and logical UI drawing stay
-in game coordinates while debug overlays can use raw drawable pixels.
-
-The main loop stays timing-centric. SDL events, input routing, pause policy,
-state dispatch, fixed updates, interpolation, rendering, assets, text, and worker
-batches are coordinated through `src/app/`, `src/render/`, and `src/game/`.
 
 See [architecture](docs/architecture.md) and
 [rendering, assets, and shaders](docs/rendering-assets-shaders.md) for the full
