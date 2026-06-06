@@ -202,7 +202,7 @@ pub const Engine = struct {
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());
         } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause)) {
             log.debug("pausing gameplay by input command", .{});
-            try self.pause.enter(&self.states, &self.input, time_loop, self.nowNs());
+            try self.pause.enterUser(&self.states, &self.input, time_loop, self.nowNs());
         }
     }
 
@@ -233,10 +233,11 @@ pub const Engine = struct {
                 .interpolation_alpha = interpolation_alpha,
                 .thread_system = &self.thread_system,
             });
+            try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
             try self.debug_overlay.render(&self.renderer);
             switch (try self.renderer.endFrame()) {
                 .submitted => {
-                    try self.debug_overlay.recordSubmittedFrame(&self.text_service, &self.renderer, frame_delta_ns);
+                    self.debug_overlay.recordSubmittedFrame(frame_delta_ns);
                     if (frame_policy.target_frame_ns) |target_frame_ns| {
                         frame_pacer.paceTargetFrame(frame_start_ns, target_frame_ns);
                     }
@@ -245,7 +246,7 @@ pub const Engine = struct {
                     if (!self.pause.isPaused()) {
                         log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
                     }
-                    try self.pause.enter(&self.states, &self.input, time_loop, self.nowNs());
+                    try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
                     frame_pacer.paceFallbackFrame(frame_start_ns);
                 },
             }

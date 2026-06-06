@@ -21,15 +21,21 @@ pub const DebugOverlay = struct {
         _ = commands;
     }
 
-    pub fn recordSubmittedFrame(
+    pub fn prepareForRender(
         self: *DebugOverlay,
         text_service: *TextService,
         renderer: *Renderer,
-        frame_delta_ns: u64,
     ) !void {
         _ = self;
         _ = text_service;
         _ = renderer;
+    }
+
+    pub fn recordSubmittedFrame(
+        self: *DebugOverlay,
+        frame_delta_ns: u64,
+    ) void {
+        _ = self;
         _ = frame_delta_ns;
     }
 

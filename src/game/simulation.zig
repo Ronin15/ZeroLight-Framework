@@ -73,6 +73,18 @@ pub const SimulationFrame = struct {
         self.structural_commands.clearRetainingCapacity();
     }
 
+    pub fn reserveStreams(
+        self: *SimulationFrame,
+        range_count: usize,
+        event_capacity: usize,
+        intent_capacity: usize,
+        structural_command_capacity: usize,
+    ) !void {
+        try self.events.reserve(range_count, event_capacity);
+        try self.intents.reserve(range_count, intent_capacity);
+        try self.structural_commands.reserve(range_count, structural_command_capacity);
+    }
+
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !data_mod.StructuralCommitStats {
         self.phase = .commit_structural;
         return try data.applyStructuralCommands(self.structural_commands.mergedItems());
@@ -110,6 +122,13 @@ pub fn RangeOutputStream(comptime T: type) type {
             self.values.clearRetainingCapacity();
             self.prefix_ready = false;
             self.merged_len = 0;
+        }
+
+        pub fn reserve(self: *Self, range_count: usize, value_capacity: usize) !void {
+            try self.counts.ensureTotalCapacity(self.allocator, range_count);
+            try self.offsets.ensureTotalCapacity(self.allocator, range_count);
+            try self.write_offsets.ensureTotalCapacity(self.allocator, range_count);
+            try self.values.ensureTotalCapacity(self.allocator, value_capacity);
         }
 
         pub fn prepareRangeCounts(self: *Self, range_count: usize) !void {
@@ -355,4 +374,66 @@ test "range output stream reuses warmed capacity without allocation" {
     try std.testing.expectEqual(@as(usize, 2), merged.len);
     try std.testing.expectEqual(@as(u32, 4), merged[0].marker);
     try std.testing.expectEqual(@as(u32, 5), merged[1].marker);
+}
+
+test "simulation frame reserves stream capacity for warmed fixed-step output" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveStreams(2, 2, 2, 1);
+
+    const original_allocator = frame.allocator;
+    const original_events_allocator = frame.events.allocator;
+    const original_intents_allocator = frame.intents.allocator;
+    const original_commands_allocator = frame.structural_commands.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fail = failing_allocator.allocator();
+    frame.allocator = fail;
+    frame.events.allocator = fail;
+    frame.intents.allocator = fail;
+    frame.structural_commands.allocator = fail;
+    defer {
+        frame.allocator = original_allocator;
+        frame.events.allocator = original_events_allocator;
+        frame.intents.allocator = original_intents_allocator;
+        frame.structural_commands.allocator = original_commands_allocator;
+    }
+
+    try frame.events.prepareRangeCounts(2);
+    frame.events.addCount(0, 1);
+    frame.events.addCount(1, 1);
+    try frame.events.prefix();
+    var event_writer = frame.events.rangeWriter(0);
+    event_writer.write(.{ .marker = 1 });
+    event_writer.finish();
+    event_writer = frame.events.rangeWriter(1);
+    event_writer.write(.{ .marker = 2 });
+    event_writer.finish();
+    frame.events.finishWrite();
+
+    try frame.intents.prepareRangeCounts(2);
+    frame.intents.addCount(0, 1);
+    frame.intents.addCount(1, 1);
+    try frame.intents.prefix();
+    var intent_writer = frame.intents.rangeWriter(0);
+    intent_writer.write(.{ .marker = 3 });
+    intent_writer.finish();
+    intent_writer = frame.intents.rangeWriter(1);
+    intent_writer.write(.{ .marker = 4 });
+    intent_writer.finish();
+    frame.intents.finishWrite();
+
+    try frame.structural_commands.prepareRangeCounts(2);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var command_writer = frame.structural_commands.rangeWriter(0);
+    command_writer.write(.{ .destroy_entity = EntityId.invalid });
+    command_writer.finish();
+    command_writer = frame.structural_commands.rangeWriter(1);
+    command_writer.finish();
+    frame.structural_commands.finishWrite();
+
+    try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 2), frame.intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.structural_commands.mergedItems().len);
 }

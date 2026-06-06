@@ -23,6 +23,7 @@ pub const FpsCounter = struct {
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
     active_font_size: f32 = font_size,
+    texture_dirty: bool = true,
 
     pub fn init(text_service: *TextService) FpsCounter {
         return .{
@@ -35,36 +36,47 @@ pub const FpsCounter = struct {
         self.texture.release();
     }
 
-    pub fn recordSubmittedFrame(
+    pub fn prepareForRender(
         self: *FpsCounter,
         text_service: *TextService,
         renderer: *Renderer,
-        frame_delta_ns: u64,
     ) !void {
-        self.sampled_frames += 1;
-        self.accumulated_ns += frame_delta_ns;
         const target_font_size = overlayFontSize(renderer.drawablePixelScale());
         const font_size_changed = !approxEqAbs(self.active_font_size, target_font_size, font_size_epsilon);
 
-        if (!self.texture.isAlive() or self.accumulated_ns >= sample_window_ns or font_size_changed) {
-            var next_fps = self.displayed_fps;
-            if (self.accumulated_ns > 0) {
-                next_fps = @intFromFloat(@round(
-                    (@as(f64, @floatFromInt(self.sampled_frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
-                        @as(f64, @floatFromInt(self.accumulated_ns)),
-                ));
-            }
-            self.sampled_frames = 0;
-            self.accumulated_ns = 0;
-            if (self.texture.isAlive() and next_fps == self.displayed_fps and !font_size_changed) return;
-
-            self.displayed_fps = next_fps;
-            if (font_size_changed) {
-                self.font = try text_service.loadFont(text_mod.defaultFontDesc(target_font_size));
-                self.active_font_size = target_font_size;
-            }
-            try self.rebuildTexture(text_service, renderer);
+        if (font_size_changed) {
+            self.font = try text_service.loadFont(text_mod.defaultFontDesc(target_font_size));
+            self.active_font_size = target_font_size;
+            self.texture_dirty = true;
         }
+
+        if (!self.texture.isAlive() or self.texture_dirty) {
+            try self.rebuildTexture(text_service, renderer);
+            self.texture_dirty = false;
+        }
+    }
+
+    pub fn recordSubmittedFrame(
+        self: *FpsCounter,
+        frame_delta_ns: u64,
+    ) void {
+        self.sampled_frames += 1;
+        self.accumulated_ns += frame_delta_ns;
+        if (self.accumulated_ns < sample_window_ns) return;
+
+        var next_fps = self.displayed_fps;
+        if (self.accumulated_ns > 0) {
+            next_fps = @intFromFloat(@round(
+                (@as(f64, @floatFromInt(self.sampled_frames)) * @as(f64, @floatFromInt(std.time.ns_per_s))) /
+                    @as(f64, @floatFromInt(self.accumulated_ns)),
+            ));
+        }
+        self.sampled_frames = 0;
+        self.accumulated_ns = 0;
+        if (next_fps == self.displayed_fps) return;
+
+        self.displayed_fps = next_fps;
+        self.texture_dirty = true;
     }
 
     pub fn render(self: *const FpsCounter, renderer: *Renderer) !void {
@@ -110,4 +122,16 @@ test "overlay font size follows drawable pixel scale" {
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(1));
     try std.testing.expectEqual(@as(f32, 36), overlayFontSize(2));
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(0.5));
+}
+
+test "submitted frame sampling marks fps texture dirty after sample window" {
+    var fps = FpsCounter{};
+
+    fps.texture_dirty = false;
+    fps.recordSubmittedFrame(sample_window_ns);
+
+    try std.testing.expect(fps.texture_dirty);
+    try std.testing.expectEqual(@as(u32, 4), fps.displayed_fps);
+    try std.testing.expectEqual(@as(u32, 0), fps.sampled_frames);
+    try std.testing.expectEqual(@as(u64, 0), fps.accumulated_ns);
 }

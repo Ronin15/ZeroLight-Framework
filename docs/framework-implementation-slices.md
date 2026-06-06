@@ -24,10 +24,10 @@ adding broad abstraction.
 
 - Finish Slice 7 parallel CPU render prep and Slice 8 shader/platform
   validation as engine-support tracks.
-- Use Slice 12 as the gameplay-systems foundation before broad collision, AI,
-  pathfinding, or emergent-rule work.
-- Treat Slice 13 and Slice 14 as dependent on Slice 12's deterministic
-  processor, event, and deferred-structural-change contracts.
+- Slice 12 is now the gameplay-systems foundation for broad collision, AI,
+  pathfinding, and emergent-rule work.
+- Treat Slice 13 and Slice 14 as built on Slice 12's deterministic processor,
+  event, and deferred-structural-change contracts.
 
 ## Slice 0: Runtime Diagnostics Policy
 
@@ -749,10 +749,10 @@ dispatch.
 Current foundation:
 
 - `DataSystem` has entity IDs, component masks, movement bodies, primitive
-  visual intent, and aligned movement SoA columns.
+  visual intent, dedicated collision bounds, and aligned movement SoA columns.
 - `MovementSystem` updates positions deterministically before later processors
   read them.
-- Slice 12 will provide the event/deferred-command boundary needed for collision
+- Slice 12 provides the event/deferred-command boundary needed for collision
   outcomes that create, remove, or change entities.
 
 Architecture notes:
@@ -765,7 +765,7 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add persistent collision-shape or bounds data in `DataSystem` only for
+- [x] Add persistent collision-shape or bounds data in `DataSystem` only for
       world objects that need collision or spatial queries.
 - [ ] Add a deterministic broadphase/spatial-query structure appropriate for the
       current 2D scale.
@@ -792,7 +792,7 @@ Current foundation:
 
 - `DataSystem` and component masks can identify entity membership for processors.
 - Movement and particle processors demonstrate the system API shape.
-- Slice 12 should provide deterministic event/intent/deferred-command contracts.
+- Slice 12 provides deterministic event/intent/deferred-command contracts.
 - Slice 13 should provide spatial query and contact data for perception and
   collision-aware decisions.
 

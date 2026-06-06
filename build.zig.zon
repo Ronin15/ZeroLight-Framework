@@ -4,11 +4,11 @@
 
 .{
     // Project identity.
-    .name = .sdl3_Template,
+    .name = .zig_sdl3_gpu_framework,
     // Project version.
     .version = "0.0.0",
     // Regenerate this when renaming the project.
-    .fingerprint = 0x5ccb1060f78de346, // Changing this has security and trust implications.
+    .fingerprint = 0x247287d00907616d, // Changing this has security and trust implications.
     // Earliest Zig version this project supports.
     .minimum_zig_version = "0.16.0",
     // Add project dependencies here as the game grows.

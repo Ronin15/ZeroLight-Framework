@@ -25,14 +25,21 @@ pub const DebugOverlay = struct {
         }
     }
 
-    pub fn recordSubmittedFrame(
+    pub fn prepareForRender(
         self: *DebugOverlay,
         text_service: *TextService,
         renderer: *Renderer,
-        frame_delta_ns: u64,
     ) !void {
         if (!self.visible) return;
-        try self.fps_counter.recordSubmittedFrame(text_service, renderer, frame_delta_ns);
+        try self.fps_counter.prepareForRender(text_service, renderer);
+    }
+
+    pub fn recordSubmittedFrame(
+        self: *DebugOverlay,
+        frame_delta_ns: u64,
+    ) void {
+        if (!self.visible) return;
+        self.fps_counter.recordSubmittedFrame(frame_delta_ns);
     }
 
     pub fn render(self: *const DebugOverlay, renderer: *Renderer) !void {

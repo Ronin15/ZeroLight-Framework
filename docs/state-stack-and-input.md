@@ -120,7 +120,7 @@ debug command.
 Default bindings are:
 
 - WASD for movement
-- P for pause
+- P for pause or resume
 - Enter or Space for resume
 - Escape for quit
 - F2 for the debug overlay

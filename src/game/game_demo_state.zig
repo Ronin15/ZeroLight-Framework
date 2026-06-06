@@ -38,10 +38,13 @@ pub const GameDemoState = struct {
         const test_squares = try spawnTestSquares(&data);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
+        var simulation_frame = SimulationFrame.init(allocator);
+        errdefer simulation_frame.deinit();
+        try simulation_frame.reserveStreams(8, 16, 16, 8);
 
         return .{
             .data = data,
-            .simulation_frame = SimulationFrame.init(allocator),
+            .simulation_frame = simulation_frame,
             .player = player,
             .movement = MovementSystem.init(),
             .particles = particles,
@@ -234,6 +237,12 @@ test "demo owns and completes a simulation frame during update" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
     var input = InputState{};
+    input.setHeld(.moveRight, true);
+    const player_before = demo.data.movementBodyConst(demo.player.entity).?;
+    var square_before: [test_square_count]math.Vec2 = undefined;
+    for (demo.test_squares, 0..) |entity, index| {
+        square_before[index] = demo.data.movementBodyConst(entity).?.position;
+    }
 
     try demo.update(.{
         .input = &input,
@@ -244,4 +253,12 @@ test "demo owns and completes a simulation frame during update" {
 
     try std.testing.expectEqual(@import("simulation.zig").SimulationPhase.finished, demo.simulation_frame.phase);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.structural_commands.mergedItems().len);
+    const player_after = demo.data.movementBodyConst(demo.player.entity).?;
+    try std.testing.expect(player_after.position.x > player_before.position.x);
+    try std.testing.expectEqual(@as(f32, 240), player_after.velocity.x);
+    for (demo.test_squares, 0..) |entity, index| {
+        const body = demo.data.movementBodyConst(entity).?;
+        try std.testing.expect(body.position.x != square_before[index].x or body.position.y != square_before[index].y);
+    }
+    try std.testing.expect(demo.particles.activeCount() > 0);
 }

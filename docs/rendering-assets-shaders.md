@@ -141,7 +141,9 @@ part of the normal runtime path.
 
 Add GLSL source under `assets/shaders/`, then add an entry to the
 `shader_programs` table in `build.zig` so the build emits the platform shader
-files. Load the resulting installed shader files from `src/render/renderer.zig`.
+files. Load the resulting installed shader files from the render-owned GPU
+pipeline module, such as `src/render/gpu/sprite_pipeline.zig`, while keeping
+`Renderer` as the game-facing facade.
 
 Keep shader resource bindings aligned with SDL_GPU's layout rules:
 

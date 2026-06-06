@@ -34,8 +34,18 @@ pub const AssetStore = struct {
         const primary_path = try self.resolvePath(relative_path);
         std.Io.Dir.cwd().access(self.io, primary_path, .{ .read = true }) catch |err| switch (err) {
             error.FileNotFound => {
+                std.Io.Dir.cwd().access(self.io, self.root, .{ .read = true }) catch |root_err| switch (root_err) {
+                    error.FileNotFound => {
+                        self.allocator.free(primary_path);
+                        return self.resolveReadableExeRelativePath(relative_path);
+                    },
+                    else => {
+                        self.allocator.free(primary_path);
+                        return root_err;
+                    },
+                };
                 self.allocator.free(primary_path);
-                return self.resolveReadableExeRelativePath(relative_path);
+                return err;
             },
             else => {
                 self.allocator.free(primary_path);

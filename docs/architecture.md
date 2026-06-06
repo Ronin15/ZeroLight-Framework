@@ -26,7 +26,7 @@ game-specific behavior under `src/game/`.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig` and `src/game/pause_state.zig` are the current game states.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
-  SoA stores for gameplay and render systems.
+  SoA stores for gameplay, collision, and render systems.
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
@@ -140,6 +140,8 @@ Gameplay states own their own `DataSystem`; it is not an app singleton. The
 system stores persistent world entities, per-entity component masks for system
 membership queries, and typed SoA data such as movement bodies, facing,
 primitive visual intent, and relative asset references.
+Collision bounds are stored as dedicated persistent gameplay data rather than
+being inferred from render visuals.
 
 Hot gameplay data is stored as scalar columns. The movement-body store exposes
 64-byte-aligned `position_x`, `position_y`, `previous_x`, `previous_y`,
@@ -154,6 +156,12 @@ state clears the frame, runs main-thread input writes, dispatches processors,
 merges transient outputs, and applies deferred structural commands at explicit
 main-thread commit points. `DataSystem` remains persistent storage, not the
 simulation scheduler.
+
+Processors run behind explicit barriers. Each ordered system finishes its serial
+or threaded work, merges any range-owned output in stable order, and only then
+allows the next system to consume the result. Deferred structural commands are
+prevalidated before the main-thread commit mutates `DataSystem`, so validation
+failures do not partially apply a command batch.
 
 Update processors receive typed slices or views from `DataSystem` during
 fixed-step updates instead of broad structural access. Render systems read
