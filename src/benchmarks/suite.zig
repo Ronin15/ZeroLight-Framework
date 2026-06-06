@@ -364,15 +364,15 @@ pub fn printUsage() void {
     , .{});
 }
 
-pub fn availableBackgroundWorkers() usize {
+pub fn availableWorkerThreads() usize {
     const cpu_count = std.Thread.getCpuCount() catch return 0;
     return if (cpu_count > 1) cpu_count - 1 else 0;
 }
 
 pub fn skipIfWorkersUnavailable(case: BenchmarkCase) ?RunStats {
     if (case.required_worker_count == 0) return null;
-    if (availableBackgroundWorkers() >= case.required_worker_count) return null;
-    return RunStats.skipped("not enough background workers available");
+    if (availableWorkerThreads() >= case.required_worker_count) return null;
+    return RunStats.skipped("not enough worker threads available");
 }
 
 pub fn serialBatch(item_count: usize, range_alignment_items: usize) BatchStats {
@@ -436,8 +436,8 @@ fn printHeader(options: Options) void {
         "\nbenchmark profile={s} warmup={} iterations={} default_cases={}\n",
         .{ @tagName(options.profile), options.warmup_iterations, options.iterations, default_cases.len },
     );
-    std.debug.print("background_workers_available={}\n", .{availableBackgroundWorkers()});
-    std.debug.print("purpose: tune per-system threading thresholds, worker fanout, scheduler mode, and batch grain size\n", .{});
+    std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
+    std.debug.print("purpose: tune per-system threading thresholds, adaptive thread count, and batch grain size\n", .{});
 }
 
 fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options: Options) void {
@@ -507,9 +507,9 @@ fn printVerdict(
         if (limited_best) |limited| {
             const delta = percentDelta(auto.stats.mean_ns, limited.stats.mean_ns);
             if (delta > 10) {
-                std.debug.print("  verdict detail: full worker fanout is too aggressive at this size.\n", .{});
+                std.debug.print("  verdict detail: full active worker-thread count is too aggressive at this size.\n", .{});
             } else if (delta < -10) {
-                std.debug.print("  verdict detail: this size has enough work to use broad worker fanout.\n", .{});
+                std.debug.print("  verdict detail: this size has enough work to use broad active worker-thread counts.\n", .{});
             }
         }
     }
@@ -549,16 +549,16 @@ fn printTuning(
             const delta = percentDelta(auto.stats.mean_ns, limited.stats.mean_ns);
             if (delta > 10) {
                 std.debug.print(
-                    "    - thread fanout: cap near {} background workers or rely on adaptive; auto used {}/{} and lost.\n",
+                    "    - adaptive thread count: cap near {} active worker threads or rely on adaptive; auto used {}/{} and lost.\n",
                     .{ limited.stats.batch.active_worker_threads, auto.stats.batch.active_worker_threads, auto.stats.batch.available_worker_threads },
                 );
             } else if (delta < -10) {
                 std.debug.print(
-                    "    - thread fanout: broad fanout is useful; auto used {}/{} workers and beat limited-worker runs.\n",
+                    "    - adaptive thread count: broad active worker-thread counts are useful; auto used {}/{} and beat limited-worker runs.\n",
                     .{ auto.stats.batch.active_worker_threads, auto.stats.batch.available_worker_threads },
                 );
             } else {
-                std.debug.print("    - thread fanout: limited and auto worker counts are close; keep measuring with steadier iteration counts.\n", .{});
+                std.debug.print("    - adaptive thread count: limited and auto counts are close; keep measuring with steadier iteration counts.\n", .{});
             }
         }
     }
@@ -567,11 +567,11 @@ fn printTuning(
         if (fixed_auto) |auto| {
             const delta = percentDelta(adaptive_case.stats.mean_ns, auto.stats.mean_ns);
             if (delta < -10) {
-                std.debug.print("    - scheduler: adaptive is helping; keep adaptive enabled for this processor.\n", .{});
+                std.debug.print("    - adaptive thread count: adaptive selection is helping; keep adaptive enabled for this processor.\n", .{});
             } else if (delta > 10) {
-                std.debug.print("    - scheduler: adaptive is slower here; fixed worker selection may be better for this processor.\n", .{});
+                std.debug.print("    - adaptive thread count: adaptive selection is slower here; fixed worker selection may be better for this processor.\n", .{});
             } else {
-                std.debug.print("    - scheduler: adaptive and fixed-auto are close; no scheduler change from this run.\n", .{});
+                std.debug.print("    - adaptive thread count: adaptive and fixed-auto are close; no selection change from this run.\n", .{});
             }
         }
     }
@@ -651,7 +651,7 @@ fn printEvidence(
     );
     if (inline_case) |inline_result| {
         std.debug.print(
-            "    - inline ThreadSystem path {f} ({f} vs serial), so inline overhead is visible without worker fanout.\n",
+            "    - inline ThreadSystem path {f} ({f} vs serial), so inline overhead is visible without active worker threads.\n",
             .{ formatDuration(inline_result.stats.mean_ns), signedPercent(percentDelta(inline_result.stats.mean_ns, baseline.stats.mean_ns)) },
         );
     }

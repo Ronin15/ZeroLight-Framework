@@ -12,6 +12,7 @@ const ThreadSystem = thread_mod.ThreadSystem;
 const ParallelRange = thread_mod.ParallelRange;
 const BatchStats = thread_mod.BatchStats;
 const AdaptiveGrainTuner = thread_mod.AdaptiveGrainTuner;
+const AdaptiveThreadCount = thread_mod.AdaptiveThreadCount;
 const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
@@ -34,6 +35,7 @@ pub const ParticleUpdateConfig = struct {
     grain_size: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
+    adaptive_thread_count: ?*AdaptiveThreadCount = null,
     grain_tuner: ?*AdaptiveGrainTuner = null,
 };
 
@@ -167,12 +169,14 @@ pub const ParticleSystem = struct {
     end_color_a: HotF32List = .empty,
     layers: std.ArrayList(i32) = .empty,
     grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
+    adaptive_thread_count: AdaptiveThreadCount = .{},
 
     pub fn init(allocator: std.mem.Allocator, system_config: ParticleSystemConfig) !ParticleSystem {
         var self = ParticleSystem{
             .allocator = allocator,
             .capacity = system_config.capacity,
             .grain_tuner = AdaptiveGrainTuner.init(.{}),
+            .adaptive_thread_count = .{},
         };
         errdefer self.deinit();
         try self.reserveStorage(system_config.capacity);
@@ -354,12 +358,17 @@ pub const ParticleSystem = struct {
             tuner.grainSize(active_before, particle_range_alignment_items)
         else
             update_config.grain_size;
+        const adaptive_thread_count = if (update_config.adaptive)
+            update_config.adaptive_thread_count orelse &self.adaptive_thread_count
+        else
+            null;
         const batch = thread_system.parallelForWithOptions(active_before, &context, particleJob, .{
             .min_parallel_items = update_config.min_parallel_items,
             .grain_size = grain_size,
             .max_worker_threads = update_config.max_worker_threads,
             .range_alignment_items = particle_range_alignment_items,
             .adaptive = update_config.adaptive,
+            .adaptive_thread_count = adaptive_thread_count,
         });
         if (active_tuner) |tuner| {
             tuner.record(batch);
@@ -903,6 +912,34 @@ test "particle system owns tuner for default update" {
 
     try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 1), particles.grain_tuner.report().sample_count);
+}
+
+test "particle update uses provided adaptive thread count" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_range_alignment_items * 8 });
+    defer particles.deinit();
+    fillParticles(&particles, particle_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    var adaptive_thread_count = AdaptiveThreadCount{
+        .last_batch_duration_ns = 100_000,
+    };
+    const stats = particles.update(&threads, 0.25, .{
+        .min_parallel_items = 1,
+        .max_worker_threads = 2,
+        .adaptive_thread_count = &adaptive_thread_count,
+    });
+
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expect(adaptive_thread_count.last_batch_duration_ns > 0);
+    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_thread_count.last_batch_duration_ns);
 }
 
 test "particle range only writes assigned rows" {

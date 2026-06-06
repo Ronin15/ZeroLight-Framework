@@ -121,16 +121,18 @@ on CPU count, with the main/render thread participating as an additional worker
 while it waits. Small batches run inline on the main thread, and batch
 submission does not allocate after initialization.
 
-Adaptive scheduling only changes how many already pre-spawned worker threads
+Adaptive thread count only changes how many already pre-spawned worker threads
 participate in a batch. It uses measured batch completion time and worker
 utilization from adaptive batches to decide when work is large enough to leave
-the main thread. Batches forced inline by `min_parallel_items`, unavailable
-workers, or a single range still report their own timing, but they do not train
-the shared scheduler or suppress worker use for a later processor. Worker
-threads are reused across frame batches, parked when idle, and joined during
-`ThreadSystem` shutdown. Processor-specific batches can override grain size,
-cap selected worker threads, and align range starts to hot-column boundaries
-through `parallelForWithOptions`.
+the main thread. Production processors can own `AdaptiveThreadCount` state so
+movement, particles, and future systems do not train each other with unrelated
+batch timings; `ThreadSystem` keeps shared fallback state for generic callers.
+Batches forced inline by `min_parallel_items`, unavailable workers, or a single
+range still report their own timing, but they do not train adaptive thread-count
+state. Worker threads are reused across frame batches, parked when idle, and
+joined during `ThreadSystem` shutdown. Processor-specific batches can override
+grain size, cap selected worker threads, and align range starts to hot-column
+boundaries through `parallelForWithOptions`.
 
 ## Gameplay Data
 

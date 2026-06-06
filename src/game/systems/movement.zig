@@ -7,6 +7,7 @@ const thread_mod = @import("../../app/thread_system.zig");
 const ThreadSystem = thread_mod.ThreadSystem;
 const ParallelRange = thread_mod.ParallelRange;
 const AdaptiveGrainTuner = thread_mod.AdaptiveGrainTuner;
+const AdaptiveThreadCount = thread_mod.AdaptiveThreadCount;
 const data_mod = @import("../data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const MovementBodySlice = data_mod.MovementBodySlice;
@@ -17,6 +18,7 @@ pub const MovementConfig = struct {
     grain_size: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
+    adaptive_thread_count: ?*AdaptiveThreadCount = null,
     grain_tuner: ?*AdaptiveGrainTuner = null,
 };
 
@@ -27,9 +29,13 @@ pub const MovementStats = struct {
 
 pub const Runtime = struct {
     grain_tuner: AdaptiveGrainTuner = AdaptiveGrainTuner.init(.{}),
+    adaptive_thread_count: AdaptiveThreadCount = .{},
 
     pub fn init() Runtime {
-        return .{ .grain_tuner = AdaptiveGrainTuner.init(.{}) };
+        return .{
+            .grain_tuner = AdaptiveGrainTuner.init(.{}),
+            .adaptive_thread_count = .{},
+        };
     }
 
     pub fn update(
@@ -42,6 +48,9 @@ pub const Runtime = struct {
         var runtime_config = config;
         if (runtime_config.grain_size == null and runtime_config.grain_tuner == null) {
             runtime_config.grain_tuner = &self.grain_tuner;
+        }
+        if (runtime_config.adaptive and runtime_config.adaptive_thread_count == null) {
+            runtime_config.adaptive_thread_count = &self.adaptive_thread_count;
         }
         return movementUpdate(data, thread_system, delta_seconds, runtime_config);
     }
@@ -84,6 +93,7 @@ fn movementUpdate(
         .max_worker_threads = config.max_worker_threads,
         .range_alignment_items = data_mod.movement_range_alignment_items,
         .adaptive = config.adaptive,
+        .adaptive_thread_count = config.adaptive_thread_count,
     });
     if (active_tuner) |tuner| {
         tuner.record(batch);
@@ -308,6 +318,34 @@ test "movement runtime owns tuner for default update" {
 
     try std.testing.expect(!stats.batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 1), runtime.grain_tuner.report().sample_count);
+}
+
+test "movement update uses provided adaptive thread count" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try fillMovementData(&data, data_mod.movement_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .grain_size = data_mod.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+
+    var adaptive_thread_count = AdaptiveThreadCount{
+        .last_batch_duration_ns = 100_000,
+    };
+    const stats = update(&data, &threads, 0.5, .{
+        .min_parallel_items = 1,
+        .max_worker_threads = 2,
+        .adaptive_thread_count = &adaptive_thread_count,
+    });
+
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expect(adaptive_thread_count.last_batch_duration_ns > 0);
+    try std.testing.expectEqual(@as(u64, 0), threads.adaptive_thread_count.last_batch_duration_ns);
 }
 
 test "movement range only writes assigned items" {
