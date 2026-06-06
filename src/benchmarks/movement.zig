@@ -118,12 +118,13 @@ fn runOnce(
     case: suite.BenchmarkCase,
     range_tuner: ?*AdaptiveRangeTuner,
 ) thread_mod.BatchStats {
+    var slice = data.movementBodySlice();
     if (!case.usesThreadSystem()) {
-        movement.updateSerial(data, delta_seconds);
+        movement.updateSerial(&slice, delta_seconds);
         return suite.serialBatch(data.movementBodySliceConst().entities.len, data_mod.movement_range_alignment_items);
     }
 
-    const stats = system.update(data, thread_system.?, delta_seconds, .{
+    const stats = system.update(&slice, thread_system.?, delta_seconds, .{
         .min_parallel_items = 1,
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),

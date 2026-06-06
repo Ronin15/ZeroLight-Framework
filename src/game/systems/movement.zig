@@ -40,7 +40,7 @@ pub const MovementSystem = struct {
 
     pub fn update(
         self: *MovementSystem,
-        data: *DataSystem,
+        slice: *MovementBodySlice,
         thread_system: *ThreadSystem,
         delta_seconds: f32,
         config: MovementConfig,
@@ -52,34 +52,24 @@ pub const MovementSystem = struct {
         if (system_config.adaptive and system_config.adaptive_thread_count == null) {
             system_config.adaptive_thread_count = &self.adaptive_thread_count;
         }
-        return movementUpdate(data, thread_system, delta_seconds, system_config);
+        return updateMovementBodies(slice, thread_system, delta_seconds, system_config);
     }
 
-    pub fn syncPreviousPositions(_: *MovementSystem, data: *DataSystem) void {
-        movementSyncPreviousPositions(data);
+    pub fn syncPreviousPositions(_: *MovementSystem, slice: *MovementBodySlice) void {
+        syncPreviousPositionsImpl(slice);
     }
 };
 
-fn update(
-    data: *DataSystem,
+fn updateMovementBodies(
+    slice: *MovementBodySlice,
     thread_system: *ThreadSystem,
     delta_seconds: f32,
     config: MovementConfig,
 ) MovementStats {
-    return movementUpdate(data, thread_system, delta_seconds, config);
-}
-
-fn movementUpdate(
-    data: *DataSystem,
-    thread_system: *ThreadSystem,
-    delta_seconds: f32,
-    config: MovementConfig,
-) MovementStats {
-    const slice = data.movementBodySlice();
     if (slice.entities.len == 0) return .{};
 
     var context = MovementJobContext{
-        .slice = slice,
+        .slice = slice.*,
         .delta_seconds = delta_seconds,
     };
     const active_tuner = if (config.items_per_range == null) config.range_tuner else null;
@@ -104,17 +94,15 @@ fn movementUpdate(
     };
 }
 
-pub fn updateSerial(data: *DataSystem, delta_seconds: f32) void {
-    var slice = data.movementBodySlice();
-    processRange(&slice, .{ .start = 0, .end = slice.entities.len }, delta_seconds);
+pub fn updateSerial(slice: *MovementBodySlice, delta_seconds: f32) void {
+    processRange(slice, .{ .start = 0, .end = slice.entities.len }, delta_seconds);
 }
 
-pub fn syncPreviousPositions(data: *DataSystem) void {
-    movementSyncPreviousPositions(data);
+pub fn syncPreviousPositions(slice: *MovementBodySlice) void {
+    syncPreviousPositionsImpl(slice);
 }
 
-fn movementSyncPreviousPositions(data: *DataSystem) void {
-    var slice = data.movementBodySlice();
+fn syncPreviousPositionsImpl(slice: *MovementBodySlice) void {
     for (0..slice.entities.len) |index| {
         slice.previous_x[index] = slice.position_x[index];
         slice.previous_y[index] = slice.position_y[index];
@@ -219,7 +207,8 @@ test "serial movement uses simd lanes and scalar tails like scalar integration" 
         try fillMovementData(&simd_data, count);
         try fillMovementData(&scalar_data, count);
 
-        updateSerial(&simd_data, 0.25);
+        var simd_slice = simd_data.movementBodySlice();
+        updateSerial(&simd_slice, 0.25);
         var scalar_slice = scalar_data.movementBodySlice();
         processRangeScalar(&scalar_slice, .{ .start = 0, .end = scalar_slice.entities.len }, 0.25);
 
@@ -249,13 +238,15 @@ test "threaded movement matches serial movement" {
         .min_items_per_range = data_mod.movement_range_alignment_items,
         .max_items_per_range = data_mod.movement_range_alignment_items * 4,
     });
-    const stats = update(&threaded_data, &threads, 0.5, .{
+    var threaded_slice = threaded_data.movementBodySlice();
+    const stats = updateMovementBodies(&threaded_slice, &threads, 0.5, .{
         .min_parallel_items = 1,
         .max_worker_threads = 2,
         .adaptive = false,
         .range_tuner = &range_tuner,
     });
-    updateSerial(&serial_data, 0.5);
+    var serial_slice = serial_data.movementBodySlice();
+    updateSerial(&serial_slice, 0.5);
 
     try std.testing.expectEqual(serial_data.movementBodySliceConst().entities.len, stats.body_count);
     try std.testing.expect(!stats.batch.ran_inline);
@@ -282,7 +273,8 @@ test "movement explicit items_per_range bypasses tuner" {
         .min_items_per_range = data_mod.movement_range_alignment_items,
         .max_items_per_range = data_mod.movement_range_alignment_items * 4,
     });
-    const stats = update(&data, &threads, 0.5, .{
+    var slice = data.movementBodySlice();
+    const stats = updateMovementBodies(&slice, &threads, 0.5, .{
         .min_parallel_items = 1,
         .items_per_range = data_mod.movement_range_alignment_items,
         .max_worker_threads = 2,
@@ -310,7 +302,8 @@ test "movement system owns tuner for default update" {
     defer threads.deinit();
 
     var system = MovementSystem.init();
-    const stats = system.update(&data, &threads, 0.5, .{
+    var slice = data.movementBodySlice();
+    const stats = system.update(&slice, &threads, 0.5, .{
         .min_parallel_items = 1,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -338,7 +331,8 @@ test "movement system owns adaptive thread count for default update" {
     system.adaptive_thread_count = .{
         .last_batch_duration_ns = 100_000,
     };
-    const stats = system.update(&data, &threads, 0.5, .{
+    var slice = data.movementBodySlice();
+    const stats = system.update(&slice, &threads, 0.5, .{
         .min_parallel_items = 1,
         .items_per_range = data_mod.movement_range_alignment_items,
         .max_worker_threads = 2,
@@ -366,7 +360,8 @@ test "movement update uses provided adaptive thread count" {
     var adaptive_thread_count = AdaptiveThreadCount{
         .last_batch_duration_ns = 100_000,
     };
-    const stats = update(&data, &threads, 0.5, .{
+    var slice = data.movementBodySlice();
+    const stats = updateMovementBodies(&slice, &threads, 0.5, .{
         .min_parallel_items = 1,
         .max_worker_threads = 2,
         .adaptive_thread_count = &adaptive_thread_count,
@@ -423,7 +418,8 @@ test "warmed movement update does not allocate" {
         threads.allocator = original_thread_allocator;
     }
 
-    const stats = update(&data, &threads, 0.016, .{
+    var slice = data.movementBodySlice();
+    const stats = updateMovementBodies(&slice, &threads, 0.016, .{
         .min_parallel_items = 1,
         .items_per_range = data_mod.movement_range_alignment_items,
     });

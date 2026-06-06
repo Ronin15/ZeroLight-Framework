@@ -563,8 +563,8 @@ Current foundation:
 - `DataSystem` provides persistent 64-byte-aligned movement SoA slices for
   systems to process.
 - `src/core/simd.zig` provides portable vector helpers.
-- `MovementSystem` integrates movement-body SoA columns through a serial path or
-  `ThreadSystem.parallelForWithOptions`.
+- `MovementSystem` integrates explicit movement-body SoA slices through a serial
+  path or `ThreadSystem.parallelForWithOptions`.
 - `ParticleSystem` owns a state-local fixed-capacity transient SoA pool and
   updates particle rows through a serial path or
   `ThreadSystem.parallelForWithOptions`.
@@ -600,12 +600,12 @@ Performance notes:
 
 System shape:
 
-- `MovementSystem` reads and writes the movement-body SoA slices in
-  `DataSystem`, keeps a simple serial path for small counts and tests, and uses
-  threaded SIMD ranges for larger batches.
+- `MovementSystem` reads and writes explicit movement-body SoA slices, keeps a
+  simple serial path for small counts and tests, and uses threaded SIMD ranges
+  for larger batches.
 - `MovementSystem` must not create, destroy, add, or remove entities/components
-  inside worker ranges. Any structural change needed by future systems should be
-  deferred to a later command-buffer design.
+  inside worker ranges. Structural changes from future processors should flow
+  through the state-owned simulation frame and `DataSystem` batch commit path.
 - `ParticleSystem` is a state-owned transient effect system rather than a
   `DataSystem` entity processor. It keeps emission and expired row swap-removal
   on the main thread, while worker ranges only mutate assigned particle rows.
@@ -614,9 +614,9 @@ System shape:
 
 Checklist:
 
-- [x] Define ECS systems as data processors that accept `DataSystem`,
-      `ThreadSystem`, and fixed-step delta time; document `ParticleSystem` as
-      the state-owned transient effect exception.
+- [x] Define ECS systems as data processors that accept typed `DataSystem`
+      slices/views, `ThreadSystem`, and fixed-step delta time; document
+      `ParticleSystem` as the state-owned transient effect exception.
 - [x] Add a movement processor that splits dense SoA slices through
       `parallelFor`.
 - [x] Add particle processors that split dense SoA slices through `parallelFor`.
@@ -653,12 +653,12 @@ Acceptance checks:
       completed output from earlier systems.
 
 Movement and particle passes landed: the demo maps player input to movement
-velocity, runs `MovementSystem` once over all movement bodies, applies
-player-only bounds clamping, emits a small particle trail, updates particles,
-and renders transient particle rectangles. A few colored moving squares remain
-as non-player movement processor coverage. Parallel render prep remains open
-under Slice 7, while simulation contracts, collision, AI, pathfinding, and rule
-processing are covered by Slices 12-14.
+velocity, exposes a movement-body slice to `MovementSystem`, applies player-only
+bounds clamping, emits a small particle trail, updates particles, and renders
+transient particle rectangles. A few colored moving squares remain as non-player
+movement processor coverage. Parallel render prep remains open under Slice 7,
+while simulation contracts, collision, AI, pathfinding, and rule processing are
+covered by Slices 12-14.
 
 ## Slice 12: Simulation Contracts And Deferred Structural Changes
 
@@ -666,7 +666,7 @@ Goal: define deterministic, efficient simulation phase contracts before broad
 gameplay systems start creating entities, emitting events, or requesting
 structural changes from worker jobs.
 
-Current foundation:
+Implemented foundation:
 
 - `main.zig` -> `Engine` -> `StateStack` is the existing runtime dispatch path
   for events, fixed updates, and rendering.
@@ -675,8 +675,19 @@ Current foundation:
   services.
 - `ThreadSystem` runs synchronous range batches that complete before the next
   system consumes their output.
-- Movement and particle processors prove serial and threaded fixed-step updates
-  over dense SoA slices.
+- `ParallelRange.index` gives inline and threaded jobs stable range-order
+  identity independent of worker scheduling.
+- `SimulationFrame` is state-owned transient per-step data with typed event,
+  intent, and deferred structural command streams.
+- `RangeOutputStream(T)` implements count/prefix/write output collection and
+  deterministic range-index merge.
+- `DataSystem.applyStructuralCommands` applies deferred entity/component changes
+  at explicit main-thread commit points.
+- `GameDemoState` owns a `SimulationFrame`, clears it each fixed step, runs
+  processor phases, and applies deferred structural commands before the step
+  finishes.
+- `MovementSystem` now consumes explicit movement-body slices rather than broad
+  structural `DataSystem` access.
 
 Architecture notes:
 
@@ -687,8 +698,6 @@ Architecture notes:
   come from stable input/range order, not worker timing or worker IDs; high-volume
   outputs must use typed range-owned buffers instead of global per-command append,
   callback chains, or hot-path hash maps; warmed paths must avoid allocation.
-- `ParallelRange` needs a stable range index before threaded processors produce
-  ordered events, intents, contacts, or deferred structural commands.
 - Threaded output collection should use a count/prefix/write pipeline:
   count outputs per range, prefix offsets on the main thread, write contiguous
   output by range, merge by range index, then consume the typed batch.
@@ -701,31 +710,34 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Define the fixed-step simulation phase order for gameplay processors,
+- [x] Define the fixed-step simulation phase order for gameplay processors,
       transient events, deferred structural commands, and save/load hooks.
-- [ ] Add stable `ParallelRange.index` support so output order can be tied to
+- [x] Add stable `ParallelRange.index` support so output order can be tied to
       deterministic range order rather than worker scheduling.
-- [ ] Add a state-owned simulation frame with typed event, intent, and deferred
+- [x] Add a state-owned simulation frame with typed event, intent, and deferred
       structural command streams.
-- [ ] Add range-owned output collection for high-volume streams using
+- [x] Add range-owned output collection for high-volume streams using
       count/prefix/write and deterministic range-index merge.
-- [ ] Add `DataSystem` batch commit boundaries for deferred structural changes;
+- [x] Add `DataSystem` batch commit boundaries for deferred structural changes;
       do not expose per-command structural mutation as the simulation output API.
-- [ ] Add tests that worker-produced outputs merge in stable order and cannot
-      mutate `DataSystem` structure from worker ranges.
-- [ ] Document what belongs in persistent `DataSystem` state versus transient
+- [x] Refactor `MovementSystem` so the processor path receives typed slices
+      rather than broad structural `DataSystem` access.
+- [x] Add tests that worker-produced outputs merge in stable order.
+- [x] Refactor typed processor APIs so hot processor paths avoid broad
+      structural `DataSystem` access.
+- [x] Document what belongs in persistent `DataSystem` state versus transient
       per-frame simulation data.
 
 Acceptance checks:
 
-- [ ] Deferred entity/component changes apply only after the producing processor
+- [x] Deferred entity/component changes apply only after the producing processor
       completes.
-- [ ] Replaying the same initial data and inputs produces the same event,
+- [x] Replaying the same initial data and inputs produces the same event,
       command, and processor output order, independent of worker timing.
-- [ ] High-volume output paths use preallocated typed arrays, slices, range-owned
+- [x] High-volume output paths use preallocated typed arrays, slices, range-owned
       buffers, and deterministic batch commit instead of global per-command
       atomics, broad event buses, or hot-path hash-map dispatch.
-- [ ] Save/load boundaries exclude transient frame events, scratch buffers,
+- [x] Save/load boundaries exclude transient frame events, scratch buffers,
       renderer resources, app services, and thread-system state.
 
 ## Slice 13: Spatial Queries And Collision Contacts

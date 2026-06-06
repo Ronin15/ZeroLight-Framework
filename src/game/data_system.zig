@@ -161,6 +161,49 @@ pub const ConstAssetReferenceSlice = struct {
     relative_paths: []const []const u8,
 };
 
+pub const EntityTemplate = struct {
+    movement_body: ?MovementBody = null,
+    facing: ?FacingData = null,
+    primitive_visual: ?PrimitiveVisual = null,
+    asset_reference: ?AssetReference = null,
+};
+
+pub const MovementBodyCommand = struct {
+    entity: EntityId,
+    body: MovementBody,
+};
+
+pub const FacingCommand = struct {
+    entity: EntityId,
+    facing: FacingData,
+};
+
+pub const PrimitiveVisualCommand = struct {
+    entity: EntityId,
+    visual: PrimitiveVisual,
+};
+
+pub const AssetReferenceCommand = struct {
+    entity: EntityId,
+    asset_reference: AssetReference,
+};
+
+pub const StructuralCommand = union(enum) {
+    create_entity: EntityTemplate,
+    destroy_entity: EntityId,
+    set_movement_body: MovementBodyCommand,
+    set_facing: FacingCommand,
+    set_primitive_visual: PrimitiveVisualCommand,
+    set_asset_reference: AssetReferenceCommand,
+};
+
+pub const StructuralCommitStats = struct {
+    created: usize = 0,
+    destroyed: usize = 0,
+    components_set: usize = 0,
+    stale_skipped: usize = 0,
+};
+
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
@@ -371,6 +414,84 @@ pub const DataSystem = struct {
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
         return self.asset_refs.sliceConst();
+    }
+
+    pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
+        var stats = StructuralCommitStats{};
+        for (commands) |command| {
+            switch (command) {
+                .create_entity => |template| {
+                    if (template.asset_reference) |asset_ref| {
+                        try assets_mod.validateRelativePath(asset_ref.relative_path);
+                    }
+                    const entity = try self.createEntity();
+                    errdefer _ = self.destroyEntity(entity);
+                    stats.created += 1;
+                    stats.components_set += try self.applyTemplateComponents(entity, template);
+                },
+                .destroy_entity => |entity| {
+                    if (self.destroyEntity(entity)) {
+                        stats.destroyed += 1;
+                    } else {
+                        stats.stale_skipped += 1;
+                    }
+                },
+                .set_movement_body => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setMovementBody(set.entity, set.body);
+                    stats.components_set += 1;
+                },
+                .set_facing => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setFacing(set.entity, set.facing);
+                    stats.components_set += 1;
+                },
+                .set_primitive_visual => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setPrimitiveVisual(set.entity, set.visual);
+                    stats.components_set += 1;
+                },
+                .set_asset_reference => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setAssetReference(set.entity, set.asset_reference);
+                    stats.components_set += 1;
+                },
+            }
+        }
+        return stats;
+    }
+
+    fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
+        var components_set: usize = 0;
+        if (template.movement_body) |body| {
+            try self.setMovementBody(entity, body);
+            components_set += 1;
+        }
+        if (template.facing) |facing| {
+            try self.setFacing(entity, facing);
+            components_set += 1;
+        }
+        if (template.primitive_visual) |visual| {
+            try self.setPrimitiveVisual(entity, visual);
+            components_set += 1;
+        }
+        if (template.asset_reference) |asset_ref| {
+            try self.setAssetReference(entity, asset_ref);
+            components_set += 1;
+        }
+        return components_set;
     }
 
     fn resolveSlot(self: *DataSystem, id: EntityId) ?*EntitySlot {
@@ -1123,6 +1244,73 @@ test "asset references validate safe relative paths and own path storage" {
     try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "../player.png" }));
     try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "/tmp/player.png" }));
     try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "" }));
+}
+
+test "structural commands apply entity creation and component changes in order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(10),
+            .facing = .{ .direction = .left },
+            .primitive_visual = testVisualWithSize(20),
+        } },
+        .{ .set_movement_body = .{ .entity = existing, .body = testBody(3) } },
+        .{ .set_facing = .{ .entity = existing, .facing = .{ .direction = .right } } },
+    };
+
+    const stats = try data.applyStructuralCommands(&commands);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.created);
+    try std.testing.expectEqual(@as(usize, 0), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 5), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 0), stats.stale_skipped);
+    try std.testing.expectEqual(@as(usize, 2), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(f32, 3), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(Facing.right, data.facingConst(existing).?.direction);
+}
+
+test "structural commands skip stale entities and preserve deterministic command order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+    const stale = entity;
+    try std.testing.expect(data.destroyEntity(entity));
+    const replacement = try data.createEntity();
+
+    const commands = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = stale, .body = testBody(99) } },
+        .{ .set_movement_body = .{ .entity = replacement, .body = testBody(4) } },
+        .{ .set_movement_body = .{ .entity = replacement, .body = testBody(5) } },
+        .{ .destroy_entity = stale },
+    };
+
+    const stats = try data.applyStructuralCommands(&commands);
+
+    try std.testing.expectEqual(@as(usize, 0), stats.created);
+    try std.testing.expectEqual(@as(usize, 0), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 2), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
+    try std.testing.expectEqual(@as(f32, 5), data.movementBodyConst(replacement).?.position.x);
+}
+
+test "structural commands validate asset references before creating entities" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(1),
+            .asset_reference = .{ .relative_path = "../bad.png" },
+        } },
+    };
+
+    try std.testing.expectError(error.InvalidAssetPath, data.applyStructuralCommands(&commands));
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
 }
 
 test "movement body slice access performs no allocations" {

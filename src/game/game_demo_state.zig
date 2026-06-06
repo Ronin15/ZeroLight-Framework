@@ -8,9 +8,11 @@ const std = @import("std");
 const data_mod = @import("data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const EntityId = data_mod.EntityId;
+const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
+const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const state_mod = @import("../app/state.zig");
 const RenderContext = state_mod.RenderContext;
 const StateTransitions = state_mod.StateTransitions;
@@ -21,6 +23,7 @@ const test_square_count = 4;
 
 pub const GameDemoState = struct {
     data: DataSystem,
+    simulation_frame: SimulationFrame,
     player: Player,
     movement: MovementSystem,
     particles: ParticleSystem,
@@ -38,6 +41,7 @@ pub const GameDemoState = struct {
 
         return .{
             .data = data,
+            .simulation_frame = SimulationFrame.init(allocator),
             .player = player,
             .movement = MovementSystem.init(),
             .particles = particles,
@@ -49,6 +53,7 @@ pub const GameDemoState = struct {
 
     pub fn deinit(self: *GameDemoState) void {
         self.particles.deinit();
+        self.simulation_frame.deinit();
         self.data.deinit();
     }
 
@@ -61,11 +66,21 @@ pub const GameDemoState = struct {
 
     pub fn update(self: *GameDemoState, context: UpdateContext) !void {
         _ = context.transitions;
+        self.simulation_frame.beginStep();
+        self.simulation_frame.phase = .main_thread_inputs;
         try self.player.applyInput(&self.data, context.input);
-        _ = self.movement.update(&self.data, context.thread_system, context.delta_seconds, .{});
+
+        self.simulation_frame.phase = .processors;
+        var movement_slice = self.data.movementBodySlice();
+        _ = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
         self.emitPlayerTrail();
         _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
+
+        self.simulation_frame.phase = .merge_outputs;
+        _ = try self.simulation_frame.applyStructuralCommands(&self.data);
+        self.simulation_frame.phase = .finished;
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -84,7 +99,8 @@ pub const GameDemoState = struct {
     }
 
     pub fn onPause(self: *GameDemoState) void {
-        self.movement.syncPreviousPositions(&self.data);
+        var movement_slice = self.data.movementBodySlice();
+        self.movement.syncPreviousPositions(&movement_slice);
         self.particles.syncPreviousPositions();
     }
 
@@ -202,4 +218,30 @@ test "demo spawns colored moving test squares" {
         const visual = demo.data.primitiveVisualConst(entity).?;
         try std.testing.expect(visual.color.a > 0);
     }
+}
+
+test "demo owns and completes a simulation frame during update" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var threads = try @import("../app/thread_system.zig").ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .min_parallel_items = 1,
+        .items_per_range = data_mod.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var input = InputState{};
+
+    try demo.update(.{
+        .input = &input,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+
+    try std.testing.expectEqual(@import("simulation.zig").SimulationPhase.finished, demo.simulation_frame.phase);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.structural_commands.mergedItems().len);
 }

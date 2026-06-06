@@ -13,6 +13,7 @@ pub const WorkerId = struct {
 };
 
 pub const ParallelRange = struct {
+    index: usize = 0,
     start: usize,
     end: usize,
 
@@ -692,6 +693,7 @@ fn itemCountShifted(previous: usize, current: usize, threshold_percent: u8) bool
 fn rangeForIndex(item_count: usize, items_per_range: usize, range_index: usize) ParallelRange {
     const start = range_index * items_per_range;
     return .{
+        .index = range_index,
         .start = start,
         .end = @min(start + items_per_range, item_count),
     };
@@ -789,6 +791,12 @@ const CoverageContext = struct {
     main_hits: std.atomic.Value(u32) = .init(0),
 };
 
+const RangeIndexContext = struct {
+    starts: []usize,
+    ends: []usize,
+    items_per_range: usize,
+};
+
 fn markCoverage(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
     const coverage: *CoverageContext = @ptrCast(@alignCast(context));
     for (range.start..range.end) |index| {
@@ -799,6 +807,14 @@ fn markCoverage(context: *anyopaque, range: ParallelRange, id: WorkerId) void {
     } else {
         _ = coverage.worker_hits.fetchAdd(1, .monotonic);
     }
+}
+
+fn recordRangeIndex(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const indices: *RangeIndexContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.index < indices.starts.len);
+    std.debug.assert(range.start == range.index * indices.items_per_range);
+    indices.starts[range.index] = range.start;
+    indices.ends[range.index] = range.end;
 }
 
 test "inline parallel for covers every item exactly once" {
@@ -818,6 +834,29 @@ test "inline parallel for covers every item exactly once" {
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
+}
+
+test "inline parallel ranges expose stable range indices" {
+    var starts = [_]usize{std.math.maxInt(usize)} ** 4;
+    var ends = [_]usize{0} ** 4;
+    var context = RangeIndexContext{
+        .starts = starts[0..],
+        .ends = ends[0..],
+        .items_per_range = 3,
+    };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .min_parallel_items = 1,
+        .items_per_range = 3,
+    });
+    defer threads.deinit();
+
+    const stats = threads.parallelFor(10, &context, recordRangeIndex);
+
+    try std.testing.expect(stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 4), stats.range_count);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 3, 6, 9 }, &starts);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 6, 9, 10 }, &ends);
 }
 
 test "forced inline batch does not train adaptive thread count" {
@@ -853,6 +892,35 @@ test "forced inline batch does not train adaptive thread count" {
     try std.testing.expectEqual(previous_duration_ns, threads.adaptive_thread_count.last_batch_duration_ns);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "threaded parallel ranges expose stable range indices" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var starts = [_]usize{std.math.maxInt(usize)} ** 16;
+    var ends = [_]usize{0} ** 16;
+    var context = RangeIndexContext{
+        .starts = starts[0..],
+        .ends = ends[0..],
+        .items_per_range = 8,
+    };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .items_per_range = 8,
+    });
+    defer threads.deinit();
+
+    const stats = threads.parallelForWithOptions(128, &context, recordRangeIndex, .{
+        .adaptive = false,
+    });
+
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 16), stats.range_count);
+    for (0..16) |range_index| {
+        try std.testing.expectEqual(range_index * 8, starts[range_index]);
+        try std.testing.expectEqual(range_index * 8 + 8, ends[range_index]);
     }
 }
 

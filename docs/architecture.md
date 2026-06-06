@@ -149,14 +149,21 @@ to `data_system.movement_range_alignment_items`, which maps one cache line to
 sixteen `f32` elements. Component masks decide whether an entity belongs to a
 system; hot processors iterate already aligned SoA slices.
 
-Update systems mutate `DataSystem` slices during fixed-step updates. Render
-systems read immutable `DataSystem` slices during state render and submit draw
-calls through `Renderer`. `DataSystem` does not own SDL handles, GPU handles,
-live renderer texture IDs, asset leases, input frame state, thread-system state,
-transient events, or scratch buffers.
+Gameplay states own a transient `SimulationFrame` for each fixed step. The
+state clears the frame, runs main-thread input writes, dispatches processors,
+merges transient outputs, and applies deferred structural commands at explicit
+main-thread commit points. `DataSystem` remains persistent storage, not the
+simulation scheduler.
 
-`MovementSystem` updates movement bodies as an ordered gameplay data processor,
-using SIMD lanes inside each assigned range and
+Update processors receive typed slices or views from `DataSystem` during
+fixed-step updates instead of broad structural access. Render systems read
+immutable `DataSystem` slices during state render and submit draw calls through
+`Renderer`. `DataSystem` does not own SDL handles, GPU handles, live renderer
+texture IDs, asset leases, input frame state, thread-system state, transient
+events, or scratch buffers.
+
+`MovementSystem` updates movement-body slices as an ordered gameplay data
+processor, using SIMD lanes inside each assigned range and
 `ThreadSystem.parallelForWithOptions` when completion-time feedback shows the
 batch is large enough. Worker ranges are aligned to movement cache-line
 boundaries and only write their assigned movement rows.
@@ -172,15 +179,14 @@ rows rather than persistent world entities. Particle emission and expired row
 swap-removal run on the state/main thread; threaded jobs only update assigned
 SoA ranges and render submits rectangles through `Renderer`.
 
-Future simulation outputs must coordinate determinism, performance, and
-efficiency as one contract. Threaded processors that produce events, intents,
-contacts, or deferred structural commands should use typed range-owned output
-buffers: count outputs per stable range, prefix offsets on the main thread,
-write contiguous output slices, merge by range index, and consume the result as
-a batch. Output order must come from stable input/range order, not worker timing
-or worker IDs. Structural mutation remains behind `DataSystem` batch commit
-boundaries; event and intent streams are transient simulation data, not
-persistent `DataSystem` state.
+Simulation outputs coordinate determinism, performance, and efficiency as one
+contract. Threaded processors that produce events, intents, contacts, or
+deferred structural commands use typed range-owned output buffers: count outputs
+per stable range, prefix offsets on the main thread, write contiguous output
+slices, merge by range index, and consume the result as a batch. Output order
+comes from stable input/range order, not worker timing or worker IDs. Structural
+mutation remains behind `DataSystem` batch commit boundaries; event and intent
+streams are transient simulation data, not persistent `DataSystem` state.
 
 ## SIMD Helpers
 

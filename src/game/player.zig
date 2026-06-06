@@ -164,7 +164,8 @@ test "player movement clamps to state bounds" {
     input.setHeld(.moveUp, true);
 
     try player.applyInput(&data, &input);
-    movement.updateSerial(&data, 1.0);
+    var movement_slice = data.movementBodySlice();
+    movement.updateSerial(&movement_slice, 1.0);
     try player.clampToBounds(&data, 800, 450);
 
     const body = data.movementBodyConst(player.entity).?;
