@@ -799,6 +799,12 @@ keeping collision detection generic. Benchmarks now report candidate pairs and
 contacts so dense stress cases can be compared against sparse gameplay-shaped
 fixtures.
 
+Follow-up: the detector already emits generic entity-to-entity contacts,
+including player contacts, but the demo response policy currently handles only
+player-vs-obstacle blocking and moving-square-vs-obstacle bouncing. Player-vs
+moving-entity response should be added as a separate gameplay policy slice or
+demo-response follow-up rather than baked into collision detection.
+
 ## Slice 14: AI, Pathfinding, And Emergent Rule Processing
 
 Goal: add AI, pathfinding, and gameplay-rule processors that compose through
