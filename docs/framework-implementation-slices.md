@@ -29,6 +29,16 @@ adding broad abstraction.
 - Treat Slice 13 and Slice 14 as built on Slice 12's deterministic processor,
   event, and deferred-structural-change contracts.
 
+## Long-Term Gameplay Direction
+
+Future gameplay features should use domain controllers for orchestration and
+SoA processors for hot data work. Controllers belong inside the owning gameplay
+state or a state-owned world simulation layer; they choose phase order, budgets,
+queues, conflict policy, and which typed `DataSystem` views processors receive.
+Persistent world facts still live in `DataSystem`, per-step outputs live in
+`SimulationFrame`, and large or reusable loops stay in systems that process
+typed slices and emit deterministic outputs.
+
 ## Slice 0: Runtime Diagnostics Policy
 
 Goal: use Zig's compile-time `std.log` filtering so debug builds can show useful
@@ -820,6 +830,10 @@ Current foundation:
 
 Architecture notes:
 
+- Domain controllers should orchestrate feature phases and budgets, not become
+  hidden per-entity stores. They may take typed `DataSystem` views and run small
+  policy passes, but hot or reusable loops should remain systems/processors over
+  SoA slices.
 - AI and rules should usually emit movement intents, steering outputs, target
   choices, path requests/results, or deferred commands rather than mutating
   unrelated stores directly.
