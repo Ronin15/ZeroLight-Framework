@@ -800,9 +800,9 @@ response processor consumes the completed same-step contact stream through
 stream, computes correction columns with `src/core/simd.zig`, and applies sparse
 movement writes in deterministic contact order before structural commands
 commit. The demo uses the same generic response path for player-obstacle,
-moving-square-obstacle, and player-moving-square contacts. Benchmarks now report
-candidate pairs and contacts so dense stress cases can be compared against
-sparse gameplay-shaped fixtures.
+moving-square-obstacle, and player-moving-square contacts. Detector benchmarks
+report candidate pairs and contacts for dense/sparse body workloads, while
+response benchmarks report triggers and intents across 1k-50k contact workloads.
 
 ## Slice 14: AI, Pathfinding, And Emergent Rule Processing
 
