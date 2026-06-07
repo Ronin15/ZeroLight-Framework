@@ -1,3 +1,4 @@
+benchmark_outputs/
 .DS_store
 .zig-cache/
 .zig-global-cache/
