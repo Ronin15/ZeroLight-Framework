@@ -145,6 +145,8 @@ pub const RunStats = struct {
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
     item_count: usize = 0,
+    candidate_pairs: usize = 0,
+    output_count: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
@@ -697,11 +699,24 @@ fn printEvidence(
             std.debug.print("    - best range case: {s} with items_per_range={}.\n", .{ range_case.case.name, range_case.stats.batch.items_per_range });
         }
     }
+    if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
+        std.debug.print(
+            "    - workload: candidates={} outputs={} outputs/body={d}.{d:0>2}.\n",
+            .{
+                best.stats.candidate_pairs,
+                best.stats.output_count,
+                outputsPerItemBasisPoints(best.stats) / 100,
+                outputsPerItemBasisPoints(best.stats) % 100,
+            },
+        );
+    }
 }
 
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
+    if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
+    if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     return "items";
 }
 
@@ -735,6 +750,12 @@ fn printCaseDetails(results: []const CaseResult, baseline: ?CaseResult) void {
             std.debug.print(
                 ", tuned range phase={s} settled={} {}/{} best {}",
                 .{ @tagName(summary.phase), summary.settled_before_measurement, summary.initial_items_per_range, summary.final_items_per_range, summary.best_items_per_range },
+            );
+        }
+        if (result.stats.candidate_pairs != 0 or result.stats.output_count != 0) {
+            std.debug.print(
+                ", candidates {} outputs {}",
+                .{ result.stats.candidate_pairs, result.stats.output_count },
             );
         }
         std.debug.print("\n", .{});
@@ -779,6 +800,11 @@ fn measured(result: ?CaseResult) ?CaseResult {
 fn speedupBasisPoints(baseline: RunStats, candidate: RunStats) u64 {
     if (candidate.mean_ns == 0) return 0;
     return @intCast((@as(u128, baseline.mean_ns) * 100) / candidate.mean_ns);
+}
+
+fn outputsPerItemBasisPoints(stats: RunStats) u64 {
+    if (stats.item_count == 0) return 0;
+    return @intCast((@as(u128, stats.output_count) * 100) / stats.item_count);
 }
 
 fn percentDelta(candidate_ns: u64, baseline_ns: u64) i64 {

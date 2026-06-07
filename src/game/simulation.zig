@@ -39,11 +39,22 @@ pub const SimulationIntent = union(enum) {
     marker: u32,
 };
 
+pub const CollisionContact = struct {
+    a: EntityId,
+    b: EntityId,
+    a_movement_index: usize,
+    b_movement_index: usize,
+    normal_x: f32,
+    normal_y: f32,
+    penetration: f32,
+};
+
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
     events: RangeOutputStream(SimulationEvent),
     intents: RangeOutputStream(SimulationIntent),
+    contacts: RangeOutputStream(CollisionContact),
     structural_commands: RangeOutputStream(data_mod.StructuralCommand),
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
@@ -51,12 +62,14 @@ pub const SimulationFrame = struct {
             .allocator = allocator,
             .events = RangeOutputStream(SimulationEvent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
+            .contacts = RangeOutputStream(CollisionContact).init(allocator),
             .structural_commands = RangeOutputStream(data_mod.StructuralCommand).init(allocator),
         };
     }
 
     pub fn deinit(self: *SimulationFrame) void {
         self.structural_commands.deinit();
+        self.contacts.deinit();
         self.intents.deinit();
         self.events.deinit();
         self.* = undefined;
@@ -70,6 +83,7 @@ pub const SimulationFrame = struct {
     pub fn clearRetainingCapacity(self: *SimulationFrame) void {
         self.events.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();
+        self.contacts.clearRetainingCapacity();
         self.structural_commands.clearRetainingCapacity();
     }
 
@@ -78,10 +92,12 @@ pub const SimulationFrame = struct {
         range_count: usize,
         event_capacity: usize,
         intent_capacity: usize,
+        contact_capacity: usize,
         structural_command_capacity: usize,
     ) !void {
         try self.events.reserve(range_count, event_capacity);
         try self.intents.reserve(range_count, intent_capacity);
+        try self.contacts.reserve(range_count, contact_capacity);
         try self.structural_commands.reserve(range_count, structural_command_capacity);
     }
 
@@ -380,7 +396,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    try frame.reserveStreams(2, 2, 2, 1);
+    try frame.reserveStreams(2, 2, 2, 2, 1);
 
     const original_allocator = frame.allocator;
     const original_events_allocator = frame.events.allocator;
@@ -423,6 +439,34 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     intent_writer.finish();
     frame.intents.finishWrite();
 
+    try frame.contacts.prepareRangeCounts(2);
+    frame.contacts.addCount(0, 1);
+    frame.contacts.addCount(1, 1);
+    try frame.contacts.prefix();
+    var contact_writer = frame.contacts.rangeWriter(0);
+    contact_writer.write(.{
+        .a = EntityId.invalid,
+        .b = EntityId.invalid,
+        .a_movement_index = 0,
+        .b_movement_index = 1,
+        .normal_x = 1,
+        .normal_y = 0,
+        .penetration = 2,
+    });
+    contact_writer.finish();
+    contact_writer = frame.contacts.rangeWriter(1);
+    contact_writer.write(.{
+        .a = EntityId.invalid,
+        .b = EntityId.invalid,
+        .a_movement_index = 2,
+        .b_movement_index = 3,
+        .normal_x = 0,
+        .normal_y = 1,
+        .penetration = 4,
+    });
+    contact_writer.finish();
+    frame.contacts.finishWrite();
+
     try frame.structural_commands.prepareRangeCounts(2);
     frame.structural_commands.addCount(0, 1);
     try frame.structural_commands.prefix();
@@ -435,5 +479,6 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
 
     try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 2), frame.contacts.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.structural_commands.mergedItems().len);
 }

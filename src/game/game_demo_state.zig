@@ -10,8 +10,10 @@ const DataSystem = data_mod.DataSystem;
 const EntityId = data_mod.EntityId;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
+const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
+const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const state_mod = @import("../app/state.zig");
 const RenderContext = state_mod.RenderContext;
@@ -20,14 +22,18 @@ const UpdateContext = state_mod.UpdateContext;
 const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 4;
+const obstacle_count = 2;
+const DemoContactResponseMode = enum { block, bounce };
 
 pub const GameDemoState = struct {
     data: DataSystem,
     simulation_frame: SimulationFrame,
     player: Player,
     movement: MovementSystem,
+    collision: CollisionSystem,
     particles: ParticleSystem,
     test_squares: [test_square_count]EntityId,
+    obstacles: [obstacle_count]EntityId,
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
 
@@ -35,20 +41,24 @@ pub const GameDemoState = struct {
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
         const player = try Player.spawn(&data);
+        try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
         const test_squares = try spawnTestSquares(&data);
+        const obstacles = try spawnObstacles(&data);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
-        try simulation_frame.reserveStreams(8, 16, 16, 8);
+        try simulation_frame.reserveStreams(8, 16, 16, 32, 8);
 
         return .{
             .data = data,
             .simulation_frame = simulation_frame,
             .player = player,
             .movement = MovementSystem.init(),
+            .collision = CollisionSystem.init(allocator),
             .particles = particles,
             .test_squares = test_squares,
+            .obstacles = obstacles,
             .bounds_width = bounds_width,
             .bounds_height = bounds_height,
         };
@@ -56,6 +66,7 @@ pub const GameDemoState = struct {
 
     pub fn deinit(self: *GameDemoState) void {
         self.particles.deinit();
+        self.collision.deinit();
         self.simulation_frame.deinit();
         self.data.deinit();
     }
@@ -78,6 +89,8 @@ pub const GameDemoState = struct {
         _ = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
 
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
+        _ = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
+        self.applyDemoCollisionResponse();
         self.emitPlayerTrail();
         _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
 
@@ -88,6 +101,9 @@ pub const GameDemoState = struct {
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
+        for (self.obstacles) |entity| {
+            try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
+        }
         for (self.test_squares) |entity| {
             try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
         }
@@ -132,6 +148,47 @@ pub const GameDemoState = struct {
             .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
             .layer = 0,
         });
+    }
+
+    fn applyDemoCollisionResponse(self: *GameDemoState) void {
+        for (self.simulation_frame.contacts.mergedItems()) |contact| {
+            if (contactIncludes(contact, self.player.entity) and self.otherEntityIsObstacle(contact, self.player.entity)) {
+                self.resolveEntityContact(self.player.entity, contact, .block);
+                continue;
+            }
+            for (self.test_squares) |square| {
+                if (contactIncludes(contact, square) and self.otherEntityIsObstacle(contact, square)) {
+                    self.resolveEntityContact(square, contact, .bounce);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn resolveEntityContact(self: *GameDemoState, entity: EntityId, contact: CollisionContact, mode: DemoContactResponseMode) void {
+        const body = self.data.movementBodyPtr(entity) orelse return;
+        const normal = contactNormalForEntity(contact, entity) orelse return;
+        body.position_x.* += normal.x * contact.penetration;
+        body.position_y.* += normal.y * contact.penetration;
+        if (normal.x != 0) {
+            if (mode == .bounce) {
+                body.velocity_x.* = -body.velocity_x.*;
+            } else {
+                body.velocity_x.* = 0;
+            }
+        }
+        if (normal.y != 0) {
+            if (mode == .bounce) {
+                body.velocity_y.* = -body.velocity_y.*;
+            } else {
+                body.velocity_y.* = 0;
+            }
+        }
+    }
+
+    fn otherEntityIsObstacle(self: *const GameDemoState, contact: CollisionContact, entity: EntityId) bool {
+        const other = if (entityIdsEqual(contact.a, entity)) contact.b else contact.a;
+        return containsEntity(&self.obstacles, other);
     }
 };
 
@@ -186,6 +243,46 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
             .marker_depth = 0,
             .marker_margin = 0,
         });
+        try data.setCollisionBounds(entity, .{ .size = spec.size });
+        entities[index] = entity;
+    }
+    return entities;
+}
+
+fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
+    const specs = [_]ObstacleSpec{
+        .{
+            .position = .{ .x = 462, .y = 215 },
+            .size = .{ .x = 72, .y = 48 },
+            .color = .{ .r = 0.2, .g = 0.28, .b = 0.34, .a = 1.0 },
+        },
+        .{
+            .position = .{ .x = 245, .y = 285 },
+            .size = .{ .x = 96, .y = 28 },
+            .color = .{ .r = 0.26, .g = 0.34, .b = 0.36, .a = 1.0 },
+        },
+    };
+    var entities: [obstacle_count]EntityId = undefined;
+    for (specs, 0..) |spec, index| {
+        const entity = try data.createEntity();
+        errdefer _ = data.destroyEntity(entity);
+        try data.setMovementBody(entity, .{
+            .position = spec.position,
+            .previous_position = spec.position,
+            .velocity = .{},
+            .speed = 0,
+        });
+        try data.setPrimitiveVisual(entity, .{
+            .size = spec.size,
+            .color = spec.color,
+            .layer = -1,
+            .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            .marker_layer = -1,
+            .marker_length = 0,
+            .marker_depth = 0,
+            .marker_margin = 0,
+        });
+        try data.setCollisionBounds(entity, .{ .size = spec.size });
         entities[index] = entity;
     }
     return entities;
@@ -216,18 +313,56 @@ const TestSquareSpec = struct {
     layer: i32,
 };
 
+const ObstacleSpec = struct {
+    position: math.Vec2,
+    size: math.Vec2,
+    color: config.Color,
+};
+
+fn contactIncludes(contact: CollisionContact, entity: EntityId) bool {
+    return entityIdsEqual(contact.a, entity) or entityIdsEqual(contact.b, entity);
+}
+
+fn contactNormalForEntity(contact: CollisionContact, entity: EntityId) ?math.Vec2 {
+    if (entityIdsEqual(contact.a, entity)) {
+        return .{ .x = contact.normal_x, .y = contact.normal_y };
+    }
+    if (entityIdsEqual(contact.b, entity)) {
+        return .{ .x = -contact.normal_x, .y = -contact.normal_y };
+    }
+    return null;
+}
+
+fn containsEntity(entities: []const EntityId, entity: EntityId) bool {
+    for (entities) |candidate| {
+        if (entityIdsEqual(candidate, entity)) return true;
+    }
+    return false;
+}
+
+fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
+    return lhs.index == rhs.index and lhs.generation == rhs.generation;
+}
+
 test "demo spawns colored moving test squares" {
     var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
     defer demo.deinit();
 
-    try std.testing.expectEqual(@as(usize, test_square_count + 1), demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
-        try std.testing.expect(demo.data.hasComponents(entity, data_mod.component_masks.movement_body | data_mod.component_masks.primitive_visual));
+        try std.testing.expect(demo.data.hasComponents(entity, data_mod.component_masks.movement_body | data_mod.component_masks.primitive_visual | data_mod.component_masks.collision_bounds));
         const body = demo.data.movementBodyConst(entity).?;
         try std.testing.expect(body.velocity.x != 0 or body.velocity.y != 0);
         const visual = demo.data.primitiveVisualConst(entity).?;
         try std.testing.expect(visual.color.a > 0);
+    }
+    for (demo.obstacles) |entity| {
+        try std.testing.expect(demo.data.hasComponents(entity, data_mod.component_masks.movement_body | data_mod.component_masks.primitive_visual | data_mod.component_masks.collision_bounds));
+        const body = demo.data.movementBodyConst(entity).?;
+        try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
+        try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
     }
 }
 
@@ -269,4 +404,40 @@ test "demo owns and completes a simulation frame during update" {
         try std.testing.expect(body.position.x != square_before[index].x or body.position.y != square_before[index].y);
     }
     try std.testing.expect(demo.particles.activeCount() > 0);
+}
+
+test "demo collision response blocks player against obstacles" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var threads = try @import("../app/thread_system.zig").ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .min_parallel_items = 1,
+        .items_per_range = data_mod.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    const obstacle = demo.obstacles[0];
+    const obstacle_body = demo.data.movementBodyConst(obstacle).?;
+    const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
+    player_body.position_x.* = obstacle_body.position.x - 30;
+    player_body.position_y.* = obstacle_body.position.y + 8;
+    player_body.previous_x.* = player_body.position_x.*;
+    player_body.previous_y.* = player_body.position_y.*;
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+
+    try demo.update(.{
+        .input = &input,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+
+    const player_after = demo.data.movementBodyConst(demo.player.entity).?;
+    try std.testing.expect(demo.simulation_frame.contacts.mergedItems().len > 0);
+    try std.testing.expect(player_after.position.x <= obstacle_body.position.x - 32);
 }

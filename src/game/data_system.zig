@@ -353,6 +353,12 @@ pub const DataSystem = struct {
         return self.movement_bodies.get(@intCast(dense_index));
     }
 
+    pub fn movementBodyDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.movement_body_index orelse return null;
+        return @intCast(dense_index);
+    }
+
     pub fn movementBodySlice(self: *DataSystem) MovementBodySlice {
         return self.movement_bodies.slice();
     }

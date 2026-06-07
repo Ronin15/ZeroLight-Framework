@@ -760,30 +760,44 @@ Current foundation:
 
 Architecture notes:
 
-- Spatial query data should be built from dense slices and stable entity IDs.
-- Collision detection should produce deterministic contact/query output before
-  response processors consume it.
-- Collision response should be separate from broadphase/narrowphase detection so
-  gameplay rules can choose how to react to contacts.
+- `CollisionSystem` owns warmed transient AABB proxy scratch, not persistent
+  gameplay data.
+- The first broadphase is sweep-and-prune over entities with both movement bodies
+  and collision bounds.
+- Contact output uses the Slice 12 count/prefix/write stream pattern so threaded
+  range windows merge deterministically.
+- Collision response stays separate from detection; `GameDemoState` consumes
+  contacts for narrow demo policies.
 
 Checklist:
 
 - [x] Add persistent collision-shape or bounds data in `DataSystem` only for
       world objects that need collision or spatial queries.
-- [ ] Add a deterministic broadphase/spatial-query structure appropriate for the
+- [x] Add a deterministic broadphase/spatial-query structure appropriate for the
       current 2D scale.
-- [ ] Add a contact output buffer and response processor boundary.
-- [ ] Add tests for stable contact ordering, stale entity rejection, and serial
+- [x] Add a contact output buffer and response processor boundary.
+- [x] Add tests for stable contact ordering, stale entity rejection, and serial
       versus threaded query behavior where threading is used.
+- [x] Add non-interactive collision benchmarks for 10k-50k body quick-profile
+      dense and sparse workloads, including candidate/contact counters.
 
 Acceptance checks:
 
-- [ ] Collision queries operate from typed SoA data and stable IDs, not object
+- [x] Collision queries operate from typed SoA data and stable IDs, not object
       callbacks.
-- [ ] Contact generation is deterministic for the same initial data and fixed
+- [x] Contact generation is deterministic for the same initial data and fixed
       update step.
-- [ ] Collision response cannot perform unsafe structural mutation inside worker
+- [x] Collision response cannot perform unsafe structural mutation inside worker
       ranges.
+
+Slice 13 landed as a high-throughput collision-contact foundation. The collision
+processor builds 64-byte-aligned AABB proxies from movement and collision bounds,
+maintains warm sorted order, partitions sweep-and-prune work into deterministic
+range windows, and emits transient contacts through `SimulationFrame`. The demo
+uses those contacts for a small player-blocking and square-bounce response while
+keeping collision detection generic. Benchmarks now report candidate pairs and
+contacts so dense stress cases can be compared against sparse gameplay-shaped
+fixtures.
 
 ## Slice 14: AI, Pathfinding, And Emergent Rule Processing
 

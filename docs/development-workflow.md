@@ -8,7 +8,7 @@ zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
-zig build bench     # run CPU entity and particle processor benchmarks
+zig build bench     # run CPU gameplay processor benchmarks
 zig build verify    # run check, test, and shader compilation
 zig build package   # install selected-mode binaries and runtime assets
 ```
@@ -100,13 +100,16 @@ zig build verify
 
 ## Benchmarks
 
-`zig build bench` runs non-interactive CPU benchmarks for the movement entity
-processor and transient particle processor. The default run automatically
+`zig build bench` runs non-interactive CPU benchmarks for movement bodies,
+transient particle rows, dense collision bodies, and sparse collision bodies.
+The default run automatically
 exercises serial, inline, fixed-worker, adaptive thread-count,
 thread-adaptive-tuned-range, thread-small-range, and thread-large-range cases.
-Movement runs a count sweep so threshold changes can be compared across entity
-counts; particles use one representative count per profile. Output is grouped
-by workload and count, then explains what to tune: per-system parallel
+Movement and collision run count sweeps so threshold changes can be compared
+across workload sizes; particles use one representative count per profile.
+Collision output includes candidate-pair and contact counts so dense stress
+cases can be compared against sparse gameplay-shaped distributions. Output is
+grouped by workload and count, then explains what to tune: per-system parallel
 thresholds, adaptive thread count, and items per claimed range. The
 adaptive+tuned-range case keeps adaptive thread-count selection enabled, layers
 an external items-per-range tuner on top, settles on the best measured

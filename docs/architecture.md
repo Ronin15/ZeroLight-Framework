@@ -179,6 +179,13 @@ processor, using SIMD lanes inside each assigned range and
 batch is large enough. Worker ranges are aligned to movement cache-line
 boundaries and only write their assigned movement rows.
 
+`CollisionSystem` is a high-throughput contact generator over entities that have
+both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
+proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
+uses range-window broadphase passes with count/prefix/write contact output.
+Contacts are transient `SimulationFrame` data; gameplay response remains a
+separate state or processor policy.
+
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects
 should normally be plain entities processed by enemy, movement, collision, AI,

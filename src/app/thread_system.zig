@@ -630,11 +630,11 @@ fn resolveWorkerThreadCount(override_count: ?usize) !usize {
     return if (cpu_count > 1) cpu_count - 1 else 0;
 }
 
-fn rangeCount(item_count: usize, items_per_range: usize) usize {
+pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
     return (item_count + items_per_range - 1) / items_per_range;
 }
 
-fn alignItemCount(item_count: usize, alignment: usize) usize {
+pub fn alignItemCount(item_count: usize, alignment: usize) usize {
     std.debug.assert(alignment > 0);
     if (alignment == 1) return item_count;
     const remainder = item_count % alignment;

@@ -142,7 +142,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         bench_run.addArgs(args);
     }
-    const bench_step = b.step("bench", "Run CPU entity and particle processor benchmarks");
+    const bench_step = b.step("bench", "Run CPU gameplay processor benchmarks");
     bench_step.dependOn(&bench_run.step);
 
     const verify_step = b.step("verify", "Run non-interactive checks for local development");

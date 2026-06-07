@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const logging = @import("../core/logging.zig");
+const collision = @import("collision.zig");
 const movement = @import("movement.zig");
 const particles = @import("particles.zig");
 const suite = @import("suite.zig");
@@ -13,6 +14,8 @@ pub const std_options = logging.std_options;
 const benchmark_groups = [_]suite.BenchmarkGroup{
     movement.group,
     particles.group,
+    collision.group,
+    collision.sparse_group,
 };
 
 pub fn main(init: std.process.Init) !void {

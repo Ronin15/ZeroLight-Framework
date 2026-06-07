@@ -21,8 +21,8 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
   boundaries.
 - **Data-oriented architecture:** dense component stores for direct,
   cache-friendly processor iteration over gameplay data.
-- **Threaded and SIMD processors:** movement and particle updates with serial,
-  SIMD, and worker-thread execution paths.
+- **Threaded and SIMD processors:** movement, particle, and collision workloads
+  with serial, SIMD-friendly, and worker-thread execution paths.
 - **Comprehensive tests:** coverage for state transitions, input routing,
   resource lifetime, renderer math, threaded CPU range batches, and SIMD/scalar parity so
   framework behavior stays stable as it grows.
