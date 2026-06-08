@@ -8,7 +8,9 @@ const std = @import("std");
 const data_mod = @import("data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const EntityId = data_mod.EntityId;
-const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
+const audio_mod = @import("../app/audio.zig");
+const AudioCommandBuffer = audio_mod.AudioCommandBuffer;
+const LoopingSfxId = audio_mod.LoopingSfxId;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
@@ -28,6 +30,8 @@ const collision_sfx_cooldown_capacity = 32;
 const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_music_path = "audio/music/demo_loop.wav";
 const collision_sfx_path = "audio/sfx/collision.wav";
+const jet_sfx_path = "audio/sfx/player_jet.wav";
+const player_jet_loop_id = LoopingSfxId{ .value = 1 };
 
 pub const GameDemoState = struct {
     data: DataSystem,
@@ -94,7 +98,7 @@ pub const GameDemoState = struct {
         self.simulation_frame.beginStep();
         self.simulation_frame.phase = .main_thread_inputs;
         try self.player.applyInput(&self.data, context.input);
-        self.queueAmbientAudio(context.audio);
+        self.queueAmbientAudio(context.audio, context.input);
 
         self.simulation_frame.phase = .processors;
         var movement_slice = self.data.movementBodySlice();
@@ -163,7 +167,7 @@ pub const GameDemoState = struct {
         });
     }
 
-    fn queueAmbientAudio(self: *GameDemoState, audio: *AudioCommandBuffer) void {
+    fn queueAmbientAudio(self: *GameDemoState, audio: *AudioCommandBuffer, input: *const InputState) void {
         if (!self.music_started) {
             audio.playMusic(.{
                 .path = demo_music_path,
@@ -176,6 +180,17 @@ pub const GameDemoState = struct {
 
         if (self.data.movementBodyConst(self.player.entity)) |body| {
             audio.setListener(.{ .x = body.position.x + 16, .y = body.position.y + 16 }) catch {};
+            if (input.movementVector().x != 0 or input.movementVector().y != 0) {
+                audio.startLoopingSfx(player_jet_loop_id, .{
+                    .path = jet_sfx_path,
+                    .gain = 0.34,
+                    .priority = 220,
+                    .frequency_ratio = 1.0,
+                    .position = .{ .x = body.position.x + 16, .y = body.position.y + 16 },
+                }) catch {};
+            } else {
+                audio.stopLoopingSfx(player_jet_loop_id) catch {};
+            }
         }
     }
 
@@ -185,10 +200,12 @@ pub const GameDemoState = struct {
             if (self.collisionPairOnCooldown(contact.a, contact.b)) continue;
             const position = self.contactAudioPosition(contact) orelse continue;
             const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
+            const frequency_ratio = collisionSfxFrequencyRatio(contact);
             audio.playSfx(.{
                 .path = collision_sfx_path,
                 .gain = gain,
                 .priority = 180,
+                .frequency_ratio = frequency_ratio,
                 .position = position,
             }) catch |err| switch (err) {
                 error.AudioCommandLimitReached => break,
@@ -243,6 +260,15 @@ pub const GameDemoState = struct {
             .key = key,
             .remaining_seconds = collision_sfx_cooldown_seconds,
         };
+    }
+
+    fn collisionSfxFrequencyRatio(contact: @import("simulation.zig").CollisionContact) f32 {
+        var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
+        hash ^= @as(u64, @intFromFloat(@abs(contact.normal_x) * 31.0));
+        hash ^= @as(u64, @intFromFloat(@abs(contact.normal_y) * 47.0)) << 8;
+        hash ^= @as(u64, @intFromFloat(std.math.clamp(contact.penetration, 0, 64) * 16.0)) << 16;
+        const bucket: f32 = @floatFromInt(hash % 9);
+        return 0.92 + bucket * 0.02;
     }
 };
 
