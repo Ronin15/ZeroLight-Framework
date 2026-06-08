@@ -180,8 +180,8 @@ Checklist:
 - [x] Add `TextureId` creation, validation, lookup, and destruction helpers.
 - [x] Keep draw submission lookup array-backed and allocation-free.
 - [x] Preserve the white texture as an internal renderer resource.
-- [x] Keep `createTextureFromPng`, `createTextureFromPixels`, and
-      `replaceTextureFromPixels` behavior compatible during migration.
+- [x] Keep renderer texture creation centered on decoded pixel uploads through
+      `createTextureFromPixels` and `replaceTextureFromPixels`.
 - [x] Add tests for stale IDs, destroyed IDs, invalid generation, and descriptor
       validation.
 - [x] Add a focused compatibility note for the `TextureHandle` to `TextureId`
@@ -204,12 +204,26 @@ Current foundation:
 
 - `AssetStore` resolves safe relative paths from repo root or executable-relative
   install location.
-- Renderer can load PNGs directly through `createTextureFromPng`.
+- `AssetStore` resolves and decodes PNGs into transient CPU `LoadedImage` data.
 - `AssetCache` maps validated relative PNG paths to retained renderer
-  `TextureId` values.
+  `TextureId` values by decoding through assets and asking render to upload
+  already-decoded pixels.
 - `Engine` owns the cache and exposes it to states through `RenderContext`.
 - `assets/test/cache_probe.png` provides a tiny installed PNG fixture for cache
   and asset-root checks.
+
+Future render-data slice:
+
+- Entity creation and world loading should bind texture handles or atlas-region
+  handles before render-time. `DataSystem` render data should store prepared
+  render references such as `TextureId` plus source rectangle, tint, layer, and
+  coordinate-space intent.
+- A state-owned render-prep system should read immutable `DataSystem` slices and
+  submit prepared `Sprite` commands to `Renderer`. The renderer should not look
+  up gameplay entities, world data, asset paths, or texture assignments.
+- Atlas work should build on the same boundary: assets decode source images,
+  atlas code packs CPU pixels, render uploads the final atlas texture, and
+  entities reference atlas regions.
 
 Checklist:
 

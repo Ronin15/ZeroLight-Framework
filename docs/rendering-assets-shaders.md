@@ -32,10 +32,7 @@ Use `drawSprite` for textured quads:
 
 ```zig
 if (self.player_texture == null) {
-    self.player_texture = try context.asset_cache.acquireTexture(
-        context.renderer,
-        "sprites/player.png",
-    );
+    self.player_texture = try context.acquireTexture("sprites/player.png");
 }
 
 try context.renderer.drawSprite(.{
@@ -113,16 +110,17 @@ shader formats. Package source assets separately if your game needs them.
 Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
-PNG texture loading uses core SDL3 `SDL_LoadPNG`/`SDL_LoadSurface` support; this
+PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
 project does not require `SDL3_image`.
 
 The asset cache maps validated relative PNG paths to renderer `TextureId` values.
-Loading the same path more than once reuses the existing texture and increments a
-retain count. Store the returned `TextureLease` in the owning state or service,
-draw with `lease.id`, and call `release` from that owner's `deinit`. When the
-last lease is released, the cache destroys the renderer texture. Cache lookup and
-retain/release are setup-time operations; per-frame rendering should keep using
-the retained `TextureId` directly.
+Loading the same path decodes PNG data through `AssetStore`, uploads decoded
+RGBA8 pixels through the renderer, reuses the existing texture on later
+acquires, and increments a retain count. Store the returned `TextureLease` in
+the owning state or service, draw with `lease.id`, and call `release` from that
+owner's `deinit`. When the last lease is released, the cache destroys the
+renderer texture. Cache lookup and retain/release are setup-time operations;
+per-frame rendering should keep using the retained `TextureId` directly.
 
 ## Text Rendering
 

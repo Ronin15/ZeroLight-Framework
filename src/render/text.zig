@@ -655,7 +655,7 @@ fn rendererRenderText(context: *anyopaque, font: *c.TTF_Font, request: TextReque
         };
     defer c.SDL_DestroySurface(surface);
 
-    const texture = try renderer.createTextureFromSurface(surface);
+    const texture = try createTextureFromTextSurface(renderer, surface);
     errdefer renderer.destroyTexture(texture);
     const desc = renderer.textureDesc(texture) orelse return error.InvalidTexture;
     return .{
@@ -663,6 +663,30 @@ fn rendererRenderText(context: *anyopaque, font: *c.TTF_Font, request: TextReque
         .width = desc.width,
         .height = desc.height,
     };
+}
+
+fn createTextureFromTextSurface(renderer: *Renderer, surface: *c.SDL_Surface) !TextureId {
+    const converted = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_RGBA32) orelse {
+        log.err("SDL_ConvertSurface failed for rendered text: {s}", .{c.SDL_GetError()});
+        return error.SdlError;
+    };
+    defer c.SDL_DestroySurface(converted);
+
+    if (!c.SDL_LockSurface(converted)) {
+        log.err("SDL_LockSurface failed for rendered text: {s}", .{c.SDL_GetError()});
+        return error.SdlError;
+    }
+    defer c.SDL_UnlockSurface(converted);
+
+    const pixels = converted.*.pixels orelse return error.SdlError;
+    const pitch: usize = @intCast(converted.*.pitch);
+    const byte_len = pitch * @as(usize, @intCast(converted.*.h));
+    return renderer.createTextureFromPixels(
+        @as([*]const u8, @ptrCast(pixels))[0..byte_len],
+        @intCast(converted.*.w),
+        @intCast(converted.*.h),
+        pitch,
+    );
 }
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {

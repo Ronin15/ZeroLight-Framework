@@ -6,7 +6,9 @@ const std = @import("std");
 const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
-const AssetCache = @import("../assets/cache.zig").AssetCache;
+const assets_cache = @import("../assets/cache.zig");
+const AssetCache = assets_cache.AssetCache;
+const TextureLease = assets_cache.TextureLease;
 const input_router = @import("input_router.zig");
 const InputRoutingPolicy = input_router.InputRoutingPolicy;
 const Renderer = @import("../render/renderer.zig").Renderer;
@@ -63,6 +65,10 @@ pub const RenderContext = struct {
     text_service: ?*TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
+
+    pub fn acquireTexture(self: RenderContext, relative_path: []const u8) !TextureLease {
+        return self.asset_cache.acquireTexture(self.renderer, relative_path);
+    }
 };
 
 pub const State = struct {

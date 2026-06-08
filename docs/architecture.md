@@ -19,6 +19,9 @@ game-specific behavior under `src/game/`.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
+- `src/assets/assets.zig` resolves safe runtime asset paths, `src/assets/image.zig`
+  decodes PNGs into transient CPU image data, and `src/assets/cache.zig` caches
+  renderer-backed runtime assets.
 - `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
 - `src/render/camera.zig` owns simple world-to-screen camera transforms.
 - `src/render/resources.zig` defines generational renderer resource IDs and descriptors.
@@ -39,8 +42,7 @@ game-specific behavior under `src/game/`.
   `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports
   plus small SDL wrappers.
-- `src/assets/assets.zig` resolves safe runtime asset paths, and `src/assets/cache.zig` caches renderer-backed runtime assets.
-  Audio assets live under `assets/audio/` and are resolved through the same
+- Audio assets live under `assets/audio/` and are resolved through the same
   traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
@@ -90,9 +92,12 @@ swapchain acquisition, vertex upload, render-pass encoding, and submit remain
 coordinated by `Renderer` on the main/render thread.
 
 Game code submits sprites and rectangles through `Renderer` using prepared
-resource handles. Retained `TextureId` leases and text texture leases belong to
-setup, state transitions, or owner shutdown paths; hot render paths should keep
-drawing with retained IDs rather than performing asset or text lookup.
+resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
+texture creation starts from decoded pixels and owns only the GPU texture
+resource. Retained `TextureId` leases and text texture leases belong to setup,
+state transitions, world/entity creation, or owner shutdown paths; hot render
+paths should keep drawing with retained IDs rather than performing asset,
+entity, or text lookup.
 
 Game states request SFX and music through `AudioCommandBuffer` in
 `UpdateContext`. `AudioService` is app-owned because SDL_mixer device, mixer,

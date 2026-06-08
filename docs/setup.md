@@ -12,8 +12,8 @@ dependencies are intentionally empty in `build.zig.zon`.
 - `glslc` for GLSL to SPIR-V compilation
 - `spirv-cross` on macOS for SPIR-V to Metal shader conversion
 
-The app uses core SDL3 PNG loading through `SDL_LoadPNG`/`SDL_LoadSurface`; it
-does not require `SDL3_image`.
+The app uses core SDL3 PNG loading through `SDL_LoadPNG`; it does not require
+`SDL3_image`.
 
 ## macOS
 

@@ -172,47 +172,6 @@ pub const Renderer = struct {
         return @max(1.0, @max(scale_x, scale_y));
     }
 
-    pub fn createTextureFromPng(self: *Renderer, assets: AssetStore, relative_path: []const u8) !TextureId {
-        const path = assets.resolveReadablePath(relative_path) catch |err| {
-            log.err("failed to resolve PNG texture asset \"{s}\": {}", .{ relative_path, err });
-            return err;
-        };
-        defer self.allocator.free(path);
-
-        const path_z = try self.allocator.dupeZ(u8, path);
-        defer self.allocator.free(path_z);
-
-        const loaded = c.SDL_LoadPNG(path_z.ptr) orelse {
-            log.err("SDL_LoadPNG failed for texture \"{s}\": {s}", .{ relative_path, c.SDL_GetError() });
-            return error.SdlError;
-        };
-        defer c.SDL_DestroySurface(loaded);
-
-        return try self.createTextureFromSurface(loaded);
-    }
-
-    pub fn createTextureFromSurface(self: *Renderer, surface: *c.SDL_Surface) !TextureId {
-        const converted = c.SDL_ConvertSurface(surface, c.SDL_PIXELFORMAT_RGBA32) orelse {
-            return sdlError("SDL_ConvertSurface");
-        };
-        defer c.SDL_DestroySurface(converted);
-
-        if (!c.SDL_LockSurface(converted)) {
-            return sdlError("SDL_LockSurface");
-        }
-        defer c.SDL_UnlockSurface(converted);
-
-        const pixels_ptr: [*]const u8 = @ptrCast(converted.*.pixels.?);
-        const pitch: usize = @intCast(converted.*.pitch);
-        const byte_len = pitch * @as(usize, @intCast(converted.*.h));
-        return try self.createTextureFromPixels(
-            pixels_ptr[0..byte_len],
-            @intCast(converted.*.w),
-            @intCast(converted.*.h),
-            pitch,
-        );
-    }
-
     pub fn destroyTexture(self: *Renderer, id: TextureId) void {
         const slot = self.resolveTextureSlot(id) orelse return;
         if (slot.internal) return;
