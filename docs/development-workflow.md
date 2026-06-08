@@ -102,31 +102,55 @@ zig build verify
 
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
 transient particle rows, dense collision bodies, sparse collision bodies, and
-collision-response contacts. The default run exercises serial, inline,
-fixed-worker, adaptive thread-count, thread-adaptive-tuned-range,
-thread-small-range, and thread-large-range cases so the full processor flow can
-be checked for regressions. Movement, collision, and collision response run
-count sweeps; particles use one representative count per profile. Collision
-output includes candidate-pair and contact counts so dense stress cases can be
-compared against sparse gameplay-shaped distributions.
+collision-response contacts. The default run exercises one serial baseline,
+fixed-worker, fixed small-range, fixed large-range, and adaptive cases so the
+full processor flow can be checked for regressions. `thread-adaptive` uses the
+same processor-owned adaptive tuner path as production systems; the fixed cases
+are controls for scheduler overhead, worker-count scaling, and range-size
+effects. The default quick profile keeps collision coverage short: dense and
+sparse collision each run one representative body count, while collision-response
+modes run small and medium contact counts. Standard and stress profiles keep the
+heavier collision sweeps.
+Collision output includes candidate-pair and contact counts so dense stress
+cases can be compared against sparse gameplay-shaped distributions.
 
 Benchmark output is grouped by workload and count. Each block prints an aligned
 plain-text table with per-case timing, speedup, throughput, worker-thread use,
 and status, then ends with a concise validation summary. The summary reports
 what the run proved, such as which path won, whether adaptive stayed inline or
-used worker threads, whether tuned range settled, and whether the expected flows
-were measured or skipped. It is not an entity-count or batching recommendation.
+used worker threads, the adaptive tuner phase and selected profile, and whether
+the expected flows were measured or skipped. It is not an entity-count or
+batching recommendation.
+
+The `worker_threads` column is `active/available` background workers. It does
+not include the main thread, which can also process ranges while waiting for the
+synchronous batch to complete. For example, `1/10` means one background worker
+was active out of ten available workers; if the main thread also processed
+ranges, the batch had two executing CPU participants. `0/10` means the adaptive
+path stayed inline through the ThreadSystem. That can still be slower than
+`serial-direct` in very small ReleaseFast movement workloads because
+`serial-direct` is the raw single-thread control path with no ThreadSystem
+submission overhead.
+
+For regression checking, `thread-adaptive` first runs the explicit `--warmup`
+iterations, then runs a bounded adaptive settle phase before the timed
+measurement loop. This keeps the adaptive row focused on the selected
+steady-state profile instead of averaging the tuner search cost into the mean.
+If the tuner still fails to settle within that budget, the detail table reports
+the probing phase and selected candidate so the run is treated as an adaptive
+coverage failure, not a clean steady-state timing.
 Use `--details` when you need scheduler ranges, wait time, items-per-range,
 tuning phase, and workload counters. In adaptive cases, low-count processors may
 stay inline until measured completion time shows that active worker threads are
 worth the synchronization cost; forced-inline batches are timing samples for
-that batch only and do not reset adaptive thread-count state for later
-processors. Use other optional arguments only to narrow or scale the run:
+that batch only and do not reset adaptive work-tuner state for later processors.
+Use other optional arguments only to narrow or scale the run:
 
 ```sh
 zig build bench -- --profile quick
 zig build bench -- --profile standard --iterations 100
 zig build bench -- --case thread-adaptive
+zig build bench -- --group movement --items 65536 --details
 zig build bench -- --details
 ```
 

@@ -5,7 +5,6 @@
 const std = @import("std");
 const thread_mod = @import("../app/thread_system.zig");
 const ThreadSystem = thread_mod.ThreadSystem;
-const AdaptiveRangeTuner = thread_mod.AdaptiveRangeTuner;
 const data_mod = @import("../game/data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const movement = @import("../game/systems/movement.zig");
@@ -13,7 +12,6 @@ const MovementSystem = movement.MovementSystem;
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
-const benchmark_tuner_settle_warmup_cap: usize = 64;
 
 pub const group = suite.BenchmarkGroup{
     .name = "movement",
@@ -76,37 +74,30 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
     defer if (threads) |*thread_system| thread_system.deinit();
 
-    var range_tuner: ?AdaptiveRangeTuner = if (case.tuned_range)
-        AdaptiveRangeTuner.init(benchmarkTunerConfig(data_mod.movement_range_alignment_items))
-    else
-        null;
     var system = MovementSystem.init();
 
     for (0..options.warmup_iterations) |_| {
-        _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case, if (range_tuner) |*tuner| tuner else null);
+        _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
     }
-    var settled_before_measurement = false;
-    if (range_tuner) |*tuner| {
-        var extra_warmup: usize = 0;
-        while (!tuner.isSettled() and extra_warmup < benchmark_tuner_settle_warmup_cap) : (extra_warmup += 1) {
-            _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case, tuner);
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
         }
-        settled_before_measurement = tuner.isSettled();
     }
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const batch = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case, if (range_tuner) |*tuner| tuner else null);
+        const batch = runOnce(&system, &data, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
     }
 
     var stats = accumulator.finish();
-    if (range_tuner) |*tuner| {
-        var summary = suite.rangeTuningSummary(tuner.report());
-        summary.settled_before_measurement = settled_before_measurement;
-        stats.range_tuning = summary;
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report());
     }
     return stats;
 }
@@ -116,7 +107,6 @@ fn runOnce(
     data: *DataSystem,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
-    range_tuner: ?*AdaptiveRangeTuner,
 ) thread_mod.BatchStats {
     var slice = data.movementBodySlice();
     if (!case.usesThreadSystem()) {
@@ -129,27 +119,14 @@ fn runOnce(
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
-        .range_tuner = range_tuner,
     });
     return stats.batch;
 }
 
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
-    if (case.tuned_range) return case.itemsPerRange(data_mod.movement_range_alignment_items);
+    if (case.adaptive) return null;
     return case.itemsPerRange(data_mod.movement_range_alignment_items) orelse
         suite.alignItemCount(suite.default_items_per_range, data_mod.movement_range_alignment_items);
-}
-
-fn benchmarkTunerConfig(range_alignment_items: usize) thread_mod.AdaptiveRangeTunerConfig {
-    return .{
-        .initial_items_per_range = suite.default_items_per_range,
-        .min_items_per_range = range_alignment_items,
-        .max_items_per_range = suite.default_items_per_range * 64,
-        .sample_window = 2,
-        .improvement_threshold_percent = 5,
-        .settle_after_failed_probes = 2,
-        .retune_after_settled_windows = 10_000,
-    };
 }
 
 test "movement benchmark fixture creates requested movement bodies" {
@@ -159,13 +136,13 @@ test "movement benchmark fixture creates requested movement bodies" {
     try std.testing.expectEqual(@as(usize, 32), data.movementBodySliceConst().entities.len);
 }
 
-test "movement benchmark tiny inline case runs without display" {
+test "movement benchmark tiny serial case runs without display" {
     var options = suite.Options{
         .warmup_iterations = 1,
         .iterations = 1,
     };
     options.profile = .quick;
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[1], 1_024);
+    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 1_024);
     try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
     try std.testing.expect(stats.batch.ran_inline);
 }
@@ -173,10 +150,11 @@ test "movement benchmark tiny inline case runs without display" {
 test "movement benchmark fixed cases use explicit range controls" {
     try std.testing.expectEqual(
         suite.alignItemCount(suite.default_items_per_range, data_mod.movement_range_alignment_items),
-        benchmarkItemsPerRange(suite.default_cases[4]).?,
+        benchmarkItemsPerRange(suite.default_cases[3]).?,
     );
+    try std.testing.expectEqual(suite.default_cases[4].itemsPerRange(data_mod.movement_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[4]).?);
+    try std.testing.expectEqual(suite.default_cases[5].itemsPerRange(data_mod.movement_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[5]).?);
     try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[6]));
-    try std.testing.expectEqual(suite.default_cases[7].itemsPerRange(data_mod.movement_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[7]).?);
 }
 
 test "movement benchmark profiles sweep multiple entity counts" {

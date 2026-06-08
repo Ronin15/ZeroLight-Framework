@@ -124,18 +124,23 @@ on CPU count, with the main/render thread participating as an additional worker
 while it waits. Small batches run inline on the main thread, and batch
 submission does not allocate after initialization.
 
-Adaptive thread count only changes how many already pre-spawned worker threads
-participate in a batch. It uses measured batch completion time and worker
-utilization from adaptive batches to decide when work is large enough to leave
-the main thread. Production processors can own `AdaptiveThreadCount` state so
-movement, particles, and future systems do not train each other with unrelated
-batch timings; `ThreadSystem` keeps shared fallback state for generic callers.
-Batches forced inline by `min_parallel_items`, unavailable workers, or a single
-range still report their own timing, but they do not train adaptive thread-count
-state. Worker threads are reused across frame batches, parked when idle, and
-joined during `ThreadSystem` shutdown. Processor-specific batches can override
-items per claimed range (`items_per_range`), cap selected worker threads, and align
-range starts to hot-column boundaries through `parallelForWithOptions`.
+Adaptive work tuning chooses a complete batch profile: inline or threaded,
+worker threads, and items per claimed range. Worker count and range size remain
+distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
+owns the decision. The tuner starts inline, probes a threaded profile when the
+measured inline window is expensive enough, then searches smaller and larger
+aligned range sizes around the best measured threaded profile before settling.
+Reported `worker_threads` counts are background worker threads only; the main
+thread is not included in that count and may also process ranges while waiting
+for the batch barrier.
+Production processors own their own tuner state so movement, particles,
+collision, and future systems do not train each other with unrelated batch
+timings; `ThreadSystem` keeps shared fallback state for generic callers. Batches
+can still force explicit fixed profiles through `items_per_range`,
+`max_worker_threads`, and `adaptive = false`. Worker threads are reused across
+frame batches, parked when idle, and joined during `ThreadSystem` shutdown.
+Processor-specific batches can align range starts to hot-column boundaries
+through `parallelForWithOptions`.
 
 ## Gameplay Data
 

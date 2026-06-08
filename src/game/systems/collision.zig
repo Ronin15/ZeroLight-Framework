@@ -6,8 +6,7 @@ const std = @import("std");
 const thread_mod = @import("../../app/thread_system.zig");
 const ThreadSystem = thread_mod.ThreadSystem;
 const ParallelRange = thread_mod.ParallelRange;
-const AdaptiveRangeTuner = thread_mod.AdaptiveRangeTuner;
-const AdaptiveThreadCount = thread_mod.AdaptiveThreadCount;
+const AdaptiveWorkTuner = thread_mod.AdaptiveWorkTuner;
 const data_mod = @import("../data_system.zig");
 const DataSystem = data_mod.DataSystem;
 const EntityId = data_mod.EntityId;
@@ -25,8 +24,7 @@ pub const CollisionConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_thread_count: ?*AdaptiveThreadCount = null,
-    range_tuner: ?*AdaptiveRangeTuner = null,
+    adaptive_tuner: ?*AdaptiveWorkTuner = null,
     full_sort_disorder_percent: u8 = 12,
 };
 
@@ -34,6 +32,7 @@ pub const CollisionStats = struct {
     body_count: usize = 0,
     contact_count: usize = 0,
     candidate_pair_count: usize = 0,
+    work_batch: thread_mod.BatchStats = .{},
     count_batch: thread_mod.BatchStats = .{},
     write_batch: thread_mod.BatchStats = .{},
     used_full_sort: bool = false,
@@ -49,14 +48,12 @@ pub const CollisionSystem = struct {
     max_y: HotF32List = .empty,
     order: std.ArrayList(usize) = .empty,
     candidate_counts: std.ArrayList(usize) = .empty,
-    range_tuner: AdaptiveRangeTuner = AdaptiveRangeTuner.init(.{}),
-    adaptive_thread_count: AdaptiveThreadCount = .{},
+    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
         return .{
             .allocator = allocator,
-            .range_tuner = AdaptiveRangeTuner.init(.{}),
-            .adaptive_thread_count = .{},
+            .adaptive_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
@@ -89,20 +86,36 @@ pub const CollisionSystem = struct {
         const used_full_sort = self.sortWarm(config.full_sort_disorder_percent);
 
         var system_config = config;
-        if (system_config.items_per_range == null and system_config.range_tuner == null) {
-            system_config.range_tuner = &self.range_tuner;
-        }
-        if (system_config.adaptive and system_config.adaptive_thread_count == null) {
-            system_config.adaptive_thread_count = &self.adaptive_thread_count;
+        if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
+            system_config.adaptive_tuner = &self.adaptive_tuner;
         }
 
-        const active_tuner = if (system_config.items_per_range == null) system_config.range_tuner else null;
-        const items_per_range = if (active_tuner) |tuner|
-            tuner.itemsPerRange(body_count, collision_range_alignment_items)
+        const max_worker_threads = @min(system_config.max_worker_threads orelse thread_system.workerThreadCount(), thread_system.workerThreadCount());
+        const active_tuner = if (system_config.adaptive and system_config.items_per_range == null)
+            system_config.adaptive_tuner
         else
-            system_config.items_per_range orelse thread_system.config.items_per_range;
+            null;
+        const selected_profile = if (active_tuner) |tuner|
+            tuner.selectProfile(.{
+                .item_count = body_count,
+                .available_worker_threads = thread_system.workerThreadCount(),
+                .max_worker_threads = max_worker_threads,
+                .min_parallel_items = system_config.min_parallel_items orelse thread_system.config.min_parallel_items,
+                .fallback_items_per_range = thread_system.config.items_per_range,
+                .range_alignment_items = collision_range_alignment_items,
+            })
+        else
+            thread_mod.AdaptiveWorkProfile{
+                .worker_threads = max_worker_threads,
+                .items_per_range = system_config.items_per_range orelse thread_system.config.items_per_range,
+            };
+        const items_per_range = selected_profile.items_per_range;
         const aligned_items_per_range = thread_mod.alignItemCount(@max(items_per_range, @as(usize, 1)), collision_range_alignment_items);
         const range_count = thread_mod.rangeCount(body_count, aligned_items_per_range);
+        const selected_worker_threads = if (body_count < (system_config.min_parallel_items orelse thread_system.config.min_parallel_items) or range_count <= 1)
+            @as(usize, 0)
+        else
+            @min(selected_profile.worker_threads, @min(max_worker_threads, range_count - 1));
 
         try contacts.prepareRangeCounts(range_count);
         try self.prepareCandidateCounts(range_count);
@@ -114,31 +127,31 @@ pub const CollisionSystem = struct {
         const count_batch = thread_system.parallelForWithOptions(body_count, &context, countContactsJob, .{
             .min_parallel_items = system_config.min_parallel_items,
             .items_per_range = aligned_items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
+            .max_worker_threads = selected_worker_threads,
             .range_alignment_items = collision_range_alignment_items,
-            .adaptive = system_config.adaptive,
-            .adaptive_thread_count = system_config.adaptive_thread_count,
+            .adaptive = false,
         });
 
         try contacts.prefix();
         const write_batch = thread_system.parallelForWithOptions(body_count, &context, writeContactsJob, .{
             .min_parallel_items = system_config.min_parallel_items,
             .items_per_range = aligned_items_per_range,
-            .max_worker_threads = system_config.max_worker_threads,
+            .max_worker_threads = selected_worker_threads,
             .range_alignment_items = collision_range_alignment_items,
-            .adaptive = system_config.adaptive,
-            .adaptive_thread_count = system_config.adaptive_thread_count,
+            .adaptive = false,
         });
         contacts.finishWrite();
 
+        const work_batch = combinedCollisionBatch(count_batch, write_batch);
         if (active_tuner) |tuner| {
-            tuner.record(write_batch);
+            tuner.record(work_batch);
         }
 
         return .{
             .body_count = body_count,
             .contact_count = contacts.mergedItems().len,
             .candidate_pair_count = sumCounts(self.candidate_counts.items),
+            .work_batch = work_batch,
             .count_batch = count_batch,
             .write_batch = write_batch,
             .used_full_sort = used_full_sort,
@@ -168,12 +181,15 @@ pub const CollisionSystem = struct {
         writeContactsInRange(self, range, &writer);
         writer.finish();
         contacts.finishWrite();
+        const count_batch = serialBatch(body_count);
+        const write_batch = serialBatch(body_count);
         return .{
             .body_count = body_count,
             .contact_count = contacts.mergedItems().len,
             .candidate_pair_count = sumCounts(self.candidate_counts.items),
-            .count_batch = serialBatch(body_count),
-            .write_batch = serialBatch(body_count),
+            .work_batch = combinedCollisionBatch(count_batch, write_batch),
+            .count_batch = count_batch,
+            .write_batch = write_batch,
             .used_full_sort = used_full_sort,
         };
     }
@@ -410,6 +426,30 @@ fn serialBatch(item_count: usize) thread_mod.BatchStats {
     };
 }
 
+fn combinedCollisionBatch(count_batch: thread_mod.BatchStats, write_batch: thread_mod.BatchStats) thread_mod.BatchStats {
+    const total_range_count = count_batch.range_count + write_batch.range_count;
+    const total_worker_ranges = count_batch.worker_thread_ranges + write_batch.worker_thread_ranges;
+    const worker_utilization = if (total_range_count == 0 or count_batch.active_worker_threads == 0)
+        @as(f32, 0)
+    else
+        @as(f32, @floatFromInt(total_worker_ranges)) / @as(f32, @floatFromInt(total_range_count));
+
+    return .{
+        .item_count = count_batch.item_count,
+        .range_count = total_range_count,
+        .items_per_range = count_batch.items_per_range,
+        .range_alignment_items = count_batch.range_alignment_items,
+        .available_worker_threads = @max(count_batch.available_worker_threads, write_batch.available_worker_threads),
+        .active_worker_threads = @max(count_batch.active_worker_threads, write_batch.active_worker_threads),
+        .main_thread_ranges = count_batch.main_thread_ranges + write_batch.main_thread_ranges,
+        .worker_thread_ranges = total_worker_ranges,
+        .worker_utilization = worker_utilization,
+        .batch_duration_ns = count_batch.batch_duration_ns + write_batch.batch_duration_ns,
+        .main_thread_wait_ns = count_batch.main_thread_wait_ns + write_batch.main_thread_wait_ns,
+        .ran_inline = count_batch.ran_inline and write_batch.ran_inline,
+    };
+}
+
 fn addBody(data: *DataSystem, position_x: f32, position_y: f32, size: f32) !EntityId {
     const entity = try data.createEntity();
     try data.setMovementBody(entity, .{
@@ -439,6 +479,8 @@ test "collision contacts are stable and reject non-overlaps" {
     try std.testing.expectEqual(@as(usize, 3), stats.body_count);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
+    try std.testing.expectEqual(stats.count_batch.range_count + stats.write_batch.range_count, stats.work_batch.range_count);
+    try std.testing.expectEqual(stats.count_batch.main_thread_ranges + stats.write_batch.main_thread_ranges, stats.work_batch.main_thread_ranges);
     const merged = contacts.mergedItems();
     try std.testing.expectEqual(first.index, merged[0].a.index);
     try std.testing.expectEqual(second.index, merged[0].b.index);
@@ -524,6 +566,9 @@ test "threaded collision matches serial contact order" {
     });
 
     try std.testing.expect(!threaded_stats.write_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.work_batch.ran_inline);
+    try std.testing.expectEqual(threaded_stats.count_batch.range_count + threaded_stats.write_batch.range_count, threaded_stats.work_batch.range_count);
+    try std.testing.expectEqual(threaded_stats.count_batch.worker_thread_ranges + threaded_stats.write_batch.worker_thread_ranges, threaded_stats.work_batch.worker_thread_ranges);
     const serial_items = serial_contacts.mergedItems();
     const threaded_items = threaded_contacts.mergedItems();
     try std.testing.expectEqual(serial_items.len, threaded_items.len);

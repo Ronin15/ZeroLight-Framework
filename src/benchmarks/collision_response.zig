@@ -37,7 +37,7 @@ pub const mixed_group = suite.BenchmarkGroup{
     .runCase = runMixedCase,
 };
 
-const quick_counts = [_]usize{ 1_000, 5_000, 10_000, 25_000, 50_000 };
+const quick_counts = [_]usize{ 1_000, 10_000 };
 const standard_counts = [_]usize{ 1_000, 5_000, 10_000, 25_000, 50_000 };
 const stress_counts = [_]usize{ 10_000, 25_000, 50_000 };
 

@@ -594,10 +594,12 @@ Performance notes:
   small counts, tests, and fallback behavior, but the processor API and tests
   must prove that systems can split `DataSystem` slices through
   `ThreadSystem.parallelFor`.
-- Treat the current adaptive thread-system thresholds as a starting heuristic,
-  not a tuned policy. The first real processor should record whether selected
-  worker counts, range sizes, main-thread wait time, and worker utilization are
-  sensible under representative movement workloads before broadening the policy.
+- Treat adaptive work tuning as a measured batch-profile policy, not a separate
+  worker-count heuristic. The tuner starts inline, probes threaded profiles only
+  when measured batch time justifies it, then searches aligned range sizes
+  around the best measured threaded profile before settling. Benchmark output
+  should keep reporting worker count, range size, main-thread wait time, and
+  worker utilization so regressions are visible.
 - Treat cache-line behavior as part of the processor contract. SoA columns used
   by SIMD processors should have an explicit alignment policy before relying on
   wider loads or target-specific vector behavior.
@@ -789,8 +791,9 @@ Checklist:
 - [x] Add a contact output buffer and response processor boundary.
 - [x] Add tests for stable contact ordering, stale entity rejection, and serial
       versus threaded query behavior where threading is used.
-- [x] Add non-interactive collision benchmarks for 10k-50k body quick-profile
-      dense and sparse workloads, including candidate/contact counters.
+- [x] Add non-interactive collision benchmarks with quick-profile dense/sparse
+      regression coverage, heavier 10k-50k standard-profile sweeps, and
+      candidate/contact counters.
 
 Acceptance checks:
 

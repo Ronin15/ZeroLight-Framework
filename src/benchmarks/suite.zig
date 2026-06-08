@@ -20,6 +20,8 @@ pub const Options = struct {
     warmup_iterations: usize = 5,
     iterations: usize = 30,
     case_filter: ?[]const u8 = null,
+    group_filter: ?[]const u8 = null,
+    item_count_filter: ?usize = null,
     details: bool = false,
 };
 
@@ -34,13 +36,11 @@ pub const BenchmarkCase = struct {
     worker_mode: WorkerMode,
     adaptive: bool = false,
     range_mode: RangeMode = .default,
-    tuned_range: bool = false,
     required_worker_count: usize = 0,
 
     pub fn maxWorkerThreads(self: BenchmarkCase) ?usize {
         return switch (self.worker_mode) {
             .serial_direct => 0,
-            .thread_inline => 0,
             .fixed_1 => 1,
             .fixed_2 => 2,
             .fixed_auto => null,
@@ -63,7 +63,6 @@ pub const BenchmarkCase = struct {
     pub fn workerModeLabel(self: BenchmarkCase) []const u8 {
         return switch (self.worker_mode) {
             .serial_direct => "serial",
-            .thread_inline => "inline",
             .fixed_1 => "fixed-1",
             .fixed_2 => "fixed-2",
             .fixed_auto => "fixed-auto",
@@ -73,7 +72,6 @@ pub const BenchmarkCase = struct {
 
 pub const WorkerMode = enum {
     serial_direct,
-    thread_inline,
     fixed_1,
     fixed_2,
     fixed_auto,
@@ -91,10 +89,6 @@ pub const default_cases = [_]BenchmarkCase{
         .worker_mode = .serial_direct,
     },
     .{
-        .name = "thread-inline",
-        .worker_mode = .thread_inline,
-    },
-    .{
         .name = "thread-fixed-1",
         .worker_mode = .fixed_1,
         .required_worker_count = 1,
@@ -110,19 +104,6 @@ pub const default_cases = [_]BenchmarkCase{
         .required_worker_count = 1,
     },
     .{
-        .name = "thread-adaptive",
-        .worker_mode = .fixed_auto,
-        .adaptive = true,
-        .required_worker_count = 1,
-    },
-    .{
-        .name = "thread-adaptive-tuned-range",
-        .worker_mode = .fixed_auto,
-        .adaptive = true,
-        .tuned_range = true,
-        .required_worker_count = 1,
-    },
-    .{
         .name = "thread-small-range",
         .worker_mode = .fixed_auto,
         .range_mode = .small,
@@ -132,6 +113,12 @@ pub const default_cases = [_]BenchmarkCase{
         .name = "thread-large-range",
         .worker_mode = .fixed_auto,
         .range_mode = .large,
+        .required_worker_count = 1,
+    },
+    .{
+        .name = "thread-adaptive",
+        .worker_mode = .fixed_auto,
+        .adaptive = true,
         .required_worker_count = 1,
     },
 };
@@ -153,7 +140,7 @@ pub const RunStats = struct {
     max_ns: u64 = 0,
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
-    range_tuning: ?RangeTuningSummary = null,
+    work_tuning: ?WorkTuningSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -183,17 +170,20 @@ pub const BatchSummary = struct {
     ran_inline: bool = true,
 };
 
-pub const RangeTuningSummary = struct {
-    phase: thread_mod.AdaptiveRangePhase = .learning,
+pub const WorkTuningSummary = struct {
+    phase: thread_mod.AdaptiveWorkPhase = .learning,
+    initial_worker_threads: usize = 0,
     initial_items_per_range: usize = 0,
+    final_worker_threads: usize = 0,
     final_items_per_range: usize = 0,
+    best_worker_threads: usize = 0,
     best_items_per_range: usize = 0,
+    candidate_worker_threads: ?usize = null,
     candidate_items_per_range: ?usize = null,
     sample_count: usize = 0,
     sample_window: usize = 0,
-    failed_probe_count: usize = 0,
+    failed_profile_count: usize = 0,
     settled_window_count: usize = 0,
-    settle_after_failed_probes: usize = 0,
     retune_after_settled_windows: usize = 0,
     settled_before_measurement: bool = false,
     best_mean_batch_duration_ns: u64 = 0,
@@ -266,24 +256,34 @@ pub const StatsAccumulator = struct {
     }
 };
 
-pub fn rangeTuningSummary(report: thread_mod.AdaptiveRangeReport) RangeTuningSummary {
+pub fn workTuningSummary(report: thread_mod.AdaptiveWorkReport) WorkTuningSummary {
     return .{
         .phase = report.phase,
-        .initial_items_per_range = report.initial_items_per_range,
-        .final_items_per_range = report.current_items_per_range,
-        .best_items_per_range = report.best_items_per_range,
-        .candidate_items_per_range = report.candidate_items_per_range,
+        .initial_worker_threads = report.initial_profile.worker_threads,
+        .initial_items_per_range = report.initial_profile.items_per_range,
+        .final_worker_threads = report.current_profile.worker_threads,
+        .final_items_per_range = report.current_profile.items_per_range,
+        .best_worker_threads = report.best_profile.worker_threads,
+        .best_items_per_range = report.best_profile.items_per_range,
+        .candidate_worker_threads = if (report.candidate_profile) |profile| profile.worker_threads else null,
+        .candidate_items_per_range = if (report.candidate_profile) |profile| profile.items_per_range else null,
         .sample_count = report.sample_count,
         .sample_window = report.sample_window,
-        .failed_probe_count = report.failed_probe_count,
+        .failed_profile_count = report.failed_profile_count,
         .settled_window_count = report.settled_window_count,
-        .settle_after_failed_probes = report.settle_after_failed_probes,
         .retune_after_settled_windows = report.retune_after_settled_windows,
         .settled_before_measurement = report.phase == .settled,
         .best_mean_batch_duration_ns = report.best_mean_batch_duration_ns,
         .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
         .probing = report.probing,
     };
+}
+
+pub fn adaptiveSettleIterationLimit(options: Options) usize {
+    const default_tuner_config = thread_mod.AdaptiveWorkTunerConfig{};
+    const settle_windows: usize = 16;
+    const settle_iterations = default_tuner_config.sample_window * settle_windows;
+    return @max(options.iterations, settle_iterations);
 }
 
 pub fn parseOptions(args: []const []const u8) !Options {
@@ -315,6 +315,18 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.case_filter = args[index];
         } else if (stripPrefix(arg, "--case=")) |value| {
             options.case_filter = value;
+        } else if (std.mem.eql(u8, arg, "--group")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.group_filter = args[index];
+        } else if (stripPrefix(arg, "--group=")) |value| {
+            options.group_filter = value;
+        } else if (std.mem.eql(u8, arg, "--items")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.item_count_filter = try parsePositiveUsize(args[index]);
+        } else if (stripPrefix(arg, "--items=")) |value| {
+            options.item_count_filter = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--details")) {
             options.details = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -331,8 +343,18 @@ pub fn parseOptions(args: []const []const u8) !Options {
 
 pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const BenchmarkGroup, options: Options) !void {
     printHeader(options);
+    var matched_group = options.group_filter == null;
+    var matched_item_count = options.item_count_filter == null;
     for (groups) |group| {
+        if (options.group_filter) |filter| {
+            if (!std.mem.eql(u8, filter, group.name)) continue;
+            matched_group = true;
+        }
         for (group.defaultItemCounts(options.profile)) |item_count| {
+            if (options.item_count_filter) |filter| {
+                if (filter != item_count) continue;
+                matched_item_count = true;
+            }
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
@@ -348,6 +370,14 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
             printGroupReport(group, results[0..result_count], options);
         }
     }
+    if (!matched_group) {
+        std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter.?});
+        return error.InvalidArgument;
+    }
+    if (!matched_item_count) {
+        std.debug.print("no benchmark workload matched --items={}\n", .{options.item_count_filter.?});
+        return error.InvalidArgument;
+    }
 }
 
 pub fn printUsage() void {
@@ -359,6 +389,8 @@ pub fn printUsage() void {
         \\  --warmup N
         \\  --iterations N
         \\  --case name
+        \\  --group name
+        \\  --items N
         \\  --details
         \\
         \\Default runs every benchmark case for every registered workload.
@@ -461,7 +493,6 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     const best = bestMeasured(results) orelse baseline;
     const fixed_auto = measured(findResult(results, "thread-fixed-auto"));
     const adaptive = measured(findResult(results, "thread-adaptive"));
-    const tuned_range = measured(findResult(results, "thread-adaptive-tuned-range"));
 
     printCompactTable(results, baseline);
     if (options.details) {
@@ -470,7 +501,7 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     } else {
         std.debug.print("\ndetails: pass --details for scheduler, range, and workload columns\n", .{});
     }
-    printValidationSummary(group.name, baseline, best, fixed_auto, adaptive, tuned_range, results);
+    printValidationSummary(group.name, baseline, best, fixed_auto, adaptive, results);
 }
 
 fn itemLabel(group_name: []const u8) []const u8 {
@@ -519,7 +550,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
     printCell("worker_ranges", 14);
     printCell("wait", 11);
     printCell("items_per_range", 16);
-    printCell("range_tuning", 45);
+    printCell("work_tuning", 56);
     std.debug.print("workload\n", .{});
 
     for (results) |result| {
@@ -531,7 +562,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
             printCell("-", 14);
             printCell("-", 11);
             printCell("-", 16);
-            printCell("-", 45);
+            printCell("-", 56);
             std.debug.print("{s}\n", .{result.stats.skip_reason});
             continue;
         }
@@ -552,7 +583,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         printCell(formatUsizeInto(&worker_ranges_buffer, result.stats.batch.worker_thread_ranges), 14);
         printCell(formatDurationInto(&wait_buffer, result.stats.batch.main_thread_wait_ns), 11);
         printCell(formatUsizeInto(&items_per_range_buffer, result.stats.batch.items_per_range), 16);
-        printCell(formatRangeTuningInto(&tuning_buffer, result.stats.range_tuning), 45);
+        printCell(formatWorkTuningInto(&tuning_buffer, result.stats.work_tuning), 56);
         std.debug.print("{s}\n", .{formatWorkloadInto(&workload_buffer, group_name, result.stats)});
     }
 }
@@ -563,7 +594,6 @@ fn printValidationSummary(
     best: CaseResult,
     fixed_auto: ?CaseResult,
     adaptive: ?CaseResult,
-    tuned_range: ?CaseResult,
     results: []const CaseResult,
 ) void {
     const speedup = speedupBasisPoints(baseline.stats, best.stats);
@@ -573,6 +603,12 @@ fn printValidationSummary(
     );
 
     if (adaptive) |adaptive_result| {
+        if (adaptive_result.stats.work_tuning) |summary| {
+            std.debug.print(
+                "adaptive phase={s} best_profile={}/{} final={}/{}. ",
+                .{ @tagName(summary.phase), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+            );
+        }
         if (adaptive_result.stats.batch.active_worker_threads == 0) {
             std.debug.print(
                 "adaptive stayed inline with {}/{} worker_threads. ",
@@ -586,15 +622,6 @@ fn printValidationSummary(
         }
     } else {
         std.debug.print("adaptive flow not selected in this run. ", .{});
-    }
-
-    if (tuned_range) |tuned| {
-        if (tuned.stats.range_tuning) |summary| {
-            std.debug.print(
-                "tuned-range phase={s} settled={s} best_items_per_range={}. ",
-                .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_items_per_range },
-            );
-        }
     }
 
     if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
@@ -613,10 +640,20 @@ fn printValidationSummary(
 
     printFlowCoverage(results);
 
-    if (validationAttention(fixed_auto, adaptive, tuned_range)) |attention| {
+    if (validationAttention(fixed_auto, adaptive, bestFixedThreadedResult(results))) |attention| {
         std.debug.print(" attention: {s}.", .{attention});
     }
     std.debug.print("\n", .{});
+}
+
+fn bestFixedThreadedResult(results: []const CaseResult) ?CaseResult {
+    return bestOfMeasured(&[_]?CaseResult{
+        findResult(results, "thread-fixed-1"),
+        findResult(results, "thread-fixed-2"),
+        findResult(results, "thread-fixed-auto"),
+        findResult(results, "thread-small-range"),
+        findResult(results, "thread-large-range"),
+    });
 }
 
 fn printFlowCoverage(results: []const CaseResult) void {
@@ -635,19 +672,18 @@ fn printFlowCoverage(results: []const CaseResult) void {
     std.debug.print(".", .{});
 }
 
-fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, tuned_range: ?CaseResult) ?[]const u8 {
+fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_control: ?CaseResult) ?[]const u8 {
     if (adaptive) |adaptive_result| {
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
                 return "adaptive is more than 25% slower than fixed-auto";
             }
         }
-    }
-
-    if (tuned_range) |tuned| {
-        if (tuned.stats.range_tuning) |summary| {
-            if (!summary.settled_before_measurement) {
-                return "tuned range did not settle before measurement";
+        if (adaptive_result.stats.batch.active_worker_threads > 0) {
+            if (threaded_control) |fixed| {
+                if (percentDelta(adaptive_result.stats.mean_ns, fixed.stats.mean_ns) > 25) {
+                    return "adaptive is more than 25% slower than best fixed threaded control";
+                }
             }
         }
     }
@@ -709,20 +745,21 @@ fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
     return std.fmt.bufPrint(buffer, "{}", .{value}) catch "value";
 }
 
-fn formatRangeTuningInto(buffer: []u8, maybe_summary: ?RangeTuningSummary) []const u8 {
+fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
     const summary = maybe_summary orelse return "-";
     if (summary.candidate_items_per_range) |candidate| {
+        const candidate_workers = summary.candidate_worker_threads orelse 0;
         return std.fmt.bufPrint(
             buffer,
-            "{s} settled={s} best={} final={} cand={}",
-            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_items_per_range, summary.final_items_per_range, candidate },
-        ) catch "range";
+            "{s} settled={s} best={}/{} final={}/{} cand={}/{}",
+            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range, candidate_workers, candidate },
+        ) catch "work";
     }
     return std.fmt.bufPrint(
         buffer,
-        "{s} settled={s} best={} final={}",
-        .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_items_per_range, summary.final_items_per_range },
-    ) catch "range";
+        "{s} settled={s} best={}/{} final={}/{}",
+        .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+    ) catch "work";
 }
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
@@ -789,22 +826,6 @@ fn percentDelta(candidate_ns: u64, baseline_ns: u64) i64 {
     return @intCast(@divTrunc((candidate - baseline_value) * 100, baseline_value));
 }
 
-fn signedPercent(value: i64) SignedPercent {
-    return .{ .value = value };
-}
-
-const SignedPercent = struct {
-    value: i64,
-
-    pub fn format(self: SignedPercent, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (self.value > 0) {
-            try writer.print("+{}%", .{self.value});
-        } else {
-            try writer.print("{}%", .{self.value});
-        }
-    }
-};
-
 fn formatDuration(ns: u64) Duration {
     return .{ .ns = ns };
 }
@@ -836,16 +857,14 @@ fn u128ToUsizeSaturated(value: u128) usize {
 }
 
 test "default benchmark cases cover required thread modes" {
-    try std.testing.expectEqual(@as(usize, 9), default_cases.len);
+    try std.testing.expectEqual(@as(usize, 7), default_cases.len);
     try std.testing.expectEqualStrings("serial-direct", default_cases[0].name);
-    try std.testing.expectEqualStrings("thread-inline", default_cases[1].name);
-    try std.testing.expectEqualStrings("thread-fixed-1", default_cases[2].name);
-    try std.testing.expectEqualStrings("thread-fixed-2", default_cases[3].name);
-    try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[4].name);
-    try std.testing.expectEqualStrings("thread-adaptive", default_cases[5].name);
-    try std.testing.expectEqualStrings("thread-adaptive-tuned-range", default_cases[6].name);
-    try std.testing.expectEqualStrings("thread-small-range", default_cases[7].name);
-    try std.testing.expectEqualStrings("thread-large-range", default_cases[8].name);
+    try std.testing.expectEqualStrings("thread-fixed-1", default_cases[1].name);
+    try std.testing.expectEqualStrings("thread-fixed-2", default_cases[2].name);
+    try std.testing.expectEqualStrings("thread-fixed-auto", default_cases[3].name);
+    try std.testing.expectEqualStrings("thread-small-range", default_cases[4].name);
+    try std.testing.expectEqualStrings("thread-large-range", default_cases[5].name);
+    try std.testing.expectEqualStrings("thread-adaptive", default_cases[6].name);
 }
 
 test "benchmark options parse scaling and filtering arguments" {
@@ -856,14 +875,19 @@ test "benchmark options parse scaling and filtering arguments" {
         "--iterations",
         "9",
         "--case",
-        "thread-inline",
+        "thread-fixed-1",
+        "--group=movement",
+        "--items",
+        "65536",
         "--details",
     };
     const options = try parseOptions(&args);
     try std.testing.expectEqual(Profile.standard, options.profile);
     try std.testing.expectEqual(@as(usize, 2), options.warmup_iterations);
     try std.testing.expectEqual(@as(usize, 9), options.iterations);
-    try std.testing.expectEqualStrings("thread-inline", options.case_filter.?);
+    try std.testing.expectEqualStrings("thread-fixed-1", options.case_filter.?);
+    try std.testing.expectEqualStrings("movement", options.group_filter.?);
+    try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
     try std.testing.expect(options.details);
 }
 
@@ -880,27 +904,32 @@ test "benchmark options reject unknown case filter" {
 test "benchmark case filter includes serial baseline for non-serial cases" {
     try std.testing.expect(shouldIncludeBaselineForFilter("thread-adaptive", default_cases[0]));
     try std.testing.expect(!shouldIncludeBaselineForFilter("serial-direct", default_cases[0]));
-    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive", default_cases[5]));
+    try std.testing.expect(!shouldIncludeBaselineForFilter("thread-adaptive", default_cases[6]));
 }
 
-test "batch tuning summary preserves settled phase" {
-    var summary = rangeTuningSummary(.{
+test "work tuning summary preserves settled phase" {
+    var summary = workTuningSummary(.{
         .phase = .settled,
-        .initial_items_per_range = 64,
-        .current_items_per_range = 256,
-        .best_items_per_range = 256,
+        .initial_profile = .{ .worker_threads = 0, .items_per_range = 64 },
+        .current_profile = .{ .worker_threads = 4, .items_per_range = 256 },
+        .best_profile = .{ .worker_threads = 4, .items_per_range = 256 },
         .sample_window = 2,
-        .failed_probe_count = 0,
+        .failed_profile_count = 0,
         .settled_window_count = 4,
-        .settle_after_failed_probes = 2,
         .retune_after_settled_windows = 10_000,
         .best_mean_batch_duration_ns = 42,
     });
     summary.settled_before_measurement = summary.phase == .settled;
 
-    try std.testing.expectEqual(thread_mod.AdaptiveRangePhase.settled, summary.phase);
+    try std.testing.expectEqual(thread_mod.AdaptiveWorkPhase.settled, summary.phase);
     try std.testing.expect(summary.settled_before_measurement);
+    try std.testing.expectEqual(@as(usize, 4), summary.best_worker_threads);
     try std.testing.expectEqual(@as(usize, 256), summary.best_items_per_range);
+}
+
+test "adaptive settle budget covers multiple tuner windows" {
+    try std.testing.expectEqual(@as(usize, 48), adaptiveSettleIterationLimit(.{}));
+    try std.testing.expectEqual(@as(usize, 100), adaptiveSettleIterationLimit(.{ .iterations = 100 }));
 }
 
 test "benchmark table formatters keep compact text" {
@@ -918,10 +947,12 @@ test "benchmark table formatters keep compact text" {
         },
     }));
     try std.testing.expectEqualStrings(
-        "settled settled=yes best=256 final=256",
-        formatRangeTuningInto(&range_buffer, .{
+        "settled settled=yes best=4/256 final=4/256",
+        formatWorkTuningInto(&range_buffer, .{
             .phase = .settled,
+            .best_worker_threads = 4,
             .best_items_per_range = 256,
+            .final_worker_threads = 4,
             .final_items_per_range = 256,
             .settled_before_measurement = true,
         }),
@@ -933,24 +964,21 @@ test "benchmark skipped status keeps skip reason visible" {
     try std.testing.expectEqualStrings("not enough worker threads available", statusText(skipped));
 }
 
-test "benchmark validation attention flags regression signals" {
+test "benchmark validation attention flags adaptive regressions against controls" {
     const fixed_auto = CaseResult{
-        .case = default_cases[4],
+        .case = default_cases[3],
         .stats = .{ .mean_ns = 100 },
     };
     const adaptive = CaseResult{
-        .case = default_cases[5],
-        .stats = .{ .mean_ns = 130 },
-    };
-    const tuned_range = CaseResult{
         .case = default_cases[6],
         .stats = .{
-            .mean_ns = 100,
-            .range_tuning = .{
-                .phase = .learning,
-                .settled_before_measurement = false,
-            },
+            .mean_ns = 130,
+            .batch = .{ .active_worker_threads = 1 },
         },
+    };
+    const threaded_control = CaseResult{
+        .case = default_cases[5],
+        .stats = .{ .mean_ns = 100 },
     };
 
     try std.testing.expectEqualStrings(
@@ -958,14 +986,18 @@ test "benchmark validation attention flags regression signals" {
         validationAttention(fixed_auto, adaptive, null).?,
     );
     try std.testing.expectEqualStrings(
-        "tuned range did not settle before measurement",
-        validationAttention(null, null, tuned_range).?,
+        "adaptive is more than 25% slower than best fixed threaded control",
+        validationAttention(null, adaptive, threaded_control).?,
     );
+    try std.testing.expect(validationAttention(fixed_auto, .{
+        .case = default_cases[6],
+        .stats = .{ .mean_ns = 110 },
+    }, threaded_control) == null);
 }
 
 test "batch modes align to cache-line item boundaries" {
-    const small = default_cases[7].itemsPerRange(16).?;
-    const large = default_cases[8].itemsPerRange(16).?;
+    const small = default_cases[4].itemsPerRange(16).?;
+    const large = default_cases[5].itemsPerRange(16).?;
     try std.testing.expectEqual(@as(usize, 32), small);
     try std.testing.expectEqual(@as(usize, 256), large);
 }
