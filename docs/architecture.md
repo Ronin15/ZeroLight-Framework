@@ -110,10 +110,10 @@ music gain.
 
 Raw keyboard input maps to named actions in `src/app/input.zig`.
 `input_router.zig` applies the active state stack's action contexts before
-mutating held gameplay actions in `InputState` or one-frame app/debug commands
-in `FrameCommands`. State `handleEvent` methods still receive raw SDL events
-according to stack policy, so named-action routing and raw event handling stay
-separate.
+mutating held gameplay actions in `InputState` or one-frame UI/app/debug
+commands in `FrameCommands`. State `handleEvent` methods still receive raw SDL
+events according to stack policy, so named-action routing and raw event handling
+stay separate.
 
 State policies decide whether lower states receive updates, events, or render
 passes. Transitions are queued through `StateTransitions` and applied after the
@@ -214,7 +214,12 @@ boundaries and only write their assigned movement rows.
 `CollisionSystem` is a high-throughput contact generator over entities that have
 both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
 proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
-uses range-window broadphase passes with count/prefix/write contact output.
+threads broadphase anchor ranges through `ThreadSystem` to emit candidate pairs
+once with SIMD Y-overlap filtering. Narrowphase then uses its own threaded batch
+over candidate pairs, computes AABB contact math with SIMD lanes inside each
+worker range, and compacts valid contacts deterministically for same-step
+response. Broadphase and narrowphase keep separate adaptive tuners and batch
+stats so each stage is measured against its own workload.
 Contacts are transient `SimulationFrame` data; `CollisionResponseSystem`
 consumes the completed same-step contact stream through explicit response-policy
 components, computes aligned correction columns with `src/core/simd.zig`, and

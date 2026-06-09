@@ -22,24 +22,29 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish Slice 7 parallel CPU render prep and Slice 8 shader/platform
-  validation as engine-support tracks.
-- Slice 12 is now the gameplay-systems foundation for broad collision, AI,
-  pathfinding, and emergent-rule work.
-- Treat Slice 13 and Slice 14 as built on Slice 12's deterministic processor,
-  event, and deferred-structural-change contracts.
-- Slice 16 lands the first root menus (main + settings) using state stack,
-  ui routing, text, and audio commands; it replaces the direct GameDemo bootstrap.
+- Finish Slice 8 shader/platform validation as the next narrow engine-support
+  track.
+- Plan the next world-asset/content slice before returning to Slice 7 render
+  threading, so render prep has realistic asset references, resource metadata,
+  and command volume to optimize against.
+- Defer Slice 7 parallel CPU render prep until world assets define the data shape
+  it should process.
+- Slice 12 is now the gameplay-systems foundation for collision, AI intent,
+  future path/query work, and deterministic rule outputs.
+- Before implementing grid pathfinding, fix and standardize multi-phase
+  processor batch timing so adaptive tuning records the full logical system
+  workload, not only one threaded sub-pass.
+- Keep future gameplay systems built on Slice 12's typed processor outputs,
+  deterministic merge, and deferred structural-change contracts.
 
 ## Long-Term Gameplay Direction
 
-Future gameplay features should use domain controllers for orchestration and
-SoA processors for hot data work. Controllers belong inside the owning gameplay
-state or a state-owned world simulation layer; they choose phase order, budgets,
-queues, conflict policy, and which typed `DataSystem` views processors receive.
-Persistent world facts still live in `DataSystem`, per-step outputs live in
-`SimulationFrame`, and large or reusable loops stay in systems that process
-typed slices and emit deterministic outputs.
+Future gameplay features should use state-owned feature controllers for
+orchestration and SoA processors for hot data work. Controllers choose phase
+order, budgets, queues, conflict policy, and which typed `DataSystem` views
+processors receive. Persistent world facts live in `DataSystem`, per-step
+outputs live in `SimulationFrame`, and large or reusable loops stay in systems
+that process typed slices and emit deterministic outputs.
 
 ## Slice 0: Runtime Diagnostics Policy
 
@@ -688,8 +693,9 @@ velocity, exposes a movement-body slice to `MovementSystem`, applies player-only
 bounds clamping, emits a small particle trail, updates particles, and renders
 transient particle rectangles. A few colored moving squares remain as non-player
 movement processor coverage. Parallel render prep remains open under Slice 7,
-while simulation contracts, collision, AI, pathfinding, and rule processing are
-covered by Slices 12-14.
+while simulation contracts, collision, and the first AI intent processor are
+covered by Slices 12-14. Pathfinding and broader rule processing remain future
+systems that should build on the same typed-output contracts.
 
 ## Slice 12: Simulation Contracts And Deferred Structural Changes
 
@@ -791,9 +797,14 @@ Architecture notes:
 - `CollisionSystem` owns warmed transient AABB proxy scratch, not persistent
   gameplay data.
 - The first broadphase is sweep-and-prune over entities with both movement bodies
-  and collision bounds.
-- Contact output uses the Slice 12 count/prefix/write stream pattern so threaded
-  range windows merge deterministically.
+  and collision bounds. It threads sorted anchor ranges, uses SIMD overlap
+  filtering, and emits range-owned candidate pairs once before deterministic
+  merge.
+- Narrowphase is a separate threaded batch: worker ranges SIMD-compute contact
+  math over candidate pairs, then compact contacts deterministically for the
+  same-step response stream.
+- Broadphase and narrowphase keep separate adaptive tuners and batch stats; no
+  combined timing trains either stage.
 - Collision response stays separate from detection; `CollisionResponseSystem`
   consumes the completed same-step contact stream through explicit
   response-policy components before structural commands commit.
@@ -833,11 +844,11 @@ moving-square-obstacle, and player-moving-square contacts. Detector benchmarks
 report candidate pairs and contacts for dense/sparse body workloads, while
 response benchmarks report triggers and intents across 1k-50k contact workloads.
 
-## Slice 14: AI, Pathfinding, And Emergent Rule Processing
+## Slice 14: First AI Intent Processor And Future Path/Rule Contracts
 
-Goal: add AI, pathfinding, and gameplay-rule processors that compose through
-data, intents, and deterministic order rather than copying player-specific
-behavior into many entity types.
+Goal: add the first data-driven non-player decision processor that emits
+deterministic movement intents through `SimulationFrame`, proving the AI/rule
+processor boundary before broader pathfinding or rule systems are added.
 
 Current foundation:
 
@@ -846,45 +857,28 @@ Current foundation:
 - Slice 12 provides deterministic event/intent/deferred-command contracts.
 - Slice 13 provides spatial query and contact data for perception and
   collision-aware decisions.
-- [x] AiAgent (AiBehavior enum + scalars) added to DataSystem after CollisionResponse:
-  Component + mask + EntityTemplate + StructuralCommand + dense SoA store (HotF32
-  columns 64B aligned) + set/get/sliceConst + applyTemplate/validate/structural +
-  destroy/clear/slot handling + tests (membership, roundtrip, stale, no-alloc).
-- [x] AiSystem (src/game/systems/ai.zig) first processor: update(ConstAiAgentSlice,
-  ConstMovementBodySlice, *SimulationFrame, *ThreadSystem, delta, AiConfig) !AiStats
-  with per-system AdaptiveWorkTuner profile selection, parallelForWithOptions
-  (ai_range_alignment_items), appended count/prefix/write ranges to frame.intents
-  (MovementIntent), serial fallback, read-only workers, BatchStats. Wander amplitude
-  + seek (player-targeted via AiConfig.seek_target from
-  previous_position + main-thread precomputed sep + `DataSystem` dense movement
-  lookup). Determinism via explicit intent_seed.
-- [x] Wired in GameDemoState: explicit processors phase (after main_thread_inputs
-  player, before movement), spawn 8 test squares with ai_agent (mix of direct
-  sets and EntityTemplate create_entity in spawn helper for pronounced behaviors),
-  intent consumption (main-thread apply after emit, before movement: dir * speed
-  via MovementBodyPtr, stale/ai-only filter). Player 100% special;
-  collision/response/particle/render unchanged.
-- [x] Behavior tests + extended demo tests (spawn mask/ai presence, appended intent
-  preservation, adaptive default-worker path, wander amplitude scaling, "demo ai
-  processor drives non-player squares via intents (seed deterministic, 0-worker)",
-  update frame + motion via chain). RangeOutputStream/DataSystem/SimFrame tests
-  cover merge/no-alloc.
-- [x] Non-interactive AI benchmarks registered under `zig build bench -- --group ai`
-  with quick/standard/stress agent-count profiles, serial/fixed/adaptive cases,
-  emitted movement-intent counters, and smaller default counts for the current
-  pairwise separation precompute.
-- [x] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify` all
-  green (dev smoke attempted; display/GPU limited in env, not required for slice).
+- `DataSystem` owns aligned `AiAgent` SoA data, membership masks,
+  structural-command validation, and dense movement lookup for AI rows.
+- `AiSystem` reads `AiAgent` and movement slices, emits deterministic
+  `MovementIntent` ranges into `SimulationFrame`, and uses serial or adaptive
+  threaded execution.
+- `GameDemoState` runs AI after main-thread player input and before movement
+  integration, then applies AI movement intents on the main thread before
+  `MovementSystem`.
+- AI benchmarks cover serial, fixed-thread, and adaptive profiles for quick,
+  standard, and stress workloads.
+- `zig build fmt`, `zig build test`, `zig build check`, and `zig build verify`
+  passed for this slice.
 
 Architecture notes:
 
-- Domain controllers should orchestrate feature phases and budgets, not become
-  hidden per-entity stores. They may take typed `DataSystem` views and run small
-  policy passes, but hot or reusable loops should remain systems/processors over
-  SoA slices.
-- AI and rules should usually emit movement intents, steering outputs, target
-  choices, path requests/results, or deferred commands rather than mutating
-  unrelated stores directly.
+- State-owned feature controllers should orchestrate feature phases and budgets,
+  not become hidden per-entity stores. They may take typed `DataSystem` views
+  and run small policy passes, but hot or reusable loops should remain
+  systems/processors over SoA slices.
+- Future AI, pathfinding, and rules should emit movement intents, steering
+  outputs, target choices, path requests/results, or deferred commands rather
+  than mutating unrelated stores directly.
 - Deterministic randomness must be explicit state or an explicit service passed
   through the processor boundary.
 - Pathfinding should use read-only navigation or world snapshots during worker
@@ -893,13 +887,14 @@ Architecture notes:
 
 Checklist:
 
-- [x] Add typed intent/request/result stores for AI, rules, and pathfinding.
-      (Reused existing SimulationIntent/MovementIntent + RangeOutputStream.)
-- [x] Define processor order for perception, decision, path/steering output,
-      movement intent, movement integration, collision response, and cleanup.
-      (Explicit in GameDemoState + ai before intent-apply before movement.)
-- [x] Add deterministic conflict-resolution policy when multiple systems request
-      incompatible outcomes. (Minimal: last-writer in range order for ai; future.)
+- [x] Reuse `MovementIntent` and `RangeOutputStream` for the first AI steering
+      output. Path request/result and broader rule output streams remain future
+      work.
+- [x] Define processor order for the first AI decision output, movement intent
+      application, movement integration, collision response, and cleanup.
+- [x] Keep current conflict policy narrow: single-writer AI movement intents are
+      applied on the main thread in merged range order. Multi-system
+      incompatible-intent arbitration remains future work.
 - [x] Add tests for repeatable decisions, stable merge order, and no steady-state
       allocation in hot processors.
 
@@ -907,8 +902,8 @@ Acceptance checks:
 
 - [x] Non-player entities can be driven by data and processors rather than
       player-behavior copies.
-- [x] AI/path/rule processors produce deterministic outputs for fixed initial
-      data, inputs, and random seeds.
+- [x] The AI movement-intent processor produces deterministic outputs for fixed
+      initial data, target, and random seed.
 - [x] Processor outputs compose through typed data, intents, or deferred commands
       with explicit ownership and lifetime.
 
@@ -954,7 +949,7 @@ Acceptance checks:
 
 ## Slice 16: Main Menu and Settings Menu
 
-Goal: provide a root main menu as the default startup state and a reachable settings menu for basic configurable options (initially live audio bus/master gains) so the app no longer boots directly into gameplay. Menus use the existing state stack (opaque + modal policies), input routing (new menu actions routed under the `.ui` context), text service for labels, renderer logical-space drawing, and audio command buffer for immediate effect.
+Goal: provide a root main menu as the default startup state and a reachable settings menu for basic configurable options (initially live audio bus/master gains) so the app no longer boots directly into gameplay. Menus use the existing state stack (opaque + modal policies), input routing (new menu actions routed under the `.ui` context), text service for labels, renderer logical-space drawing, and audio command buffer for fixed-step gain changes.
 
 Current foundation:
 
@@ -966,47 +961,43 @@ Current foundation:
 - `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
 - `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.
 - Menus use `handleEvent` (raw SDL events, which reach top state for modal/opaque policies) and translate keys through `input.actionForKey(...)` before acting on named ui/app actions. `UpdateContext` carries audio for gain commands, transitions, input, and thread_system; `RenderContext` carries renderer + optional text_service. This matches the actual `UpdateContext` definition (no one-frame commands field).
-- All states follow the vtable shape with `init`/`deinit`/`update`/`render`/`handleEvent` (optionally `onPause`/`onResume`).
+- All states follow the vtable shape with `init`/`deinit`/`update`/`render`/`handleEvent` and required `onPause`; `onResume` is optional.
+
+Architecture notes:
+
+- `StatePolicy.gameplay` is the source of truth for active gameplay; pause entry
+  is gated by `StateStack.isGameplayActive()`.
+- `pauseActive` / `resumeActive` target the gameplay-policy state, so overlays
+  can sit on top without stealing gameplay pause notifications.
+- Menu and settings states are non-gameplay UI states; pause attempts over them
+  are inert.
 
 Checklist:
 
 - [x] Add four menu navigation actions (`menuUp`/`menuDown`/`menuLeft`/`menuRight`) bound to arrow keys, classified as command actions, and routed to the `.ui` context. Update binding, routing, and action tests.
 - [x] Extend `StateTransitions` and `StateStack` with `pop()` (request + apply + destroy) plus minimal tests so child menus can dismiss themselves cleanly.
 - [x] Implement `MainMenuState` (src/game/main_menu_state.zig) as an opaque-screen root menu: 3 items, allocator storage for spawning GameDemo, selection + wrap, lazy TextTextureLease title+items with accent for selected, logical rect + text rendering, confirm via resumeGame action, quit action exits, transitions to gameplay or settings or app quit. Internal focused tests.
-- [x] Implement `SettingsMenuState` (src/game/settings_menu_state.zig): 3 volume rows + Back, u8 0-10 state, live set*Gain on menuLeft/menuRight for selected volume, label text rebuild on change, quit action or Back confirm does pop(), same visual style. Tests for clamping, emitted commands, pop, lease lifetime, command-failure consistency.
+- [x] Implement `SettingsMenuState` (src/game/settings_menu_state.zig): 3 volume rows + Back, u8 0-10 state, menuLeft/menuRight records a pending adjustment for the selected volume, the next update queues set*Gain, label text rebuilds on change, quit action or Back confirm does pop(), same visual style. Tests for clamping, emitted commands, pop, cleanup hooks for text leases, and command-failure consistency.
 - [x] Update Engine bootstrap to create MainMenuState (opaque) at startup with logical size + allocator; keep GameDemo import for launch path. Update the old placeholder comment.
 - [x] Register the two new game modules in src/tests.zig comptime block for `zig build test` coverage.
 - [x] Add the full Slice 16 section (this text) to framework-implementation-slices.md following prior slice format, plus update Next Priority Tracks and the Suggested Order list.
 - [x] Minor doc updates in state-stack-and-input.md (new actions in input model) and architecture.md (new states under game/, bootstrap note).
 - [x] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify` all pass.
-- [ ] Manual `zig build dev` smoke: arrow navigation + wrap, Enter starts demo, Esc quits from main, Settings reachable, Left/Right adjust volumes with audible result and label update, Back/Esc returns to main, gains persist into launched gameplay, F2 overlay works, no leaks on repeated transitions.
+- [x] Manual `zig build dev` smoke confirmed: arrow navigation + wrap, Enter starts demo, Esc quits from main, Settings reachable, Left/Right adjust volumes with audible result and label update, Back/Esc returns to main, gains persist into launched gameplay, F2 overlay works, no leaks on repeated transitions.
 
 Acceptance checks:
 
 - [x] App starts at a usable main menu (title + 3 keyboard-selectable items) instead of the demo.
 - [x] Arrow keys change selection (wraps); Enter/Space activates; Esc quits from main menu.
 - [x] "Start Game" replace-launches a fully functional GameDemoState (player input, systems, audio, pause overlay still work).
-- [x] "Settings" pushes a modal settings view; Left/Right on volume rows immediately queue gain commands; labels update; Esc or Back returns cleanly via pop.
+- [x] "Settings" pushes a modal settings view; Left/Right on volume rows records a pending gain change, the next update queues the gain command, labels update, and Esc or Back returns cleanly via pop.
 - [x] Volume changes made in settings are respected when starting gameplay afterward.
-- [x] All new states properly release TextTextureLeases in deinit; no leaks across menu<->settings<->game transitions.
+- [x] TextTextureLeases are released from menu state deinit; repeated transition leak smoke remains part of manual `zig build dev` validation.
 - [x] Focused (no-window) tests cover action-mapped selection, wrap, transition requests (including pop), volume clamp + command emission, and command-failure consistency.
 - [x] Updated routing tests prove menu actions are allowed exactly under ui/modal/opaque policies and blocked from pure gameplay routing.
 - [x] `zig build verify` passes; docs updated in the canonical slices format.
 
-Slice 16 lands the first real menu layer. The implementation stays deliberately small (direct state-owned text leases, no widget system, keyboard only, volumes as the single live setting) while covering the tested contract: state-driven navigation through named actions, consumed-event ui input routing, text + logical renderer drawing, audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
-
-### Pause restriction + recipient targeting (post-Slice 16)
-
-This is a post-Slice 16 clarification that completes the pause contract:
-
-- `StatePolicy` gained an explicit `gameplay: bool` flag (true only on the `state_policy.gameplay` value used exclusively by `replaceGameplay` / `replaceOwnedGameplay`).
-- `StateStack` exposes `isGameplayActive()` (top-down policy walk) and uses a private `pauseRecipient()` walk to redirect `pauseActive`/`resumeActive` notifications to the gameplay-policy owner regardless of literal top (pass-through overlays are transparent; modals/opaques that are not gameplay stop the walk and mean no recipient).
-- `PauseController` (the owner per AGENTS) gates `enter` (both user and policy) on `isGameplayActive()` and keeps an already-owned policy pause idempotent while the policy source persists. `Engine` has corresponding light guards on its log/enter call sites in `applyFrameControls` and the `skipped_no_swapchain` path in `renderFrame`.
-- Result: `PauseState` + pause notifications (the `onPause` interp sync for `GameDemoState`'s systems) + audio duck / time reset are allowed *only* from active game states. Main menu / settings (opaque / modal) never receive `onPause` from this flow; pause attempts outside active gameplay are inert.
-- `onResume` / resume paths, reconcile, and "P/Enter from overlay" continue to work exactly as before when a real gameplay recipient is under the modal.
-- No changes to `src/game/pause_state.zig`, `GameDemoState`, input routing tables, `.pause` action classification, `DataSystem`, or hot paths. All main-thread, allocation-free, O(stack depth) only on pause events.
-- Added/extended focused `test` blocks (counter-based `TestingState` patterns) in `state.zig` and `pause_controller.zig`. `zig build verify` (tests + check + shaders) passes cleanly.
-- References the "in-game pause integration" future work noted in Slice 16; this locks the boundary so future pause/menu extensions have a clear, queryable gameplay vs. UI distinction (see also `state-stack-and-input.md` Policies section and `architecture.md` Coordination Boundaries).
+Slice 16 lands the first real menu layer. The implementation stays deliberately small (direct state-owned text leases, no widget system, keyboard only, volumes as the single live setting) while covering the tested contract: state-driven navigation through named actions, consumed-event ui input routing, text + logical renderer drawing, fixed-step audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, pause restricted to active gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
 
 ## Suggested Order
 
@@ -1024,16 +1015,12 @@ This is a post-Slice 16 clarification that completes the pause contract:
 11. SIMD-aware data processor systems.
 12. Simulation contracts and deferred structural changes.
 13. Spatial queries and collision contacts.
-14. AI, pathfinding, and emergent rule processing.
+14. First AI intent processor and future path/rule contracts.
 15. SDL3_mixer audio service.
 16. Main menu and settings menu.
 
-This order keeps gameplay/menu correctness ahead of larger renderer work, then
-builds resource ownership before text/UI, renderer composition, and parallel
-render preparation depend on it. SIMD helpers land before the DataSystem and
-processor slices so the storage and system APIs can be designed around the hot
-loop shape from the start. The new gameplay-system slices keep structural
-changes, spatial contacts, and AI/rule outputs ordered and testable before
-emergent behavior becomes broad. The audio slice lands as an app-service track
-because it depends on asset ownership, state contexts, and pause policy rather
-than on gameplay-data storage.
+This order records the dependency path used to build the current project
+foundation. Current work should be chosen from Next Priority Tracks above.
+Resource ownership, text/UI, renderer composition, threading, SIMD,
+`DataSystem`, simulation outputs, collision, AI intent processing, audio, and
+menus now form the source-of-truth foundation for future slices.

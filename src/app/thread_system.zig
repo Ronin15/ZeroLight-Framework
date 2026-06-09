@@ -60,6 +60,7 @@ pub const ParallelForOptions = struct {
     range_alignment_items: usize = 1,
     adaptive: bool = true,
     adaptive_tuner: ?*AdaptiveWorkTuner = null,
+    selected_profile: ?AdaptiveWorkProfile = null,
 };
 
 pub const AdaptiveWorkProfile = struct {
@@ -795,11 +796,16 @@ pub const ThreadSystem = struct {
         const min_parallel_items = options.min_parallel_items orelse self.config.min_parallel_items;
         const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
         const requested_items_per_range = @max(options.items_per_range orelse self.config.items_per_range, @as(usize, 1));
-        const adaptive_tuner = if (options.adaptive and options.items_per_range == null and max_worker_threads > 0)
-            options.adaptive_tuner orelse &self.adaptive_tuner
+        const adaptive_tuner = if (options.adaptive and max_worker_threads > 0)
+            if (options.selected_profile != null)
+                options.adaptive_tuner
+            else if (options.items_per_range == null)
+                options.adaptive_tuner orelse &self.adaptive_tuner
+            else
+                null
         else
             null;
-        const profile = if (adaptive_tuner) |tuner|
+        const profile = options.selected_profile orelse if (adaptive_tuner) |tuner|
             tuner.selectProfile(.{
                 .item_count = item_count,
                 .available_worker_threads = self.workers.len,
@@ -1324,6 +1330,39 @@ test "parallel for options use provided adaptive work tuner" {
     try std.testing.expect(!stats.ran_inline);
     try std.testing.expect(adaptive_tuner.report().best_mean_batch_duration_ns > 0);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
+    for (&hits) |*hit| {
+        try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "parallel for options record selected adaptive profile" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var context = CoverageContext{ .hits = hits[0..] };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .min_parallel_items = 1,
+        .items_per_range = 64,
+    });
+    defer threads.deinit();
+
+    var adaptive_tuner = AdaptiveWorkTuner.init(.{
+        .sample_window = 1,
+        .threaded_batch_ns = 1,
+    });
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{
+        .adaptive_tuner = &adaptive_tuner,
+        .selected_profile = .{
+            .worker_threads = 1,
+            .items_per_range = 16,
+        },
+    });
+
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
+    try std.testing.expectEqual(@as(usize, 16), stats.items_per_range);
+    try std.testing.expect(adaptive_tuner.report().best_mean_batch_duration_ns > 0);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }

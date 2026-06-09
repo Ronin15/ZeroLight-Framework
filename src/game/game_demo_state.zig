@@ -119,8 +119,8 @@ pub const GameDemoState = struct {
 
         self.simulation_frame.phase = .processors;
         // AI decision processor (Slice 14): reads ai_agent + prior movement positions (const slices),
-        // appends MovementIntent ranges into frame.intents (count/prefix/write + parallelForWithOptions inside,
-        // using per-system adaptive profile selection + alignment + serial fallback). Fixed seed for determinism this slice.
+        // pre-sizes MovementIntent ranges, then threads only the decision/write batch using
+        // per-system adaptive profile selection + alignment + serial fallback. Fixed seed for determinism this slice.
         const ai_slice = self.data.aiAgentSliceConst();
         const move_slice = self.data.movementBodySliceConst();
 

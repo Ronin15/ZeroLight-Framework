@@ -26,9 +26,12 @@ const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_align
 pub const CollisionConfig = struct {
     min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
+    broadphase_items_per_range: ?usize = null,
+    narrowphase_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
+    broadphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
+    narrowphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     full_sort_disorder_percent: u8 = 12,
 };
 
@@ -36,10 +39,43 @@ pub const CollisionStats = struct {
     body_count: usize = 0,
     contact_count: usize = 0,
     candidate_pair_count: usize = 0,
-    work_batch: BatchStats = .{},
-    count_batch: BatchStats = .{},
-    write_batch: BatchStats = .{},
+    broadphase_simd_groups: usize = 0,
+    broadphase_batch: BatchStats = .{},
+    narrowphase_batch: BatchStats = .{},
     used_full_sort: bool = false,
+};
+
+const CandidatePair = struct {
+    a: usize,
+    b: usize,
+};
+
+const BroadphaseRangeBuffer = struct {
+    pairs: std.ArrayList(CandidatePair) = .empty,
+    required_capacity: usize = 0,
+    simd_groups: usize = 0,
+
+    fn clearRetainingCapacity(self: *BroadphaseRangeBuffer) void {
+        self.pairs.clearRetainingCapacity();
+        self.required_capacity = 0;
+        self.simd_groups = 0;
+    }
+
+    fn appendCandidateAssumeCapacity(self: *BroadphaseRangeBuffer, pair: CandidatePair) void {
+        self.required_capacity += 1;
+        if (self.pairs.items.len < self.pairs.capacity) {
+            self.pairs.appendAssumeCapacity(pair);
+        }
+    }
+
+    fn overflowed(self: *const BroadphaseRangeBuffer) bool {
+        return self.required_capacity > self.pairs.capacity;
+    }
+
+    fn deinit(self: *BroadphaseRangeBuffer, allocator: std.mem.Allocator) void {
+        self.pairs.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 pub const CollisionSystem = struct {
@@ -51,18 +87,31 @@ pub const CollisionSystem = struct {
     max_x: HotF32List = .empty,
     max_y: HotF32List = .empty,
     order: std.ArrayList(usize) = .empty,
-    candidate_counts: std.ArrayList(usize) = .empty,
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    broadphase_ranges: std.ArrayList(BroadphaseRangeBuffer) = .empty,
+    candidate_pairs: std.ArrayList(CandidatePair) = .empty,
+    narrowphase_contacts: std.ArrayList(CollisionContact) = .empty,
+    contact_valid: std.ArrayList(bool) = .empty,
+    narrowphase_counts: std.ArrayList(usize) = .empty,
+    broadphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    narrowphase_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator) CollisionSystem {
         return .{
             .allocator = allocator,
-            .adaptive_tuner = AdaptiveWorkTuner.init(.{}),
+            .broadphase_tuner = AdaptiveWorkTuner.init(.{}),
+            .narrowphase_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
     pub fn deinit(self: *CollisionSystem) void {
-        self.candidate_counts.deinit(self.allocator);
+        self.narrowphase_counts.deinit(self.allocator);
+        self.contact_valid.deinit(self.allocator);
+        self.narrowphase_contacts.deinit(self.allocator);
+        self.candidate_pairs.deinit(self.allocator);
+        for (self.broadphase_ranges.items) |*buffer| {
+            buffer.deinit(self.allocator);
+        }
+        self.broadphase_ranges.deinit(self.allocator);
         self.order.deinit(self.allocator);
         self.max_y.deinit(self.allocator);
         self.max_x.deinit(self.allocator);
@@ -88,76 +137,77 @@ pub const CollisionSystem = struct {
         }
 
         const used_full_sort = self.sortWarm(config.full_sort_disorder_percent);
-
         var system_config = config;
-        if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-            system_config.adaptive_tuner = &self.adaptive_tuner;
+        if (system_config.adaptive) {
+            if (system_config.broadphase_adaptive_tuner == null and system_config.broadphase_items_per_range == null and system_config.items_per_range == null) {
+                system_config.broadphase_adaptive_tuner = &self.broadphase_tuner;
+            }
+            if (system_config.narrowphase_adaptive_tuner == null and system_config.narrowphase_items_per_range == null and system_config.items_per_range == null) {
+                system_config.narrowphase_adaptive_tuner = &self.narrowphase_tuner;
+            }
         }
 
-        const max_worker_threads = @min(system_config.max_worker_threads orelse thread_system.workerThreadCount(), thread_system.workerThreadCount());
-        const active_tuner = if (system_config.adaptive and system_config.items_per_range == null)
-            system_config.adaptive_tuner
-        else
-            null;
-        const selected_profile = if (active_tuner) |tuner|
-            tuner.selectProfile(.{
-                .item_count = body_count,
-                .available_worker_threads = thread_system.workerThreadCount(),
-                .max_worker_threads = max_worker_threads,
-                .min_parallel_items = system_config.min_parallel_items orelse thread_system.config.min_parallel_items,
-                .fallback_items_per_range = thread_system.config.items_per_range,
-                .range_alignment_items = collision_range_alignment_items,
-            })
-        else
-            AdaptiveWorkProfile{
-                .worker_threads = max_worker_threads,
-                .items_per_range = system_config.items_per_range orelse thread_system.config.items_per_range,
+        const broadphase_selection = selectStageWork(
+            thread_system,
+            body_count,
+            system_config.min_parallel_items,
+            system_config.broadphase_items_per_range orelse system_config.items_per_range,
+            system_config.max_worker_threads,
+            system_config.adaptive,
+            system_config.broadphase_adaptive_tuner,
+        );
+        const broadphase = try self.buildBroadphaseCandidatesThreaded(
+            thread_system,
+            broadphase_selection,
+            system_config.min_parallel_items,
+        );
+        const candidate_pair_count = self.candidate_pairs.items.len;
+        if (broadphase_selection.active_tuner) |tuner| {
+            tuner.record(broadphase.batch);
+        }
+        if (candidate_pair_count == 0) {
+            contacts.clearRetainingCapacity();
+            return .{
+                .body_count = body_count,
+                .candidate_pair_count = 0,
+                .broadphase_simd_groups = broadphase.simd_groups,
+                .broadphase_batch = broadphase.batch,
+                .used_full_sort = used_full_sort,
             };
-        const items_per_range = selected_profile.items_per_range;
-        const aligned_items_per_range = alignItemCount(@max(items_per_range, @as(usize, 1)), collision_range_alignment_items);
-        const range_count = rangeCount(body_count, aligned_items_per_range);
-        const selected_worker_threads = if (body_count < (system_config.min_parallel_items orelse thread_system.config.min_parallel_items) or range_count <= 1)
-            @as(usize, 0)
-        else
-            @min(selected_profile.worker_threads, @min(max_worker_threads, range_count - 1));
-
-        try contacts.prepareRangeCounts(range_count);
-        try self.prepareCandidateCounts(range_count);
-        var context = CollisionJobContext{
-            .system = self,
-            .contacts = contacts,
-            .candidate_counts = self.candidate_counts.items,
-        };
-        const count_batch = thread_system.parallelForWithOptions(body_count, &context, countContactsJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
-            .items_per_range = aligned_items_per_range,
-            .max_worker_threads = selected_worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive = false,
-        });
-
-        try contacts.prefix();
-        const write_batch = thread_system.parallelForWithOptions(body_count, &context, writeContactsJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
-            .items_per_range = aligned_items_per_range,
-            .max_worker_threads = selected_worker_threads,
-            .range_alignment_items = collision_range_alignment_items,
-            .adaptive = false,
-        });
-        contacts.finishWrite();
-
-        const work_batch = combinedCollisionBatch(count_batch, write_batch);
-        if (active_tuner) |tuner| {
-            tuner.record(work_batch);
         }
+
+        const narrowphase_selection = selectStageWork(
+            thread_system,
+            candidate_pair_count,
+            system_config.min_parallel_items,
+            system_config.narrowphase_items_per_range orelse system_config.items_per_range,
+            system_config.max_worker_threads,
+            system_config.adaptive,
+            system_config.narrowphase_adaptive_tuner,
+        );
+
+        try self.prepareNarrowphaseScratch(candidate_pair_count, narrowphase_selection.range_count);
+        var context = NarrowphaseJobContext{
+            .system = self,
+            .range_contact_counts = self.narrowphase_counts.items,
+        };
+        const narrowphase_batch = thread_system.parallelForWithOptions(candidate_pair_count, &context, narrowphaseContactsJob, .{
+            .min_parallel_items = system_config.min_parallel_items,
+            .max_worker_threads = narrowphase_selection.worker_threads,
+            .range_alignment_items = collision_range_alignment_items,
+            .adaptive_tuner = narrowphase_selection.active_tuner,
+            .selected_profile = narrowphase_selection.profile,
+        });
+        const contact_count = sumCounts(self.narrowphase_counts.items);
+        try self.compactNarrowphaseContacts(contacts, contact_count);
 
         return .{
             .body_count = body_count,
-            .contact_count = contacts.mergedItems().len,
-            .candidate_pair_count = sumCounts(self.candidate_counts.items),
-            .work_batch = work_batch,
-            .count_batch = count_batch,
-            .write_batch = write_batch,
+            .contact_count = contact_count,
+            .candidate_pair_count = candidate_pair_count,
+            .broadphase_simd_groups = broadphase.simd_groups,
+            .broadphase_batch = broadphase.batch,
+            .narrowphase_batch = narrowphase_batch,
             .used_full_sort = used_full_sort,
         };
     }
@@ -174,26 +224,32 @@ pub const CollisionSystem = struct {
             return .{ .body_count = body_count };
         }
         const used_full_sort = self.sortWarm(100);
-        try contacts.prepareRangeCounts(1);
-        try self.prepareCandidateCounts(1);
-        const range = ParallelRange{ .index = 0, .start = 0, .end = body_count };
-        const count_result = countContactsInRange(self, range);
-        self.candidate_counts.items[0] = count_result.candidate_pairs;
-        contacts.addCount(0, count_result.contacts);
-        try contacts.prefix();
-        var writer = contacts.rangeWriter(0);
-        writeContactsInRange(self, range, &writer);
-        writer.finish();
-        contacts.finishWrite();
-        const count_batch = serialBatch(body_count);
-        const write_batch = serialBatch(body_count);
+        const broadphase = try self.buildBroadphaseCandidatesSimd();
+        const candidate_pair_count = self.candidate_pairs.items.len;
+        if (candidate_pair_count == 0) {
+            contacts.clearRetainingCapacity();
+            return .{
+                .body_count = body_count,
+                .candidate_pair_count = 0,
+                .broadphase_simd_groups = broadphase.simd_groups,
+                .broadphase_batch = serialBatch(body_count),
+                .used_full_sort = used_full_sort,
+            };
+        }
+
+        try self.prepareNarrowphaseScratch(candidate_pair_count, 1);
+        const range = ParallelRange{ .index = 0, .start = 0, .end = candidate_pair_count };
+        self.narrowphase_counts.items[0] = writeNarrowphaseContactsSimd(self, range);
+        const contact_count = self.narrowphase_counts.items[0];
+        try self.compactNarrowphaseContacts(contacts, contact_count);
+
         return .{
             .body_count = body_count,
-            .contact_count = contacts.mergedItems().len,
-            .candidate_pair_count = sumCounts(self.candidate_counts.items),
-            .work_batch = combinedCollisionBatch(count_batch, write_batch),
-            .count_batch = count_batch,
-            .write_batch = write_batch,
+            .contact_count = contact_count,
+            .candidate_pair_count = candidate_pair_count,
+            .broadphase_simd_groups = broadphase.simd_groups,
+            .broadphase_batch = serialBatch(body_count),
+            .narrowphase_batch = serialBatch(candidate_pair_count),
             .used_full_sort = used_full_sort,
         };
     }
@@ -254,12 +310,74 @@ pub const CollisionSystem = struct {
         }
     }
 
-    fn prepareCandidateCounts(self: *CollisionSystem, range_count: usize) !void {
-        self.candidate_counts.clearRetainingCapacity();
-        try self.candidate_counts.ensureTotalCapacity(self.allocator, range_count);
-        for (0..range_count) |_| {
-            self.candidate_counts.appendAssumeCapacity(0);
+    fn prepareNarrowphaseScratch(self: *CollisionSystem, candidate_pair_count: usize, range_count: usize) !void {
+        self.narrowphase_contacts.clearRetainingCapacity();
+        self.contact_valid.clearRetainingCapacity();
+        self.narrowphase_counts.clearRetainingCapacity();
+        try self.narrowphase_contacts.ensureTotalCapacity(self.allocator, candidate_pair_count);
+        try self.contact_valid.ensureTotalCapacity(self.allocator, candidate_pair_count);
+        try self.narrowphase_counts.ensureTotalCapacity(self.allocator, range_count);
+        self.narrowphase_contacts.items.len = candidate_pair_count;
+        self.contact_valid.items.len = candidate_pair_count;
+        self.narrowphase_counts.items.len = range_count;
+    }
+
+    fn compactNarrowphaseContacts(
+        self: *CollisionSystem,
+        contacts: *RangeOutputStream(CollisionContact),
+        contact_count: usize,
+    ) !void {
+        try contacts.prepareRangeCounts(1);
+        contacts.addCount(0, contact_count);
+        try contacts.prefix();
+        var writer = contacts.rangeWriter(0);
+        for (self.contact_valid.items, 0..) |valid, index| {
+            if (valid) {
+                writer.write(self.narrowphase_contacts.items[index]);
+            }
         }
+        writer.finish();
+        contacts.finishWrite();
+    }
+
+    fn prepareBroadphaseRangeBuffers(self: *CollisionSystem, range_count: usize) !void {
+        try self.broadphase_ranges.ensureTotalCapacity(self.allocator, range_count);
+        while (self.broadphase_ranges.items.len < range_count) {
+            self.broadphase_ranges.appendAssumeCapacity(.{});
+        }
+    }
+
+    fn growBroadphaseRangeBuffersIfNeeded(self: *CollisionSystem, range_count: usize) !bool {
+        var grew = false;
+        for (self.broadphase_ranges.items[0..range_count]) |*buffer| {
+            if (buffer.overflowed()) {
+                try buffer.pairs.ensureTotalCapacity(self.allocator, buffer.required_capacity);
+                grew = true;
+            }
+        }
+        return grew;
+    }
+
+    fn mergeBroadphaseRangeBuffers(self: *CollisionSystem, range_count: usize) !void {
+        self.candidate_pairs.clearRetainingCapacity();
+        var total: usize = 0;
+        for (self.broadphase_ranges.items[0..range_count]) |*buffer| {
+            total += buffer.pairs.items.len;
+        }
+        try self.candidate_pairs.ensureTotalCapacity(self.allocator, total);
+        for (self.broadphase_ranges.items[0..range_count]) |*buffer| {
+            const start = self.candidate_pairs.items.len;
+            self.candidate_pairs.items.len = start + buffer.pairs.items.len;
+            @memcpy(self.candidate_pairs.items[start..][0..buffer.pairs.items.len], buffer.pairs.items);
+        }
+    }
+
+    fn broadphaseSimdGroupCount(self: *const CollisionSystem, range_count: usize) usize {
+        var total: usize = 0;
+        for (self.broadphase_ranges.items[0..range_count]) |*buffer| {
+            total += buffer.simd_groups;
+        }
+        return total;
     }
 
     fn sortWarm(self: *CollisionSystem, full_sort_disorder_percent: u8) bool {
@@ -297,81 +415,283 @@ pub const CollisionSystem = struct {
             self.order.items[insert] = value;
         }
     }
+
+    fn buildBroadphaseCandidatesSimd(self: *CollisionSystem) !BroadphaseStats {
+        self.candidate_pairs.clearRetainingCapacity();
+        var stats = BroadphaseStats{};
+        const sorted_count = self.order.items.len;
+        for (0..sorted_count) |sorted_index| {
+            const proxy_index = self.order.items[sorted_index];
+            const proxy_max_x = self.max_x.items[proxy_index];
+            const proxy_min_y = self.min_y.items[proxy_index];
+            const proxy_max_y = self.max_y.items[proxy_index];
+            var candidate_sorted_index = sorted_index + 1;
+
+            while (candidate_sorted_index + simd.lane_count <= sorted_count) {
+                var candidate_indices: [simd.lane_count]usize = undefined;
+                inline for (0..simd.lane_count) |lane| {
+                    candidate_indices[lane] = self.order.items[candidate_sorted_index + lane];
+                }
+                const candidate_min_x = simd.float4(
+                    self.min_x.items[candidate_indices[0]],
+                    self.min_x.items[candidate_indices[1]],
+                    self.min_x.items[candidate_indices[2]],
+                    self.min_x.items[candidate_indices[3]],
+                );
+                const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
+                if (!x_active[0]) break;
+
+                const candidate_min_y = simd.float4(
+                    self.min_y.items[candidate_indices[0]],
+                    self.min_y.items[candidate_indices[1]],
+                    self.min_y.items[candidate_indices[2]],
+                    self.min_y.items[candidate_indices[3]],
+                );
+                const candidate_max_y = simd.float4(
+                    self.max_y.items[candidate_indices[0]],
+                    self.max_y.items[candidate_indices[1]],
+                    self.max_y.items[candidate_indices[2]],
+                    self.max_y.items[candidate_indices[3]],
+                );
+                const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
+                inline for (0..simd.lane_count) |lane| {
+                    if (overlaps[lane]) {
+                        try self.candidate_pairs.append(self.allocator, .{ .a = proxy_index, .b = candidate_indices[lane] });
+                    }
+                }
+                stats.simd_groups += 1;
+                candidate_sorted_index += simd.lane_count;
+                if (!x_active[simd.lane_count - 1]) break;
+            }
+
+            while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
+                const candidate_index = self.order.items[candidate_sorted_index];
+                if (self.min_x.items[candidate_index] >= proxy_max_x) break;
+                if (overlapsY(self, proxy_index, candidate_index)) {
+                    try self.candidate_pairs.append(self.allocator, .{ .a = proxy_index, .b = candidate_index });
+                }
+            }
+        }
+        return stats;
+    }
+
+    fn buildBroadphaseCandidatesThreaded(
+        self: *CollisionSystem,
+        thread_system: *ThreadSystem,
+        selection: StageWorkSelection,
+        min_parallel_items: ?usize,
+    ) !BroadphaseBuildResult {
+        try self.prepareBroadphaseRangeBuffers(selection.range_count);
+
+        var context = BroadphaseJobContext{ .system = self };
+        var result = BroadphaseBuildResult{};
+        while (true) {
+            for (self.broadphase_ranges.items[0..selection.range_count]) |*buffer| {
+                buffer.clearRetainingCapacity();
+            }
+            const batch = thread_system.parallelForWithOptions(self.order.items.len, &context, broadphaseCandidatesJob, .{
+                .min_parallel_items = min_parallel_items,
+                .max_worker_threads = selection.worker_threads,
+                .range_alignment_items = collision_range_alignment_items,
+                .selected_profile = selection.profile,
+            });
+            result.batch = if (result.batch.item_count == 0 and result.batch.range_count == 0)
+                batch
+            else
+                combineStageBatches(result.batch, batch);
+
+            if (try self.growBroadphaseRangeBuffersIfNeeded(selection.range_count)) {
+                continue;
+            }
+
+            result.simd_groups = self.broadphaseSimdGroupCount(selection.range_count);
+            try self.mergeBroadphaseRangeBuffers(selection.range_count);
+            return result;
+        }
+    }
 };
 
-const CollisionJobContext = struct {
-    system: *const CollisionSystem,
-    contacts: *RangeOutputStream(CollisionContact),
-    candidate_counts: []usize,
+const BroadphaseStats = struct {
+    simd_groups: usize = 0,
 };
 
-fn countContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *CollisionJobContext = @ptrCast(@alignCast(context));
-    const result = countContactsInRange(job.system, range);
-    job.candidate_counts[range.index] = result.candidate_pairs;
-    job.contacts.addCount(range.index, result.contacts);
+const BroadphaseBuildResult = struct {
+    simd_groups: usize = 0,
+    batch: BatchStats = .{},
+};
+
+const BroadphaseJobContext = struct {
+    system: *CollisionSystem,
+};
+
+fn broadphaseCandidatesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *BroadphaseJobContext = @ptrCast(@alignCast(context));
+    writeBroadphaseRangeCandidatesSimd(job.system, range);
 }
 
-fn writeContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *CollisionJobContext = @ptrCast(@alignCast(context));
-    var writer = job.contacts.rangeWriter(range.index);
-    writeContactsInRange(job.system, range, &writer);
-    writer.finish();
-}
+fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelRange) void {
+    const sorted_count = system.order.items.len;
+    const buffer = &system.broadphase_ranges.items[range.index];
 
-const ContactCountResult = struct {
-    candidate_pairs: usize = 0,
-    contacts: usize = 0,
-};
-
-fn countContactsInRange(system: *const CollisionSystem, range: ParallelRange) ContactCountResult {
-    var result = ContactCountResult{};
     for (range.start..range.end) |sorted_index| {
         const proxy_index = system.order.items[sorted_index];
-        const max_x = system.max_x.items[proxy_index];
+        const proxy_max_x = system.max_x.items[proxy_index];
+        const proxy_min_y = system.min_y.items[proxy_index];
+        const proxy_max_y = system.max_y.items[proxy_index];
         var candidate_sorted_index = sorted_index + 1;
-        while (candidate_sorted_index < system.order.items.len) : (candidate_sorted_index += 1) {
+
+        while (candidate_sorted_index + simd.lane_count <= sorted_count) {
+            var candidate_indices: [simd.lane_count]usize = undefined;
+            inline for (0..simd.lane_count) |lane| {
+                candidate_indices[lane] = system.order.items[candidate_sorted_index + lane];
+            }
+            const candidate_min_x = simd.float4(
+                system.min_x.items[candidate_indices[0]],
+                system.min_x.items[candidate_indices[1]],
+                system.min_x.items[candidate_indices[2]],
+                system.min_x.items[candidate_indices[3]],
+            );
+            const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
+            if (!x_active[0]) break;
+
+            const candidate_min_y = simd.float4(
+                system.min_y.items[candidate_indices[0]],
+                system.min_y.items[candidate_indices[1]],
+                system.min_y.items[candidate_indices[2]],
+                system.min_y.items[candidate_indices[3]],
+            );
+            const candidate_max_y = simd.float4(
+                system.max_y.items[candidate_indices[0]],
+                system.max_y.items[candidate_indices[1]],
+                system.max_y.items[candidate_indices[2]],
+                system.max_y.items[candidate_indices[3]],
+            );
+            const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
+            inline for (0..simd.lane_count) |lane| {
+                if (overlaps[lane]) {
+                    buffer.appendCandidateAssumeCapacity(.{ .a = proxy_index, .b = candidate_indices[lane] });
+                }
+            }
+            buffer.simd_groups += 1;
+            candidate_sorted_index += simd.lane_count;
+            if (!x_active[simd.lane_count - 1]) break;
+        }
+
+        while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
             const candidate_index = system.order.items[candidate_sorted_index];
-            if (system.min_x.items[candidate_index] >= max_x) break;
-            result.candidate_pairs += 1;
+            if (system.min_x.items[candidate_index] >= proxy_max_x) break;
             if (overlapsY(system, proxy_index, candidate_index)) {
-                result.contacts += 1;
+                buffer.appendCandidateAssumeCapacity(.{ .a = proxy_index, .b = candidate_index });
             }
         }
     }
-    return result;
 }
 
-fn writeContactsInRange(
-    system: *const CollisionSystem,
-    range: ParallelRange,
-    writer: *RangeOutputStream(CollisionContact).RangeWriter,
-) void {
-    for (range.start..range.end) |sorted_index| {
-        const proxy_index = system.order.items[sorted_index];
-        const max_x = system.max_x.items[proxy_index];
-        var candidate_sorted_index = sorted_index + 1;
-        while (candidate_sorted_index < system.order.items.len) : (candidate_sorted_index += 1) {
-            const candidate_index = system.order.items[candidate_sorted_index];
-            if (system.min_x.items[candidate_index] >= max_x) break;
-            if (overlapsY(system, proxy_index, candidate_index)) {
-                writer.write(contactFor(system, proxy_index, candidate_index));
+const NarrowphaseJobContext = struct {
+    system: *CollisionSystem,
+    range_contact_counts: []usize,
+};
+
+fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *NarrowphaseJobContext = @ptrCast(@alignCast(context));
+    job.range_contact_counts[range.index] = writeNarrowphaseContactsSimd(job.system, range);
+}
+
+fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) usize {
+    var contact_count: usize = 0;
+    var index = range.start;
+    const zero = simd.splatFloat4(0);
+    const one = simd.splatFloat4(1);
+    const negative_one = simd.splatFloat4(-1);
+
+    while (index + simd.lane_count <= range.end) : (index += simd.lane_count) {
+        var a_indices: [simd.lane_count]usize = undefined;
+        var b_indices: [simd.lane_count]usize = undefined;
+        inline for (0..simd.lane_count) |lane| {
+            const pair = system.candidate_pairs.items[index + lane];
+            a_indices[lane] = pair.a;
+            b_indices[lane] = pair.b;
+        }
+
+        const a_min_x = gather4(system.min_x.items, a_indices);
+        const a_max_x = gather4(system.max_x.items, a_indices);
+        const a_min_y = gather4(system.min_y.items, a_indices);
+        const a_max_y = gather4(system.max_y.items, a_indices);
+        const b_min_x = gather4(system.min_x.items, b_indices);
+        const b_max_x = gather4(system.max_x.items, b_indices);
+        const b_min_y = gather4(system.min_y.items, b_indices);
+        const b_max_y = gather4(system.max_y.items, b_indices);
+
+        const overlap_left = a_max_x - b_min_x;
+        const overlap_right = b_max_x - a_min_x;
+        const overlap_x = @min(overlap_left, overlap_right);
+        const overlap_top = a_max_y - b_min_y;
+        const overlap_bottom = b_max_y - a_min_y;
+        const overlap_y = @min(overlap_top, overlap_bottom);
+        const valid = (overlap_x > zero) & (overlap_y > zero);
+        const use_x_axis = overlap_x <= overlap_y;
+        const a_center_x = (a_min_x + a_max_x) * simd.splatFloat4(0.5);
+        const b_center_x = (b_min_x + b_max_x) * simd.splatFloat4(0.5);
+        const a_center_y = (a_min_y + a_max_y) * simd.splatFloat4(0.5);
+        const b_center_y = (b_min_y + b_max_y) * simd.splatFloat4(0.5);
+        const normal_x = @select(f32, use_x_axis, @select(f32, a_center_x <= b_center_x, negative_one, one), zero);
+        const normal_y = @select(f32, use_x_axis, zero, @select(f32, a_center_y <= b_center_y, negative_one, one));
+        const penetration = @select(f32, use_x_axis, overlap_x, overlap_y);
+
+        inline for (0..simd.lane_count) |lane| {
+            const scratch_index = index + lane;
+            if (valid[lane]) {
+                system.narrowphase_contacts.items[scratch_index] = contactForResolved(
+                    system,
+                    a_indices[lane],
+                    b_indices[lane],
+                    normal_x[lane],
+                    normal_y[lane],
+                    penetration[lane],
+                );
+                system.contact_valid.items[scratch_index] = true;
+                contact_count += 1;
+            } else {
+                system.contact_valid.items[scratch_index] = false;
             }
         }
     }
+
+    while (index < range.end) : (index += 1) {
+        const pair = system.candidate_pairs.items[index];
+        if (contactForCandidate(system, pair.a, pair.b)) |contact| {
+            system.narrowphase_contacts.items[index] = contact;
+            system.contact_valid.items[index] = true;
+            contact_count += 1;
+        } else {
+            system.contact_valid.items[index] = false;
+        }
+    }
+
+    return contact_count;
+}
+
+fn gather4(values: []const f32, indices: [simd.lane_count]usize) simd.Float4 {
+    return simd.float4(
+        values[indices[0]],
+        values[indices[1]],
+        values[indices[2]],
+        values[indices[3]],
+    );
 }
 
 fn overlapsY(system: *const CollisionSystem, a: usize, b: usize) bool {
     return system.max_y.items[a] > system.min_y.items[b] and system.max_y.items[b] > system.min_y.items[a];
 }
 
-fn contactFor(system: *const CollisionSystem, a: usize, b: usize) CollisionContact {
+fn contactForCandidate(system: *const CollisionSystem, a: usize, b: usize) ?CollisionContact {
     const overlap_left = system.max_x.items[a] - system.min_x.items[b];
     const overlap_right = system.max_x.items[b] - system.min_x.items[a];
     const overlap_x = @min(overlap_left, overlap_right);
     const overlap_top = system.max_y.items[a] - system.min_y.items[b];
     const overlap_bottom = system.max_y.items[b] - system.min_y.items[a];
     const overlap_y = @min(overlap_top, overlap_bottom);
+    if (overlap_x <= 0 or overlap_y <= 0) return null;
 
     var normal_x: f32 = 0;
     var normal_y: f32 = 0;
@@ -387,6 +707,17 @@ fn contactFor(system: *const CollisionSystem, a: usize, b: usize) CollisionConta
         penetration = overlap_y;
     }
 
+    return contactForResolved(system, a, b, normal_x, normal_y, penetration);
+}
+
+fn contactForResolved(
+    system: *const CollisionSystem,
+    a: usize,
+    b: usize,
+    normal_x: f32,
+    normal_y: f32,
+    penetration: f32,
+) CollisionContact {
     return .{
         .a = system.entities.items[a],
         .b = system.entities.items[b],
@@ -411,6 +742,68 @@ fn proxyIndexLessThan(system: *const CollisionSystem, lhs: usize, rhs: usize) bo
     return lhs_entity.generation < rhs_entity.generation;
 }
 
+const StageWorkSelection = struct {
+    profile: AdaptiveWorkProfile,
+    items_per_range: usize,
+    worker_threads: usize,
+    range_count: usize,
+    active_tuner: ?*AdaptiveWorkTuner = null,
+};
+
+fn selectStageWork(
+    thread_system: *const ThreadSystem,
+    item_count: usize,
+    min_parallel_items_override: ?usize,
+    items_per_range_override: ?usize,
+    max_worker_threads_override: ?usize,
+    adaptive: bool,
+    adaptive_tuner: ?*AdaptiveWorkTuner,
+) StageWorkSelection {
+    const available_workers = thread_system.workerThreadCount();
+    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
+    const min_parallel_items = min_parallel_items_override orelse thread_system.config.min_parallel_items;
+    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
+    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
+        adaptive_tuner
+    else
+        null;
+    const profile = if (active_tuner) |tuner|
+        tuner.selectProfile(.{
+            .item_count = item_count,
+            .available_worker_threads = available_workers,
+            .max_worker_threads = max_worker_threads,
+            .min_parallel_items = min_parallel_items,
+            .fallback_items_per_range = requested_items_per_range,
+            .range_alignment_items = collision_range_alignment_items,
+        })
+    else
+        AdaptiveWorkProfile{
+            .worker_threads = max_worker_threads,
+            .items_per_range = requested_items_per_range,
+        };
+    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), collision_range_alignment_items);
+    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
+    const selected_worker_threads = if (item_count < min_parallel_items or selected_range_count <= 1)
+        @as(usize, 0)
+    else
+        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
+    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
+        item_count
+    else
+        aligned_items_per_range;
+
+    return .{
+        .profile = .{
+            .worker_threads = selected_worker_threads,
+            .items_per_range = items_per_range,
+        },
+        .items_per_range = items_per_range,
+        .worker_threads = selected_worker_threads,
+        .range_count = rangeCount(item_count, items_per_range),
+        .active_tuner = active_tuner,
+    };
+}
+
 fn sumCounts(values: []const usize) usize {
     var total: usize = 0;
     for (values) |value| {
@@ -430,27 +823,28 @@ fn serialBatch(item_count: usize) BatchStats {
     };
 }
 
-fn combinedCollisionBatch(count_batch: BatchStats, write_batch: BatchStats) BatchStats {
-    const total_range_count = count_batch.range_count + write_batch.range_count;
-    const total_worker_ranges = count_batch.worker_thread_ranges + write_batch.worker_thread_ranges;
-    const worker_utilization = if (total_range_count == 0 or count_batch.active_worker_threads == 0)
+fn combineStageBatches(first: BatchStats, second: BatchStats) BatchStats {
+    const total_range_count = first.range_count + second.range_count;
+    const total_worker_ranges = first.worker_thread_ranges + second.worker_thread_ranges;
+    const active_worker_threads = @max(first.active_worker_threads, second.active_worker_threads);
+    const worker_utilization = if (total_range_count == 0 or active_worker_threads == 0)
         @as(f32, 0)
     else
         @as(f32, @floatFromInt(total_worker_ranges)) / @as(f32, @floatFromInt(total_range_count));
 
     return .{
-        .item_count = count_batch.item_count,
+        .item_count = first.item_count,
         .range_count = total_range_count,
-        .items_per_range = count_batch.items_per_range,
-        .range_alignment_items = count_batch.range_alignment_items,
-        .available_worker_threads = @max(count_batch.available_worker_threads, write_batch.available_worker_threads),
-        .active_worker_threads = @max(count_batch.active_worker_threads, write_batch.active_worker_threads),
-        .main_thread_ranges = count_batch.main_thread_ranges + write_batch.main_thread_ranges,
+        .items_per_range = first.items_per_range,
+        .range_alignment_items = first.range_alignment_items,
+        .available_worker_threads = @max(first.available_worker_threads, second.available_worker_threads),
+        .active_worker_threads = active_worker_threads,
+        .main_thread_ranges = first.main_thread_ranges + second.main_thread_ranges,
         .worker_thread_ranges = total_worker_ranges,
         .worker_utilization = worker_utilization,
-        .batch_duration_ns = count_batch.batch_duration_ns + write_batch.batch_duration_ns,
-        .main_thread_wait_ns = count_batch.main_thread_wait_ns + write_batch.main_thread_wait_ns,
-        .ran_inline = count_batch.ran_inline and write_batch.ran_inline,
+        .batch_duration_ns = first.batch_duration_ns + second.batch_duration_ns,
+        .main_thread_wait_ns = first.main_thread_wait_ns + second.main_thread_wait_ns,
+        .ran_inline = first.ran_inline and second.ran_inline,
     };
 }
 
@@ -483,8 +877,10 @@ test "collision contacts are stable and reject non-overlaps" {
     try std.testing.expectEqual(@as(usize, 3), stats.body_count);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
-    try std.testing.expectEqual(stats.count_batch.range_count + stats.write_batch.range_count, stats.work_batch.range_count);
-    try std.testing.expectEqual(stats.count_batch.main_thread_ranges + stats.write_batch.main_thread_ranges, stats.work_batch.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 1), stats.broadphase_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.broadphase_batch.main_thread_ranges);
+    try std.testing.expectEqual(@as(usize, 1), stats.narrowphase_batch.range_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.narrowphase_batch.main_thread_ranges);
     const merged = contacts.mergedItems();
     try std.testing.expectEqual(first.index, merged[0].a.index);
     try std.testing.expectEqual(second.index, merged[0].b.index);
@@ -493,7 +889,7 @@ test "collision contacts are stable and reject non-overlaps" {
     try std.testing.expectApproxEqAbs(@as(f32, 2), merged[0].penetration, 0.001);
 }
 
-test "collision stats report candidate pairs separately from contacts" {
+test "collision broadphase filters y misses before narrowphase" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     _ = try addBody(&data, 0, 0, 5);
@@ -507,8 +903,34 @@ test "collision stats report candidate pairs separately from contacts" {
 
     const stats = try system.updateSerial(&data, &contacts);
 
-    try std.testing.expectEqual(@as(usize, 3), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
     try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
+}
+
+test "collision broadphase uses simd groups while preserving contact order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try addBody(&data, 0, 0, 10);
+    const second = try addBody(&data, 1, -9, 10);
+    _ = try addBody(&data, 2, 40, 10);
+    const fourth = try addBody(&data, 3, 9, 10);
+    _ = try addBody(&data, 4, 60, 10);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const stats = try system.updateSerial(&data, &contacts);
+    const merged = contacts.mergedItems();
+
+    try std.testing.expect(stats.broadphase_simd_groups > 0);
+    try std.testing.expectEqual(@as(usize, 2), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.contact_count);
+    try std.testing.expectEqual(first.index, merged[0].a.index);
+    try std.testing.expectEqual(second.index, merged[0].b.index);
+    try std.testing.expectEqual(first.index, merged[1].a.index);
+    try std.testing.expectEqual(fourth.index, merged[1].b.index);
 }
 
 test "warm sorted collision order skips repair when already ordered" {
@@ -560,6 +982,7 @@ test "threaded collision matches serial contact order" {
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
@@ -569,10 +992,10 @@ test "threaded collision matches serial contact order" {
         .adaptive = false,
     });
 
-    try std.testing.expect(!threaded_stats.write_batch.ran_inline);
-    try std.testing.expect(!threaded_stats.work_batch.ran_inline);
-    try std.testing.expectEqual(threaded_stats.count_batch.range_count + threaded_stats.write_batch.range_count, threaded_stats.work_batch.range_count);
-    try std.testing.expectEqual(threaded_stats.count_batch.worker_thread_ranges + threaded_stats.write_batch.worker_thread_ranges, threaded_stats.work_batch.worker_thread_ranges);
+    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
+    try std.testing.expect(!threaded_stats.narrowphase_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 64), threaded_stats.broadphase_batch.item_count);
+    try std.testing.expectEqual(threaded_stats.candidate_pair_count, threaded_stats.narrowphase_batch.item_count);
     const serial_items = serial_contacts.mergedItems();
     const threaded_items = threaded_contacts.mergedItems();
     try std.testing.expectEqual(serial_items.len, threaded_items.len);

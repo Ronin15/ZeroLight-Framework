@@ -4,7 +4,7 @@
 
 //! First AI decision processor for Slice 14.
 //! Stateless (except work memory + per-system tuner); reads typed const slices for ai + movement prior positions,
-//! appends MovementIntent ranges to SimulationFrame.intents using RangeOutputStream count/prefix/write + parallelForWithOptions.
+//! pre-sizes MovementIntent output ranges and uses parallelForWithOptions only for decision/write work.
 //! Deterministic via explicit seed in config. Wander + seek (player-targeted via AiConfig.seek_target) + local separation.
 //! Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
 //! Separation precomputed once on main thread (Hot lists), O(1) read in workers (no O(N^2) in jobs).
@@ -170,19 +170,15 @@ pub const AiSystem = struct {
             .range_base = range_base,
         };
 
-        // Count phase: each ai ent emits exactly 1 intent.
-        _ = thread_system.parallelForWithOptions(entity_count, &context, countAiIntentsJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
-            .items_per_range = items_per_range,
-            .max_worker_threads = selected_workers,
-            .range_alignment_items = ai_range_alignment_items,
-            .adaptive = false,
-        });
+        for (0..rcount) |range_index| {
+            const start = range_index * items_per_range;
+            const end = @min(start + items_per_range, entity_count);
+            frame.intents.addCount(range_base + range_index, end - start);
+        }
 
         try frame.intents.prefixAppendedRanges(range_base);
 
-        // Write phase: compute dirs read-only, write intents.
-        const write_batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
+        const batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
             .min_parallel_items = system_config.min_parallel_items,
             .items_per_range = items_per_range,
             .max_worker_threads = selected_workers,
@@ -193,13 +189,13 @@ pub const AiSystem = struct {
         frame.intents.finishWrite();
 
         if (adaptive_tuner) |tuner| {
-            tuner.record(write_batch);
+            tuner.record(batch);
         }
 
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
-            .batch = write_batch,
+            .batch = batch,
         };
     }
 
@@ -430,11 +426,6 @@ const AiJobContext = struct {
     seed: u64,
     range_base: usize,
 };
-
-fn countAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *AiJobContext = @ptrCast(@alignCast(context));
-    job.intents.addCount(job.range_base + range.index, range.end - range.start);
-}
 
 fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiJobContext = @ptrCast(@alignCast(context));
