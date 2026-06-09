@@ -11,6 +11,8 @@ const build_options = @import("build_options");
 const config = @import("../config.zig");
 const DebugOverlay = if (build_options.debug_overlay) @import("../render/debug_overlay.zig").DebugOverlay else @import("../render/debug_overlay_stub.zig").DebugOverlay;
 const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
+const MainMenuState = @import("../game/main_menu_state.zig").MainMenuState;
+const SettingsMenuState = @import("../game/settings_menu_state.zig").SettingsMenuState;
 const frame_pacer = @import("frame_pacer.zig");
 const input_router = @import("input_router.zig");
 const log = @import("../core/logging.zig").app;
@@ -25,6 +27,7 @@ const RenderContext = @import("state.zig").RenderContext;
 const State = @import("state.zig").State;
 const StateStack = @import("state.zig").StateStack;
 const StateTransitions = @import("state.zig").StateTransitions;
+const state_policy = @import("state.zig").state_policy;
 const TextService = @import("../render/text.zig").TextService;
 const UpdateContext = @import("state.zig").UpdateContext;
 const ThreadSystem = @import("thread_system.zig").ThreadSystem;
@@ -341,19 +344,19 @@ fn minimumWindowSizeForPolicy(policy: resolution.ResolutionPolicy) ?resolution.L
 
 fn bootstrapStartupState(states: *StateStack, allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
     const logical_size = app_config.resolution_policy.logical_size;
-    // GameDemoState is the startup state until a real MainMenuState exists.
-    const game_demo_state_ptr = try allocator.create(GameDemoState);
+    // Main menu is now the default startup state (Slice 16). Gameplay is launched from it.
+    const menu_ptr = try allocator.create(MainMenuState);
     var owned_by_state = false;
-    errdefer if (!owned_by_state) allocator.destroy(game_demo_state_ptr);
-    game_demo_state_ptr.* = try GameDemoState.init(
+    errdefer if (!owned_by_state) allocator.destroy(menu_ptr);
+    menu_ptr.* = MainMenuState.init(
         allocator,
         @floatFromInt(logical_size.width),
         @floatFromInt(logical_size.height),
     );
 
-    const state = State.fromOwnedPtr(GameDemoState, game_demo_state_ptr);
+    const state = State.fromOwnedPtr(MainMenuState, menu_ptr);
     owned_by_state = true;
-    _ = try states.replaceOwnedGameplay(state);
+    _ = try states.replaceOwnedState(state, state_policy.opaque_screen);
 }
 
 test "integer fit requests logical minimum window size" {

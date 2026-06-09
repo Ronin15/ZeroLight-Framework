@@ -30,6 +30,9 @@ comptime {
     _ = @import("core/simd.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/game_demo_state.zig");
+    _ = @import("game/main_menu_state.zig");
+    _ = @import("game/menu_view.zig");
+    _ = @import("game/settings_menu_state.zig");
     _ = @import("game/player.zig");
     _ = @import("game/simulation.zig");
     _ = @import("game/systems/collision.zig");

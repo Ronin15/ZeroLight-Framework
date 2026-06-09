@@ -28,6 +28,8 @@ adding broad abstraction.
   pathfinding, and emergent-rule work.
 - Treat Slice 13 and Slice 14 as built on Slice 12's deterministic processor,
   event, and deferred-structural-change contracts.
+- Slice 16 lands the first root menus (main + settings) using state stack,
+  ui routing, text, and audio commands; it replaces the direct GameDemo bootstrap.
 
 ## Long-Term Gameplay Direction
 
@@ -950,6 +952,49 @@ Acceptance checks:
 - [x] Missing audio assets warn once per path instead of retrying every frame.
 - [x] The demo proves music plus collision SFX through installed runtime assets.
 
+## Slice 16: Main Menu and Settings Menu
+
+Goal: provide a root main menu as the default startup state and a reachable settings menu for basic configurable options (initially live audio bus/master gains) so the app no longer boots directly into gameplay. Menus use the existing state stack (opaque + modal policies), input routing (new menu actions routed under the `.ui` context), text service for labels, renderer logical-space drawing, and audio command buffer for immediate effect.
+
+Current foundation:
+
+- `StateStack` + `StateTransitions` (replaceGameplay, pushModal, pop support added in this slice) and the four policies (gameplay / modal_overlay / pass_through_overlay / opaque_screen).
+- `InputState` / `FrameCommands` + `input_router` with explicit `.ui` context and `modalUi`/`opaqueScreen` policies that already block gameplay movement while allowing app/debug/ui commands.
+- `TextService` + `TextTextureLease` + `acquireText` (Slice 5) and `Renderer.drawSprite` / `drawRectInSpace(..., .logical)` for UI.
+- `PauseState` provides the concrete drawing, layering (~9000+), color, lazy-lease-in-render, and centered-panel precedent.
+- `AudioCommandBuffer.setMasterGain` / `setBusGain` + `AudioBus` (Slice 15) for live settings feedback without owning mixer resources.
+- `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
+- `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.
+- Menus use `handleEvent` (raw SDL events, which reach top state for modal/opaque policies) for discrete navigation using ui-routed actions, and `UpdateContext` (audio for gain commands, transitions, input, thread_system) plus `RenderContext` (renderer + optional text_service) for rendering. This matches the actual `UpdateContext` definition (no one-frame commands field).
+- All states follow the vtable shape with `init`/`deinit`/`update`/`render`/`handleEvent` (optionally `onPause`/`onResume`).
+
+Checklist:
+
+- [ ] Add four menu navigation actions (`menuUp`/`menuDown`/`menuLeft`/`menuRight`) bound to arrow keys, classified as command actions, and routed to the `.ui` context. Update binding, routing, and action tests.
+- [ ] Extend `StateTransitions` and `StateStack` with `pop()` (request + apply + destroy) plus minimal tests so child menus can dismiss themselves cleanly.
+- [ ] Implement `MainMenuState` (src/game/main_menu_state.zig) as an opaque-screen root menu: 3 items, allocator storage for spawning GameDemo, selection + wrap, lazy TextTextureLease title+items with accent for selected, logical rect + text rendering, confirm via resumeGame, Esc quit, transitions to gameplay or settings or app quit. Internal focused tests.
+- [ ] Implement `SettingsMenuState` (src/game/settings_menu_state.zig): 3 volume rows + Back, u8 0-10 state, live set*Gain on left/right for selected volume, label text rebuild on change, Esc or Back confirm does pop(), same visual style. Tests for clamping, emitted commands, pop, lease lifetime.
+- [ ] Update Engine bootstrap to create MainMenuState (opaque) at startup with logical size + allocator; keep GameDemo import for launch path. Update the old placeholder comment.
+- [ ] Register the two new game modules in src/tests.zig comptime block for `zig build test` coverage.
+- [ ] Add the full Slice 16 section (this text) to framework-implementation-slices.md following prior slice format, plus update Next Priority Tracks and the Suggested Order list.
+- [ ] Minor doc updates in state-stack-and-input.md (new actions in input model) and architecture.md (new states under game/, bootstrap note).
+- [ ] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify` all pass.
+- [ ] Manual `zig build dev` smoke: arrow navigation + wrap, Enter starts demo, Esc quits from main, Settings reachable, Left/Right adjust volumes with audible result and label update, Back/Esc returns to main, gains persist into launched gameplay, F2 overlay works, no leaks on repeated transitions.
+
+Acceptance checks:
+
+- [ ] App starts at a usable main menu (title + 3 keyboard-selectable items) instead of the demo.
+- [ ] Arrow keys change selection (wraps); Enter/Space activates; Esc quits from main menu.
+- [ ] "Start Game" replace-launches a fully functional GameDemoState (player input, systems, audio, pause overlay still work).
+- [ ] "Settings" pushes a modal settings view; Left/Right on volume rows immediately queue gain commands (music audibly responds); labels update; Esc or Back returns cleanly via pop.
+- [ ] Volume changes made in settings are respected when starting gameplay afterward.
+- [ ] All new states properly release TextTextureLeases in deinit; no leaks across menu<->settings<->game transitions.
+- [ ] Focused (no-window) tests cover selection, wrap, transition requests (including pop), volume clamp + command emission, and lease release.
+- [ ] Updated routing tests prove menu actions are allowed exactly under ui/modal/opaque policies and blocked from pure gameplay routing.
+- [ ] `zig build verify` passes; docs updated in the canonical slices format.
+
+Slice 16 lands the first real menu layer. The implementation stays deliberately small (direct state-owned text leases, no widget system, keyboard only, volumes as the single live setting) while proving the full contract: state-driven navigation, ui input routing, text + logical renderer drawing, audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -968,6 +1013,7 @@ Acceptance checks:
 13. Spatial queries and collision contacts.
 14. AI, pathfinding, and emergent rule processing.
 15. SDL3_mixer audio service.
+16. Main menu and settings menu.
 
 This order keeps gameplay/menu correctness ahead of larger renderer work, then
 builds resource ownership before text/UI, renderer composition, and parallel

@@ -117,9 +117,35 @@ One-frame commands:
 - `resumeGame`
 - `quit`
 - `toggleDebugOverlay`
+- `menuUp`
+- `menuDown`
+- `menuLeft`
+- `menuRight`
 
 `pause`, `resumeGame`, and `quit` are app commands. `toggleDebugOverlay` is a
-debug command.
+debug command. The four `menu*` actions are routed under the `.ui` context (see
+`InputRoutingPolicy.modalUi` / `opaqueScreen`); they are one-frame commands captured
+by `FrameCommands` (not held movement).
+
+Default bindings are:
+
+- WASD for movement
+- Arrow keys for menu navigation (up/down/left/right)
+- P for pause or resume
+- Enter or Space for resume (also used as confirm/activate inside menus)
+- Escape for quit (also used as back/cancel inside modal menus such as settings)
+- F2 for the debug overlay
+
+Gameplay code should read movement through `InputState`, usually from the
+`UpdateContext`. App-level commands should stay in `FrameCommands` and engine
+coordination code. `State.handleEvent` still receives raw SDL events according
+to `events_below`; input routing only decides whether named actions mutate
+`InputState` or `FrameCommands`.
+
+Menu states (e.g. main menu as an opaque screen, settings as a modal overlay)
+typically read `context.commands.wasPressed(.resumeGame)` for confirm and
+`.quit` for back/quit-app, plus the explicit menu nav actions. They use
+`context.transitions.pop()` (added alongside Slice 16) or `quit()` / `replaceGameplay(...)`.
 
 Default bindings are:
 

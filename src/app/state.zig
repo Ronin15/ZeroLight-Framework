@@ -174,6 +174,7 @@ pub const StateTransitions = struct {
         replace: StateRequest,
         push: StateRequest,
         remove: StateHandle,
+        pop,
         quit,
     };
 
@@ -230,6 +231,10 @@ pub const StateTransitions = struct {
 
     pub fn quit(self: *StateTransitions) !void {
         try self.requests.append(self.allocator, .quit);
+    }
+
+    pub fn pop(self: *StateTransitions) !void {
+        try self.requests.append(self.allocator, .pop);
     }
 
     fn destroyPendingStates(self: *StateTransitions) void {
@@ -314,6 +319,13 @@ pub const StateStack = struct {
         const value = handle.* orelse return false;
         if (!self.remove(value)) return false;
         handle.* = null;
+        return true;
+    }
+
+    pub fn pop(self: *StateStack) bool {
+        if (self.states.items.len == 0) return false;
+        const removed = self.states.pop() orelse return false;
+        removed.state.destroy(self.allocator);
         return true;
     }
 
@@ -423,6 +435,10 @@ pub const StateStack = struct {
                 },
                 .remove => |handle| {
                     _ = self.remove(handle);
+                },
+                .pop => {
+                    _ = self.pop();
+                    request.* = .none;
                 },
                 .quit => {
                     result.quit_requested = true;
@@ -1235,4 +1251,68 @@ test "quit transition reports through apply result" {
     const result = try stack.applyTransitions(&transitions);
 
     try std.testing.expect(result.quit_requested);
+}
+
+test "pop transition removes and destroys the current top state" {
+    const TestingState = struct {
+        id: u32,
+        deinit_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    var deinit_count: u32 = 0;
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .deinit_count = &deinit_count });
+    _ = try stack.pushModal(TestingState, .{ .id = 2, .deinit_count = &deinit_count });
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    try transitions.pop();
+    const result = try stack.applyTransitions(&transitions);
+
+    try std.testing.expect(!result.quit_requested);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(@as(u32, 1), deinit_count);
+}
+
+test "pop on empty stack is safe and no-op" {
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    try transitions.pop();
+    const result = try stack.applyTransitions(&transitions);
+
+    try std.testing.expect(!result.quit_requested);
+    try std.testing.expectEqual(@as(usize, 0), stack.len());
 }

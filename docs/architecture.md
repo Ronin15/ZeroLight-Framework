@@ -29,7 +29,7 @@ game-specific behavior under `src/game/`.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
-- `src/game/game_demo_state.zig` and `src/game/pause_state.zig` are the current game states.
+- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, and `src/game/settings_menu_state.zig` are the game/application states. Main menu is the default startup state (Slice 16); gameplay is launched from it via transitions.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
   SoA stores for gameplay, collision, and render systems.
 - `src/game/player.zig` keeps player-specific input and facing behavior while

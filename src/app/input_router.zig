@@ -80,6 +80,7 @@ pub fn contextForAction(action: Action) InputContext {
         .moveLeft, .moveRight, .moveUp, .moveDown => .gameplay,
         .pause, .resumeGame, .quit => .app,
         .toggleDebugOverlay => .debug,
+        .menuUp, .menuDown, .menuLeft, .menuRight => .ui,
     };
 }
 
@@ -134,6 +135,8 @@ test "gameplay routing allows gameplay app and debug actions" {
     try std.testing.expect(policy.allowsAction(.quit));
     try std.testing.expect(policy.allowsAction(.resumeGame));
     try std.testing.expect(policy.allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(!policy.allowsAction(.menuUp));
+    try std.testing.expect(!policy.allowsAction(.menuDown));
     try std.testing.expect(!policy.allowsContext(.ui));
 }
 
@@ -145,6 +148,10 @@ test "ui modal routing blocks gameplay while keeping UI and debug commands" {
     try std.testing.expect(policy.allowsAction(.pause));
     try std.testing.expect(policy.allowsAction(.quit));
     try std.testing.expect(policy.allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(policy.allowsAction(.menuUp));
+    try std.testing.expect(policy.allowsAction(.menuDown));
+    try std.testing.expect(policy.allowsAction(.menuLeft));
+    try std.testing.expect(policy.allowsAction(.menuRight));
 }
 
 test "pass through overlay routing allows gameplay ui app and debug contexts" {
