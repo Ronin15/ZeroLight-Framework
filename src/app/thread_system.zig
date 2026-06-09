@@ -80,6 +80,8 @@ pub const AdaptiveWorkTunerConfig = struct {
     threaded_batch_ns: u64 = 50_000,
     settle_after_failed_profiles: usize = 2,
     retune_after_settled_windows: usize = 120,
+    min_ranges_per_participant: usize = 1,
+    max_ranges_per_participant: usize = 16,
 };
 
 pub const AdaptiveWorkPhase = enum {
@@ -88,13 +90,9 @@ pub const AdaptiveWorkPhase = enum {
     settled,
 };
 
-const AdaptiveWorkSearchStage = enum {
-    workers,
-    shrink,
-    grow,
-};
-
-const max_work_candidates = 32;
+const default_participant_overhead_ns: f64 = 1_000;
+const min_participant_overhead_ns: f64 = 100;
+const default_range_overhead_ns: f64 = 1_000;
 
 pub const AdaptiveWorkRequest = struct {
     item_count: usize,
@@ -133,23 +131,17 @@ pub const AdaptiveWorkTuner = struct {
     baseline_mean_batch_duration_ns: u64 = 0,
     sample_count: usize = 0,
     sample_total_ns: u128 = 0,
-    range_step_items: usize = 0,
-    search_stage: AdaptiveWorkSearchStage = .shrink,
-    probe_inline_candidate: bool = false,
-    worker_search_exhausted: bool = false,
-    rejected_shrink: bool = false,
-    rejected_grow: bool = false,
-    grow_exhausted: bool = false,
-    work_candidates: [max_work_candidates]AdaptiveWorkProfile = [_]AdaptiveWorkProfile{.{}} ** max_work_candidates,
-    work_candidate_count: usize = 0,
-    work_candidate_index: usize = 0,
     failed_profile_count: usize = 0,
     settled_window_count: usize = 0,
-    next_grow_items_per_range: usize = 0,
     last_item_count: usize = 0,
     last_range_alignment_items: usize = 1,
     last_request: ?AdaptiveWorkRequest = null,
     sampled_profile: ?AdaptiveWorkProfile = null,
+    model_work_ns_per_item: f64 = 0,
+    model_participant_overhead_ns: f64 = 0,
+    model_range_overhead_ns: f64 = 0,
+    model_imbalance_work_ns: f64 = 0,
+    last_predicted_profile: ?AdaptiveWorkProfile = null,
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
@@ -199,6 +191,7 @@ pub const AdaptiveWorkTuner = struct {
 
         self.sample_count += 1;
         self.sample_total_ns += stats.batch_duration_ns;
+        self.updateCostModel(stats);
         if (self.sample_count < self.config.sample_window) return;
 
         const sample_mean_ns: u64 = @intCast(self.sample_total_ns / self.sample_count);
@@ -251,7 +244,7 @@ pub const AdaptiveWorkTuner = struct {
             self.settle();
             return;
         }
-        self.startProfileSearch(profile, sample_mean_ns, false);
+        self.startPredictedProbe(profile, sample_mean_ns);
     }
 
     fn finishProfileWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
@@ -266,14 +259,18 @@ pub const AdaptiveWorkTuner = struct {
             self.current_profile = candidate;
             self.baseline_mean_batch_duration_ns = sample_mean_ns;
             self.failed_profile_count = 0;
-            self.rejected_shrink = false;
-            self.rejected_grow = false;
-            self.updateRangeStepAfterWin(candidate);
-            self.startNextProfile();
+            self.startPredictedProbe(candidate, sample_mean_ns);
             return;
         }
 
-        self.rejectProfile();
+        self.failed_profile_count += 1;
+        self.current_profile = self.best_profile;
+        self.baseline_mean_batch_duration_ns = self.best_mean_batch_duration_ns;
+        if (self.failed_profile_count >= self.config.settle_after_failed_profiles) {
+            self.settle();
+            return;
+        }
+        self.startPredictedProbe(self.best_profile, self.best_mean_batch_duration_ns);
     }
 
     fn finishSettledWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
@@ -282,116 +279,160 @@ pub const AdaptiveWorkTuner = struct {
         self.settled_window_count += 1;
 
         if (profile.worker_threads == 0 and sample_mean_ns >= self.config.threaded_batch_ns) {
-            self.startProfileSearch(profile, sample_mean_ns, false);
+            self.startPredictedProbe(profile, sample_mean_ns);
             return;
         }
         if (self.settled_window_count >= self.config.retune_after_settled_windows) {
-            self.startProfileSearch(profile, sample_mean_ns, false);
+            self.startPredictedProbe(profile, sample_mean_ns);
             return;
         }
         self.recordBest(profile, sample_mean_ns);
     }
 
-    fn startProfileSearch(self: *AdaptiveWorkTuner, baseline_profile: AdaptiveWorkProfile, baseline_mean_ns: u64, include_inline_candidate: bool) void {
+    fn startPredictedProbe(self: *AdaptiveWorkTuner, baseline_profile: AdaptiveWorkProfile, baseline_mean_ns: u64) void {
         const request = self.last_request orelse {
             self.settle();
             return;
         };
         const normalized_baseline = self.normalizedProfile(baseline_profile, request);
-        self.range_step_items = 0;
-        self.search_stage = .workers;
-        self.probe_inline_candidate = include_inline_candidate and normalized_baseline.worker_threads > 0;
-        self.worker_search_exhausted = false;
-        self.rejected_shrink = false;
-        self.rejected_grow = false;
-        self.grow_exhausted = false;
-        self.failed_profile_count = 0;
-        self.next_grow_items_per_range = 0;
         self.current_profile = normalized_baseline;
         self.best_profile = normalized_baseline;
         self.best_mean_batch_duration_ns = baseline_mean_ns;
         self.baseline_mean_batch_duration_ns = baseline_mean_ns;
-        self.prepareWorkCandidates(request, normalized_baseline);
-        self.startNextProfile();
-    }
 
-    fn startNextProfile(self: *AdaptiveWorkTuner) void {
-        const request = self.last_request orelse {
+        const predicted = self.predictProfile(request);
+        self.last_predicted_profile = predicted;
+        if (profilesEqual(predicted, normalized_baseline)) {
             self.settle();
             return;
-        };
+        }
 
-        if (self.probe_inline_candidate) {
-            self.probe_inline_candidate = false;
-            const inline_candidate = self.normalizedProfile(.{
+        self.candidate_profile = predicted;
+        self.phase = .probing;
+    }
+
+    fn predictProfile(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) AdaptiveWorkProfile {
+        if (request.item_count < request.min_parallel_items or request.max_worker_threads == 0) {
+            return self.normalizedProfile(.{
                 .worker_threads = 0,
                 .items_per_range = request.fallback_items_per_range,
             }, request);
-            if (!profilesEqual(inline_candidate, self.current_profile) and !profilesEqual(inline_candidate, self.best_profile)) {
-                self.candidate_profile = inline_candidate;
-                self.phase = .probing;
-                return;
-            }
         }
 
-        if (!self.worker_search_exhausted) {
-            if (self.nextWorkCandidate(request)) |candidate| {
-                self.candidate_profile = candidate;
-                self.search_stage = .workers;
-                self.phase = .probing;
-                return;
-            }
-            self.worker_search_exhausted = true;
-            self.search_stage = .shrink;
+        const item_count_f: f64 = @floatFromInt(request.item_count);
+        const work_ns_per_item = if (self.model_work_ns_per_item > 0)
+            self.model_work_ns_per_item
+        else if (self.baseline_mean_batch_duration_ns > 0)
+            @as(f64, @floatFromInt(self.baseline_mean_batch_duration_ns)) / item_count_f
+        else
+            @as(f64, @floatFromInt(self.config.threaded_batch_ns)) / item_count_f;
+        const estimated_work_ns = @max(work_ns_per_item * item_count_f, 1);
+        if (estimated_work_ns < @as(f64, @floatFromInt(self.config.threaded_batch_ns))) {
+            return self.normalizedProfile(.{
+                .worker_threads = 0,
+                .items_per_range = request.fallback_items_per_range,
+            }, request);
         }
 
-        if (self.range_step_items == 0) {
-            self.range_step_items = self.initialRangeStep(self.best_profile.items_per_range, request);
+        const participant_overhead_ns = @max(self.model_participant_overhead_ns, default_participant_overhead_ns);
+        const ideal_participants_f = @sqrt(estimated_work_ns / participant_overhead_ns);
+        const max_participants = request.max_worker_threads + 1;
+        const predicted_participants = clampUsize(
+            roundedUsize(ideal_participants_f),
+            1,
+            max_participants,
+        );
+        const predicted_threaded_ns = estimated_work_ns / @as(f64, @floatFromInt(predicted_participants)) +
+            participant_overhead_ns * @as(f64, @floatFromInt(predicted_participants - 1));
+        if (predicted_participants <= 1 or predicted_threaded_ns >= estimated_work_ns) {
+            return self.normalizedProfile(.{
+                .worker_threads = 0,
+                .items_per_range = request.fallback_items_per_range,
+            }, request);
         }
 
-        while (self.range_step_items >= request.range_alignment_items) {
-            if (self.search_stage == .shrink and !self.rejected_shrink) {
-                if (self.rangeCandidate(request, .shrink)) |candidate| {
-                    self.candidate_profile = candidate;
-                    self.phase = .probing;
-                    return;
-                }
-                self.rejected_shrink = true;
-                self.search_stage = .grow;
-                continue;
-            }
-            if (self.search_stage == .grow and !self.grow_exhausted) {
-                if (self.nextGrowRangeCandidate(request)) |candidate| {
-                    self.candidate_profile = candidate;
-                    self.phase = .probing;
-                    return;
-                }
-                self.grow_exhausted = true;
-                self.rejected_grow = true;
-            }
+        const range_overhead_ns = @max(self.model_range_overhead_ns, default_range_overhead_ns);
+        const work_per_participant_ns = estimated_work_ns / @as(f64, @floatFromInt(predicted_participants));
+        const ranges_per_participant_f = if (self.model_imbalance_work_ns > 0)
+            @sqrt(self.model_imbalance_work_ns / (range_overhead_ns * @as(f64, @floatFromInt(predicted_participants))))
+        else
+            @sqrt(work_per_participant_ns / range_overhead_ns);
+        const ranges_per_participant = clampUsize(
+            roundedUsize(ranges_per_participant_f),
+            self.config.min_ranges_per_participant,
+            self.config.max_ranges_per_participant,
+        );
+        const target_ranges = saturatingMul(predicted_participants, ranges_per_participant);
+        const predicted_items_per_range = self.normalizedItemsPerRange(
+            targetRangeSizeForRangeCount(request.item_count, target_ranges),
+            request.range_alignment_items,
+        );
+        const worker_threads = maxUsefulWorkersForRange(
+            request.item_count,
+            predicted_items_per_range,
+            request.max_worker_threads,
+        );
+        return self.normalizedProfile(.{
+            .worker_threads = worker_threads,
+            .items_per_range = predicted_items_per_range,
+        }, request);
+    }
 
-            if (self.rejected_shrink and self.rejected_grow) {
-                const next_step = alignItemCountDown(@max(self.range_step_items / 2, request.range_alignment_items), request.range_alignment_items);
-                if (next_step >= self.range_step_items or next_step < request.range_alignment_items) break;
-                self.range_step_items = next_step;
-                self.rejected_shrink = false;
-                self.rejected_grow = false;
-                self.grow_exhausted = false;
-                self.next_grow_items_per_range = 0;
-                self.search_stage = .shrink;
-                continue;
-            }
+    fn updateCostModel(self: *AdaptiveWorkTuner, stats: BatchStats) void {
+        const duration_ns: f64 = @floatFromInt(stats.batch_duration_ns);
+        const item_count_f: f64 = @floatFromInt(stats.item_count);
+        if (item_count_f <= 0 or duration_ns <= 0) return;
 
-            self.search_stage = .grow;
+        const participants: usize = stats.active_worker_threads + 1;
+        if (stats.active_worker_threads == 0 or stats.ran_inline) {
+            self.model_work_ns_per_item = ewma(self.model_work_ns_per_item, duration_ns / item_count_f, 0.35);
+            return;
         }
 
-        self.settle();
+        if (self.model_work_ns_per_item == 0) {
+            self.model_work_ns_per_item = duration_ns * @as(f64, @floatFromInt(participants)) / item_count_f;
+        }
+
+        const estimated_parallel_work_ns = (self.model_work_ns_per_item * item_count_f) /
+            @as(f64, @floatFromInt(participants));
+        const overhead_ns = @max(duration_ns - estimated_parallel_work_ns, 0);
+        const main_thread_wait_ns: f64 = @floatFromInt(stats.main_thread_wait_ns);
+        const non_tail_overhead_ns = @max(overhead_ns - main_thread_wait_ns, 0);
+        if (stats.range_count > 0) {
+            self.model_range_overhead_ns = ewma(
+                self.model_range_overhead_ns,
+                non_tail_overhead_ns / @as(f64, @floatFromInt(stats.range_count)),
+                0.25,
+            );
+        }
+
+        const participant_observed = non_tail_overhead_ns / @as(f64, @floatFromInt(@max(participants, @as(usize, 1))));
+        self.model_participant_overhead_ns = ewma(
+            self.model_participant_overhead_ns,
+            @max(participant_observed, min_participant_overhead_ns),
+            0.25,
+        );
+
+        if (stats.range_count > 0 and stats.main_thread_wait_ns > 0) {
+            const ranges_per_participant = @max(@as(usize, 1), ceilDiv(stats.range_count, participants));
+            self.model_imbalance_work_ns = ewma(
+                self.model_imbalance_work_ns,
+                main_thread_wait_ns * @as(f64, @floatFromInt(ranges_per_participant)),
+                0.25,
+            );
+        }
+
+        const threaded_work_per_item = duration_ns * @as(f64, @floatFromInt(participants)) / item_count_f;
+        if (threaded_work_per_item < self.model_work_ns_per_item * 1.25) {
+            self.model_work_ns_per_item = ewma(self.model_work_ns_per_item, threaded_work_per_item, 0.10);
+        }
     }
 
     fn settle(self: *AdaptiveWorkTuner) void {
         self.phase = .settled;
         self.current_profile = self.best_profile;
         self.candidate_profile = null;
+        self.last_predicted_profile = null;
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
     }
@@ -401,21 +442,11 @@ pub const AdaptiveWorkTuner = struct {
         self.current_profile = self.initial_profile;
         self.best_profile = self.initial_profile;
         self.candidate_profile = null;
-        self.range_step_items = 0;
-        self.search_stage = .workers;
-        self.probe_inline_candidate = false;
-        self.worker_search_exhausted = false;
-        self.rejected_shrink = false;
-        self.rejected_grow = false;
-        self.grow_exhausted = false;
-        self.work_candidates = [_]AdaptiveWorkProfile{.{}} ** max_work_candidates;
-        self.work_candidate_count = 0;
-        self.work_candidate_index = 0;
+        self.last_predicted_profile = null;
         self.best_mean_batch_duration_ns = 0;
         self.baseline_mean_batch_duration_ns = 0;
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
-        self.next_grow_items_per_range = 0;
         self.resetSamples();
     }
 
@@ -456,182 +487,6 @@ pub const AdaptiveWorkTuner = struct {
         return clamped;
     }
 
-    fn initialRangeStep(self: *const AdaptiveWorkTuner, items_per_range: usize, request: AdaptiveWorkRequest) usize {
-        const alignment = @max(request.range_alignment_items, @as(usize, 1));
-        const raw = @max(items_per_range / 2, alignment);
-        const aligned = alignItemCountDown(raw, alignment);
-        _ = self;
-        return @max(aligned, alignment);
-    }
-
-    fn prepareWorkCandidates(self: *AdaptiveWorkTuner, request: AdaptiveWorkRequest, baseline: AdaptiveWorkProfile) void {
-        self.work_candidates = [_]AdaptiveWorkProfile{.{}} ** max_work_candidates;
-        self.work_candidate_count = 0;
-        self.work_candidate_index = 0;
-
-        const max_threads = self.normalizedProfile(.{
-            .worker_threads = request.max_worker_threads,
-            .items_per_range = request.fallback_items_per_range,
-        }, request).worker_threads;
-        if (max_threads == 0) return;
-
-        const half_threads = @max(@as(usize, 1), max_threads / 2);
-        const conservative_threads = @min(max_threads, @as(usize, 2));
-        const cheap_threaded_work = baseline.worker_threads == 0 and
-            @as(u128, self.baseline_mean_batch_duration_ns) < @as(u128, self.config.threaded_batch_ns) * 3;
-
-        const fallback_range = request.fallback_items_per_range;
-        const small_range = self.normalizedItemsPerRange(@max(fallback_range / 2, request.range_alignment_items), request.range_alignment_items);
-        const large_range = self.normalizedItemsPerRange(saturatingMul(fallback_range, @as(usize, 4)), request.range_alignment_items);
-        const coarse_range = self.maxThreadedItemsPerRange(request);
-
-        if (cheap_threaded_work) {
-            self.appendWorkCandidatesForThreads(conservative_threads, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(1, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(half_threads, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(max_threads, fallback_range, small_range, large_range, coarse_range, request);
-        } else {
-            self.appendWorkCandidatesForThreads(max_threads, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(half_threads, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(conservative_threads, fallback_range, small_range, large_range, coarse_range, request);
-            self.appendWorkCandidatesForThreads(1, fallback_range, small_range, large_range, coarse_range, request);
-        }
-    }
-
-    fn appendWorkCandidatesForThreads(
-        self: *AdaptiveWorkTuner,
-        worker_threads: usize,
-        fallback_range: usize,
-        small_range: usize,
-        large_range: usize,
-        coarse_range: usize,
-        request: AdaptiveWorkRequest,
-    ) void {
-        if (worker_threads == 0) return;
-        self.appendWorkCandidate(.{ .worker_threads = worker_threads, .items_per_range = fallback_range }, request);
-        self.appendWorkCandidate(.{ .worker_threads = worker_threads, .items_per_range = small_range }, request);
-        self.appendWorkCandidate(.{ .worker_threads = worker_threads, .items_per_range = large_range }, request);
-        self.appendWorkCandidate(.{ .worker_threads = worker_threads, .items_per_range = coarse_range }, request);
-    }
-
-    fn appendWorkCandidate(self: *AdaptiveWorkTuner, profile: AdaptiveWorkProfile, request: AdaptiveWorkRequest) void {
-        const candidate = self.normalizedProfile(profile, request);
-        if (candidate.worker_threads == 0) return;
-        if (profilesEqual(candidate, self.current_profile) or profilesEqual(candidate, self.best_profile)) return;
-        for (self.work_candidates[0..self.work_candidate_count]) |existing| {
-            if (profilesEqual(existing, candidate)) return;
-        }
-        if (self.work_candidate_count >= self.work_candidates.len) return;
-        self.work_candidates[self.work_candidate_count] = candidate;
-        self.work_candidate_count += 1;
-    }
-
-    fn nextWorkCandidate(self: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) ?AdaptiveWorkProfile {
-        while (self.work_candidate_index < self.work_candidate_count) {
-            const candidate = self.normalizedProfile(self.work_candidates[self.work_candidate_index], request);
-            self.work_candidate_index += 1;
-            if (candidate.worker_threads == 0) continue;
-            if (profilesEqual(candidate, self.current_profile) or profilesEqual(candidate, self.best_profile)) continue;
-            return candidate;
-        }
-        return null;
-    }
-
-    fn rangeCandidate(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest, direction: AdaptiveWorkSearchStage) ?AdaptiveWorkProfile {
-        const best = self.best_profile;
-        if (best.worker_threads == 0 or self.range_step_items == 0) return null;
-
-        const min_items_per_range = self.normalizedItemsPerRange(self.config.min_items_per_range, request.range_alignment_items);
-        const max_items_per_range = self.effectiveMaxItemsPerRange(request);
-        const raw = switch (direction) {
-            .workers => unreachable,
-            .shrink => blk: {
-                if (best.items_per_range <= min_items_per_range + self.range_step_items) return null;
-                break :blk best.items_per_range - self.range_step_items;
-            },
-            .grow => blk: {
-                if (best.items_per_range >= max_items_per_range - self.range_step_items) return null;
-                break :blk best.items_per_range + self.range_step_items;
-            },
-        };
-
-        const candidate = self.normalizedProfile(.{
-            .worker_threads = best.worker_threads,
-            .items_per_range = raw,
-        }, request);
-        if (profilesEqual(candidate, self.best_profile) or profilesEqual(candidate, self.current_profile)) return null;
-        return candidate;
-    }
-
-    fn nextGrowRangeCandidate(self: *AdaptiveWorkTuner, request: AdaptiveWorkRequest) ?AdaptiveWorkProfile {
-        const best = self.best_profile;
-        if (best.worker_threads == 0) return null;
-
-        if (self.next_grow_items_per_range == 0) {
-            self.next_grow_items_per_range = self.nextLargerItemsPerRange(best.items_per_range, request) orelse return null;
-        }
-
-        while (true) {
-            const raw = self.next_grow_items_per_range;
-            const next = self.nextLargerItemsPerRange(raw, request);
-            self.next_grow_items_per_range = next orelse 0;
-            if (next == null) self.grow_exhausted = true;
-
-            const candidate = self.normalizedProfile(.{
-                .worker_threads = best.worker_threads,
-                .items_per_range = raw,
-            }, request);
-            if (!profilesEqual(candidate, self.best_profile) and !profilesEqual(candidate, self.current_profile)) {
-                return candidate;
-            }
-            if (next == null) return null;
-        }
-    }
-
-    fn nextLargerItemsPerRange(self: *const AdaptiveWorkTuner, current_items_per_range: usize, request: AdaptiveWorkRequest) ?usize {
-        const alignment = @max(request.range_alignment_items, @as(usize, 1));
-        const current = self.normalizedItemsPerRange(current_items_per_range, alignment);
-        const max_items_per_range = self.maxThreadedItemsPerRange(request);
-        if (current >= max_items_per_range) return null;
-
-        const doubled = saturatingMul(current, @as(usize, 2));
-        const raw = if (doubled > current) @min(doubled, max_items_per_range) else max_items_per_range;
-        const candidate = self.normalizedItemsPerRange(raw, alignment);
-        if (candidate <= current) return null;
-        return candidate;
-    }
-
-    fn maxThreadedItemsPerRange(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
-        if (request.item_count <= 1) return self.config.min_items_per_range;
-
-        const alignment = @max(request.range_alignment_items, @as(usize, 1));
-        const max_raw = @min(self.config.max_items_per_range, request.item_count - 1);
-        const aligned = alignItemCountDown(max_raw, alignment);
-        if (aligned >= self.config.min_items_per_range) return aligned;
-        return @min(max_raw, self.config.min_items_per_range);
-    }
-
-    fn updateRangeStepAfterWin(self: *AdaptiveWorkTuner, candidate: AdaptiveWorkProfile) void {
-        const request = self.last_request orelse return;
-        if (self.range_step_items == 0) {
-            self.range_step_items = self.initialRangeStep(candidate.items_per_range, request);
-        }
-    }
-
-    fn maxUsefulItemsPerRange(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest, max_items_per_range: usize) usize {
-        if (request.item_count == 0) return self.config.min_items_per_range;
-        var target_ranges = @max(@as(usize, 2), saturatingAdd(request.max_worker_threads, 1));
-        const max_target_ranges = @max(target_ranges, rangeCount(request.item_count, self.config.min_items_per_range));
-        while (target_ranges < max_target_ranges) : (target_ranges += 1) {
-            const candidate = self.normalizedItemsPerRange(
-                @min(targetRangeSizeForRangeCount(request.item_count, target_ranges), max_items_per_range),
-                request.range_alignment_items,
-            );
-            if (rangeCount(request.item_count, candidate) > request.max_worker_threads) return candidate;
-        }
-        return self.normalizedItemsPerRange(self.config.min_items_per_range, request.range_alignment_items);
-    }
-
     fn effectiveMaxItemsPerRange(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
         if (request.item_count == 0) return self.config.min_items_per_range;
         return @max(
@@ -655,32 +510,6 @@ pub const AdaptiveWorkTuner = struct {
         else
             self.config.improvement_threshold_percent;
         return isMeaningfullyFaster(mean_ns, best_ns, threshold);
-    }
-
-    fn rejectProfile(self: *AdaptiveWorkTuner) void {
-        if (self.candidate_profile == null) {
-            self.settle();
-            return;
-        }
-
-        switch (self.search_stage) {
-            .workers => {
-                self.failed_profile_count = 0;
-            },
-            .shrink => {
-                self.rejected_shrink = true;
-                self.search_stage = .grow;
-                self.failed_profile_count = 0;
-            },
-            .grow => {
-                self.failed_profile_count += 1;
-                if (self.failed_profile_count >= self.config.settle_after_failed_profiles) {
-                    self.settle();
-                    return;
-                }
-            },
-        }
-        self.startNextProfile();
     }
 
     fn resetSamples(self: *AdaptiveWorkTuner) void {
@@ -1072,6 +901,22 @@ fn targetRangeSizeForRangeCount(item_count: usize, target_ranges: usize) usize {
     return @max(@as(usize, 1), ceilDiv(item_count, @max(target_ranges, @as(usize, 1))));
 }
 
+fn clampUsize(value: usize, minimum: usize, maximum: usize) usize {
+    return @min(@max(value, minimum), maximum);
+}
+
+fn roundedUsize(value: f64) usize {
+    if (value <= 1) return 1;
+    const max_f: f64 = @floatFromInt(std.math.maxInt(usize));
+    if (value >= max_f) return std.math.maxInt(usize);
+    return @intFromFloat(@floor(value + 0.5));
+}
+
+fn ewma(current: f64, observed: f64, alpha: f64) f64 {
+    if (current <= 0) return observed;
+    return current * (1.0 - alpha) + observed * alpha;
+}
+
 fn maxUsefulWorkersForRange(item_count: usize, items_per_range: usize, max_worker_threads: usize) usize {
     const ranges = rangeCount(item_count, @max(items_per_range, @as(usize, 1)));
     if (ranges <= 1) return 0;
@@ -1089,6 +934,8 @@ fn normalizeWorkTunerConfig(config: AdaptiveWorkTunerConfig) AdaptiveWorkTunerCo
     normalized.item_count_reset_percent = @min(normalized.item_count_reset_percent, @as(u8, 100));
     normalized.settle_after_failed_profiles = @max(normalized.settle_after_failed_profiles, @as(usize, 1));
     normalized.retune_after_settled_windows = @max(normalized.retune_after_settled_windows, @as(usize, 1));
+    normalized.min_ranges_per_participant = @max(normalized.min_ranges_per_participant, @as(usize, 1));
+    normalized.max_ranges_per_participant = @max(normalized.max_ranges_per_participant, normalized.min_ranges_per_participant);
     return normalized;
 }
 
@@ -1327,7 +1174,7 @@ test "parallel for options use provided adaptive work tuner" {
         .adaptive_tuner = &adaptive_tuner,
     });
 
-    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expect(stats.item_count == hits.len);
     try std.testing.expect(adaptive_tuner.report().best_mean_batch_duration_ns > 0);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
     for (&hits) |*hit| {
@@ -1495,7 +1342,7 @@ test "adaptive work tuner default threshold keeps cheap inline work settled" {
     try std.testing.expectEqual(@as(usize, 0), report.current_profile.worker_threads);
 }
 
-test "adaptive work tuner probes complete threaded profile after slow inline batch" {
+test "adaptive work tuner predicts threaded profile from slow inline batch" {
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 64,
         .min_items_per_range = 16,
@@ -1503,41 +1350,20 @@ test "adaptive work tuner probes complete threaded profile after slow inline bat
         .sample_window = 1,
         .threaded_batch_ns = 1000,
     });
+    const request = tunerTestRequest(1024, 4, 16, 64);
 
-    const inline_profile = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
+    const inline_profile = tuner.selectProfile(request);
     tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 4000));
     try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
 
-    const candidate = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    try std.testing.expectEqual(@as(usize, 4), candidate.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), candidate.items_per_range);
+    const candidate = tuner.selectProfile(request);
+    try std.testing.expect(candidate.worker_threads > 0);
+    try std.testing.expect(candidate.worker_threads <= request.max_worker_threads);
+    try std.testing.expect(candidate.items_per_range >= 16);
+    try std.testing.expect(candidate.items_per_range <= 256);
 }
 
-test "adaptive work tuner commits faster threaded profile" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-        .improvement_threshold_percent = 5,
-    });
-
-    const inline_profile = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 4000));
-    const candidate = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, candidate, 800));
-
-    const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, report.phase);
-    try std.testing.expectEqual(@as(usize, 4), report.current_profile.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), report.current_profile.items_per_range);
-    try std.testing.expectEqual(@as(usize, 4), report.best_profile.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), report.best_profile.items_per_range);
-    try std.testing.expectEqual(@as(u64, 800), report.best_mean_batch_duration_ns);
-}
-
-test "adaptive work tuner keeps best measured threaded profile through rejected probes" {
+test "adaptive work tuner commits verified predicted profile" {
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 64,
         .min_items_per_range = 16,
@@ -1549,172 +1375,17 @@ test "adaptive work tuner keeps best measured threaded profile through rejected 
 
     const request = tunerTestRequest(1024, 4, 16, 64);
     const inline_profile = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 1500));
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 4000));
     const candidate = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(1024, candidate, 1300));
-
-    var guard: usize = 0;
-    while (!tuner.isSettled() and guard < 512) : (guard += 1) {
-        const rejected = tuner.selectProfile(request);
-        tuner.record(tunerTestBatchWithProfile(1024, rejected, 1600));
-    }
+    tuner.record(tunerTestBatchWithProfile(1024, candidate, 800));
 
     const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
     try std.testing.expectEqual(candidate.worker_threads, report.current_profile.worker_threads);
     try std.testing.expectEqual(candidate.items_per_range, report.current_profile.items_per_range);
-    try std.testing.expectEqual(@as(u64, 1300), report.best_mean_batch_duration_ns);
-}
-
-test "adaptive work tuner starts threaded probing at fallback range" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-
-    const inline_profile = tuner.selectProfile(tunerTestRequest(12_000, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(12_000, inline_profile, 4000));
-
-    const candidate = tuner.selectProfile(tunerTestRequest(12_000, 4, 16, 64));
-    try std.testing.expectEqual(@as(usize, 4), candidate.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), candidate.items_per_range);
-}
-
-test "adaptive work tuner starts cheap threaded work with conservative workers" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-
-    const inline_profile = tuner.selectProfile(tunerTestRequest(4096, 10, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(4096, inline_profile, 1500));
-
-    const candidate = tuner.selectProfile(tunerTestRequest(4096, 10, 16, 64));
-    try std.testing.expectEqual(@as(usize, 2), candidate.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), candidate.items_per_range);
-}
-
-test "adaptive work tuner scales worker candidates to request max" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-
-    const inline_profile = tuner.selectProfile(tunerTestRequest(65_536, 64, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(65_536, inline_profile, 4000));
-
-    const candidate = tuner.selectProfile(tunerTestRequest(65_536, 64, 16, 64));
-    try std.testing.expectEqual(@as(usize, 64), candidate.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), candidate.items_per_range);
-}
-
-test "adaptive work tuner measures worker threads and items_per_range together" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-    const request = tunerTestRequest(16_384, 10, 16, 64);
-
-    const inline_profile = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(16_384, inline_profile, 4000));
-    const max_threads = tuner.selectProfile(request);
-    try std.testing.expectEqual(@as(usize, 10), max_threads.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), max_threads.items_per_range);
-    tuner.record(tunerTestBatchWithProfile(16_384, max_threads, 1000));
-    const smaller_range = tuner.selectProfile(request);
-    try std.testing.expectEqual(@as(usize, 10), smaller_range.worker_threads);
-    try std.testing.expectEqual(@as(usize, 32), smaller_range.items_per_range);
-    tuner.record(tunerTestBatchWithProfile(16_384, smaller_range, 1100));
-    const larger_range = tuner.selectProfile(request);
-    try std.testing.expectEqual(@as(usize, 10), larger_range.worker_threads);
-    try std.testing.expectEqual(@as(usize, 256), larger_range.items_per_range);
-}
-
-test "adaptive work tuner keeps faster high thread timing over slower low thread timing" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-    const request = tunerTestRequest(16_384, 10, 16, 64);
-
-    recordSyntheticTuningRun(&tuner, request, .{ .worker_threads = 10, .items_per_range = 64 }, 800, 1000);
-
-    const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
-    try std.testing.expectEqual(@as(usize, 10), report.best_profile.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), report.best_profile.items_per_range);
     try std.testing.expectEqual(@as(u64, 800), report.best_mean_batch_duration_ns);
 }
 
-test "adaptive work tuner can select lower thread count when timing wins" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-    });
-    const request = tunerTestRequest(16_384, 10, 16, 64);
-
-    recordSyntheticTuningRun(&tuner, request, .{ .worker_threads = 2, .items_per_range = 64 }, 700, 1000);
-
-    const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
-    try std.testing.expectEqual(@as(usize, 2), report.best_profile.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), report.best_profile.items_per_range);
-    try std.testing.expectEqual(@as(u64, 700), report.best_mean_batch_duration_ns);
-}
-
-test "adaptive work tuner does not let one noisy low thread sample beat high thread timing" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 3,
-        .threaded_batch_ns = 1000,
-    });
-    const request = tunerTestRequest(16_384, 10, 16, 64);
-
-    recordSyntheticTuningRun(&tuner, request, .{ .worker_threads = 10, .items_per_range = 64 }, 1000, 1200);
-
-    const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
-    try std.testing.expectEqual(@as(usize, 10), report.best_profile.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), report.best_profile.items_per_range);
-    try std.testing.expectEqual(@as(u64, 1000), report.best_mean_batch_duration_ns);
-}
-
-test "adaptive work tuner searches smaller ranges around best threaded profile" {
-    var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .sample_window = 1,
-        .threaded_batch_ns = 1000,
-        .improvement_threshold_percent = 5,
-    });
-
-    const inline_profile = tuner.selectProfile(tunerTestRequest(8192, 1, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(8192, inline_profile, 1500));
-    const first_candidate = tuner.selectProfile(tunerTestRequest(8192, 1, 16, 64));
-    try std.testing.expectEqual(@as(usize, 1), first_candidate.worker_threads);
-    try std.testing.expectEqual(@as(usize, 64), first_candidate.items_per_range);
-
-    tuner.record(tunerTestBatchWithProfile(8192, first_candidate, 800));
-    const second_candidate = tuner.selectProfile(tunerTestRequest(8192, 1, 16, 64));
-    try std.testing.expectEqual(@as(usize, 1), second_candidate.worker_threads);
-    try std.testing.expect(second_candidate.items_per_range < first_candidate.items_per_range);
-    try std.testing.expect(second_candidate.items_per_range > 16);
-}
-
-test "adaptive work tuner shrink search reaches high range counts" {
+test "adaptive work tuner computes more workers for larger measured work" {
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 64,
         .min_items_per_range = 16,
@@ -1722,22 +1393,36 @@ test "adaptive work tuner shrink search reaches high range counts" {
         .threaded_batch_ns = 1000,
     });
 
-    const request = tunerTestRequest(65_536, 10, 16, 64);
+    const request = tunerTestRequest(65_536, 64, 16, 64);
     const inline_profile = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(65_536, inline_profile, 4000));
+    tuner.record(tunerTestBatchWithProfile(65_536, inline_profile, 1_000_000));
 
-    var found_large_range_shape = false;
-    var guard: usize = 0;
-    while (!tuner.isSettled() and guard < 64) : (guard += 1) {
-        const candidate = tuner.selectProfile(request);
-        if (candidate.worker_threads == 10 and candidate.items_per_range <= 320) {
-            found_large_range_shape = true;
-            break;
-        }
-        tuner.record(tunerTestBatchWithProfile(65_536, candidate, @intCast(candidate.items_per_range)));
-    }
+    const candidate = tuner.selectProfile(request);
+    try std.testing.expect(candidate.worker_threads > 1);
+    try std.testing.expect(candidate.worker_threads <= request.max_worker_threads);
+}
 
-    try std.testing.expect(found_large_range_shape);
+test "adaptive work tuner derives range size from range overhead policy" {
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_items_per_range = 64,
+        .min_items_per_range = 16,
+        .sample_window = 1,
+        .threaded_batch_ns = 1000,
+        .min_ranges_per_participant = 2,
+        .max_ranges_per_participant = 2,
+    });
+    const request = tunerTestRequest(16_384, 10, 16, 64);
+
+    const inline_profile = tuner.selectProfile(request);
+    tuner.record(tunerTestBatchWithProfile(16_384, inline_profile, 1_000_000));
+    const candidate = tuner.selectProfile(request);
+    const participants = candidate.worker_threads + 1;
+    const target_ranges = participants * 2;
+    const expected_items_per_range = alignItemCount(
+        targetRangeSizeForRangeCount(request.item_count, target_ranges),
+        request.range_alignment_items,
+    );
+    try std.testing.expectEqual(expected_items_per_range, candidate.items_per_range);
 }
 
 test "adaptive work tuner keeps inline when first threaded probe loses" {
@@ -1793,9 +1478,9 @@ test "adaptive work tuner clears in-progress profile after item count shift" {
     });
 
     const profile = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, profile, 1000));
+    tuner.record(tunerTestBatchWithProfile(1024, profile, 1_000_000));
     try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
-    try std.testing.expectEqual(@as(u64, 1000), tuner.report().best_mean_batch_duration_ns);
+    try std.testing.expectEqual(@as(u64, 1_000_000), tuner.report().best_mean_batch_duration_ns);
 
     _ = tuner.selectProfile(tunerTestRequest(2048, 4, 16, 64));
     const report = tuner.report();
@@ -1817,13 +1502,13 @@ test "adaptive work tuner item count reset starts new workload inline" {
     const request = tunerTestRequest(1024, 4, 16, 16);
 
     const inline_profile = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 1500));
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 1_000_000));
     const threaded = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(1024, threaded, 800));
+    tuner.record(tunerTestBatchWithProfile(1024, threaded, 100_000));
     var settle_guard: usize = 0;
     while (!tuner.isSettled() and settle_guard < 64) : (settle_guard += 1) {
         const candidate = tuner.selectProfile(request);
-        tuner.record(tunerTestBatchWithProfile(1024, candidate, 1200));
+        tuner.record(tunerTestBatchWithProfile(1024, candidate, 150_000));
     }
     try std.testing.expect(tuner.isSettled());
     try std.testing.expect(tuner.report().current_profile.worker_threads > 0);
@@ -1833,12 +1518,11 @@ test "adaptive work tuner item count reset starts new workload inline" {
     try std.testing.expectEqual(AdaptiveWorkPhase.learning, tuner.report().phase);
 }
 
-test "adaptive work tuner settled threaded retune does not probe inline" {
-    const inline_baseline_ns = 1500;
-    const first_threaded_win_ns = 800;
-    const settled_threaded_ns = 900;
-    const losing_threaded_challenger_ns = 1200;
-    const rejected_threaded_candidate_ns = 1000;
+test "adaptive work tuner settled threaded retune does not fall back inline" {
+    const inline_baseline_ns = 1_000_000;
+    const first_threaded_win_ns = 100_000;
+    const settled_threaded_ns = 110_000;
+    const losing_threaded_challenger_ns = 150_000;
 
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 16,
@@ -1865,28 +1549,19 @@ test "adaptive work tuner settled threaded retune does not probe inline" {
 
     const settled = tuner.selectProfile(request);
     tuner.record(tunerTestBatchWithProfile(1024, settled, settled_threaded_ns));
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
-
-    const threaded_candidate = tuner.selectProfile(request);
-    try std.testing.expect(threaded_candidate.worker_threads > 0);
-    tuner.record(tunerTestBatchWithProfile(1024, threaded_candidate, losing_threaded_challenger_ns));
-    var return_guard: usize = 0;
-    while (!tuner.isSettled() and return_guard < 64) : (return_guard += 1) {
-        const candidate = tuner.selectProfile(request);
-        tuner.record(tunerTestBatchWithProfile(1024, candidate, rejected_threaded_candidate_ns));
-    }
-    try std.testing.expect(tuner.isSettled());
+    const after_retune = tuner.selectProfile(request);
+    try std.testing.expect(after_retune.worker_threads > 0);
+    tuner.record(tunerTestBatchWithProfile(1024, after_retune, losing_threaded_challenger_ns));
 
     const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
     try std.testing.expect(report.current_profile.worker_threads > 0);
 }
 
 test "adaptive work tuner retune keeps threaded profile when inline loses" {
-    const inline_baseline_ns = 1500;
-    const first_threaded_win_ns = 800;
-    const settled_threaded_ns = 900;
-    const losing_threaded_challenger_ns = 1200;
+    const inline_baseline_ns = 1_000_000;
+    const first_threaded_win_ns = 100_000;
+    const settled_threaded_ns = 110_000;
+    const losing_threaded_challenger_ns = 150_000;
 
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 16,
@@ -1913,7 +1588,6 @@ test "adaptive work tuner retune keeps threaded profile when inline loses" {
 
     const settled = tuner.selectProfile(request);
     tuner.record(tunerTestBatchWithProfile(1024, settled, settled_threaded_ns));
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
     const threaded_candidate = tuner.selectProfile(request);
     try std.testing.expect(threaded_candidate.worker_threads > 0);
     tuner.record(tunerTestBatchWithProfile(1024, threaded_candidate, losing_threaded_challenger_ns));
@@ -1925,7 +1599,6 @@ test "adaptive work tuner retune keeps threaded profile when inline loses" {
     try std.testing.expect(tuner.isSettled());
 
     const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
     try std.testing.expect(report.current_profile.worker_threads > 0);
 }
 
@@ -1953,7 +1626,7 @@ test "adaptive work tuner keeps aligned items_per_range within max when possible
     try std.testing.expectEqual(@as(usize, 64), profile.items_per_range);
 }
 
-test "adaptive work tuner reopens probing after settled cooldown" {
+test "adaptive work tuner settled cooldown keeps stable model settled" {
     var tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = 64,
         .min_items_per_range = 16,
@@ -1964,25 +1637,25 @@ test "adaptive work tuner reopens probing after settled cooldown" {
     });
 
     const inline_profile = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 1500));
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, 1_000_000));
     const candidate = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, candidate, 1000));
+    tuner.record(tunerTestBatchWithProfile(1024, candidate, 100_000));
     var guard: usize = 0;
     while (!tuner.isSettled() and guard < 512) : (guard += 1) {
         const rejected = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-        tuner.record(tunerTestBatchWithProfile(1024, rejected, 1500));
+        tuner.record(tunerTestBatchWithProfile(1024, rejected, 150_000));
     }
     try std.testing.expect(tuner.isSettled());
 
     const settled = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 64));
-    tuner.record(tunerTestBatchWithProfile(1024, settled, 1500));
+    tuner.record(tunerTestBatchWithProfile(1024, settled, 110_000));
     try std.testing.expect(tuner.isSettled());
 
-    tuner.record(tunerTestBatchWithProfile(1024, settled, 1500));
+    tuner.record(tunerTestBatchWithProfile(1024, settled, 110_000));
 
     const report = tuner.report();
-    try std.testing.expectEqual(AdaptiveWorkPhase.probing, report.phase);
-    try std.testing.expect(report.candidate_profile != null);
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
+    try std.testing.expectEqual(@as(?AdaptiveWorkProfile, null), report.candidate_profile);
 }
 
 test "worker scratch slots include main thread and worker threads" {
