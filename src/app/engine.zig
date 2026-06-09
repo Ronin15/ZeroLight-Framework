@@ -211,7 +211,7 @@ pub const Engine = struct {
         time_loop: *TimeLoop,
     ) !void {
         const was_paused = self.pause.isPaused();
-        if (frame_policy.should_pause_gameplay and !self.pause.isPaused()) {
+        if (frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.states.isGameplayActive()) {
             log.debug("pausing gameplay while window cannot render", .{});
         }
         try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.nowNs());
@@ -220,7 +220,7 @@ pub const Engine = struct {
         {
             log.debug("resuming gameplay by input command", .{});
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());
-        } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause)) {
+        } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause) and self.states.isGameplayActive()) {
             log.debug("pausing gameplay by input command", .{});
             try self.pause.enterUser(&self.states, &self.input, time_loop, self.nowNs());
         }
@@ -274,11 +274,13 @@ pub const Engine = struct {
                     }
                 },
                 .skipped_no_swapchain => {
-                    if (!self.pause.isPaused()) {
-                        log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
-                    }
                     self.swapchain_blocked = true;
-                    try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                    if (self.states.isGameplayActive()) {
+                        if (!self.pause.isPaused()) {
+                            log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
+                        }
+                        try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                    }
                     frame_pacer.paceFallbackFrame(frame_start_ns);
                 },
             }

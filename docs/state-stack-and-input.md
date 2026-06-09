@@ -82,10 +82,23 @@ when the stack shuts down.
 
 ## Policies
 
-- `replaceGameplay` installs a normal gameplay/screen state.
+- `replaceGameplay` installs a normal gameplay/screen state (carries `StatePolicy.gameplay = true`).
 - `pushModal` blocks updates and events below it while still rendering lower states.
 - `pushOverlay` allows updates, events, and rendering below it.
 - `pushOpaque` blocks rendering below it for full-screen replacement views.
+
+`StatePolicy` carries a `gameplay: bool` flag (defaults false; only `state_policy.gameplay` sets it true).
+This flag is the source of truth for "active game state" (states installed via `replaceGameplay` / `replaceOwnedGameplay`).
+It is independent of the routing / update / render / events policy bits.
+
+Pause (user via P or `resumeGame` reversal, and window/frame-policy via `should_pause_gameplay`) only enters
+when a gameplay state is active (`StateStack.isGameplayActive()`). `PauseController` (and light guards in `Engine`)
+gate entry so the `PauseState` overlay + audio duck + time reset is never applied over menus or other non-gameplay
+states. `pauseActive` / `resumeActive` (called by the controller) walk to the unique recipient entry carrying the
+`gameplay` flag and deliver `onPause` / `onResume` to it. This ensures the real owner (e.g. `GameDemoState`)
+receives the interp sync call even when a pass-through overlay (or the PauseState modal itself after push) is
+the literal top of the stack. Menus and pure UI states implement `onPause` as a no-op and never receive it from
+the pause flow.
 
 Policies also control named-action routing:
 
@@ -99,6 +112,10 @@ Policies also control named-action routing:
 The top state controls command availability. Held gameplay input is also gated
 by modal and opaque states in the active event path, so pass-through overlays do
 not tunnel movement through a modal state beneath them.
+
+`.pause` / `.resumeGame` remain routable under modal and opaque policies (intentionally, to support
+P/Enter/Space resume when the pause overlay is the top modal, and Esc/quit flows inside menus).
+The gameplay flag gate in the controller makes a pause command from a non-gameplay top a safe no-op.
 
 ## Input Model
 

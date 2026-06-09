@@ -13,6 +13,18 @@ const UpdateContext = @import("state.zig").UpdateContext;
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const c = @import("../platform/sdl.zig").c;
 
+/// PauseController owns user-initiated (.pause / P) and window-policy (hidden/minimized,
+/// swapchain-blocked) pause entry/exit + source tracking.
+///
+/// Only enters (user or policy) and notifies via pauseActive when states.isGameplayActive().
+/// This restricts PauseState overlay + onPause (e.g. GameDemoState interp sync for movement/particles)
+/// exclusively to active game states installed via replaceGameplay / state_policy.gameplay.
+/// Non-gameplay states (MainMenu opaque_screen, Settings modal_overlay, any future HUD pass-through)
+/// never receive onPause from the pause flow, and PauseState is never pushed over them.
+///
+/// .pause/.resumeGame commands may still be generated under modals (per input routing policy,
+/// for resume-from-overlay and menu Esc/quit flows); the isGameplayActive gate here turns them
+/// into safe no-ops from menus. No changes to routing or command production.
 pub const PauseController = struct {
     handle: ?StateHandle = null,
     source: PauseSource = .none,
@@ -68,6 +80,9 @@ pub const PauseController = struct {
         try self.enter(.window_policy, states, input, time_loop, now_ns);
     }
 
+    /// Only enters (and calls pauseActive + pushModal(PauseState)) when !isPaused() and
+    /// states.isGameplayActive(). Non-gameplay tops (menus) cause early return: no notification,
+    /// no overlay, no time reset, no audio duck side-effect from this path.
     fn enter(
         self: *PauseController,
         source: PauseSource,
@@ -77,6 +92,7 @@ pub const PauseController = struct {
         now_ns: u64,
     ) !void {
         if (self.isPaused()) return;
+        if (!states.isGameplayActive()) return;
 
         states.pauseActive();
         input.releaseMovement();
@@ -108,7 +124,7 @@ pub const PauseController = struct {
         time_loop: *TimeLoop,
         now_ns: u64,
     ) !void {
-        if (policy.should_pause_gameplay) {
+        if (policy.should_pause_gameplay and states.isGameplayActive()) {
             try self.enterPolicy(states, input, time_loop, now_ns);
         } else if (self.isPolicyPaused()) {
             self.exit(states, input, time_loop, now_ns);
@@ -355,4 +371,128 @@ test "pause controller clears stale handle after stack replacement" {
 
     try std.testing.expect(!pause.isPaused());
     try std.testing.expectEqual(@as(usize, 1), states.len());
+}
+
+test "enterUser from opaque non-gameplay is no-op (no push, no count++, !isPaused)" {
+    const std = @import("std");
+
+    const TestingState = struct {
+        pause_count: *u32,
+        resume_count: *u32,
+
+        pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        pub fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn onPause(self: *@This()) void {
+            self.pause_count.* += 1;
+        }
+
+        pub fn onResume(self: *@This()) void {
+            self.resume_count.* += 1;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var pause_count: u32 = 0;
+    var resume_count: u32 = 0;
+    var input = InputState{};
+    var time_loop = TimeLoop.init(0);
+    var states = StateStack.init(std.testing.allocator);
+    defer states.deinit();
+    // Non-gameplay top (opaque_screen policy, as used for MainMenu bootstrap).
+    _ = try states.pushOpaque(TestingState, .{ .pause_count = &pause_count, .resume_count = &resume_count });
+    var pause = PauseController.init(800, 450);
+
+    try pause.enterUser(&states, &input, &time_loop, 10);
+    try pause.enterUser(&states, &input, &time_loop, 20); // idempotent no-op still
+
+    try std.testing.expect(!pause.isPaused());
+    try std.testing.expect(!pause.isPolicyPaused());
+    try std.testing.expectEqual(@as(usize, 1), states.len()); // no PauseState pushed
+    try std.testing.expectEqual(@as(u32, 0), pause_count);
+    try std.testing.expectEqual(@as(u32, 0), resume_count);
+}
+
+test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op from non-gameplay)" {
+    const std = @import("std");
+
+    const TestingState = struct {
+        pause_count: *u32,
+
+        pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        pub fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn onPause(self: *@This()) void {
+            self.pause_count.* += 1;
+        }
+
+        pub fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var pause_count: u32 = 0;
+    var input = InputState{};
+    var time_loop = TimeLoop.init(0);
+    var states = StateStack.init(std.testing.allocator);
+    defer states.deinit();
+    // Start as menu-like opaque non-gameplay.
+    _ = try states.pushOpaque(TestingState, .{ .pause_count = &pause_count });
+    var pause = PauseController.init(800, 450);
+
+    const policy_pause = FramePolicy{
+        .can_render = false,
+        .target_frame_ns = TimeLoop.fixed_delta_ns,
+        .should_pause_gameplay = true,
+    };
+    try pause.applyWindowPolicy(policy_pause, &states, &input, &time_loop, 10);
+    try pause.applyWindowPolicy(policy_pause, &states, &input, &time_loop, 20);
+
+    try std.testing.expect(!pause.isPaused());
+    try std.testing.expect(!pause.isPolicyPaused());
+    try std.testing.expectEqual(@as(usize, 1), states.len());
+    try std.testing.expectEqual(@as(u32, 0), pause_count);
+
+    // Now launch gameplay (replace), policy pause should take effect.
+    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count });
+    try pause.applyWindowPolicy(policy_pause, &states, &input, &time_loop, 30);
+    try std.testing.expect(pause.isPaused());
+    try std.testing.expect(pause.isPolicyPaused());
+    try std.testing.expectEqual(@as(usize, 2), states.len());
+    try std.testing.expectEqual(@as(u32, 1), pause_count);
 }

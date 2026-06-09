@@ -995,6 +995,19 @@ Acceptance checks:
 
 Slice 16 lands the first real menu layer. The implementation stays deliberately small (direct state-owned text leases, no widget system, keyboard only, volumes as the single live setting) while proving the full contract: state-driven navigation, ui input routing, text + logical renderer drawing, audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
 
+### Pause restriction + recipient targeting (post-Slice 16)
+
+This is a post-Slice 16 clarification that completes the pause contract:
+
+- `StatePolicy` gained an explicit `gameplay: bool` flag (true only on the `state_policy.gameplay` value used exclusively by `replaceGameplay` / `replaceOwnedGameplay`).
+- `StateStack` exposes `isGameplayActive()` (cheap any-entry walk) and uses a private `pauseRecipient()` walk to redirect `pauseActive`/`resumeActive` notifications to the gameplay-policy owner regardless of literal top (pass-through overlays are transparent; modals/opaques that are not gameplay simply mean no recipient).
+- `PauseController` (the owner per AGENTS) gates `enter` (both user and policy) and `applyWindowPolicy` on `isGameplayActive()`. `Engine` has corresponding light guards on its log/enter call sites in `applyFrameControls` and the `skipped_no_swapchain` path in `renderFrame`.
+- Result: `PauseState` + pause notifications (the `onPause` interp sync for `GameDemoState`'s systems) + audio duck / time reset are allowed *only* from active game states. Main menu / settings (opaque / modal) never receive `onPause` from this flow; P is inert on them (command may be produced by routing but gated at controller).
+- `onResume` / resume paths, reconcile, and "P/Enter from overlay" continue to work exactly as before when a real gameplay recipient is under the modal.
+- No changes to `src/game/pause_state.zig`, `GameDemoState`, input routing tables, `.pause` action classification, `DataSystem`, or hot paths. All main-thread, allocation-free, O(stack depth) only on pause events.
+- Added/extended focused `test` blocks (counter-based `TestingState` patterns) in `state.zig` and `pause_controller.zig`. `zig build verify` (tests + check + shaders) passes cleanly.
+- References the "in-game pause integration" future work noted in Slice 16; this locks the boundary so future pause/menu extensions have a clear, queryable gameplay vs. UI distinction (see also `state-stack-and-input.md` Policies section and `architecture.md` Coordination Boundaries).
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.

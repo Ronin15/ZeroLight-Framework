@@ -25,10 +25,11 @@ pub const StatePolicy = struct {
     render_below: bool = true,
     input_routing: InputRoutingPolicy = InputRoutingPolicy.gameplay(),
     blocks_held_gameplay_input: bool = false,
+    gameplay: bool = false,
 };
 
 pub const state_policy = struct {
-    pub const gameplay = StatePolicy{};
+    pub const gameplay = StatePolicy{ .gameplay = true };
     pub const modal_overlay = StatePolicy{
         .input_routing = InputRoutingPolicy.modalUi(),
         .blocks_held_gameplay_input = true,
@@ -366,14 +367,26 @@ pub const StateStack = struct {
         return routing;
     }
 
+    pub fn isGameplayActive(self: *const StateStack) bool {
+        for (self.states.items) |e| if (e.policy.gameplay) return true;
+        return false;
+    }
+
+    fn pauseRecipient(self: *StateStack) ?State {
+        for (self.states.items) |e| {
+            if (e.policy.gameplay) return e.state;
+        }
+        return null;
+    }
+
     pub fn pauseActive(self: *StateStack) void {
-        if (self.active()) |state| {
+        if (self.pauseRecipient()) |state| {
             state.onPause();
         }
     }
 
     pub fn resumeActive(self: *StateStack) void {
-        if (self.active()) |state| {
+        if (self.pauseRecipient()) |state| {
             state.onResume();
         }
     }
@@ -904,6 +917,13 @@ test "state stack input routing follows active state policy" {
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
+    // StatePolicy.gameplay flag is the source of truth for "active game state" (replaceGameplay users).
+    // The other three policies never carry it.
+    try std.testing.expect(state_policy.gameplay.gameplay);
+    try std.testing.expect(!state_policy.modal_overlay.gameplay);
+    try std.testing.expect(!state_policy.pass_through_overlay.gameplay);
+    try std.testing.expect(!state_policy.opaque_screen.gameplay);
+
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
@@ -1315,4 +1335,113 @@ test "pop on empty stack is safe and no-op" {
 
     try std.testing.expect(!result.quit_requested);
     try std.testing.expectEqual(@as(usize, 0), stack.len());
+}
+
+test "isGameplayActive and pauseActive/resumeActive target the gameplay policy entry (not literal top) even with pass-through overlay above" {
+    const TestingState = struct {
+        pause_count: *u32,
+        resume_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            self.pause_count.* += 1;
+        }
+
+        fn onResume(self: *@This()) void {
+            self.resume_count.* += 1;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var game_pause: u32 = 0;
+    var game_resume: u32 = 0;
+    var overlay_pause: u32 = 0;
+    var overlay_resume: u32 = 0;
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    _ = try stack.replaceGameplay(TestingState, .{ .pause_count = &game_pause, .resume_count = &game_resume });
+    _ = try stack.pushOverlay(TestingState, .{ .pause_count = &overlay_pause, .resume_count = &overlay_resume });
+
+    try std.testing.expect(stack.isGameplayActive());
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+    // Literal top is the pass-through overlay (which has gameplay=false), but recipient is the lower gameplay entry.
+    stack.pauseActive();
+    try std.testing.expectEqual(@as(u32, 1), game_pause);
+    try std.testing.expectEqual(@as(u32, 0), overlay_pause);
+
+    stack.resumeActive();
+    try std.testing.expectEqual(@as(u32, 1), game_resume);
+    try std.testing.expectEqual(@as(u32, 0), overlay_resume);
+}
+
+test "opaque non-gameplay top yields isGameplayActive false and pauseActive delivers no notification" {
+    const TestingState = struct {
+        pause_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            self.pause_count.* += 1;
+        }
+
+        fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var menu_pause: u32 = 0;
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+
+    // Simulate non-gameplay opaque top (e.g. MainMenu bootstrap via opaque_screen policy, or replaceOpaque).
+    // No replaceGameplay entry exists, so isGameplayActive is false and pauseActive is a no-op (no onPause delivered to menu).
+    _ = try stack.pushOpaque(TestingState, .{ .pause_count = &menu_pause });
+
+    try std.testing.expect(!stack.isGameplayActive());
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+
+    stack.pauseActive();
+    try std.testing.expectEqual(@as(u32, 0), menu_pause);
+
+    stack.resumeActive();
+    // (resume also no-op, no crash)
 }

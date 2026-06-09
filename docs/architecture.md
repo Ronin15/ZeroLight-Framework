@@ -119,6 +119,13 @@ State policies decide whether lower states receive updates, events, or render
 passes. Transitions are queued through `StateTransitions` and applied after the
 current dispatch completes.
 
+Pause notifications via `pauseActive`/`resumeActive` target the active `replaceGameplay`
+state (via the `StatePolicy.gameplay` flag on `StateStack`) so `GameDemoState` (and its
+`syncInterpolatedState` for movement/particles) receive the call even if overlays or the
+`PauseState` modal are present on top. `PauseController` + `Engine` gate entry (user + policy)
+so the pause overlay + associated side effects are never shown or applied over menus or
+non-gameplay states.
+
 ## Configuration And Diagnostics
 
 `AppConfig` is the runtime contract for app metadata, asset root, resolution
