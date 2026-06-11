@@ -6,8 +6,7 @@ const std = @import("std");
 const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
-const AssetCache = @import("../assets/cache.zig").AssetCache;
-const TextureLease = @import("../assets/cache.zig").TextureLease;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const inputRouter = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
 const Renderer = @import("../render/renderer.zig").Renderer;
@@ -61,14 +60,10 @@ pub const UpdateContext = struct {
 
 pub const RenderContext = struct {
     renderer: *Renderer,
-    asset_cache: *AssetCache,
+    runtime_assets: *RuntimeAssets,
     text_service: ?*TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
-
-    pub fn acquireTexture(self: RenderContext, relative_path: []const u8) !TextureLease {
-        return self.asset_cache.acquireTexture(self.renderer, relative_path);
-    }
 };
 
 pub const State = struct {
@@ -541,13 +536,13 @@ fn testUpdateContext(
 
 fn testRenderContext(
     renderer: *Renderer,
-    asset_cache: *AssetCache,
+    runtime_assets: *RuntimeAssets,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
 ) RenderContext {
     return .{
         .renderer = renderer,
-        .asset_cache = asset_cache,
+        .runtime_assets = runtime_assets,
         .text_service = null,
         .interpolation_alpha = interpolation_alpha,
         .thread_system = thread_system,
@@ -1067,18 +1062,14 @@ test "opaque state render policy hides states below it" {
     defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
-    var asset_cache = AssetCache.init(std.testing.allocator, .{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .root = "assets",
-    });
+    var runtime_assets = RuntimeAssets.init();
 
     _ = try stack.replaceGameplay(TestingState, .{ .render_count = &bottom_count });
     _ = try stack.pushOpaque(TestingState, .{ .render_count = &opaque_count });
     _ = try stack.pushOverlay(TestingState, .{ .render_count = &overlay_count });
 
     var renderer: Renderer = undefined;
-    try stack.render(testRenderContext(&renderer, &asset_cache, 0.0, &threads));
+    try stack.render(testRenderContext(&renderer, &runtime_assets, 0.0, &threads));
 
     try std.testing.expectEqual(@as(u32, 0), bottom_count);
     try std.testing.expectEqual(@as(u32, 1), opaque_count);
@@ -1124,11 +1115,7 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
-    var asset_cache = AssetCache.init(std.testing.allocator, .{
-        .allocator = std.testing.allocator,
-        .io = std.testing.io,
-        .root = "assets",
-    });
+    var runtime_assets = RuntimeAssets.init();
 
     _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .render_order = &render_order });
     try transitions.pushModal(TestingState, .{ .id = 2, .render_order = &render_order });
@@ -1140,7 +1127,7 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
 
     var renderer: Renderer = undefined;
-    try stack.render(testRenderContext(&renderer, &asset_cache, 0.0, &threads));
+    try stack.render(testRenderContext(&renderer, &runtime_assets, 0.0, &threads));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, render_order.items);
 }
 

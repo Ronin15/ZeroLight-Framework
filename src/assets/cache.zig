@@ -14,27 +14,11 @@ const Renderer = @import("../render/renderer.zig").Renderer;
 const TextureId = @import("../render/resources.zig").TextureId;
 
 pub const TextureLease = struct {
-    cache: ?*AssetCache = null,
-    backend_context: ?*anyopaque = null,
     handle: LeaseHandle = LeaseHandle.invalid,
     id: TextureId = TextureId.invalid,
 
     pub fn isAlive(self: TextureLease) bool {
-        const cache = self.cache orelse return false;
-        return self.backend_context != null and self.id.isValid() and cache.resolveLeaseSlotConst(self.handle) != null;
-    }
-
-    pub fn release(self: *TextureLease) void {
-        const cache = self.cache orelse return;
-        const backend_context = self.backend_context orelse return;
-        const handle = self.handle;
-
-        self.cache = null;
-        self.backend_context = null;
-        self.handle = LeaseHandle.invalid;
-        self.id = TextureId.invalid;
-
-        cache.releaseLeaseWithContext(backend_context, handle);
+        return self.handle.isValid() and self.id.isValid();
     }
 };
 
@@ -58,6 +42,10 @@ pub const AssetCache = struct {
         return self.acquireTextureWithContext(@ptrCast(renderer), relative_path);
     }
 
+    pub fn releaseTexture(self: *AssetCache, renderer: *Renderer, lease: *TextureLease) void {
+        self.releaseTextureLeaseWithContext(@ptrCast(renderer), lease);
+    }
+
     fn initWithBackend(allocator: std.mem.Allocator, assetStore: assets.AssetStore, backend: TextureBackend) AssetCache {
         return .{
             .allocator = allocator,
@@ -79,8 +67,6 @@ pub const AssetCache = struct {
             entry.retain_count += 1;
             log.debug("retained cached texture \"{s}\" count={}", .{ entry.path, entry.retain_count });
             return .{
-                .cache = self,
-                .backend_context = backend_context,
                 .handle = lease,
                 .id = entry.texture,
             };
@@ -117,11 +103,16 @@ pub const AssetCache = struct {
         const lease = try self.createLease(owned_path, texture);
         log.debug("loaded cached texture \"{s}\"", .{owned_path});
         return .{
-            .cache = self,
-            .backend_context = backend_context,
             .handle = lease,
             .id = texture,
         };
+    }
+
+    fn releaseTextureLeaseWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
+        const handle = lease.handle;
+        lease.handle = LeaseHandle.invalid;
+        lease.id = TextureId.invalid;
+        self.releaseLeaseWithContext(backend_context, handle);
     }
 
     fn releaseLeaseWithContext(
@@ -347,9 +338,9 @@ test "duplicate texture acquires reuse the same cached id" {
     defer cache.deinitWithContext(&fake);
 
     var first = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
-    defer first.release();
+    defer cache.releaseTextureLeaseWithContext(&fake, &first);
     var second = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
-    defer second.release();
+    defer cache.releaseTextureLeaseWithContext(&fake, &second);
 
     try std.testing.expectEqual(@as(u32, 1), fake.upload_count);
     try std.testing.expect(fake.last_width > 0);
@@ -369,24 +360,24 @@ test "texture leases destroy only after final release" {
     var first = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
     var second = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
 
-    first.release();
+    cache.releaseTextureLeaseWithContext(&fake, &first);
     try std.testing.expect(!first.isAlive());
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
 
-    second.release();
+    cache.releaseTextureLeaseWithContext(&fake, &second);
     try std.testing.expect(!second.isAlive());
     try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
 }
 
-test "texture lease release is idempotent" {
+test "explicit texture lease release is idempotent" {
     const allocator = std.testing.allocator;
     var fake = FakeBackend{};
     var cache = testCache(allocator);
     defer cache.deinitWithContext(&fake);
 
     var lease = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
-    lease.release();
-    lease.release();
+    cache.releaseTextureLeaseWithContext(&fake, &lease);
+    cache.releaseTextureLeaseWithContext(&fake, &lease);
 
     try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
 }
@@ -400,12 +391,17 @@ test "copied stale texture lease release does not touch freed cache path" {
     var lease = try cache.acquireTextureWithContext(&fake, "test/cache_probe.png");
     var copied = lease;
 
-    lease.release();
-    copied.release();
+    cache.releaseTextureLeaseWithContext(&fake, &lease);
+    cache.releaseTextureLeaseWithContext(&fake, &copied);
 
     try std.testing.expect(!lease.isAlive());
     try std.testing.expect(!copied.isAlive());
     try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
+}
+
+test "texture lease is a non owning token" {
+    try std.testing.expect(!@hasField(TextureLease, "cache"));
+    try std.testing.expect(!@hasField(TextureLease, "backend_context"));
 }
 
 test "invalid texture paths fail before backend upload" {

@@ -22,12 +22,13 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Implement Slice 17 startup runtime asset catalog as the next world-asset/content
-  slice before returning to Slice 7 render threading.
+- Finish the manual Slice 17 interaction smoke, then choose between Slice 7
+  parallel render prep and Slice 8 shader/platform validation as the next
+  engine-support track.
 - Defer Slice 8 shader/platform validation until that engine-support track is
   intentionally picked back up.
-- Defer Slice 7 parallel CPU render prep until world assets define the data shape
-  it should process.
+- Slice 17 now gives Slice 7 parallel CPU render prep a realistic sprite/audio
+  asset-ID data shape to process.
 - Slice 12 is now the gameplay-systems foundation for collision, AI intent,
   future path/query work, and deterministic rule outputs.
 - Before implementing grid pathfinding, keep multi-phase processor timing
@@ -1024,10 +1025,10 @@ Current foundation:
 - `AudioService` owns SDL3_mixer lifecycle, track pools, loaded audio handles,
   bus gains, and pause ducking.
 - `Renderer` owns live GPU textures and draw submission.
-- `DataSystem` stores persistent asset-reference component rows, but it must not
-  own live renderer or audio resources.
-- `RenderContext` currently exposes path-based texture acquisition;
-  `AudioCommandBuffer` currently carries copied audio paths.
+- `DataSystem` stores persistent asset-reference component rows as stable
+  `SpriteAssetId` values, but it does not own live renderer or audio resources.
+- `RenderContext` exposes `RuntimeAssets`; `AudioCommandBuffer` carries stable
+  `AudioAssetId` values plus playback parameters.
 
 Architecture notes:
 
@@ -1038,7 +1039,8 @@ Architecture notes:
 - `Engine` owns `RuntimeAssets`. It preloads declared sprites/images through
   `AssetCache` after `Renderer` exists and preloads declared audio through
   `AudioService` after the mixer service exists.
-- `RuntimeAssets` owns startup texture leases and exposes prepared sprite
+- `RuntimeAssets` owns startup texture lease tokens, releases them explicitly
+  through the live `AssetCache`/`Renderer` owner, and exposes prepared sprite
   metadata such as `{ texture, source_rect }`. Today each sprite can use a full
   texture; future atlas work can map the same `SpriteAssetId` to an atlas texture
   and source rectangle.
@@ -1059,43 +1061,52 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add a typed startup asset manifest with stable sprite and audio IDs.
-- [ ] Add Engine-owned `RuntimeAssets` that preloads declared sprite/image
+- [x] Add a typed startup asset manifest with stable sprite and audio IDs.
+- [x] Add Engine-owned `RuntimeAssets` that preloads declared sprite/image
       assets during `Engine.init`, owns their texture leases, and releases them
       before renderer teardown.
-- [ ] Add audio preload support so declared music and SFX IDs resolve to loaded
+- [x] Add audio preload support so declared music and SFX IDs resolve to loaded
       `AudioService` handles without path lookup during command drain.
-- [ ] Change render-facing code to resolve `SpriteAssetId` through
+- [x] Change render-facing code to resolve `SpriteAssetId` through
       `RuntimeAssets` instead of acquiring textures by relative path.
-- [ ] Change audio commands to carry `AudioAssetId` instead of copied relative
+- [x] Change audio commands to carry `AudioAssetId` instead of copied relative
       paths.
-- [ ] Change `DataSystem` asset-reference component data from relative paths to
+- [x] Change `DataSystem` asset-reference component data from relative paths to
       stable `SpriteAssetId` values.
-- [ ] Add the first demo sprite asset under `assets/sprites/` and assign sprite
+- [x] Add the first demo sprite asset under `assets/sprites/` and assign sprite
       IDs to player, AI squares, and obstacles.
-- [ ] Add or update render prep so entity render rows produce deterministic
+- [x] Add or update render prep so entity render rows produce deterministic
       sprite commands with primitive fallback for unavailable sprite IDs.
-- [ ] Update architecture and rendering/assets docs to describe startup preload,
+- [x] Update architecture and rendering/assets docs to describe startup preload,
       stable IDs, missing-asset behavior, and atlas-ready source rectangles.
 
 Acceptance checks:
 
-- [ ] Engine startup attempts to preload every declared sprite and audio asset
+- [x] Engine startup attempts to preload every declared sprite and audio asset
       once.
-- [ ] Missing declared content logs once, marks the asset unavailable, and does
+- [x] Missing declared content logs once, marks the asset unavailable, and does
       not abort app initialization.
-- [ ] Gameplay state, render prep, and audio commands use stable asset IDs
+- [x] Gameplay state, render prep, and audio commands use stable asset IDs
       rather than runtime string paths.
-- [ ] `DataSystem` contains no live renderer texture IDs, texture leases,
+- [x] `DataSystem` contains no live renderer texture IDs, texture leases,
       prepared sprite records, SDL_mixer handles, or loaded audio handles.
-- [ ] Render prep resolves `SpriteAssetId` to `{ texture, source_rect }` and
+- [x] Render prep resolves `SpriteAssetId` to `{ texture, source_rect }` and
       preserves deterministic draw ordering.
-- [ ] Future atlas mapping can change the catalog resolution without changing
+- [x] Future atlas mapping can change the catalog resolution without changing
       entity component storage.
-- [ ] `zig build fmt`, `zig build test`, `zig build check`, and
+- [x] `zig build fmt`, `zig build test`, `zig build check`, and
       `zig build verify` pass.
 - [ ] Manual `zig build dev` smoke confirms menu, gameplay, sprite rendering,
       audio, pause, debug overlay, and repeated transitions still work.
+
+Slice 17 lands the startup runtime asset catalog. `Engine` now preloads the
+manifest-declared demo sprite and audio set, gameplay stores stable sprite IDs,
+rendering resolves IDs through `RuntimeAssets` with primitive fallback, and
+audio commands drain by preloaded `AudioAssetId` instead of copied paths. The
+catalog release path uses the live cache/renderer owner rather than
+self-releasing lease pointers. The manual interactive smoke remains the final
+human check because the automated pass only starts `zig build dev` long enough
+to confirm menu startup and startup asset preload.
 
 ## Suggested Order
 

@@ -7,7 +7,7 @@
 //! directly with core/simd.zig and split contiguous ranges through ThreadSystem.
 
 const std = @import("std");
-const assets = @import("../assets/assets.zig");
+const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const simd = @import("../core/simd.zig");
@@ -159,12 +159,12 @@ pub const ConstPrimitiveVisualSlice = struct {
 };
 
 pub const AssetReference = struct {
-    relative_path: []const u8,
+    sprite: SpriteAssetId,
 };
 
 pub const ConstAssetReferenceSlice = struct {
     entities: []const EntityId,
-    relative_paths: []const []const u8,
+    sprite_ids: []const SpriteAssetId,
 };
 
 pub const CollisionBounds = struct {
@@ -497,20 +497,14 @@ pub const DataSystem = struct {
     }
 
     pub fn setAssetReference(self: *DataSystem, id: EntityId, asset_ref: AssetReference) !void {
-        try assets.validateRelativePath(asset_ref.relative_path);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
 
-        const owned_path = try self.allocator.dupe(u8, asset_ref.relative_path);
-        errdefer self.allocator.free(owned_path);
-
         if (slot.asset_ref_index) |index| {
-            const dense_index: usize = @intCast(index);
-            self.allocator.free(self.asset_refs.relative_paths.items[dense_index]);
-            self.asset_refs.relative_paths.items[dense_index] = owned_path;
+            self.asset_refs.sprite_ids.items[@intCast(index)] = asset_ref.sprite;
             return;
         }
 
-        const dense_index = try self.asset_refs.append(self.allocator, id, owned_path);
+        const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref.sprite);
         slot.asset_ref_index = dense_index;
         slot.addComponent(.asset_reference);
     }
@@ -518,7 +512,7 @@ pub const DataSystem = struct {
     pub fn assetReferenceConst(self: *const DataSystem, id: EntityId) ?AssetReference {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.asset_ref_index orelse return null;
-        return .{ .relative_path = self.asset_refs.relative_paths.items[@intCast(dense_index)] };
+        return .{ .sprite = self.asset_refs.sprite_ids.items[@intCast(dense_index)] };
     }
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
@@ -600,9 +594,6 @@ pub const DataSystem = struct {
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
-                    if (template.asset_reference) |asset_ref| {
-                        try assets.validateRelativePath(asset_ref.relative_path);
-                    }
                     const entity = try self.createEntity();
                     errdefer _ = self.destroyEntity(entity);
                     stats.created += 1;
@@ -680,9 +671,6 @@ pub const DataSystem = struct {
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
-                    if (template.asset_reference) |asset_ref| {
-                        try assets.validateRelativePath(asset_ref.relative_path);
-                    }
                     if (template.collision_bounds) |bounds| {
                         try validateCollisionBounds(bounds);
                     }
@@ -693,7 +681,6 @@ pub const DataSystem = struct {
                         try validateAiAgent(agent);
                     }
                 },
-                .set_asset_reference => |set| try assets.validateRelativePath(set.asset_reference.relative_path),
                 .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
                 .set_collision_response => |set| try validateCollisionResponse(set.response),
                 .set_ai_agent => |set| try validateAiAgent(set.agent),
@@ -1228,44 +1215,43 @@ const PrimitiveVisualStore = struct {
 
 const AssetReferenceStore = struct {
     entities: std.ArrayList(EntityId) = .empty,
-    relative_paths: std.ArrayList([]const u8) = .empty,
+    sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
 
-    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, owned_path: []const u8) !u32 {
+    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, sprite: SpriteAssetId) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
         const capacity = self.entities.items.len + 1;
         try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.relative_paths.ensureTotalCapacity(allocator, capacity);
+        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
-        self.relative_paths.appendAssumeCapacity(owned_path);
+        self.sprite_ids.appendAssumeCapacity(sprite);
         return index;
     }
 
     fn removeAt(self: *AssetReferenceStore, allocator: std.mem.Allocator, index: usize) ?EntityId {
-        allocator.free(self.relative_paths.items[index]);
+        _ = allocator;
         const last = self.entities.items.len - 1;
         const moved_entity = if (index != last) self.entities.items[last] else null;
         self.entities.items[index] = self.entities.items[last];
-        self.relative_paths.items[index] = self.relative_paths.items[last];
+        self.sprite_ids.items[index] = self.sprite_ids.items[last];
         _ = self.entities.pop();
-        _ = self.relative_paths.pop();
+        _ = self.sprite_ids.pop();
         return moved_entity;
     }
 
     fn sliceConst(self: *const AssetReferenceStore) ConstAssetReferenceSlice {
-        return .{ .entities = self.entities.items, .relative_paths = self.relative_paths.items };
+        return .{ .entities = self.entities.items, .sprite_ids = self.sprite_ids.items };
     }
 
     fn clearRetainingCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        for (self.relative_paths.items) |path| allocator.free(path);
+        _ = allocator;
         self.entities.clearRetainingCapacity();
-        self.relative_paths.clearRetainingCapacity();
+        self.sprite_ids.clearRetainingCapacity();
     }
 
     fn deinit(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        for (self.relative_paths.items) |path| allocator.free(path);
         self.entities.deinit(allocator);
-        self.relative_paths.deinit(allocator);
+        self.sprite_ids.deinit(allocator);
         self.* = .{};
     }
 };
@@ -1732,7 +1718,7 @@ test "destroying an entity removes every attached data row" {
     try data.setMovementBody(entity, testBody(1));
     try data.setFacing(entity, .{ .direction = .right });
     try data.setPrimitiveVisual(entity, testVisual());
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
     try data.setCollisionBounds(entity, testBounds(1));
     try data.setCollisionResponse(entity, testResponse(.bounce, .dynamic, 0.75));
 
@@ -1774,7 +1760,7 @@ test "reset invalidates old ids while keeping system reusable" {
 
     const entity = try data.createEntity();
     try data.setMovementBody(entity, testBody(1));
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
 
     data.reset();
     try std.testing.expect(!data.isAlive(entity));
@@ -1786,20 +1772,17 @@ test "reset invalidates old ids while keeping system reusable" {
     try std.testing.expect(reused.generation != entity.generation);
 }
 
-test "asset references validate safe relative paths and own path storage" {
+test "asset references store stable sprite ids" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     const entity = try data.createEntity();
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
-    try std.testing.expectEqualStrings("sprites/player.png", data.assetReferenceConst(entity).?.relative_path);
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
 
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player-alt.png" });
-    try std.testing.expectEqualStrings("sprites/player-alt.png", data.assetReferenceConst(entity).?.relative_path);
-
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "../player.png" }));
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "/tmp/player.png" }));
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "" }));
+    const slice = data.assetReferenceSliceConst();
+    try std.testing.expectEqual(@as(usize, 1), slice.entities.len);
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, slice.sprite_ids[0]);
 }
 
 test "collision bounds store is columnar compact and rejects invalid bounds" {
@@ -1981,19 +1964,20 @@ test "ai agent via EntityTemplate in structural create and mask queries" {
     try std.testing.expectEqual(@as(f32, 55), agent.wander_amplitude);
 }
 
-test "structural commands validate asset references before creating entities" {
+test "structural commands set stable asset references" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     const commands = [_]StructuralCommand{
         .{ .create_entity = .{
             .movement_body = testBody(1),
-            .asset_reference = .{ .relative_path = "../bad.png" },
+            .asset_reference = .{ .sprite = .demo_tile },
         } },
     };
 
-    try std.testing.expectError(error.InvalidAssetPath, data.applyStructuralCommands(&commands));
-    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    _ = try data.applyStructuralCommands(&commands);
+    const entity = data.assetReferenceSliceConst().entities[0];
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
 }
 
 test "structural commands prevalidate fallible data before mutating" {
@@ -2007,11 +1991,11 @@ test "structural commands prevalidate fallible data before mutating" {
         .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
         .{ .create_entity = .{
             .movement_body = testBody(2),
-            .asset_reference = .{ .relative_path = "../bad.png" },
+            .collision_bounds = .{ .size = .{ .x = 0, .y = 12 } },
         } },
     };
 
-    try std.testing.expectError(error.InvalidAssetPath, data.applyStructuralCommands(&commands));
+    try std.testing.expectError(error.InvalidCollisionBounds, data.applyStructuralCommands(&commands));
     try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
 }

@@ -9,7 +9,9 @@ game-specific behavior under `src/game/`.
 - `src/main.zig` creates `AppConfig`, initializes `Engine`, and runs the fixed-step loop.
 - `src/config.zig` defines app configuration, presentation options, clear color,
   and thread-system defaults shared by build options and runtime startup.
-- `src/app/engine.zig` coordinates SDL app flow, the window, asset cache, audio service, text service, renderer, state stack, pause controller, input, debug overlay, and thread system.
+- `src/app/engine.zig` coordinates SDL app flow, the window, asset cache,
+  runtime asset catalog, audio service, text service, renderer, state stack,
+  pause controller, input, debug overlay, and thread system.
 - `src/app/audio.zig` owns SDL3_mixer lifecycle, app-level audio tracks,
   loaded audio assets, bus gains, and the fixed-step audio command buffer.
 - `src/app/input.zig` owns named actions, held gameplay input, and one-frame app/debug commands.
@@ -19,9 +21,10 @@ game-specific behavior under `src/game/`.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
-- `src/assets/assets.zig` resolves safe runtime asset paths, `src/assets/image.zig`
-  decodes PNGs into transient CPU image data, and `src/assets/cache.zig` caches
-  renderer-backed runtime assets.
+- `src/assets/assets.zig` resolves safe runtime asset paths,
+  `src/assets/image.zig` decodes PNGs into transient CPU image data,
+  `src/assets/cache.zig` caches renderer-backed runtime assets, and
+  `src/assets/runtime_assets.zig` owns the startup runtime asset catalog.
 - `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
 - `src/render/camera.zig` owns simple world-to-screen camera transforms.
 - `src/render/resources.zig` defines generational renderer resource IDs and descriptors.
@@ -42,8 +45,8 @@ game-specific behavior under `src/game/`.
   `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports
   plus small SDL wrappers.
-- Audio assets live under `assets/audio/` and are resolved through the same
-  traversal-safe asset root.
+- Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
+  live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
@@ -94,19 +97,23 @@ coordinated by `Renderer` on the main/render thread.
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
 texture creation starts from decoded pixels and owns only the GPU texture
-resource. Retained `TextureId` leases and text texture leases belong to setup,
-state transitions, world/entity creation, or owner shutdown paths; hot render
-paths should keep drawing with retained IDs rather than performing asset,
-entity, or text lookup.
+resource. `Engine` owns `RuntimeAssets`, which preloads declared sprites through
+`AssetCache`, keeps retained texture lease tokens, releases them through the
+live cache/renderer owner, and exposes `SpriteAssetId` lookup as atlas-ready
+`{ texture, source_rect }` records. Hot render paths resolve stable IDs through
+this catalog and fall back to primitive rectangles when a declared sprite is
+unavailable. Engine-owned services must not persist pointers to sibling service
+fields; release paths take the live owner explicitly.
 
 Game states request SFX and music through `AudioCommandBuffer` in
-`UpdateContext`. `AudioService` is app-owned because SDL_mixer device, mixer,
-track pool, loaded-audio cache, bus gains, and pause ducking are process-level
-runtime services. States choose what sound to request; they do not own
-`MIX_Mixer`, `MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio
-commands on the main thread after fixed-step state updates and state transition
-application. Gameplay pause stops active SFX and ducks music; resume restores
-music gain.
+`UpdateContext` using stable `AudioAssetId` values. `AudioService` is app-owned
+because SDL_mixer device, mixer, track pool, loaded-audio cache, bus gains, and
+pause ducking are process-level runtime services. Startup preload resolves
+declared audio paths before command drain; fixed-step audio commands carry IDs,
+gain, priority, frequency, and position only. States do not own `MIX_Mixer`,
+`MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio commands on
+the main thread after fixed-step state updates and state transition application.
+Gameplay pause stops active SFX and ducks music; resume restores music gain.
 
 Raw keyboard input maps to named actions in `src/app/input.zig`.
 `input_router.zig` applies the active state stack's action contexts before
@@ -184,7 +191,7 @@ size.
 Gameplay states own their own `DataSystem`; it is not an app singleton. The
 system stores persistent world entities, per-entity component masks for system
 membership queries, and typed SoA data such as movement bodies, facing,
-primitive visual intent, and relative asset references.
+primitive visual intent, and stable sprite asset references.
 Collision bounds are stored as dedicated persistent gameplay data rather than
 being inferred from render visuals.
 
@@ -210,10 +217,11 @@ failures do not partially apply a command batch.
 
 Update processors receive typed slices or views from `DataSystem` during
 fixed-step updates instead of broad structural access. Render systems read
-immutable `DataSystem` slices during state render and submit draw calls through
-`Renderer`. `DataSystem` does not own SDL handles, GPU handles, SDL_mixer
-handles, live renderer texture IDs, asset leases, audio command buffers, input
-frame state, thread-system state, transient events, or scratch buffers.
+immutable `DataSystem` slices during state render, resolve stable sprite IDs
+through `RuntimeAssets`, and submit draw calls through `Renderer`. `DataSystem`
+does not own SDL handles, GPU handles, SDL_mixer handles, live renderer texture
+IDs, prepared sprite records, asset leases, audio command buffers, input frame
+state, thread-system state, transient events, or scratch buffers.
 
 `MovementSystem` updates movement-body slices as an ordered gameplay data
 processor, using SIMD lanes inside each assigned range and

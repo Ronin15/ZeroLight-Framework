@@ -7,6 +7,7 @@ const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const AudioService = @import("audio.zig").AudioService;
 const AssetCache = @import("../assets/cache.zig").AssetCache;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const build_options = @import("build_options");
 const config = @import("../config.zig");
 const DebugOverlay = if (build_options.debug_overlay) @import("../render/debug_overlay.zig").DebugOverlay else @import("../render/debug_overlay_stub.zig").DebugOverlay;
@@ -45,6 +46,7 @@ pub const Engine = struct {
     audio_commands: AudioCommandBuffer,
     renderer: Renderer,
     asset_cache: AssetCache,
+    runtime_assets: RuntimeAssets,
     text_service: TextService,
     debug_overlay: DebugOverlay,
     states: StateStack,
@@ -93,6 +95,10 @@ pub const Engine = struct {
         var asset_cache = AssetCache.init(allocator, assets);
         errdefer asset_cache.deinit(&renderer);
 
+        var runtime_assets = RuntimeAssets.init();
+        try runtime_assets.preload(assets, &asset_cache, &renderer, &audio_service);
+        errdefer runtime_assets.deinit(&asset_cache, &renderer);
+
         var text_service = try TextService.init(allocator, assets);
         errdefer text_service.deinit(&renderer);
 
@@ -136,6 +142,7 @@ pub const Engine = struct {
             .audio_commands = audio_commands,
             .renderer = renderer,
             .asset_cache = asset_cache,
+            .runtime_assets = runtime_assets,
             .text_service = text_service,
             .debug_overlay = debug_overlay,
             .states = states,
@@ -154,6 +161,7 @@ pub const Engine = struct {
         self.states.deinit();
         self.debug_overlay.deinit();
         self.text_service.deinit(&self.renderer);
+        self.runtime_assets.deinit(&self.asset_cache, &self.renderer);
         self.asset_cache.deinit(&self.renderer);
         self.renderer.deinit();
         self.audio_commands.deinit();
@@ -258,7 +266,7 @@ pub const Engine = struct {
             self.renderer.beginFrame(self.app_config.clear_color);
             try self.states.render(RenderContext{
                 .renderer = &self.renderer,
-                .asset_cache = &self.asset_cache,
+                .runtime_assets = &self.runtime_assets,
                 .text_service = &self.text_service,
                 .interpolation_alpha = interpolation_alpha,
                 .thread_system = &self.thread_system,

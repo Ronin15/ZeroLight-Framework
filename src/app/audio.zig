@@ -8,6 +8,9 @@
 
 const std = @import("std");
 const assets = @import("../assets/assets.zig");
+const manifest = @import("../assets/manifest.zig");
+const AudioAssetId = manifest.AudioAssetId;
+const AudioAssetKind = manifest.AudioAssetKind;
 const AudioConfig = @import("../config.zig").AudioConfig;
 const log = @import("../core/logging.zig").audio;
 const math = @import("../core/math.zig");
@@ -23,7 +26,7 @@ pub const AudioBus = enum {
 };
 
 pub const PlaySfxRequest = struct {
-    path: []const u8,
+    asset: AudioAssetId,
     gain: f32 = 1.0,
     priority: u8 = 128,
     frequency_ratio: f32 = 1.0,
@@ -31,7 +34,7 @@ pub const PlaySfxRequest = struct {
 };
 
 pub const MusicRequest = struct {
-    path: []const u8,
+    asset: AudioAssetId,
     gain: f32 = 1.0,
     loop: bool = true,
     fade_in_ms: u32 = 750,
@@ -48,7 +51,7 @@ pub const LoopingSfxId = struct {
 };
 
 const OwnedPlaySfxRequest = struct {
-    path: []const u8,
+    asset: AudioAssetId,
     gain: f32,
     priority: u8,
     frequency_ratio: f32,
@@ -56,7 +59,7 @@ const OwnedPlaySfxRequest = struct {
 };
 
 const OwnedMusicRequest = struct {
-    path: []const u8,
+    asset: AudioAssetId,
     gain: f32,
     loop: bool,
     fade_in_ms: u32,
@@ -72,15 +75,6 @@ pub const AudioCommand = union(enum) {
     set_listener: math.Vec2,
     set_bus_gain: BusGain,
     set_master_gain: f32,
-
-    fn path(self: AudioCommand) ?[]const u8 {
-        return switch (self) {
-            .play_sfx => |request| request.path,
-            .start_looping_sfx => |request| request.sfx.path,
-            .play_music => |request| request.path,
-            else => null,
-        };
-    }
 };
 
 pub const BusGain = struct {
@@ -124,17 +118,13 @@ pub const AudioCommandBuffer = struct {
     }
 
     pub fn playSfx(self: *AudioCommandBuffer, request: PlaySfxRequest) !void {
-        const owned_request = try self.copySfxRequest(request);
-        errdefer self.allocator.free(owned_request.path);
-        try self.append(.{ .play_sfx = owned_request });
+        try self.append(.{ .play_sfx = copySfxRequest(request) });
     }
 
     pub fn startLoopingSfx(self: *AudioCommandBuffer, id: LoopingSfxId, request: PlaySfxRequest) !void {
-        const owned_request = try self.copySfxRequest(request);
-        errdefer self.allocator.free(owned_request.path);
         try self.append(.{ .start_looping_sfx = .{
             .id = id,
-            .sfx = owned_request,
+            .sfx = copySfxRequest(request),
         } });
     }
 
@@ -143,11 +133,8 @@ pub const AudioCommandBuffer = struct {
     }
 
     pub fn playMusic(self: *AudioCommandBuffer, request: MusicRequest) !void {
-        try assets.validateRelativePath(request.path);
-        const path = try self.copyPathForCommand(request.path);
-        errdefer self.allocator.free(path);
         try self.append(.{ .play_music = .{
-            .path = path,
+            .asset = request.asset,
             .gain = clampGain(request.gain),
             .loop = request.loop,
             .fade_in_ms = request.fade_in_ms,
@@ -178,15 +165,9 @@ pub const AudioCommandBuffer = struct {
         try self.commands.append(self.allocator, command);
     }
 
-    fn copyPathForCommand(self: *AudioCommandBuffer, path: []const u8) ![]const u8 {
-        return try self.allocator.dupe(u8, path);
-    }
-
-    fn copySfxRequest(self: *AudioCommandBuffer, request: PlaySfxRequest) !OwnedPlaySfxRequest {
-        try assets.validateRelativePath(request.path);
-        const path = try self.copyPathForCommand(request.path);
+    fn copySfxRequest(request: PlaySfxRequest) OwnedPlaySfxRequest {
         return .{
-            .path = path,
+            .asset = request.asset,
             .gain = clampGain(request.gain),
             .priority = request.priority,
             .frequency_ratio = clampFrequencyRatio(request.frequency_ratio),
@@ -195,9 +176,6 @@ pub const AudioCommandBuffer = struct {
     }
 
     fn clearRetainingCapacity(self: *AudioCommandBuffer) void {
-        for (self.commands.items) |command| {
-            if (command.path()) |path| self.allocator.free(path);
-        }
         self.commands.clearRetainingCapacity();
     }
 };
@@ -212,9 +190,10 @@ pub const AudioService = struct {
     owns_backend_context: bool = false,
     entries: std.StringHashMapUnmanaged(AudioEntry) = .empty,
     failed_paths: std.StringHashMapUnmanaged(void) = .empty,
+    audio_assets: [manifest.audio_asset_count]AudioAssetSlot = initAudioAssetSlots(),
     sfx_tracks: std.ArrayList(TrackSlot) = .empty,
     music_track: BackendHandle = invalid_backend_handle,
-    current_music_path: ?[]const u8 = null,
+    current_music_asset: ?AudioAssetId = null,
     master_gain: f32,
     sfx_gain: f32,
     music_gain: f32,
@@ -313,6 +292,27 @@ pub const AudioService = struct {
         self.* = undefined;
     }
 
+    pub fn preloadAudio(
+        self: *AudioService,
+        id: AudioAssetId,
+        relative_path: []const u8,
+        kind: AudioAssetKind,
+        predecode: bool,
+    ) !bool {
+        try assets.validateRelativePath(relative_path);
+        const index = manifest.audioIndex(id);
+        self.audio_assets[index] = .{ .status = .unavailable, .kind = kind };
+        if (!self.enabled) return false;
+
+        const handle = try self.loadAudio(relative_path, predecode) orelse return false;
+        self.audio_assets[index] = .{
+            .status = .available,
+            .kind = kind,
+            .handle = handle,
+        };
+        return true;
+    }
+
     pub fn drain(self: *AudioService, commands: *const AudioCommandBuffer) void {
         if (!self.enabled) return;
         for (commands.items()) |command| {
@@ -378,7 +378,7 @@ pub const AudioService = struct {
     }
 
     fn playSfx(self: *AudioService, request: OwnedPlaySfxRequest) !void {
-        const audio = try self.loadAudio(request.path, true) orelse return;
+        const audio = try self.audioHandle(request.asset, .sfx) orelse return;
         const slot_index = try self.selectSfxTrack(request.priority) orelse return;
         const slot = &self.sfx_tracks.items[slot_index];
         try self.backend.stop_track(self.backend_context, slot.handle, 0);
@@ -413,7 +413,7 @@ pub const AudioService = struct {
             return;
         }
 
-        const audio = try self.loadAudio(request.path, true) orelse return;
+        const audio = try self.audioHandle(request.asset, .sfx) orelse return;
         const slot_index = try self.selectLoopingSfxTrack(request.priority) orelse return;
         const slot = &self.sfx_tracks.items[slot_index];
         try self.backend.stop_track(self.backend_context, slot.handle, 0);
@@ -442,11 +442,10 @@ pub const AudioService = struct {
     }
 
     fn playMusic(self: *AudioService, request: OwnedMusicRequest) !void {
-        const audio = try self.loadAudio(request.path, false) orelse return;
-        const stable_path = self.loadedAudioPath(request.path) orelse return error.AudioBackendFailure;
+        const audio = try self.audioHandle(request.asset, .music) orelse return;
         if (!request.restart) {
-            if (self.current_music_path) |current| {
-                if (std.mem.eql(u8, current, request.path)) {
+            if (self.current_music_asset) |current| {
+                if (current == request.asset) {
                     self.active_music_gain = request.gain;
                     self.applyMusicGain();
                     return;
@@ -457,14 +456,14 @@ pub const AudioService = struct {
         try self.backend.stop_track(self.backend_context, self.music_track, 0);
         try self.backend.set_track_audio(self.backend_context, self.music_track, audio);
         self.active_music_gain = request.gain;
-        self.current_music_path = stable_path;
+        self.current_music_asset = request.asset;
         try self.backend.set_track_gain(self.backend_context, self.music_track, self.effectiveMusicGain());
         try self.backend.play_track(self.backend_context, self.music_track, if (request.loop) -1 else 0, request.fade_in_ms);
     }
 
     fn stopMusic(self: *AudioService, fade_out_ms: u32) !void {
         try self.backend.stop_track(self.backend_context, self.music_track, fade_out_ms);
-        self.current_music_path = null;
+        self.current_music_asset = null;
     }
 
     fn stopAllSfx(self: *AudioService) void {
@@ -557,6 +556,13 @@ pub const AudioService = struct {
         slot.position = null;
     }
 
+    fn audioHandle(self: *const AudioService, id: AudioAssetId, kind: AudioAssetKind) !?BackendHandle {
+        const slot = self.audio_assets[manifest.audioIndex(id)];
+        if (slot.status != .available) return null;
+        if (slot.kind != kind) return error.InvalidAudioAssetKind;
+        return slot.handle;
+    }
+
     fn loadAudio(self: *AudioService, relative_path: []const u8, predecode: bool) !?BackendHandle {
         try assets.validateRelativePath(relative_path);
         if (self.entries.get(relative_path)) |entry| {
@@ -601,16 +607,27 @@ pub const AudioService = struct {
         return handle;
     }
 
-    fn loadedAudioPath(self: *const AudioService, relative_path: []const u8) ?[]const u8 {
-        const entry = self.entries.get(relative_path) orelse return null;
-        return entry.path;
-    }
-
     fn rememberFailedPath(self: *AudioService, owned_path: []const u8, owns_path: *bool) !void {
         try self.failed_paths.put(self.allocator, owned_path, {});
         owns_path.* = false;
     }
 };
+
+const AudioAssetSlot = struct {
+    status: AudioAssetStatus = .not_loaded,
+    kind: AudioAssetKind = .sfx,
+    handle: BackendHandle = invalid_backend_handle,
+};
+
+const AudioAssetStatus = enum {
+    not_loaded,
+    available,
+    unavailable,
+};
+
+fn initAudioAssetSlots() [manifest.audio_asset_count]AudioAssetSlot {
+    return [_]AudioAssetSlot{.{}} ** manifest.audio_asset_count;
+}
 
 const AudioEntry = struct {
     path: []const u8,
@@ -1006,29 +1023,25 @@ fn fakeSetTrackPosition(context: *anyopaque, track: BackendHandle, position: ?Ba
     fake.position_calls += 1;
 }
 
-test "audio command buffer validates paths and owns copied command paths" {
+test "audio command buffer stores stable ids and clamps command values" {
     var commands = AudioCommandBuffer.init(std.testing.allocator, 4);
     defer commands.deinit();
 
-    const mutable_path = try std.testing.allocator.dupe(u8, "audio/sfx/hit.wav");
-    defer std.testing.allocator.free(mutable_path);
-    try commands.playSfx(.{ .path = mutable_path, .gain = 2.0 });
-    mutable_path[0] = 'X';
+    try commands.playSfx(.{ .asset = .collision_sfx, .gain = 2.0 });
 
     try std.testing.expectEqual(@as(usize, 1), commands.len());
-    try std.testing.expectEqualStrings("audio/sfx/hit.wav", commands.items()[0].play_sfx.path);
+    try std.testing.expectEqual(AudioAssetId.collision_sfx, commands.items()[0].play_sfx.asset);
     try std.testing.expectEqual(@as(f32, 1.0), commands.items()[0].play_sfx.gain);
     try std.testing.expectEqual(@as(f32, 1.0), commands.items()[0].play_sfx.frequency_ratio);
-    try std.testing.expectError(error.InvalidAssetPath, commands.playSfx(.{ .path = "../bad.wav" }));
 }
 
 test "audio command buffer clamps invalid sfx frequency ratios" {
     var commands = AudioCommandBuffer.init(std.testing.allocator, 4);
     defer commands.deinit();
 
-    try commands.playSfx(.{ .path = "audio/sfx/low.wav", .frequency_ratio = 0.001 });
-    try commands.playSfx(.{ .path = "audio/sfx/high.wav", .frequency_ratio = 101.0 });
-    try commands.playSfx(.{ .path = "audio/sfx/nan.wav", .frequency_ratio = std.math.nan(f32) });
+    try commands.playSfx(.{ .asset = .collision_sfx, .frequency_ratio = 0.001 });
+    try commands.playSfx(.{ .asset = .collision_sfx, .frequency_ratio = 101.0 });
+    try commands.playSfx(.{ .asset = .collision_sfx, .frequency_ratio = std.math.nan(f32) });
 
     try std.testing.expectEqual(@as(f32, 0.01), commands.items()[0].play_sfx.frequency_ratio);
     try std.testing.expectEqual(@as(f32, 100.0), commands.items()[1].play_sfx.frequency_ratio);
@@ -1039,8 +1052,8 @@ test "audio command buffer enforces per-step command cap" {
     var commands = AudioCommandBuffer.init(std.testing.allocator, 1);
     defer commands.deinit();
 
-    try commands.playSfx(.{ .path = "audio/sfx/one.wav" });
-    try std.testing.expectError(error.AudioCommandLimitReached, commands.playSfx(.{ .path = "audio/sfx/two.wav" }));
+    try commands.playSfx(.{ .asset = .collision_sfx });
+    try std.testing.expectError(error.AudioCommandLimitReached, commands.playSfx(.{ .asset = .player_jet_sfx }));
     try std.testing.expectEqual(@as(usize, 1), commands.len());
     commands.beginStep();
     try std.testing.expectEqual(@as(usize, 0), commands.len());
@@ -1078,23 +1091,27 @@ test "audio service init cleans up partially created sfx tracks" {
     try std.testing.expectEqual(@as(usize, 0), fake.tracks.count());
 }
 
-test "audio service caches loads and memoizes failed paths" {
+test "audio service preloads ids and memoizes failed paths" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
     try fake.failPath("audio/sfx/missing.wav");
     const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 2 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
+    try std.testing.expect(!try service.preloadAudio(.player_jet_sfx, "audio/sfx/missing.wav", .sfx, true));
+    try std.testing.expect(!try service.preloadAudio(.player_jet_sfx, "audio/sfx/missing.wav", .sfx, true));
+    const load_calls_after_preload = fake.load_calls;
+
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
-
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav" });
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav" });
-    try commands.playSfx(.{ .path = "audio/sfx/missing.wav" });
-    try commands.playSfx(.{ .path = "audio/sfx/missing.wav" });
+    try commands.playSfx(.{ .asset = .collision_sfx });
+    try commands.playSfx(.{ .asset = .collision_sfx });
+    try commands.playSfx(.{ .asset = .player_jet_sfx });
     service.drain(&commands);
 
     try std.testing.expectEqual(@as(u32, 2), fake.load_calls);
+    try std.testing.expectEqual(load_calls_after_preload, fake.load_calls);
     try std.testing.expectEqual(@as(usize, 1), service.entries.count());
     try std.testing.expectEqual(@as(usize, 1), service.failed_paths.count());
 }
@@ -1109,18 +1126,18 @@ test "audio service plays music idempotently and ducks on pause" {
         .paused_music_gain = 0.25,
     }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.demo_music, "audio/music/theme.wav", .music, false));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
 
-    try commands.playMusic(.{ .path = "audio/music/theme.wav", .gain = 0.8, .fade_in_ms = 100 });
-    try commands.playMusic(.{ .path = "audio/music/theme.wav", .gain = 0.8, .fade_in_ms = 100 });
+    try commands.playMusic(.{ .asset = .demo_music, .gain = 0.8, .fade_in_ms = 100 });
+    try commands.playMusic(.{ .asset = .demo_music, .gain = 0.8, .fade_in_ms = 100 });
     service.drain(&commands);
     try std.testing.expectEqual(@as(u32, 1), fake.play_calls);
-    const stable_music_path = service.entries.get("audio/music/theme.wav").?.path;
-    try std.testing.expectEqual(@intFromPtr(stable_music_path.ptr), @intFromPtr(service.current_music_path.?.ptr));
+    try std.testing.expectEqual(AudioAssetId.demo_music, service.current_music_asset.?);
 
     commands.beginStep();
-    try commands.playMusic(.{ .path = "audio/music/theme.wav", .gain = 0.8, .fade_in_ms = 100 });
+    try commands.playMusic(.{ .asset = .demo_music, .gain = 0.8, .fade_in_ms = 100 });
     service.drain(&commands);
     try std.testing.expectEqual(@as(u32, 1), fake.play_calls);
 
@@ -1143,11 +1160,12 @@ test "audio service applies spatial position relative to listener" {
         .spatial_units_per_meter = 100,
     }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
 
     try commands.setListener(.{ .x = 50, .y = 50 });
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav", .position = .{ .x = 250, .y = 150 } });
+    try commands.playSfx(.{ .asset = .collision_sfx, .position = .{ .x = 250, .y = 150 } });
     service.drain(&commands);
 
     const track = fake.tracks.get(service.sfx_tracks.items[0].handle).?;
@@ -1161,10 +1179,11 @@ test "audio service applies per-sfx frequency ratio" {
     const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
 
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav", .frequency_ratio = 1.08 });
+    try commands.playSfx(.{ .asset = .collision_sfx, .frequency_ratio = 1.08 });
     service.drain(&commands);
 
     const track = fake.tracks.get(service.sfx_tracks.items[0].handle).?;
@@ -1177,11 +1196,12 @@ test "audio service starts updates and stops keyed looping sfx" {
     const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
     const loop_id = try LoopingSfxId.init(7);
 
-    try commands.startLoopingSfx(loop_id, .{ .path = "audio/sfx/jet.wav", .gain = 0.4, .frequency_ratio = 1.0 });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .gain = 0.4, .frequency_ratio = 1.0 });
     service.drain(&commands);
     try std.testing.expectEqual(@as(u32, 1), fake.play_calls);
     try std.testing.expect(service.sfx_tracks.items[0].looping_id.?.value == loop_id.value);
@@ -1191,14 +1211,14 @@ test "audio service starts updates and stops keyed looping sfx" {
     const position_calls_after_start = fake.position_calls;
 
     commands.beginStep();
-    try commands.startLoopingSfx(loop_id, .{ .path = "audio/sfx/jet.wav", .gain = 0.4, .frequency_ratio = 1.0 });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .gain = 0.4, .frequency_ratio = 1.0 });
     service.drain(&commands);
     try std.testing.expectEqual(gain_calls_after_start, fake.gain_calls);
     try std.testing.expectEqual(frequency_calls_after_start, fake.frequency_ratio_calls);
     try std.testing.expectEqual(position_calls_after_start, fake.position_calls);
 
     commands.beginStep();
-    try commands.startLoopingSfx(loop_id, .{ .path = "audio/sfx/jet.wav", .gain = 0.7, .frequency_ratio = 1.12 });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .gain = 0.7, .frequency_ratio = 1.12 });
     service.drain(&commands);
     try std.testing.expectEqual(@as(u32, 1), fake.play_calls);
     const updated = fake.tracks.get(service.sfx_tracks.items[0].handle).?;
@@ -1218,12 +1238,14 @@ test "audio service clears backend position when stopping looping sfx" {
     const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .spatial_units_per_meter = 100 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
     const loop_id = try LoopingSfxId.init(9);
 
     try commands.setListener(.{ .x = 0, .y = 0 });
-    try commands.startLoopingSfx(loop_id, .{ .path = "audio/sfx/jet.wav", .position = .{ .x = 200, .y = 100 } });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .position = .{ .x = 200, .y = 100 } });
     service.drain(&commands);
     try std.testing.expect(fake.tracks.get(service.sfx_tracks.items[0].handle).?.position != null);
 
@@ -1233,7 +1255,7 @@ test "audio service clears backend position when stopping looping sfx" {
     try std.testing.expect(fake.tracks.get(service.sfx_tracks.items[0].handle).?.position == null);
 
     commands.beginStep();
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav" });
+    try commands.playSfx(.{ .asset = .collision_sfx });
     service.drain(&commands);
     try std.testing.expect(fake.tracks.get(service.sfx_tracks.items[0].handle).?.position == null);
 }
@@ -1244,14 +1266,16 @@ test "audio service does not steal active loop track for one shot sfx" {
     const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
+    try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer commands.deinit();
     const loop_id = try LoopingSfxId.init(11);
 
-    try commands.startLoopingSfx(loop_id, .{ .path = "audio/sfx/jet.wav", .priority = 10 });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .priority = 10 });
     service.drain(&commands);
     commands.beginStep();
-    try commands.playSfx(.{ .path = "audio/sfx/hit.wav", .priority = 255 });
+    try commands.playSfx(.{ .asset = .collision_sfx, .priority = 255 });
     service.drain(&commands);
 
     try std.testing.expectEqual(@as(u32, 1), fake.play_calls);

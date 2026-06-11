@@ -8,6 +8,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
+const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
+const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const component_masks = @import("data_system.zig").component_masks;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
@@ -28,7 +30,9 @@ const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
+const Rect = @import("../render/renderer.zig").Rect;
 const Renderer = @import("../render/renderer.zig").Renderer;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const c = @import("../platform/sdl.zig").c;
 
@@ -37,9 +41,9 @@ const obstacle_count = 2;
 const collision_sfx_cooldown_capacity = 32;
 const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_contact_capacity = 64;
-const demo_music_path = "audio/music/demo_loop.wav";
-const collision_sfx_path = "audio/sfx/collision.wav";
-const jet_sfx_path = "audio/sfx/player_jet.wav";
+const demo_music = AudioAssetId.demo_music;
+const collision_sfx = AudioAssetId.collision_sfx;
+const jet_sfx = AudioAssetId.player_jet_sfx;
 const player_jet_loop_id = LoopingSfxId{ .value = 1 };
 
 pub const GameDemoState = struct {
@@ -171,13 +175,13 @@ pub const GameDemoState = struct {
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
         for (self.obstacles) |entity| {
-            try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
+            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
         }
         for (self.test_squares) |entity| {
-            try renderPrimitiveEntity(&self.data, entity, context.renderer, context.interpolation_alpha);
+            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
         }
         try self.particles.render(context.renderer, context.interpolation_alpha);
-        try self.player.render(&self.data, context.renderer, context.interpolation_alpha);
+        try self.player.render(&self.data, context.runtime_assets, context.renderer, context.interpolation_alpha);
         try context.renderer.drawRect(.{
             .x = 0,
             .y = self.bounds_height - 4,
@@ -244,7 +248,7 @@ pub const GameDemoState = struct {
     fn queueAmbientAudio(self: *GameDemoState, audio: *AudioCommandBuffer, input: *const InputState) void {
         if (!self.music_started) {
             audio.playMusic(.{
-                .path = demo_music_path,
+                .asset = demo_music,
                 .gain = 1.0,
                 .loop = true,
                 .fade_in_ms = 750,
@@ -256,7 +260,7 @@ pub const GameDemoState = struct {
             audio.setListener(.{ .x = body.position.x + 16, .y = body.position.y + 16 }) catch {};
             if (input.movementVector().x != 0 or input.movementVector().y != 0) {
                 audio.startLoopingSfx(player_jet_loop_id, .{
-                    .path = jet_sfx_path,
+                    .asset = jet_sfx,
                     .gain = 0.34,
                     .priority = 220,
                     .frequency_ratio = 1.0,
@@ -276,7 +280,7 @@ pub const GameDemoState = struct {
             const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
             const frequency_ratio = collisionSfxFrequencyRatio(contact);
             audio.playSfx(.{
-                .path = collision_sfx_path,
+                .asset = collision_sfx,
                 .gain = gain,
                 .priority = 180,
                 .frequency_ratio = frequency_ratio,
@@ -407,6 +411,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                         .marker_depth = 0,
                         .marker_margin = 0,
                     },
+                    .asset_reference = .{ .sprite = .demo_tile },
                     .collision_bounds = .{ .size = spec.size },
                     .collision_response = .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 },
                     .ai_agent = if (index == 3)
@@ -436,6 +441,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                 .marker_depth = 0,
                 .marker_margin = 0,
             });
+            try data.setAssetReference(e, .{ .sprite = .demo_tile });
             try data.setCollisionBounds(e, .{ .size = spec.size });
             try data.setCollisionResponse(e, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
             break :blk e;
@@ -494,6 +500,7 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
             .marker_depth = 0,
             .marker_margin = 0,
         });
+        try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
         entities[index] = entity;
@@ -501,21 +508,35 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
     return entities;
 }
 
-fn renderPrimitiveEntity(
+fn renderEntity(
     data: *const DataSystem,
     entity: EntityId,
+    runtime_assets: *const RuntimeAssets,
     renderer: *Renderer,
     interpolation_alpha: f32,
 ) !void {
     const body = data.movementBodyConst(entity) orelse return;
     const visual = data.primitiveVisualConst(entity) orelse return;
     const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-    try renderer.drawRect(.{
+    const dest = Rect{
         .x = render_position.x,
         .y = render_position.y,
         .w = visual.size.x,
         .h = visual.size.y,
-    }, visual.color, visual.layer);
+    };
+    if (data.assetReferenceConst(entity)) |asset_ref| {
+        if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
+            try renderer.drawSprite(.{
+                .texture = sprite.texture,
+                .source = sprite.source_rect,
+                .dest = dest,
+                .tint = visual.color,
+                .layer = visual.layer,
+            });
+            return;
+        }
+    }
+    try renderer.drawRect(dest, visual.color, visual.layer);
 }
 
 const TestSquareSpec = struct {
@@ -539,9 +560,12 @@ test "demo spawns colored moving test squares" {
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(demo.player.entity).?.sprite);
     try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
-        try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.collision_bounds | component_masks.collision_response));
+        try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
+        try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(entity).?.sprite);
         const body = demo.data.movementBodyConst(entity).?;
         const has_ai = demo.data.hasComponents(entity, component_masks.ai_agent);
         try std.testing.expect(has_ai or body.velocity.x != 0 or body.velocity.y != 0);
@@ -553,7 +577,8 @@ test "demo spawns colored moving test squares" {
         try std.testing.expectEqual(CollisionResponseMode.bounce, demo.data.collisionResponseConst(entity).?.mode);
     }
     for (demo.obstacles) |entity| {
-        try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.collision_bounds | component_masks.collision_response));
+        try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
+        try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(entity).?.sprite);
         const body = demo.data.movementBodyConst(entity).?;
         try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
         try std.testing.expectEqual(@as(f32, 0), body.velocity.y);

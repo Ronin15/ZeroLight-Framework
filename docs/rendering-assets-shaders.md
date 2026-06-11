@@ -31,15 +31,15 @@ rewriting SDL_GPU device setup.
 Use `drawSprite` for textured quads:
 
 ```zig
-if (self.player_texture == null) {
-    self.player_texture = try context.acquireTexture("sprites/player.png");
+if (context.runtime_assets.sprite(.demo_tile)) |sprite| {
+    try context.renderer.drawSprite(.{
+        .texture = sprite.texture,
+        .source = sprite.source_rect,
+        .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
+        .tint = .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 },
+        .layer = 0,
+    });
 }
-
-try context.renderer.drawSprite(.{
-    .texture = self.player_texture.?.id,
-    .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
-    .layer = 0,
-});
 ```
 
 `TextureId` values are stable while the texture is alive. Destroying a texture
@@ -59,10 +59,11 @@ try renderer.drawRect(.{
 }, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, 0);
 ```
 
-For atlases or future tile rendering, keep one `TextureId` for the atlas texture
-and draw individual sprites or tiles with `Sprite.source` rectangles. Tilemap
-batching should build on the same texture ID plus source-rect model rather than
-creating one texture per tile.
+For atlases or future tile rendering, keep entity data on stable
+`SpriteAssetId` values and let `RuntimeAssets` map those IDs to one atlas
+`TextureId` plus `Sprite.source` rectangles. Tilemap batching should build on
+the same ID-to-texture/source model rather than creating one texture per tile or
+storing live renderer handles in gameplay data.
 
 ## Logical Presentation
 
@@ -96,10 +97,13 @@ Sprite coordinate spaces:
 
 ## Runtime Assets
 
-The current demo draws primitives, so it has no required PNG asset. The default
-text path uses the bundled `assets/fonts/NotoSansMono-Regular.ttf` font. Put
-additional PNGs, fonts, and other runtime files under `assets/`, then acquire
-renderer-backed resources through the app-owned services from a render context.
+Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
+`Engine` owns `RuntimeAssets`, preloads declared sprites through `AssetCache`,
+preloads declared audio through `AudioService`, and passes the catalog to render
+contexts. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
+sprite for player, AI squares, and obstacles, with primitive rectangle fallback
+when a sprite ID is unavailable. The default text path uses the bundled
+`assets/fonts/NotoSansMono-Regular.ttf` font.
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default
 asset root is `assets`; change it with `-Dasset-root=content`.
@@ -113,14 +117,17 @@ absolute paths, `.` components, and `..` traversal.
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
 project does not require `SDL3_image`.
 
-The asset cache maps validated relative PNG paths to renderer `TextureId` values.
-Loading the same path decodes PNG data through `AssetStore`, uploads decoded
-RGBA8 pixels through the renderer, reuses the existing texture on later
-acquires, and increments a retain count. Store the returned `TextureLease` in
-the owning state or service, draw with `lease.id`, and call `release` from that
-owner's `deinit`. When the last lease is released, the cache destroys the
-renderer texture. Cache lookup and retain/release are setup-time operations;
-per-frame rendering should keep using the retained `TextureId` directly.
+The asset cache maps validated relative PNG paths to renderer `TextureId`
+values. Loading the same path decodes PNG data through `AssetStore`, uploads
+decoded RGBA8 pixels through the renderer, reuses the existing texture on later
+acquires, and increments a retain count. `TextureLease` is a non-owning retained
+texture token; it does not store an `AssetCache` pointer or renderer/backend
+context. Owners that hold leases release them through
+`AssetCache.releaseTexture(renderer, &lease)` before renderer teardown. Gameplay
+and render prep should store or pass `SpriteAssetId`, not paths, `TextureId`,
+`TextureLease`, or prepared sprite records. Cache lookup and retain/release are
+setup-time operations; per-frame rendering should use the startup catalog and
+retained IDs directly.
 
 ## Text Rendering
 

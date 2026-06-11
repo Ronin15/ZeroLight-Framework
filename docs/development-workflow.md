@@ -54,7 +54,8 @@ zig build -Ddebug-overlay=false
 The default runtime asset directory is `assets`. If you pass
 `-Dasset-root=content`, generated shaders and copied runtime assets are installed
 under `zig-out/bin/content`, and the executable looks there at runtime.
-Texture, font, and audio assets all use this runtime root.
+Startup sprite IDs, font paths, and audio IDs all resolve through this runtime
+root.
 
 Use non-default shader compiler paths:
 

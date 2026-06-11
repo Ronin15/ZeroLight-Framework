@@ -10,6 +10,8 @@ comptime {
     _ = @import("assets/assets.zig");
     _ = @import("assets/cache.zig");
     _ = @import("assets/image.zig");
+    _ = @import("assets/manifest.zig");
+    _ = @import("assets/runtime_assets.zig");
     _ = @import("app/audio.zig");
     _ = @import("app/frame_pacer.zig");
     _ = @import("app/input.zig");
