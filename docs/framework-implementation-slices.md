@@ -22,11 +22,10 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish Slice 8 shader/platform validation as the next narrow engine-support
-  track.
-- Plan the next world-asset/content slice before returning to Slice 7 render
-  threading, so render prep has realistic asset references, resource metadata,
-  and command volume to optimize against.
+- Implement Slice 17 startup runtime asset catalog as the next world-asset/content
+  slice before returning to Slice 7 render threading.
+- Defer Slice 8 shader/platform validation until that engine-support track is
+  intentionally picked back up.
 - Defer Slice 7 parallel CPU render prep until world assets define the data shape
   it should process.
 - Slice 12 is now the gameplay-systems foundation for collision, AI intent,
@@ -1008,6 +1007,96 @@ Acceptance checks:
 
 Slice 16 lands the first real menu layer. The implementation stays deliberately small (direct state-owned text leases, no widget system, keyboard only, volumes as the single live setting) while covering the tested contract: state-driven navigation through named actions, consumed-event ui input routing, text + logical renderer drawing, fixed-step audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, pause restricted to active gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
 
+## Slice 17: Startup Runtime Asset Catalog
+
+Goal: preload the declared runtime asset set during `Engine.init` and make an
+Engine-owned `RuntimeAssets` app service the source of stable sprite/audio
+handles for gameplay, render prep, and audio commands. Missing declared content
+should log once and mark that asset unavailable, but should not fail app
+initialization.
+
+Current foundation:
+
+- `AssetStore` resolves traversal-safe runtime asset paths under the configured
+  asset root.
+- `AssetCache` decodes PNGs, uploads renderer textures, and returns retained
+  `TextureLease` values.
+- `AudioService` owns SDL3_mixer lifecycle, track pools, loaded audio handles,
+  bus gains, and pause ducking.
+- `Renderer` owns live GPU textures and draw submission.
+- `DataSystem` stores persistent asset-reference component rows, but it must not
+  own live renderer or audio resources.
+- `RenderContext` currently exposes path-based texture acquisition;
+  `AudioCommandBuffer` currently carries copied audio paths.
+
+Architecture notes:
+
+- `RuntimeAssets` lives under `src/assets/` and is an app service/catalog, not a
+  gameplay processor under `src/game/systems/`.
+- Add a typed code manifest for startup assets. It assigns stable IDs such as
+  `SpriteAssetId` and `AudioAssetId` to relative asset paths.
+- `Engine` owns `RuntimeAssets`. It preloads declared sprites/images through
+  `AssetCache` after `Renderer` exists and preloads declared audio through
+  `AudioService` after the mixer service exists.
+- `RuntimeAssets` owns startup texture leases and exposes prepared sprite
+  metadata such as `{ texture, source_rect }`. Today each sprite can use a full
+  texture; future atlas work can map the same `SpriteAssetId` to an atlas texture
+  and source rectangle.
+- `DataSystem` stores only stable sprite asset IDs as persistent entity component
+  data. It may keep those component rows dense, but it must not store
+  `TextureId`, `TextureLease`, prepared sprite records, SDL_mixer handles, or
+  loaded audio handles.
+- Runtime gameplay and render prep should use stable asset IDs, not string
+  paths. Path validation, PNG decode, GPU upload, audio load/predecode, and
+  string/hash lookup stay out of fixed update and hot render paths.
+- Missing declared assets are logged and exposed as unavailable handles;
+  allocation failures, invalid config, and SDL/GPU/audio service initialization
+  failures still return errors.
+- A dedicated loading state is future work for larger asset sets, streamed
+  content, or visible progress. This slice keeps startup preload in `Engine.init`
+  but should keep enough catalog status to let a later loading state report
+  loaded, missing, and unavailable assets without changing ownership.
+
+Checklist:
+
+- [ ] Add a typed startup asset manifest with stable sprite and audio IDs.
+- [ ] Add Engine-owned `RuntimeAssets` that preloads declared sprite/image
+      assets during `Engine.init`, owns their texture leases, and releases them
+      before renderer teardown.
+- [ ] Add audio preload support so declared music and SFX IDs resolve to loaded
+      `AudioService` handles without path lookup during command drain.
+- [ ] Change render-facing code to resolve `SpriteAssetId` through
+      `RuntimeAssets` instead of acquiring textures by relative path.
+- [ ] Change audio commands to carry `AudioAssetId` instead of copied relative
+      paths.
+- [ ] Change `DataSystem` asset-reference component data from relative paths to
+      stable `SpriteAssetId` values.
+- [ ] Add the first demo sprite asset under `assets/sprites/` and assign sprite
+      IDs to player, AI squares, and obstacles.
+- [ ] Add or update render prep so entity render rows produce deterministic
+      sprite commands with primitive fallback for unavailable sprite IDs.
+- [ ] Update architecture and rendering/assets docs to describe startup preload,
+      stable IDs, missing-asset behavior, and atlas-ready source rectangles.
+
+Acceptance checks:
+
+- [ ] Engine startup attempts to preload every declared sprite and audio asset
+      once.
+- [ ] Missing declared content logs once, marks the asset unavailable, and does
+      not abort app initialization.
+- [ ] Gameplay state, render prep, and audio commands use stable asset IDs
+      rather than runtime string paths.
+- [ ] `DataSystem` contains no live renderer texture IDs, texture leases,
+      prepared sprite records, SDL_mixer handles, or loaded audio handles.
+- [ ] Render prep resolves `SpriteAssetId` to `{ texture, source_rect }` and
+      preserves deterministic draw ordering.
+- [ ] Future atlas mapping can change the catalog resolution without changing
+      entity component storage.
+- [ ] `zig build fmt`, `zig build test`, `zig build check`, and
+      `zig build verify` pass.
+- [ ] Manual `zig build dev` smoke confirms menu, gameplay, sprite rendering,
+      audio, pause, debug overlay, and repeated transitions still work.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1027,9 +1116,11 @@ Slice 16 lands the first real menu layer. The implementation stays deliberately 
 14. First AI intent processor and future path/rule contracts.
 15. SDL3_mixer audio service.
 16. Main menu and settings menu.
+17. Startup runtime asset catalog.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
 Resource ownership, text/UI, renderer composition, threading, SIMD,
-`DataSystem`, simulation outputs, collision, AI intent processing, audio, and
-menus now form the source-of-truth foundation for future slices.
+`DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
+and startup runtime assets now form the source-of-truth foundation for future
+slices.
