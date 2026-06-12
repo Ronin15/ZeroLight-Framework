@@ -4,10 +4,10 @@
 
 //! First AI decision processor for Slice 14.
 //! Stateless (except work memory + per-system tuner); reads typed const slices for ai + movement prior positions,
-//! pre-sizes MovementIntent output ranges and uses parallelForWithOptions only for decision/write work.
+//! pre-sizes MovementIntent output ranges and uses staged parallelForWithOptions work.
 //! Deterministic via explicit seed in config. Wander + seek (player-targeted via AiConfig.seek_target) + local separation.
 //! Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
-//! Separation precomputed once on main thread (Hot lists), O(1) read in workers (no O(N^2) in jobs).
+//! Separation uses a deterministic 32-unit spatial grid and bounded neighbor samples.
 //! decideDir pure base; applySeparationAndNormalize shared (no logic dup). Serial fallback + threaded identical.
 //! Serial/main-only clamp for AI squares (math.clamp consistent with player, vel zero for AI decision rate).
 //! Serial fallback, read-only workers, range aligned to ai_range_alignment_items, no hot alloc after init, direct SoA.
@@ -37,12 +37,22 @@ const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
 const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(64));
+const grid_cell_size: f32 = 32.0;
+const separation_radius: f32 = 48.0;
+const separation_radius2: f32 = separation_radius * separation_radius;
+const separation_cell_radius: i32 = 2;
+const max_separation_neighbors: u8 = 32;
+const max_separation_candidate_checks: u16 = 128;
 
 pub const AiConfig = struct {
     min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
+    separation_items_per_range: ?usize = null,
+    intent_items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
+    separation_adaptive_tuner: ?*AdaptiveWorkTuner = null,
+    intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
     /// If provided, seekers head toward this position instead of the global center-of-mass
@@ -54,6 +64,10 @@ pub const AiConfig = struct {
 pub const AiStats = struct {
     entity_count: usize = 0,
     intent_count: usize = 0,
+    separation_candidate_checks: usize = 0,
+    separation_neighbor_samples: usize = 0,
+    separation_batch: BatchStats = .{},
+    intent_batch: BatchStats = .{},
     batch: BatchStats = .{},
 };
 
@@ -70,16 +84,26 @@ pub const AiSystem = struct {
     // Eliminates per-item O(N) scans inside jobs (was quadratic total in worker path).
     sep_x: HotF32List = .empty,
     sep_y: HotF32List = .empty,
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    separation_neighbor_counts: std.ArrayList(u8) = .empty,
+    separation_candidate_counts: std.ArrayList(u16) = .empty,
+    cell_entries: std.ArrayList(CellEntry) = .empty,
+    cell_ranges: std.ArrayList(CellRange) = .empty,
+    separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
             .allocator = allocator,
-            .adaptive_tuner = AdaptiveWorkTuner.init(.{}),
+            .separation_tuner = AdaptiveWorkTuner.init(.{}),
+            .intent_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
     pub fn deinit(self: *AiSystem) void {
+        self.cell_ranges.deinit(self.allocator);
+        self.cell_entries.deinit(self.allocator);
+        self.separation_candidate_counts.deinit(self.allocator);
+        self.separation_neighbor_counts.deinit(self.allocator);
         self.sep_y.deinit(self.allocator);
         self.sep_x.deinit(self.allocator);
         self.seek_weights.deinit(self.allocator);
@@ -108,46 +132,46 @@ pub const AiSystem = struct {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
             return .{};
         }
-        self.computeAiSeparations(); // main-thread only; O(N^2) here (small N) not inside workers/jobs.
 
-        var system_config = config;
-        if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
-            system_config.adaptive_tuner = &self.adaptive_tuner;
-        }
+        const system_config = normalizedConfig(config, self);
+        try self.buildSeparationGrid();
+        const separation_selection = selectStageWork(
+            thread_system,
+            entity_count,
+            system_config.min_parallel_items,
+            system_config.separation_items_per_range orelse system_config.items_per_range,
+            system_config.max_worker_threads,
+            system_config.adaptive,
+            system_config.separation_adaptive_tuner,
+        );
+        var separation_context = AiSeparationContext{
+            .pos_x = self.pos_x.items,
+            .pos_y = self.pos_y.items,
+            .sep_x = self.sep_x.items,
+            .sep_y = self.sep_y.items,
+            .neighbor_counts = self.separation_neighbor_counts.items,
+            .candidate_counts = self.separation_candidate_counts.items,
+            .cell_entries = self.cell_entries.items,
+            .cell_ranges = self.cell_ranges.items,
+        };
+        const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
+            .min_parallel_items = system_config.min_parallel_items,
+            .max_worker_threads = separation_selection.worker_threads,
+            .range_alignment_items = ai_range_alignment_items,
+            .adaptive_tuner = separation_selection.active_tuner,
+            .selected_profile = separation_selection.profile,
+        });
 
-        const min_par = system_config.min_parallel_items orelse thread_system.config.min_parallel_items;
-        const ipr = system_config.items_per_range orelse thread_system.config.items_per_range;
-        const available_workers = thread_system.workerThreadCount();
-        const max_workers = @min(system_config.max_worker_threads orelse available_workers, available_workers);
-        const adaptive_tuner = if (system_config.adaptive and system_config.items_per_range == null and max_workers > 0)
-            system_config.adaptive_tuner
-        else
-            null;
-        const profile = if (adaptive_tuner) |tuner|
-            tuner.selectProfile(.{
-                .item_count = entity_count,
-                .available_worker_threads = available_workers,
-                .max_worker_threads = max_workers,
-                .min_parallel_items = min_par,
-                .fallback_items_per_range = ipr,
-                .range_alignment_items = ai_range_alignment_items,
-            })
-        else
-            AdaptiveWorkProfile{
-                .worker_threads = max_workers,
-                .items_per_range = ipr,
-            };
-        const aligned = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), ai_range_alignment_items);
-        const selected_range_count = rangeCount(entity_count, aligned);
-        const selected_workers = if (entity_count < min_par or selected_range_count <= 1)
-            @as(usize, 0)
-        else
-            @min(profile.worker_threads, @min(max_workers, selected_range_count - 1));
-        const items_per_range = if (selected_workers == 0 and adaptive_tuner != null and profile.worker_threads == 0)
-            entity_count
-        else
-            aligned;
-        const rcount = rangeCount(entity_count, items_per_range);
+        const intent_selection = selectStageWork(
+            thread_system,
+            entity_count,
+            system_config.min_parallel_items,
+            system_config.intent_items_per_range orelse system_config.items_per_range,
+            system_config.max_worker_threads,
+            system_config.adaptive,
+            system_config.intent_adaptive_tuner,
+        );
+        const rcount = intent_selection.range_count;
 
         const range_base = try frame.intents.appendRangeCounts(rcount);
 
@@ -171,31 +195,31 @@ pub const AiSystem = struct {
         };
 
         for (0..rcount) |range_index| {
-            const start = range_index * items_per_range;
-            const end = @min(start + items_per_range, entity_count);
+            const start = range_index * intent_selection.items_per_range;
+            const end = @min(start + intent_selection.items_per_range, entity_count);
             frame.intents.addCount(range_base + range_index, end - start);
         }
 
         try frame.intents.prefixAppendedRanges(range_base);
 
-        const batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
+        const intent_batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
             .min_parallel_items = system_config.min_parallel_items,
-            .items_per_range = items_per_range,
-            .max_worker_threads = selected_workers,
+            .max_worker_threads = intent_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
-            .adaptive = false,
+            .adaptive_tuner = intent_selection.active_tuner,
+            .selected_profile = intent_selection.profile,
         });
 
         frame.intents.finishWrite();
 
-        if (adaptive_tuner) |tuner| {
-            tuner.record(batch);
-        }
-
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
-            .batch = batch,
+            .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
+            .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
+            .separation_batch = separation_batch,
+            .intent_batch = intent_batch,
+            .batch = separation_batch,
         };
     }
 
@@ -212,7 +236,8 @@ pub const AiSystem = struct {
         try self.gatherAiData(ai_agents, movement, data);
         const entity_count = self.entities.items.len;
         if (entity_count == 0) return .{};
-        self.computeAiSeparations(); // main-thread only; O(N^2) here (small N) not inside serial loop.
+        try self.buildSeparationGrid();
+        self.computeAiSeparationsSerial();
         const rcount: usize = 1;
         const range_base = try frame.intents.appendRangeCounts(rcount);
         const range = ParallelRange{ .index = 0, .start = 0, .end = entity_count };
@@ -245,10 +270,16 @@ pub const AiSystem = struct {
         }
         writer.finish();
         frame.intents.finishWrite();
+        const separation_batch = serialBatch(entity_count);
+        const intent_batch = serialBatch(entity_count);
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
-            .batch = serialBatch(entity_count),
+            .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
+            .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
+            .separation_batch = separation_batch,
+            .intent_batch = intent_batch,
+            .batch = separation_batch,
         };
     }
 
@@ -264,6 +295,10 @@ pub const AiSystem = struct {
         try self.seek_weights.ensureTotalCapacity(self.allocator, n);
         try self.sep_x.ensureTotalCapacity(self.allocator, n);
         try self.sep_y.ensureTotalCapacity(self.allocator, n);
+        try self.separation_neighbor_counts.ensureTotalCapacity(self.allocator, n);
+        try self.separation_candidate_counts.ensureTotalCapacity(self.allocator, n);
+        try self.cell_entries.ensureTotalCapacity(self.allocator, n);
+        try self.cell_ranges.ensureTotalCapacity(self.allocator, n);
 
         // Preserve ai order for deterministic output. DataSystem rejects stale generations
         // and returns direct dense movement rows without transient high-water index tables.
@@ -277,6 +312,8 @@ pub const AiSystem = struct {
             self.seek_weights.appendAssumeCapacity(ai_slice.seek_weights[i]);
             self.sep_x.appendAssumeCapacity(0);
             self.sep_y.appendAssumeCapacity(0);
+            self.separation_neighbor_counts.appendAssumeCapacity(0);
+            self.separation_candidate_counts.appendAssumeCapacity(0);
         }
     }
 
@@ -289,41 +326,214 @@ pub const AiSystem = struct {
         self.seek_weights.clearRetainingCapacity();
         self.sep_x.clearRetainingCapacity();
         self.sep_y.clearRetainingCapacity();
+        self.separation_neighbor_counts.clearRetainingCapacity();
+        self.separation_candidate_counts.clearRetainingCapacity();
+        self.cell_entries.clearRetainingCapacity();
+        self.cell_ranges.clearRetainingCapacity();
     }
 
-    /// Compute pairwise local separation contributions once on the main thread after
-    /// gather. Result stored in sep_* lists (indexed same as entities/pos). Workers/jobs
-    /// and serial path read O(1) per entity. Total cost O(N^2) but confined to main thread
-    /// (N is ai entity count per step, tiny in practice for demo and early game).
-    fn computeAiSeparations(self: *AiSystem) void {
+    fn buildSeparationGrid(self: *AiSystem) !void {
         const n = self.entities.items.len;
         if (n == 0) return;
-        // Reset to zeros (capacity already ensured in gather).
         for (self.sep_x.items) |*v| v.* = 0;
         for (self.sep_y.items) |*v| v.* = 0;
-        const sep_radius: f32 = 48;
-        const sep_radius2 = sep_radius * sep_radius;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            var sx: f32 = 0;
-            var sy: f32 = 0;
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                if (j == i) continue;
-                const dx = self.pos_x.items[i] - self.pos_x.items[j];
-                const dy = self.pos_y.items[i] - self.pos_y.items[j];
-                const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.1 and dist2 < sep_radius2) {
-                    const invd = 1.0 / @sqrt(dist2);
-                    sx += dx * invd;
-                    sy += dy * invd;
-                }
+        @memset(self.separation_neighbor_counts.items, 0);
+        @memset(self.separation_candidate_counts.items, 0);
+
+        for (0..n) |index| {
+            self.cell_entries.appendAssumeCapacity(.{
+                .cell = cellForPosition(self.pos_x.items[index], self.pos_y.items[index]),
+                .index = index,
+            });
+        }
+        std.mem.sort(CellEntry, self.cell_entries.items, {}, cellEntryLessThan);
+
+        var entry_index: usize = 0;
+        while (entry_index < self.cell_entries.items.len) {
+            const cell = self.cell_entries.items[entry_index].cell;
+            const start = entry_index;
+            while (entry_index < self.cell_entries.items.len and cellsEqual(self.cell_entries.items[entry_index].cell, cell)) {
+                entry_index += 1;
             }
-            self.sep_x.items[i] = sx;
-            self.sep_y.items[i] = sy;
+            self.cell_ranges.appendAssumeCapacity(.{ .cell = cell, .start = start, .end = entry_index });
         }
     }
+
+    fn computeAiSeparationsSerial(self: *AiSystem) void {
+        var context = AiSeparationContext{
+            .pos_x = self.pos_x.items,
+            .pos_y = self.pos_y.items,
+            .sep_x = self.sep_x.items,
+            .sep_y = self.sep_y.items,
+            .neighbor_counts = self.separation_neighbor_counts.items,
+            .candidate_counts = self.separation_candidate_counts.items,
+            .cell_entries = self.cell_entries.items,
+            .cell_ranges = self.cell_ranges.items,
+        };
+        writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.entities.items.len }, WorkerId.main);
+    }
 };
+
+const NormalizedAiConfig = struct {
+    min_parallel_items: ?usize,
+    items_per_range: ?usize,
+    separation_items_per_range: ?usize,
+    intent_items_per_range: ?usize,
+    max_worker_threads: ?usize,
+    adaptive: bool,
+    separation_adaptive_tuner: ?*AdaptiveWorkTuner,
+    intent_adaptive_tuner: ?*AdaptiveWorkTuner,
+    intent_seed: u64,
+    seek_target: ?math.Vec2,
+};
+
+fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
+    return .{
+        .min_parallel_items = config.min_parallel_items,
+        .items_per_range = config.items_per_range,
+        .separation_items_per_range = config.separation_items_per_range,
+        .intent_items_per_range = config.intent_items_per_range,
+        .max_worker_threads = config.max_worker_threads,
+        .adaptive = config.adaptive,
+        .separation_adaptive_tuner = config.separation_adaptive_tuner orelse if (config.adaptive and config.separation_items_per_range == null and config.items_per_range == null)
+            &system.separation_tuner
+        else
+            null,
+        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse config.adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
+            &system.intent_tuner
+        else
+            null,
+        .intent_seed = config.intent_seed,
+        .seek_target = config.seek_target,
+    };
+}
+
+const GridCell = struct {
+    x: i32,
+    y: i32,
+};
+
+const CellEntry = struct {
+    cell: GridCell,
+    index: usize,
+};
+
+const CellRange = struct {
+    cell: GridCell,
+    start: usize,
+    end: usize,
+};
+
+const StageWorkSelection = struct {
+    profile: AdaptiveWorkProfile,
+    items_per_range: usize,
+    worker_threads: usize,
+    range_count: usize,
+    active_tuner: ?*AdaptiveWorkTuner = null,
+};
+
+fn selectStageWork(
+    thread_system: *const ThreadSystem,
+    item_count: usize,
+    min_parallel_items_override: ?usize,
+    items_per_range_override: ?usize,
+    max_worker_threads_override: ?usize,
+    adaptive: bool,
+    adaptive_tuner: ?*AdaptiveWorkTuner,
+) StageWorkSelection {
+    const available_workers = thread_system.workerThreadCount();
+    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
+    const min_parallel_items = min_parallel_items_override orelse thread_system.config.min_parallel_items;
+    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
+    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
+        adaptive_tuner
+    else
+        null;
+    const profile = if (active_tuner) |tuner|
+        tuner.selectProfile(.{
+            .item_count = item_count,
+            .available_worker_threads = available_workers,
+            .max_worker_threads = max_worker_threads,
+            .min_parallel_items = min_parallel_items,
+            .fallback_items_per_range = requested_items_per_range,
+            .range_alignment_items = ai_range_alignment_items,
+        })
+    else
+        AdaptiveWorkProfile{
+            .worker_threads = max_worker_threads,
+            .items_per_range = requested_items_per_range,
+        };
+    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), ai_range_alignment_items);
+    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
+    const selected_worker_threads = if (item_count < min_parallel_items or selected_range_count <= 1)
+        @as(usize, 0)
+    else
+        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
+    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
+        item_count
+    else
+        aligned_items_per_range;
+
+    return .{
+        .profile = .{
+            .worker_threads = selected_worker_threads,
+            .items_per_range = items_per_range,
+        },
+        .items_per_range = items_per_range,
+        .worker_threads = selected_worker_threads,
+        .range_count = rangeCount(item_count, items_per_range),
+        .active_tuner = active_tuner,
+    };
+}
+
+fn cellForPosition(x: f32, y: f32) GridCell {
+    return .{
+        .x = @intFromFloat(@floor(x / grid_cell_size)),
+        .y = @intFromFloat(@floor(y / grid_cell_size)),
+    };
+}
+
+fn cellsEqual(lhs: GridCell, rhs: GridCell) bool {
+    return lhs.x == rhs.x and lhs.y == rhs.y;
+}
+
+fn cellLessThan(lhs: GridCell, rhs: GridCell) bool {
+    if (lhs.y != rhs.y) return lhs.y < rhs.y;
+    return lhs.x < rhs.x;
+}
+
+fn cellEntryLessThan(_: void, lhs: CellEntry, rhs: CellEntry) bool {
+    if (!cellsEqual(lhs.cell, rhs.cell)) return cellLessThan(lhs.cell, rhs.cell);
+    return lhs.index < rhs.index;
+}
+
+fn findCellRange(ranges: []const CellRange, cell: GridCell) ?CellRange {
+    var low: usize = 0;
+    var high: usize = ranges.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const mid_cell = ranges[mid].cell;
+        if (cellsEqual(mid_cell, cell)) return ranges[mid];
+        if (cellLessThan(mid_cell, cell)) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return null;
+}
+
+fn sumU8(values: []const u8) usize {
+    var total: usize = 0;
+    for (values) |value| total += value;
+    return total;
+}
+
+fn sumU16(values: []const u16) usize {
+    var total: usize = 0;
+    for (values) |value| total += value;
+    return total;
+}
 
 fn computeTarget(movement: ConstMovementBodySlice, axis: enum { x, y }) f32 {
     if (movement.entities.len == 0) return if (axis == .x) @as(f32, 400) else @as(f32, 225);
@@ -409,6 +619,64 @@ fn deterministicUnitDir(seed: u64, key: u32) AiDir {
     const u = @as(f32, @floatFromInt(h & 0xffffffff)) / 4294967295.0;
     const angle = u * 2.0 * std.math.pi;
     return .{ .x = @cos(angle), .y = @sin(angle) };
+}
+
+const AiSeparationContext = struct {
+    pos_x: []const f32,
+    pos_y: []const f32,
+    sep_x: []f32,
+    sep_y: []f32,
+    neighbor_counts: []u8,
+    candidate_counts: []u16,
+    cell_entries: []const CellEntry,
+    cell_ranges: []const CellRange,
+};
+
+fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *AiSeparationContext = @ptrCast(@alignCast(context));
+    for (range.start..range.end) |index| {
+        const result = computeBoundedSeparation(job, index);
+        job.sep_x[index] = result.x;
+        job.sep_y[index] = result.y;
+        job.neighbor_counts[index] = result.neighbor_count;
+        job.candidate_counts[index] = result.candidate_count;
+    }
+}
+
+const SeparationResult = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    neighbor_count: u8 = 0,
+    candidate_count: u16 = 0,
+};
+
+fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
+    const own_cell = cellForPosition(job.pos_x[index], job.pos_y[index]);
+    var result = SeparationResult{};
+    var cell_y = own_cell.y - separation_cell_radius;
+    while (cell_y <= own_cell.y + separation_cell_radius) : (cell_y += 1) {
+        var cell_x = own_cell.x - separation_cell_radius;
+        while (cell_x <= own_cell.x + separation_cell_radius) : (cell_x += 1) {
+            const range = findCellRange(job.cell_ranges, .{ .x = cell_x, .y = cell_y }) orelse continue;
+            for (job.cell_entries[range.start..range.end]) |entry| {
+                if (entry.index == index) continue;
+                if (result.candidate_count >= max_separation_candidate_checks) return result;
+                result.candidate_count += 1;
+
+                const dx = job.pos_x[index] - job.pos_x[entry.index];
+                const dy = job.pos_y[index] - job.pos_y[entry.index];
+                const dist2 = dx * dx + dy * dy;
+                if (dist2 > 0.1 and dist2 < separation_radius2) {
+                    const invd = 1.0 / @sqrt(dist2);
+                    result.x += dx * invd;
+                    result.y += dy * invd;
+                    result.neighbor_count += 1;
+                    if (result.neighbor_count >= max_separation_neighbors) return result;
+                }
+            }
+        }
+    }
+    return result;
 }
 
 const AiJobContext = struct {
@@ -537,7 +805,7 @@ test "ai processor appends movement intents without clearing existing stream out
     try std.testing.expectEqual(entity.index, intents[1].movement.entity.index);
 }
 
-test "ai processor uses committed adaptive threaded profile with default thread worker config" {
+test "ai processor uses committed adaptive threaded profiles with default thread worker config" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -567,25 +835,29 @@ test "ai processor uses committed adaptive threaded profile with default thread 
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    var adaptive_tuner = AdaptiveWorkTuner.init(.{
+    var separation_tuner = AdaptiveWorkTuner.init(.{
         .initial_items_per_range = ai_range_alignment_items,
         .min_items_per_range = ai_range_alignment_items,
         .max_items_per_range = ai_range_alignment_items * 4,
     });
-    adaptive_tuner.current_profile = .{
+    separation_tuner.current_profile = .{
         .worker_threads = 1,
         .items_per_range = ai_range_alignment_items,
     };
-    adaptive_tuner.best_profile = adaptive_tuner.current_profile;
-    adaptive_tuner.has_threaded_profile = true;
-    adaptive_tuner.best_mean_batch_duration_ns = 1;
+    separation_tuner.best_profile = separation_tuner.current_profile;
+    separation_tuner.has_threaded_profile = true;
+    separation_tuner.best_mean_batch_duration_ns = 1;
+
+    var intent_tuner = separation_tuner;
 
     const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, &threads, 0.016, .{
-        .adaptive_tuner = &adaptive_tuner,
+        .separation_adaptive_tuner = &separation_tuner,
+        .intent_adaptive_tuner = &intent_tuner,
         .intent_seed = 3,
     });
     try std.testing.expectEqual(@as(usize, 128), stats.intent_count);
-    try std.testing.expect(stats.batch.active_worker_threads > 0);
+    try std.testing.expect(stats.separation_batch.active_worker_threads > 0);
+    try std.testing.expect(stats.intent_batch.active_worker_threads > 0);
 }
 
 test "wander amplitude scales steering perturbation against seek" {
@@ -828,4 +1100,93 @@ test "ai serial and real threaded workers produce identical movement intents" {
         try std.testing.expectEqual(a.movement.direction_x, b.movement.direction_x);
         try std.testing.expectEqual(a.movement.direction_y, b.movement.direction_y);
     }
+}
+
+test "ai spatial separation caps dense neighbor samples" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const count = 80;
+    for (0..count) |i| {
+        const entity = try data.createEntity();
+        const position = math.Vec2{
+            .x = @floatFromInt(i % 16),
+            .y = @floatFromInt(i / 16),
+        };
+        try data.setMovementBody(entity, .{
+            .position = position,
+            .previous_position = position,
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{
+            .behavior = .seek,
+            .wander_amplitude = 0,
+            .seek_weight = 1,
+        });
+    }
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(8, 0, count, 0, 0, 0);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 100 },
+    });
+
+    try std.testing.expectEqual(@as(usize, count), stats.intent_count);
+    try std.testing.expect(stats.separation_neighbor_samples <= count * @as(usize, max_separation_neighbors));
+    try std.testing.expect(stats.separation_candidate_checks <= count * @as(usize, max_separation_candidate_checks));
+    try std.testing.expect(stats.separation_neighbor_samples > 0);
+}
+
+test "ai spatial separation handles negative grid coordinates" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    try data.setMovementBody(first, .{
+        .position = .{ .x = -34, .y = -33 },
+        .previous_position = .{ .x = -34, .y = -33 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setAiAgent(first, .{
+        .behavior = .seek,
+        .wander_amplitude = 0,
+        .seek_weight = 1,
+    });
+
+    const second = try data.createEntity();
+    try data.setMovementBody(second, .{
+        .position = .{ .x = -20, .y = -21 },
+        .previous_position = .{ .x = -20, .y = -21 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setAiAgent(second, .{
+        .behavior = .seek,
+        .wander_amplitude = 0,
+        .seek_weight = 1,
+    });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 0, .y = 0 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.separation_candidate_checks);
+    try std.testing.expectEqual(@as(usize, 2), stats.separation_neighbor_samples);
 }

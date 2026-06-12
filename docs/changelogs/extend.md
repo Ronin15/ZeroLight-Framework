@@ -6,7 +6,7 @@ Range: `main..extend`
 
 Base: `e6bec53` (`Merge pull request #4 from Ronin15/emerge`)
 
-Tip: `db9b7b8` (`fixed a unit test failure as expected, for missing sprites`)
+Tip: `f0bf703` (`docs, skills, and steering guidance updated for current state of the project`)
 
 ## Summary
 
@@ -22,9 +22,9 @@ contracts.
 - Added Slice 14 AI intent processing with `AiAgent` component data,
   deterministic `MovementIntent` output through `SimulationFrame`, and serial,
   fixed-worker, and adaptive benchmark coverage.
-- Kept the current AI separation gather as a bounded main-thread setup step,
-  with threaded intent emission and explicit future guidance for staged scalable
-  perception, pathfinding, and rule processors.
+- Reworked AI separation around a transient spatial grid with bounded neighbor
+  sampling, independent separation/intent adaptive tuning, and explicit future
+  guidance for staged scalable perception, pathfinding, and rule processors.
 - Added Slice 16 main-menu and settings states using the existing state stack,
   named UI actions, text service, logical renderer drawing, and fixed-step audio
   command buffer for live gain changes.
@@ -63,3 +63,4 @@ contracts.
 - `5d28483` review fixes
 - `a206b2d` docs update
 - `db9b7b8` fixed a unit test failure as expected, for missing sprites
+- `f0bf703` docs, skills, and steering guidance updated for current state of the project

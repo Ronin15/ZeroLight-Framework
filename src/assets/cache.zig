@@ -115,6 +115,7 @@ pub const AssetCache = struct {
     }
 
     fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
+        if (lease.owner_id != self.owner_id) return;
         const handle = lease.handle;
         const texture = lease.id;
         const owner_id = lease.owner_id;
@@ -488,13 +489,20 @@ test "texture lease release validates the owning cache before retiring a slot" {
     var foreign = lease_a;
 
     cache_b.releaseTextureWithContext(&fake_b, &foreign);
-    try std.testing.expect(!foreign.isAlive());
+    try std.testing.expect(foreign.isAlive());
     try std.testing.expectEqual(@as(u32, 0), fake_b.destroy_count);
     try std.testing.expect(cache_b.resolveLeaseSlotConst(lease_b.handle) != null);
 
+    cache_a.releaseTextureWithContext(&fake_a, &foreign);
+    try std.testing.expect(!foreign.isAlive());
+    try std.testing.expectEqual(@as(u32, 1), fake_a.destroy_count);
+
     cache_b.releaseTextureWithContext(&fake_b, &lease_b);
-    cache_a.releaseTextureWithContext(&fake_a, &lease_a);
     try std.testing.expectEqual(@as(u32, 1), fake_b.destroy_count);
+    try std.testing.expectEqual(@as(u32, 1), fake_a.destroy_count);
+    try std.testing.expect(lease_a.isAlive());
+    cache_a.releaseTextureWithContext(&fake_a, &lease_a);
+    try std.testing.expect(!lease_a.isAlive());
     try std.testing.expectEqual(@as(u32, 1), fake_a.destroy_count);
 }
 

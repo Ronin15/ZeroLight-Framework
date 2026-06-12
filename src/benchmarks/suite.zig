@@ -686,7 +686,7 @@ fn printValidationSummary(
     if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
-                "workload separation_pairs={} intents={}. ",
+                "workload separation_checks={} intents={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
         } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
@@ -844,7 +844,30 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
     if (stats.candidate_pairs == 0 and stats.output_count == 0) return "-";
     if (std.mem.eql(u8, group_name, "ai")) {
-        return std.fmt.bufPrint(buffer, "separation_pairs={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+        if (stats.secondary_batch) |intent| {
+            const tuning = stats.secondary_work_tuning;
+            if (intent.active_worker_threads == 0 or intent.ran_inline) {
+                if (tuning) |summary| {
+                    const tuned = if (summary.has_threaded_profile) "threaded" else "none";
+                    return std.fmt.bufPrint(
+                        buffer,
+                        "separation_checks={} intents={} intent=inline tuned={s}",
+                        .{ stats.candidate_pairs, stats.output_count, tuned },
+                    ) catch "workload";
+                }
+                return std.fmt.bufPrint(
+                    buffer,
+                    "separation_checks={} intents={} intent=inline",
+                    .{ stats.candidate_pairs, stats.output_count },
+                ) catch "workload";
+            }
+            return std.fmt.bufPrint(
+                buffer,
+                "separation_checks={} intents={} intent={}/{}",
+                .{ stats.candidate_pairs, stats.output_count, intent.active_worker_threads, intent.items_per_range },
+            ) catch "workload";
+        }
+        return std.fmt.bufPrint(buffer, "separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";

@@ -22,9 +22,9 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish the manual Slice 17 interaction smoke, then choose between Slice 7
-  parallel render prep and Slice 8 shader/platform validation as the next
-  engine-support track.
+- Use the completed Slice 17 runtime asset catalog as the base for Slice 7
+  parallel render prep or Slice 8 shader/platform validation when the next
+  engine-support track is picked.
 - Defer Slice 8 shader/platform validation until that engine-support track is
   intentionally picked back up.
 - Slice 17 now gives Slice 7 parallel CPU render prep a realistic sprite/audio
@@ -864,10 +864,10 @@ Current foundation:
   collision-aware decisions.
 - `DataSystem` owns aligned `AiAgent` SoA data, membership masks,
   structural-command validation, and dense movement lookup for AI rows.
-- `AiSystem` reads `AiAgent` and movement slices, gathers pairwise local
-  separation on the main thread, emits deterministic `MovementIntent` ranges
-  into `SimulationFrame`, and uses serial or adaptive threaded execution for the
-  intent-emission stage.
+- `AiSystem` reads `AiAgent` and movement slices, builds a transient 32-unit
+  spatial grid, computes bounded local-separation samples, emits deterministic
+  `MovementIntent` ranges into `SimulationFrame`, and uses serial or adaptive
+  threaded execution for the separation and intent-emission stages.
 - `GameDemoState` runs AI after main-thread player input and before movement
   integration, then applies AI movement intents on the main thread before
   `MovementSystem`.
@@ -885,9 +885,9 @@ Architecture notes:
 - Future AI, pathfinding, and rules should emit movement intents, steering
   outputs, target choices, path requests/results, or deferred commands rather
   than mutating unrelated stores directly.
-- The current AI separation gather is an O(N^2) demo-scale setup step. Future
-  scalable perception, pathfinding, or rule passes need explicit staged work
-  ownership, stage-specific tuning, and deterministic merge points.
+- AI separation and intent emission are independently staged and tuned. Future
+  perception, pathfinding, or rule passes need the same explicit work ownership,
+  stage-specific tuning, and deterministic merge points.
 - Deterministic randomness must be explicit state or an explicit service passed
   through the processor boundary.
 - Pathfinding should use read-only navigation or world snapshots during worker
@@ -985,6 +985,9 @@ Architecture notes:
   can sit on top without stealing gameplay pause notifications.
 - Menu and settings states are non-gameplay UI states; pause attempts over them
   are inert.
+- Settings are currently runtime menu state. Persistent settings file work
+  should move pending adjustment persistence out of modal-local state so closing
+  the settings menu cannot drop a not-yet-applied adjustment.
 
 Checklist:
 

@@ -268,14 +268,15 @@ applies sparse movement writes deterministically on the main thread before
 structural commands commit.
 
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
-It receives const AiAgent + movement prior-position slices, gathers the current
-pairwise local-separation context on the main thread, then uses a per-system
-AdaptiveWorkTuner to select the range/worker profile for threaded intent
-emission through `SimulationFrame.intents` (count/prefix/write). This current
-O(N^2) separation gather is deliberate and bounded for the demo and benchmark
-profiles; future scalable perception, pathfinding, or rule systems need their
-own staged/tuned design. Wander amplitude and seek prove non-player entities
-are driven by persistent data + processor intents, not hardcoded velocities.
+It receives const AiAgent + movement prior-position slices, builds a transient
+32-unit spatial grid, computes bounded local-separation samples, then emits
+threaded movement intents through `SimulationFrame.intents`
+(count/prefix/write). Separation and intent emission have independent
+AdaptiveWorkTuner state and benchmark stats so each stage can remain inline or
+thread independently. Future perception, pathfinding, or rule systems should
+keep the same explicit staged/tuned design rather than hiding extra work inside
+intent emission. Wander amplitude and seek prove non-player entities are
+driven by persistent data + processor intents, not hardcoded velocities.
 Consumption (main-thread, before MovementSystem) writes velocities from intent
 dir * speed using MovementBodyPtr; player remains special-cased with no
 ai_agent component. Intent streams and processor order are explicit in the

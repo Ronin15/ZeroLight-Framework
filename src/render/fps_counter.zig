@@ -19,7 +19,8 @@ const overlay_layer: i32 = 10_000;
 
 pub const FpsCounter = struct {
     font: FontId = FontId.invalid,
-    text: PreparedText = .invalid,
+    prefix: PreparedText = .invalid,
+    digits: [10]PreparedText = [_]PreparedText{PreparedText.invalid} ** 10,
     accumulated_ns: u64 = 0,
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
@@ -51,8 +52,8 @@ pub const FpsCounter = struct {
             self.texture_dirty = true;
         }
 
-        if (self.texture_dirty or !self.text.isValid()) {
-            try self.prepareTextView(text_service, renderer);
+        if (self.texture_dirty or !self.glyphsValid()) {
+            try self.prepareGlyphs(text_service, renderer);
         }
     }
 
@@ -76,23 +77,48 @@ pub const FpsCounter = struct {
         if (next_fps == self.displayed_fps) return;
 
         self.displayed_fps = next_fps;
-        self.texture_dirty = true;
     }
 
     pub fn render(self: *const FpsCounter, renderer: *Renderer) !void {
-        try text.drawPreparedText(renderer, self.text, .{
-            .x = 12,
-            .y = 10,
+        var x: f32 = 12;
+        const y: f32 = 10;
+        try text.drawPreparedText(renderer, self.prefix, .{
+            .x = x,
+            .y = y,
             .layer = overlay_layer,
             .coordinate_space = .drawable,
         });
+        x += @floatFromInt(self.prefix.width);
+
+        var buffer: [16]u8 = undefined;
+        const digits = std.fmt.bufPrint(&buffer, "{d}", .{self.displayed_fps}) catch "0";
+        for (digits) |digit| {
+            const prepared = self.digits[digit - '0'];
+            try text.drawPreparedText(renderer, prepared, .{
+                .x = x,
+                .y = y,
+                .layer = overlay_layer,
+                .coordinate_space = .drawable,
+            });
+            x += @floatFromInt(prepared.width);
+        }
     }
 
-    fn prepareTextView(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
-        var text_buffer: [32]u8 = undefined;
-        const label = try std.fmt.bufPrint(&text_buffer, "FPS {d}", .{self.displayed_fps});
-        self.text = try text_service.prepareText(renderer, TextRequest.init(label, self.font, yellow));
+    fn prepareGlyphs(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
+        self.prefix = try text_service.prepareText(renderer, TextRequest.init("FPS ", self.font, yellow));
+        for (&self.digits, 0..) |*digit_text, index| {
+            const digit = [_]u8{@intCast('0' + index)};
+            digit_text.* = try text_service.prepareText(renderer, TextRequest.init(&digit, self.font, yellow));
+        }
         self.texture_dirty = false;
+    }
+
+    fn glyphsValid(self: *const FpsCounter) bool {
+        if (!self.prefix.isValid()) return false;
+        for (self.digits) |digit| {
+            if (!digit.isValid()) return false;
+        }
+        return true;
     }
 };
 
@@ -110,14 +136,18 @@ test "overlay font size follows drawable pixel scale" {
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(0.5));
 }
 
-test "submitted frame sampling marks fps texture dirty after sample window" {
+test "submitted frame sampling updates fps without dirtying cached glyphs" {
     var fps = FpsCounter{};
 
     fps.texture_dirty = false;
     fps.recordSubmittedFrame(sample_window_ns);
 
-    try std.testing.expect(fps.texture_dirty);
+    try std.testing.expect(!fps.texture_dirty);
     try std.testing.expectEqual(@as(u32, 4), fps.displayed_fps);
     try std.testing.expectEqual(@as(u32, 0), fps.sampled_frames);
     try std.testing.expectEqual(@as(u64, 0), fps.accumulated_ns);
+}
+
+test "fps counter uses fixed glyph set" {
+    try std.testing.expectEqual(@as(usize, 10), @typeInfo(@TypeOf((FpsCounter{}).digits)).array.len);
 }

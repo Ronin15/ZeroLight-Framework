@@ -115,14 +115,14 @@ range-size effects. The default quick profile keeps collision coverage short:
 dense and sparse collision each run one representative body count, while
 collision-response modes run small and medium contact counts. AI sweeps
 128-1,024 agents in the quick profile, 128-4,096 in standard, and 512-8,192 in
-stress. These counts stay below movement/particle counts because the current AI
-processor precomputes pairwise local separation on the main thread before worker
-range emission, so that setup grows as `agent_count * (agent_count - 1)`.
+stress. AI separation uses a transient spatial grid with bounded neighbor and
+candidate samples, then intent emission runs as its own stage.
 Collision output includes candidate-pair and contact counts so dense stress
 cases can be compared against sparse gameplay-shaped distributions. Detail rows
 also report narrowphase as `narrow=inline` or `narrow=worker_threads/items_per_range`
 because collision has independently tuned broadphase and narrowphase stages. AI
-output reports pairwise separation checks and emitted movement-intent counts.
+detail rows similarly report intent-stage worker/range tuning, while AI output
+reports bounded separation checks and emitted movement-intent counts.
 
 Benchmark output is grouped by workload and count. Each block prints an aligned
 plain-text table with per-case timing, speedup, throughput, worker-thread use,

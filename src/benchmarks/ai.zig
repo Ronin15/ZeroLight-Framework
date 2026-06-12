@@ -83,7 +83,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var system = AiSystem.init(allocator);
     defer system.deinit();
     if (suite.adaptiveTunerForCase(case, ai_range_alignment_items)) |tuner| {
-        system.adaptive_tuner = tuner;
+        system.separation_tuner = tuner;
+        system.intent_tuner = suite.adaptiveTunerForCase(case, ai_range_alignment_items).?;
     }
 
     var threads: ?ThreadSystem = null;
@@ -102,11 +103,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!system.separation_tuner.isSettled() or !system.intent_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
         }
     }
-    const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
+    const separation_settled_before_measurement = if (case.adaptive) system.separation_tuner.isSettled() else false;
+    const intent_settled_before_measurement = if (case.adaptive) system.intent_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_ai_stats = AiStats{};
@@ -114,14 +116,16 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const start_ns = suite.nowNs(io);
         last_ai_stats = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_ai_stats.batch);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_ai_stats.separation_batch);
     }
 
     var stats = accumulator.finish();
-    stats.candidate_pairs = orderedSeparationPairCount(item_count);
+    stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
     stats.output_count = last_ai_stats.intent_count;
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(system.separation_tuner.report(), separation_settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.intent_tuner.report(), intent_settled_before_measurement);
     }
     return stats;
 }
@@ -161,11 +165,6 @@ fn rangeCount(item_count: usize, items_per_range: usize) usize {
     return (item_count + items_per_range - 1) / items_per_range;
 }
 
-fn orderedSeparationPairCount(item_count: usize) usize {
-    if (item_count == 0) return 0;
-    return item_count * (item_count - 1);
-}
-
 test "ai benchmark fixture creates requested agents and movement bodies" {
     var fixture = try createFixture(std.testing.allocator, 32);
     defer fixture.deinit();
@@ -196,9 +195,8 @@ test "ai benchmark fixed cases use explicit range controls" {
     try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[7]));
 }
 
-test "ai benchmark profiles keep quadratic separation workload bounded" {
+test "ai benchmark profiles keep bounded separation workload cases" {
     try std.testing.expectEqual(@as(usize, 4), defaultItemCounts(.quick).len);
     try std.testing.expectEqual(@as(usize, 128), defaultItemCounts(.quick)[0]);
     try std.testing.expectEqual(@as(usize, 8_192), defaultItemCounts(.stress)[4]);
-    try std.testing.expectEqual(@as(usize, 1_024 * 1_023), orderedSeparationPairCount(1_024));
 }
