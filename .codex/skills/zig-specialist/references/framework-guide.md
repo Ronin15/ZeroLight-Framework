@@ -83,11 +83,13 @@ range, prefix offsets, contiguous writes, deterministic range-index merge, and
 batch commit boundaries over global per-command atomics, broad event buses, or
 callback chains.
 
-The current AI processor keeps pairwise local-separation gathering on the main
-thread and threads deterministic intent emission only. Future scalable
-perception, pathfinding, or rule processors need explicit staged ownership,
-stage-specific tuning, and deterministic merge points instead of treating the
-current demo AI shape as the final scalable path.
+AI/perception processors should keep scalable setup work bounded and explicit:
+use an appropriate spatial/perception structure for the workload, then emit
+deterministic movement intents or rule outputs as separate staged work. Stages
+that can dominate timing, such as separation/perception and intent emission,
+should have independent tuning/stats so each can stay inline or thread
+independently. Future pathfinding or rule processors need the same explicit
+staged ownership, stage-specific tuning, and deterministic merge points.
 
 Hot processors should iterate dense SoA columns directly. Component masks are
 for membership/query decisions; they should not turn hot loops into dynamic

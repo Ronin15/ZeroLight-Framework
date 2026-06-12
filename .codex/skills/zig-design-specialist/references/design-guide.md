@@ -86,10 +86,10 @@ repo. Keep the final design compact, but make the decisions below explicit.
 - AI, pathfinding, and rule systems should usually emit movement intents,
   steering outputs, target choices, or deferred commands rather than mutating
   unrelated stores directly.
-- The current demo AI gathers pairwise local separation on the main thread and
-  threads intent emission only. Treat scalable perception, pathfinding, and
-  rule processing as future staged designs with their own tuners and merge
-  points.
+- AI/perception, pathfinding, and rule processing should be designed as bounded
+  stages with explicit inputs, outputs, timing visibility, tuning policy, and
+  deterministic merge points. Pick the spatial, perception, or graph structure
+  that fits the workload instead of copying today's processor shape.
 - Deterministic randomness, if needed, should be explicit state or an explicit
   service passed through the processor boundary. Do not hide random choices in
   hot processors.

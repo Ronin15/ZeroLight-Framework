@@ -36,7 +36,8 @@ For performance failures, first identify the hot path and whether the regression
 comes from allocation, repeated lookup/validation, dynamic dispatch, formatted
 logging, resource recreation, excessive GPU submissions, or frame pacing. Prefer
 moving work to initialization, asset loading, state transitions, or explicit
-caches over adding per-frame workarounds.
+caches over adding per-frame workarounds. For multi-stage processors, isolate
+stage timing and tuner state before changing thread policy or algorithm shape.
 
 ## Command Selection
 
