@@ -11,10 +11,9 @@ const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
 const inputFile = @import("../app/input.zig");
 const menu_view = @import("menu_view.zig");
-const text_file = @import("../render/text.zig");
-const FontId = text_file.FontId;
-const PreparedText = text_file.PreparedText;
-const TextService = text_file.TextService;
+const text = @import("../render/text.zig");
+const PreparedText = text.PreparedText;
+const TextService = text.TextService;
 const log = @import("../core/logging.zig").game;
 const c = @import("../platform/sdl.zig").c;
 
@@ -215,8 +214,7 @@ pub const SettingsMenuState = struct {
     }
 
     fn prepareTextViews(self: *SettingsMenuState, text_service: *TextService, renderer: *Renderer) !void {
-        const font = text_service.defaultFont();
-        self.title_text = try prepareLabel(text_service, renderer, font, "Settings", title_color);
+        self.title_text = try text_service.prepareDefaultText(renderer, "Settings", title_color);
 
         var master_buf: [64]u8 = undefined;
         var sfx_buf: [64]u8 = undefined;
@@ -229,10 +227,8 @@ pub const SettingsMenuState = struct {
         };
 
         for (labels, 0..) |label, i| {
-            self.item_texts[i] = try prepareLabel(
-                text_service,
+            self.item_texts[i] = try text_service.prepareDefaultText(
                 renderer,
-                font,
                 label,
                 if (i == self.selected) accent_color else normal_color,
             );
@@ -241,22 +237,6 @@ pub const SettingsMenuState = struct {
         self.text_dirty = false;
     }
 };
-
-fn prepareLabel(
-    text_service: *TextService,
-    renderer: *Renderer,
-    font: FontId,
-    label: []const u8,
-    color: config.Color,
-) !PreparedText {
-    return text_service.prepareText(renderer, .{
-        .text = label,
-        .style = .{
-            .font = font,
-            .color = color,
-        },
-    });
-}
 
 test "settings volumes clamp and emit gain commands" {
     var runtime_settings = RuntimeAudioSettings.init(.{});

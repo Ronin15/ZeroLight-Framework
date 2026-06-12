@@ -14,10 +14,9 @@ const GameDemoState = @import("game_demo_state.zig").GameDemoState;
 const SettingsMenuState = @import("settings_menu_state.zig").SettingsMenuState;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const menu_view = @import("menu_view.zig");
-const text_file = @import("../render/text.zig");
-const FontId = text_file.FontId;
-const PreparedText = text_file.PreparedText;
-const TextService = text_file.TextService;
+const text = @import("../render/text.zig");
+const PreparedText = text.PreparedText;
+const TextService = text.TextService;
 const log = @import("../core/logging.zig").game;
 const c = @import("../platform/sdl.zig").c;
 
@@ -170,14 +169,10 @@ pub const MainMenuState = struct {
     }
 
     fn prepareTextViews(self: *MainMenuState, text_service: *TextService, renderer: *Renderer) !void {
-        const font = text_service.defaultFont();
-
-        self.title_text = try prepareLabel(text_service, renderer, font, "Zig SDL3 GPU", title_color);
+        self.title_text = try text_service.prepareDefaultText(renderer, "Zig SDL3 GPU", title_color);
         for (items, 0..) |label, i| {
-            self.item_texts[i] = try prepareLabel(
-                text_service,
+            self.item_texts[i] = try text_service.prepareDefaultText(
                 renderer,
-                font,
                 label,
                 if (i == self.selected) accent_color else normal_color,
             );
@@ -186,22 +181,6 @@ pub const MainMenuState = struct {
         self.text_dirty = false;
     }
 };
-
-fn prepareLabel(
-    text_service: *TextService,
-    renderer: *Renderer,
-    font: FontId,
-    label: []const u8,
-    color: config.Color,
-) !PreparedText {
-    return text_service.prepareText(renderer, .{
-        .text = label,
-        .style = .{
-            .font = font,
-            .color = color,
-        },
-    });
-}
 
 test "main menu selection wraps and activates produce transitions" {
     var menu = MainMenuState.init(std.testing.allocator, 800, 450, .{});

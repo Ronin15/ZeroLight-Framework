@@ -10,8 +10,8 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
-const text_file = @import("../render/text.zig");
-const PreparedText = text_file.PreparedText;
+const text = @import("../render/text.zig");
+const PreparedText = text.PreparedText;
 
 pub fn changeSelection(selected: *usize, delta: i32, item_count: usize) void {
     const n: i32 = @intCast(item_count);
@@ -53,7 +53,7 @@ pub fn renderList(
         .h = panel_height,
     }, panel_color, panel_layer);
 
-    try text_file.drawPrepared(renderer, title, .{
+    try text.drawPreparedText(renderer, title, .{
         .x = width * 0.5,
         .y = title_y,
         .anchor = .top_center,
@@ -74,7 +74,7 @@ pub fn renderList(
             }, highlight_color, highlight_layer);
         }
 
-        try text_file.drawPrepared(renderer, item, .{
+        try text.drawPreparedText(renderer, item, .{
             .x = width * 0.5,
             .y = y,
             .anchor = .top_center,

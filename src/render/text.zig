@@ -4,6 +4,8 @@
 
 //! Asset-backed SDL_ttf service for cached UI and debug text.
 //! Text rendering is synchronous on cache misses and cached for app lifetime.
+//! Prepare text only when content/style changes; render stored PreparedText
+//! views with drawPreparedText.
 
 const std = @import("std");
 const assets = @import("../assets/assets.zig");
@@ -47,7 +49,7 @@ pub const FontId = struct {
     }
 };
 
-pub const TextTextureId = struct {
+const TextTextureId = struct {
     index: u32,
     generation: u32,
 
@@ -88,6 +90,13 @@ pub const TextStyle = struct {
     font: FontId,
     color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
 
+    pub fn init(font: FontId, color: config.Color) TextStyle {
+        return .{
+            .font = font,
+            .color = color,
+        };
+    }
+
     pub fn validate(self: TextStyle) !void {
         if (!self.font.isValid()) return error.InvalidFont;
         try validateColor(self.color);
@@ -113,6 +122,21 @@ pub const TextRequest = struct {
     style: TextStyle,
     layout: TextLayoutOptions = .{},
 
+    pub fn init(text: []const u8, font: FontId, color: config.Color) TextRequest {
+        return .{
+            .text = text,
+            .style = TextStyle.init(font, color),
+        };
+    }
+
+    pub fn withLayout(self: TextRequest, layout: TextLayoutOptions) TextRequest {
+        return .{
+            .text = self.text,
+            .style = self.style,
+            .layout = layout,
+        };
+    }
+
     pub fn validate(self: TextRequest) !void {
         if (self.text.len == 0) return error.InvalidText;
         try self.style.validate();
@@ -120,7 +144,7 @@ pub const TextRequest = struct {
     }
 };
 
-pub const RenderedText = struct {
+const RenderedText = struct {
     texture: TextureId,
     width: u32,
     height: u32,
@@ -225,6 +249,15 @@ pub const TextService = struct {
         request: TextRequest,
     ) !PreparedText {
         return self.prepareTextWithContext(@ptrCast(renderer), request);
+    }
+
+    pub fn prepareDefaultText(
+        self: *TextService,
+        renderer: *Renderer,
+        text: []const u8,
+        color: config.Color,
+    ) !PreparedText {
+        return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
     fn initWithBackend(allocator: std.mem.Allocator, assetStore: assets.AssetStore, backend: TextBackend) TextService {
@@ -417,7 +450,7 @@ pub const TextService = struct {
     }
 };
 
-pub fn drawPrepared(renderer: *Renderer, prepared: PreparedText, placement: TextPlacement) !void {
+pub fn drawPreparedText(renderer: *Renderer, prepared: PreparedText, placement: TextPlacement) !void {
     if (!prepared.isValid()) return;
     try renderer.drawSprite(.{
         .texture = prepared.texture,

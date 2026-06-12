@@ -4,8 +4,8 @@
 
 const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
-const text_file = @import("../render/text.zig");
-const PreparedText = text_file.PreparedText;
+const text = @import("../render/text.zig");
+const PreparedText = text.PreparedText;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -89,13 +89,7 @@ fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").R
 fn drawPrompt(self: *PauseState, context: RenderContext) !void {
     const text_service = context.text_service orelse return;
     if (!self.prompt.isValid()) {
-        self.prompt = try text_service.prepareText(context.renderer, .{
-            .text = PauseState.prompt_text,
-            .style = .{
-                .font = text_service.defaultFont(),
-                .color = PauseState.prompt_color,
-            },
-        });
+        self.prompt = try text_service.prepareDefaultText(context.renderer, PauseState.prompt_text, PauseState.prompt_color);
     }
     const prompt_height: f32 = @floatFromInt(self.prompt.height);
     const panel_bottom = (self.height + PauseState.panel_height) * 0.5;
@@ -103,7 +97,7 @@ fn drawPrompt(self: *PauseState, context: RenderContext) !void {
         panel_bottom + PauseState.prompt_gap_below_panel,
         self.height - prompt_height - PauseState.prompt_screen_margin,
     );
-    try text_file.drawPrepared(context.renderer, self.prompt, .{
+    try text.drawPreparedText(context.renderer, self.prompt, .{
         .x = self.width * 0.5,
         .y = prompt_y,
         .anchor = .top_center,

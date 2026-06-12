@@ -5,10 +5,11 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const Renderer = @import("renderer.zig").Renderer;
-const textServiceFile = @import("text.zig");
-const FontId = @import("text.zig").FontId;
-const PreparedText = @import("text.zig").PreparedText;
-const TextService = @import("text.zig").TextService;
+const text = @import("text.zig");
+const FontId = text.FontId;
+const PreparedText = text.PreparedText;
+const TextRequest = text.TextRequest;
+const TextService = text.TextService;
 
 const yellow = config.Color{ .r = 1.0, .g = 0.902, .b = 0.157, .a = 1.0 };
 const sample_window_ns = std.time.ns_per_s / 4;
@@ -45,7 +46,7 @@ pub const FpsCounter = struct {
         const font_size_changed = !approxEqAbs(self.active_font_size, target_font_size, font_size_epsilon);
 
         if (font_size_changed) {
-            self.font = try text_service.loadFont(textServiceFile.defaultFontDesc(target_font_size));
+            self.font = try text_service.loadFont(text.defaultFontDesc(target_font_size));
             self.active_font_size = target_font_size;
             self.texture_dirty = true;
         }
@@ -79,7 +80,7 @@ pub const FpsCounter = struct {
     }
 
     pub fn render(self: *const FpsCounter, renderer: *Renderer) !void {
-        try textServiceFile.drawPrepared(renderer, self.text, .{
+        try text.drawPreparedText(renderer, self.text, .{
             .x = 12,
             .y = 10,
             .layer = overlay_layer,
@@ -89,14 +90,8 @@ pub const FpsCounter = struct {
 
     fn prepareTextView(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
         var text_buffer: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&text_buffer, "FPS {d}", .{self.displayed_fps});
-        self.text = try text_service.prepareText(renderer, .{
-            .text = text,
-            .style = .{
-                .font = self.font,
-                .color = yellow,
-            },
-        });
+        const label = try std.fmt.bufPrint(&text_buffer, "FPS {d}", .{self.displayed_fps});
+        self.text = try text_service.prepareText(renderer, TextRequest.init(label, self.font, yellow));
         self.texture_dirty = false;
     }
 };

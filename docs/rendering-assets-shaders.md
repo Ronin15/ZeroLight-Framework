@@ -136,13 +136,13 @@ retained IDs directly.
 `RenderContext` values provide it for menu and UI states; unit-test contexts can
 leave it null when text is not part of the contract under test. Load fonts from
 `assets/fonts/...` and keep the returned `FontId`. UI states store text intent,
-dirty flags, and non-owning `PreparedText` views. When text, font, color, wrap,
-or DPI scale changes, the state calls `TextService.prepareText(renderer,
-request)` to create or retrieve the cached renderer texture. Normal render
-frames draw the stored view with `text.drawPrepared(...)`, so stable labels do
-not re-check the cache every frame. The service keeps generated text textures
-cached for app lifetime and releases them during `TextService.deinit` after the
-renderer is idle.
+dirty flags, and non-owning `PreparedText` views. For common default-font labels,
+call `TextService.prepareDefaultText(renderer, label, color)`. For custom fonts
+or layout, call `TextService.prepareText(renderer, TextRequest.init(...))`.
+Normal render frames draw the stored view with `text.drawPreparedText(...)`, so
+stable labels do not re-check the cache every frame. The service keeps generated
+text textures cached for app lifetime and releases them during
+`TextService.deinit` after the renderer is idle.
 
 The default font is `fonts/NotoSansMono-Regular.ttf`. System font probing is not
 part of the normal runtime path.
