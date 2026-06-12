@@ -1077,8 +1077,9 @@ Checklist:
       stable `SpriteAssetId` values.
 - [x] Add the first demo sprite asset under `assets/sprites/` and assign sprite
       IDs to player, AI squares, and obstacles.
-- [x] Add or update render prep so entity render rows produce deterministic
-      sprite commands with primitive fallback for unavailable sprite IDs.
+- [x] Update render-facing demo code so deterministic entity drawing resolves
+      sprite IDs through `RuntimeAssets` with primitive fallback for unavailable
+      sprite IDs.
 - [x] Update architecture and rendering/assets docs to describe startup preload,
       stable IDs, missing-asset behavior, and atlas-ready source rectangles.
 
@@ -1088,12 +1089,12 @@ Acceptance checks:
       once.
 - [x] Missing declared content logs once, marks the asset unavailable, and does
       not abort app initialization.
-- [x] Gameplay state, render prep, and audio commands use stable asset IDs
-      rather than runtime string paths.
+- [x] Gameplay state, render-facing drawing, and audio commands use stable asset
+      IDs rather than runtime string paths.
 - [x] `DataSystem` contains no live renderer texture IDs, texture leases,
       prepared sprite records, SDL_mixer handles, or loaded audio handles.
-- [x] Render prep resolves `SpriteAssetId` to `{ texture, source_rect }` and
-      preserves deterministic draw ordering.
+- [x] Render-facing drawing resolves `SpriteAssetId` to
+      `{ texture, source_rect }` and preserves deterministic draw ordering.
 - [x] Future atlas mapping can change the catalog resolution without changing
       entity component storage.
 - [x] `zig build fmt`, `zig build test`, `zig build check`, and
