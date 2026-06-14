@@ -30,9 +30,11 @@ const AiAgent = @import("../data_system.zig").AiAgent;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const MovementIntent = @import("../simulation.zig").MovementIntent;
+const PathRequest = @import("../simulation.zig").PathRequest;
 const SimulationIntent = @import("../simulation.zig").SimulationIntent;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
+const PathfindingSystem = @import("pathfinding.zig").PathfindingSystem;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -59,11 +61,18 @@ pub const AiConfig = struct {
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
     seek_target: ?math.Vec2 = null,
+    pathfinding: ?*const PathfindingSystem = null,
+    path_requests: ?*RangeOutputStream(PathRequest) = null,
 };
 
 pub const AiStats = struct {
     entity_count: usize = 0,
     intent_count: usize = 0,
+    path_request_count: usize = 0,
+    path_available_count: usize = 0,
+    path_pending_count: usize = 0,
+    path_unavailable_count: usize = 0,
+    path_direct_fallback_count: usize = 0,
     separation_candidate_checks: usize = 0,
     separation_neighbor_samples: usize = 0,
     separation_batch: BatchStats = .{},
@@ -84,6 +93,9 @@ pub const AiSystem = struct {
     // Eliminates per-item O(N) scans inside jobs (was quadratic total in worker path).
     sep_x: HotF32List = .empty,
     sep_y: HotF32List = .empty,
+    path_dir_x: HotF32List = .empty,
+    path_dir_y: HotF32List = .empty,
+    path_overrides: std.ArrayList(bool) = .empty,
     separation_neighbor_counts: std.ArrayList(u8) = .empty,
     separation_candidate_counts: std.ArrayList(u16) = .empty,
     cell_entries: std.ArrayList(CellEntry) = .empty,
@@ -104,6 +116,9 @@ pub const AiSystem = struct {
         self.cell_entries.deinit(self.allocator);
         self.separation_candidate_counts.deinit(self.allocator);
         self.separation_neighbor_counts.deinit(self.allocator);
+        self.path_overrides.deinit(self.allocator);
+        self.path_dir_y.deinit(self.allocator);
+        self.path_dir_x.deinit(self.allocator);
         self.sep_y.deinit(self.allocator);
         self.sep_x.deinit(self.allocator);
         self.seek_weights.deinit(self.allocator);
@@ -177,6 +192,7 @@ pub const AiSystem = struct {
 
         const target_x = if (system_config.seek_target) |t| t.x else computeTarget(movement, .x);
         const target_y = if (system_config.seek_target) |t| t.y else computeTarget(movement, .y);
+        const pathing_stats = try self.preparePathing(system_config, target_x, target_y);
 
         var context = AiJobContext{
             .entities = self.entities.items,
@@ -187,6 +203,9 @@ pub const AiSystem = struct {
             .seek_weights = self.seek_weights.items,
             .sep_x = self.sep_x.items,
             .sep_y = self.sep_y.items,
+            .path_dir_x = self.path_dir_x.items,
+            .path_dir_y = self.path_dir_y.items,
+            .path_overrides = self.path_overrides.items,
             .intents = &frame.intents,
             .target_x = target_x,
             .target_y = target_y,
@@ -215,6 +234,11 @@ pub const AiSystem = struct {
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
+            .path_request_count = pathing_stats.requested,
+            .path_available_count = pathing_stats.available,
+            .path_pending_count = pathing_stats.pending,
+            .path_unavailable_count = pathing_stats.unavailable,
+            .path_direct_fallback_count = pathing_stats.direct_fallback,
             .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
             .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
             .separation_batch = separation_batch,
@@ -246,18 +270,23 @@ pub const AiSystem = struct {
         var writer = frame.intents.rangeWriter(range_base);
         const tx = if (config.seek_target) |t| t.x else computeTarget(movement, .x);
         const ty = if (config.seek_target) |t| t.y else computeTarget(movement, .y);
+        const system_config = normalizedConfig(config, self);
+        const pathing_stats = try self.preparePathing(system_config, tx, ty);
         for (range.start..range.end) |i| {
-            const base_dir = decideDir(
-                self.behaviors.items[i],
-                self.pos_x.items[i],
-                self.pos_y.items[i],
-                tx,
-                ty,
-                self.wander_amplitudes.items[i],
-                self.seek_weights.items[i],
-                config.intent_seed,
-                self.entities.items[i].index,
-            );
+            const base_dir = if (self.path_overrides.items[i])
+                AiDir{ .x = self.path_dir_x.items[i], .y = self.path_dir_y.items[i] }
+            else
+                decideDir(
+                    self.behaviors.items[i],
+                    self.pos_x.items[i],
+                    self.pos_y.items[i],
+                    tx,
+                    ty,
+                    self.wander_amplitudes.items[i],
+                    self.seek_weights.items[i],
+                    config.intent_seed,
+                    self.entities.items[i].index,
+                );
             const sep_x = if (i < self.sep_x.items.len) self.sep_x.items[i] else 0;
             const sep_y = if (i < self.sep_y.items.len) self.sep_y.items[i] else 0;
             const dir = applySeparationAndNormalize(base_dir, sep_x, sep_y);
@@ -275,6 +304,11 @@ pub const AiSystem = struct {
         return .{
             .entity_count = entity_count,
             .intent_count = entity_count,
+            .path_request_count = pathing_stats.requested,
+            .path_available_count = pathing_stats.available,
+            .path_pending_count = pathing_stats.pending,
+            .path_unavailable_count = pathing_stats.unavailable,
+            .path_direct_fallback_count = pathing_stats.direct_fallback,
             .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
             .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
             .separation_batch = separation_batch,
@@ -295,6 +329,9 @@ pub const AiSystem = struct {
         try self.seek_weights.ensureTotalCapacity(self.allocator, n);
         try self.sep_x.ensureTotalCapacity(self.allocator, n);
         try self.sep_y.ensureTotalCapacity(self.allocator, n);
+        try self.path_dir_x.ensureTotalCapacity(self.allocator, n);
+        try self.path_dir_y.ensureTotalCapacity(self.allocator, n);
+        try self.path_overrides.ensureTotalCapacity(self.allocator, n);
         try self.separation_neighbor_counts.ensureTotalCapacity(self.allocator, n);
         try self.separation_candidate_counts.ensureTotalCapacity(self.allocator, n);
         try self.cell_entries.ensureTotalCapacity(self.allocator, n);
@@ -312,6 +349,9 @@ pub const AiSystem = struct {
             self.seek_weights.appendAssumeCapacity(ai_slice.seek_weights[i]);
             self.sep_x.appendAssumeCapacity(0);
             self.sep_y.appendAssumeCapacity(0);
+            self.path_dir_x.appendAssumeCapacity(0);
+            self.path_dir_y.appendAssumeCapacity(0);
+            self.path_overrides.appendAssumeCapacity(false);
             self.separation_neighbor_counts.appendAssumeCapacity(0);
             self.separation_candidate_counts.appendAssumeCapacity(0);
         }
@@ -326,6 +366,9 @@ pub const AiSystem = struct {
         self.seek_weights.clearRetainingCapacity();
         self.sep_x.clearRetainingCapacity();
         self.sep_y.clearRetainingCapacity();
+        self.path_dir_x.clearRetainingCapacity();
+        self.path_dir_y.clearRetainingCapacity();
+        self.path_overrides.clearRetainingCapacity();
         self.separation_neighbor_counts.clearRetainingCapacity();
         self.separation_candidate_counts.clearRetainingCapacity();
         self.cell_entries.clearRetainingCapacity();
@@ -372,6 +415,76 @@ pub const AiSystem = struct {
         };
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.entities.items.len }, WorkerId.main);
     }
+
+    fn preparePathing(self: *AiSystem, config: NormalizedAiConfig, target_x: f32, target_y: f32) !AiPathingStats {
+        for (self.path_overrides.items) |*value| value.* = false;
+        for (self.path_dir_x.items) |*value| value.* = 0;
+        for (self.path_dir_y.items) |*value| value.* = 0;
+
+        const pathfinding = config.pathfinding orelse return .{};
+        const requests = config.path_requests orelse return .{};
+        var stats = AiPathingStats{};
+        for (self.entities.items, 0..) |entity, index| {
+            if (self.behaviors.items[index] != .seek or self.seek_weights.items[index] <= 0) continue;
+            const start = math.Vec2{ .x = self.pos_x.items[index], .y = self.pos_y.items[index] };
+            const goal = math.Vec2{ .x = target_x, .y = target_y };
+            const view = pathfinding.statusForEntityWorld(entity, start, goal, .default);
+            switch (view.status) {
+                .available => {
+                    const dir = normalizeOrZero(view.next_waypoint.x - start.x, view.next_waypoint.y - start.y);
+                    self.path_dir_x.items[index] = dir.x;
+                    self.path_dir_y.items[index] = dir.y;
+                    self.path_overrides.items[index] = true;
+                    stats.available += 1;
+                },
+                .missing => {
+                    stats.requested += 1;
+                    stats.direct_fallback += 1;
+                },
+                .pending => {
+                    stats.pending += 1;
+                    stats.direct_fallback += 1;
+                },
+                .unavailable => {
+                    stats.unavailable += 1;
+                    stats.direct_fallback += 1;
+                },
+            }
+        }
+        if (stats.requested == 0) return stats;
+
+        const range_base = try requests.appendRangeCounts(1);
+        requests.addCount(range_base, stats.requested);
+        try requests.prefixAppendedRanges(range_base);
+        var writer = requests.rangeWriter(range_base);
+        var written: usize = 0;
+        for (self.entities.items, 0..) |entity, index| {
+            if (self.behaviors.items[index] != .seek or self.seek_weights.items[index] <= 0) continue;
+            const start = math.Vec2{ .x = self.pos_x.items[index], .y = self.pos_y.items[index] };
+            const goal = math.Vec2{ .x = target_x, .y = target_y };
+            const view = pathfinding.statusForEntityWorld(entity, start, goal, .default);
+            if (view.status != .missing) continue;
+            writer.write(.{
+                .entity = entity,
+                .agent_class = .default,
+                .start = start,
+                .goal = goal,
+            });
+            written += 1;
+        }
+        std.debug.assert(written == stats.requested);
+        writer.finish();
+        requests.finishWrite();
+        return stats;
+    }
+};
+
+const AiPathingStats = struct {
+    requested: usize = 0,
+    available: usize = 0,
+    pending: usize = 0,
+    unavailable: usize = 0,
+    direct_fallback: usize = 0,
 };
 
 const NormalizedAiConfig = struct {
@@ -385,6 +498,8 @@ const NormalizedAiConfig = struct {
     intent_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_seed: u64,
     seek_target: ?math.Vec2,
+    pathfinding: ?*const PathfindingSystem,
+    path_requests: ?*RangeOutputStream(PathRequest),
 };
 
 fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
@@ -405,6 +520,8 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
             null,
         .intent_seed = config.intent_seed,
         .seek_target = config.seek_target,
+        .pathfinding = config.pathfinding,
+        .path_requests = config.path_requests,
     };
 }
 
@@ -609,6 +726,14 @@ fn normalizeOrDefault(dx: f32, dy: f32) AiDir {
     return .{ .x = nx, .y = ny };
 }
 
+fn normalizeOrZero(dx: f32, dy: f32) AiDir {
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{ .x = 0, .y = 0 };
+    const len2 = dx * dx + dy * dy;
+    if (!std.math.isFinite(len2) or len2 <= 0.0001) return .{ .x = 0, .y = 0 };
+    const inv_len = 1.0 / @sqrt(len2);
+    return .{ .x = dx * inv_len, .y = dy * inv_len };
+}
+
 fn deterministicUnitDir(seed: u64, key: u32) AiDir {
     var h: u64 = seed ^ @as(u64, key) ^ 0x9e3779b97f4a7c15;
     h ^= h >> 30;
@@ -688,6 +813,9 @@ const AiJobContext = struct {
     seek_weights: []const f32,
     sep_x: []const f32,
     sep_y: []const f32,
+    path_dir_x: []const f32,
+    path_dir_y: []const f32,
+    path_overrides: []const bool,
     intents: *RangeOutputStream(SimulationIntent),
     target_x: f32,
     target_y: f32,
@@ -699,17 +827,20 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
     const job: *AiJobContext = @ptrCast(@alignCast(context));
     var writer = job.intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |i| {
-        const base_dir = decideDir(
-            job.behaviors[i],
-            job.pos_x[i],
-            job.pos_y[i],
-            job.target_x,
-            job.target_y,
-            job.wander_amplitudes[i],
-            job.seek_weights[i],
-            job.seed,
-            job.entities[i].index,
-        );
+        const base_dir = if (job.path_overrides[i])
+            AiDir{ .x = job.path_dir_x[i], .y = job.path_dir_y[i] }
+        else
+            decideDir(
+                job.behaviors[i],
+                job.pos_x[i],
+                job.pos_y[i],
+                job.target_x,
+                job.target_y,
+                job.wander_amplitudes[i],
+                job.seek_weights[i],
+                job.seed,
+                job.entities[i].index,
+            );
         const sep_x = if (i < job.sep_x.len) job.sep_x[i] else 0;
         const sep_y = if (i < job.sep_y.len) job.sep_y[i] else 0;
         const dir = applySeparationAndNormalize(base_dir, sep_x, sep_y);
@@ -905,6 +1036,179 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
     frame.phase = .finished;
 
     frame.allocator = original;
+}
+
+test "ai path requests keep direct seek while result is missing or pending" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setAiAgent(entity, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 4, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    try frame.reservePathRequests(2, 2);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    const missing_stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    const missing_intent = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 1), missing_stats.path_request_count);
+    try std.testing.expectEqual(@as(usize, 1), missing_stats.path_direct_fallback_count);
+    try std.testing.expect(missing_intent.direction_x > 0);
+
+    _ = try pathfinding.updateSerial(&frame.path_requests, .{ .max_solved_requests_per_step = 0 });
+
+    frame.beginStep();
+    const pending_stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    const pending_intent = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 0), pending_stats.path_request_count);
+    try std.testing.expectEqual(@as(usize, 1), pending_stats.path_pending_count);
+    try std.testing.expectEqual(@as(usize, 1), pending_stats.path_direct_fallback_count);
+    try std.testing.expect(pending_intent.direction_x > 0);
+    try std.testing.expectEqual(@as(usize, 0), frame.path_requests.mergedItems().len);
+}
+
+test "ai path request emission is batched and allocation-free after reserve" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(a, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1 });
+
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 32, .y = 0 }, .previous_position = .{ .x = 32, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(b, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 4, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    try frame.reservePathRequests(1, 2);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    frame.phase = .finished;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_ai_allocator = ai_sys.allocator;
+    const original_intent_allocator = frame.intents.allocator;
+    const original_path_allocator = frame.path_requests.allocator;
+    ai_sys.allocator = failing.allocator();
+    frame.intents.allocator = failing.allocator();
+    frame.path_requests.allocator = failing.allocator();
+    defer {
+        ai_sys.allocator = original_ai_allocator;
+        frame.intents.allocator = original_intent_allocator;
+        frame.path_requests.allocator = original_path_allocator;
+    }
+
+    frame.beginStep();
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 2,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    try std.testing.expectEqual(@as(usize, 2), stats.path_request_count);
+    try std.testing.expectEqual(@as(usize, 2), frame.path_requests.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.path_requests.rangeCount());
+    frame.phase = .finished;
+}
+
+test "ai unavailable path keeps direct seek without re-requesting" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setCollisionBounds(entity, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(entity, .{ .mobility = .dynamic });
+    try data.setAiAgent(entity, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1 });
+
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{ .position = .{ .x = 32, .y = 0 }, .previous_position = .{ .x = 32, .y = 0 } });
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 32, .y = 128 } });
+    try data.setCollisionResponse(wall, .{ .mobility = .static });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 4, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 1 });
+    try pathfinding.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    try frame.reservePathRequests(2, 2);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    const unavailable_solve = try pathfinding.updateSerial(&frame.path_requests, .{});
+    try std.testing.expectEqual(@as(usize, 1), unavailable_solve.unavailable_results);
+
+    frame.beginStep();
+    const unavailable_stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 96, .y = 0 },
+        .pathfinding = &pathfinding,
+        .path_requests = &frame.path_requests,
+    });
+    const intent = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 0), unavailable_stats.path_request_count);
+    try std.testing.expectEqual(@as(usize, 1), unavailable_stats.path_unavailable_count);
+    try std.testing.expectEqual(@as(usize, 1), unavailable_stats.path_direct_fallback_count);
+    try std.testing.expect(intent.direction_x > 0);
+    try std.testing.expectEqual(@as(usize, 0), frame.path_requests.mergedItems().len);
 }
 
 test "ai sparse high entity index does not allocate during warmed gather" {

@@ -7,6 +7,7 @@
 //! per-step streams for processor events, intents, and deferred structure.
 
 const std = @import("std");
+const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
@@ -42,6 +43,17 @@ pub const MovementIntent = struct {
     direction_y: f32,
 };
 
+pub const PathAgentClass = enum {
+    default,
+};
+
+pub const PathRequest = struct {
+    entity: EntityId,
+    agent_class: PathAgentClass = .default,
+    start: math.Vec2,
+    goal: math.Vec2,
+};
+
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
     marker: u32,
@@ -64,6 +76,7 @@ pub const SimulationFrame = struct {
     phase: SimulationPhase = .idle,
     events: RangeOutputStream(SimulationEvent),
     intents: RangeOutputStream(SimulationIntent),
+    path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),
     collision_triggers: RangeOutputStream(CollisionTriggerEvent),
     structural_commands: RangeOutputStream(StructuralCommand),
@@ -73,6 +86,7 @@ pub const SimulationFrame = struct {
             .allocator = allocator,
             .events = RangeOutputStream(SimulationEvent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
+            .path_requests = RangeOutputStream(PathRequest).init(allocator),
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
             .collision_triggers = RangeOutputStream(CollisionTriggerEvent).init(allocator),
             .structural_commands = RangeOutputStream(StructuralCommand).init(allocator),
@@ -83,6 +97,7 @@ pub const SimulationFrame = struct {
         self.structural_commands.deinit();
         self.collision_triggers.deinit();
         self.contacts.deinit();
+        self.path_requests.deinit();
         self.intents.deinit();
         self.events.deinit();
         self.* = undefined;
@@ -96,6 +111,7 @@ pub const SimulationFrame = struct {
     pub fn clearRetainingCapacity(self: *SimulationFrame) void {
         self.events.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();
+        self.path_requests.clearRetainingCapacity();
         self.contacts.clearRetainingCapacity();
         self.collision_triggers.clearRetainingCapacity();
         self.structural_commands.clearRetainingCapacity();
@@ -115,6 +131,10 @@ pub const SimulationFrame = struct {
         try self.contacts.reserve(range_count, contact_capacity);
         try self.collision_triggers.reserve(range_count, collision_trigger_capacity);
         try self.structural_commands.reserve(range_count, structural_command_capacity);
+    }
+
+    pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
+        try self.path_requests.reserve(range_count, request_capacity);
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {

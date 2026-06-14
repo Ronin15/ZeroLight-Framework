@@ -574,6 +574,11 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -699,6 +704,21 @@ fn printValidationSummary(
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
                 "workload separation_checks={} intents={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding")) {
+            std.debug.print(
+                "workload field_requests={} results={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
+            std.debug.print(
+                "workload cache_hits={} results={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+            std.debug.print(
+                "workload fallback_requests={} results={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
         } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
@@ -880,6 +900,15 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             ) catch "workload";
         }
         return std.fmt.bufPrint(buffer, "separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding")) {
+        return std.fmt.bufPrint(buffer, "field_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
+        return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+        return std.fmt.bufPrint(buffer, "fallback_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";

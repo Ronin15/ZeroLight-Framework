@@ -24,6 +24,8 @@ const CollisionResponseSystem = @import("systems/collision_response.zig").Collis
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
+const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
@@ -55,6 +57,7 @@ pub const GameDemoState = struct {
     collision_response: CollisionResponseSystem,
     particles: ParticleSystem,
     ai: AiSystem,
+    pathfinding: PathfindingSystem,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
@@ -75,9 +78,21 @@ pub const GameDemoState = struct {
         errdefer particles.deinit();
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
+        var pathfinding = PathfindingSystem.init(allocator);
+        errdefer pathfinding.deinit();
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
         try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, 8);
+        try simulation_frame.reservePathRequests(8, test_square_count);
+        try pathfinding.reserve(PathfindingCapacity{
+            .max_frame_requests = test_square_count,
+            .max_pending_requests = test_square_count,
+            .max_cached_results = test_square_count * 4,
+            .max_goal_fields = 4,
+            .max_worker_scratch_slots = 64,
+            .max_solved_requests_per_step = test_square_count,
+        });
+        try pathfinding.rebuildStaticNavGrid(&data, bounds_width, bounds_height, 32.0);
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
         try collision_response.reserveForContacts(demo_contact_capacity);
@@ -91,6 +106,7 @@ pub const GameDemoState = struct {
             .collision_response = collision_response,
             .particles = particles,
             .ai = ai,
+            .pathfinding = pathfinding,
             .test_squares = test_squares,
             .obstacles = obstacles,
             .bounds_width = bounds_width,
@@ -99,6 +115,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
+        self.pathfinding.deinit();
         self.ai.deinit();
         self.particles.deinit();
         self.collision_response.deinit();
@@ -139,7 +156,11 @@ pub const GameDemoState = struct {
         _ = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
+            .pathfinding = &self.pathfinding,
+            .path_requests = &self.simulation_frame.path_requests,
         });
+
+        _ = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
 
         // Intent application step (main thread): consume merged MovementIntents from AI (and future), write velocities
         // for ai_agent entities only via direct MovementBodyPtr (hot column mutation). Stale IDs rejected. Player

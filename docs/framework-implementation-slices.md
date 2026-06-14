@@ -30,10 +30,14 @@ adding broad abstraction.
 - Slice 17 now gives Slice 7 parallel CPU render prep a realistic sprite/audio
   asset-ID data shape to process.
 - Slice 12 is now the gameplay-systems foundation for collision, AI intent,
-  future path/query work, and deterministic rule outputs.
-- Before implementing grid pathfinding, keep multi-phase processor timing
-  explicit: each independently threaded stage either stays inline by design or
-  owns the adaptive tuner that measures that stage's exact batch.
+  path/query work, and deterministic rule outputs.
+- Slice 18 now gives AI/rule systems a frame-delayed navigation substrate. The
+  next gameplay-facing track should turn those paths into better steering,
+  local avoidance, and behavior arbitration instead of expanding the pathfinder
+  into a controller.
+- Keep hard-path navigation benchmarks, fallback budgets, and cache/tuner
+  regression checks as their own hardening track so common path requests stay
+  cheap and rare A* work stays visible.
 - Keep future gameplay systems built on Slice 12's typed processor outputs,
   deterministic merge, and deferred structural-change contracts.
 
@@ -44,7 +48,9 @@ orchestration and SoA processors for hot data work. Controllers choose phase
 order, budgets, queues, conflict policy, and which typed `DataSystem` views
 processors receive. Persistent world facts live in `DataSystem`, per-step
 outputs live in `SimulationFrame`, and large or reusable loops stay in systems
-that process typed slices and emit deterministic outputs.
+that process typed slices and emit deterministic outputs. Pathfinding provides a
+navigation substrate; immersive NPC behavior still needs steering, local
+avoidance, perception, and rule arbitration layered above it.
 
 ## Slice 0: Runtime Diagnostics Policy
 
@@ -849,11 +855,11 @@ moving-square-obstacle, and player-moving-square contacts. Detector benchmarks
 report candidate pairs and contacts for dense/sparse body workloads, while
 response benchmarks report triggers and intents across 1k-50k contact workloads.
 
-## Slice 14: First AI Intent Processor And Future Path/Rule Contracts
+## Slice 14: First AI Intent Processor And Future Rule Contracts
 
 Goal: add the first data-driven non-player decision processor that emits
 deterministic movement intents through `SimulationFrame`, proving the AI/rule
-processor boundary before broader pathfinding or rule systems are added.
+processor boundary before broader rule systems are added.
 
 Current foundation:
 
@@ -882,28 +888,19 @@ Architecture notes:
   not become hidden per-entity stores. They may take typed `DataSystem` views
   and run small policy passes, but hot or reusable loops should remain
   systems/processors over SoA slices.
-- Future AI, pathfinding, and rules should emit movement intents, steering
-  outputs, target choices, path requests/results, or deferred commands rather
-  than mutating unrelated stores directly.
+- Future AI and rules should emit movement intents, steering outputs, target
+  choices, typed requests/results, or deferred commands rather than mutating
+  unrelated stores directly.
 - AI separation and intent emission are independently staged and tuned. Future
-  perception, pathfinding, or rule passes need the same explicit work ownership,
+  perception or rule passes need the same explicit work ownership,
   stage-specific tuning, and deterministic merge points.
 - Deterministic randomness must be explicit state or an explicit service passed
   through the processor boundary.
-- Pathfinding should use read-only navigation or world snapshots during worker
-  jobs and merge results deterministically before movement or response systems
-  consume them.
-- Grid pathfinding should follow the multi-stage tuner pattern from collision
-  when stages have different cost shapes. Frontier expansion, neighbor scoring,
-  result/path reconstruction, and output emission should each either stay
-  serial/inline by design or own the adaptive tuner that measures that exact
-  batch. Do not force one timing profile to cover all pathfinding subpasses.
 
 Checklist:
 
 - [x] Reuse `MovementIntent` and `RangeOutputStream` for the first AI steering
-      output. Path request/result and broader rule output streams remain future
-      work.
+      output.
 - [x] Define processor order for the first AI decision output, movement intent
       application, movement integration, collision response, and cleanup.
 - [x] Keep current conflict policy narrow: single-writer AI movement intents are
@@ -1119,6 +1116,188 @@ self-releasing lease pointers. Manual `zig build dev` validation confirmed menu,
 gameplay, sprite rendering, audio, pause, debug overlay, and repeated
 transitions.
 
+## Slice 18: Frame-Delayed Pathfinding System
+
+Goal: add a state-owned, frame-delayed grid pathfinding system so AI and rule
+processors can request navigation without blocking current-step movement or
+storing solver queues, caches, or scratch data in `DataSystem`.
+
+Current foundation:
+
+- Slice 12 provides typed transient streams and deterministic merge points
+  through `SimulationFrame`.
+- Slice 14 provides AI processors that can emit movement intent and consume
+  later-step navigation results without owning solver state.
+- `PathfindingSystem` lives under `src/game/systems/` as a system, not a
+  controller. It owns a static versioned nav grid, pending request queue,
+  request dedupe, completed result cache, unavailable-path cache, connected
+  components, portal data, warmed fixed scratch buffers, shared goal fields, and
+  per-stage adaptive tuners.
+- `SimulationFrame.path_requests` carries transient path requests from AI to the
+  pathfinder. Results are frame-delayed so AI consumes completed paths on later
+  fixed steps instead of blocking current-step movement on fresh solves.
+- Common requests avoid heap A* through request/result caches, unavailable-key
+  caches, shared goal fields, open-grid direct paths, disconnected-component
+  rejection, line-of-sight paths, and portal detours.
+- Regular batch work uses `src/core/simd.zig` for request key preparation and
+  static-grid blocked rectangle marking. Branch-heavy A* frontier expansion
+  remains scalar inside worker ranges.
+- Benchmarks split common-goal field reuse, hot cache-hit profiles, and hard
+  fallback profiles. Cache profiles report `cache_hits`; hard fallback profiles
+  report `fallback_requests` so regressions do not hide behind aggregate timing.
+
+Architecture notes:
+
+- Persistent gameplay facts stay in `DataSystem`; solver queues, caches,
+  scratch buffers, nav-grid topology, and tuner state stay in the state-owned
+  pathfinding system.
+- Pathfinding uses read-only navigation snapshots during worker jobs and merges
+  results deterministically before AI, movement, or response systems consume
+  them.
+- Adaptive tuning belongs to the actual work stage being measured. Shared goal
+  field construction, fallback solves, and result emission should each either
+  stay inline by design or use the tuner that measures that exact batch shape.
+- Heap A* is a bounded fallback path, not the expected per-frame path for common
+  requests. Hard true-A* fixtures and solve budgets remain a future hardening
+  track.
+
+Checklist:
+
+- [x] Add typed path requests and completed path results through
+      `SimulationFrame`.
+- [x] Add a state-owned `PathfindingSystem` under `src/game/systems/` and wire
+      it into fixed-step gameplay order after AI request emission.
+- [x] Keep solver state, warmed scratch buffers, caches, and adaptive tuners out
+      of `DataSystem`.
+- [x] Add request/result cache hits, unavailable-path caching, request dedupe,
+      and pending-request dedupe so repeat work stays cheap.
+- [x] Add shared goal fields and regular-batch SIMD where the data shape is
+      suitable.
+- [x] Add fast paths for direct open-grid paths, unreachable component rejects,
+      line-of-sight paths, and portal detours before heap A* fallback.
+- [x] Add deterministic serial, fixed-thread, and adaptive benchmarks for common
+      field reuse, hot cache-shaped workloads, and hard fallback workloads with
+      visible cache/fallback counters.
+- [x] Add tests covering deterministic results, cache behavior, no hot-loop heap
+      allocation in steady-state paths, unavailable requests, and serial versus
+      threaded consistency.
+
+Acceptance checks:
+
+- [x] AI can request paths without blocking the current fixed-step movement
+      integration on a fresh solve.
+- [x] Pathfinding is modeled as a gameplay system over typed data and transient
+      requests, not as a persistent gameplay-state owner.
+- [x] Repeated, unavailable, open-grid, detour, and shared-goal requests use
+      cheaper paths before heap A*.
+- [x] Adaptive and threaded runs are benchmarked against serial runs with
+      fallback counters visible.
+- [x] Debug and ReleaseFast 1024-request benchmarks cover open unique, detour,
+      and unreachable fixtures; all report zero fallback requests for the fast
+      fixtures after the fixture correction.
+- [x] `zig build test --summary all`, `zig build check`, `zig build verify`, and
+      `git diff --check` pass for the pathfinding implementation.
+
+Slice 18 lands the navigation substrate. It gives AI and future rule systems a
+deterministic, frame-delayed path request/result boundary with caches, fixed
+scratch, SIMD-friendly batch work, and adaptive thread-system scheduling. It
+does not by itself make NPC behavior immersive; steering, avoidance, perception,
+and behavior arbitration remain the next gameplay layers.
+
+## Slice 19: Steering And Local Avoidance
+
+Goal: turn pathfinding results into smoother NPC movement by adding local
+steering, avoidance, and stuck/replan policy above the pathfinder without moving
+that transient behavior into `DataSystem`.
+
+Current foundation:
+
+- Slice 14 AI intent processing can emit deterministic movement intents.
+- Slice 18 pathfinding can provide frame-delayed path waypoints and unavailable
+  results.
+- Slice 13 collision contacts and spatial-query foundations provide the data
+  shape needed for local crowd and obstacle decisions.
+
+Architecture notes:
+
+- Steering should be a system or state-owned feature controller that consumes
+  path results and typed SoA views, then emits movement intents or rule outputs.
+- Persistent tuning data such as agent radius, desired speed, or avoidance class
+  may live in dense `DataSystem` components. Per-step neighbor lists, waypoint
+  cursors, avoidance scratch, and replan queues should stay transient or
+  state-owned.
+- Avoidance and steering benchmarks should measure the processor cost directly
+  rather than masking it behind the pathfinding benchmark.
+
+Checklist:
+
+- [ ] Add path-following state needed to turn completed paths into movement
+      intents.
+- [ ] Add local obstacle and agent avoidance using bounded fixed scratch.
+- [ ] Add stuck detection, replan cooldowns, and unavailable-path backoff.
+- [ ] Define arbitration between player input, AI steering, collision response,
+      and future rule outputs.
+- [ ] Add deterministic tests for waypoint following, avoidance ordering, replan
+      backoff, and no steady-state hot-loop allocation.
+- [ ] Add steering/local-avoidance benchmarks that report agent count, neighbor
+      samples, intents emitted, and threaded/adaptive detail where used.
+
+Acceptance checks:
+
+- [ ] NPCs can follow path waypoints without sharp frame-to-frame oscillation.
+- [ ] Nearby NPCs and static obstacles are avoided through bounded local work.
+- [ ] Unavailable or stale paths do not cause per-frame re-request loops.
+- [ ] Steering outputs compose through typed movement intents or rule outputs
+      with deterministic order.
+
+## Slice 20: Navigation Hardening And Hard-Path Budgets
+
+Goal: keep rare true-A* and complex-map navigation costs bounded, tested, and
+visible so pathfinding remains a stable gameplay foundation as map and NPC
+counts grow.
+
+Current foundation:
+
+- Slice 18 benchmark profiles expose common fast paths and fallback counters.
+- Pathfinding stats already distinguish field requests, cache hits,
+  unavailable-path cache hits, and fallback requests.
+
+Architecture notes:
+
+- Benchmarks should distinguish common-path throughput from true hard-path
+  fallback costs. A slow fallback should be treated as a visible budget decision,
+  not hidden by aggregate adaptive numbers.
+- Solve budgets should prefer deterministic deferral over unbounded same-frame
+  work. If the pathfinder cannot finish all fallback work inside the budget, it
+  should report pending work explicitly.
+- Module splitting is justified only if it improves maintainability without
+  weakening the system boundary. The pathfinder should remain a system, not a
+  controller that owns gameplay state.
+
+Checklist:
+
+- [ ] Add true-A*-required fixtures that cannot be solved by direct, field,
+      component, or portal fast paths.
+- [ ] Add per-frame fallback solve budgets and deterministic pending/deferred
+      behavior for overflow work.
+- [ ] Add cache, goal-field, and unavailable-entry aging or capacity tests if
+      long-running sessions need eviction.
+- [ ] Add regression thresholds or benchmark callouts for Debug and ReleaseFast
+      hard-path workloads.
+- [ ] Audit heap use and scratch sizing for worst-case fallback fixtures.
+- [ ] Consider splitting solver internals into smaller files once hard-path
+      contracts are stable.
+
+Acceptance checks:
+
+- [ ] Benchmarks report true fallback count and timing separately from fast-path
+      work.
+- [ ] Unreachable or impossible destinations are rejected once and cached rather
+      than re-solved every frame.
+- [ ] Fallback overflow defers deterministically instead of stalling the fixed
+      update.
+- [ ] Hard-path changes cannot silently regress common request throughput.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1135,14 +1314,18 @@ transitions.
 11. SIMD-aware data processor systems.
 12. Simulation contracts and deferred structural changes.
 13. Spatial queries and collision contacts.
-14. First AI intent processor and future path/rule contracts.
+14. First AI intent processor and future rule contracts.
 15. SDL3_mixer audio service.
 16. Main menu and settings menu.
 17. Startup runtime asset catalog.
+18. Frame-delayed pathfinding system.
+19. Steering and local avoidance.
+20. Navigation hardening and hard-path budgets.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
 Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
-and startup runtime assets now form the source-of-truth foundation for future
-slices.
+startup runtime assets, and frame-delayed pathfinding now form the
+source-of-truth foundation for future slices. Steering/local avoidance and
+navigation hardening are the next navigation-focused gameplay candidates.

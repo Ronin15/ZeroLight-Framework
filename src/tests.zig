@@ -27,6 +27,7 @@ comptime {
     _ = @import("benchmarks/suite.zig");
     _ = @import("benchmarks/movement.zig");
     _ = @import("benchmarks/particles.zig");
+    _ = @import("benchmarks/pathfinding.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");
@@ -40,6 +41,7 @@ comptime {
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
+    _ = @import("game/systems/pathfinding.zig");
     _ = @import("game/systems/particle.zig");
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");

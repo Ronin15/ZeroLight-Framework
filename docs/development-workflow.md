@@ -157,8 +157,10 @@ that batch only and do not reset adaptive work-tuner state for later processors.
 For multi-stage systems, read each stage independently: an adaptive row can have
 a threaded primary batch while a secondary batch still reports `inline`, or both
 stages can settle on separate threaded profiles. This is expected when the
-stages have different work shapes, and it is the pattern future pathfinding and
-other multi-pass processors should follow.
+stages have different work shapes. Pathfinding follows this same rule: request
+preparation/grid marking can use SIMD lane batches, while the branch-heavy A*
+solve stage owns its own pathfinding tuner and benchmark row instead of sharing
+another system's profile.
 Use other optional arguments only to narrow or scale the run:
 
 ```sh

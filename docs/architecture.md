@@ -273,14 +273,28 @@ It receives const AiAgent + movement prior-position slices, builds a transient
 threaded movement intents through `SimulationFrame.intents`
 (count/prefix/write). Separation and intent emission have independent
 AdaptiveWorkTuner state and benchmark stats so each stage can remain inline or
-thread independently. Future perception, pathfinding, or rule systems should
-keep the same explicit staged/tuned design rather than hiding extra work inside
-intent emission. Wander amplitude and seek prove non-player entities are
-driven by persistent data + processor intents, not hardcoded velocities.
+thread independently. Seek agents can emit typed path requests without owning
+path solver state. Wander amplitude, seek, and the path request/result handoff
+prove non-player entities are driven by persistent data + processor intents, not
+hardcoded velocities.
 Consumption (main-thread, before MovementSystem) writes velocities from intent
 dir * speed using MovementBodyPtr; player remains special-cased with no
 ai_agent component. Intent streams and processor order are explicit in the
 owning `GameDemoState`.
+
+`PathfindingSystem` is a frame-delayed grid pathfinding processor under
+`src/game/systems/`. It owns the static versioned nav grid, pending request
+queue, duplicate suppression, completed result cache, unavailable-path cache,
+warmed A* scratch, per-stage adaptive tuner state, and benchmark stats.
+`SimulationFrame.path_requests` carries transient requests from AI or future
+rule systems; path queues, scratch, thread state, and live path caches stay out
+of `DataSystem`. Request key preparation and static grid marking use
+`src/core/simd.zig` lane batches where the work is regular; branch-heavy A*
+frontier expansion remains scalar inside threaded request ranges. Path results
+are consumed on later fixed steps so missing or unreachable paths do not stall
+same-step movement, and unavailable keys are cached by
+`nav_version + agent_class + start_cell + goal_cell` to avoid repeated request
+spam.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects
