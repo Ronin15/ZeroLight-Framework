@@ -13,7 +13,6 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 
 pub const MovementConfig = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
@@ -66,7 +65,6 @@ fn updateMovementBodies(
         .delta_seconds = delta_seconds,
     };
     const batch = thread_system.parallelForWithOptions(slice.entities.len, &context, movementJob, .{
-        .min_parallel_items = config.min_parallel_items,
         .items_per_range = config.items_per_range,
         .max_worker_threads = config.max_worker_threads,
         .range_alignment_items = data.movement_range_alignment_items,
@@ -213,14 +211,12 @@ test "threaded movement matches serial movement" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
 
     var threaded_slice = threaded_data.movementBodySlice();
     const stats = updateMovementBodies(&threaded_slice, &threads, 0.5, .{
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -243,19 +239,17 @@ test "movement explicit items_per_range bypasses tuner" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
 
     var adaptive_tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = data.movement_range_alignment_items * 2,
-        .min_items_per_range = data.movement_range_alignment_items,
-        .max_items_per_range = data.movement_range_alignment_items * 4,
+        .initial_range_items = data.movement_range_alignment_items * 2,
+        .smallest_range_items = data.movement_range_alignment_items,
+        .largest_range_items = data.movement_range_alignment_items * 4,
     });
     var slice = gameData.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.5, .{
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive_tuner = &adaptive_tuner,
@@ -275,7 +269,6 @@ test "movement system owns adaptive tuner for default update" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -285,7 +278,6 @@ test "movement system owns adaptive tuner for default update" {
     for (0..system.adaptive_tuner.report().sample_window) |_| {
         var slice = gameData.movementBodySlice();
         stats = system.update(&slice, &threads, 0.5, .{
-            .min_parallel_items = 1,
             .max_worker_threads = 2,
         });
     }
@@ -305,7 +297,6 @@ test "movement update uses provided adaptive tuner" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -313,7 +304,6 @@ test "movement update uses provided adaptive tuner" {
     var adaptive_tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1 });
     var slice = gameData.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.5, .{
-        .min_parallel_items = 1,
         .max_worker_threads = 2,
         .adaptive_tuner = &adaptive_tuner,
     });
@@ -355,7 +345,6 @@ test "warmed movement update does not allocate" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -372,7 +361,6 @@ test "warmed movement update does not allocate" {
 
     var slice = gameData.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.016, .{
-        .min_parallel_items = 1,
         .items_per_range = data.movement_range_alignment_items,
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);

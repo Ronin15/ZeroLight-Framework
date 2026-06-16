@@ -222,7 +222,7 @@ pub const BatchSummary = struct {
 pub const WorkTuningSummary = struct {
     phase: AdaptiveWorkPhase = .learning,
     initial_worker_threads: usize = 0,
-    initial_items_per_range: usize = 0,
+    initial_range_items: usize = 0,
     final_worker_threads: usize = 0,
     final_items_per_range: usize = 0,
     best_worker_threads: usize = 0,
@@ -310,7 +310,7 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
     return .{
         .phase = report.phase,
         .initial_worker_threads = report.initial_profile.worker_threads,
-        .initial_items_per_range = report.initial_profile.items_per_range,
+        .initial_range_items = report.initial_profile.items_per_range,
         .final_worker_threads = report.current_profile.worker_threads,
         .final_items_per_range = report.current_profile.items_per_range,
         .best_worker_threads = report.best_profile.worker_threads,
@@ -337,9 +337,9 @@ pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?
         .fixed => fixed: {
             const fixed_range = alignItemCount(default_items_per_range, range_alignment_items);
             break :fixed AdaptiveWorkTuner.init(.{
-                .initial_items_per_range = fixed_range,
-                .min_items_per_range = fixed_range,
-                .max_items_per_range = fixed_range,
+                .initial_range_items = fixed_range,
+                .smallest_range_items = fixed_range,
+                .largest_range_items = fixed_range,
             });
         },
     };

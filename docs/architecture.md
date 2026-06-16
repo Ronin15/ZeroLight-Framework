@@ -174,8 +174,13 @@ work that must finish before the next system or render phase.
 
 Worker threads are pre-spawned at startup. The default worker thread count is based
 on CPU count, with the main/render thread participating as an additional worker
-while it waits. Small batches run inline on the main thread, and batch
-submission does not allocate after initialization.
+while it waits. Batch submission does not allocate after initialization.
+Production worker participation is timing-adaptive: batches start inline and
+move to worker participation only when measured completion time shows the
+threaded profile is worthwhile. Structural limits still force inline execution
+when there is no work, no available worker, only one splittable range, an
+explicit serial override, or a processor range-alignment constraint leaves no
+safe split.
 
 Adaptive work tuning chooses a complete batch profile: inline or threaded,
 worker threads, and items per claimed range. Worker count and range size remain
@@ -183,6 +188,9 @@ distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
 owns the decision. The tuner starts inline, records that inline baseline for the
 owning batch, probes a threaded profile when the measured work is expensive
 enough, and only reports a best threaded profile after a threaded candidate wins.
+Static item-count floors should not gate production threading; slower hardware
+or expensive small-N processors must be able to train their own threaded
+profile.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.

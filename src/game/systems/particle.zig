@@ -30,7 +30,6 @@ pub const ParticleSystemConfig = struct {
 };
 
 pub const ParticleUpdateConfig = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
@@ -351,7 +350,6 @@ pub const ParticleSystem = struct {
         else
             null;
         const batch = thread_system.parallelForWithOptions(active_before, &context, particleJob, .{
-            .min_parallel_items = update_config.min_parallel_items,
             .items_per_range = update_config.items_per_range,
             .max_worker_threads = update_config.max_worker_threads,
             .range_alignment_items = particle_range_alignment_items,
@@ -819,13 +817,11 @@ test "threaded particle update matches serial update" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
 
     const stats = threaded_particles.update(&threads, 0.25, .{
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -846,18 +842,16 @@ test "particle explicit items_per_range bypasses tuner" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
 
     var adaptive_tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = particle_range_alignment_items * 2,
-        .min_items_per_range = particle_range_alignment_items,
-        .max_items_per_range = particle_range_alignment_items * 4,
+        .initial_range_items = particle_range_alignment_items * 2,
+        .smallest_range_items = particle_range_alignment_items,
+        .largest_range_items = particle_range_alignment_items * 4,
     });
     const stats = particles.update(&threads, 0.25, .{
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive_tuner = &adaptive_tuner,
@@ -878,7 +872,6 @@ test "particle system owns adaptive tuner for default update" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
@@ -886,7 +879,6 @@ test "particle system owns adaptive tuner for default update" {
     var stats = ParticleUpdateStats{};
     for (0..particles.adaptive_tuner.report().sample_window) |_| {
         stats = particles.update(&threads, 0.25, .{
-            .min_parallel_items = 1,
             .max_worker_threads = 2,
         });
     }
@@ -906,14 +898,12 @@ test "particle update uses provided adaptive tuner" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
 
     var adaptive_tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1 });
     const stats = particles.update(&threads, 0.25, .{
-        .min_parallel_items = 1,
         .max_worker_threads = 2,
         .adaptive_tuner = &adaptive_tuner,
     });
@@ -956,7 +946,6 @@ test "warmed particle update and emission do not allocate" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
     defer threads.deinit();
@@ -973,7 +962,6 @@ test "warmed particle update and emission do not allocate" {
 
     const emitted = particles.emitBurst(.{ .count = 2, .lifetime = 1 });
     const stats = particles.update(&threads, 0.016, .{
-        .min_parallel_items = 1,
         .items_per_range = particle_range_alignment_items,
     });
 

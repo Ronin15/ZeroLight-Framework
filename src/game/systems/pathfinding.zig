@@ -76,7 +76,6 @@ pub const PathfindingCapacity = struct {
 };
 
 pub const PathfindingConfig = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
@@ -938,7 +937,6 @@ pub const PathfindingSystem = struct {
             if (participants > self.scratch_slots.items.len) return error.PathfindingScratchCapacityExceeded;
             var context = SolveJobContext{ .system = self };
             stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
-                .min_parallel_items = system_config.min_parallel_items,
                 .items_per_range = system_config.items_per_range,
                 .max_worker_threads = system_config.max_worker_threads,
                 .range_alignment_items = pathfinding_range_alignment_items,
@@ -1111,7 +1109,6 @@ pub const PathfindingSystem = struct {
         }
         var context = FieldResultJobContext{ .system = self, .solve_count = solve_count };
         const batch = thread_system.parallelForWithOptions(solve_count, &context, emitFieldResultJob, .{
-            .min_parallel_items = config.min_parallel_items,
             .items_per_range = config.items_per_range,
             .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = pathfinding_range_alignment_items,
@@ -1956,11 +1953,10 @@ test "pathfinding threaded solve matches serial solve" {
     _ = try serial_system.updateSerial(&stream, .{});
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    _ = try threaded_system.update(&stream, &threads, .{ .adaptive = false, .min_parallel_items = 1, .items_per_range = 1 });
+    _ = try threaded_system.update(&stream, &threads, .{ .adaptive = false, .items_per_range = 1 });
 
     const serial_view = serial_system.statusForWorld(.{ .x = 16, .y = 16 }, .{ .x = 144, .y = 144 }, .default);
     const threaded_view = threaded_system.statusForWorld(.{ .x = 16, .y = 16 }, .{ .x = 144, .y = 144 }, .default);

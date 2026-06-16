@@ -70,6 +70,11 @@ Add new code under the matching owner directory. Keep executable-only code near
   the same cache line, and use 64-byte padding only for thread-shared records
   where false sharing is a real risk. Do not pad cold entity slot metadata by
   default.
+- Let `ThreadSystem` production scheduling adapt from measured batch timing.
+  Do not add static item-count floors for worker participation; only structural
+  limits such as zero work, no available workers, one splittable range, explicit
+  serial overrides, and cache-line/range-alignment constraints should force
+  inline execution.
 - Avoid per-frame string lookup, hash-map dispatch, dynamic dispatch, resource
   churn, formatted logging, and broad frame-rate caps unless measured and
   justified.

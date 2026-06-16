@@ -46,15 +46,12 @@ pub const ThreadSystemConfig = struct {
     /// Set to `0` to force serial execution.
     max_worker_threads: ?usize = null,
     stack_size: usize = std.Thread.SpawnConfig.default_stack_size,
-    /// Batches smaller than this item count run on the main thread only.
-    min_parallel_items: usize = 256,
     /// Number of items assigned to each range before another participant takes
     /// more work.
     items_per_range: usize = 64,
 };
 
 pub const ParallelForOptions = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     range_alignment_items: usize = 1,
@@ -70,9 +67,9 @@ pub const AdaptiveWorkProfile = struct {
 };
 
 pub const AdaptiveWorkTunerConfig = struct {
-    initial_items_per_range: usize = (ThreadSystemConfig{}).items_per_range,
-    min_items_per_range: usize = 16,
-    max_items_per_range: usize = std.math.maxInt(usize),
+    initial_range_items: usize = (ThreadSystemConfig{}).items_per_range,
+    smallest_range_items: usize = 1,
+    largest_range_items: usize = std.math.maxInt(usize),
     sample_window: usize = 3,
     improvement_threshold_percent: u8 = 1,
     threaded_commit_threshold_percent: u8 = 5,
@@ -98,7 +95,6 @@ pub const AdaptiveWorkRequest = struct {
     item_count: usize,
     available_worker_threads: usize,
     max_worker_threads: usize,
-    min_parallel_items: usize,
     fallback_items_per_range: usize,
     range_alignment_items: usize,
 };
@@ -148,7 +144,7 @@ pub const AdaptiveWorkTuner = struct {
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
-        const initial = clampItemCount(normalized.initial_items_per_range, normalized.min_items_per_range, normalized.max_items_per_range);
+        const initial = clampItemCount(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
         const profile = AdaptiveWorkProfile{
             .worker_threads = 1,
             .items_per_range = initial,
@@ -235,7 +231,7 @@ pub const AdaptiveWorkTuner = struct {
         const normalized_request = self.normalizeRequest(request);
         const max_range = self.effectiveMaxItemsPerRange(normalized_request);
         const alignment = @max(normalized_request.range_alignment_items, @as(usize, 1));
-        const range_span_steps = @max(@as(usize, 1), (max_range - self.config.min_items_per_range) / alignment);
+        const range_span_steps = @max(@as(usize, 1), (max_range - self.config.smallest_range_items) / alignment);
         const range_windows = saturatingMul(ceilLog2(range_span_steps) + 2, @as(usize, 2));
         const windows = saturatingAdd(@as(usize, 3), range_windows);
         return saturatingMul(windows, self.config.sample_window);
@@ -334,7 +330,7 @@ pub const AdaptiveWorkTuner = struct {
     }
 
     fn predictProfile(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) AdaptiveWorkProfile {
-        if (request.item_count < request.min_parallel_items or request.max_worker_threads == 0) {
+        if (request.max_worker_threads == 0) {
             return self.normalizedProfile(.{
                 .worker_threads = 0,
                 .items_per_range = request.fallback_items_per_range,
@@ -508,7 +504,6 @@ pub const AdaptiveWorkTuner = struct {
             .item_count = request.item_count,
             .available_worker_threads = request.available_worker_threads,
             .max_worker_threads = max_workers,
-            .min_parallel_items = request.min_parallel_items,
             .fallback_items_per_range = self.normalizedItemsPerRange(request.fallback_items_per_range, alignment),
             .range_alignment_items = alignment,
         };
@@ -518,10 +513,7 @@ pub const AdaptiveWorkTuner = struct {
         const items_per_range = self.normalizedItemsPerRange(profile.items_per_range, request.range_alignment_items);
         const ranges = rangeCount(request.item_count, items_per_range);
         const range_limited_workers = if (ranges > 1) @min(request.max_worker_threads, ranges - 1) else 0;
-        const workers = if (request.item_count < request.min_parallel_items)
-            @as(usize, 0)
-        else
-            @min(profile.worker_threads, range_limited_workers);
+        const workers = @min(profile.worker_threads, range_limited_workers);
         return .{
             .worker_threads = workers,
             .items_per_range = items_per_range,
@@ -529,20 +521,20 @@ pub const AdaptiveWorkTuner = struct {
     }
 
     fn normalizedItemsPerRange(self: *const AdaptiveWorkTuner, items_per_range: usize, alignment: usize) usize {
-        const clamped = clampItemCount(@max(items_per_range, @as(usize, 1)), self.config.min_items_per_range, self.config.max_items_per_range);
+        const clamped = clampItemCount(@max(items_per_range, @as(usize, 1)), self.config.smallest_range_items, self.config.largest_range_items);
         const aligned_up = alignItemCount(clamped, alignment);
-        if (aligned_up <= self.config.max_items_per_range) return aligned_up;
+        if (aligned_up <= self.config.largest_range_items) return aligned_up;
 
-        const aligned_max = alignItemCountDown(self.config.max_items_per_range, alignment);
-        if (aligned_max >= self.config.min_items_per_range) return aligned_max;
+        const aligned_max = alignItemCountDown(self.config.largest_range_items, alignment);
+        if (aligned_max >= self.config.smallest_range_items) return aligned_max;
         return clamped;
     }
 
     fn effectiveMaxItemsPerRange(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
-        if (request.item_count == 0) return self.config.min_items_per_range;
+        if (request.item_count == 0) return self.config.smallest_range_items;
         return @max(
-            self.config.min_items_per_range,
-            @min(self.config.max_items_per_range, request.item_count),
+            self.config.smallest_range_items,
+            @min(self.config.largest_range_items, request.item_count),
         );
     }
 
@@ -629,8 +621,8 @@ pub const ThreadSystem = struct {
         }
 
         log.debug(
-            "ThreadSystem initialized: worker_threads={} min_parallel_items={} items_per_range={} stack_size={}",
-            .{ self.workers.len, self.config.min_parallel_items, self.config.items_per_range, self.config.stack_size },
+            "ThreadSystem initialized: worker_threads={} items_per_range={} stack_size={}",
+            .{ self.workers.len, self.config.items_per_range, self.config.stack_size },
         );
         return self;
     }
@@ -681,7 +673,6 @@ pub const ThreadSystem = struct {
         if (item_count == 0) return .{};
 
         const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
-        const min_parallel_items = options.min_parallel_items orelse self.config.min_parallel_items;
         const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
         const requested_items_per_range = @max(options.items_per_range orelse self.config.items_per_range, @as(usize, 1));
         const adaptive_tuner = if (options.adaptive and (max_worker_threads > 0 or options.selected_profile != null))
@@ -698,7 +689,6 @@ pub const ThreadSystem = struct {
                 .item_count = item_count,
                 .available_worker_threads = self.workers.len,
                 .max_worker_threads = max_worker_threads,
-                .min_parallel_items = min_parallel_items,
                 .fallback_items_per_range = requested_items_per_range,
                 .range_alignment_items = range_alignment_items,
             })
@@ -709,7 +699,7 @@ pub const ThreadSystem = struct {
             };
         const selected_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
         const selected_range_count = rangeCount(item_count, selected_items_per_range);
-        const active_worker_threads = if (item_count < min_parallel_items or selected_range_count <= 1)
+        const active_worker_threads = if (selected_range_count <= 1)
             @as(usize, 0)
         else
             @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
@@ -984,9 +974,9 @@ fn maxUsefulWorkersForRange(item_count: usize, items_per_range: usize, max_worke
 
 fn normalizeWorkTunerConfig(config: AdaptiveWorkTunerConfig) AdaptiveWorkTunerConfig {
     var normalized = config;
-    normalized.min_items_per_range = @max(normalized.min_items_per_range, @as(usize, 1));
-    normalized.max_items_per_range = @max(normalized.max_items_per_range, normalized.min_items_per_range);
-    normalized.initial_items_per_range = clampItemCount(normalized.initial_items_per_range, normalized.min_items_per_range, normalized.max_items_per_range);
+    normalized.smallest_range_items = @max(normalized.smallest_range_items, @as(usize, 1));
+    normalized.largest_range_items = @max(normalized.largest_range_items, normalized.smallest_range_items);
+    normalized.initial_range_items = clampItemCount(normalized.initial_range_items, normalized.smallest_range_items, normalized.largest_range_items);
     normalized.sample_window = @max(normalized.sample_window, @as(usize, 1));
     normalized.improvement_threshold_percent = @min(normalized.improvement_threshold_percent, @as(u8, 100));
     normalized.threaded_commit_threshold_percent = @min(normalized.threaded_commit_threshold_percent, @as(u8, 100));
@@ -1097,7 +1087,6 @@ test "inline parallel for covers every item exactly once" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = 2,
     });
     defer threads.deinit();
@@ -1121,7 +1110,6 @@ test "inline parallel ranges expose stable range indices" {
     };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = 3,
     });
     defer threads.deinit();
@@ -1141,7 +1129,6 @@ test "adaptive inline runs as one direct main-thread range" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
@@ -1176,7 +1163,6 @@ test "threaded parallel ranges expose stable range indices" {
     };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 8,
     });
     defer threads.deinit();
@@ -1200,7 +1186,6 @@ test "worker thread parallel for covers every item exactly once" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
@@ -1225,7 +1210,6 @@ test "parallel for options use provided adaptive work tuner" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
@@ -1257,7 +1241,6 @@ test "parallel for options record selected adaptive profile" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 64,
     });
     defer threads.deinit();
@@ -1291,7 +1274,6 @@ test "parallel for options record selected inline adaptive profile" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 64,
     });
     defer threads.deinit();
@@ -1320,14 +1302,13 @@ test "parallel for options record selected inline adaptive profile" {
     }
 }
 
-test "small batches run inline even when worker threads exist" {
+test "single selected range runs inline even when worker threads exist" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 8;
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 1,
-        .min_parallel_items = 64,
         .items_per_range = 2,
     });
     defer threads.deinit();
@@ -1335,8 +1316,43 @@ test "small batches run inline even when worker threads exist" {
     const stats = threads.parallelFor(hits.len, &context, markCoverage);
 
     try std.testing.expect(stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), stats.range_count);
     try std.testing.expectEqual(@as(usize, 0), stats.active_worker_threads);
     try std.testing.expectEqual(@as(usize, 0), stats.worker_thread_ranges);
+    for (&hits) |*hit| {
+        try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "small measured-expensive batch can activate worker threads" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 8;
+    var context = CoverageContext{ .hits = hits[0..] };
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 1,
+        .items_per_range = 2,
+    });
+    defer threads.deinit();
+
+    var adaptive_tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 2,
+        .smallest_range_items = 1,
+        .largest_range_items = 8,
+        .sample_window = 1,
+        .threaded_batch_ns = 1,
+    });
+    const inline_profile = adaptive_tuner.selectProfile(tunerTestRequest(hits.len, 1, 1, 2));
+    try std.testing.expectEqual(@as(usize, 0), inline_profile.worker_threads);
+    adaptive_tuner.record(tunerTestBatchWithProfile(hits.len, inline_profile, 100_000));
+
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{
+        .adaptive_tuner = &adaptive_tuner,
+    });
+
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
+    try std.testing.expect(stats.range_count > 1);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }
@@ -1349,7 +1365,6 @@ test "parallel for options cap active workers and align ranges" {
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 3,
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
@@ -1374,9 +1389,9 @@ test "parallel for options cap active workers and align ranges" {
 
 test "adaptive work tuner aligns and clamps selected items_per_range" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 17,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 17,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
     });
 
     const profile = tuner.selectProfile(tunerTestRequest(1024, 4, 16, 17));
@@ -1389,9 +1404,9 @@ test "adaptive work tuner aligns and clamps selected items_per_range" {
 
 test "adaptive work tuner stays inline below threaded threshold" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
     });
@@ -1411,9 +1426,9 @@ test "adaptive work tuner stays inline below threaded threshold" {
 
 test "adaptive work tuner default threshold requires full slow inline window" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
     });
     const request = tunerTestRequest(1024, 4, 16, 64);
 
@@ -1432,9 +1447,9 @@ test "adaptive work tuner default threshold requires full slow inline window" {
 
 test "adaptive work tuner default threshold keeps cheap inline work settled" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
     });
     const request = tunerTestRequest(1024, 4, 16, 64);
 
@@ -1454,9 +1469,9 @@ test "adaptive work tuner default threshold keeps cheap inline work settled" {
 
 test "adaptive work tuner predicts threaded profile from slow inline batch" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
     });
@@ -1475,9 +1490,9 @@ test "adaptive work tuner predicts threaded profile from slow inline batch" {
 
 test "adaptive work tuner commits verified predicted profile" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .improvement_threshold_percent = 5,
@@ -1497,8 +1512,8 @@ test "adaptive work tuner commits verified predicted profile" {
 
 test "adaptive work tuner computes more workers for larger measured work" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
     });
@@ -1514,8 +1529,8 @@ test "adaptive work tuner computes more workers for larger measured work" {
 
 test "adaptive work tuner derives range size from range overhead policy" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .min_ranges_per_participant = 2,
@@ -1537,9 +1552,9 @@ test "adaptive work tuner derives range size from range overhead policy" {
 
 test "adaptive work tuner keeps inline when first threaded probe loses" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .improvement_threshold_percent = 5,
         .threaded_batch_ns = 1000,
@@ -1566,9 +1581,9 @@ test "adaptive work tuner keeps inline when first threaded probe loses" {
 
 test "adaptive work tuner cools down after failed inline threaded probe" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .improvement_threshold_percent = 5,
         .threaded_batch_ns = 1000,
@@ -1602,7 +1617,7 @@ test "adaptive work tuner cools down after failed inline threaded probe" {
 
 test "adaptive work tuner resets sample window after item count shift" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
+        .initial_range_items = 64,
         .sample_window = 4,
         .item_count_reset_percent = 25,
     });
@@ -1618,7 +1633,7 @@ test "adaptive work tuner resets sample window after item count shift" {
 
 test "adaptive work tuner clears in-progress profile after item count shift" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
+        .initial_range_items = 64,
         .sample_window = 1,
         .item_count_reset_percent = 25,
         .threaded_batch_ns = 1,
@@ -1640,9 +1655,9 @@ test "adaptive work tuner clears in-progress profile after item count shift" {
 
 test "adaptive work tuner item count reset starts new workload inline" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 16,
-        .min_items_per_range = 16,
-        .max_items_per_range = 64,
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 64,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .improvement_threshold_percent = 5,
@@ -1674,9 +1689,9 @@ test "adaptive work tuner settled threaded retune does not fall back inline" {
     const losing_threaded_challenger_ns = 150_000;
 
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 16,
-        .min_items_per_range = 16,
-        .max_items_per_range = 64,
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 64,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .retune_after_settled_windows = 1,
@@ -1713,9 +1728,9 @@ test "adaptive work tuner retune keeps threaded profile when inline loses" {
     const losing_threaded_challenger_ns = 150_000;
 
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 16,
-        .min_items_per_range = 16,
-        .max_items_per_range = 64,
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 64,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .retune_after_settled_windows = 1,
@@ -1753,7 +1768,7 @@ test "adaptive work tuner retune keeps threaded profile when inline loses" {
 
 test "adaptive work tuner resets sample window when profile changes" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
+        .initial_range_items = 64,
         .sample_window = 4,
     });
 
@@ -1766,9 +1781,9 @@ test "adaptive work tuner resets sample window when profile changes" {
 
 test "adaptive work tuner keeps aligned items_per_range within max when possible" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 90,
-        .min_items_per_range = 1,
-        .max_items_per_range = 100,
+        .initial_range_items = 90,
+        .smallest_range_items = 1,
+        .largest_range_items = 100,
     });
 
     const profile = tuner.selectProfile(tunerTestRequest(1024, 4, 64, 90));
@@ -1777,9 +1792,9 @@ test "adaptive work tuner keeps aligned items_per_range within max when possible
 
 test "adaptive work tuner settled cooldown keeps stable model settled" {
     var tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = 64,
-        .min_items_per_range = 16,
-        .max_items_per_range = 256,
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
         .sample_window = 1,
         .threaded_batch_ns = 1000,
         .retune_after_settled_windows = 2,
@@ -1821,7 +1836,6 @@ test "worker scratch slots include main thread and worker threads" {
 test "batch submission does not allocate after init" {
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = 2,
     });
     defer threads.deinit();
@@ -1861,7 +1875,6 @@ fn tunerTestRequest(item_count: usize, available_worker_threads: usize, range_al
         .item_count = item_count,
         .available_worker_threads = available_worker_threads,
         .max_worker_threads = available_worker_threads,
-        .min_parallel_items = 1,
         .fallback_items_per_range = fallback_items_per_range,
         .range_alignment_items = range_alignment_items,
     };

@@ -614,7 +614,6 @@ test "demo owns and completes a simulation frame during update" {
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -664,7 +663,6 @@ test "demo collision response blocks player against obstacles" {
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -704,7 +702,6 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -753,7 +750,6 @@ test "demo collision response handles player contacts with moving entities" {
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = movement_range_alignment_items,
     });
     defer threads.deinit();
@@ -811,7 +807,6 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
-        .min_parallel_items = 1,
         .items_per_range = movement_range_alignment_items,
     });
     defer threads.deinit();

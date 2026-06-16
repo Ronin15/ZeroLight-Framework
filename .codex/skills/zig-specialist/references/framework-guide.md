@@ -96,8 +96,9 @@ for membership/query decisions; they should not turn hot loops into dynamic
 component joins, string lookup, or hash-map dispatch. Threaded/SIMD processors
 must keep structural entity changes, state transitions, SDL/GPU calls, asset
 loading, save/load streaming, and renderer resource ownership behind an explicit
-deferred or main-thread boundary. Use serial fallbacks for small counts, tests,
-unsupported thread targets, and deterministic comparisons.
+deferred or main-thread boundary. Use serial fallbacks for tests, unsupported
+thread targets, explicit fallback behavior, and deterministic comparisons; do
+not gate production worker participation with static item-count floors.
 
 For threaded/SIMD ECS work, treat cache-line behavior as part of the contract.
 Document hot SoA column alignment before relying on wider or target-specific

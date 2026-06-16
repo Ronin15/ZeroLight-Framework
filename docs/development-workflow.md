@@ -150,10 +150,11 @@ If the tuner still fails to settle within that budget, the detail table reports
 the probing phase and selected candidate so the run is treated as an adaptive
 coverage failure, not a clean steady-state timing.
 Use `--details` when you need scheduler ranges, wait time, items-per-range,
-tuning phase, and workload counters. In adaptive cases, low-count processors may
-stay inline until measured completion time shows that active worker threads are
-worth the synchronization cost; forced-inline batches are timing samples for
-that batch only and do not reset adaptive work-tuner state for later processors.
+tuning phase, and workload counters. In adaptive cases, processors may stay
+inline until measured completion time shows that active worker threads are worth
+the synchronization cost; fixed worker/range cases are benchmark controls only,
+not production scheduling policy. Inline batches are timing samples for that
+batch only and do not reset adaptive work-tuner state for later processors.
 For multi-stage systems, read each stage independently: an adaptive row can have
 a threaded primary batch while a secondary batch still reports `inline`, or both
 stages can settle on separate threaded profiles. This is expected when the

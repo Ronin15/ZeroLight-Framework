@@ -368,7 +368,6 @@ test "range output stream keeps deterministic order across threaded passes" {
     defer stream.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 5,
     });
     defer threads.deinit();

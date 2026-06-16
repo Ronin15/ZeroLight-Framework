@@ -25,7 +25,6 @@ const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_align
 const thread_shared_record_alignment: usize = 64;
 
 pub const CollisionConfig = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     broadphase_items_per_range: ?usize = null,
     narrowphase_items_per_range: ?usize = null,
@@ -180,7 +179,6 @@ pub const CollisionSystem = struct {
         const broadphase_selection = selectStageWork(
             thread_system,
             body_count,
-            system_config.min_parallel_items,
             system_config.broadphase_items_per_range orelse system_config.items_per_range,
             system_config.max_worker_threads,
             system_config.adaptive,
@@ -189,7 +187,6 @@ pub const CollisionSystem = struct {
         const broadphase = try self.buildBroadphaseCandidatesThreaded(
             thread_system,
             broadphase_selection,
-            system_config.min_parallel_items,
         );
         const candidate_pair_count = self.candidate_pairs.items.len;
         if (broadphase_selection.active_tuner) |tuner| {
@@ -209,7 +206,6 @@ pub const CollisionSystem = struct {
         const narrowphase_selection = selectStageWork(
             thread_system,
             candidate_pair_count,
-            system_config.min_parallel_items,
             system_config.narrowphase_items_per_range orelse system_config.items_per_range,
             system_config.max_worker_threads,
             system_config.adaptive,
@@ -221,7 +217,6 @@ pub const CollisionSystem = struct {
             .system = self,
         };
         const narrowphase_batch = thread_system.parallelForWithOptions(candidate_pair_count, &context, narrowphaseContactsJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
             .max_worker_threads = narrowphase_selection.worker_threads,
             .range_alignment_items = collision_range_alignment_items,
             .adaptive_tuner = narrowphase_selection.active_tuner,
@@ -533,7 +528,6 @@ pub const CollisionSystem = struct {
         self: *CollisionSystem,
         thread_system: *ThreadSystem,
         selection: StageWorkSelection,
-        min_parallel_items: ?usize,
     ) !BroadphaseBuildResult {
         try self.prepareBroadphaseRangeBuffers(selection.range_count);
         try self.reserveInitialBroadphaseRangeCapacity(selection);
@@ -545,7 +539,6 @@ pub const CollisionSystem = struct {
                 slot.buffer.clearRetainingCapacity();
             }
             const batch = thread_system.parallelForWithOptions(self.order.items.len, &context, broadphaseCandidatesJob, .{
-                .min_parallel_items = min_parallel_items,
                 .max_worker_threads = selection.worker_threads,
                 .range_alignment_items = collision_range_alignment_items,
                 .selected_profile = selection.profile,
@@ -798,7 +791,6 @@ const StageWorkSelection = struct {
 fn selectStageWork(
     thread_system: *const ThreadSystem,
     item_count: usize,
-    min_parallel_items_override: ?usize,
     items_per_range_override: ?usize,
     max_worker_threads_override: ?usize,
     adaptive: bool,
@@ -806,7 +798,6 @@ fn selectStageWork(
 ) StageWorkSelection {
     const available_workers = thread_system.workerThreadCount();
     const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const min_parallel_items = min_parallel_items_override orelse thread_system.config.min_parallel_items;
     const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
     const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
         adaptive_tuner
@@ -817,7 +808,6 @@ fn selectStageWork(
             .item_count = item_count,
             .available_worker_threads = available_workers,
             .max_worker_threads = max_worker_threads,
-            .min_parallel_items = min_parallel_items,
             .fallback_items_per_range = requested_items_per_range,
             .range_alignment_items = collision_range_alignment_items,
         })
@@ -828,7 +818,7 @@ fn selectStageWork(
         };
     const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), collision_range_alignment_items);
     const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (item_count < min_parallel_items or selected_range_count <= 1)
+    const selected_worker_threads = if (selected_range_count <= 1)
         @as(usize, 0)
     else
         @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
@@ -1026,7 +1016,6 @@ test "threaded collision matches serial contact order" {
     defer threaded_contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
@@ -1034,7 +1023,6 @@ test "threaded collision matches serial contact order" {
 
     _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
     const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -1120,14 +1108,12 @@ test "threaded broadphase prewarms empty range buffers before dispatch" {
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const stats = try system.update(&data, &contacts, &threads, .{
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -1184,14 +1170,12 @@ test "threaded collision update reuses warmed range scratch without steady state
     defer contacts.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
     });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     _ = try system.update(&data, &contacts, &threads, .{
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -1209,7 +1193,6 @@ test "threaded collision update reuses warmed range scratch without steady state
     }
 
     const stats = try system.update(&data, &contacts, &threads, .{
-        .min_parallel_items = 1,
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,

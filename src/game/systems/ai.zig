@@ -47,7 +47,6 @@ const max_separation_neighbors: u8 = 32;
 const max_separation_candidate_checks: u16 = 128;
 
 pub const AiConfig = struct {
-    min_parallel_items: ?usize = null,
     items_per_range: ?usize = null,
     separation_items_per_range: ?usize = null,
     intent_items_per_range: ?usize = null,
@@ -153,7 +152,6 @@ pub const AiSystem = struct {
         const separation_selection = selectStageWork(
             thread_system,
             entity_count,
-            system_config.min_parallel_items,
             system_config.separation_items_per_range orelse system_config.items_per_range,
             system_config.max_worker_threads,
             system_config.adaptive,
@@ -170,7 +168,6 @@ pub const AiSystem = struct {
             .cell_ranges = self.cell_ranges.items,
         };
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
             .max_worker_threads = separation_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
             .adaptive_tuner = separation_selection.active_tuner,
@@ -180,7 +177,6 @@ pub const AiSystem = struct {
         const intent_selection = selectStageWork(
             thread_system,
             entity_count,
-            system_config.min_parallel_items,
             system_config.intent_items_per_range orelse system_config.items_per_range,
             system_config.max_worker_threads,
             system_config.adaptive,
@@ -222,7 +218,6 @@ pub const AiSystem = struct {
         try frame.intents.prefixAppendedRanges(range_base);
 
         const intent_batch = thread_system.parallelForWithOptions(entity_count, &context, writeAiIntentsJob, .{
-            .min_parallel_items = system_config.min_parallel_items,
             .max_worker_threads = intent_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
             .adaptive_tuner = intent_selection.active_tuner,
@@ -488,7 +483,6 @@ const AiPathingStats = struct {
 };
 
 const NormalizedAiConfig = struct {
-    min_parallel_items: ?usize,
     items_per_range: ?usize,
     separation_items_per_range: ?usize,
     intent_items_per_range: ?usize,
@@ -504,7 +498,6 @@ const NormalizedAiConfig = struct {
 
 fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
     return .{
-        .min_parallel_items = config.min_parallel_items,
         .items_per_range = config.items_per_range,
         .separation_items_per_range = config.separation_items_per_range,
         .intent_items_per_range = config.intent_items_per_range,
@@ -552,7 +545,6 @@ const StageWorkSelection = struct {
 fn selectStageWork(
     thread_system: *const ThreadSystem,
     item_count: usize,
-    min_parallel_items_override: ?usize,
     items_per_range_override: ?usize,
     max_worker_threads_override: ?usize,
     adaptive: bool,
@@ -560,7 +552,6 @@ fn selectStageWork(
 ) StageWorkSelection {
     const available_workers = thread_system.workerThreadCount();
     const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const min_parallel_items = min_parallel_items_override orelse thread_system.config.min_parallel_items;
     const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
     const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
         adaptive_tuner
@@ -571,7 +562,6 @@ fn selectStageWork(
             .item_count = item_count,
             .available_worker_threads = available_workers,
             .max_worker_threads = max_worker_threads,
-            .min_parallel_items = min_parallel_items,
             .fallback_items_per_range = requested_items_per_range,
             .range_alignment_items = ai_range_alignment_items,
         })
@@ -582,7 +572,7 @@ fn selectStageWork(
         };
     const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), ai_range_alignment_items);
     const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (item_count < min_parallel_items or selected_range_count <= 1)
+    const selected_worker_threads = if (selected_range_count <= 1)
         @as(usize, 0)
     else
         @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
@@ -940,7 +930,6 @@ test "ai processor uses committed adaptive threaded profiles with default thread
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
-        .min_parallel_items = 1,
         .items_per_range = 1,
     });
     defer threads.deinit();
@@ -967,9 +956,9 @@ test "ai processor uses committed adaptive threaded profiles with default thread
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     var separation_tuner = AdaptiveWorkTuner.init(.{
-        .initial_items_per_range = ai_range_alignment_items,
-        .min_items_per_range = ai_range_alignment_items,
-        .max_items_per_range = ai_range_alignment_items * 4,
+        .initial_range_items = ai_range_alignment_items,
+        .smallest_range_items = ai_range_alignment_items,
+        .largest_range_items = ai_range_alignment_items * 4,
     });
     separation_tuner.current_profile = .{
         .worker_threads = 1,
@@ -1366,14 +1355,12 @@ test "ai serial and real threaded workers produce identical movement intents" {
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
-        .min_parallel_items = 1,
         .items_per_range = 16,
     });
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     const cfg: AiConfig = .{
-        .min_parallel_items = 1,
         .items_per_range = 16,
         .max_worker_threads = 2,
         .adaptive = false,

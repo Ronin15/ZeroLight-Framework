@@ -83,7 +83,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
             .max_worker_threads = case.maxWorkerThreads(),
-            .min_parallel_items = 1,
             .items_per_range = suite.default_items_per_range,
         });
     }
@@ -134,7 +133,6 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, 
     }
 
     return try system.update(ai_slice, movement_slice, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
-        .min_parallel_items = 1,
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,

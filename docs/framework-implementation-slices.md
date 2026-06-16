@@ -379,8 +379,8 @@ Thread-system design:
 - [x] Default worker thread count to one fewer than
       `std.Thread.getCpuCount()` when possible, reserving the main/render thread
       as an additional batch participant; allow config override for worker
-      thread count, stack size, minimum parallel item count, and items per
-      claimed range (`items_per_range`).
+      thread count, stack size, and items per claimed range
+      (`items_per_range`).
 - [x] Use preallocated worker records, one synchronous batch descriptor, and an
       atomic range cursor. No frame-batch submission may allocate after
       initialization.
@@ -391,7 +391,8 @@ Thread-system design:
       does useful work instead of only acting as a coordinator.
 - [x] Dynamically scale active workers only at batch boundaries based on prior
       batch cost, item count, main-thread wait time, and worker utilization.
-      Small batches run inline on the main thread.
+      Static item-count floors do not gate production worker participation;
+      timing and structural range feasibility decide whether work stays inline.
 - [x] Stop accepting work during shutdown, wake parked workers, join every
       pre-spawned thread, and assert that no frame batch is still outstanding.
 
@@ -619,8 +620,8 @@ Performance notes:
 - Hot processors should iterate SoA columns directly, not per-entity AoS structs
   or dynamically joined component records.
 - `ThreadSystem` integration is required for this slice. Keep a serial path for
-  small counts, tests, and fallback behavior, but the processor API and tests
-  must prove that systems can split `DataSystem` slices through
+  tests, explicit fallback behavior, and deterministic comparisons, but the
+  processor API and tests must prove that systems can split `DataSystem` slices through
   `ThreadSystem.parallelFor`.
 - Treat adaptive work tuning as a measured batch-profile policy, not a separate
   worker-count heuristic. The tuner starts inline, probes threaded profiles only
@@ -644,8 +645,8 @@ Performance notes:
 System shape:
 
 - `MovementSystem` reads and writes explicit movement-body SoA slices, keeps a
-  simple serial path for small counts and tests, and uses threaded SIMD ranges
-  for larger batches.
+  simple serial path for tests and deterministic comparisons, and uses
+  timing-adaptive threaded SIMD ranges for eligible batches.
 - `MovementSystem` must not create, destroy, add, or remove entities/components
   inside worker ranges. Structural changes from future processors should flow
   through the state-owned simulation frame and `DataSystem` batch commit path.
@@ -664,7 +665,7 @@ Checklist:
       `parallelFor`.
 - [x] Add particle processors that split dense SoA slices through `parallelFor`.
 - [x] Wire `MovementSystem` through `ThreadSystem.parallelFor` with a serial path
-      for small counts and deterministic tests.
+      for deterministic tests and explicit comparisons.
 - [x] Use SIMD inside each worker range and scalar-tail code for remainder
       elements.
 - [x] Add an explicit alignment strategy for hot SoA columns before introducing

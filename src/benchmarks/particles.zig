@@ -67,7 +67,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
             .max_worker_threads = case.maxWorkerThreads(),
-            .min_parallel_items = 1,
             .items_per_range = suite.default_items_per_range,
         });
     }
@@ -106,7 +105,6 @@ fn runOnce(particles: *ParticleSystem, thread_system: ?*ThreadSystem, case: suit
     }
 
     return particles.update(thread_system.?, delta_seconds, .{
-        .min_parallel_items = 1,
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
