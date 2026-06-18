@@ -24,6 +24,11 @@ zig build gpu-smoke # run a display-gated renderer pipeline smoke
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.
 
+On Windows, `package`, `run`, `dev`, and normal build steps install the required
+`SDL3.dll`, `SDL3_ttf.dll`, and `SDL3_mixer.dll` beside the app binary when
+using the pinned package SDL path. Optional SDL_mixer codec DLLs are not copied
+by this slice because current runtime audio assets are WAV-based.
+
 ## Release Modes
 
 The default optimize mode is `Debug`, matching standard Zig build behavior. Use
@@ -36,6 +41,10 @@ zig build --release=fast
 zig build --release=small
 zig build -Doptimize=ReleaseFast
 ```
+
+Release builds use the same pinned Zig package cache as Debug builds. They do
+not download SDL again unless a required package is missing and Zig fetching is
+enabled by the current `--fetch` mode.
 
 ## Build Options
 
@@ -62,7 +71,37 @@ Use non-default shader compiler paths:
 ```sh
 zig build shaders -Dshader-compiler=/path/to/glslc
 zig build shaders -Dshader-cross-compiler=/path/to/spirv-cross
+zig build shaders -Ddxil-compiler=/path/to/dxc
 ```
+
+On Windows, the shader pipeline is GLSL to SPIR-V with `glslc`, SPIR-V to HLSL
+with `spirv-cross --hlsl --shader-model 60`, and HLSL to DXIL with `dxc` using
+`vs_6_0` or `ps_6_0` targets. Installed Windows shader files end in `.dxil`.
+
+## Windows SDL Packages
+
+The pinned Windows SDL packages are declared in `build.zig.zon` and fetched by
+Zig's package manager:
+
+- SDL 3.4.10, `SDL3-devel-3.4.10-VC.zip`
+- SDL_ttf 3.2.2, `SDL3_ttf-devel-3.2.2-VC.zip`
+- SDL_mixer 3.2.4, `SDL3_mixer-devel-3.2.4-VC.zip`
+
+Default Windows builds use Zig's native target and do not require an external
+MinGW or Visual Studio toolchain. The `-VC.zip` suffix is SDL's published
+archive naming, not a compiler requirement for this project.
+
+Use this once on a Windows machine, or any time you want to validate the cache:
+
+```sh
+zig build fetch-sdl
+```
+
+The default `--fetch=needed` behavior fetches only missing lazy packages, then
+re-runs the build with package paths available. After that, normal builds are
+offline and deterministic unless the package cache is removed. Pass
+`-Dsystem-sdl=true` to use globally installed SDL libraries instead, or
+`-Dsdl-root=<path>` for custom extracted SDL archives.
 
 SDL_GPU debug validation is enabled by default in Debug builds. Override it with:
 
@@ -95,6 +134,9 @@ zig build test
 For a broader local check before sharing changes:
 
 ```sh
+zig build shaders
+zig build check
+zig build test
 zig build verify
 ```
 

@@ -16,6 +16,9 @@ pub const SpriteMaterial = struct {
     spirv_vertex_path: []const u8,
     spirv_fragment_path: []const u8,
     spirv_entrypoint: [:0]const u8,
+    dxil_vertex_path: []const u8,
+    dxil_fragment_path: []const u8,
+    dxil_entrypoint: [:0]const u8,
     msl_vertex_path: []const u8,
     msl_fragment_path: []const u8,
     msl_entrypoint: [:0]const u8,
@@ -28,6 +31,9 @@ pub const sprite_material = SpriteMaterial{
     .spirv_vertex_path = "shaders/sprite.vert.spv",
     .spirv_fragment_path = "shaders/sprite.frag.spv",
     .spirv_entrypoint = "main",
+    .dxil_vertex_path = "shaders/sprite.vert.dxil",
+    .dxil_fragment_path = "shaders/sprite.frag.dxil",
+    .dxil_entrypoint = "main",
     .msl_vertex_path = "shaders/sprite.vert.msl",
     .msl_fragment_path = "shaders/sprite.frag.msl",
     .msl_entrypoint = "main0",
@@ -162,6 +168,15 @@ pub fn selectShaderSetFromFormats(
         };
     }
 
+    if ((usable_formats & c.SDL_GPU_SHADERFORMAT_DXIL) != 0) {
+        return .{
+            .format = c.SDL_GPU_SHADERFORMAT_DXIL,
+            .vertex_path = sprite_material.dxil_vertex_path,
+            .fragment_path = sprite_material.dxil_fragment_path,
+            .entrypoint = sprite_material.dxil_entrypoint,
+        };
+    }
+
     if ((usable_formats & c.SDL_GPU_SHADERFORMAT_SPIRV) != 0) {
         return .{
             .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
@@ -176,6 +191,7 @@ pub fn selectShaderSetFromFormats(
 
 pub fn shaderFormatName(format: c.SDL_GPUShaderFormat) []const u8 {
     if (format == c.SDL_GPU_SHADERFORMAT_MSL) return "MSL";
+    if (format == c.SDL_GPU_SHADERFORMAT_DXIL) return "DXIL";
     if (format == c.SDL_GPU_SHADERFORMAT_SPIRV) return "SPIR-V";
     return "unknown";
 }
@@ -228,6 +244,18 @@ test "shader set selection prefers metal shading language when available" {
     try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_MSL, shader_set.format);
     try std.testing.expectEqualStrings("shaders/sprite.vert.msl", shader_set.vertex_path);
     try std.testing.expectEqualStrings("main0", shader_set.entrypoint);
+}
+
+test "shader set selection uses dxil before spirv when both are available" {
+    const shader_set = try selectShaderSetFromFormats(
+        c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL,
+        c.SDL_GPU_SHADERFORMAT_SPIRV | c.SDL_GPU_SHADERFORMAT_DXIL,
+    );
+
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_DXIL, shader_set.format);
+    try std.testing.expectEqualStrings("shaders/sprite.vert.dxil", shader_set.vertex_path);
+    try std.testing.expectEqualStrings("main", shader_set.entrypoint);
+    try std.testing.expectEqualStrings("DXIL", shaderFormatName(shader_set.format));
 }
 
 test "shader set selection uses spirv when it is the matching format" {

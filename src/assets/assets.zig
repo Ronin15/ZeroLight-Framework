@@ -89,7 +89,10 @@ test "asset paths are rooted under configured asset directory" {
     const path = try assets.resolvePath("shaders/sprite.vert.spv");
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("assets/shaders/sprite.vert.spv", path);
+    const expected = try std.fs.path.join(allocator, &.{ "assets", "shaders/sprite.vert.spv" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "readable asset paths prefer configured asset directory" {
@@ -99,7 +102,10 @@ test "readable asset paths prefer configured asset directory" {
     const path = try assets.resolveReadablePath("shaders/sprite.vert.glsl");
     defer allocator.free(path);
 
-    try std.testing.expectEqualStrings("assets/shaders/sprite.vert.glsl", path);
+    const expected = try std.fs.path.join(allocator, &.{ "assets", "shaders/sprite.vert.glsl" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "asset paths reject empty absolute and parent traversal paths" {

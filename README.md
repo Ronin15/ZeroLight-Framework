@@ -34,11 +34,12 @@ For deeper details, see [architecture](docs/architecture.md),
 ## Requirements
 
 - Zig 0.16.0 or a compatible 0.16.x build
-- SDL3 development headers and library
-- SDL3_ttf development headers and library
-- SDL3_mixer development headers and library
+- SDL3, SDL3_ttf, and SDL3_mixer development files
+  - Windows defaults to pinned packages fetched by Zig's package manager.
+  - Linux and macOS use system packages.
 - `glslc` for shader compilation
 - `spirv-cross` for macOS Metal shader generation
+- `spirv-cross` and `dxc` for Windows DXIL shader generation
 
 See [setup](docs/setup.md) for platform package notes.
 
