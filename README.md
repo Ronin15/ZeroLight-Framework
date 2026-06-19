@@ -14,6 +14,9 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
 
 - **Fixed-step runtime flow:** a thin main loop with app coordination, state
   dispatch, pause policy, input routing, and interpolated rendering.
+- **Usable app shell:** a startup main menu, modal settings screen, live audio
+  gain controls, gameplay launch flow, pause overlay, and debug overlay all run
+  through the same state stack and input-routing rules.
 - **SDL_GPU rendering:** a game-facing `Renderer` with shader loading, texture
   ownership, sprite batching, and frame submission kept behind render/platform
   boundaries.
@@ -23,8 +26,8 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
   pathfinding, and steering use dense data, deterministic outputs, serial
   baselines, and worker-thread/SIMD paths where appropriate.
 - **Comprehensive tests:** coverage for state transitions, input routing,
-  resource lifetime, renderer math, threaded CPU range batches, and SIMD/scalar parity so
-  framework behavior stays stable as it grows.
+  resource lifetime, renderer math, threaded CPU range batches, and SIMD/scalar
+  parity so framework behavior stays stable as it grows.
 - **Runtime asset, audio, and text services:** traversal-safe asset paths,
   stable sprite/audio IDs, core SDL3 PNG loading, SDL3_mixer audio ownership,
   asset-backed SDL3_ttf text rendering, and an F2 FPS overlay.
