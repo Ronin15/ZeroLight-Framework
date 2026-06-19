@@ -238,6 +238,18 @@ merges transient outputs, and applies deferred structural commands at explicit
 main-thread commit points. `DataSystem` remains persistent storage, not the
 simulation scheduler.
 
+The current gameplay fixed-step pipeline is:
+
+1. Clear `SimulationFrame` and mark the step active.
+2. Apply main-thread player input and queue fixed-step audio commands.
+3. Run AI decision output, steering, and frame-delayed pathfinding.
+4. Apply merged movement intents on the main thread.
+5. Run movement over dense `DataSystem` movement slices.
+6. Clamp bounds, generate collision contacts, and apply collision response.
+7. Queue contact audio, emit/update transient particles, and merge outputs.
+8. Commit deferred structural commands to `DataSystem`.
+9. Render current `DataSystem` and particle state with interpolation.
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
