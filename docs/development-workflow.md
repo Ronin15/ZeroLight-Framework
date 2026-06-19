@@ -29,6 +29,12 @@ On Windows, `package`, `run`, `dev`, and normal build steps install the required
 using the pinned package SDL path. Optional SDL_mixer codec DLLs are not copied
 by this slice because current runtime audio assets are WAV-based.
 
+`run`, `dev`, and `gpu-smoke` launch from the installed binary directory, so the
+default asset root resolves copied runtime assets and generated shader files
+under `zig-out/bin`. If you run the binary directly, run it from `zig-out/bin`
+or provide a deliberate asset-root layout; launching from the repo root can find
+source assets while missing generated shader outputs.
+
 ## Release Modes
 
 The default optimize mode is `Debug`, matching standard Zig build behavior. Use

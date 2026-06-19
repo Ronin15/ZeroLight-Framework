@@ -22,23 +22,14 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Use the completed Slice 17 runtime asset catalog as the base for Slice 7
-  parallel render prep or Slice 8 shader/platform validation when the next
-  engine-support track is picked.
-- Defer Slice 8 shader/platform validation until that engine-support track is
-  intentionally picked back up.
-- Slice 17 now gives Slice 7 parallel CPU render prep a realistic sprite/audio
-  asset-ID data shape to process.
-- Slice 12 is now the gameplay-systems foundation for collision, AI intent,
-  path/query work, and deterministic rule outputs.
-- Slice 19 turns frame-delayed path results into deterministic NPC steering,
-  local avoidance, replan cooldowns, and movement-intent arbitration above the
-  pathfinder.
-- The next navigation-focused track should harden rare true-A* fallback costs,
-  pending budgets, cache aging, and hard-path benchmark visibility.
-- Keep hard-path navigation benchmarks, fallback budgets, and cache/tuner
-  regression checks as their own hardening track so common path requests stay
-  cheap and rare A* work stays visible.
+- Finish Slice 7 parallel CPU render prep on top of the Slice 17
+  `RuntimeAssets` catalog. Keep it incomplete until serial and parallel prep
+  produce identical draw order, grouping, and invalid-resource handling.
+- Finish Slice 20 navigation hardening before scaling to large maps or many NPC
+  path users. Rare true-A* work, pending budgets, cache aging/capacity, and
+  hard-path benchmark visibility should remain explicit.
+- Track collision-response merge/apply, renderer batch capacity, text-cache
+  lifetime policy, and manual registry guardrails as hardening follow-ups.
 - Keep future gameplay systems built on Slice 12's typed processor outputs,
   deterministic merge, and deferred structural-change contracts.
 
@@ -470,17 +461,22 @@ Goal: keep platform support reliable as shader count and target platforms grow.
 Current foundation:
 
 - SDL chooses the GPU backend from supplied shader formats.
-- macOS builds MSL, Linux builds SPIR-V.
+- Linux builds SPIR-V, macOS builds MSL, and Windows builds DXIL.
 - Runtime selects shader files from SDL-reported supported formats.
+- Build metadata and runtime pipeline metadata are still updated in separate
+  places until a shared shader/material manifest exists.
 
 Checklist:
 
-- [ ] Extend the shader-program table as new render pipelines are added.
-- [ ] Keep generated runtime shader files under `assets/shaders` in the install
+- [x] Keep generated runtime shader files under `assets/shaders` in the install
       tree.
-- [ ] Add explicit Windows target support only when Windows is an active target.
+- [x] Add explicit Windows target output through DXIL.
+- [x] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
+- [ ] Consolidate shader-program, material, and runtime pipeline metadata so
+      new pipelines do not need parallel registry edits.
 - [ ] Validate the right shader format list for each target OS.
-- [ ] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
+- [ ] Add direct runtime asset/shader lookup guidance or tests for direct binary
+      execution outside the installed binary directory.
 - [ ] Add shader output checks for each supported target path.
 
 Acceptance checks:

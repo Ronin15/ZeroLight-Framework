@@ -20,6 +20,11 @@ live under `src/render/gpu/` and load the shader files matching
 Runtime shader selection prefers MSL, then DXIL, then SPIR-V when multiple
 formats are available.
 
+Shader metadata currently exists in both the build graph and the runtime render
+pipeline. When adding a shader or material, update the `shader_programs` table
+in `build.zig` and the render-owned pipeline loader until a shared manifest
+replaces the parallel registries.
+
 ## Sprite Rendering
 
 Sprites and colored rectangles are collected into a CPU sprite batch, uploaded to one
@@ -70,6 +75,11 @@ For atlases or future tile rendering, keep entity data on stable
 the same ID-to-texture/source model rather than creating one texture per tile or
 storing live renderer handles in gameplay data.
 
+Large sprite, tile, or particle scenes should reserve or surface sprite-batch
+capacity before relying on allocation-free render frames. The warmed path avoids
+per-frame allocation only inside the currently reserved command, vertex, and
+draw-group capacity.
+
 ## Logical Presentation
 
 The default logical game size is 1280x720. Windows are resizable and request
@@ -112,6 +122,10 @@ when a sprite ID is unavailable. The default text path uses the bundled
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default
 asset root is `assets`; change it with `-Dasset-root=content`.
+`zig build run`, `zig build dev`, and `zig build gpu-smoke` run from the
+installed binary directory so generated shaders and copied assets resolve
+through that tree. When launching a binary directly, run it from `zig-out/bin`
+or provide an asset-root layout that includes generated shader files.
 
 The installed runtime asset tree excludes shader source files and build-only
 shader formats. Package source assets separately if your game needs them.
@@ -156,6 +170,11 @@ Normal render frames draw the stored view with `text.drawPreparedText(...)`, so
 stable labels do not re-check the cache every frame. The service keeps generated
 text textures cached for app lifetime and releases them during
 `TextService.deinit` after the renderer is idle.
+
+The app-lifetime cache fits stable menu labels, debug text, and low-cardinality
+UI. Chat logs, combat text, localization sweeps, or other high-cardinality
+dynamic text need eviction, explicit release, or a different text-atlas policy
+before they are treated as long-running workloads.
 
 The default font is `fonts/NotoSansMono-Regular.ttf`. System font probing is not
 part of the normal runtime path.

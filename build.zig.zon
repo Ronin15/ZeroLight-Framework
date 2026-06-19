@@ -4,11 +4,11 @@
 
 .{
     // Project identity.
-    .name = .zig_sdl3_gpu_framework,
+    .name = .zero_light_framework,
     // Project version.
     .version = "0.0.0",
     // Regenerate this when renaming the project.
-    .fingerprint = 0x247287d00907616d, // Changing this has security and trust implications.
+    .fingerprint = 0xf8699fde2a9a0aef, // Changing this has security and trust implications.
     // Earliest Zig version this project supports.
     .minimum_zig_version = "0.16.0",
     // Add project dependencies here as the game grows.
@@ -35,6 +35,11 @@
         "assets",
         "build.zig",
         "build.zig.zon",
+        "docs/architecture.md",
+        "docs/development-workflow.md",
+        "docs/rendering-assets-shaders.md",
+        "docs/setup.md",
+        "docs/state-stack-and-input.md",
         "LICENSE",
         "src",
     },

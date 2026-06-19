@@ -19,13 +19,15 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
   boundaries.
 - **Data-oriented architecture:** dense component stores for direct,
   cache-friendly processor iteration over gameplay data.
-- **Threaded and SIMD processors:** movement, particle, AI, and collision workloads
-  with serial, SIMD-friendly, and worker-thread execution paths.
+- **Threaded and SIMD processors:** movement, particles, AI, collision,
+  pathfinding, and steering use dense data, deterministic outputs, serial
+  baselines, and worker-thread/SIMD paths where appropriate.
 - **Comprehensive tests:** coverage for state transitions, input routing,
   resource lifetime, renderer math, threaded CPU range batches, and SIMD/scalar parity so
   framework behavior stays stable as it grows.
-- **Runtime asset and text services:** traversal-safe asset paths, core SDL3 PNG
-  loading, asset-backed SDL3_ttf text rendering, and an F2 FPS overlay.
+- **Runtime asset, audio, and text services:** traversal-safe asset paths,
+  stable sprite/audio IDs, core SDL3 PNG loading, SDL3_mixer audio ownership,
+  asset-backed SDL3_ttf text rendering, and an F2 FPS overlay.
 
 For deeper details, see [architecture](docs/architecture.md),
 [state stack and input](docs/state-stack-and-input.md), and
@@ -34,9 +36,9 @@ For deeper details, see [architecture](docs/architecture.md),
 ## Requirements
 
 - Zig 0.16.0 or a compatible 0.16.x build
-- SDL3, SDL3_ttf, and SDL3_mixer development files
+- SDL3, SDL3_ttf, and SDL3_mixer
+  - Linux and macOS use system development packages.
   - Windows defaults to pinned packages fetched by Zig's package manager.
-  - Linux and macOS use system packages.
 - `glslc` for shader compilation
 - `spirv-cross` for macOS Metal shader generation
 - `spirv-cross` and `dxc` for Windows DXIL shader generation
@@ -83,7 +85,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `build.zig` defines executables, tests, formatting, shaders, and install steps.
 - `build.zig.zon` contains project metadata.
 - `src/main.zig` contains the entry point and high-level fixed-step loop.
-- `src/app/` contains SDL coordination, input, timing, pause policy, frame pacing, threads, and state stack flow.
+- `src/app/` contains SDL coordination, input, timing, pause policy, frame pacing, audio, threads, and state stack flow.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and the debug overlay.
 - `src/game/` contains game states, gameplay data, and ECS-style processors.
 - `src/platform/` contains SDL/platform helpers and GPU smoke-test code.

@@ -59,7 +59,11 @@ Add new code under the matching owner directory. Keep executable-only code near
   `TextureLease`, prepared sprite records, SDL_mixer handles, or loaded audio
   handles in `DataSystem`.
 - Use core SDL3 PNG loading for textures. Do not add `SDL3_image` unless that dependency is explicitly chosen.
-- SDL3, SDL3_ttf, and SDL3_mixer are system dependencies; avoid vendoring or half-adopting external dependencies.
+- SDL3, SDL3_ttf, and SDL3_mixer are system dependencies on Linux and
+  macOS. Windows defaults to the pinned lazy packages in `build.zig.zon`;
+  use `-Dsystem-sdl=true` for global SDL installs or `-Dsdl-root=...` for
+  custom extracted archives. Avoid vendoring or half-adopting external
+  dependencies.
 - Pair SDL resource creation with cleanup close to the creation site.
 - Treat performance as a correctness constraint in hot paths: fixed-step update,
   input dispatch, render submission, asset lookup, and text/debug overlay.
