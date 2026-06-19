@@ -40,8 +40,8 @@ app-level service.
 Controllers may own small feature-local queues, budgets, cooldowns, transient
 scratch, and arbitration rules. They should not become hidden per-entity stores,
 own renderer/audio/SDL handles, hide random choices, or replace SoA processors
-for hot loops. Persistent world facts live in `DataSystem`; per-step outputs
-live in `SimulationFrame`.
+for hot loops. Persistent gameplay/domain facts live in `DataSystem` or
+state-owned domain storage; per-step outputs live in `SimulationFrame`.
 
 ## Data Ownership
 

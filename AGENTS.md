@@ -47,9 +47,14 @@ Add new code under the matching owner directory. Keep executable-only code near
   entity IDs, component masks, and dense typed SoA component stores live there.
 - Let a state-owned pipeline own light domain controllers when a feature needs
   orchestration for phase order, budgets, queues, cooldowns, conflict policy,
-  or processor handoff. Keep persistent world facts in `DataSystem`, per-step
-  outputs in `SimulationFrame`, and hot/reusable loops in systems/processors
-  over typed SoA slices.
+  or processor handoff. Keep persistent gameplay/domain facts in `DataSystem`
+  or state-owned domain storage, per-step outputs in `SimulationFrame`, and
+  hot/reusable loops in systems/processors over typed SoA slices.
+- Treat future simulation/domain events as typed transient
+  `SimulationFrame`/pipeline signals for cross-system communication about
+  important system changes. Do not add a global pub/sub bus, string-topic
+  dispatcher, callback chain, or event payloads carrying pointers,
+  app/render/audio handles, asset paths, allocators, or service references.
 - Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
   render preparation as mostly stateless processors over `DataSystem` slices;
   they borrow data and services, but do not own persistent gameplay state.

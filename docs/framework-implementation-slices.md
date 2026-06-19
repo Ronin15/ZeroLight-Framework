@@ -30,6 +30,9 @@ adding broad abstraction.
   hard-path benchmark visibility should remain explicit.
 - Track collision-response merge/apply, renderer batch capacity, text-cache
   lifetime policy, and manual registry guardrails as hardening follow-ups.
+- Add a typed simulation event system slice before broad domain features such as
+  tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
+  and spawning start depending on cross-system change signals.
 - When multiple gameplay states need the same ordered processor flow, extract a
   state-owned simulation pipeline helper instead of duplicating `GameDemoState`
   orchestration or adding a global ECS scheduler. The pipeline may own
@@ -48,9 +51,10 @@ reusable pipeline is appropriate once multiple gameplay states or instances
 need the same ordered stages; it should remain owned by the state instance and
 should not be promoted into a global scheduler. The pipeline can own domain
 controllers for one state instance, and those controllers can coordinate small
-feature-local state and processor handoff. Persistent world facts live in
-`DataSystem`, per-step outputs live in `SimulationFrame`, and large or reusable
-loops stay in systems that process typed slices and emit deterministic outputs.
+feature-local state and processor handoff. Persistent gameplay/domain facts
+live in `DataSystem` or state-owned domain storage, per-step outputs live in
+`SimulationFrame`, and large or reusable loops stay in systems that process
+typed slices and emit deterministic outputs.
 Pathfinding provides a navigation substrate; immersive NPC behavior still needs
 steering, local avoidance, perception, and rule arbitration layered above it.
 
@@ -1321,6 +1325,117 @@ Acceptance checks:
       update.
 - [ ] Hard-path changes cannot silently regress common request throughput.
 
+## Slice 21: Typed Simulation Event System And Domain Signals
+
+Goal: add a deterministic, typed simulation event layer that lets future
+gameplay/domain systems communicate important system changes and interactions,
+including tile, pathfinding, AI, obstacle, weather, combat, spawning, rules, and
+resource changes, without introducing a global pub/sub bus, hidden persistent
+state, or hot-path dynamic dispatch.
+
+Current foundation:
+
+- Slice 12 already provides `SimulationFrame`, typed transient streams,
+  `RangeOutputStream(T)`, deterministic range-index merge, and deferred
+  structural command boundaries.
+- Collision, AI, steering, and pathfinding already use specialized typed
+  streams for high-volume or latency-sensitive outputs: contacts, navigation
+  intents, movement intents, path requests, and structural commands.
+- The roadmap now points toward a state-owned `SimulationPipeline` as the owner
+  of ordered gameplay phases and lightweight domain controller composition.
+- `DataSystem` is the persistent gameplay-fact owner; transient event, request,
+  scratch, queue, and service state stay outside persistent component storage.
+
+Architecture notes:
+
+- Map this feature to the intended simulation structure explicitly:
+  `StateStack` dispatches states; a gameplay state owns `DataSystem`,
+  `SimulationFrame`, and, when shared orchestration is needed, a
+  `SimulationPipeline`; the pipeline owns event phases and domain-controller
+  order; controllers consume typed event slices and decide reactions;
+  processors do hot SoA work and emit typed outputs; `DataSystem` stores
+  persistent facts; `SimulationFrame` stores this-step communication.
+- Use events to communicate that something important changed or that a later
+  stage should consider a request. Use `DataSystem` to store what remains true
+  after the step. Use controllers to decide how domains react. Use processors
+  for scalable data work. Use deferred commands for structural mutation.
+- The event layer should be state-owned and tied to the `SimulationPipeline` for
+  one gameplay state instance. It is not an app service, global singleton,
+  reflection system, string-topic dispatcher, callback chain, or dynamic
+  dependency graph.
+- Events communicate domain or system changes that happened this step, or
+  requests that a later fixed stage should consider. Persistent facts such as
+  tile state, obstacle occupancy, weather fields, faction state, resources,
+  actor components, or long-lived rule state still live in `DataSystem` or
+  state-owned domain storage.
+- Prefer explicit typed event unions or typed event channels with stable IDs:
+  examples include `TileChanged`, `ObstacleChanged`, `WeatherChanged`,
+  `NavRegionInvalidated`, `PerceptionStimulus`, `NoiseEmitted`,
+  `InteractionRequested`, `DamageRequested`, and `SpawnRequested`.
+- Keep existing high-volume streams specialized. Collision contacts, movement
+  intents, navigation intents, path requests, and render-prep outputs should not
+  be collapsed into one generic simulation-event stream just for uniformity.
+- Threaded producers must use the same count/prefix/write/range-index merge
+  model as other `SimulationFrame` streams. Output order must come from stable
+  phase, input, range, and per-range sequence order, not worker timing.
+- The pipeline owns event reaction order. Controllers consume immutable event
+  slices in explicit stages, may emit typed requests or deferred structural
+  commands, and may schedule next-step work in controller-owned queues when a
+  response cannot safely happen in the same fixed step.
+- Avoid recursive event storms. If consuming one event emits more events, the
+  design must name the next event phase or defer to the next fixed step instead
+  of allowing unbounded immediate redispatch.
+- Events must carry stable IDs, scalar data, enum tags, compact coordinates,
+  and small value payloads only. Do not store pointers, renderer/audio/SDL
+  handles, asset paths, loaded resources, allocators, or service references in
+  event payloads.
+- Simulation-event diagnostics should expose counts by type and
+  producer/controller stage. Logging individual events in hot paths is not
+  acceptable outside targeted debug tooling.
+
+Checklist:
+
+- [ ] Define `SimulationEvent` extensions and/or typed event channels with
+      concrete payloads for the first cross-system domains needed by tiles,
+      obstacles, pathfinding invalidation, AI perception, weather interaction,
+      combat, spawning, resource changes, or other system-change signals.
+- [ ] Add a state-owned event collection API under the simulation/pipeline
+      boundary, reusing `RangeOutputStream` or an equivalent typed
+      count/prefix/write collector.
+- [ ] Define pipeline event phases: producer stages, merge points, controller
+      reaction order, derived-event policy, and next-step deferral policy.
+- [ ] Add domain-controller integration points so controllers can consume
+      immutable event slices and emit typed outputs, requests, or deferred
+      structural commands without owning persistent entity/component facts.
+- [ ] Add capacity and reserve policy for event channels, including behavior
+      when a low-priority event channel exceeds its per-step budget.
+- [ ] Add event stats with per-type counts, dropped/deferred counts where
+      applicable, and stage/controller attribution for benchmarks or debug UI.
+- [ ] Document which cross-system communication should use simulation/domain
+      events and which should remain a specialized stream such as contacts,
+      movement intents, navigation intents, path requests, render prep, or
+      structural commands.
+- [ ] Document the architecture mapping for event producers and consumers:
+      pipeline phase, controller owner, persistent data owner, transient event
+      stream, processor outputs, and deferred mutation point.
+
+Acceptance checks:
+
+- [ ] Replaying the same initial `DataSystem`, controller state, fixed-step
+      inputs, and worker split decisions produces the same event order and same
+      downstream outputs.
+- [ ] Threaded producers merge events deterministically by stable range order,
+      never by worker completion order.
+- [ ] Event consumption cannot mutate `DataSystem` structurally except through
+      deferred structural commands applied at the pipeline commit point.
+- [ ] Event payload tests reject or avoid pointers, app/render/audio handles,
+      asset paths, allocator references, and other non-stable runtime state.
+- [ ] Capacity tests cover reserve, overflow, drop/defer policy, and
+      no-allocation warmed event production.
+- [ ] Benchmarks or debug stats can show event counts by type/stage so weather,
+      tile, obstacle, AI, and navigation interactions do not become invisible
+      fixed-step cost.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1344,6 +1459,7 @@ Acceptance checks:
 18. Frame-delayed pathfinding system.
 19. Steering and local avoidance.
 20. Navigation hardening and hard-path budgets.
+21. Typed simulation event system and domain signals.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
@@ -1351,4 +1467,7 @@ Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
 startup runtime assets, and frame-delayed pathfinding now form the
 source-of-truth foundation for future slices. Steering/local avoidance and
-navigation hardening are the next navigation-focused gameplay candidates.
+navigation hardening are the next navigation-focused gameplay candidates. Typed
+simulation/domain events should land before broad tile, weather, obstacle,
+perception, combat, spawning, resource, and rule-system interactions depend on
+cross-system communication.

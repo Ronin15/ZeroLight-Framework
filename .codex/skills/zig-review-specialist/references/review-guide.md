@@ -27,6 +27,26 @@ Use concrete severity judgment:
 - State stack mutation happens through queued transitions or explicit stack APIs, not ad hoc ownership transfer.
 - Lower states receive update/input/render only according to policy.
 - Game code draws through renderer-facing APIs rather than owning raw SDL_GPU resources.
+- Shared gameplay orchestration stays state-owned: `StateStack` dispatches,
+  gameplay states own `DataSystem`/`SimulationFrame`/pipeline instances, and
+  pipelines own controller order.
+- Domain controllers coordinate feature policy and handoff, but persistent
+  gameplay/domain facts stay in `DataSystem` or state-owned domain storage.
+
+## Simulation Event Checks
+
+- Typed simulation/domain events are transient signals for important system
+  changes, not persistent state and not a global app service.
+- Event reaction order is explicit in the pipeline; consuming events must not
+  cause unbounded immediate redispatch or recursive event storms.
+- Event payloads use stable IDs, enums, compact coordinates, and small value
+  payloads. Flag pointers, app/render/audio handles, asset paths, allocators,
+  loaded resources, or service references in payloads.
+- High-volume outputs remain specialized when appropriate: contacts, movement
+  intents, navigation intents, path requests, render prep, and structural
+  commands should not be collapsed into one generic event stream for uniformity.
+- Threaded event producers use deterministic count/prefix/write/range-index
+  merge, not worker-completion order or global per-command atomics.
 
 ## Rendering And Resource Checks
 

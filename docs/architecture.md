@@ -361,6 +361,16 @@ comes from stable input/range order, not worker timing or worker IDs. Structural
 mutation remains behind `DataSystem` batch commit boundaries; event and intent
 streams are transient simulation data, not persistent `DataSystem` state.
 
+Future simulation/domain event work should stay inside this same simulation
+contract. These events are typed, transient cross-system signals owned by the
+gameplay state's pipeline, useful for any important domain change that other
+systems must react to: tile changes, obstacle changes, weather changes, AI
+perception, navigation invalidation, combat, spawning, resources, or rule
+interactions. They are not a global pub/sub service. Persistent gameplay/domain
+facts stay in `DataSystem` or state-owned domain storage, high-volume streams
+remain specialized, and controllers consume immutable event slices in explicit
+pipeline stages before emitting typed outputs or deferred structural commands.
+
 ## SIMD Helpers
 
 `src/core/simd.zig` provides project-named four-lane vector aliases and helper
