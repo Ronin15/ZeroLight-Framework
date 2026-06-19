@@ -54,6 +54,15 @@ pub const PathRequest = struct {
     goal: math.Vec2,
 };
 
+pub const NavigationIntent = struct {
+    entity: EntityId,
+    agent_class: PathAgentClass = .default,
+    goal: math.Vec2,
+    direct_direction_x: f32 = 0,
+    direct_direction_y: f32 = 0,
+    priority: i16 = 0,
+};
+
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
     marker: u32,
@@ -75,6 +84,7 @@ pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
     events: RangeOutputStream(SimulationEvent),
+    navigation_intents: RangeOutputStream(NavigationIntent),
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),
@@ -85,6 +95,7 @@ pub const SimulationFrame = struct {
         return .{
             .allocator = allocator,
             .events = RangeOutputStream(SimulationEvent).init(allocator),
+            .navigation_intents = RangeOutputStream(NavigationIntent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
             .path_requests = RangeOutputStream(PathRequest).init(allocator),
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
@@ -99,6 +110,7 @@ pub const SimulationFrame = struct {
         self.contacts.deinit();
         self.path_requests.deinit();
         self.intents.deinit();
+        self.navigation_intents.deinit();
         self.events.deinit();
         self.* = undefined;
     }
@@ -110,6 +122,7 @@ pub const SimulationFrame = struct {
 
     pub fn clearRetainingCapacity(self: *SimulationFrame) void {
         self.events.clearRetainingCapacity();
+        self.navigation_intents.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();
         self.path_requests.clearRetainingCapacity();
         self.contacts.clearRetainingCapacity();
@@ -127,6 +140,7 @@ pub const SimulationFrame = struct {
         structural_command_capacity: usize,
     ) !void {
         try self.events.reserve(range_count, event_capacity);
+        try self.navigation_intents.reserve(range_count, intent_capacity);
         try self.intents.reserve(range_count, intent_capacity);
         try self.contacts.reserve(range_count, contact_capacity);
         try self.collision_triggers.reserve(range_count, collision_trigger_capacity);
@@ -135,6 +149,10 @@ pub const SimulationFrame = struct {
 
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
         try self.path_requests.reserve(range_count, request_capacity);
+    }
+
+    pub fn reserveNavigationIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
+        try self.navigation_intents.reserve(range_count, intent_capacity);
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
@@ -504,6 +522,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
 
     const original_allocator = frame.allocator;
     const original_events_allocator = frame.events.allocator;
+    const original_navigation_intents_allocator = frame.navigation_intents.allocator;
     const original_intents_allocator = frame.intents.allocator;
     const original_triggers_allocator = frame.collision_triggers.allocator;
     const original_commands_allocator = frame.structural_commands.allocator;
@@ -511,12 +530,14 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     const fail = failing_allocator.allocator();
     frame.allocator = fail;
     frame.events.allocator = fail;
+    frame.navigation_intents.allocator = fail;
     frame.intents.allocator = fail;
     frame.collision_triggers.allocator = fail;
     frame.structural_commands.allocator = fail;
     defer {
         frame.allocator = original_allocator;
         frame.events.allocator = original_events_allocator;
+        frame.navigation_intents.allocator = original_navigation_intents_allocator;
         frame.intents.allocator = original_intents_allocator;
         frame.collision_triggers.allocator = original_triggers_allocator;
         frame.structural_commands.allocator = original_commands_allocator;
@@ -533,6 +554,28 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     event_writer.write(.{ .marker = 2 });
     event_writer.finish();
     frame.events.finishWrite();
+
+    try frame.navigation_intents.prepareRangeCounts(2);
+    frame.navigation_intents.addCount(0, 1);
+    frame.navigation_intents.addCount(1, 1);
+    try frame.navigation_intents.prefix();
+    var navigation_writer = frame.navigation_intents.rangeWriter(0);
+    navigation_writer.write(.{
+        .entity = EntityId.invalid,
+        .goal = .{ .x = 10, .y = 20 },
+        .direct_direction_x = 1,
+        .priority = 2,
+    });
+    navigation_writer.finish();
+    navigation_writer = frame.navigation_intents.rangeWriter(1);
+    navigation_writer.write(.{
+        .entity = EntityId.invalid,
+        .goal = .{ .x = 30, .y = 40 },
+        .direct_direction_y = 1,
+        .priority = 1,
+    });
+    navigation_writer.finish();
+    frame.navigation_intents.finishWrite();
 
     try frame.intents.prepareRangeCounts(2);
     frame.intents.addCount(0, 1);
@@ -595,6 +638,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.structural_commands.finishWrite();
 
     try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 2), frame.navigation_intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.contacts.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);

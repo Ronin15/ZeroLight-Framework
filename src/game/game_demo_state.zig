@@ -26,6 +26,7 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AiSystem = @import("systems/ai.zig").AiSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
+const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
@@ -57,6 +58,7 @@ pub const GameDemoState = struct {
     collision_response: CollisionResponseSystem,
     particles: ParticleSystem,
     ai: AiSystem,
+    steering: SteeringSystem,
     pathfinding: PathfindingSystem,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
@@ -78,6 +80,9 @@ pub const GameDemoState = struct {
         errdefer particles.deinit();
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
+        var steering = SteeringSystem.init(allocator);
+        errdefer steering.deinit();
+        try steering.reserveForCapacity(test_square_count, obstacle_count);
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         var simulation_frame = SimulationFrame.init(allocator);
@@ -106,6 +111,7 @@ pub const GameDemoState = struct {
             .collision_response = collision_response,
             .particles = particles,
             .ai = ai,
+            .steering = steering,
             .pathfinding = pathfinding,
             .test_squares = test_squares,
             .obstacles = obstacles,
@@ -116,6 +122,7 @@ pub const GameDemoState = struct {
 
     pub fn deinit(self: *GameDemoState) void {
         self.pathfinding.deinit();
+        self.steering.deinit();
         self.ai.deinit();
         self.particles.deinit();
         self.collision_response.deinit();
@@ -139,9 +146,8 @@ pub const GameDemoState = struct {
         self.queueAmbientAudio(context.audio, context.input);
 
         self.simulation_frame.phase = .processors;
-        // AI decision processor (Slice 14): reads ai_agent + prior movement positions (const slices),
-        // pre-sizes MovementIntent ranges, then threads only the decision/write batch using
-        // per-system adaptive profile selection + alignment + serial fallback. Fixed seed for determinism this slice.
+        // AI emits high-level navigation intents. Steering consumes those intents,
+        // path status, and dense steering data before it writes final NPC MovementIntents.
         const ai_slice = self.data.aiAgentSliceConst();
         const move_slice = self.data.movementBodySliceConst();
 
@@ -156,10 +162,10 @@ pub const GameDemoState = struct {
         _ = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
-            .pathfinding = &self.pathfinding,
-            .path_requests = &self.simulation_frame.path_requests,
+            .navigation_intents = &self.simulation_frame.navigation_intents,
         });
 
+        _ = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
         _ = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
 
         // Intent application step (main thread): consume merged MovementIntents from AI (and future), write velocities
@@ -439,6 +445,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                         .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.35 }
                     else
                         .{ .behavior = .seek, .wander_amplitude = 4, .seek_weight = 1.6 },
+                    .steering_agent = demoSteeringAgent(spec.size),
                 },
             }});
             const post = data.movementBodySliceConst();
@@ -475,9 +482,11 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
         if (index == 0 or index == 4) {
             // Strong pure wanderers
             try data.setAiAgent(entity, .{ .behavior = .wander, .wander_amplitude = 58, .seek_weight = 0 });
+            try data.setSteeringAgent(entity, demoSteeringAgent(spec.size));
         } else if (index == 1 or index == 5) {
             // Strong seekers (COM pull dominates, light wander)
             try data.setAiAgent(entity, .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 1.55 });
+            try data.setSteeringAgent(entity, demoSteeringAgent(spec.size));
         } else if (index == 2 or index == 6) {
             // No ai_agent — these keep classic spawn velocity and bounce normally
         } else if (index == 3 or index == 7) {
@@ -486,6 +495,19 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
         entities[index] = entity;
     }
     return entities;
+}
+
+fn demoSteeringAgent(size: math.Vec2) @import("data_system.zig").SteeringAgent {
+    return .{
+        .agent_radius = @max(size.x, size.y) * 0.5,
+        .waypoint_tolerance = 10,
+        .avoidance_radius = 54,
+        .avoidance_weight = 1.15,
+        .max_neighbor_samples = 8,
+        .stuck_step_threshold = 24,
+        .replan_cooldown_steps = 10,
+        .unavailable_backoff_steps = 45,
+    };
 }
 
 fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
@@ -728,12 +750,12 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
 
     try std.testing.expectEqual(SimulationPhase.finished, demo.simulation_frame.phase);
     const post_intents = demo.simulation_frame.intents.mergedItems();
-    try std.testing.expect(post_intents.len >= 3); // at least the 3 ai ents emitted movement intents
+    try std.testing.expect(post_intents.len >= 3); // steering emitted final movement intents for ai-controlled squares
 
     const post0 = demo.data.movementBodyConst(ai0).?.position;
     const post1 = demo.data.movementBodyConst(ai1).?.position;
     const post3 = demo.data.movementBodyConst(ai3).?.position;
-    // Driven by ai (intents consumed to vel before movement) => position advanced from spawn vel override + integration.
+    // Driven by ai navigation + steering movement intents before movement integration.
     try std.testing.expect(post0.x != pre0.x or post0.y != pre0.y);
     try std.testing.expect(post1.x != pre1.x or post1.y != pre1.y);
     try std.testing.expect(post3.x != pre3.x or post3.y != pre3.y);

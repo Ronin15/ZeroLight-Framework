@@ -31,10 +31,11 @@ adding broad abstraction.
   asset-ID data shape to process.
 - Slice 12 is now the gameplay-systems foundation for collision, AI intent,
   path/query work, and deterministic rule outputs.
-- Slice 18 now gives AI/rule systems a frame-delayed navigation substrate. The
-  next gameplay-facing track should turn those paths into better steering,
-  local avoidance, and behavior arbitration instead of expanding the pathfinder
-  into a controller.
+- Slice 19 turns frame-delayed path results into deterministic NPC steering,
+  local avoidance, replan cooldowns, and movement-intent arbitration above the
+  pathfinder.
+- The next navigation-focused track should harden rare true-A* fallback costs,
+  pending budgets, cache aging, and hard-path benchmark visibility.
 - Keep hard-path navigation benchmarks, fallback budgets, and cache/tuner
   regression checks as their own hardening track so common path requests stay
   cheap and rare A* work stays visible.
@@ -1213,11 +1214,16 @@ that transient behavior into `DataSystem`.
 
 Current foundation:
 
-- Slice 14 AI intent processing can emit deterministic movement intents.
+- Slice 14 AI processing provides deterministic AI decision output; Slice 19
+  routes that output through navigation intents before final steering movement.
 - Slice 18 pathfinding can provide frame-delayed path waypoints and unavailable
   results.
 - Slice 13 collision contacts and spatial-query foundations provide the data
   shape needed for local crowd and obstacle decisions.
+- `SteeringSystem` consumes high-level navigation intents, pathfinding status,
+  dense steering components, movement slices, and static obstacle data, then
+  emits final NPC movement intents through deterministic threaded range writes
+  after main-thread path/status preparation.
 
 Architecture notes:
 
@@ -1232,24 +1238,34 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add path-following state needed to turn completed paths into movement
+- [x] Add path-following state needed to turn completed paths into movement
       intents.
-- [ ] Add local obstacle and agent avoidance using bounded fixed scratch.
-- [ ] Add stuck detection, replan cooldowns, and unavailable-path backoff.
-- [ ] Define arbitration between player input, AI steering, collision response,
+- [x] Add local obstacle and agent avoidance using bounded fixed scratch.
+- [x] Add stuck detection, replan cooldowns, and unavailable-path backoff.
+- [x] Define arbitration between player input, AI steering, collision response,
       and future rule outputs.
-- [ ] Add deterministic tests for waypoint following, avoidance ordering, replan
+- [x] Add deterministic tests for waypoint following, avoidance ordering, replan
       backoff, and no steady-state hot-loop allocation.
-- [ ] Add steering/local-avoidance benchmarks that report agent count, neighbor
-      samples, intents emitted, and threaded/adaptive detail where used.
+- [x] Add steering/local-avoidance benchmarks that report agent count, bounded
+      avoidance checks, accepted samples, intents emitted, and threaded/adaptive
+      detail where used.
 
 Acceptance checks:
 
-- [ ] NPCs can follow path waypoints without sharp frame-to-frame oscillation.
-- [ ] Nearby NPCs and static obstacles are avoided through bounded local work.
-- [ ] Unavailable or stale paths do not cause per-frame re-request loops.
-- [ ] Steering outputs compose through typed movement intents or rule outputs
+- [x] NPCs can follow path waypoints without sharp frame-to-frame oscillation.
+- [x] Nearby NPCs and static obstacles are avoided through bounded local work.
+- [x] Unavailable or stale paths do not cause per-frame re-request loops.
+- [x] Steering outputs compose through typed movement intents or rule outputs
       with deterministic order.
+- [x] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify`,
+      and `zig build bench -- --profile quick --group steering --details` pass.
+
+Slice 19 lands steering as a separate gameplay processor. AI now emits
+`NavigationIntent` goals, `SteeringSystem` owns runtime steering rows,
+path-request cooldown/backoff, local avoidance scratch, deterministic priority
+arbitration, and threaded final movement-intent emission. Only the steering
+stage writes final NPC `MovementIntent`s. Player movement remains direct input,
+and collision response still resolves after movement.
 
 ## Slice 20: Navigation Hardening And Hard-Path Budgets
 

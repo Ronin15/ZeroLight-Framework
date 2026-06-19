@@ -42,7 +42,9 @@ game-specific behavior under `src/game/`.
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges.
-- `src/game/systems/ai.zig` emits movement intents for ai_agent rows.
+- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
+- `src/game/systems/steering.zig` consumes navigation intents and path status,
+  then emits final NPC movement intents with local avoidance.
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
   response-policy movement corrections.
@@ -278,25 +280,32 @@ structural commands commit.
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
 It receives const AiAgent + movement prior-position slices, builds a transient
 32-unit spatial grid, computes bounded local-separation samples, then emits
-threaded movement intents through `SimulationFrame.intents`
+threaded navigation intents through `SimulationFrame.navigation_intents`
 (count/prefix/write). Separation and intent emission have independent
 AdaptiveWorkTuner state and benchmark stats so each stage can remain inline or
-thread independently. Seek agents can emit typed path requests without owning
-path solver state. Wander amplitude, seek, and the path request/result handoff
-prove non-player entities are driven by persistent data + processor intents, not
-hardcoded velocities.
-Consumption (main-thread, before MovementSystem) writes velocities from intent
-dir * speed using MovementBodyPtr; player remains special-cased with no
-ai_agent component. Intent streams and processor order are explicit in the
-owning `GameDemoState`.
+thread independently. Wander amplitude and seek prove non-player entities emit
+high-level goals from persistent data rather than hardcoded velocities.
+
+`SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
+component data, movement slices, static obstacle data, and frame-delayed
+`PathfindingSystem` status. It owns runtime path-following rows, replan
+cooldowns, unavailable-path backoff, stuck counters, and bounded local-avoidance
+bucket scratch outside `DataSystem`. Path-status, cooldown mutation, runtime-row
+pruning, and intent arbitration stay on the main-thread boundary, then the
+prepared steering work emits final NPC `MovementIntent`s through deterministic
+threaded range writes to `SimulationFrame.intents`.
+Priority arbitration chooses the highest-priority navigation intent per entity
+with stable stream order as the tie-breaker.
+Player movement remains direct input with no steering component, while collision
+response still resolves after movement.
 
 `PathfindingSystem` is a frame-delayed grid pathfinding processor under
 `src/game/systems/`. It owns the static versioned nav grid, pending request
 queue, duplicate suppression, completed result cache, unavailable-path cache,
 warmed A* scratch, per-stage adaptive tuner state, and benchmark stats.
-`SimulationFrame.path_requests` carries transient requests from AI or future
-rule systems; path queues, scratch, thread state, and live path caches stay out
-of `DataSystem`. Request key preparation and static grid marking use
+`SimulationFrame.path_requests` carries transient requests from steering or
+future rule systems; path queues, scratch, thread state, and live path caches
+stay out of `DataSystem`. Request key preparation and static grid marking use
 `src/core/simd.zig` lane batches where the work is regular; branch-heavy A*
 frontier expansion remains scalar inside threaded request ranges. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall

@@ -891,12 +891,7 @@ pub const PathfindingSystem = struct {
         if (self.entity_results.find(entity, key)) |result| {
             return .{ .status = result.status, .next_waypoint = result.next_waypoint, .path_len = result.path_len };
         }
-        if (self.completed.find(key)) |result| {
-            return .{ .status = .available, .next_waypoint = result.next_waypoint, .path_len = result.path_len };
-        }
-        if (self.unavailable.contains(key)) return .{ .status = .unavailable };
-        if (self.pending_keys.contains(key)) return .{ .status = .pending };
-        return .{ .status = .missing };
+        return self.statusForKey(key);
     }
 
     pub fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
@@ -1854,6 +1849,31 @@ test "pathfinding groups common goals into a reusable field" {
     try std.testing.expectEqual(@as(usize, 1), stats.goal_fields_built);
     try std.testing.expectEqual(@as(usize, 2), stats.field_requests);
     try std.testing.expectEqual(@as(usize, 2), stats.available_results);
+}
+
+test "entity path status reuses goal field when moving between start cells" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try system.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(2, 2);
+    try appendPathRequest(&stream, .{ .entity = a, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 128, .y = 128 } });
+    try appendPathRequest(&stream, .{ .entity = b, .start = .{ .x = 40, .y = 8 }, .goal = .{ .x = 128, .y = 128 } });
+
+    const stats = try system.updateSerial(&stream, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.goal_fields_built);
+
+    const moved_view = system.statusForEntityWorld(a, .{ .x = 72, .y = 8 }, .{ .x = 128, .y = 128 }, .default);
+    try std.testing.expectEqual(PathStatus.available, moved_view.status);
+    try std.testing.expect(moved_view.path_len >= 2);
 }
 
 test "pathfinding solve limit is clamped to reserved buffers" {

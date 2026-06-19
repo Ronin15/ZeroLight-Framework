@@ -163,6 +163,7 @@ pub const RunStats = struct {
     skip_reason: []const u8 = "",
     item_count: usize = 0,
     candidate_pairs: usize = 0,
+    sample_count: usize = 0,
     output_count: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
@@ -579,6 +580,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
+    if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -909,6 +911,9 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
         return std.fmt.bufPrint(buffer, "fallback_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "steering")) {
+        return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";

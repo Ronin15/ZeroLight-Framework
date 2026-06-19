@@ -145,8 +145,8 @@ zig build verify
 ## Benchmarks
 
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
-transient particle rows, AI agents, dense collision bodies, sparse collision
-bodies, and collision-response contacts. The default run exercises one serial baseline,
+transient particle rows, AI agents, steering agents, dense collision bodies,
+sparse collision bodies, and collision-response contacts. The default run exercises one serial baseline,
 fixed-worker, fixed small-range, fixed large-range, and adaptive cases so the
 full processor flow can be checked for regressions.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
@@ -164,7 +164,11 @@ cases can be compared against sparse gameplay-shaped distributions. Detail rows
 also report narrowphase as `narrow=inline` or `narrow=worker_threads/items_per_range`
 because collision has independently tuned broadphase and narrowphase stages. AI
 detail rows similarly report intent-stage worker/range tuning, while AI output
-reports bounded separation checks and emitted movement-intent counts.
+reports bounded separation checks and emitted navigation-intent counts.
+Steering output reports bounded avoidance candidate checks, accepted avoidance
+samples, and emitted movement-intent counts. Steering movement emission is a
+threaded processor stage with serial fallback, per-system adaptive tuning, and
+deterministic range-owned output.
 
 Benchmark output is grouped by workload and count. Each block prints an aligned
 plain-text table with per-case timing, speedup, throughput, worker-thread use,
@@ -212,6 +216,7 @@ zig build bench -- --profile standard --iterations 100
 zig build bench -- --case thread-adaptive-tuned-range
 zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
+zig build bench -- --group steering --details
 zig build bench -- --details
 ```
 

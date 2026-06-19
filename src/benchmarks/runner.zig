@@ -10,6 +10,7 @@ const collision_response = @import("collision_response.zig");
 const movement = @import("movement.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
+const steering = @import("steering.zig");
 const suite = @import("suite.zig");
 
 pub const std_options = logging.std_options;
@@ -29,6 +30,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.fallback_detour_group,
     pathfinding.fallback_unreachable_group,
     pathfinding.hard_fallback_group,
+    steering.group,
 };
 
 pub fn main(init: std.process.Init) !void {
