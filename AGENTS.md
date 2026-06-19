@@ -40,8 +40,16 @@ Add new code under the matching owner directory. Keep executable-only code near
   device, mixer, track, bus, and loaded-audio ownership in the app audio service.
 - Map raw input to named actions. Keep held gameplay input in `InputState` separate from one-frame app commands in `FrameCommands`.
 - Let stack policies decide whether lower states receive update, input, or render passes.
+- When multiple gameplay states or simulation instances need the same fixed-step
+  order, use a state-owned `SimulationPipeline` helper. `StateStack` remains the
+  dispatch and lifetime owner; it should not know domain controller internals.
 - Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation:
   entity IDs, component masks, and dense typed SoA component stores live there.
+- Let a state-owned pipeline own light domain controllers when a feature needs
+  orchestration for phase order, budgets, queues, cooldowns, conflict policy,
+  or processor handoff. Keep persistent world facts in `DataSystem`, per-step
+  outputs in `SimulationFrame`, and hot/reusable loops in systems/processors
+  over typed SoA slices.
 - Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
   render preparation as mostly stateless processors over `DataSystem` slices;
   they borrow data and services, but do not own persistent gameplay state.

@@ -30,19 +30,29 @@ adding broad abstraction.
   hard-path benchmark visibility should remain explicit.
 - Track collision-response merge/apply, renderer batch capacity, text-cache
   lifetime policy, and manual registry guardrails as hardening follow-ups.
+- When multiple gameplay states need the same ordered processor flow, extract a
+  state-owned simulation pipeline helper instead of duplicating `GameDemoState`
+  orchestration or adding a global ECS scheduler. The pipeline may own
+  lightweight domain controllers, but persistent facts stay in `DataSystem` and
+  hot loops stay in SoA processors.
 - Keep future gameplay systems built on Slice 12's typed processor outputs,
   deterministic merge, and deferred structural-change contracts.
 
 ## Long-Term Gameplay Direction
 
-Future gameplay features should use state-owned feature controllers for
-orchestration and SoA processors for hot data work. Controllers choose phase
-order, budgets, queues, conflict policy, and which typed `DataSystem` views
-processors receive. Persistent world facts live in `DataSystem`, per-step
-outputs live in `SimulationFrame`, and large or reusable loops stay in systems
-that process typed slices and emit deterministic outputs. Pathfinding provides a
-navigation substrate; immersive NPC behavior still needs steering, local
-avoidance, perception, and rule arbitration layered above it.
+Future gameplay features should use state-owned feature controllers or a
+state-owned simulation pipeline helper for orchestration, and SoA processors for
+hot data work. Controllers choose phase order, budgets, queues, cooldowns,
+conflict policy, and which typed `DataSystem` views processors receive. A
+reusable pipeline is appropriate once multiple gameplay states or instances
+need the same ordered stages; it should remain owned by the state instance and
+should not be promoted into a global scheduler. The pipeline can own domain
+controllers for one state instance, and those controllers can coordinate small
+feature-local state and processor handoff. Persistent world facts live in
+`DataSystem`, per-step outputs live in `SimulationFrame`, and large or reusable
+loops stay in systems that process typed slices and emit deterministic outputs.
+Pathfinding provides a navigation substrate; immersive NPC behavior still needs
+steering, local avoidance, perception, and rule arbitration layered above it.
 
 ## Slice 0: Runtime Diagnostics Policy
 

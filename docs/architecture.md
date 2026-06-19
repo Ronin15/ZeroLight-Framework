@@ -250,6 +250,22 @@ The current gameplay fixed-step pipeline is:
 8. Commit deferred structural commands to `DataSystem`.
 9. Render current `DataSystem` and particle state with interpolation.
 
+When multiple gameplay states or simulation instances need this same ordering,
+move the ordered processor sequence into a state-owned pipeline helper, such as
+`SimulationPipeline`, while keeping `StateStack` as the dispatch/lifetime owner.
+The helper should own phase order, budgets, queues, conflict policy, and output
+application for one gameplay state instance; it should not become a global
+engine scheduler, reflection system, or dynamic dependency graph.
+
+The pipeline is also the right place to compose light domain controllers for
+features such as combat, spawning, rules, encounters, or other gameplay
+domains. Controllers own feature orchestration: small queues, budgets,
+cooldowns, priority/conflict policy, and handoff between processors. They should
+emit `SimulationFrame` outputs or deferred structural commands and call
+processors with typed `DataSystem` views. They should not become hidden
+per-entity stores, own renderer/audio/SDL handles, or replace SoA processors for
+hot/reusable loops.
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
