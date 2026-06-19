@@ -20,7 +20,8 @@ Use the existing docs as source of truth for deeper details:
 - `src/render/` owns SDL_GPU rendering, camera transforms, renderer resources, text, FPS/debug overlay, and frame submission.
 - `src/game/` owns game/application states, gameplay behavior, `DataSystem`, and ECS-style gameplay systems/processors.
 - `src/platform/` owns SDL C imports, small platform wrappers, and GPU smoke-test implementation.
-- `src/assets/` owns runtime asset path resolution and safe installed asset loading.
+- `src/assets/` owns runtime asset path resolution, safe installed asset
+  loading, the typed startup manifest, and the `RuntimeAssets` catalog.
 - `src/core/` owns small shared helpers such as math primitives.
 - `src/root.zig` is the minimal test/root file for math aliases and compile coverage.
 - `assets/` contains runtime assets, audio files, and shader sources. Runtime assets install under `zig-out/bin/assets` by default.
@@ -39,8 +40,21 @@ Add new code under the matching owner directory. Keep executable-only code near
   device, mixer, track, bus, and loaded-audio ownership in the app audio service.
 - Map raw input to named actions. Keep held gameplay input in `InputState` separate from one-frame app commands in `FrameCommands`.
 - Let stack policies decide whether lower states receive update, input, or render passes.
+- When multiple gameplay states or simulation instances need the same fixed-step
+  order, use a state-owned `SimulationPipeline` helper. `StateStack` remains the
+  dispatch and lifetime owner; it should not know domain controller internals.
 - Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation:
   entity IDs, component masks, and dense typed SoA component stores live there.
+- Let a state-owned pipeline own light domain controllers when a feature needs
+  orchestration for phase order, budgets, queues, cooldowns, conflict policy,
+  or processor handoff. Keep persistent gameplay/domain facts in `DataSystem`
+  or state-owned domain storage, per-step outputs in `SimulationFrame`, and
+  hot/reusable loops in systems/processors over typed SoA slices.
+- Treat future simulation/domain events as typed transient
+  `SimulationFrame`/pipeline signals for cross-system communication about
+  important system changes. Do not add a global pub/sub bus, string-topic
+  dispatcher, callback chain, or event payloads carrying pointers,
+  app/render/audio handles, asset paths, allocators, or service references.
 - Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
   render preparation as mostly stateless processors over `DataSystem` slices;
   they borrow data and services, but do not own persistent gameplay state.
@@ -53,8 +67,16 @@ Add new code under the matching owner directory. Keep executable-only code near
   deferred/main-thread boundary is designed.
 - Keep debug UI state in the debug overlay path, not in gameplay state.
 - Keep runtime asset paths relative and traversal-safe.
+- Keep persistent gameplay/render data on stable asset IDs such as
+  `SpriteAssetId` and `AudioAssetId`; do not store string paths, `TextureId`,
+  `TextureLease`, prepared sprite records, SDL_mixer handles, or loaded audio
+  handles in `DataSystem`.
 - Use core SDL3 PNG loading for textures. Do not add `SDL3_image` unless that dependency is explicitly chosen.
-- SDL3, SDL3_ttf, and SDL3_mixer are system dependencies; avoid vendoring or half-adopting external dependencies.
+- SDL3, SDL3_ttf, and SDL3_mixer are system dependencies on Linux and
+  macOS. Windows defaults to the pinned lazy packages in `build.zig.zon`;
+  use `-Dsystem-sdl=true` for global SDL installs or `-Dsdl-root=...` for
+  custom extracted archives. Avoid vendoring or half-adopting external
+  dependencies.
 - Pair SDL resource creation with cleanup close to the creation site.
 - Treat performance as a correctness constraint in hot paths: fixed-step update,
   input dispatch, render submission, asset lookup, and text/debug overlay.
@@ -65,6 +87,11 @@ Add new code under the matching owner directory. Keep executable-only code near
   the same cache line, and use 64-byte padding only for thread-shared records
   where false sharing is a real risk. Do not pad cold entity slot metadata by
   default.
+- Let `ThreadSystem` production scheduling adapt from measured batch timing.
+  Do not add static item-count floors for worker participation; only structural
+  limits such as zero work, no available workers, one splittable range, explicit
+  serial overrides, and cache-line/range-alignment constraints should force
+  inline execution.
 - Avoid per-frame string lookup, hash-map dispatch, dynamic dispatch, resource
   churn, formatted logging, and broad frame-rate caps unless measured and
   justified.
@@ -78,15 +105,18 @@ Add new code under the matching owner directory. Keep executable-only code near
 
 ## Build, Test, And Development Commands
 
-- `zig build` builds and installs the game executable to `zig-out/bin/my-sdl3-game`.
+- `zig build` builds and installs the game executable, runtime assets, and
+  platform shader files under `zig-out/bin`.
 - `zig build run` builds, installs runtime assets/shaders, and runs the app.
 - `zig build dev` builds shaders, installs assets, and runs the app for normal development.
 - `zig build test` runs reusable module tests plus SDL-linked compile coverage.
 - `zig build check` compiles the game, benchmark, and GPU smoke executables without installing.
-- `zig build bench` runs non-interactive CPU entity and particle processor benchmarks.
+- `zig build bench` runs non-interactive CPU gameplay processor benchmarks.
 - `zig build verify` runs check, tests, and shader compilation.
 - `zig build shaders` compiles platform GPU shaders.
-- `zig build gpu-smoke` runs a display-gated SDL_GPU frame submission check.
+- `zig build gpu-smoke` runs a display-gated renderer pipeline smoke that
+  installs assets/shaders, creates SDL_GPU resources, draws, and submits one
+  frame.
 - `zig build fmt` formats `build.zig`, `build.zig.zon`, and `src/`.
 - `zig build package` installs selected-mode game binaries and runtime assets.
 

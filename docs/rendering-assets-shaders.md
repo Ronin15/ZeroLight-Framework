@@ -9,11 +9,21 @@ Shader sources live in `assets/shaders/*.glsl`.
 
 - On Linux, `glslc` emits installed SPIR-V files under `zig-out/bin/assets/shaders/*.spv`.
 - On macOS, `glslc` emits temporary SPIR-V and `spirv-cross` converts it to installed MSL files under `zig-out/bin/assets/shaders/*.msl`.
+- On Windows, `glslc` emits temporary SPIR-V, `spirv-cross` converts it to HLSL
+  shader model 6.0, and `dxc` emits installed DXIL files under
+  `zig-out/bin/assets/shaders/*.dxil`.
 
 The renderer tells SDL which shader formats the build produced and passes a null
 driver name so SDL chooses the backend. Sprite material and pipeline creation
 live under `src/render/gpu/` and load the shader files matching
 `SDL_GetGPUShaderFormats()`.
+Runtime shader selection prefers MSL, then DXIL, then SPIR-V when multiple
+formats are available.
+
+Shader metadata currently exists in both the build graph and the runtime render
+pipeline. When adding a shader or material, update the `shader_programs` table
+in `build.zig` and the render-owned pipeline loader until a shared manifest
+replaces the parallel registries.
 
 ## Sprite Rendering
 
@@ -31,15 +41,15 @@ rewriting SDL_GPU device setup.
 Use `drawSprite` for textured quads:
 
 ```zig
-if (self.player_texture == null) {
-    self.player_texture = try context.acquireTexture("sprites/player.png");
+if (context.runtime_assets.sprite(.demo_tile)) |sprite| {
+    try context.renderer.drawSprite(.{
+        .texture = sprite.texture,
+        .source = sprite.source_rect,
+        .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
+        .tint = .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 },
+        .layer = 0,
+    });
 }
-
-try context.renderer.drawSprite(.{
-    .texture = self.player_texture.?.id,
-    .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
-    .layer = 0,
-});
 ```
 
 `TextureId` values are stable while the texture is alive. Destroying a texture
@@ -59,10 +69,16 @@ try renderer.drawRect(.{
 }, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, 0);
 ```
 
-For atlases or future tile rendering, keep one `TextureId` for the atlas texture
-and draw individual sprites or tiles with `Sprite.source` rectangles. Tilemap
-batching should build on the same texture ID plus source-rect model rather than
-creating one texture per tile.
+For atlases or future tile rendering, keep entity data on stable
+`SpriteAssetId` values and let `RuntimeAssets` map those IDs to one atlas
+`TextureId` plus `Sprite.source` rectangles. Tilemap batching should build on
+the same ID-to-texture/source model rather than creating one texture per tile or
+storing live renderer handles in gameplay data.
+
+Large sprite, tile, or particle scenes should reserve or surface sprite-batch
+capacity before relying on allocation-free render frames. The warmed path avoids
+per-frame allocation only inside the currently reserved command, vertex, and
+draw-group capacity.
 
 ## Logical Presentation
 
@@ -96,13 +112,20 @@ Sprite coordinate spaces:
 
 ## Runtime Assets
 
-The current demo draws primitives, so it has no required PNG asset. The default
-text path uses the bundled `assets/fonts/NotoSansMono-Regular.ttf` font. Put
-additional PNGs, fonts, and other runtime files under `assets/`, then acquire
-renderer-backed resources through the app-owned services from a render context.
+Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
+`Engine` owns `RuntimeAssets`, preloads declared sprites through `AssetCache`,
+preloads declared audio through `AudioService`, and passes the catalog to render
+contexts. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
+sprite for player, AI squares, and obstacles, with primitive rectangle fallback
+when a sprite ID is unavailable. The default text path uses the bundled
+`assets/fonts/NotoSansMono-Regular.ttf` font.
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default
 asset root is `assets`; change it with `-Dasset-root=content`.
+`zig build run`, `zig build dev`, and `zig build gpu-smoke` run from the
+installed binary directory so generated shaders and copied assets resolve
+through that tree. When launching a binary directly, run it from `zig-out/bin`
+or provide an asset-root layout that includes generated shader files.
 
 The installed runtime asset tree excludes shader source files and build-only
 shader formats. Package source assets separately if your game needs them.
@@ -113,14 +136,25 @@ absolute paths, `.` components, and `..` traversal.
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
 project does not require `SDL3_image`.
 
-The asset cache maps validated relative PNG paths to renderer `TextureId` values.
-Loading the same path decodes PNG data through `AssetStore`, uploads decoded
-RGBA8 pixels through the renderer, reuses the existing texture on later
-acquires, and increments a retain count. Store the returned `TextureLease` in
-the owning state or service, draw with `lease.id`, and call `release` from that
-owner's `deinit`. When the last lease is released, the cache destroys the
-renderer texture. Cache lookup and retain/release are setup-time operations;
-per-frame rendering should keep using the retained `TextureId` directly.
+The asset cache maps validated relative PNG paths to renderer `TextureId`
+values. Loading the same path decodes PNG data through `AssetStore`, uploads
+decoded RGBA8 pixels through the renderer, reuses the existing texture on later
+acquires, and increments a retain count. `TextureLease` is a non-owning retained
+texture token; it does not store an `AssetCache` pointer or renderer/backend
+context. It still carries enough identity for the cache to reject stale,
+forged, or wrong-owner releases before retiring a slot. Owners that hold leases
+release them through `AssetCache.releaseTexture(renderer, &lease)` before
+renderer teardown. Gameplay and render prep should store or pass
+`SpriteAssetId`, not paths, `TextureId`, `TextureLease`, or prepared sprite
+records. Cache lookup and retain/release are setup-time operations; per-frame
+rendering should use the startup catalog and retained IDs directly.
+
+`RuntimeAssets` owns startup sprite leases. Missing declared content marks that
+asset unavailable and keeps startup moving; fatal preload errors release partial
+retained sprite work before returning the error. Replacing a sprite slot or
+marking it unavailable releases the previous lease first. Backend-context test
+seams stay under asset tests; production code goes through the renderer-facing
+cache API.
 
 ## Text Rendering
 
@@ -128,9 +162,19 @@ per-frame rendering should keep using the retained `TextureId` directly.
 `AssetStore`, and caches rendered text as renderer textures. Production
 `RenderContext` values provide it for menu and UI states; unit-test contexts can
 leave it null when text is not part of the contract under test. Load fonts from
-`assets/fonts/...`, keep the returned `FontId`, acquire text only when the string
-or style changes, draw the returned texture through `Renderer.drawSprite`, and
-release the `TextTextureLease` from the owning state or service.
+`assets/fonts/...` and keep the returned `FontId`. UI states store text intent,
+dirty flags, and non-owning `PreparedText` views. For common default-font labels,
+call `TextService.prepareDefaultText(renderer, label, color)`. For custom fonts
+or layout, call `TextService.prepareText(renderer, TextRequest.init(...))`.
+Normal render frames draw the stored view with `text.drawPreparedText(...)`, so
+stable labels do not re-check the cache every frame. The service keeps generated
+text textures cached for app lifetime and releases them during
+`TextService.deinit` after the renderer is idle.
+
+The app-lifetime cache fits stable menu labels, debug text, and low-cardinality
+UI. Chat logs, combat text, localization sweeps, or other high-cardinality
+dynamic text need eviction, explicit release, or a different text-atlas policy
+before they are treated as long-running workloads.
 
 The default font is `fonts/NotoSansMono-Regular.ttf`. System font probing is not
 part of the normal runtime path.
@@ -150,7 +194,8 @@ Keep shader resource bindings aligned with SDL_GPU's layout rules:
 - fragment uniform buffers: set 3
 
 The build converts those SPIR-V bindings to SDL-compatible MSL resource bindings
-for macOS through `spirv-cross`.
+for macOS through `spirv-cross`. Windows DXIL uses the HLSL generated by
+`spirv-cross` and compiled with `dxc -E main -T vs_6_0` or `ps_6_0`.
 
 ## Debug Overlay
 

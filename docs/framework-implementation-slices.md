@@ -22,22 +22,41 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish Slice 7 parallel CPU render prep and Slice 8 shader/platform
-  validation as engine-support tracks.
-- Slice 12 is now the gameplay-systems foundation for broad collision, AI,
-  pathfinding, and emergent-rule work.
-- Treat Slice 13 and Slice 14 as built on Slice 12's deterministic processor,
-  event, and deferred-structural-change contracts.
+- Finish Slice 7 parallel CPU render prep on top of the Slice 17
+  `RuntimeAssets` catalog. Keep it incomplete until serial and parallel prep
+  produce identical draw order, grouping, and invalid-resource handling.
+- Finish Slice 20 navigation hardening before scaling to large maps or many NPC
+  path users. Rare true-A* work, pending budgets, cache aging/capacity, and
+  hard-path benchmark visibility should remain explicit.
+- Track collision-response merge/apply, renderer batch capacity, text-cache
+  lifetime policy, and manual registry guardrails as hardening follow-ups.
+- Add a typed simulation event system slice before broad domain features such as
+  tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
+  and spawning start depending on cross-system change signals.
+- When multiple gameplay states need the same ordered processor flow, extract a
+  state-owned simulation pipeline helper instead of duplicating `GameDemoState`
+  orchestration or adding a global ECS scheduler. The pipeline may own
+  lightweight domain controllers, but persistent facts stay in `DataSystem` and
+  hot loops stay in SoA processors.
+- Keep future gameplay systems built on Slice 12's typed processor outputs,
+  deterministic merge, and deferred structural-change contracts.
 
 ## Long-Term Gameplay Direction
 
-Future gameplay features should use domain controllers for orchestration and
-SoA processors for hot data work. Controllers belong inside the owning gameplay
-state or a state-owned world simulation layer; they choose phase order, budgets,
-queues, conflict policy, and which typed `DataSystem` views processors receive.
-Persistent world facts still live in `DataSystem`, per-step outputs live in
+Future gameplay features should use state-owned feature controllers or a
+state-owned simulation pipeline helper for orchestration, and SoA processors for
+hot data work. Controllers choose phase order, budgets, queues, cooldowns,
+conflict policy, and which typed `DataSystem` views processors receive. A
+reusable pipeline is appropriate once multiple gameplay states or instances
+need the same ordered stages; it should remain owned by the state instance and
+should not be promoted into a global scheduler. The pipeline can own domain
+controllers for one state instance, and those controllers can coordinate small
+feature-local state and processor handoff. Persistent gameplay/domain facts
+live in `DataSystem` or state-owned domain storage, per-step outputs live in
 `SimulationFrame`, and large or reusable loops stay in systems that process
 typed slices and emit deterministic outputs.
+Pathfinding provides a navigation substrate; immersive NPC behavior still needs
+steering, local avoidance, perception, and rule arbitration layered above it.
 
 ## Slice 0: Runtime Diagnostics Policy
 
@@ -208,16 +227,17 @@ Current foundation:
 - `AssetCache` maps validated relative PNG paths to retained renderer
   `TextureId` values by decoding through assets and asking render to upload
   already-decoded pixels.
-- `Engine` owns the cache and exposes it to states through `RenderContext`.
+- `Engine` owns the cache. Slice 17 later moved gameplay-facing render lookup
+  to stable `RuntimeAssets` IDs exposed through `RenderContext`.
 - `assets/test/cache_probe.png` provides a tiny installed PNG fixture for cache
   and asset-root checks.
 
 Future render-data slice:
 
-- Entity creation and world loading should bind texture handles or atlas-region
-  handles before render-time. `DataSystem` render data should store prepared
-  render references such as `TextureId` plus source rectangle, tint, layer, and
-  coordinate-space intent.
+- Entity creation and world loading should bind stable sprite or atlas-region
+  IDs before render-time. `DataSystem` render data should store stable asset
+  references plus source intent such as tint, layer, and coordinate-space
+  intent, not live renderer handles.
 - A state-owned render-prep system should read immutable `DataSystem` slices and
   submit prepared `Sprite` commands to `Renderer`. The renderer should not look
   up gameplay entities, world data, asset paths, or texture assignments.
@@ -365,8 +385,8 @@ Thread-system design:
 - [x] Default worker thread count to one fewer than
       `std.Thread.getCpuCount()` when possible, reserving the main/render thread
       as an additional batch participant; allow config override for worker
-      thread count, stack size, minimum parallel item count, and items per
-      claimed range (`items_per_range`).
+      thread count, stack size, and items per claimed range
+      (`items_per_range`).
 - [x] Use preallocated worker records, one synchronous batch descriptor, and an
       atomic range cursor. No frame-batch submission may allocate after
       initialization.
@@ -377,7 +397,8 @@ Thread-system design:
       does useful work instead of only acting as a coordinator.
 - [x] Dynamically scale active workers only at batch boundaries based on prior
       batch cost, item count, main-thread wait time, and worker utilization.
-      Small batches run inline on the main thread.
+      Static item-count floors do not gate production worker participation;
+      timing and structural range feasibility decide whether work stays inline.
 - [x] Stop accepting work during shutdown, wake parked workers, join every
       pre-spawned thread, and assert that no frame batch is still outstanding.
 
@@ -454,17 +475,22 @@ Goal: keep platform support reliable as shader count and target platforms grow.
 Current foundation:
 
 - SDL chooses the GPU backend from supplied shader formats.
-- macOS builds MSL, Linux builds SPIR-V.
+- Linux builds SPIR-V, macOS builds MSL, and Windows builds DXIL.
 - Runtime selects shader files from SDL-reported supported formats.
+- Build metadata and runtime pipeline metadata are still updated in separate
+  places until a shared shader/material manifest exists.
 
 Checklist:
 
-- [ ] Extend the shader-program table as new render pipelines are added.
-- [ ] Keep generated runtime shader files under `assets/shaders` in the install
+- [x] Keep generated runtime shader files under `assets/shaders` in the install
       tree.
-- [ ] Add explicit Windows target support only when Windows is an active target.
+- [x] Add explicit Windows target output through DXIL.
+- [x] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
+- [ ] Consolidate shader-program, material, and runtime pipeline metadata so
+      new pipelines do not need parallel registry edits.
 - [ ] Validate the right shader format list for each target OS.
-- [ ] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
+- [ ] Add direct runtime asset/shader lookup guidance or tests for direct binary
+      execution outside the installed binary directory.
 - [ ] Add shader output checks for each supported target path.
 
 Acceptance checks:
@@ -605,8 +631,8 @@ Performance notes:
 - Hot processors should iterate SoA columns directly, not per-entity AoS structs
   or dynamically joined component records.
 - `ThreadSystem` integration is required for this slice. Keep a serial path for
-  small counts, tests, and fallback behavior, but the processor API and tests
-  must prove that systems can split `DataSystem` slices through
+  tests, explicit fallback behavior, and deterministic comparisons, but the
+  processor API and tests must prove that systems can split `DataSystem` slices through
   `ThreadSystem.parallelFor`.
 - Treat adaptive work tuning as a measured batch-profile policy, not a separate
   worker-count heuristic. The tuner starts inline, probes threaded profiles only
@@ -630,8 +656,8 @@ Performance notes:
 System shape:
 
 - `MovementSystem` reads and writes explicit movement-body SoA slices, keeps a
-  simple serial path for small counts and tests, and uses threaded SIMD ranges
-  for larger batches.
+  simple serial path for tests and deterministic comparisons, and uses
+  timing-adaptive threaded SIMD ranges for eligible batches.
 - `MovementSystem` must not create, destroy, add, or remove entities/components
   inside worker ranges. Structural changes from future processors should flow
   through the state-owned simulation frame and `DataSystem` batch commit path.
@@ -650,7 +676,7 @@ Checklist:
       `parallelFor`.
 - [x] Add particle processors that split dense SoA slices through `parallelFor`.
 - [x] Wire `MovementSystem` through `ThreadSystem.parallelFor` with a serial path
-      for small counts and deterministic tests.
+      for deterministic tests and explicit comparisons.
 - [x] Use SIMD inside each worker range and scalar-tail code for remainder
       elements.
 - [x] Add an explicit alignment strategy for hot SoA columns before introducing
@@ -686,8 +712,9 @@ velocity, exposes a movement-body slice to `MovementSystem`, applies player-only
 bounds clamping, emits a small particle trail, updates particles, and renders
 transient particle rectangles. A few colored moving squares remain as non-player
 movement processor coverage. Parallel render prep remains open under Slice 7,
-while simulation contracts, collision, AI, pathfinding, and rule processing are
-covered by Slices 12-14.
+while simulation contracts, collision, and the first AI intent processor are
+covered by Slices 12-14. Pathfinding and broader rule processing remain future
+systems that should build on the same typed-output contracts.
 
 ## Slice 12: Simulation Contracts And Deferred Structural Changes
 
@@ -789,9 +816,18 @@ Architecture notes:
 - `CollisionSystem` owns warmed transient AABB proxy scratch, not persistent
   gameplay data.
 - The first broadphase is sweep-and-prune over entities with both movement bodies
-  and collision bounds.
-- Contact output uses the Slice 12 count/prefix/write stream pattern so threaded
-  range windows merge deterministically.
+  and collision bounds. It threads sorted anchor ranges, uses SIMD overlap
+  filtering, and emits range-owned candidate pairs once before deterministic
+  merge.
+- Narrowphase is a separate threaded batch: worker ranges SIMD-compute contact
+  math over candidate pairs, then merge range-owned contact buffers
+  deterministically for the same-step response stream.
+- Thread-written broadphase and narrowphase range scratch is 64-byte padded;
+  persistent collision component storage remains dense and unpadded by default.
+- Broadphase and narrowphase keep separate adaptive tuners and batch stats; no
+  combined timing trains either stage. Inline stage measurements still train the
+  owning stage tuner, so a later expensive window can switch that stage to
+  worker threads without borrowing another stage's profile.
 - Collision response stays separate from detection; `CollisionResponseSystem`
   consumes the completed same-step contact stream through explicit
   response-policy components before structural commands commit.
@@ -831,52 +867,67 @@ moving-square-obstacle, and player-moving-square contacts. Detector benchmarks
 report candidate pairs and contacts for dense/sparse body workloads, while
 response benchmarks report triggers and intents across 1k-50k contact workloads.
 
-## Slice 14: AI, Pathfinding, And Emergent Rule Processing
+## Slice 14: First AI Intent Processor And Future Rule Contracts
 
-Goal: add AI, pathfinding, and gameplay-rule processors that compose through
-data, intents, and deterministic order rather than copying player-specific
-behavior into many entity types.
+Goal: add the first data-driven non-player decision processor that emits
+deterministic movement intents through `SimulationFrame`, proving the AI/rule
+processor boundary before broader rule systems are added.
 
 Current foundation:
 
 - `DataSystem` and component masks can identify entity membership for processors.
 - Movement and particle processors demonstrate the system API shape.
 - Slice 12 provides deterministic event/intent/deferred-command contracts.
-- Slice 13 should provide spatial query and contact data for perception and
+- Slice 13 provides spatial query and contact data for perception and
   collision-aware decisions.
+- `DataSystem` owns aligned `AiAgent` SoA data, membership masks,
+  structural-command validation, and dense movement lookup for AI rows.
+- `AiSystem` reads `AiAgent` and movement slices, builds a transient 32-unit
+  spatial grid, computes bounded local-separation samples, emits deterministic
+  `MovementIntent` ranges into `SimulationFrame`, and uses serial or adaptive
+  threaded execution for the separation and intent-emission stages.
+- `GameDemoState` runs AI after main-thread player input and before movement
+  integration, then applies AI movement intents on the main thread before
+  `MovementSystem`.
+- AI benchmarks cover serial, fixed-thread, and adaptive profiles for quick,
+  standard, and stress workloads.
+- `zig build fmt`, `zig build test`, `zig build check`, and `zig build verify`
+  passed for this slice.
 
 Architecture notes:
 
-- Domain controllers should orchestrate feature phases and budgets, not become
-  hidden per-entity stores. They may take typed `DataSystem` views and run small
-  policy passes, but hot or reusable loops should remain systems/processors over
-  SoA slices.
-- AI and rules should usually emit movement intents, steering outputs, target
-  choices, path requests/results, or deferred commands rather than mutating
+- State-owned feature controllers should orchestrate feature phases and budgets,
+  not become hidden per-entity stores. They may take typed `DataSystem` views
+  and run small policy passes, but hot or reusable loops should remain
+  systems/processors over SoA slices.
+- Future AI and rules should emit movement intents, steering outputs, target
+  choices, typed requests/results, or deferred commands rather than mutating
   unrelated stores directly.
+- AI separation and intent emission are independently staged and tuned. Future
+  perception or rule passes need the same explicit work ownership,
+  stage-specific tuning, and deterministic merge points.
 - Deterministic randomness must be explicit state or an explicit service passed
   through the processor boundary.
-- Pathfinding should use read-only navigation or world snapshots during worker
-  jobs and merge results deterministically before movement or response systems
-  consume them.
 
 Checklist:
 
-- [ ] Add typed intent/request/result stores for AI, rules, and pathfinding.
-- [ ] Define processor order for perception, decision, path/steering output,
-      movement intent, movement integration, collision response, and cleanup.
-- [ ] Add deterministic conflict-resolution policy when multiple systems request
-      incompatible outcomes.
-- [ ] Add tests for repeatable decisions, stable merge order, and no steady-state
+- [x] Reuse `MovementIntent` and `RangeOutputStream` for the first AI steering
+      output.
+- [x] Define processor order for the first AI decision output, movement intent
+      application, movement integration, collision response, and cleanup.
+- [x] Keep current conflict policy narrow: single-writer AI movement intents are
+      applied on the main thread in merged range order. Multi-system
+      incompatible-intent arbitration remains future work.
+- [x] Add tests for repeatable decisions, stable merge order, and no steady-state
       allocation in hot processors.
 
 Acceptance checks:
 
-- [ ] Non-player entities can be driven by data and processors rather than
+- [x] Non-player entities can be driven by data and processors rather than
       player-behavior copies.
-- [ ] AI/path/rule processors produce deterministic outputs for fixed initial
-      data, inputs, and random seeds.
-- [ ] Processor outputs compose through typed data, intents, or deferred commands
+- [x] The AI movement-intent processor produces deterministic outputs for fixed
+      initial data, target, and random seed.
+- [x] Processor outputs compose through typed data, intents, or deferred commands
       with explicit ownership and lifetime.
 
 ## Slice 15: SDL3_mixer Audio Service
@@ -919,6 +970,472 @@ Acceptance checks:
 - [x] Missing audio assets warn once per path instead of retrying every frame.
 - [x] The demo proves music plus collision SFX through installed runtime assets.
 
+## Slice 16: Main Menu and Settings Menu
+
+Goal: provide a root main menu as the default startup state and a reachable settings menu for basic configurable options (initially live audio bus/master gains) so the app no longer boots directly into gameplay. Menus use the existing state stack (opaque + modal policies), input routing (new menu actions routed under the `.ui` context), text service for labels, renderer logical-space drawing, and audio command buffer for fixed-step gain changes.
+
+Current foundation:
+
+- `StateStack` + `StateTransitions` (replaceGameplay, replaceOwnedGameplay, pushModal, pop support added in this slice) and the four policies (gameplay / modal_overlay / pass_through_overlay / opaque_screen).
+- `InputState` / `FrameCommands` + `input_router` with explicit `.ui` context and `modalUi`/`opaqueScreen` policies that already block gameplay movement while allowing app/debug/ui commands. Consumed state events suppress fallback routing into global frame commands.
+- `TextService` cached text drawing/preparation (Slice 5) and `Renderer.drawSprite` / `drawRectInSpace(..., .logical)` for UI.
+- `PauseState` provides the concrete drawing, layering (~9000+), color, text-measurement, and centered-panel precedent.
+- `AudioCommandBuffer.setMasterGain` / `setBusGain` + `AudioBus` (Slice 15) for live settings feedback without owning mixer resources. MainMenuState owns the runtime audio-setting values so they persist across settings reopen and into gameplay launch.
+- `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
+- `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.
+- Menus use `handleEvent` (raw SDL events, which reach top state for modal/opaque policies) and translate keys through `input.actionForKey(...)` before acting on named ui/app actions. `UpdateContext` carries audio for gain commands, transitions, input, and thread_system; `RenderContext` carries renderer + optional text_service. This matches the actual `UpdateContext` definition (no one-frame commands field).
+- All states follow the vtable shape with `init`/`deinit`/`update`/`render`/`handleEvent` and required `onPause`; `onResume` is optional.
+
+Architecture notes:
+
+- `StatePolicy.gameplay` is the source of truth for active gameplay; pause entry
+  is gated by `StateStack.isGameplayActive()`.
+- `pauseActive` / `resumeActive` target the gameplay-policy state, so overlays
+  can sit on top without stealing gameplay pause notifications.
+- Menu and settings states are non-gameplay UI states; pause attempts over them
+  are inert.
+- Settings are currently runtime menu state. Persistent settings file work
+  should move pending adjustment persistence out of modal-local state so closing
+  the settings menu cannot drop a not-yet-applied adjustment.
+
+Checklist:
+
+- [x] Add four menu navigation actions (`menuUp`/`menuDown`/`menuLeft`/`menuRight`) bound to arrow keys, classified as command actions, and routed to the `.ui` context. Update binding, routing, and action tests.
+- [x] Extend `StateTransitions` and `StateStack` with `pop()` (request + apply + destroy) plus minimal tests so child menus can dismiss themselves cleanly.
+- [x] Implement `MainMenuState` (src/game/main_menu_state.zig) as an opaque-screen root menu: 3 items, allocator storage for spawning GameDemo, selection + wrap, text-service-backed title+items with accent for selected, logical rect + text rendering, confirm via resumeGame action, quit action exits, transitions to gameplay or settings or app quit. Internal focused tests.
+- [x] Implement `SettingsMenuState` (src/game/settings_menu_state.zig): 3 volume rows + Back, u8 0-10 state, menuLeft/menuRight records a pending adjustment for the selected volume, the next update queues set*Gain, labels render from current state, quit action or Back confirm does pop(), same visual style. Tests for clamping, emitted commands, pop, and command-failure consistency.
+- [x] Update Engine bootstrap to create MainMenuState (opaque) at startup with logical size + allocator; keep GameDemo import for launch path. Update the old placeholder comment.
+- [x] Register the two new game modules in src/tests.zig comptime block for `zig build test` coverage.
+- [x] Add the full Slice 16 section (this text) to framework-implementation-slices.md following prior slice format, plus update Next Priority Tracks and the Suggested Order list.
+- [x] Minor doc updates in state-stack-and-input.md (new actions in input model) and architecture.md (new states under game/, bootstrap note).
+- [x] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify` all pass.
+- [x] Manual `zig build dev` smoke confirmed: arrow navigation + wrap, Enter starts demo, Esc quits from main, Settings reachable, Left/Right adjust volumes with audible result and label update, Back/Esc returns to main, gains persist into launched gameplay, F2 overlay works, no leaks on repeated transitions.
+
+Acceptance checks:
+
+- [x] App starts at a usable main menu (title + 3 keyboard-selectable items) instead of the demo.
+- [x] Arrow keys change selection (wraps); Enter/Space activates; Esc quits from main menu.
+- [x] "Start Game" replace-launches a fully functional GameDemoState (player input, systems, audio, pause overlay still work).
+- [x] "Settings" pushes a modal settings view; Left/Right on volume rows records a pending gain change, the next update queues the gain command, labels update, and Esc or Back returns cleanly via pop.
+- [x] Volume changes made in settings are respected when starting gameplay afterward.
+- [x] Menu states store dirty non-owning `PreparedText` views, not generated
+      text texture ownership; stable render frames draw prepared views directly
+      and `TextService` owns the app-lifetime text cache.
+- [x] Focused (no-window) tests cover action-mapped selection, wrap, transition requests (including pop), volume clamp + command emission, and command-failure consistency.
+- [x] Updated routing tests prove menu actions are allowed exactly under ui/modal/opaque policies and blocked from pure gameplay routing.
+- [x] `zig build verify` passes; docs updated in the canonical slices format.
+
+Slice 16 lands the first real menu layer. The implementation stays deliberately small (no widget system, keyboard only, volumes as the single live setting) while covering the tested contract: state-driven navigation through named actions, consumed-event ui input routing, service-cached text + logical renderer drawing, fixed-step audio command effects from menus, clean pop + replace transitions, allocator hand-off for spawned gameplay, pause restricted to active gameplay, and complete tests + docs. Future menu work (controls, graphics stubs, in-game pause integration, persistence) can build directly on these states and the pop primitive.
+
+## Slice 17: Startup Runtime Asset Catalog
+
+Goal: preload the declared runtime asset set during `Engine.init` and make an
+Engine-owned `RuntimeAssets` app service the source of stable sprite/audio
+handles for gameplay, render prep, and audio commands. Missing declared content
+should log once and mark that asset unavailable, but should not fail app
+initialization.
+
+Current foundation:
+
+- `AssetStore` resolves traversal-safe runtime asset paths under the configured
+  asset root.
+- `AssetCache` decodes PNGs, uploads renderer textures, and returns retained
+  `TextureLease` values.
+- `AudioService` owns SDL3_mixer lifecycle, track pools, loaded audio handles,
+  bus gains, and pause ducking.
+- `Renderer` owns live GPU textures and draw submission.
+- `DataSystem` stores persistent asset-reference component rows as stable
+  `SpriteAssetId` values, but it does not own live renderer or audio resources.
+- `RenderContext` exposes `RuntimeAssets`; `AudioCommandBuffer` carries stable
+  `AudioAssetId` values plus playback parameters.
+
+Architecture notes:
+
+- `RuntimeAssets` lives under `src/assets/` and is an app service/catalog, not a
+  gameplay processor under `src/game/systems/`.
+- Add a typed code manifest for startup assets. It assigns stable IDs such as
+  `SpriteAssetId` and `AudioAssetId` to relative asset paths.
+- `Engine` owns `RuntimeAssets`. It preloads declared sprites/images through
+  `AssetCache` after `Renderer` exists and preloads declared audio through
+  `AudioService` after the mixer service exists.
+- `RuntimeAssets` owns startup texture lease tokens, releases them explicitly
+  through the live `AssetCache`/`Renderer` owner, and exposes prepared sprite
+  metadata such as `{ texture, source_rect }`. Today each sprite can use a full
+  texture; future atlas work can map the same `SpriteAssetId` to an atlas texture
+  and source rectangle.
+- `DataSystem` stores only stable sprite asset IDs as persistent entity component
+  data. It may keep those component rows dense, but it must not store
+  `TextureId`, `TextureLease`, prepared sprite records, SDL_mixer handles, or
+  loaded audio handles.
+- Runtime gameplay and render prep should use stable asset IDs, not string
+  paths. Path validation, PNG decode, GPU upload, audio load/predecode, and
+  string/hash lookup stay out of fixed update and hot render paths.
+- Missing declared assets are logged and exposed as unavailable handles;
+  allocation failures, invalid config, and SDL/GPU/audio service initialization
+  failures still return errors.
+- A dedicated loading state is future work for larger asset sets, streamed
+  content, or visible progress. This slice keeps startup preload in `Engine.init`
+  but should keep enough catalog status to let a later loading state report
+  loaded, missing, and unavailable assets without changing ownership.
+
+Checklist:
+
+- [x] Add a typed startup asset manifest with stable sprite and audio IDs.
+- [x] Add Engine-owned `RuntimeAssets` that preloads declared sprite/image
+      assets during `Engine.init`, owns their texture leases, and releases them
+      before renderer teardown.
+- [x] Add audio preload support so declared music and SFX IDs resolve to loaded
+      `AudioService` handles without path lookup during command drain.
+- [x] Change render-facing code to resolve `SpriteAssetId` through
+      `RuntimeAssets` instead of acquiring textures by relative path.
+- [x] Change audio commands to carry `AudioAssetId` instead of copied relative
+      paths.
+- [x] Change `DataSystem` asset-reference component data from relative paths to
+      stable `SpriteAssetId` values.
+- [x] Add the first demo sprite asset under `assets/sprites/` and assign sprite
+      IDs to player, AI squares, and obstacles.
+- [x] Update render-facing demo code so deterministic entity drawing resolves
+      sprite IDs through `RuntimeAssets` with primitive fallback for unavailable
+      sprite IDs.
+- [x] Update architecture and rendering/assets docs to describe startup preload,
+      stable IDs, missing-asset behavior, and atlas-ready source rectangles.
+
+Acceptance checks:
+
+- [x] Engine startup attempts to preload every declared sprite and audio asset
+      once.
+- [x] Missing declared content logs once, marks the asset unavailable, and does
+      not abort app initialization.
+- [x] Gameplay state, render-facing drawing, and audio commands use stable asset
+      IDs rather than runtime string paths.
+- [x] `DataSystem` contains no live renderer texture IDs, texture leases,
+      prepared sprite records, SDL_mixer handles, or loaded audio handles.
+- [x] Render-facing drawing resolves `SpriteAssetId` to
+      `{ texture, source_rect }` and preserves deterministic draw ordering.
+- [x] Future atlas mapping can change the catalog resolution without changing
+      entity component storage.
+- [x] `zig build fmt`, `zig build test`, `zig build check`, and
+      `zig build verify` pass.
+- [x] Manual `zig build dev` smoke confirms menu, gameplay, sprite rendering,
+      audio, pause, debug overlay, and repeated transitions still work.
+
+Slice 17 lands the startup runtime asset catalog. `Engine` now preloads the
+manifest-declared demo sprite and audio set, gameplay stores stable sprite IDs,
+rendering resolves IDs through `RuntimeAssets` with primitive fallback, and
+audio commands drain by preloaded `AudioAssetId` instead of copied paths. The
+catalog release path uses the live cache/renderer owner rather than
+self-releasing lease pointers. Manual `zig build dev` validation confirmed menu,
+gameplay, sprite rendering, audio, pause, debug overlay, and repeated
+transitions.
+
+## Slice 18: Frame-Delayed Pathfinding System
+
+Goal: add a state-owned, frame-delayed grid pathfinding system so AI and rule
+processors can request navigation without blocking current-step movement or
+storing solver queues, caches, or scratch data in `DataSystem`.
+
+Current foundation:
+
+- Slice 12 provides typed transient streams and deterministic merge points
+  through `SimulationFrame`.
+- Slice 14 provides AI processors that can emit movement intent and consume
+  later-step navigation results without owning solver state.
+- `PathfindingSystem` lives under `src/game/systems/` as a system, not a
+  controller. It owns a static versioned nav grid, pending request queue,
+  request dedupe, completed result cache, unavailable-path cache, connected
+  components, portal data, warmed fixed scratch buffers, shared goal fields, and
+  per-stage adaptive tuners.
+- `SimulationFrame.path_requests` carries transient path requests from AI to the
+  pathfinder. Results are frame-delayed so AI consumes completed paths on later
+  fixed steps instead of blocking current-step movement on fresh solves.
+- Common requests avoid heap A* through request/result caches, unavailable-key
+  caches, shared goal fields, open-grid direct paths, disconnected-component
+  rejection, line-of-sight paths, and portal detours.
+- Regular batch work uses `src/core/simd.zig` for request key preparation and
+  static-grid blocked rectangle marking. Branch-heavy A* frontier expansion
+  remains scalar inside worker ranges.
+- Benchmarks split common-goal field reuse, hot cache-hit profiles, and hard
+  fallback profiles. Cache profiles report `cache_hits`; hard fallback profiles
+  report `fallback_requests` so regressions do not hide behind aggregate timing.
+
+Architecture notes:
+
+- Persistent gameplay facts stay in `DataSystem`; solver queues, caches,
+  scratch buffers, nav-grid topology, and tuner state stay in the state-owned
+  pathfinding system.
+- Pathfinding uses read-only navigation snapshots during worker jobs and merges
+  results deterministically before AI, movement, or response systems consume
+  them.
+- Adaptive tuning belongs to the actual work stage being measured. Shared goal
+  field construction, fallback solves, and result emission should each either
+  stay inline by design or use the tuner that measures that exact batch shape.
+- Heap A* is a bounded fallback path, not the expected per-frame path for common
+  requests. Hard true-A* fixtures and solve budgets remain a future hardening
+  track.
+
+Checklist:
+
+- [x] Add typed path requests and completed path results through
+      `SimulationFrame`.
+- [x] Add a state-owned `PathfindingSystem` under `src/game/systems/` and wire
+      it into fixed-step gameplay order after AI request emission.
+- [x] Keep solver state, warmed scratch buffers, caches, and adaptive tuners out
+      of `DataSystem`.
+- [x] Add request/result cache hits, unavailable-path caching, request dedupe,
+      and pending-request dedupe so repeat work stays cheap.
+- [x] Add shared goal fields and regular-batch SIMD where the data shape is
+      suitable.
+- [x] Add fast paths for direct open-grid paths, unreachable component rejects,
+      line-of-sight paths, and portal detours before heap A* fallback.
+- [x] Add deterministic serial, fixed-thread, and adaptive benchmarks for common
+      field reuse, hot cache-shaped workloads, and hard fallback workloads with
+      visible cache/fallback counters.
+- [x] Add tests covering deterministic results, cache behavior, no hot-loop heap
+      allocation in steady-state paths, unavailable requests, and serial versus
+      threaded consistency.
+
+Acceptance checks:
+
+- [x] AI can request paths without blocking the current fixed-step movement
+      integration on a fresh solve.
+- [x] Pathfinding is modeled as a gameplay system over typed data and transient
+      requests, not as a persistent gameplay-state owner.
+- [x] Repeated, unavailable, open-grid, detour, and shared-goal requests use
+      cheaper paths before heap A*.
+- [x] Adaptive and threaded runs are benchmarked against serial runs with
+      fallback counters visible.
+- [x] Debug and ReleaseFast 1024-request benchmarks cover open unique, detour,
+      and unreachable fixtures; all report zero fallback requests for the fast
+      fixtures after the fixture correction.
+- [x] `zig build test --summary all`, `zig build check`, `zig build verify`, and
+      `git diff --check` pass for the pathfinding implementation.
+
+Slice 18 lands the navigation substrate. It gives AI and future rule systems a
+deterministic, frame-delayed path request/result boundary with caches, fixed
+scratch, SIMD-friendly batch work, and adaptive thread-system scheduling. It
+does not by itself make NPC behavior immersive; steering, avoidance, perception,
+and behavior arbitration remain the next gameplay layers.
+
+## Slice 19: Steering And Local Avoidance
+
+Goal: turn pathfinding results into smoother NPC movement by adding local
+steering, avoidance, and stuck/replan policy above the pathfinder without moving
+that transient behavior into `DataSystem`.
+
+Current foundation:
+
+- Slice 14 AI processing provides deterministic AI decision output; Slice 19
+  routes that output through navigation intents before final steering movement.
+- Slice 18 pathfinding can provide frame-delayed path waypoints and unavailable
+  results.
+- Slice 13 collision contacts and spatial-query foundations provide the data
+  shape needed for local crowd and obstacle decisions.
+- `SteeringSystem` consumes high-level navigation intents, pathfinding status,
+  dense steering components, movement slices, and static obstacle data, then
+  emits final NPC movement intents through deterministic threaded range writes
+  after main-thread path/status preparation.
+
+Architecture notes:
+
+- Steering should be a system or state-owned feature controller that consumes
+  path results and typed SoA views, then emits movement intents or rule outputs.
+- Persistent tuning data such as agent radius, desired speed, or avoidance class
+  may live in dense `DataSystem` components. Per-step neighbor lists, waypoint
+  cursors, avoidance scratch, and replan queues should stay transient or
+  state-owned.
+- Avoidance and steering benchmarks should measure the processor cost directly
+  rather than masking it behind the pathfinding benchmark.
+
+Checklist:
+
+- [x] Add path-following state needed to turn completed paths into movement
+      intents.
+- [x] Add local obstacle and agent avoidance using bounded fixed scratch.
+- [x] Add stuck detection, replan cooldowns, and unavailable-path backoff.
+- [x] Define arbitration between player input, AI steering, collision response,
+      and future rule outputs.
+- [x] Add deterministic tests for waypoint following, avoidance ordering, replan
+      backoff, and no steady-state hot-loop allocation.
+- [x] Add steering/local-avoidance benchmarks that report agent count, bounded
+      avoidance checks, accepted samples, intents emitted, and threaded/adaptive
+      detail where used.
+
+Acceptance checks:
+
+- [x] NPCs can follow path waypoints without sharp frame-to-frame oscillation.
+- [x] Nearby NPCs and static obstacles are avoided through bounded local work.
+- [x] Unavailable or stale paths do not cause per-frame re-request loops.
+- [x] Steering outputs compose through typed movement intents or rule outputs
+      with deterministic order.
+- [x] `zig build fmt`, `zig build test`, `zig build check`, `zig build verify`,
+      and `zig build bench -- --profile quick --group steering --details` pass.
+
+Slice 19 lands steering as a separate gameplay processor. AI now emits
+`NavigationIntent` goals, `SteeringSystem` owns runtime steering rows,
+path-request cooldown/backoff, local avoidance scratch, deterministic priority
+arbitration, and threaded final movement-intent emission. Only the steering
+stage writes final NPC `MovementIntent`s. Player movement remains direct input,
+and collision response still resolves after movement.
+
+## Slice 20: Navigation Hardening And Hard-Path Budgets
+
+Goal: keep rare true-A* and complex-map navigation costs bounded, tested, and
+visible so pathfinding remains a stable gameplay foundation as map and NPC
+counts grow.
+
+Current foundation:
+
+- Slice 18 benchmark profiles expose common fast paths and fallback counters.
+- Pathfinding stats already distinguish field requests, cache hits,
+  unavailable-path cache hits, and fallback requests.
+
+Architecture notes:
+
+- Benchmarks should distinguish common-path throughput from true hard-path
+  fallback costs. A slow fallback should be treated as a visible budget decision,
+  not hidden by aggregate adaptive numbers.
+- Solve budgets should prefer deterministic deferral over unbounded same-frame
+  work. If the pathfinder cannot finish all fallback work inside the budget, it
+  should report pending work explicitly.
+- Module splitting is justified only if it improves maintainability without
+  weakening the system boundary. The pathfinder should remain a system, not a
+  controller that owns gameplay state.
+
+Checklist:
+
+- [ ] Add true-A*-required fixtures that cannot be solved by direct, field,
+      component, or portal fast paths.
+- [ ] Add per-frame fallback solve budgets and deterministic pending/deferred
+      behavior for overflow work.
+- [ ] Add cache, goal-field, and unavailable-entry aging or capacity tests if
+      long-running sessions need eviction.
+- [ ] Add regression thresholds or benchmark callouts for Debug and ReleaseFast
+      hard-path workloads.
+- [ ] Audit heap use and scratch sizing for worst-case fallback fixtures.
+- [ ] Consider splitting solver internals into smaller files once hard-path
+      contracts are stable.
+
+Acceptance checks:
+
+- [ ] Benchmarks report true fallback count and timing separately from fast-path
+      work.
+- [ ] Unreachable or impossible destinations are rejected once and cached rather
+      than re-solved every frame.
+- [ ] Fallback overflow defers deterministically instead of stalling the fixed
+      update.
+- [ ] Hard-path changes cannot silently regress common request throughput.
+
+## Slice 21: Typed Simulation Event System And Domain Signals
+
+Goal: add a deterministic, typed simulation event layer that lets future
+gameplay/domain systems communicate important system changes and interactions,
+including tile, pathfinding, AI, obstacle, weather, combat, spawning, rules, and
+resource changes, without introducing a global pub/sub bus, hidden persistent
+state, or hot-path dynamic dispatch.
+
+Current foundation:
+
+- Slice 12 already provides `SimulationFrame`, typed transient streams,
+  `RangeOutputStream(T)`, deterministic range-index merge, and deferred
+  structural command boundaries.
+- Collision, AI, steering, and pathfinding already use specialized typed
+  streams for high-volume or latency-sensitive outputs: contacts, navigation
+  intents, movement intents, path requests, and structural commands.
+- The roadmap now points toward a state-owned `SimulationPipeline` as the owner
+  of ordered gameplay phases and lightweight domain controller composition.
+- `DataSystem` is the persistent gameplay-fact owner; transient event, request,
+  scratch, queue, and service state stay outside persistent component storage.
+
+Architecture notes:
+
+- Map this feature to the intended simulation structure explicitly:
+  `StateStack` dispatches states; a gameplay state owns `DataSystem`,
+  `SimulationFrame`, and, when shared orchestration is needed, a
+  `SimulationPipeline`; the pipeline owns event phases and domain-controller
+  order; controllers consume typed event slices and decide reactions;
+  processors do hot SoA work and emit typed outputs; `DataSystem` stores
+  persistent facts; `SimulationFrame` stores this-step communication.
+- Use events to communicate that something important changed or that a later
+  stage should consider a request. Use `DataSystem` to store what remains true
+  after the step. Use controllers to decide how domains react. Use processors
+  for scalable data work. Use deferred commands for structural mutation.
+- The event layer should be state-owned and tied to the `SimulationPipeline` for
+  one gameplay state instance. It is not an app service, global singleton,
+  reflection system, string-topic dispatcher, callback chain, or dynamic
+  dependency graph.
+- Events communicate domain or system changes that happened this step, or
+  requests that a later fixed stage should consider. Persistent facts such as
+  tile state, obstacle occupancy, weather fields, faction state, resources,
+  actor components, or long-lived rule state still live in `DataSystem` or
+  state-owned domain storage.
+- Prefer explicit typed event unions or typed event channels with stable IDs:
+  examples include `TileChanged`, `ObstacleChanged`, `WeatherChanged`,
+  `NavRegionInvalidated`, `PerceptionStimulus`, `NoiseEmitted`,
+  `InteractionRequested`, `DamageRequested`, and `SpawnRequested`.
+- Keep existing high-volume streams specialized. Collision contacts, movement
+  intents, navigation intents, path requests, and render-prep outputs should not
+  be collapsed into one generic simulation-event stream just for uniformity.
+- Threaded producers must use the same count/prefix/write/range-index merge
+  model as other `SimulationFrame` streams. Output order must come from stable
+  phase, input, range, and per-range sequence order, not worker timing.
+- The pipeline owns event reaction order. Controllers consume immutable event
+  slices in explicit stages, may emit typed requests or deferred structural
+  commands, and may schedule next-step work in controller-owned queues when a
+  response cannot safely happen in the same fixed step.
+- Avoid recursive event storms. If consuming one event emits more events, the
+  design must name the next event phase or defer to the next fixed step instead
+  of allowing unbounded immediate redispatch.
+- Events must carry stable IDs, scalar data, enum tags, compact coordinates,
+  and small value payloads only. Do not store pointers, renderer/audio/SDL
+  handles, asset paths, loaded resources, allocators, or service references in
+  event payloads.
+- Simulation-event diagnostics should expose counts by type and
+  producer/controller stage. Logging individual events in hot paths is not
+  acceptable outside targeted debug tooling.
+
+Checklist:
+
+- [ ] Define `SimulationEvent` extensions and/or typed event channels with
+      concrete payloads for the first cross-system domains needed by tiles,
+      obstacles, pathfinding invalidation, AI perception, weather interaction,
+      combat, spawning, resource changes, or other system-change signals.
+- [ ] Add a state-owned event collection API under the simulation/pipeline
+      boundary, reusing `RangeOutputStream` or an equivalent typed
+      count/prefix/write collector.
+- [ ] Define pipeline event phases: producer stages, merge points, controller
+      reaction order, derived-event policy, and next-step deferral policy.
+- [ ] Add domain-controller integration points so controllers can consume
+      immutable event slices and emit typed outputs, requests, or deferred
+      structural commands without owning persistent entity/component facts.
+- [ ] Add capacity and reserve policy for event channels, including behavior
+      when a low-priority event channel exceeds its per-step budget.
+- [ ] Add event stats with per-type counts, dropped/deferred counts where
+      applicable, and stage/controller attribution for benchmarks or debug UI.
+- [ ] Document which cross-system communication should use simulation/domain
+      events and which should remain a specialized stream such as contacts,
+      movement intents, navigation intents, path requests, render prep, or
+      structural commands.
+- [ ] Document the architecture mapping for event producers and consumers:
+      pipeline phase, controller owner, persistent data owner, transient event
+      stream, processor outputs, and deferred mutation point.
+
+Acceptance checks:
+
+- [ ] Replaying the same initial `DataSystem`, controller state, fixed-step
+      inputs, and worker split decisions produces the same event order and same
+      downstream outputs.
+- [ ] Threaded producers merge events deterministically by stable range order,
+      never by worker completion order.
+- [ ] Event consumption cannot mutate `DataSystem` structurally except through
+      deferred structural commands applied at the pipeline commit point.
+- [ ] Event payload tests reject or avoid pointers, app/render/audio handles,
+      asset paths, allocator references, and other non-stable runtime state.
+- [ ] Capacity tests cover reserve, overflow, drop/defer policy, and
+      no-allocation warmed event production.
+- [ ] Benchmarks or debug stats can show event counts by type/stage so weather,
+      tile, obstacle, AI, and navigation interactions do not become invisible
+      fixed-step cost.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -935,15 +1452,22 @@ Acceptance checks:
 11. SIMD-aware data processor systems.
 12. Simulation contracts and deferred structural changes.
 13. Spatial queries and collision contacts.
-14. AI, pathfinding, and emergent rule processing.
+14. First AI intent processor and future rule contracts.
 15. SDL3_mixer audio service.
+16. Main menu and settings menu.
+17. Startup runtime asset catalog.
+18. Frame-delayed pathfinding system.
+19. Steering and local avoidance.
+20. Navigation hardening and hard-path budgets.
+21. Typed simulation event system and domain signals.
 
-This order keeps gameplay/menu correctness ahead of larger renderer work, then
-builds resource ownership before text/UI, renderer composition, and parallel
-render preparation depend on it. SIMD helpers land before the DataSystem and
-processor slices so the storage and system APIs can be designed around the hot
-loop shape from the start. The new gameplay-system slices keep structural
-changes, spatial contacts, and AI/rule outputs ordered and testable before
-emergent behavior becomes broad. The audio slice lands as an app-service track
-because it depends on asset ownership, state contexts, and pause policy rather
-than on gameplay-data storage.
+This order records the dependency path used to build the current project
+foundation. Current work should be chosen from Next Priority Tracks above.
+Resource ownership, text/UI, renderer composition, threading, SIMD,
+`DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
+startup runtime assets, and frame-delayed pathfinding now form the
+source-of-truth foundation for future slices. Steering/local avoidance and
+navigation hardening are the next navigation-focused gameplay candidates. Typed
+simulation/domain events should land before broad tile, weather, obstacle,
+perception, combat, spawning, resource, and rule-system interactions depend on
+cross-system communication.

@@ -3,14 +3,18 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Asset-backed SDL_ttf service for cached UI and debug text.
-//! Text rendering is synchronous and intended for explicit content/style changes,
-//! not per-frame draw submission.
+//! Text rendering is synchronous on cache misses and cached for app lifetime.
+//! Prepare text only when content/style changes; render stored PreparedText
+//! views with drawPreparedText.
 
 const std = @import("std");
 const assets = @import("../assets/assets.zig");
 const config = @import("../config.zig");
 const log = @import("../core/logging.zig").render;
-const Renderer = @import("renderer.zig").Renderer;
+const renderer_file = @import("renderer.zig");
+const CoordinateSpace = renderer_file.CoordinateSpace;
+const Rect = renderer_file.Rect;
+const Renderer = renderer_file.Renderer;
 const TextureId = @import("resources.zig").TextureId;
 const c = @import("../platform/sdl.zig").c;
 
@@ -45,7 +49,7 @@ pub const FontId = struct {
     }
 };
 
-pub const TextTextureId = struct {
+const TextTextureId = struct {
     index: u32,
     generation: u32,
 
@@ -63,40 +67,6 @@ pub const TextTextureId = struct {
 
     pub fn matches(self: TextTextureId, index: u32, generation: u32) bool {
         return self.isValid() and self.index == index and self.generation == generation;
-    }
-};
-
-pub const TextTextureLease = struct {
-    service: ?*TextService = null,
-    backend_context: ?*anyopaque = null,
-    handle: TextLeaseHandle = TextLeaseHandle.invalid,
-    id: TextTextureId = TextTextureId.invalid,
-    texture: TextureId = TextureId.invalid,
-    width: u32 = 0,
-    height: u32 = 0,
-
-    pub fn isAlive(self: TextTextureLease) bool {
-        const service = self.service orelse return false;
-        return self.backend_context != null and
-            self.id.isValid() and
-            self.texture.isValid() and
-            service.resolveLeaseSlotConst(self.handle) != null;
-    }
-
-    pub fn release(self: *TextTextureLease) void {
-        const service = self.service orelse return;
-        const backend_context = self.backend_context orelse return;
-        const handle = self.handle;
-
-        self.service = null;
-        self.backend_context = null;
-        self.handle = TextLeaseHandle.invalid;
-        self.id = TextTextureId.invalid;
-        self.texture = TextureId.invalid;
-        self.width = 0;
-        self.height = 0;
-
-        service.releaseLeaseWithContext(backend_context, handle);
     }
 };
 
@@ -119,6 +89,13 @@ pub const TextAlign = enum {
 pub const TextStyle = struct {
     font: FontId,
     color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+
+    pub fn init(font: FontId, color: config.Color) TextStyle {
+        return .{
+            .font = font,
+            .color = color,
+        };
+    }
 
     pub fn validate(self: TextStyle) !void {
         if (!self.font.isValid()) return error.InvalidFont;
@@ -145,6 +122,21 @@ pub const TextRequest = struct {
     style: TextStyle,
     layout: TextLayoutOptions = .{},
 
+    pub fn init(text: []const u8, font: FontId, color: config.Color) TextRequest {
+        return .{
+            .text = text,
+            .style = TextStyle.init(font, color),
+        };
+    }
+
+    pub fn withLayout(self: TextRequest, layout: TextLayoutOptions) TextRequest {
+        return .{
+            .text = self.text,
+            .style = self.style,
+            .layout = layout,
+        };
+    }
+
     pub fn validate(self: TextRequest) !void {
         if (self.text.len == 0) return error.InvalidText;
         try self.style.validate();
@@ -152,10 +144,39 @@ pub const TextRequest = struct {
     }
 };
 
-pub const RenderedText = struct {
+const RenderedText = struct {
     texture: TextureId,
     width: u32,
     height: u32,
+};
+
+pub const PreparedText = struct {
+    texture: TextureId,
+    width: u32,
+    height: u32,
+
+    pub const invalid = PreparedText{
+        .texture = TextureId.invalid,
+        .width = 0,
+        .height = 0,
+    };
+
+    pub fn isValid(self: PreparedText) bool {
+        return self.texture.isValid() and self.width > 0 and self.height > 0;
+    }
+};
+
+pub const TextAnchor = enum {
+    top_left,
+    top_center,
+};
+
+pub const TextPlacement = struct {
+    x: f32,
+    y: f32,
+    anchor: TextAnchor = .top_left,
+    layer: i32,
+    coordinate_space: CoordinateSpace = .logical,
 };
 
 pub const TextService = struct {
@@ -164,10 +185,8 @@ pub const TextService = struct {
     backend: TextBackend,
     fonts: std.ArrayList(FontSlot) = .empty,
     entries: std.ArrayList(TextEntrySlot) = .empty,
-    lease_slots: std.ArrayList(TextLeaseSlot) = .empty,
     first_free_font_slot: ?u32 = null,
     first_free_entry_slot: ?u32 = null,
-    first_free_lease_slot: ?u32 = null,
     default_font: FontId = FontId.invalid,
     ttf_initialized: bool = false,
 
@@ -224,12 +243,21 @@ pub const TextService = struct {
         }, font);
     }
 
-    pub fn acquireText(
+    pub fn prepareText(
         self: *TextService,
         renderer: *Renderer,
         request: TextRequest,
-    ) !TextTextureLease {
-        return self.acquireTextWithContext(@ptrCast(renderer), request);
+    ) !PreparedText {
+        return self.prepareTextWithContext(@ptrCast(renderer), request);
+    }
+
+    pub fn prepareDefaultText(
+        self: *TextService,
+        renderer: *Renderer,
+        text: []const u8,
+        color: config.Color,
+    ) !PreparedText {
+        return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
     fn initWithBackend(allocator: std.mem.Allocator, assetStore: assets.AssetStore, backend: TextBackend) TextService {
@@ -243,10 +271,7 @@ pub const TextService = struct {
     fn deinitWithContext(self: *TextService, backend_context: *anyopaque) void {
         var entry_index: u32 = 0;
         while (entry_index < self.entries.items.len) : (entry_index += 1) {
-            const slot = &self.entries.items[@intCast(entry_index)];
-            if (!slot.alive) continue;
-            self.backend.destroy_texture(backend_context, slot.texture);
-            self.allocator.free(slot.key.?.text);
+            self.destroyEntryWithContext(backend_context, TextTextureId.init(entry_index, self.entries.items[@intCast(entry_index)].generation) catch unreachable);
         }
         self.entries.deinit(self.allocator);
         self.entries = .empty;
@@ -261,9 +286,6 @@ pub const TextService = struct {
         self.fonts = .empty;
         self.first_free_font_slot = null;
 
-        self.lease_slots.deinit(self.allocator);
-        self.lease_slots = .empty;
-        self.first_free_lease_slot = null;
         self.default_font = FontId.invalid;
 
         if (self.ttf_initialized) {
@@ -277,29 +299,18 @@ pub const TextService = struct {
         self.deinitWithContext(no_backend_context);
     }
 
-    fn acquireTextWithContext(
+    fn prepareTextWithContext(
         self: *TextService,
         backend_context: *anyopaque,
         request: TextRequest,
-    ) !TextTextureLease {
+    ) !PreparedText {
         try request.validate();
         const font_slot = self.resolveFontSlot(request.style.font) orelse return error.InvalidFont;
         const key = TextCacheKey.fromRequest(request);
 
         if (self.findEntry(key)) |entry_id| {
             const entry = self.resolveEntrySlot(entry_id).?;
-            if (entry.retain_count == std.math.maxInt(u32)) return error.TooManyTextLeases;
-            const lease = try self.createLease(entry_id, entry.texture, entry.width, entry.height);
-            entry.retain_count += 1;
-            return .{
-                .service = self,
-                .backend_context = backend_context,
-                .handle = lease,
-                .id = entry_id,
-                .texture = entry.texture,
-                .width = entry.width,
-                .height = entry.height,
-            };
+            return preparedFromEntry(entry);
         }
 
         const owned_text = try self.allocator.dupe(u8, request.text);
@@ -316,20 +327,7 @@ pub const TextService = struct {
         const entry_id = try self.createEntry(owned_key, rendered);
         text_owned = false;
         rendered_owned = false;
-        var entry_owned = true;
-        errdefer if (entry_owned) self.releaseEntryWithContext(backend_context, entry_id);
-
-        const lease = try self.createLease(entry_id, rendered.texture, rendered.width, rendered.height);
-        entry_owned = false;
-        return .{
-            .service = self,
-            .backend_context = backend_context,
-            .handle = lease,
-            .id = entry_id,
-            .texture = rendered.texture,
-            .width = rendered.width,
-            .height = rendered.height,
-        };
+        return preparedFromEntry(self.resolveEntrySlot(entry_id).?);
     }
 
     fn findFont(self: *const TextService, desc: FontDesc) ?FontId {
@@ -400,7 +398,6 @@ pub const TextService = struct {
                 .texture = rendered.texture,
                 .width = rendered.width,
                 .height = rendered.height,
-                .retain_count = 1,
                 .generation = generation,
                 .alive = true,
                 .next_free = null,
@@ -415,7 +412,6 @@ pub const TextService = struct {
             .texture = rendered.texture,
             .width = rendered.width,
             .height = rendered.height,
-            .retain_count = 1,
             .generation = 1,
             .alive = true,
             .next_free = null,
@@ -434,13 +430,8 @@ pub const TextService = struct {
         return slot;
     }
 
-    fn releaseEntryWithContext(self: *TextService, backend_context: *anyopaque, id: TextTextureId) void {
+    fn destroyEntryWithContext(self: *TextService, backend_context: *anyopaque, id: TextTextureId) void {
         const slot = self.resolveEntrySlot(id) orelse return;
-        if (slot.retain_count > 1) {
-            slot.retain_count -= 1;
-            return;
-        }
-
         self.backend.destroy_texture(backend_context, slot.texture);
         self.allocator.free(slot.key.?.text);
         self.retireEntrySlot(id.index, slot);
@@ -452,106 +443,45 @@ pub const TextService = struct {
         slot.texture = TextureId.invalid;
         slot.width = 0;
         slot.height = 0;
-        slot.retain_count = 0;
         slot.generation = nextGeneration(slot.generation);
         slot.alive = false;
         slot.next_free = self.first_free_entry_slot;
         self.first_free_entry_slot = index;
     }
-
-    fn createLease(self: *TextService, id: TextTextureId, texture: TextureId, width: u32, height: u32) !TextLeaseHandle {
-        if (self.first_free_lease_slot) |index| {
-            const slot = &self.lease_slots.items[@intCast(index)];
-            const generation = slot.generation;
-            self.first_free_lease_slot = slot.next_free;
-            slot.* = .{
-                .entry = id,
-                .texture = texture,
-                .width = width,
-                .height = height,
-                .generation = generation,
-                .alive = true,
-                .next_free = null,
-            };
-            return TextLeaseHandle.init(index, generation) catch unreachable;
-        }
-
-        if (self.lease_slots.items.len >= std.math.maxInt(u32)) return error.TooManyTextLeases;
-        const index: u32 = @intCast(self.lease_slots.items.len);
-        try self.lease_slots.append(self.allocator, .{
-            .entry = id,
-            .texture = texture,
-            .width = width,
-            .height = height,
-            .generation = 1,
-            .alive = true,
-            .next_free = null,
-        });
-        return TextLeaseHandle.init(index, 1) catch unreachable;
-    }
-
-    fn releaseLeaseWithContext(self: *TextService, backend_context: *anyopaque, handle: TextLeaseHandle) void {
-        const slot = self.resolveLeaseSlot(handle) orelse return;
-        const entry = slot.entry;
-        self.retireLeaseSlot(handle.index, slot);
-        self.releaseEntryWithContext(backend_context, entry);
-    }
-
-    fn resolveLeaseSlot(self: *TextService, handle: TextLeaseHandle) ?*TextLeaseSlot {
-        if (!handle.isValid()) return null;
-        const index: usize = @intCast(handle.index);
-        if (index >= self.lease_slots.items.len) return null;
-
-        const slot = &self.lease_slots.items[index];
-        if (!slot.alive) return null;
-        if (!handle.matches(handle.index, slot.generation)) return null;
-        return slot;
-    }
-
-    fn resolveLeaseSlotConst(self: *const TextService, handle: TextLeaseHandle) ?*const TextLeaseSlot {
-        if (!handle.isValid()) return null;
-        const index: usize = @intCast(handle.index);
-        if (index >= self.lease_slots.items.len) return null;
-
-        const slot = &self.lease_slots.items[index];
-        if (!slot.alive) return null;
-        if (!handle.matches(handle.index, slot.generation)) return null;
-        return slot;
-    }
-
-    fn retireLeaseSlot(self: *TextService, index: u32, slot: *TextLeaseSlot) void {
-        std.debug.assert(slot.alive);
-        slot.entry = TextTextureId.invalid;
-        slot.texture = TextureId.invalid;
-        slot.width = 0;
-        slot.height = 0;
-        slot.generation = nextGeneration(slot.generation);
-        slot.alive = false;
-        slot.next_free = self.first_free_lease_slot;
-        self.first_free_lease_slot = index;
-    }
 };
 
-pub const TextLeaseHandle = struct {
-    index: u32,
-    generation: u32,
+pub fn drawPreparedText(renderer: *Renderer, prepared: PreparedText, placement: TextPlacement) !void {
+    if (!prepared.isValid()) return;
+    try renderer.drawSprite(.{
+        .texture = prepared.texture,
+        .dest = textDest(prepared, placement),
+        .layer = placement.layer,
+        .coordinate_space = placement.coordinate_space,
+    });
+}
 
-    pub const invalid = TextLeaseHandle{ .index = std.math.maxInt(u32), .generation = 0 };
+fn preparedFromEntry(entry: *const TextEntrySlot) PreparedText {
+    return .{
+        .texture = entry.texture,
+        .width = entry.width,
+        .height = entry.height,
+    };
+}
 
-    pub fn init(index: u32, generation: u32) !TextLeaseHandle {
-        if (index == std.math.maxInt(u32)) return error.InvalidTextLeaseIndex;
-        if (generation == 0) return error.InvalidGeneration;
-        return .{ .index = index, .generation = generation };
-    }
-
-    pub fn isValid(self: TextLeaseHandle) bool {
-        return self.generation != 0 and self.index != std.math.maxInt(u32);
-    }
-
-    pub fn matches(self: TextLeaseHandle, index: u32, generation: u32) bool {
-        return self.isValid() and self.index == index and self.generation == generation;
-    }
-};
+fn textDest(prepared: PreparedText, placement: TextPlacement) Rect {
+    const width: f32 = @floatFromInt(prepared.width);
+    const height: f32 = @floatFromInt(prepared.height);
+    const x = switch (placement.anchor) {
+        .top_left => placement.x,
+        .top_center => placement.x - width * 0.5,
+    };
+    return .{
+        .x = x,
+        .y = placement.y,
+        .w = width,
+        .h = height,
+    };
+}
 
 const FontSlot = struct {
     font: ?*c.TTF_Font = null,
@@ -583,17 +513,6 @@ const TextCacheKey = struct {
 
 const TextEntrySlot = struct {
     key: ?TextCacheKey = null,
-    texture: TextureId = TextureId.invalid,
-    width: u32 = 0,
-    height: u32 = 0,
-    retain_count: u32 = 0,
-    generation: u32 = 1,
-    alive: bool = false,
-    next_free: ?u32 = null,
-};
-
-const TextLeaseSlot = struct {
-    entry: TextTextureId = TextTextureId.invalid,
     texture: TextureId = TextureId.invalid,
     width: u32 = 0,
     height: u32 = 0,
@@ -851,63 +770,64 @@ test "cache keys include text font color layout and alignment" {
     try std.testing.expect(!textCacheKeyEql(base, different_layout));
 }
 
-test "duplicate text acquires reuse cached texture until final release" {
+test "prepared text reuses cached texture until service teardown" {
     var fake = FakeBackend{};
     var service = try initFakeTextService(std.testing.allocator, &fake);
-    defer service.deinitWithContext(&fake);
 
     const request = TextRequest{
         .text = "Menu",
         .style = .{ .font = service.defaultFont() },
     };
 
-    var first = try service.acquireTextWithContext(&fake, request);
-    var second = try service.acquireTextWithContext(&fake, request);
+    const first = try service.prepareTextWithContext(&fake, request);
+    const second = try service.prepareTextWithContext(&fake, request);
 
     try std.testing.expect(first.texture.matches(second.texture.index, second.texture.generation));
     try std.testing.expectEqual(@as(u32, 1), fake.render_count);
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
 
-    first.release();
-    try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
-    second.release();
+    service.deinitWithContext(&fake);
     try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
 }
 
-test "cached text acquire rejects retain count overflow before creating a lease" {
+test "prepared text cache keys include style changes" {
     var fake = FakeBackend{};
     var service = try initFakeTextService(std.testing.allocator, &fake);
     defer service.deinitWithContext(&fake);
 
-    const request = TextRequest{
+    const white = TextRequest{
         .text = "Menu",
         .style = .{ .font = service.defaultFont() },
     };
+    const accent = TextRequest{
+        .text = "Menu",
+        .style = .{ .font = service.defaultFont(), .color = .{ .r = 0.4, .g = 0.8, .b = 1, .a = 1 } },
+    };
 
-    var first = try service.acquireTextWithContext(&fake, request);
-    defer first.release();
+    const first = try service.prepareTextWithContext(&fake, white);
+    const second = try service.prepareTextWithContext(&fake, accent);
 
-    const key = TextCacheKey.fromRequest(request);
-    const entry_id = service.findEntry(key).?;
-    service.resolveEntrySlot(entry_id).?.retain_count = std.math.maxInt(u32);
-
-    try std.testing.expectError(error.TooManyTextLeases, service.acquireTextWithContext(&fake, request));
+    try std.testing.expect(!first.texture.matches(second.texture.index, second.texture.generation));
+    try std.testing.expectEqual(@as(u32, 2), fake.render_count);
 }
 
-test "text lease release is idempotent and rejects stale copied leases" {
-    var fake = FakeBackend{};
-    var service = try initFakeTextService(std.testing.allocator, &fake);
-    defer service.deinitWithContext(&fake);
+test "text placement supports top left and top center anchors" {
+    const texture = try TextureId.init(7, 1);
+    const prepared = PreparedText{
+        .texture = texture,
+        .width = 80,
+        .height = 20,
+    };
 
-    var lease = try service.acquireTextWithContext(&fake, .{
-        .text = "Paused",
-        .style = .{ .font = service.defaultFont() },
-    });
-    var stale_copy = lease;
-
-    lease.release();
-    lease.release();
-    stale_copy.release();
-
-    try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
+    try std.testing.expectEqual(Rect{ .x = 10, .y = 30, .w = 80, .h = 20 }, textDest(prepared, .{
+        .x = 10,
+        .y = 30,
+        .layer = 1,
+    }));
+    try std.testing.expectEqual(Rect{ .x = 60, .y = 30, .w = 80, .h = 20 }, textDest(prepared, .{
+        .x = 100,
+        .y = 30,
+        .anchor = .top_center,
+        .layer = 1,
+    }));
 }

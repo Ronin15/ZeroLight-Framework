@@ -14,6 +14,10 @@ pub const Action = enum(usize) {
     resumeGame,
     quit,
     toggleDebugOverlay,
+    menuUp,
+    menuDown,
+    menuLeft,
+    menuRight,
 };
 
 const action_count = @typeInfo(Action).@"enum".fields.len;
@@ -33,6 +37,10 @@ pub const default_key_bindings = [_]KeyBinding{
     .{ .key = c.SDLK_SPACE, .action = .resumeGame },
     .{ .key = c.SDLK_ESCAPE, .action = .quit },
     .{ .key = c.SDLK_F2, .action = .toggleDebugOverlay },
+    .{ .key = c.SDLK_UP, .action = .menuUp },
+    .{ .key = c.SDLK_DOWN, .action = .menuDown },
+    .{ .key = c.SDLK_LEFT, .action = .menuLeft },
+    .{ .key = c.SDLK_RIGHT, .action = .menuRight },
 };
 
 pub const InputState = struct {
@@ -114,7 +122,7 @@ fn isGameplayAction(action: Action) bool {
 
 fn isCommandAction(action: Action) bool {
     return switch (action) {
-        .pause, .resumeGame, .quit, .toggleDebugOverlay => true,
+        .pause, .resumeGame, .quit, .toggleDebugOverlay, .menuUp, .menuDown, .menuLeft, .menuRight => true,
         else => false,
     };
 }
@@ -154,6 +162,10 @@ test "default key bindings map keyboard keys to actions" {
     try std.testing.expectEqual(Action.resumeGame, actionForKey(c.SDLK_SPACE).?);
     try std.testing.expectEqual(Action.quit, actionForKey(c.SDLK_ESCAPE).?);
     try std.testing.expectEqual(Action.toggleDebugOverlay, actionForKey(c.SDLK_F2).?);
+    try std.testing.expectEqual(Action.menuUp, actionForKey(c.SDLK_UP).?);
+    try std.testing.expectEqual(Action.menuDown, actionForKey(c.SDLK_DOWN).?);
+    try std.testing.expectEqual(Action.menuLeft, actionForKey(c.SDLK_LEFT).?);
+    try std.testing.expectEqual(Action.menuRight, actionForKey(c.SDLK_RIGHT).?);
 }
 
 test "input key mapping tracks held gameplay actions" {

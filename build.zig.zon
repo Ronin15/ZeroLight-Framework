@@ -4,21 +4,42 @@
 
 .{
     // Project identity.
-    .name = .zig_sdl3_gpu_framework,
+    .name = .zero_light_framework,
     // Project version.
     .version = "0.0.0",
     // Regenerate this when renaming the project.
-    .fingerprint = 0x247287d00907616d, // Changing this has security and trust implications.
+    .fingerprint = 0xf8699fde2a9a0aef, // Changing this has security and trust implications.
     // Earliest Zig version this project supports.
     .minimum_zig_version = "0.16.0",
     // Add project dependencies here as the game grows.
-    .dependencies = .{},
+    .dependencies = .{
+        .sdl3_windows_vc = .{
+            .url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.10/SDL3-devel-3.4.10-VC.zip",
+            .hash = "N-V-__8AAMQxjQPrEsveYx0lrM_x5rJFUD0ypfBMXYNS0NFC",
+            .lazy = true,
+        },
+        .sdl3_ttf_windows_vc = .{
+            .url = "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-devel-3.2.2-VC.zip",
+            .hash = "N-V-__8AAMHAnwPtValhGCZ2fBN0jcJtDqmUP6bS6RqshJhz",
+            .lazy = true,
+        },
+        .sdl3_mixer_windows_vc = .{
+            .url = "https://github.com/libsdl-org/SDL_mixer/releases/download/release-3.2.4/SDL3_mixer-devel-3.2.4-VC.zip",
+            .hash = "N-V-__8AAKAtNQEjYPJyA-iHQ61NkuPsnO01fkOy91yAx3lU",
+            .lazy = true,
+        },
+    },
     .paths = .{
         "AGENTS.md",
         "README.md",
         "assets",
         "build.zig",
         "build.zig.zon",
+        "docs/architecture.md",
+        "docs/development-workflow.md",
+        "docs/rendering-assets-shaders.md",
+        "docs/setup.md",
+        "docs/state-stack-and-input.md",
         "LICENSE",
         "src",
     },

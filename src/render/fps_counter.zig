@@ -5,10 +5,11 @@
 const std = @import("std");
 const config = @import("../config.zig");
 const Renderer = @import("renderer.zig").Renderer;
-const textServiceFile = @import("text.zig");
-const FontId = @import("text.zig").FontId;
-const TextService = @import("text.zig").TextService;
-const TextTextureLease = @import("text.zig").TextTextureLease;
+const text = @import("text.zig");
+const FontId = text.FontId;
+const PreparedText = text.PreparedText;
+const TextRequest = text.TextRequest;
+const TextService = text.TextService;
 
 const yellow = config.Color{ .r = 1.0, .g = 0.902, .b = 0.157, .a = 1.0 };
 const sample_window_ns = std.time.ns_per_s / 4;
@@ -18,7 +19,8 @@ const overlay_layer: i32 = 10_000;
 
 pub const FpsCounter = struct {
     font: FontId = FontId.invalid,
-    texture: TextTextureLease = .{},
+    prefix: PreparedText = .invalid,
+    digits: [10]PreparedText = [_]PreparedText{PreparedText.invalid} ** 10,
     accumulated_ns: u64 = 0,
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
@@ -33,7 +35,7 @@ pub const FpsCounter = struct {
     }
 
     pub fn deinit(self: *FpsCounter) void {
-        self.texture.release();
+        _ = self;
     }
 
     pub fn prepareForRender(
@@ -45,14 +47,13 @@ pub const FpsCounter = struct {
         const font_size_changed = !approxEqAbs(self.active_font_size, target_font_size, font_size_epsilon);
 
         if (font_size_changed) {
-            self.font = try text_service.loadFont(textServiceFile.defaultFontDesc(target_font_size));
+            self.font = try text_service.loadFont(text.defaultFontDesc(target_font_size));
             self.active_font_size = target_font_size;
             self.texture_dirty = true;
         }
 
-        if (!self.texture.isAlive() or self.texture_dirty) {
-            try self.rebuildTexture(text_service, renderer);
-            self.texture_dirty = false;
+        if (self.texture_dirty or !self.glyphsValid()) {
+            try self.prepareGlyphs(text_service, renderer);
         }
     }
 
@@ -76,37 +77,48 @@ pub const FpsCounter = struct {
         if (next_fps == self.displayed_fps) return;
 
         self.displayed_fps = next_fps;
-        self.texture_dirty = true;
     }
 
     pub fn render(self: *const FpsCounter, renderer: *Renderer) !void {
-        if (!self.texture.isAlive()) return;
-        try renderer.drawSprite(.{
-            .texture = self.texture.texture,
-            .dest = .{
-                .x = 12,
-                .y = 10,
-                .w = @floatFromInt(self.texture.width),
-                .h = @floatFromInt(self.texture.height),
-            },
+        var x: f32 = 12;
+        const y: f32 = 10;
+        try text.drawPreparedText(renderer, self.prefix, .{
+            .x = x,
+            .y = y,
             .layer = overlay_layer,
             .coordinate_space = .drawable,
         });
+        x += @floatFromInt(self.prefix.width);
+
+        var buffer: [16]u8 = undefined;
+        const digits = std.fmt.bufPrint(&buffer, "{d}", .{self.displayed_fps}) catch "0";
+        for (digits) |digit| {
+            const prepared = self.digits[digit - '0'];
+            try text.drawPreparedText(renderer, prepared, .{
+                .x = x,
+                .y = y,
+                .layer = overlay_layer,
+                .coordinate_space = .drawable,
+            });
+            x += @floatFromInt(prepared.width);
+        }
     }
 
-    fn rebuildTexture(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
-        var text_buffer: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&text_buffer, "FPS {d}", .{self.displayed_fps});
+    fn prepareGlyphs(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
+        self.prefix = try text_service.prepareText(renderer, TextRequest.init("FPS ", self.font, yellow));
+        for (&self.digits, 0..) |*digit_text, index| {
+            const digit = [_]u8{@intCast('0' + index)};
+            digit_text.* = try text_service.prepareText(renderer, TextRequest.init(&digit, self.font, yellow));
+        }
+        self.texture_dirty = false;
+    }
 
-        const next_texture = try text_service.acquireText(renderer, .{
-            .text = text,
-            .style = .{
-                .font = self.font,
-                .color = yellow,
-            },
-        });
-        self.texture.release();
-        self.texture = next_texture;
+    fn glyphsValid(self: *const FpsCounter) bool {
+        if (!self.prefix.isValid()) return false;
+        for (self.digits) |digit| {
+            if (!digit.isValid()) return false;
+        }
+        return true;
     }
 };
 
@@ -124,14 +136,18 @@ test "overlay font size follows drawable pixel scale" {
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(0.5));
 }
 
-test "submitted frame sampling marks fps texture dirty after sample window" {
+test "submitted frame sampling updates fps without dirtying cached glyphs" {
     var fps = FpsCounter{};
 
     fps.texture_dirty = false;
     fps.recordSubmittedFrame(sample_window_ns);
 
-    try std.testing.expect(fps.texture_dirty);
+    try std.testing.expect(!fps.texture_dirty);
     try std.testing.expectEqual(@as(u32, 4), fps.displayed_fps);
     try std.testing.expectEqual(@as(u32, 0), fps.sampled_frames);
     try std.testing.expectEqual(@as(u64, 0), fps.accumulated_ns);
+}
+
+test "fps counter uses fixed glyph set" {
+    try std.testing.expectEqual(@as(usize, 10), @typeInfo(@TypeOf((FpsCounter{}).digits)).array.len);
 }

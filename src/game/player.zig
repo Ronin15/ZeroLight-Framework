@@ -12,6 +12,7 @@ const Facing = @import("data_system.zig").Facing;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const Rect = @import("../render/renderer.zig").Rect;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 
 pub const Player = struct {
     entity: EntityId = EntityId.invalid,
@@ -37,6 +38,7 @@ pub const Player = struct {
         });
         try data.setFacing(entity, .{ .direction = .down });
         try data.setPrimitiveVisual(entity, playerVisual());
+        try data.setAssetReference(entity, .{ .sprite = .demo_tile });
 
         return .{ .entity = entity };
     }
@@ -79,18 +81,33 @@ pub const Player = struct {
         );
     }
 
-    pub fn render(self: Player, data: *const DataSystem, renderer_instance: *Renderer, interpolation_alpha: f32) !void {
+    pub fn render(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, renderer_instance: *Renderer, interpolation_alpha: f32) !void {
         const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
         const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
         const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
         const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
 
-        try renderer_instance.drawRect(.{
+        const dest = Rect{
             .x = render_position.x,
             .y = render_position.y,
             .w = visual.size.x,
             .h = visual.size.y,
-        }, visual.color, visual.layer);
+        };
+        if (data.assetReferenceConst(self.entity)) |asset_ref| {
+            if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
+                try renderer_instance.drawSprite(.{
+                    .texture = sprite.texture,
+                    .source = sprite.source_rect,
+                    .dest = dest,
+                    .tint = visual.color,
+                    .layer = visual.layer,
+                });
+            } else {
+                try renderer_instance.drawRect(dest, visual.color, visual.layer);
+            }
+        } else {
+            try renderer_instance.drawRect(dest, visual.color, visual.layer);
+        }
         try renderer_instance.drawRect(markerRect(render_position, facing.direction, visual), visual.marker_color, visual.marker_layer);
     }
 

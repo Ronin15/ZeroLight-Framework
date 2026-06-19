@@ -4,7 +4,8 @@
 
 const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
-const TextTextureLease = @import("../render/text.zig").TextTextureLease;
+const text = @import("../render/text.zig");
+const PreparedText = text.PreparedText;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -13,7 +14,7 @@ const c = @import("../platform/sdl.zig").c;
 pub const PauseState = struct {
     width: f32,
     height: f32,
-    prompt: TextTextureLease = .{},
+    prompt: PreparedText = .invalid,
 
     const overlay_layer: i32 = 9_000;
     const icon_layer: i32 = 9_001;
@@ -33,7 +34,7 @@ pub const PauseState = struct {
     }
 
     pub fn deinit(self: *PauseState) void {
-        self.prompt.release();
+        _ = self;
     }
 
     pub fn handleEvent(self: *PauseState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
@@ -87,32 +88,19 @@ fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").R
 
 fn drawPrompt(self: *PauseState, context: RenderContext) !void {
     const text_service = context.text_service orelse return;
-    if (!self.prompt.isAlive()) {
-        self.prompt = try text_service.acquireText(context.renderer, .{
-            .text = PauseState.prompt_text,
-            .style = .{
-                .font = text_service.defaultFont(),
-                .color = PauseState.prompt_color,
-            },
-        });
+    if (!self.prompt.isValid()) {
+        self.prompt = try text_service.prepareDefaultText(context.renderer, PauseState.prompt_text, PauseState.prompt_color);
     }
-
-    const prompt_width: f32 = @floatFromInt(self.prompt.width);
     const prompt_height: f32 = @floatFromInt(self.prompt.height);
     const panel_bottom = (self.height + PauseState.panel_height) * 0.5;
     const prompt_y = @min(
         panel_bottom + PauseState.prompt_gap_below_panel,
         self.height - prompt_height - PauseState.prompt_screen_margin,
     );
-    try context.renderer.drawSprite(.{
-        .texture = self.prompt.texture,
-        .dest = .{
-            .x = (self.width - prompt_width) * 0.5,
-            .y = prompt_y,
-            .w = prompt_width,
-            .h = prompt_height,
-        },
+    try text.drawPreparedText(context.renderer, self.prompt, .{
+        .x = self.width * 0.5,
+        .y = prompt_y,
+        .anchor = .top_center,
         .layer = PauseState.text_layer,
-        .coordinate_space = .logical,
     });
 }

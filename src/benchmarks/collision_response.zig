@@ -38,10 +38,6 @@ pub const mixed_group = suite.BenchmarkGroup{
     .runCase = runMixedCase,
 };
 
-const quick_counts = [_]usize{ 1_000, 10_000 };
-const standard_counts = [_]usize{ 1_000, 5_000, 10_000, 25_000, 50_000 };
-const stress_counts = [_]usize{ 10_000, 25_000, 50_000 };
-
 const FixtureMode = enum {
     solid_static,
     bounce_static,
@@ -61,11 +57,7 @@ const Fixture = struct {
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &quick_counts,
-        .standard => &standard_counts,
-        .stress => &stress_counts,
-    };
+    return suite.eventScaleCounts(profile);
 }
 
 pub fn createSolidFixture(allocator: std.mem.Allocator, contact_count: usize) !Fixture {
@@ -244,4 +236,10 @@ test "collision response benchmark skips threaded cases until response apply has
     };
     const stats = try runSolidCase(std.testing.allocator, std.testing.io, options, suite.default_cases[1], 10_000);
     try std.testing.expectEqual(suite.RunStatus.skipped, stats.status);
+}
+
+test "collision response benchmark profiles sweep shared event scale counts" {
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.quick), defaultItemCounts(.quick));
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.standard), defaultItemCounts(.standard));
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.stress), defaultItemCounts(.stress));
 }

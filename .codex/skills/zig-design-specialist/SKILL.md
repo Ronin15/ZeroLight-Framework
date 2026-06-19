@@ -42,6 +42,8 @@ save/load, or roadmap-slice design.
 - Ownership boundaries and exact owner layer.
 - Frame/state call flow, preserving `main.zig` -> `Engine` phase method ->
   `StateStack` policy dispatch -> eligible state or states.
+- Pipeline/controller placement when orchestration is shared or complex:
+  state-owned pipeline, state-owned feature controllers, or plain state code.
 - Data layout and lifetime for every persistent and transient data set.
 - Ordered processor list, including what each processor reads and writes.
 - Deferred/main-thread boundary for structural changes, SDL/GPU calls, asset

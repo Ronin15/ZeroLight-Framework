@@ -26,21 +26,13 @@ pub const sparse_group = suite.BenchmarkGroup{
     .runCase = runSparseCase,
 };
 
-const quick_counts = [_]usize{10_000};
-const standard_counts = [_]usize{ 10_000, 25_000, 50_000 };
-const stress_counts = [_]usize{ 25_000, 50_000 };
-
 const FixtureMode = enum {
     dense,
     sparse,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
-    return switch (profile) {
-        .quick => &quick_counts,
-        .standard => &standard_counts,
-        .stress => &stress_counts,
-    };
+    return suite.eventScaleCounts(profile);
 }
 
 pub fn createFixture(allocator: std.mem.Allocator, count: usize) !DataSystem {
@@ -89,7 +81,8 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     var system = CollisionSystem.init(allocator);
     defer system.deinit();
     if (suite.adaptiveTunerForCase(case, collision_range_alignment_items)) |tuner| {
-        system.adaptive_tuner = tuner;
+        system.broadphase_tuner = tuner;
+        system.narrowphase_tuner = suite.adaptiveTunerForCase(case, collision_range_alignment_items).?;
     }
     var contacts = RangeOutputStream(CollisionContact).init(allocator);
     defer contacts.deinit();
@@ -98,7 +91,6 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
             .max_worker_threads = case.maxWorkerThreads(),
-            .min_parallel_items = 1,
             .items_per_range = suite.default_items_per_range,
         });
     }
@@ -110,11 +102,12 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while ((!system.broadphase_tuner.isSettled() or !system.narrowphase_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
             _ = try runOnce(&system, &data, &contacts, if (threads) |*thread_system| thread_system else null, case);
         }
     }
-    const settled_before_measurement = if (case.adaptive) system.adaptive_tuner.isSettled() else false;
+    const broadphase_settled_before_measurement = if (case.adaptive) system.broadphase_tuner.isSettled() else false;
+    const narrowphase_settled_before_measurement = if (case.adaptive) system.narrowphase_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_collision_stats = CollisionStats{};
@@ -122,14 +115,16 @@ fn runCaseWithMode(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
         const start_ns = suite.nowNs(io);
         last_collision_stats = try runOnce(&system, &data, &contacts, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_collision_stats.work_batch);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_collision_stats.broadphase_batch);
     }
 
     var stats = accumulator.finish();
     stats.candidate_pairs = last_collision_stats.candidate_pair_count;
     stats.output_count = last_collision_stats.contact_count;
+    stats.secondary_batch = suite.batchSummaryFromBatch(last_collision_stats.narrowphase_batch);
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.adaptive_tuner.report(), settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(system.broadphase_tuner.report(), broadphase_settled_before_measurement);
+        stats.secondary_work_tuning = suite.workTuningSummary(system.narrowphase_tuner.report(), narrowphase_settled_before_measurement);
     }
     return stats;
 }
@@ -146,7 +141,6 @@ fn runOnce(
     }
 
     return try system.update(data, contacts, thread_system.?, .{
-        .min_parallel_items = 1,
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -220,10 +214,7 @@ test "collision benchmark tiny serial case runs without display" {
 }
 
 test "collision benchmark profiles cover high-throughput target counts" {
-    try std.testing.expectEqual(@as(usize, 1), defaultItemCounts(.quick).len);
-    try std.testing.expectEqual(@as(usize, 10_000), defaultItemCounts(.quick)[0]);
-    try std.testing.expectEqual(@as(usize, 3), defaultItemCounts(.standard).len);
-    try std.testing.expectEqual(@as(usize, 50_000), defaultItemCounts(.standard)[2]);
-    try std.testing.expectEqual(@as(usize, 2), defaultItemCounts(.stress).len);
-    try std.testing.expectEqual(@as(usize, 50_000), defaultItemCounts(.stress)[1]);
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.quick), defaultItemCounts(.quick));
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.standard), defaultItemCounts(.standard));
+    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.stress), defaultItemCounts(.stress));
 }

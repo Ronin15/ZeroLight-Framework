@@ -7,7 +7,7 @@
 //! directly with core/simd.zig and split contiguous ranges through ThreadSystem.
 
 const std = @import("std");
-const assets = @import("../assets/assets.zig");
+const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const simd = @import("../core/simd.zig");
@@ -48,6 +48,8 @@ pub const Component = enum(u5) {
     asset_reference,
     collision_bounds,
     collision_response,
+    ai_agent,
+    steering_agent,
 };
 
 pub const ComponentMask = u32;
@@ -59,6 +61,8 @@ pub const component_masks = struct {
     pub const asset_reference = componentMask(.asset_reference);
     pub const collision_bounds = componentMask(.collision_bounds);
     pub const collision_response = componentMask(.collision_response);
+    pub const ai_agent = componentMask(.ai_agent);
+    pub const steering_agent = componentMask(.steering_agent);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -157,12 +161,12 @@ pub const ConstPrimitiveVisualSlice = struct {
 };
 
 pub const AssetReference = struct {
-    relative_path: []const u8,
+    sprite: SpriteAssetId,
 };
 
 pub const ConstAssetReferenceSlice = struct {
     entities: []const EntityId,
-    relative_paths: []const []const u8,
+    sprite_ids: []const SpriteAssetId,
 };
 
 pub const CollisionBounds = struct {
@@ -212,6 +216,65 @@ pub const ConstCollisionResponseSlice = struct {
     restitution: ConstHotF32Slice,
 };
 
+pub const AiBehavior = enum {
+    wander,
+    seek,
+};
+
+pub const AiAgent = struct {
+    behavior: AiBehavior = .wander,
+    wander_amplitude: f32 = 30.0,
+    seek_weight: f32 = 0.0,
+};
+
+pub const max_ai_wander_amplitude: f32 = 1000.0;
+pub const max_ai_seek_weight: f32 = 16.0;
+
+pub const AiAgentCommand = struct {
+    entity: EntityId,
+    agent: AiAgent,
+};
+
+pub const ConstAiAgentSlice = struct {
+    entities: []const EntityId,
+    behaviors: []const AiBehavior,
+    wander_amplitudes: ConstHotF32Slice,
+    seek_weights: ConstHotF32Slice,
+};
+
+pub const SteeringAgent = struct {
+    agent_radius: f32 = 12.0,
+    waypoint_tolerance: f32 = 8.0,
+    avoidance_radius: f32 = 48.0,
+    avoidance_weight: f32 = 1.0,
+    max_neighbor_samples: u16 = 16,
+    stuck_step_threshold: u16 = 18,
+    replan_cooldown_steps: u16 = 12,
+    unavailable_backoff_steps: u16 = 45,
+};
+
+pub const max_steering_radius: f32 = 512.0;
+pub const max_steering_weight: f32 = 32.0;
+pub const max_steering_neighbor_samples: u16 = 256;
+pub const max_steering_cooldown_steps: u16 = 4096;
+
+pub const SteeringAgentCommand = struct {
+    entity: EntityId,
+    agent: SteeringAgent,
+};
+
+pub const ConstSteeringAgentSlice = struct {
+    entities: []const EntityId,
+    agent_radii: ConstHotF32Slice,
+    waypoint_tolerances: ConstHotF32Slice,
+    avoidance_radii: ConstHotF32Slice,
+    avoidance_weights: ConstHotF32Slice,
+    max_neighbor_samples: []const u16,
+    stuck_step_thresholds: []const u16,
+    replan_cooldown_steps: []const u16,
+    unavailable_backoff_steps: []const u16,
+};
+
 pub const EntityTemplate = struct {
     movement_body: ?MovementBody = null,
     facing: ?FacingData = null,
@@ -219,6 +282,8 @@ pub const EntityTemplate = struct {
     asset_reference: ?AssetReference = null,
     collision_bounds: ?CollisionBounds = null,
     collision_response: ?CollisionResponse = null,
+    ai_agent: ?AiAgent = null,
+    steering_agent: ?SteeringAgent = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -250,6 +315,8 @@ pub const StructuralCommand = union(enum) {
     set_asset_reference: AssetReferenceCommand,
     set_collision_bounds: CollisionBoundsCommand,
     set_collision_response: CollisionResponseCommand,
+    set_ai_agent: AiAgentCommand,
+    set_steering_agent: SteeringAgentCommand,
 };
 
 pub const StructuralCommitStats = struct {
@@ -269,12 +336,16 @@ pub const DataSystem = struct {
     asset_refs: AssetReferenceStore = .{},
     collision_bounds: CollisionBoundsStore = .{},
     collision_responses: CollisionResponseStore = .{},
+    ai_agents: AiAgentStore = .{},
+    steering_agents: SteeringAgentStore = .{},
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DataSystem) void {
+        self.steering_agents.deinit(self.allocator);
+        self.ai_agents.deinit(self.allocator);
         self.collision_responses.deinit(self.allocator);
         self.collision_bounds.deinit(self.allocator);
         self.asset_refs.deinit(self.allocator);
@@ -310,6 +381,8 @@ pub const DataSystem = struct {
         if (slot.asset_ref_index) |dense_index| self.removeAssetReferenceAt(@intCast(dense_index));
         if (slot.collision_bounds_index) |dense_index| self.removeCollisionBoundsAt(@intCast(dense_index));
         if (slot.collision_response_index) |dense_index| self.removeCollisionResponseAt(@intCast(dense_index));
+        if (slot.ai_agent_index) |dense_index| self.removeAiAgentAt(@intCast(dense_index));
+        if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
 
         const retired_slot = &self.slots.items[@intCast(index)];
         retired_slot.generation = nextGeneration(retired_slot.generation);
@@ -322,6 +395,8 @@ pub const DataSystem = struct {
         retired_slot.asset_ref_index = null;
         retired_slot.collision_bounds_index = null;
         retired_slot.collision_response_index = null;
+        retired_slot.ai_agent_index = null;
+        retired_slot.steering_agent_index = null;
         self.first_free_slot = index;
         return true;
     }
@@ -341,6 +416,8 @@ pub const DataSystem = struct {
     }
 
     pub fn clearRetainingCapacity(self: *DataSystem) void {
+        self.steering_agents.clearRetainingCapacity();
+        self.ai_agents.clearRetainingCapacity();
         self.asset_refs.clearRetainingCapacity(self.allocator);
         self.collision_bounds.clearRetainingCapacity();
         self.collision_responses.clearRetainingCapacity();
@@ -360,6 +437,8 @@ pub const DataSystem = struct {
             slot.asset_ref_index = null;
             slot.collision_bounds_index = null;
             slot.collision_response_index = null;
+            slot.ai_agent_index = null;
+            slot.steering_agent_index = null;
             self.first_free_slot = @intCast(index);
         }
     }
@@ -461,20 +540,14 @@ pub const DataSystem = struct {
     }
 
     pub fn setAssetReference(self: *DataSystem, id: EntityId, asset_ref: AssetReference) !void {
-        try assets.validateRelativePath(asset_ref.relative_path);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
 
-        const owned_path = try self.allocator.dupe(u8, asset_ref.relative_path);
-        errdefer self.allocator.free(owned_path);
-
         if (slot.asset_ref_index) |index| {
-            const dense_index: usize = @intCast(index);
-            self.allocator.free(self.asset_refs.relative_paths.items[dense_index]);
-            self.asset_refs.relative_paths.items[dense_index] = owned_path;
+            self.asset_refs.sprite_ids.items[@intCast(index)] = asset_ref.sprite;
             return;
         }
 
-        const dense_index = try self.asset_refs.append(self.allocator, id, owned_path);
+        const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref.sprite);
         slot.asset_ref_index = dense_index;
         slot.addComponent(.asset_reference);
     }
@@ -482,7 +555,7 @@ pub const DataSystem = struct {
     pub fn assetReferenceConst(self: *const DataSystem, id: EntityId) ?AssetReference {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.asset_ref_index orelse return null;
-        return .{ .relative_path = self.asset_refs.relative_paths.items[@intCast(dense_index)] };
+        return .{ .sprite = self.asset_refs.sprite_ids.items[@intCast(dense_index)] };
     }
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
@@ -508,6 +581,12 @@ pub const DataSystem = struct {
         return self.collision_bounds.get(@intCast(dense_index));
     }
 
+    pub fn collisionBoundsDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.collision_bounds_index orelse return null;
+        return @intCast(dense_index);
+    }
+
     pub fn collisionBoundsSliceConst(self: *const DataSystem) ConstCollisionBoundsSlice {
         return self.collision_bounds.sliceConst();
     }
@@ -531,8 +610,66 @@ pub const DataSystem = struct {
         return self.collision_responses.get(@intCast(dense_index));
     }
 
+    pub fn collisionResponseDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.collision_response_index orelse return null;
+        return @intCast(dense_index);
+    }
+
     pub fn collisionResponseSliceConst(self: *const DataSystem) ConstCollisionResponseSlice {
         return self.collision_responses.sliceConst();
+    }
+
+    pub fn setAiAgent(self: *DataSystem, id: EntityId, agent: AiAgent) !void {
+        try validateAiAgent(agent);
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.ai_agent_index) |index| {
+            self.ai_agents.set(@intCast(index), agent);
+            return;
+        }
+
+        const dense_index = try self.ai_agents.append(self.allocator, id, agent);
+        slot.ai_agent_index = dense_index;
+        slot.addComponent(.ai_agent);
+    }
+
+    pub fn aiAgentConst(self: *const DataSystem, id: EntityId) ?AiAgent {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.ai_agent_index orelse return null;
+        return self.ai_agents.get(@intCast(dense_index));
+    }
+
+    pub fn aiAgentSliceConst(self: *const DataSystem) ConstAiAgentSlice {
+        return self.ai_agents.sliceConst();
+    }
+
+    pub fn setSteeringAgent(self: *DataSystem, id: EntityId, agent: SteeringAgent) !void {
+        try validateSteeringAgent(agent);
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.steering_agent_index) |index| {
+            self.steering_agents.set(@intCast(index), agent);
+            return;
+        }
+
+        const dense_index = try self.steering_agents.append(self.allocator, id, agent);
+        slot.steering_agent_index = dense_index;
+        slot.addComponent(.steering_agent);
+    }
+
+    pub fn steeringAgentConst(self: *const DataSystem, id: EntityId) ?SteeringAgent {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.steering_agent_index orelse return null;
+        return self.steering_agents.get(@intCast(dense_index));
+    }
+
+    pub fn steeringAgentDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.steering_agent_index orelse return null;
+        return @intCast(dense_index);
+    }
+
+    pub fn steeringAgentSliceConst(self: *const DataSystem) ConstSteeringAgentSlice {
+        return self.steering_agents.sliceConst();
     }
 
     pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
@@ -541,9 +678,6 @@ pub const DataSystem = struct {
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
-                    if (template.asset_reference) |asset_ref| {
-                        try assets.validateRelativePath(asset_ref.relative_path);
-                    }
                     const entity = try self.createEntity();
                     errdefer _ = self.destroyEntity(entity);
                     stats.created += 1;
@@ -604,6 +738,22 @@ pub const DataSystem = struct {
                     try self.setCollisionResponse(set.entity, set.response);
                     stats.components_set += 1;
                 },
+                .set_ai_agent => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setAiAgent(set.entity, set.agent);
+                    stats.components_set += 1;
+                },
+                .set_steering_agent => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setSteeringAgent(set.entity, set.agent);
+                    stats.components_set += 1;
+                },
             }
         }
         return stats;
@@ -613,19 +763,23 @@ pub const DataSystem = struct {
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
-                    if (template.asset_reference) |asset_ref| {
-                        try assets.validateRelativePath(asset_ref.relative_path);
-                    }
                     if (template.collision_bounds) |bounds| {
                         try validateCollisionBounds(bounds);
                     }
                     if (template.collision_response) |response| {
                         try validateCollisionResponse(response);
                     }
+                    if (template.ai_agent) |agent| {
+                        try validateAiAgent(agent);
+                    }
+                    if (template.steering_agent) |agent| {
+                        try validateSteeringAgent(agent);
+                    }
                 },
-                .set_asset_reference => |set| try assets.validateRelativePath(set.asset_reference.relative_path),
                 .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
                 .set_collision_response => |set| try validateCollisionResponse(set.response),
+                .set_ai_agent => |set| try validateAiAgent(set.agent),
+                .set_steering_agent => |set| try validateSteeringAgent(set.agent),
                 else => {},
             }
         }
@@ -655,6 +809,14 @@ pub const DataSystem = struct {
         }
         if (template.collision_response) |response| {
             try self.setCollisionResponse(entity, response);
+            components_set += 1;
+        }
+        if (template.ai_agent) |agent| {
+            try self.setAiAgent(entity, agent);
+            components_set += 1;
+        }
+        if (template.steering_agent) |agent| {
+            try self.setSteeringAgent(entity, agent);
             components_set += 1;
         }
         return components_set;
@@ -711,6 +873,16 @@ pub const DataSystem = struct {
         const moved = self.collision_responses.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].collision_response_index = @intCast(index);
     }
+
+    fn removeAiAgentAt(self: *DataSystem, index: usize) void {
+        const moved = self.ai_agents.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_agent_index = @intCast(index);
+    }
+
+    fn removeSteeringAgentAt(self: *DataSystem, index: usize) void {
+        const moved = self.steering_agents.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].steering_agent_index = @intCast(index);
+    }
 };
 
 const EntitySlot = struct {
@@ -724,6 +896,8 @@ const EntitySlot = struct {
     asset_ref_index: ?u32 = null,
     collision_bounds_index: ?u32 = null,
     collision_response_index: ?u32 = null,
+    ai_agent_index: ?u32 = null,
+    steering_agent_index: ?u32 = null,
 
     fn addComponent(self: *EntitySlot, component: Component) void {
         self.component_mask |= componentMask(component);
@@ -743,6 +917,39 @@ fn validateCollisionBounds(bounds: CollisionBounds) !void {
 fn validateCollisionResponse(response: CollisionResponse) !void {
     if (!std.math.isFinite(response.restitution)) return error.InvalidCollisionResponse;
     if (response.restitution < 0) return error.InvalidCollisionResponse;
+}
+
+fn validateAiAgent(agent: AiAgent) !void {
+    if (!std.math.isFinite(agent.wander_amplitude) or !std.math.isFinite(agent.seek_weight)) return error.InvalidAiAgent;
+    if (agent.wander_amplitude < 0 or agent.seek_weight < 0) return error.InvalidAiAgent;
+    if (agent.wander_amplitude > max_ai_wander_amplitude or agent.seek_weight > max_ai_seek_weight) return error.InvalidAiAgent;
+}
+
+fn validateSteeringAgent(agent: SteeringAgent) !void {
+    if (!std.math.isFinite(agent.agent_radius) or
+        !std.math.isFinite(agent.waypoint_tolerance) or
+        !std.math.isFinite(agent.avoidance_radius) or
+        !std.math.isFinite(agent.avoidance_weight))
+    {
+        return error.InvalidSteeringAgent;
+    }
+    if (agent.agent_radius <= 0 or
+        agent.waypoint_tolerance < 0 or
+        agent.avoidance_radius < 0 or
+        agent.avoidance_weight < 0)
+    {
+        return error.InvalidSteeringAgent;
+    }
+    if (agent.agent_radius > max_steering_radius or
+        agent.waypoint_tolerance > max_steering_radius or
+        agent.avoidance_radius > max_steering_radius or
+        agent.avoidance_weight > max_steering_weight or
+        agent.max_neighbor_samples > max_steering_neighbor_samples or
+        agent.replan_cooldown_steps > max_steering_cooldown_steps or
+        agent.unavailable_backoff_steps > max_steering_cooldown_steps)
+    {
+        return error.InvalidSteeringAgent;
+    }
 }
 
 const MovementBodyStore = struct {
@@ -1141,44 +1348,43 @@ const PrimitiveVisualStore = struct {
 
 const AssetReferenceStore = struct {
     entities: std.ArrayList(EntityId) = .empty,
-    relative_paths: std.ArrayList([]const u8) = .empty,
+    sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
 
-    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, owned_path: []const u8) !u32 {
+    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, sprite: SpriteAssetId) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
         const capacity = self.entities.items.len + 1;
         try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.relative_paths.ensureTotalCapacity(allocator, capacity);
+        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
-        self.relative_paths.appendAssumeCapacity(owned_path);
+        self.sprite_ids.appendAssumeCapacity(sprite);
         return index;
     }
 
     fn removeAt(self: *AssetReferenceStore, allocator: std.mem.Allocator, index: usize) ?EntityId {
-        allocator.free(self.relative_paths.items[index]);
+        _ = allocator;
         const last = self.entities.items.len - 1;
         const moved_entity = if (index != last) self.entities.items[last] else null;
         self.entities.items[index] = self.entities.items[last];
-        self.relative_paths.items[index] = self.relative_paths.items[last];
+        self.sprite_ids.items[index] = self.sprite_ids.items[last];
         _ = self.entities.pop();
-        _ = self.relative_paths.pop();
+        _ = self.sprite_ids.pop();
         return moved_entity;
     }
 
     fn sliceConst(self: *const AssetReferenceStore) ConstAssetReferenceSlice {
-        return .{ .entities = self.entities.items, .relative_paths = self.relative_paths.items };
+        return .{ .entities = self.entities.items, .sprite_ids = self.sprite_ids.items };
     }
 
     fn clearRetainingCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        for (self.relative_paths.items) |path| allocator.free(path);
+        _ = allocator;
         self.entities.clearRetainingCapacity();
-        self.relative_paths.clearRetainingCapacity();
+        self.sprite_ids.clearRetainingCapacity();
     }
 
     fn deinit(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        for (self.relative_paths.items) |path| allocator.free(path);
         self.entities.deinit(allocator);
-        self.relative_paths.deinit(allocator);
+        self.sprite_ids.deinit(allocator);
         self.* = .{};
     }
 };
@@ -1347,6 +1553,216 @@ const CollisionResponseStore = struct {
     }
 };
 
+const AiAgentStore = struct {
+    entities: std.ArrayList(EntityId) = .empty,
+    behaviors: std.ArrayList(AiBehavior) = .empty,
+    wander_amplitudes: HotF32List = .empty,
+    seek_weights: HotF32List = .empty,
+
+    fn append(self: *AiAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: AiAgent) !u32 {
+        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        try self.ensureCapacityForOne(allocator);
+        const index: u32 = @intCast(self.entities.items.len);
+        self.entities.appendAssumeCapacity(entity);
+        self.behaviors.appendAssumeCapacity(agent.behavior);
+        self.wander_amplitudes.appendAssumeCapacity(agent.wander_amplitude);
+        self.seek_weights.appendAssumeCapacity(agent.seek_weight);
+        return index;
+    }
+
+    fn set(self: *AiAgentStore, index: usize, agent: AiAgent) void {
+        self.behaviors.items[index] = agent.behavior;
+        self.wander_amplitudes.items[index] = agent.wander_amplitude;
+        self.seek_weights.items[index] = agent.seek_weight;
+    }
+
+    fn get(self: *const AiAgentStore, index: usize) AiAgent {
+        return .{
+            .behavior = self.behaviors.items[index],
+            .wander_amplitude = self.wander_amplitudes.items[index],
+            .seek_weight = self.seek_weights.items[index],
+        };
+    }
+
+    fn removeAt(self: *AiAgentStore, index: usize) ?EntityId {
+        const last = self.entities.items.len - 1;
+        const moved_entity = if (index != last) self.entities.items[last] else null;
+        self.entities.items[index] = self.entities.items[last];
+        self.behaviors.items[index] = self.behaviors.items[last];
+        self.wander_amplitudes.items[index] = self.wander_amplitudes.items[last];
+        self.seek_weights.items[index] = self.seek_weights.items[last];
+        _ = self.entities.pop();
+        _ = self.behaviors.pop();
+        _ = self.wander_amplitudes.pop();
+        _ = self.seek_weights.pop();
+        return moved_entity;
+    }
+
+    fn sliceConst(self: *const AiAgentStore) ConstAiAgentSlice {
+        return .{
+            .entities = self.entities.items,
+            .behaviors = self.behaviors.items,
+            .wander_amplitudes = self.wander_amplitudes.items,
+            .seek_weights = self.seek_weights.items,
+        };
+    }
+
+    fn clearRetainingCapacity(self: *AiAgentStore) void {
+        self.entities.clearRetainingCapacity();
+        self.behaviors.clearRetainingCapacity();
+        self.wander_amplitudes.clearRetainingCapacity();
+        self.seek_weights.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *AiAgentStore, allocator: std.mem.Allocator) void {
+        self.entities.deinit(allocator);
+        self.behaviors.deinit(allocator);
+        self.wander_amplitudes.deinit(allocator);
+        self.seek_weights.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {
+        const capacity = self.entities.items.len + 1;
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.behaviors.ensureTotalCapacity(allocator, capacity);
+        try self.wander_amplitudes.ensureTotalCapacity(allocator, capacity);
+        try self.seek_weights.ensureTotalCapacity(allocator, capacity);
+    }
+};
+
+const SteeringAgentStore = struct {
+    entities: std.ArrayList(EntityId) = .empty,
+    agent_radii: HotF32List = .empty,
+    waypoint_tolerances: HotF32List = .empty,
+    avoidance_radii: HotF32List = .empty,
+    avoidance_weights: HotF32List = .empty,
+    max_neighbor_samples: std.ArrayList(u16) = .empty,
+    stuck_step_thresholds: std.ArrayList(u16) = .empty,
+    replan_cooldown_steps: std.ArrayList(u16) = .empty,
+    unavailable_backoff_steps: std.ArrayList(u16) = .empty,
+
+    fn append(self: *SteeringAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: SteeringAgent) !u32 {
+        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+        try self.ensureCapacityForOne(allocator);
+        const index: u32 = @intCast(self.entities.items.len);
+        self.entities.appendAssumeCapacity(entity);
+        self.appendColumnsAssumeCapacity(agent);
+        return index;
+    }
+
+    fn set(self: *SteeringAgentStore, index: usize, agent: SteeringAgent) void {
+        self.agent_radii.items[index] = agent.agent_radius;
+        self.waypoint_tolerances.items[index] = agent.waypoint_tolerance;
+        self.avoidance_radii.items[index] = agent.avoidance_radius;
+        self.avoidance_weights.items[index] = agent.avoidance_weight;
+        self.max_neighbor_samples.items[index] = agent.max_neighbor_samples;
+        self.stuck_step_thresholds.items[index] = agent.stuck_step_threshold;
+        self.replan_cooldown_steps.items[index] = agent.replan_cooldown_steps;
+        self.unavailable_backoff_steps.items[index] = agent.unavailable_backoff_steps;
+    }
+
+    fn get(self: *const SteeringAgentStore, index: usize) SteeringAgent {
+        return .{
+            .agent_radius = self.agent_radii.items[index],
+            .waypoint_tolerance = self.waypoint_tolerances.items[index],
+            .avoidance_radius = self.avoidance_radii.items[index],
+            .avoidance_weight = self.avoidance_weights.items[index],
+            .max_neighbor_samples = self.max_neighbor_samples.items[index],
+            .stuck_step_threshold = self.stuck_step_thresholds.items[index],
+            .replan_cooldown_steps = self.replan_cooldown_steps.items[index],
+            .unavailable_backoff_steps = self.unavailable_backoff_steps.items[index],
+        };
+    }
+
+    fn removeAt(self: *SteeringAgentStore, index: usize) ?EntityId {
+        const last = self.entities.items.len - 1;
+        const moved_entity = if (index != last) self.entities.items[last] else null;
+        self.entities.items[index] = self.entities.items[last];
+        self.agent_radii.items[index] = self.agent_radii.items[last];
+        self.waypoint_tolerances.items[index] = self.waypoint_tolerances.items[last];
+        self.avoidance_radii.items[index] = self.avoidance_radii.items[last];
+        self.avoidance_weights.items[index] = self.avoidance_weights.items[last];
+        self.max_neighbor_samples.items[index] = self.max_neighbor_samples.items[last];
+        self.stuck_step_thresholds.items[index] = self.stuck_step_thresholds.items[last];
+        self.replan_cooldown_steps.items[index] = self.replan_cooldown_steps.items[last];
+        self.unavailable_backoff_steps.items[index] = self.unavailable_backoff_steps.items[last];
+        _ = self.entities.pop();
+        _ = self.agent_radii.pop();
+        _ = self.waypoint_tolerances.pop();
+        _ = self.avoidance_radii.pop();
+        _ = self.avoidance_weights.pop();
+        _ = self.max_neighbor_samples.pop();
+        _ = self.stuck_step_thresholds.pop();
+        _ = self.replan_cooldown_steps.pop();
+        _ = self.unavailable_backoff_steps.pop();
+        return moved_entity;
+    }
+
+    fn sliceConst(self: *const SteeringAgentStore) ConstSteeringAgentSlice {
+        return .{
+            .entities = self.entities.items,
+            .agent_radii = self.agent_radii.items,
+            .waypoint_tolerances = self.waypoint_tolerances.items,
+            .avoidance_radii = self.avoidance_radii.items,
+            .avoidance_weights = self.avoidance_weights.items,
+            .max_neighbor_samples = self.max_neighbor_samples.items,
+            .stuck_step_thresholds = self.stuck_step_thresholds.items,
+            .replan_cooldown_steps = self.replan_cooldown_steps.items,
+            .unavailable_backoff_steps = self.unavailable_backoff_steps.items,
+        };
+    }
+
+    fn clearRetainingCapacity(self: *SteeringAgentStore) void {
+        self.entities.clearRetainingCapacity();
+        self.agent_radii.clearRetainingCapacity();
+        self.waypoint_tolerances.clearRetainingCapacity();
+        self.avoidance_radii.clearRetainingCapacity();
+        self.avoidance_weights.clearRetainingCapacity();
+        self.max_neighbor_samples.clearRetainingCapacity();
+        self.stuck_step_thresholds.clearRetainingCapacity();
+        self.replan_cooldown_steps.clearRetainingCapacity();
+        self.unavailable_backoff_steps.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *SteeringAgentStore, allocator: std.mem.Allocator) void {
+        self.entities.deinit(allocator);
+        self.agent_radii.deinit(allocator);
+        self.waypoint_tolerances.deinit(allocator);
+        self.avoidance_radii.deinit(allocator);
+        self.avoidance_weights.deinit(allocator);
+        self.max_neighbor_samples.deinit(allocator);
+        self.stuck_step_thresholds.deinit(allocator);
+        self.replan_cooldown_steps.deinit(allocator);
+        self.unavailable_backoff_steps.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureCapacityForOne(self: *SteeringAgentStore, allocator: std.mem.Allocator) !void {
+        const capacity = self.entities.items.len + 1;
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.agent_radii.ensureTotalCapacity(allocator, capacity);
+        try self.waypoint_tolerances.ensureTotalCapacity(allocator, capacity);
+        try self.avoidance_radii.ensureTotalCapacity(allocator, capacity);
+        try self.avoidance_weights.ensureTotalCapacity(allocator, capacity);
+        try self.max_neighbor_samples.ensureTotalCapacity(allocator, capacity);
+        try self.stuck_step_thresholds.ensureTotalCapacity(allocator, capacity);
+        try self.replan_cooldown_steps.ensureTotalCapacity(allocator, capacity);
+        try self.unavailable_backoff_steps.ensureTotalCapacity(allocator, capacity);
+    }
+
+    fn appendColumnsAssumeCapacity(self: *SteeringAgentStore, agent: SteeringAgent) void {
+        self.agent_radii.appendAssumeCapacity(agent.agent_radius);
+        self.waypoint_tolerances.appendAssumeCapacity(agent.waypoint_tolerance);
+        self.avoidance_radii.appendAssumeCapacity(agent.avoidance_radius);
+        self.avoidance_weights.appendAssumeCapacity(agent.avoidance_weight);
+        self.max_neighbor_samples.appendAssumeCapacity(agent.max_neighbor_samples);
+        self.stuck_step_thresholds.appendAssumeCapacity(agent.stuck_step_threshold);
+        self.replan_cooldown_steps.appendAssumeCapacity(agent.replan_cooldown_steps);
+        self.unavailable_backoff_steps.appendAssumeCapacity(agent.unavailable_backoff_steps);
+    }
+};
+
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
@@ -1410,6 +1826,29 @@ fn expectCollisionResponseColumnsAligned(slice: ConstCollisionResponseSlice) !vo
     try std.testing.expectEqual(slice.entities.len, slice.mobilities.len);
     try std.testing.expectEqual(slice.entities.len, slice.restitution.len);
     try expectPointerAligned(slice.restitution.ptr);
+}
+
+fn expectAiAgentColumnsAligned(slice: ConstAiAgentSlice) !void {
+    try std.testing.expectEqual(slice.entities.len, slice.behaviors.len);
+    try std.testing.expectEqual(slice.entities.len, slice.wander_amplitudes.len);
+    try std.testing.expectEqual(slice.entities.len, slice.seek_weights.len);
+    try expectPointerAligned(slice.wander_amplitudes.ptr);
+    try expectPointerAligned(slice.seek_weights.ptr);
+}
+
+fn expectSteeringAgentColumnsAligned(slice: ConstSteeringAgentSlice) !void {
+    try std.testing.expectEqual(slice.entities.len, slice.agent_radii.len);
+    try std.testing.expectEqual(slice.entities.len, slice.waypoint_tolerances.len);
+    try std.testing.expectEqual(slice.entities.len, slice.avoidance_radii.len);
+    try std.testing.expectEqual(slice.entities.len, slice.avoidance_weights.len);
+    try std.testing.expectEqual(slice.entities.len, slice.max_neighbor_samples.len);
+    try std.testing.expectEqual(slice.entities.len, slice.stuck_step_thresholds.len);
+    try std.testing.expectEqual(slice.entities.len, slice.replan_cooldown_steps.len);
+    try std.testing.expectEqual(slice.entities.len, slice.unavailable_backoff_steps.len);
+    try expectPointerAligned(slice.agent_radii.ptr);
+    try expectPointerAligned(slice.waypoint_tolerances.ptr);
+    try expectPointerAligned(slice.avoidance_radii.ptr);
+    try expectPointerAligned(slice.avoidance_weights.ptr);
 }
 
 test "entity ids reject invalid values and match slots exactly" {
@@ -1489,11 +1928,15 @@ test "component masks track entity membership for system queries" {
     try data.setPrimitiveVisual(entity, testVisual());
     try data.setCollisionBounds(entity, testBounds(2));
     try data.setCollisionResponse(entity, testResponse(.solid, .dynamic, 0));
+    try data.setAiAgent(entity, .{ .behavior = .wander });
+    try data.setSteeringAgent(entity, testSteeringAgent(1));
     try std.testing.expect(data.hasComponents(entity, component_masks.render_primitive));
     try std.testing.expect(data.hasComponents(entity, component_masks.collision_bounds));
     try std.testing.expect(data.hasComponents(entity, component_masks.collision_response));
+    try std.testing.expect(data.hasComponents(entity, component_masks.ai_agent));
+    try std.testing.expect(data.hasComponents(entity, component_masks.steering_agent));
     try std.testing.expectEqual(
-        component_masks.movement_body | component_masks.facing | component_masks.primitive_visual | component_masks.collision_bounds | component_masks.collision_response,
+        component_masks.movement_body | component_masks.facing | component_masks.primitive_visual | component_masks.collision_bounds | component_masks.collision_response | component_masks.ai_agent | component_masks.steering_agent,
         data.componentMaskFor(entity),
     );
 
@@ -1557,9 +2000,10 @@ test "destroying an entity removes every attached data row" {
     try data.setMovementBody(entity, testBody(1));
     try data.setFacing(entity, .{ .direction = .right });
     try data.setPrimitiveVisual(entity, testVisual());
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
     try data.setCollisionBounds(entity, testBounds(1));
     try data.setCollisionResponse(entity, testResponse(.bounce, .dynamic, 0.75));
+    try data.setSteeringAgent(entity, testSteeringAgent(1));
 
     try std.testing.expect(data.destroyEntity(entity));
     try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
@@ -1568,6 +2012,7 @@ test "destroying an entity removes every attached data row" {
     try std.testing.expectEqual(@as(usize, 0), data.assetReferenceSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), data.collisionResponseSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.steeringAgentSliceConst().entities.len);
 }
 
 test "primitive visual store is columnar and compact after removal" {
@@ -1599,7 +2044,7 @@ test "reset invalidates old ids while keeping system reusable" {
 
     const entity = try data.createEntity();
     try data.setMovementBody(entity, testBody(1));
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
 
     data.reset();
     try std.testing.expect(!data.isAlive(entity));
@@ -1611,20 +2056,17 @@ test "reset invalidates old ids while keeping system reusable" {
     try std.testing.expect(reused.generation != entity.generation);
 }
 
-test "asset references validate safe relative paths and own path storage" {
+test "asset references store stable sprite ids" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     const entity = try data.createEntity();
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player.png" });
-    try std.testing.expectEqualStrings("sprites/player.png", data.assetReferenceConst(entity).?.relative_path);
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
 
-    try data.setAssetReference(entity, .{ .relative_path = "sprites/player-alt.png" });
-    try std.testing.expectEqualStrings("sprites/player-alt.png", data.assetReferenceConst(entity).?.relative_path);
-
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "../player.png" }));
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "/tmp/player.png" }));
-    try std.testing.expectError(error.InvalidAssetPath, data.setAssetReference(entity, .{ .relative_path = "" }));
+    const slice = data.assetReferenceSliceConst();
+    try std.testing.expectEqual(@as(usize, 1), slice.entities.len);
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, slice.sprite_ids[0]);
 }
 
 test "collision bounds store is columnar compact and rejects invalid bounds" {
@@ -1656,6 +2098,11 @@ test "collision bounds store is columnar compact and rejects invalid bounds" {
     try std.testing.expect(data.collisionBoundsConst(first) != null);
     try std.testing.expect(data.collisionBoundsConst(third) != null);
     try std.testing.expect(data.collisionBoundsConst(second) == null);
+    try std.testing.expect(data.collisionBoundsDenseIndex(first) != null);
+    try std.testing.expect(data.collisionBoundsDenseIndex(third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data.collisionBoundsDenseIndex(second));
+    try std.testing.expectEqual(first.index, slice.entities[data.collisionBoundsDenseIndex(first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[data.collisionBoundsDenseIndex(third).?].index);
 }
 
 test "collision response store is columnar compact and rejects invalid response data" {
@@ -1685,6 +2132,11 @@ test "collision response store is columnar compact and rejects invalid response 
     try std.testing.expect(data.collisionResponseConst(first) != null);
     try std.testing.expect(data.collisionResponseConst(third) != null);
     try std.testing.expect(data.collisionResponseConst(second) == null);
+    try std.testing.expect(data.collisionResponseDenseIndex(first) != null);
+    try std.testing.expect(data.collisionResponseDenseIndex(third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data.collisionResponseDenseIndex(second));
+    try std.testing.expectEqual(first.index, slice.entities[data.collisionResponseDenseIndex(first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[data.collisionResponseDenseIndex(third).?].index);
 }
 
 test "structural commands apply entity creation and component changes in order" {
@@ -1699,24 +2151,37 @@ test "structural commands apply entity creation and component changes in order" 
             .primitive_visual = testVisualWithSize(20),
             .collision_bounds = testBounds(6),
             .collision_response = testResponse(.solid, .dynamic, 0),
+            .ai_agent = .{ .behavior = .wander, .wander_amplitude = 42.0, .seek_weight = 0.1 },
+            .steering_agent = testSteeringAgent(1),
         } },
         .{ .set_movement_body = .{ .entity = existing, .body = testBody(3) } },
         .{ .set_facing = .{ .entity = existing, .facing = .{ .direction = .right } } },
         .{ .set_collision_bounds = .{ .entity = existing, .bounds = testBounds(8) } },
         .{ .set_collision_response = .{ .entity = existing, .response = testResponse(.bounce, .dynamic, 0.8) } },
+        .{ .set_ai_agent = .{ .entity = existing, .agent = .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 0.75 } } },
+        .{ .set_steering_agent = .{ .entity = existing, .agent = testSteeringAgent(2) } },
     };
 
     const stats = try data.applyStructuralCommands(&commands);
 
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 0), stats.destroyed);
-    try std.testing.expectEqual(@as(usize, 9), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 13), stats.components_set);
     try std.testing.expectEqual(@as(usize, 0), stats.stale_skipped);
     try std.testing.expectEqual(@as(usize, 2), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(f32, 3), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(Facing.right, data.facingConst(existing).?.direction);
     try std.testing.expectEqual(@as(f32, 8), data.collisionBoundsConst(existing).?.size.x);
     try std.testing.expectEqual(CollisionResponseMode.bounce, data.collisionResponseConst(existing).?.mode);
+    const ai_slice = data.aiAgentSliceConst();
+    try expectAiAgentColumnsAligned(ai_slice);
+    try std.testing.expectEqual(@as(usize, 2), ai_slice.entities.len);
+    const existing_ai = data.aiAgentConst(existing).?;
+    try std.testing.expectEqual(AiBehavior.seek, existing_ai.behavior);
+    try std.testing.expectEqual(@as(f32, 0.75), existing_ai.seek_weight);
+    try std.testing.expectEqual(@as(f32, 14), data.steeringAgentConst(existing).?.agent_radius);
+    // created one also has ai from template
+    try std.testing.expect(data.aiAgentConst(data.movementBodySliceConst().entities[0]) != null or data.aiAgentConst(data.movementBodySliceConst().entities[1]) != null);
 }
 
 test "structural commands skip stale entities and preserve deterministic command order" {
@@ -1745,19 +2210,123 @@ test "structural commands skip stale entities and preserve deterministic command
     try std.testing.expectEqual(@as(f32, 5), data.movementBodyConst(replacement).?.position.x);
 }
 
-test "structural commands validate asset references before creating entities" {
+test "ai agent component stores dense columns, supports template create and set/get, rejects invalid, compacts on destroy" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setAiAgent(first, .{ .behavior = .wander, .wander_amplitude = 12.5, .seek_weight = 0 });
+    try data.setAiAgent(second, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 0.9 });
+    try data.setAiAgent(third, .{ .behavior = .wander, .wander_amplitude = 99, .seek_weight = 0.1 });
+    try data.setAiAgent(first, .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 0.3 });
+
+    const first_agent = data.aiAgentConst(first).?;
+    try std.testing.expectEqual(AiBehavior.seek, first_agent.behavior);
+    try std.testing.expectEqual(@as(f32, 7), first_agent.wander_amplitude);
+    try std.testing.expectEqual(@as(f32, 0.3), first_agent.seek_weight);
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = -0.1 }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .seek_weight = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = std.math.floatMax(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .seek_weight = max_ai_seek_weight + 1.0 }));
+
+    try std.testing.expect(data.destroyEntity(second));
+    const slice = data.aiAgentSliceConst();
+    try expectAiAgentColumnsAligned(slice);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+    try std.testing.expect(data.aiAgentConst(first) != null);
+    try std.testing.expect(data.aiAgentConst(third) != null);
+    try std.testing.expect(data.aiAgentConst(second) == null);
+}
+
+test "steering agent component stores dense columns, supports set/get, rejects invalid, compacts on destroy" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setSteeringAgent(first, testSteeringAgent(1));
+    try data.setSteeringAgent(second, testSteeringAgent(2));
+    try data.setSteeringAgent(third, testSteeringAgent(3));
+    try data.setSteeringAgent(first, .{
+        .agent_radius = 9,
+        .waypoint_tolerance = 3,
+        .avoidance_radius = 42,
+        .avoidance_weight = 2.5,
+        .max_neighbor_samples = 7,
+        .stuck_step_threshold = 5,
+        .replan_cooldown_steps = 11,
+        .unavailable_backoff_steps = 23,
+    });
+
+    const first_agent = data.steeringAgentConst(first).?;
+    try std.testing.expectEqual(@as(f32, 9), first_agent.agent_radius);
+    try std.testing.expectEqual(@as(f32, 3), first_agent.waypoint_tolerance);
+    try std.testing.expectEqual(@as(f32, 42), first_agent.avoidance_radius);
+    try std.testing.expectEqual(@as(f32, 2.5), first_agent.avoidance_weight);
+    try std.testing.expectEqual(@as(u16, 7), first_agent.max_neighbor_samples);
+    try std.testing.expectEqual(@as(u16, 5), first_agent.stuck_step_threshold);
+    try std.testing.expectEqual(@as(u16, 11), first_agent.replan_cooldown_steps);
+    try std.testing.expectEqual(@as(u16, 23), first_agent.unavailable_backoff_steps);
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .agent_radius = 0 }));
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .avoidance_weight = -0.1 }));
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .waypoint_tolerance = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .avoidance_radius = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidSteeringAgent, data.setSteeringAgent(first, .{ .max_neighbor_samples = max_steering_neighbor_samples + 1 }));
+
+    try std.testing.expect(data.destroyEntity(second));
+    const slice = data.steeringAgentSliceConst();
+    try expectSteeringAgentColumnsAligned(slice);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+    try std.testing.expect(data.steeringAgentConst(first) != null);
+    try std.testing.expect(data.steeringAgentConst(third) != null);
+    try std.testing.expect(data.steeringAgentConst(second) == null);
+    try std.testing.expect(data.steeringAgentDenseIndex(first) != null);
+    try std.testing.expect(data.steeringAgentDenseIndex(third) != null);
+    try std.testing.expectEqual(@as(?usize, null), data.steeringAgentDenseIndex(second));
+    try std.testing.expectEqual(first.index, slice.entities[data.steeringAgentDenseIndex(first).?].index);
+    try std.testing.expectEqual(third.index, slice.entities[data.steeringAgentDenseIndex(third).?].index);
+}
+
+test "ai agent via EntityTemplate in structural create and mask queries" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     const commands = [_]StructuralCommand{
         .{ .create_entity = .{
             .movement_body = testBody(1),
-            .asset_reference = .{ .relative_path = "../bad.png" },
+            .ai_agent = .{ .behavior = .wander, .wander_amplitude = 55, .seek_weight = 0 },
+            .steering_agent = testSteeringAgent(1),
+        } },
+    };
+    _ = try data.applyStructuralCommands(&commands);
+
+    const entity = data.movementBodySliceConst().entities[0];
+    try std.testing.expect(data.hasComponents(entity, component_masks.ai_agent | component_masks.steering_agent | component_masks.movement_body));
+    try std.testing.expect(!data.hasComponents(entity, component_masks.collision_response));
+    const agent = data.aiAgentConst(entity).?;
+    try std.testing.expectEqual(AiBehavior.wander, agent.behavior);
+    try std.testing.expectEqual(@as(f32, 55), agent.wander_amplitude);
+    try std.testing.expectEqual(@as(f32, 13), data.steeringAgentConst(entity).?.agent_radius);
+}
+
+test "structural commands set stable asset references" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(1),
+            .asset_reference = .{ .sprite = .demo_tile },
         } },
     };
 
-    try std.testing.expectError(error.InvalidAssetPath, data.applyStructuralCommands(&commands));
-    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    _ = try data.applyStructuralCommands(&commands);
+    const entity = data.assetReferenceSliceConst().entities[0];
+    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
 }
 
 test "structural commands prevalidate fallible data before mutating" {
@@ -1771,11 +2340,51 @@ test "structural commands prevalidate fallible data before mutating" {
         .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
         .{ .create_entity = .{
             .movement_body = testBody(2),
-            .asset_reference = .{ .relative_path = "../bad.png" },
+            .collision_bounds = .{ .size = .{ .x = 0, .y = 12 } },
         } },
     };
 
-    try std.testing.expectError(error.InvalidAssetPath, data.applyStructuralCommands(&commands));
+    try std.testing.expectError(error.InvalidCollisionBounds, data.applyStructuralCommands(&commands));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+}
+
+test "structural commands prevalidate ai agents before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+            .ai_agent = .{ .behavior = .wander, .wander_amplitude = std.math.floatMax(f32), .seek_weight = 0 },
+        } },
+    };
+
+    try std.testing.expectError(error.InvalidAiAgent, data.applyStructuralCommands(&commands));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+}
+
+test "structural commands prevalidate steering agents before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+            .steering_agent = .{ .agent_radius = std.math.inf(f32) },
+        } },
+    };
+
+    try std.testing.expectError(error.InvalidSteeringAgent, data.applyStructuralCommands(&commands));
     try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
 }
@@ -1827,6 +2436,19 @@ fn testVisualWithSize(size: f32) PrimitiveVisual {
         .marker_length = 12,
         .marker_depth = 6,
         .marker_margin = 4,
+    };
+}
+
+fn testSteeringAgent(base: f32) SteeringAgent {
+    return .{
+        .agent_radius = base + 12,
+        .waypoint_tolerance = base + 4,
+        .avoidance_radius = base + 48,
+        .avoidance_weight = base + 1,
+        .max_neighbor_samples = @intFromFloat(base + 8),
+        .stuck_step_threshold = @intFromFloat(base + 12),
+        .replan_cooldown_steps = @intFromFloat(base + 16),
+        .unavailable_backoff_steps = @intFromFloat(base + 32),
     };
 }
 

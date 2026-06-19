@@ -7,10 +7,13 @@ const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const AudioService = @import("audio.zig").AudioService;
 const AssetCache = @import("../assets/cache.zig").AssetCache;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const build_options = @import("build_options");
 const config = @import("../config.zig");
 const DebugOverlay = if (build_options.debug_overlay) @import("../render/debug_overlay.zig").DebugOverlay else @import("../render/debug_overlay_stub.zig").DebugOverlay;
 const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
+const MainMenuState = @import("../game/main_menu_state.zig").MainMenuState;
+const SettingsMenuState = @import("../game/settings_menu_state.zig").SettingsMenuState;
 const frame_pacer = @import("frame_pacer.zig");
 const input_router = @import("input_router.zig");
 const log = @import("../core/logging.zig").app;
@@ -25,6 +28,7 @@ const RenderContext = @import("state.zig").RenderContext;
 const State = @import("state.zig").State;
 const StateStack = @import("state.zig").StateStack;
 const StateTransitions = @import("state.zig").StateTransitions;
+const state_policy = @import("state.zig").state_policy;
 const TextService = @import("../render/text.zig").TextService;
 const UpdateContext = @import("state.zig").UpdateContext;
 const ThreadSystem = @import("thread_system.zig").ThreadSystem;
@@ -42,6 +46,7 @@ pub const Engine = struct {
     audio_commands: AudioCommandBuffer,
     renderer: Renderer,
     asset_cache: AssetCache,
+    runtime_assets: RuntimeAssets,
     text_service: TextService,
     debug_overlay: DebugOverlay,
     states: StateStack,
@@ -90,6 +95,10 @@ pub const Engine = struct {
         var asset_cache = AssetCache.init(allocator, assets);
         errdefer asset_cache.deinit(&renderer);
 
+        var runtime_assets = RuntimeAssets.init();
+        try runtime_assets.preload(assets, &asset_cache, &renderer, &audio_service);
+        errdefer runtime_assets.deinit(&asset_cache, &renderer);
+
         var text_service = try TextService.init(allocator, assets);
         errdefer text_service.deinit(&renderer);
 
@@ -133,6 +142,7 @@ pub const Engine = struct {
             .audio_commands = audio_commands,
             .renderer = renderer,
             .asset_cache = asset_cache,
+            .runtime_assets = runtime_assets,
             .text_service = text_service,
             .debug_overlay = debug_overlay,
             .states = states,
@@ -151,6 +161,7 @@ pub const Engine = struct {
         self.states.deinit();
         self.debug_overlay.deinit();
         self.text_service.deinit(&self.renderer);
+        self.runtime_assets.deinit(&self.asset_cache, &self.renderer);
         self.asset_cache.deinit(&self.renderer);
         self.renderer.deinit();
         self.audio_commands.deinit();
@@ -177,7 +188,7 @@ pub const Engine = struct {
     pub fn handleEvents(self: *Engine) !void {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event)) {
-            input_router.routeEvent(self.states.inputRoutingPolicy(), &event, &self.input, &self.commands);
+            const routing_policy = self.states.inputRoutingPolicy();
             switch (event.type) {
                 c.SDL_EVENT_QUIT => {
                     log.debug("quit requested by SDL event", .{});
@@ -185,7 +196,10 @@ pub const Engine = struct {
                 },
                 else => {},
             }
-            try self.states.handleEvent(&event, &self.transitions);
+            const consumed = try self.states.handleEvent(&event, &self.transitions);
+            if (!consumed) {
+                input_router.routeEvent(routing_policy, &event, &self.input, &self.commands);
+            }
             try self.applyTransitions();
         }
 
@@ -208,7 +222,7 @@ pub const Engine = struct {
         time_loop: *TimeLoop,
     ) !void {
         const was_paused = self.pause.isPaused();
-        if (frame_policy.should_pause_gameplay and !self.pause.isPaused()) {
+        if (frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.states.isGameplayActive()) {
             log.debug("pausing gameplay while window cannot render", .{});
         }
         try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.nowNs());
@@ -217,7 +231,7 @@ pub const Engine = struct {
         {
             log.debug("resuming gameplay by input command", .{});
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());
-        } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause)) {
+        } else if (!frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.commands.wasPressed(Action.pause) and self.states.isGameplayActive()) {
             log.debug("pausing gameplay by input command", .{});
             try self.pause.enterUser(&self.states, &self.input, time_loop, self.nowNs());
         }
@@ -252,7 +266,7 @@ pub const Engine = struct {
             self.renderer.beginFrame(self.app_config.clear_color);
             try self.states.render(RenderContext{
                 .renderer = &self.renderer,
-                .asset_cache = &self.asset_cache,
+                .runtime_assets = &self.runtime_assets,
                 .text_service = &self.text_service,
                 .interpolation_alpha = interpolation_alpha,
                 .thread_system = &self.thread_system,
@@ -271,11 +285,13 @@ pub const Engine = struct {
                     }
                 },
                 .skipped_no_swapchain => {
-                    if (!self.pause.isPaused()) {
-                        log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
-                    }
                     self.swapchain_blocked = true;
-                    try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                    if (self.states.isGameplayActive()) {
+                        if (!self.pause.isPaused()) {
+                            log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
+                        }
+                        try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                    }
                     frame_pacer.paceFallbackFrame(frame_start_ns);
                 },
             }
@@ -341,19 +357,20 @@ fn minimumWindowSizeForPolicy(policy: resolution.ResolutionPolicy) ?resolution.L
 
 fn bootstrapStartupState(states: *StateStack, allocator: std.mem.Allocator, app_config: config.AppConfig) !void {
     const logical_size = app_config.resolution_policy.logical_size;
-    // GameDemoState is the startup state until a real MainMenuState exists.
-    const game_demo_state_ptr = try allocator.create(GameDemoState);
+    // Main menu is now the default startup state (Slice 16). Gameplay is launched from it.
+    const menu_ptr = try allocator.create(MainMenuState);
     var owned_by_state = false;
-    errdefer if (!owned_by_state) allocator.destroy(game_demo_state_ptr);
-    game_demo_state_ptr.* = try GameDemoState.init(
+    errdefer if (!owned_by_state) allocator.destroy(menu_ptr);
+    menu_ptr.* = MainMenuState.init(
         allocator,
         @floatFromInt(logical_size.width),
         @floatFromInt(logical_size.height),
+        app_config.audio,
     );
 
-    const state = State.fromOwnedPtr(GameDemoState, game_demo_state_ptr);
+    const state = State.fromOwnedPtr(MainMenuState, menu_ptr);
     owned_by_state = true;
-    _ = try states.replaceOwnedGameplay(state);
+    _ = try states.replaceOwnedState(state, state_policy.opaque_screen);
 }
 
 test "integer fit requests logical minimum window size" {

@@ -55,8 +55,9 @@ pub const CollisionResponseSystem = struct {
     }
 
     /// Consumes the completed same-step sorted contact stream after
-    /// CollisionSystem count/prefix/write has finished. Dense movement indices
-    /// are fast-path hints; release builds revalidate before writing.
+    /// CollisionSystem broadphase/narrowphase contact generation has finished.
+    /// Dense movement indices are fast-path hints; release builds revalidate
+    /// before writing.
     pub fn update(self: *CollisionResponseSystem, data: *DataSystem, frame: *SimulationFrame) !CollisionResponseStats {
         const contacts = frame.contacts.mergedItems();
         self.clearIntentsRetainingCapacity();

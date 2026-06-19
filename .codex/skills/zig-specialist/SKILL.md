@@ -29,14 +29,35 @@ diagnosed before implementation.
 Place code in the layer that owns the behavior:
 
 - `src/main.zig`: executable entry and high-level fixed-step timing loop only.
-- `src/app/`: engine coordination, state stack, input routing, pause policy, timing, and frame pacing.
+- `src/app/`: engine coordination, state stack, input routing, pause policy, timing, frame pacing, audio service, and thread system.
 - `src/render/`: SDL_GPU renderer, camera, resources, text, and debug overlay.
 - `src/game/`: game/demo states, gameplay behavior, `DataSystem`, and ECS-style gameplay systems/processors.
 - `src/platform/`: SDL/platform integration helpers and smoke-test implementation.
-- `src/assets/`: runtime asset path resolution and installed asset loading.
+- `src/assets/`: runtime asset path resolution, installed asset loading, typed asset manifest, and startup `RuntimeAssets` catalog.
 - `src/core/`: small shared primitives only.
 
 If a change appears to belong in multiple layers, keep SDL/window/GPU ownership on the app/render/platform side and expose only the small API the game layer needs.
+
+## Simulation Pipeline And Event Boundaries
+
+When multiple gameplay states or simulation instances need the same fixed-step
+order, use a state-owned `SimulationPipeline` helper. `StateStack` remains the
+dispatch/lifetime owner and should not know domain controller internals.
+
+A gameplay state owns `DataSystem`, `SimulationFrame`, and its pipeline
+instance. The pipeline owns ordered stages and may compose light domain
+controllers for phase order, budgets, queues, cooldowns, conflict policy, and
+processor handoff. Controllers should not become hidden per-entity stores or
+replace hot SoA processors.
+
+Use typed simulation/domain events only as transient `SimulationFrame` or
+pipeline signals for important system changes. Persistent gameplay/domain facts
+stay in `DataSystem` or state-owned domain storage. Existing high-volume streams
+such as contacts, movement intents, navigation intents, path requests, render
+prep, and structural commands should remain specialized. Do not add global
+pub/sub buses, string-topic dispatchers, callback chains, or event payloads that
+carry pointers, app/render/audio handles, asset paths, allocators, or service
+references.
 
 ## Implementation Workflow
 
@@ -62,6 +83,7 @@ asset loading, state transitions, configuration, or an explicit cache.
 - Keep hot paths allocation-free unless the allocation is measured, bounded, and intentionally isolated.
 - Prefer enums, bitsets, arrays, slices, direct indices, ring buffers, and generational IDs for runtime dispatch and resource lookup.
 - Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation. Entity IDs, component masks, and dense typed SoA component stores live there; ECS systems/processors such as movement, AI, collision, pathfinding, and render preparation should be mostly stateless processors over `DataSystem` slices.
+- Store stable asset IDs such as `SpriteAssetId` and `AudioAssetId` in gameplay/render-prep data. Do not store string paths, `TextureId`, `TextureLease`, prepared sprite records, SDL_mixer handles, or loaded audio handles in `DataSystem`.
 - Keep hot ECS component data in dense SoA columns. Component masks are for membership/query decisions, not a replacement for direct slice iteration in hot processors.
 - Keep entity structural changes, state transitions, SDL/GPU calls, asset loading, save/load streaming, and renderer resource ownership out of threaded SIMD processors unless an explicit deferred/main-thread boundary is designed.
 - For threaded/SIMD ECS work, document hot SoA column alignment, split worker ranges so workers do not write the same cache line, and use 64-byte padding only for thread-shared records where false sharing is a real risk. Do not pad cold entity slot metadata by default.
@@ -74,10 +96,10 @@ asset loading, state transitions, configuration, or an explicit cache.
 Use the narrowest useful check first:
 
 - `zig build test` for unit behavior and reusable module coverage.
-- `zig build check` for compile coverage of the game and GPU smoke executable.
+- `zig build check` for compile coverage of the game, benchmark, and GPU smoke executables.
 - `zig build verify` before considering a larger implementation slice complete.
 - `zig build shaders` after shader source or shader build wiring changes.
-- `zig build gpu-smoke` only when display/GPU validation is relevant and a usable display environment exists.
+- `zig build gpu-smoke` only when display/GPU validation is relevant and a usable display environment exists; it exercises renderer initialization, installed shaders/assets, primitive draw submission, swapchain acquisition, and one-frame submit.
 - `zig build fmt` only when Zig/build files were edited and formatting is needed.
 
 Report any validation that could not be run, especially display-gated GPU checks.

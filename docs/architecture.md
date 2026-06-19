@@ -9,7 +9,9 @@ game-specific behavior under `src/game/`.
 - `src/main.zig` creates `AppConfig`, initializes `Engine`, and runs the fixed-step loop.
 - `src/config.zig` defines app configuration, presentation options, clear color,
   and thread-system defaults shared by build options and runtime startup.
-- `src/app/engine.zig` coordinates SDL app flow, the window, asset cache, audio service, text service, renderer, state stack, pause controller, input, debug overlay, and thread system.
+- `src/app/engine.zig` coordinates SDL app flow, the window, asset cache,
+  runtime asset catalog, audio service, text service, renderer, state stack,
+  pause controller, input, debug overlay, and thread system.
 - `src/app/audio.zig` owns SDL3_mixer lifecycle, app-level audio tracks,
   loaded audio assets, bus gains, and the fixed-step audio command buffer.
 - `src/app/input.zig` owns named actions, held gameplay input, and one-frame app/debug commands.
@@ -19,9 +21,11 @@ game-specific behavior under `src/game/`.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
-- `src/assets/assets.zig` resolves safe runtime asset paths, `src/assets/image.zig`
-  decodes PNGs into transient CPU image data, and `src/assets/cache.zig` caches
-  renderer-backed runtime assets.
+- `src/assets/assets.zig` resolves safe runtime asset paths,
+  `src/assets/image.zig` decodes PNGs into transient CPU image data,
+  `src/assets/cache.zig` caches renderer-backed runtime assets,
+  `src/assets/manifest.zig` defines stable startup sprite/audio IDs, and
+  `src/assets/runtime_assets.zig` owns the startup runtime asset catalog.
 - `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
 - `src/render/camera.zig` owns simple world-to-screen camera transforms.
 - `src/render/resources.zig` defines generational renderer resource IDs and descriptors.
@@ -29,21 +33,29 @@ game-specific behavior under `src/game/`.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
-- `src/game/game_demo_state.zig` and `src/game/pause_state.zig` are the current game states.
+- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state (Slice 16); gameplay is launched from it via transitions.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
   SoA stores for gameplay, collision, and render systems.
+- `src/game/simulation.zig` owns transient fixed-step streams, deterministic
+  range-output collection, and deferred structural command buffers.
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges.
+- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
+- `src/game/systems/steering.zig` consumes navigation intents and path status,
+  then emits final NPC movement intents with local avoidance.
+- `src/game/systems/collision.zig` generates deterministic contact streams.
+- `src/game/systems/collision_response.zig` consumes contacts and applies
+  response-policy movement corrections.
 - `src/game/systems/particle.zig` owns state-local transient particle effects
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
 - `src/gpu_smoke.zig` is the GPU smoke executable entry point, while
   `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports
   plus small SDL wrappers.
-- Audio assets live under `assets/audio/` and are resolved through the same
-  traversal-safe asset root.
+- Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
+  live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
@@ -94,30 +106,53 @@ coordinated by `Renderer` on the main/render thread.
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
 texture creation starts from decoded pixels and owns only the GPU texture
-resource. Retained `TextureId` leases and text texture leases belong to setup,
-state transitions, world/entity creation, or owner shutdown paths; hot render
-paths should keep drawing with retained IDs rather than performing asset,
-entity, or text lookup.
+resource. `Engine` owns `RuntimeAssets`, which preloads declared sprites through
+`AssetCache`, keeps retained texture lease tokens, releases them through the
+live cache/renderer owner, and exposes `SpriteAssetId` lookup as atlas-ready
+`{ texture, source_rect }` records. Hot render paths resolve stable IDs through
+this catalog and fall back to primitive rectangles when a declared sprite is
+unavailable. Engine-owned services must not persist pointers to sibling service
+fields; release paths take the live owner explicitly. Cache lease tokens include
+cache-owner identity, slot generation, and texture identity so release paths can
+reject stale, forged, or wrong-owner tokens. Missing declared startup content is
+logged and exposed as unavailable; fatal preload errors roll back partial sprite
+work instead of leaving retained renderer resources behind.
+
+Generated text follows the render-service ownership rule. `TextService` owns
+SDL_ttf, loaded fonts, and generated renderer text textures for the app
+lifetime. UI states describe text intent during render and receive only
+non-owning prepared text views when the intent changes. Stable render frames
+draw those prepared views directly, without re-checking the text cache. State
+teardown stays service-free: do not pass renderer/text/audio services into
+generic state destruction to compensate for escaped resource ownership.
 
 Game states request SFX and music through `AudioCommandBuffer` in
-`UpdateContext`. `AudioService` is app-owned because SDL_mixer device, mixer,
-track pool, loaded-audio cache, bus gains, and pause ducking are process-level
-runtime services. States choose what sound to request; they do not own
-`MIX_Mixer`, `MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio
-commands on the main thread after fixed-step state updates and state transition
-application. Gameplay pause stops active SFX and ducks music; resume restores
-music gain.
+`UpdateContext` using stable `AudioAssetId` values. `AudioService` is app-owned
+because SDL_mixer device, mixer, track pool, loaded-audio cache, bus gains, and
+pause ducking are process-level runtime services. Startup preload resolves
+declared audio paths before command drain; fixed-step audio commands carry IDs,
+gain, priority, frequency, and position only. States do not own `MIX_Mixer`,
+`MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio commands on
+the main thread after fixed-step state updates and state transition application.
+Gameplay pause stops active SFX and ducks music; resume restores music gain.
 
 Raw keyboard input maps to named actions in `src/app/input.zig`.
 `input_router.zig` applies the active state stack's action contexts before
-mutating held gameplay actions in `InputState` or one-frame app/debug commands
-in `FrameCommands`. State `handleEvent` methods still receive raw SDL events
-according to stack policy, so named-action routing and raw event handling stay
-separate.
+mutating held gameplay actions in `InputState` or one-frame UI/app/debug
+commands in `FrameCommands`. State `handleEvent` methods still receive raw SDL
+events according to stack policy, so named-action routing and raw event handling
+stay separate.
 
 State policies decide whether lower states receive updates, events, or render
 passes. Transitions are queued through `StateTransitions` and applied after the
 current dispatch completes.
+
+Pause notifications via `pauseActive`/`resumeActive` target the active `replaceGameplay`
+state (via the `StatePolicy.gameplay` flag on `StateStack`) so `GameDemoState` (and its
+`syncInterpolatedState` for movement/particles) receive the call even if overlays or the
+`PauseState` modal are present on top. `PauseController` + `Engine` gate entry (user + policy)
+so the pause overlay + associated side effects are never shown or applied over menus or
+non-gameplay states.
 
 ## Configuration And Diagnostics
 
@@ -141,15 +176,23 @@ work that must finish before the next system or render phase.
 
 Worker threads are pre-spawned at startup. The default worker thread count is based
 on CPU count, with the main/render thread participating as an additional worker
-while it waits. Small batches run inline on the main thread, and batch
-submission does not allocate after initialization.
+while it waits. Batch submission does not allocate after initialization.
+Production worker participation is timing-adaptive: batches start inline and
+move to worker participation only when measured completion time shows the
+threaded profile is worthwhile. Structural limits still force inline execution
+when there is no work, no available worker, only one splittable range, an
+explicit serial override, or a processor range-alignment constraint leaves no
+safe split.
 
 Adaptive work tuning chooses a complete batch profile: inline or threaded,
 worker threads, and items per claimed range. Worker count and range size remain
 distinct knobs, but `AdaptiveWorkTuner` measures them together so one controller
-owns the decision. The tuner starts inline, probes a threaded profile when the
-measured inline window is expensive enough, then searches smaller and larger
-aligned range sizes around the best measured threaded profile before settling.
+owns the decision. The tuner starts inline, records that inline baseline for the
+owning batch, probes a threaded profile when the measured work is expensive
+enough, and only reports a best threaded profile after a threaded candidate wins.
+Static item-count floors should not gate production threading; slower hardware
+or expensive small-N processors must be able to train their own threaded
+profile.
 Reported `worker_threads` counts are background worker threads only; the main
 thread is not included in that count and may also process ranges while waiting
 for the batch barrier.
@@ -162,12 +205,22 @@ frame batches, parked when idle, and joined during `ThreadSystem` shutdown.
 Processor-specific batches can align range starts to hot-column boundaries
 through `parallelForWithOptions`.
 
+Systems with multiple independently timed threaded stages own one tuner per
+stage. Do not train a shared stage profile across different work shapes, such as
+broadphase candidate generation and narrowphase contact validation, AI gather
+and decision emission, or future pathfinding frontier expansion and path
+reconstruction. If a stage preselects a profile before dispatch, it must pass
+the selected profile and the stage-owned tuner together so inline samples still
+train that stage before it decides whether to thread. Benchmark and diagnostics
+output should report inline stages as `inline`, not as a fake zero-worker range
+size.
+
 ## Gameplay Data
 
 Gameplay states own their own `DataSystem`; it is not an app singleton. The
 system stores persistent world entities, per-entity component masks for system
 membership queries, and typed SoA data such as movement bodies, facing,
-primitive visual intent, and relative asset references.
+primitive visual intent, and stable sprite asset references.
 Collision bounds are stored as dedicated persistent gameplay data rather than
 being inferred from render visuals.
 
@@ -185,6 +238,34 @@ merges transient outputs, and applies deferred structural commands at explicit
 main-thread commit points. `DataSystem` remains persistent storage, not the
 simulation scheduler.
 
+The current gameplay fixed-step pipeline is:
+
+1. Clear `SimulationFrame` and mark the step active.
+2. Apply main-thread player input and queue fixed-step audio commands.
+3. Run AI decision output, steering, and frame-delayed pathfinding.
+4. Apply merged movement intents on the main thread.
+5. Run movement over dense `DataSystem` movement slices.
+6. Clamp bounds, generate collision contacts, and apply collision response.
+7. Queue contact audio, emit/update transient particles, and merge outputs.
+8. Commit deferred structural commands to `DataSystem`.
+9. Render current `DataSystem` and particle state with interpolation.
+
+When multiple gameplay states or simulation instances need this same ordering,
+move the ordered processor sequence into a state-owned pipeline helper, such as
+`SimulationPipeline`, while keeping `StateStack` as the dispatch/lifetime owner.
+The helper should own phase order, budgets, queues, conflict policy, and output
+application for one gameplay state instance; it should not become a global
+engine scheduler, reflection system, or dynamic dependency graph.
+
+The pipeline is also the right place to compose light domain controllers for
+features such as combat, spawning, rules, encounters, or other gameplay
+domains. Controllers own feature orchestration: small queues, budgets,
+cooldowns, priority/conflict policy, and handoff between processors. They should
+emit `SimulationFrame` outputs or deferred structural commands and call
+processors with typed `DataSystem` views. They should not become hidden
+per-entity stores, own renderer/audio/SDL handles, or replace SoA processors for
+hot/reusable loops.
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
@@ -193,10 +274,11 @@ failures do not partially apply a command batch.
 
 Update processors receive typed slices or views from `DataSystem` during
 fixed-step updates instead of broad structural access. Render systems read
-immutable `DataSystem` slices during state render and submit draw calls through
-`Renderer`. `DataSystem` does not own SDL handles, GPU handles, SDL_mixer
-handles, live renderer texture IDs, asset leases, audio command buffers, input
-frame state, thread-system state, transient events, or scratch buffers.
+immutable `DataSystem` slices during state render, resolve stable sprite IDs
+through `RuntimeAssets`, and submit draw calls through `Renderer`. `DataSystem`
+does not own SDL handles, GPU handles, SDL_mixer handles, live renderer texture
+IDs, prepared sprite records, asset leases, audio command buffers, input frame
+state, thread-system state, transient events, or scratch buffers.
 
 `MovementSystem` updates movement-body slices as an ordered gameplay data
 processor, using SIMD lanes inside each assigned range and
@@ -207,12 +289,57 @@ boundaries and only write their assigned movement rows.
 `CollisionSystem` is a high-throughput contact generator over entities that have
 both movement bodies and collision bounds. It owns warmed, 64-byte-aligned AABB
 proxy scratch, preserves a sorted sweep-and-prune order across fixed steps, and
-uses range-window broadphase passes with count/prefix/write contact output.
+threads broadphase anchor ranges through `ThreadSystem` to emit candidate pairs
+once with SIMD Y-overlap filtering. Narrowphase then uses its own threaded batch
+over candidate pairs, computes AABB contact math with SIMD lanes inside each
+worker range, and merges range-owned contact buffers deterministically for
+same-step response. Thread-written range scratch is cache-line padded;
+persistent collision component data is not padded by default. Broadphase and
+narrowphase keep separate adaptive tuners and batch stats so each stage is
+measured against its own workload; benchmark detail rows report narrowphase
+separately so an inline narrowphase cannot be mistaken for a broadphase tuning
+result.
 Contacts are transient `SimulationFrame` data; `CollisionResponseSystem`
 consumes the completed same-step contact stream through explicit response-policy
 components, computes aligned correction columns with `src/core/simd.zig`, and
 applies sparse movement writes deterministically on the main thread before
 structural commands commit.
+
+`AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
+It receives const AiAgent + movement prior-position slices, builds a transient
+32-unit spatial grid, computes bounded local-separation samples, then emits
+threaded navigation intents through `SimulationFrame.navigation_intents`
+(count/prefix/write). Separation and intent emission have independent
+AdaptiveWorkTuner state and benchmark stats so each stage can remain inline or
+thread independently. Wander amplitude and seek prove non-player entities emit
+high-level goals from persistent data rather than hardcoded velocities.
+
+`SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
+component data, movement slices, static obstacle data, and frame-delayed
+`PathfindingSystem` status. It owns runtime path-following rows, replan
+cooldowns, unavailable-path backoff, stuck counters, and bounded local-avoidance
+bucket scratch outside `DataSystem`. Path-status, cooldown mutation, runtime-row
+pruning, and intent arbitration stay on the main-thread boundary, then the
+prepared steering work emits final NPC `MovementIntent`s through deterministic
+threaded range writes to `SimulationFrame.intents`.
+Priority arbitration chooses the highest-priority navigation intent per entity
+with stable stream order as the tie-breaker.
+Player movement remains direct input with no steering component, while collision
+response still resolves after movement.
+
+`PathfindingSystem` is a frame-delayed grid pathfinding processor under
+`src/game/systems/`. It owns the static versioned nav grid, pending request
+queue, duplicate suppression, completed result cache, unavailable-path cache,
+warmed A* scratch, per-stage adaptive tuner state, and benchmark stats.
+`SimulationFrame.path_requests` carries transient requests from steering or
+future rule systems; path queues, scratch, thread state, and live path caches
+stay out of `DataSystem`. Request key preparation and static grid marking use
+`src/core/simd.zig` lane batches where the work is regular; branch-heavy A*
+frontier expansion remains scalar inside threaded request ranges. Path results
+are consumed on later fixed steps so missing or unreachable paths do not stall
+same-step movement, and unavailable keys are cached by
+`nav_version + agent_class + start_cell + goal_cell` to avoid repeated request
+spam.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects
@@ -233,6 +360,16 @@ slices, merge by range index, and consume the result as a batch. Output order
 comes from stable input/range order, not worker timing or worker IDs. Structural
 mutation remains behind `DataSystem` batch commit boundaries; event and intent
 streams are transient simulation data, not persistent `DataSystem` state.
+
+Future simulation/domain event work should stay inside this same simulation
+contract. These events are typed, transient cross-system signals owned by the
+gameplay state's pipeline, useful for any important domain change that other
+systems must react to: tile changes, obstacle changes, weather changes, AI
+perception, navigation invalidation, combat, spawning, resources, or rule
+interactions. They are not a global pub/sub service. Persistent gameplay/domain
+facts stay in `DataSystem` or state-owned domain storage, high-volume streams
+remain specialized, and controllers consume immutable event slices in explicit
+pipeline stages before emitting typed outputs or deferred structural commands.
 
 ## SIMD Helpers
 

@@ -18,6 +18,18 @@ pub const Profile = enum {
     stress,
 };
 
+const event_scale_quick_counts = [_]usize{ 1_024, 4_096, 10_000 };
+const event_scale_standard_counts = [_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 };
+const event_scale_stress_counts = [_]usize{ 10_000, 25_000, 50_000 };
+
+pub fn eventScaleCounts(profile: Profile) []const usize {
+    return switch (profile) {
+        .quick => &event_scale_quick_counts,
+        .standard => &event_scale_standard_counts,
+        .stress => &event_scale_stress_counts,
+    };
+}
+
 pub const Options = struct {
     profile: Profile = .quick,
     warmup_iterations: usize = 5,
@@ -151,6 +163,7 @@ pub const RunStats = struct {
     skip_reason: []const u8 = "",
     item_count: usize = 0,
     candidate_pairs: usize = 0,
+    sample_count: usize = 0,
     output_count: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
@@ -158,7 +171,9 @@ pub const RunStats = struct {
     max_ns: u64 = 0,
     items_per_second: u64 = 0,
     batch: BatchSummary = .{},
+    secondary_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
+    secondary_work_tuning: ?WorkTuningSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -167,6 +182,23 @@ pub const RunStats = struct {
         };
     }
 };
+
+pub fn batchSummaryFromBatch(batch: BatchStats) BatchSummary {
+    return .{
+        .item_count = batch.item_count,
+        .range_count = batch.range_count,
+        .items_per_range = batch.items_per_range,
+        .range_alignment_items = batch.range_alignment_items,
+        .available_worker_threads = batch.available_worker_threads,
+        .active_worker_threads = batch.active_worker_threads,
+        .main_thread_ranges = batch.main_thread_ranges,
+        .worker_thread_ranges = batch.worker_thread_ranges,
+        .worker_utilization_percent = @intFromFloat(batch.worker_utilization * 100.0),
+        .batch_duration_ns = batch.batch_duration_ns,
+        .main_thread_wait_ns = batch.main_thread_wait_ns,
+        .ran_inline = batch.ran_inline,
+    };
+}
 
 const CaseResult = struct {
     case: BenchmarkCase,
@@ -191,7 +223,7 @@ pub const BatchSummary = struct {
 pub const WorkTuningSummary = struct {
     phase: AdaptiveWorkPhase = .learning,
     initial_worker_threads: usize = 0,
-    initial_items_per_range: usize = 0,
+    initial_range_items: usize = 0,
     final_worker_threads: usize = 0,
     final_items_per_range: usize = 0,
     best_worker_threads: usize = 0,
@@ -206,6 +238,7 @@ pub const WorkTuningSummary = struct {
     settled_before_measurement: bool = false,
     best_mean_batch_duration_ns: u64 = 0,
     baseline_mean_batch_duration_ns: u64 = 0,
+    has_threaded_profile: bool = false,
     probing: bool = false,
 };
 
@@ -278,7 +311,7 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
     return .{
         .phase = report.phase,
         .initial_worker_threads = report.initial_profile.worker_threads,
-        .initial_items_per_range = report.initial_profile.items_per_range,
+        .initial_range_items = report.initial_profile.items_per_range,
         .final_worker_threads = report.current_profile.worker_threads,
         .final_items_per_range = report.current_profile.items_per_range,
         .best_worker_threads = report.best_profile.worker_threads,
@@ -293,6 +326,7 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
         .settled_before_measurement = settled_before_measurement,
         .best_mean_batch_duration_ns = report.best_mean_batch_duration_ns,
         .baseline_mean_batch_duration_ns = report.baseline_mean_batch_duration_ns,
+        .has_threaded_profile = report.has_threaded_profile,
         .probing = report.probing,
     };
 }
@@ -304,9 +338,9 @@ pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?
         .fixed => fixed: {
             const fixed_range = alignItemCount(default_items_per_range, range_alignment_items);
             break :fixed AdaptiveWorkTuner.init(.{
-                .initial_items_per_range = fixed_range,
-                .min_items_per_range = fixed_range,
-                .max_items_per_range = fixed_range,
+                .initial_range_items = fixed_range,
+                .smallest_range_items = fixed_range,
+                .largest_range_items = fixed_range,
             });
         },
     };
@@ -540,6 +574,13 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
+    if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
+    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
+    if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -607,7 +648,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [64]u8 = undefined;
+        var workload_buffer: [128]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -637,10 +678,14 @@ fn printValidationSummary(
 
     if (adaptive) |adaptive_result| {
         if (adaptive_result.stats.work_tuning) |summary| {
-            std.debug.print(
-                "adaptive phase={s} best_profile={}/{} final={}/{}. ",
-                .{ @tagName(summary.phase), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
-            );
+            if (summary.has_threaded_profile) {
+                std.debug.print(
+                    "adaptive phase={s} best_profile={}/{} final={}/{}. ",
+                    .{ @tagName(summary.phase), summary.best_worker_threads, summary.best_items_per_range, summary.final_worker_threads, summary.final_items_per_range },
+                );
+            } else {
+                std.debug.print("adaptive phase={s} threaded_profile=none. ", .{@tagName(summary.phase)});
+            }
         }
         if (adaptive_result.stats.batch.active_worker_threads == 0) {
             std.debug.print(
@@ -658,7 +703,27 @@ fn printValidationSummary(
     }
 
     if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
-        if (std.mem.startsWith(u8, group_name, "collision-response")) {
+        if (std.mem.eql(u8, group_name, "ai")) {
+            std.debug.print(
+                "workload separation_checks={} intents={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding")) {
+            std.debug.print(
+                "workload field_requests={} results={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
+            std.debug.print(
+                "workload cache_hits={} results={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+            std.debug.print(
+                "workload fallback_requests={} results={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count },
+            );
+        } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
             std.debug.print(
                 "workload triggers={} intents={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
@@ -780,6 +845,21 @@ fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
 
 fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
     const summary = maybe_summary orelse return "-";
+    if (!summary.has_threaded_profile) {
+        if (summary.candidate_items_per_range) |candidate| {
+            const candidate_workers = summary.candidate_worker_threads orelse 0;
+            return std.fmt.bufPrint(
+                buffer,
+                "{s} settled={s} threaded=none cand={}/{}",
+                .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement), candidate_workers, candidate },
+            ) catch "work";
+        }
+        return std.fmt.bufPrint(
+            buffer,
+            "{s} settled={s} threaded=none",
+            .{ @tagName(summary.phase), yesNo(summary.settled_before_measurement) },
+        ) catch "work";
+    }
     if (summary.candidate_items_per_range) |candidate| {
         const candidate_workers = summary.candidate_worker_threads orelse 0;
         return std.fmt.bufPrint(
@@ -797,8 +877,71 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
     if (stats.candidate_pairs == 0 and stats.output_count == 0) return "-";
+    if (std.mem.eql(u8, group_name, "ai")) {
+        if (stats.secondary_batch) |intent| {
+            const tuning = stats.secondary_work_tuning;
+            if (intent.active_worker_threads == 0 or intent.ran_inline) {
+                if (tuning) |summary| {
+                    const tuned = if (summary.has_threaded_profile) "threaded" else "none";
+                    return std.fmt.bufPrint(
+                        buffer,
+                        "separation_checks={} intents={} intent=inline tuned={s}",
+                        .{ stats.candidate_pairs, stats.output_count, tuned },
+                    ) catch "workload";
+                }
+                return std.fmt.bufPrint(
+                    buffer,
+                    "separation_checks={} intents={} intent=inline",
+                    .{ stats.candidate_pairs, stats.output_count },
+                ) catch "workload";
+            }
+            return std.fmt.bufPrint(
+                buffer,
+                "separation_checks={} intents={} intent={}/{}",
+                .{ stats.candidate_pairs, stats.output_count, intent.active_worker_threads, intent.items_per_range },
+            ) catch "workload";
+        }
+        return std.fmt.bufPrint(buffer, "separation_checks={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding")) {
+        return std.fmt.bufPrint(buffer, "field_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
+        return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+        return std.fmt.bufPrint(buffer, "fallback_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "steering")) {
+        return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+    }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    }
+    if (std.mem.startsWith(u8, group_name, "collision")) {
+        if (stats.secondary_batch) |narrow| {
+            const tuning = stats.secondary_work_tuning;
+            if (narrow.active_worker_threads == 0 or narrow.ran_inline) {
+                if (tuning) |summary| {
+                    const tuned = if (summary.has_threaded_profile) "threaded" else "none";
+                    return std.fmt.bufPrint(
+                        buffer,
+                        "candidates={} outputs={} narrow=inline tuned={s}",
+                        .{ stats.candidate_pairs, stats.output_count, tuned },
+                    ) catch "workload";
+                }
+                return std.fmt.bufPrint(
+                    buffer,
+                    "candidates={} outputs={} narrow=inline",
+                    .{ stats.candidate_pairs, stats.output_count },
+                ) catch "workload";
+            }
+            return std.fmt.bufPrint(
+                buffer,
+                "candidates={} outputs={} narrow={}/{}",
+                .{ stats.candidate_pairs, stats.output_count, narrow.active_worker_threads, narrow.items_per_range },
+            ) catch "workload";
+        }
     }
     return std.fmt.bufPrint(buffer, "candidates={} outputs={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
 }
@@ -974,6 +1117,12 @@ test "adaptive settle budget covers multiple tuner windows" {
     try std.testing.expectEqual(@as(usize, 100), adaptiveSettleIterationLimit(.{ .iterations = 100 }));
 }
 
+test "event scale profiles cover low through high signal counts" {
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000 }, eventScaleCounts(.quick));
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1_024, 4_096, 10_000, 25_000, 50_000 }, eventScaleCounts(.standard));
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 10_000, 25_000, 50_000 }, eventScaleCounts(.stress));
+}
+
 test "benchmark table formatters keep compact text" {
     var throughput_buffer: [32]u8 = undefined;
     var speedup_buffer: [16]u8 = undefined;
@@ -997,6 +1146,7 @@ test "benchmark table formatters keep compact text" {
             .final_worker_threads = 4,
             .final_items_per_range = 256,
             .settled_before_measurement = true,
+            .has_threaded_profile = true,
         }),
     );
 }
