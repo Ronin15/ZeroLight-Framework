@@ -6,7 +6,7 @@ Classify first:
 
 - Build configuration: `build.zig`, `build.zig.zon`, module roots, build options, install steps.
 - Zig compile: type errors, imports, visibility, error sets, comptime, API drift.
-- Link/system dependency: SDL3, SDL3_ttf, pkg-config, system headers, library paths.
+- Link/system dependency: SDL3, SDL3_ttf, SDL3_mixer, pkg-config, system headers, library paths.
 - Shader toolchain: `glslc`, `spirv-cross`, GLSL source, SPIR-V/MSL output, installed shader paths.
 - Tests: behavior contract failure, stale test expectation, missing aggregate test import.
 - Runtime app: SDL init, window creation, asset resolution, renderer init, pause/frame pacing.
@@ -30,7 +30,7 @@ Do not treat an environmental display failure as proof of renderer logic failure
 - Shader-only: `zig build shaders`
 - Full non-interactive local validation: `zig build verify`
 - Runtime app: `zig build dev`
-- Display-gated GPU path: `zig build gpu-smoke`
+- Display-gated renderer/GPU path: `zig build gpu-smoke`
 
 If a sandbox or cache path blocks Zig from writing caches, separate that infrastructure problem from compiler output before changing source.
 
@@ -46,6 +46,10 @@ For frame pacing issues, distinguish visible, occluded/unfocused, hidden, minimi
 
 For input bugs, separate raw SDL events, action mapping, held gameplay state, one-frame commands, router policy, and state-stack dispatch. Clear held movement when a modal policy begins blocking gameplay input.
 
-For GPU smoke failures, record whether SDL created a window, created the GPU device, claimed the window, acquired the swapchain texture, encoded a pass, and submitted. Each step points to a different class of issue.
+For GPU smoke failures, record whether the build installed shaders/assets, SDL
+created a window, the renderer loaded the platform shader pipeline, SDL created
+and claimed the GPU device, the smoke path drew a primitive, acquired the
+swapchain texture, encoded a pass, and submitted. Each step points to a
+different class of issue.
 
 When a fix improves a runtime boundary, add or preserve scoped `std.log` diagnostics that would make the same class of failure easier to identify next time. Use `debug` for low-frequency lifecycle/config/fallback context, `warn` only for recovered degraded behavior, and `err` only for real failure context. Keep pure helpers and validation helpers log-free unless they are runtime wrappers with useful call-site context.

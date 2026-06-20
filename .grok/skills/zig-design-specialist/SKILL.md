@@ -1,18 +1,22 @@
 ---
 name: zig-design-specialist
 description: >
-  Zig DOD game systems design specialist for pre-implementation planning.
-  Use when asked to design or plan gameplay systems, ECS/DataSystem changes,
-  processor ordering, deferred structural changes, save/load boundaries,
-  emergent gameplay mechanics, AI, collision, pathfinding, parallel render prep,
-  roadmap slices, or performance-sensitive architecture before implementation.
-  Also use when running /zig-design-specialist.
+  Zig DOD game systems design specialist for ZeroLight-Framework pre-implementation
+  planning. Use proactively in this repo before building new systems, changing
+  architecture, ECS/DataSystem layout, processor order, SimulationPipeline shape,
+  roadmap slices, or emergent gameplay mechanics. Triggers: design, plan, architect,
+  how should we, approach, slice, roadmap, system design. Also use for
+  /zig-design-specialist.
 when-to-use: >
-  Design new systems or architecture, plan ECS or DataSystem changes, define
-  processor contracts and ordering, create roadmap slices, design AI/collision/
-  pathfinding/render-prep/save-load mechanics, or do pre-implementation planning
-  for performance-sensitive or emergent gameplay features. Produce ownership
-  boundaries, data layouts, and acceptance criteria.
+  Use proactively in ZeroLight-Framework before implementing new systems,
+  architecture changes, ECS/DataSystem changes, processor contracts, deferred
+  structural boundaries, save/load design, AI/collision/pathfinding/render-prep
+  planning, SimulationPipeline/controller placement, roadmap slices, or any
+  performance-sensitive emergent gameplay feature. Run this before zig-specialist
+  when scope is unclear or crosses ownership boundaries. Produce ownership
+  boundaries, data layouts, processor order, and acceptance criteria. Triggers:
+  design, plan, architect, approach, strategy, slice, roadmap, system design, how
+  should we, what is the right way. Slash: /zig-design-specialist.
 metadata:
   short-description: "Plan DOD Zig game systems before implementation"
 ---
@@ -65,6 +69,8 @@ save/load, or roadmap-slice design.
 - Ownership boundaries and exact owner layer.
 - Frame/state call flow, preserving `main.zig` -> `Engine` phase method ->
   `StateStack` policy dispatch -> eligible state or states.
+- Pipeline/controller placement when orchestration is shared or complex:
+  state-owned pipeline, state-owned feature controllers, or plain state code.
 - Data layout and lifetime for every persistent and transient data set.
 - Ordered processor list, including what each processor reads and writes.
 - Deferred/main-thread boundary for structural changes, SDL/GPU calls, asset

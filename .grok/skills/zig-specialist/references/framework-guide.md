@@ -7,11 +7,11 @@ Use this guidance for lean Zig SDL3/SDL_GPU 2D game projects. Treat the codebase
 ## Ownership Boundaries
 
 - `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
-- `src/app/` owns SDL3 app coordination, input, timing, frame pacing, pause policy, and state stack flow.
+- `src/app/` owns SDL3 app coordination, input, timing, frame pacing, pause policy, state stack flow, audio service, and thread system.
 - `src/render/` owns SDL_GPU rendering, camera transforms, renderer resources, text, FPS counter, and debug overlay rendering.
 - `src/game/` owns game/application states, `DataSystem`, gameplay-specific behavior, and ECS-style gameplay systems/processors.
 - `src/platform/` owns SDL/platform integration helpers and GPU smoke-test implementation.
-- `src/assets/` owns runtime asset path resolution and installed asset lookup.
+- `src/assets/` owns runtime asset path resolution, installed asset lookup, the typed startup manifest, and `RuntimeAssets` catalog.
 - `src/core/` owns small shared helpers such as math primitives.
 - `src/root.zig` should stay limited to math aliases and compile coverage; feature code should live under the matching `src/` area.
 
@@ -25,14 +25,14 @@ Use scoped `std.log` diagnostics as part of feature work. Debug logs may include
 
 ## Build And Validation Commands
 
-- `zig build`: build and install a runnable app to `zig-out/bin`.
+- `zig build`: build and install a runnable app, runtime assets, and platform shaders to `zig-out/bin`.
 - `zig build run`: build, install runtime assets/shaders, and run the app.
 - `zig build dev`: shader build, asset install, and run loop for normal development.
 - `zig build test`: run Zig unit tests.
-- `zig build check`: compile the game and GPU smoke executable.
+- `zig build check`: compile the game, benchmark, and GPU smoke executables.
 - `zig build verify`: run check, tests, and shader compilation.
 - `zig build shaders`: compile platform GPU shaders.
-- `zig build gpu-smoke`: open a small display-gated SDL_GPU smoke window and submit one frame.
+- `zig build gpu-smoke`: open a small display-gated renderer pipeline smoke window, load installed shaders/assets, draw, and submit one frame.
 - `zig build package`: install selected-mode binaries and runtime assets.
 - `zig build fmt`: format `build.zig`, `build.zig.zon`, and `src/`.
 
@@ -54,7 +54,7 @@ Apply state transitions after dispatch. State stack code should own state lifeti
 
 ## Asset And Shader Rules
 
-Runtime assets live under `assets/` and are installed to `zig-out/bin/assets` unless `-Dasset-root` changes the root. Keep asset paths relative and traversal-safe. PNG texture loading uses core SDL3 support; do not add SDL3_image unless the user explicitly asks.
+Runtime assets live under `assets/` and are installed to `zig-out/bin/assets` unless `-Dasset-root` changes the root. Keep asset paths relative and traversal-safe. PNG texture loading uses core SDL3 support; do not add SDL3_image unless the user explicitly asks. Runtime gameplay and render prep should use stable manifest IDs through `RuntimeAssets`, not per-frame path lookup or live renderer/audio handles in `DataSystem`.
 
 Shader tools are required for runnable builds. Linux uses SPIR-V output; macOS uses SPIR-V converted to MSL. If shader compilation fails, separate shader tool availability from Zig compile errors.
 
@@ -83,13 +83,22 @@ range, prefix offsets, contiguous writes, deterministic range-index merge, and
 batch commit boundaries over global per-command atomics, broad event buses, or
 callback chains.
 
+AI/perception processors should keep scalable setup work bounded and explicit:
+use an appropriate spatial/perception structure for the workload, then emit
+deterministic movement intents or rule outputs as separate staged work. Stages
+that can dominate timing, such as separation/perception and intent emission,
+should have independent tuning/stats so each can stay inline or thread
+independently. Future pathfinding or rule processors need the same explicit
+staged ownership, stage-specific tuning, and deterministic merge points.
+
 Hot processors should iterate dense SoA columns directly. Component masks are
 for membership/query decisions; they should not turn hot loops into dynamic
 component joins, string lookup, or hash-map dispatch. Threaded/SIMD processors
 must keep structural entity changes, state transitions, SDL/GPU calls, asset
 loading, save/load streaming, and renderer resource ownership behind an explicit
-deferred or main-thread boundary. Use serial fallbacks for small counts, tests,
-unsupported thread targets, and deterministic comparisons.
+deferred or main-thread boundary. Use serial fallbacks for tests, unsupported
+thread targets, explicit fallback behavior, and deterministic comparisons; do
+not gate production worker participation with static item-count floors.
 
 For threaded/SIMD ECS work, treat cache-line behavior as part of the contract.
 Document hot SoA column alignment before relying on wider or target-specific

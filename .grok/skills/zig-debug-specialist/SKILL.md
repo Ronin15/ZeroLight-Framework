@@ -1,17 +1,22 @@
 ---
 name: zig-debug-specialist
 description: >
-  Zig game engine debugging specialist. Use when asked to diagnose or fix Zig
-  build failures, test failures, shader compilation errors, SDL3 linking/runtime
-  errors, SDL_GPU device or swapchain failures, asset loading problems, frame
-  pacing or performance regressions, input/state bugs, crashes, leaks, or
-  display-gated GPU smoke failures. Also use when running /zig-debug-specialist.
+  Zig game engine debugging specialist for ZeroLight-Framework. Use proactively in
+  this repo whenever builds, tests, shaders, SDL linking/runtime, SDL_GPU,
+  assets, frame pacing, input/state, crashes, leaks, performance regressions, or
+  gpu-smoke fail — even if the user only pastes an error. Triggers: debug, fix
+  error, failing, broken, crash, investigate, diagnose, triage. Also use for
+  /zig-debug-specialist.
 when-to-use: >
-  Debug or investigate failures: zig build errors, test failures, shader
-  compilation, SDL init/linking, GPU device/swapchain problems, asset loading,
-  frame pacing, performance regressions, input or state bugs, crashes, or
-  gpu-smoke issues. Triage, reproduce, and fix root causes following narrow
-  commands and layer ownership.
+  Use proactively in ZeroLight-Framework whenever anything fails or misbehaves:
+  zig build/check/test/verify/shaders/gpu-smoke errors, compile or link failures,
+  shader toolchain problems, SDL3/SDL3_ttf/SDL3_mixer issues, asset lookup/install
+  failures, renderer or swapchain problems, frame pacing regressions, input or
+  state bugs, crashes, leaks, or performance regressions. Prefer this over generic
+  debugging advice for this repo. Triage with narrow commands, identify the owning
+  layer, reproduce, and fix root causes. Triggers: debug, error, failing, broken,
+  crash, investigate, diagnose, triage, not working, regression, gpu-smoke.
+  Slash: /zig-debug-specialist.
 metadata:
   short-description: "Debug Zig game engine and performance failures"
 ---
@@ -58,15 +63,16 @@ For performance failures, first identify the hot path and whether the regression
 comes from allocation, repeated lookup/validation, dynamic dispatch, formatted
 logging, resource recreation, excessive GPU submissions, or frame pacing. Prefer
 moving work to initialization, asset loading, state transitions, or explicit
-caches over adding per-frame workarounds.
+caches over adding per-frame workarounds. For multi-stage processors, isolate
+stage timing and tuner state before changing thread policy or algorithm shape.
 
 ## Command Selection
 
 - Use `zig build test` for Zig unit failures and pure behavior regressions.
-- Use `zig build check` for compile/link coverage without running the app.
+- Use `zig build check` for compile/link coverage of the game, benchmark, and GPU smoke executables without running the app.
 - Use `zig build shaders` for shader source, shader tool, or install-path failures.
 - Use `zig build dev` or `zig build run` only when runtime behavior needs the app.
-- Use `zig build gpu-smoke` for SDL_GPU device/swapchain frame submission checks when a display is available.
+- Use `zig build gpu-smoke` for display-gated renderer pipeline checks when a display is available: renderer init, installed shader/assets, primitive draw, swapchain acquisition, and frame submission.
 - Use `zig build verify` after a fix that affects multiple layers.
 
 Report display, GPU, or sandbox limitations separately from code failures.
@@ -74,7 +80,7 @@ Report display, GPU, or sandbox limitations separately from code failures.
 ## Common Failure Boundaries
 
 - Zig compiler errors usually point to type, import, build option, or API drift.
-- Link errors usually point to SDL3/SDL3_ttf discovery, system packages, or build wiring.
+- Link errors usually point to SDL3, SDL3_ttf, SDL3_mixer discovery, system packages, or build wiring.
 - Shader failures usually point to `glslc`, `spirv-cross`, shader source, platform format, or installed asset paths.
 - Runtime asset failures usually point to asset-root configuration, install steps, traversal checks, or executable-relative lookup.
 - SDL_GPU smoke failures may be code bugs, missing display backend, missing Vulkan/Metal support, or driver setup.

@@ -17,6 +17,32 @@ repo. Keep the final design compact, but make the decisions below explicit.
 - New designs should keep gameplay behavior in states or processors, not in
   `main.zig` or broad `Engine` conditionals.
 
+## Simulation Pipeline And Controllers
+
+Use this hierarchy when a design spans multiple gameplay systems:
+
+- `StateStack` dispatches states and owns state lifetimes.
+- A gameplay state owns its `DataSystem`, `SimulationFrame`, and optional
+  `SimulationPipeline` instance.
+- `SimulationPipeline` owns the ordered fixed-step stages for that gameplay
+  state and composes any light domain controllers.
+- Domain controllers orchestrate feature policy: phase order, budgets, queues,
+  cooldowns, priority/conflict rules, and handoff between processors.
+- Systems/processors do hot or reusable data work over typed `DataSystem` SoA
+  slices and emit deterministic `SimulationFrame` outputs or deferred commands.
+
+Introduce a `SimulationPipeline` when several gameplay states or simulation
+instances need the same ordered processor flow, or when a single state update is
+becoming mostly orchestration. Keep the pipeline state-owned; do not promote it
+into a global ECS scheduler, reflection system, dynamic dependency graph, or
+app-level service.
+
+Controllers may own small feature-local queues, budgets, cooldowns, transient
+scratch, and arbitration rules. They should not become hidden per-entity stores,
+own renderer/audio/SDL handles, hide random choices, or replace SoA processors
+for hot loops. Persistent gameplay/domain facts live in `DataSystem` or
+state-owned domain storage; per-step outputs live in `SimulationFrame`.
+
 ## Data Ownership
 
 - `DataSystem` owns persistent gameplay data for the owning gameplay state:
@@ -31,6 +57,9 @@ repo. Keep the final design compact, but make the decisions below explicit.
 - Save/load designs should stream persistent gameplay data and stable asset
   references, not app services, renderer resources, thread objects, or frame
   commands.
+- Runtime gameplay and render-prep data should carry stable asset IDs such as
+  `SpriteAssetId` and `AudioAssetId`; path validation, PNG decode, GPU upload,
+  audio load/predecode, and string lookup belong in asset/app services.
 
 ## Processor Contracts
 
@@ -83,6 +112,10 @@ repo. Keep the final design compact, but make the decisions below explicit.
 - AI, pathfinding, and rule systems should usually emit movement intents,
   steering outputs, target choices, or deferred commands rather than mutating
   unrelated stores directly.
+- AI/perception, pathfinding, and rule processing should be designed as bounded
+  stages with explicit inputs, outputs, timing visibility, tuning policy, and
+  deterministic merge points. Pick the spatial, perception, or graph structure
+  that fits the workload instead of copying today's processor shape.
 - Deterministic randomness, if needed, should be explicit state or an explicit
   service passed through the processor boundary. Do not hide random choices in
   hot processors.
