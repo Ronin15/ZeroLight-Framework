@@ -33,13 +33,18 @@ adding broad abstraction.
 - Add a typed simulation event system slice before broad domain features such as
   tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
   and spawning start depending on cross-system change signals.
-- When multiple gameplay states need the same ordered processor flow, extract a
-  state-owned simulation pipeline helper instead of duplicating `GameDemoState`
-  orchestration or adding a global ECS scheduler. The pipeline may own
-  lightweight domain controllers, but persistent facts stay in `DataSystem` and
-  hot loops stay in SoA processors.
+- Extract Slice 22 `SimulationPipeline` and scoped simulation tiers before
+  broad world/chunk gameplay depends on manual `GameDemoState` orchestration.
+  See [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for
+  tier definitions, scope rules, stage map, and acceptance themes.
+- When multiple gameplay states need the same ordered processor flow, share the
+  state-owned pipeline helper instead of duplicating orchestration or adding a
+  global ECS scheduler. The pipeline may own lightweight domain controllers,
+  but persistent facts stay in `DataSystem` and hot loops stay in SoA processors.
 - Keep future gameplay systems built on Slice 12's typed processor outputs,
   deterministic merge, and deferred structural-change contracts.
+- Treat CPU benchmark 50k scales as throughput ceilings, not per-frame targets;
+  tiers and active scope keep typical fixed steps far below those stress counts.
 
 ## Long-Term Gameplay Direction
 
@@ -55,6 +60,9 @@ feature-local state and processor handoff. Persistent gameplay/domain facts
 live in `DataSystem` or state-owned domain storage, per-step outputs live in
 `SimulationFrame`, and large or reusable loops stay in systems that process
 typed slices and emit deterministic outputs.
+Simulation tiers and per-step active scope filter which entities enter each
+pipeline stage without changing processor hot paths. See
+[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md).
 Pathfinding provides a navigation substrate; immersive NPC behavior still needs
 steering, local avoidance, perception, and rule arbitration layered above it.
 
@@ -1436,6 +1444,78 @@ Acceptance checks:
       tile, obstacle, AI, and navigation interactions do not become invisible
       fixed-step cost.
 
+## Slice 22: Simulation Pipeline And Scoped Tiers
+
+Goal: extract state-owned fixed-step orchestration into `SimulationPipeline`,
+add `SimulationScope` and simulation tiers, and keep today's processor order
+while scoping which entities run each stage. This is the world-scale policy
+layer on top of the existing fast processor stack.
+
+Design source of truth:
+
+- [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md)
+
+Current foundation:
+
+- Slice 12 provides `SimulationFrame`, `SimulationPhase`, typed streams, and
+  deferred structural commits.
+- `GameDemoState.update` already runs the full processor order explicitly.
+- Processors gather dense `DataSystem` slices and support threaded serial
+  parity paths with benchmarks into the 50k stress scale.
+- Architecture docs already describe `SimulationPipeline` as the future owner of
+  phase order, budgets, and domain-controller composition.
+
+Architecture notes:
+
+- Tiers are persistent membership; scope is per-step active filtering; the
+  pipeline is one ordered stage list with gated inputs.
+- Tier and chunk metadata stay on cold `EntitySlot` data, not hot movement SoA
+  columns, unless profiling proves otherwise.
+- Processors stay dumb: scoped gather entry points filter inputs without
+  learning world/chunk/camera policy.
+- Tier promotion/demotion commits at the deferred structural boundary or an
+  explicit main-thread commit, not inside worker ranges.
+- Slice 21 events/controllers are the long-term tier transition source; spatial
+  chunk policy is the first concrete source.
+- Benchmark 50k counts prove spike absorption; typical gameplay should scope
+  active cognition/collision far lower every frame.
+
+Checklist:
+
+- [ ] Add `src/game/simulation_pipeline.zig` and move the ordered fixed-step
+      sequence out of `GameDemoState.update`.
+- [ ] Add `src/game/simulation_scope.zig` with `SimulationTier`, `ActiveRegion`,
+      and per-step gather lists or dense index subsets.
+- [ ] Introduce cold tier/chunk metadata on `EntitySlot` or equivalent compact
+      storage with validation helpers and tests.
+- [ ] Add scoped gather entry points for movement, collision, AI, and steering
+      without changing hot processor math or merge rules.
+- [ ] Keep the existing processor stage order identical to the current
+      `GameDemoState` pipeline while scope shrinks participation.
+- [ ] Add stagger and reduced-cadence policy for cognition without adding a
+      second pipeline.
+- [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
+      stagger skips, and wake promotions.
+- [ ] Document multi-world behavior: inactive worlds stay out of scope; active
+      world uses chunk + halo rules.
+- [ ] Update architecture and roadmap cross-links after runtime wiring lands.
+
+Acceptance checks:
+
+- [ ] `GameDemoState` delegates fixed-step processor dispatch to
+      `SimulationPipeline` with no behavior change when all entities are treated
+      as full-tier active scope.
+- [ ] Scoped and unscoped processor paths produce identical outputs for the same
+      entity subset in tests.
+- [ ] Tier/chunk filtering changes which entities enter each stage without
+      changing stage order or `SimulationFrame` stream contracts.
+- [ ] Tier changes do not mutate `DataSystem` structurally except through the
+      existing deferred command commit point.
+- [ ] `zig build test` covers scope build, tier gates, stagger skips, and
+      pipeline phase transitions without opening a window.
+- [ ] Benchmarks or debug stats report active scope counts so typical runs stay
+      far below 50k stress scales by policy rather than by accident.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1460,6 +1540,7 @@ Acceptance checks:
 19. Steering and local avoidance.
 20. Navigation hardening and hard-path budgets.
 21. Typed simulation event system and domain signals.
+22. Simulation pipeline and scoped tiers.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
@@ -1467,7 +1548,10 @@ Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
 startup runtime assets, and frame-delayed pathfinding now form the
 source-of-truth foundation for future slices. Steering/local avoidance and
-navigation hardening are the next navigation-focused gameplay candidates. Typed
+navigation hardening are the next navigation-focused gameplay candidates.
+`SimulationPipeline` and scoped tiers should land before broad multi-chunk or
+multi-world gameplay duplicates `GameDemoState` orchestration. Typed
 simulation/domain events should land before broad tile, weather, obstacle,
 perception, combat, spawning, resource, and rule-system interactions depend on
-cross-system communication.
+cross-system communication; tier transitions should eventually consume those
+event signals through pipeline-owned controllers.

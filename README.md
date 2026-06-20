@@ -33,8 +33,9 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
   asset-backed SDL3_ttf text rendering, and an F2 FPS overlay.
 
 For deeper details, see [architecture](docs/architecture.md),
-[state stack and input](docs/state-stack-and-input.md), and
-[rendering, assets, and shaders](docs/rendering-assets-shaders.md).
+[state stack and input](docs/state-stack-and-input.md),
+[rendering, assets, and shaders](docs/rendering-assets-shaders.md), and
+[simulation tiers and pipeline](docs/simulation-tiers-and-pipeline.md).
 
 ## Requirements
 
@@ -105,6 +106,7 @@ Generated build output goes under `zig-out/` and should not be committed.
 - [Architecture](docs/architecture.md)
 - [State Stack And Input](docs/state-stack-and-input.md)
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
+- [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
 
 ## License
 

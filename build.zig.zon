@@ -39,6 +39,7 @@
         "docs/development-workflow.md",
         "docs/rendering-assets-shaders.md",
         "docs/setup.md",
+        "docs/simulation-tiers-and-pipeline.md",
         "docs/state-stack-and-input.md",
         "LICENSE",
         "src",

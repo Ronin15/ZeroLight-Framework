@@ -257,6 +257,16 @@ The helper should own phase order, budgets, queues, conflict policy, and output
 application for one gameplay state instance; it should not become a global
 engine scheduler, reflection system, or dynamic dependency graph.
 
+Simulation tiers and active scope belong in the same pipeline boundary.
+Persistent tier and chunk metadata live on cold entity slot data; each fixed step
+builds a transient `SimulationScope` that decides which entities enter AI,
+steering, movement, and collision stages. Processors keep today's hot loops and
+receive scoped gathers instead of learning world/chunk policy. CPU benchmarks at
+50k scale are throughput ceilings for rare spikes; typical frames should scope
+active work far lower. See
+[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for tier
+definitions, stage map, multi-world scope rules, and Slice 22 tracking.
+
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
 domains. Controllers own feature orchestration: small queues, budgets,

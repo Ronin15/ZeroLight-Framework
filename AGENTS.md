@@ -11,6 +11,7 @@ Use the existing docs as source of truth for deeper details:
 - `docs/architecture.md` for frame flow, source layout, and engine boundaries.
 - `docs/state-stack-and-input.md` for state contracts, transition policies, and input mapping.
 - `docs/rendering-assets-shaders.md` for SDL_GPU rendering, assets, PNG loading, shaders, and debug overlay.
+- `docs/simulation-tiers-and-pipeline.md` for `SimulationPipeline`, scoped tiers, world/chunk simulation policy, and Slice 22 design.
 - `docs/development-workflow.md` for build options, release modes, testing, and GPU smoke usage.
 
 ## Ownership Boundaries
