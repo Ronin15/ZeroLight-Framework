@@ -76,7 +76,7 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, benchmark, and GPU smoke executables
 zig build test      # run Zig unit tests
 zig build bench     # run non-interactive CPU processor benchmarks
-zig build verify    # run check, test, and shader compilation
+zig build verify    # run check, test, shader compilation, and atlas lint
 zig build package   # install selected-mode binaries and runtime assets
 zig build gpu-smoke # run a display-gated renderer pipeline smoke
 ```

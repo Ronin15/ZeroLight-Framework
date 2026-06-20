@@ -96,7 +96,7 @@ pub const Engine = struct {
         errdefer asset_cache.deinit(&renderer);
 
         var runtime_assets = RuntimeAssets.init();
-        try runtime_assets.preload(assets, &asset_cache, &renderer, &audio_service);
+        try runtime_assets.preload(allocator, assets, &asset_cache, &renderer, &audio_service);
         errdefer runtime_assets.deinit(&asset_cache, &renderer);
 
         var text_service = try TextService.init(allocator, assets);

@@ -10,8 +10,11 @@ comptime {
     _ = @import("assets/assets.zig");
     _ = @import("assets/cache.zig");
     _ = @import("assets/image.zig");
+    _ = @import("assets/atlas_meta_common.zig");
     _ = @import("assets/manifest.zig");
     _ = @import("assets/runtime_assets.zig");
+    _ = @import("assets/world_tileset_meta.zig");
+    _ = @import("assets/sprite_atlas_meta.zig");
     _ = @import("app/audio.zig");
     _ = @import("app/frame_pacer.zig");
     _ = @import("app/input.zig");

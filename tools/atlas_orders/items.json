@@ -1,0 +1,207 @@
+{
+  "atlas": {
+    "name": "grim_dark_items",
+    "theme": "grim_dark_fantasy",
+    "png": "sprites/grim_items.png",
+    "json": "sprites/grim_items.json",
+    "sprite_asset_id": "grim_items",
+    "frame_width": 16,
+    "frame_height": 16,
+    "columns": 16,
+    "append_unlisted": true
+  },
+  "sprites": [
+    {
+      "name": "sword",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "greatsword",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "axe",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "mace",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "war_hammer",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "dagger",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "spear",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "flail",
+      "category": "weapon_melee"
+    },
+    {
+      "name": "bow",
+      "category": "weapon_ranged"
+    },
+    {
+      "name": "crossbow",
+      "category": "weapon_ranged"
+    },
+    {
+      "name": "arrows",
+      "category": "weapon_ranged"
+    },
+    {
+      "name": "staff",
+      "category": "weapon_magic"
+    },
+    {
+      "name": "wand",
+      "category": "weapon_magic"
+    },
+    {
+      "name": "spell_tome",
+      "category": "weapon_magic"
+    },
+    {
+      "name": "throwing_knife",
+      "category": "weapon_ranged"
+    },
+    {
+      "name": "chakram",
+      "category": "weapon_ranged"
+    },
+    {
+      "name": "health_potion",
+      "category": "consumable"
+    },
+    {
+      "name": "greater_health",
+      "category": "consumable"
+    },
+    {
+      "name": "mana_potion",
+      "category": "consumable"
+    },
+    {
+      "name": "stamina_potion",
+      "category": "consumable"
+    },
+    {
+      "name": "antidote",
+      "category": "consumable"
+    },
+    {
+      "name": "food_ration",
+      "category": "consumable"
+    },
+    {
+      "name": "bandage",
+      "category": "consumable"
+    },
+    {
+      "name": "holy_water",
+      "category": "consumable"
+    },
+    {
+      "name": "iron_key",
+      "category": "key"
+    },
+    {
+      "name": "gold_key",
+      "category": "key"
+    },
+    {
+      "name": "skull_key",
+      "category": "key"
+    },
+    {
+      "name": "ruby_gem",
+      "category": "treasure"
+    },
+    {
+      "name": "sapphire_gem",
+      "category": "treasure"
+    },
+    {
+      "name": "gold_coins",
+      "category": "treasure"
+    },
+    {
+      "name": "silver_coins",
+      "category": "treasure"
+    },
+    {
+      "name": "ancient_scroll",
+      "category": "quest"
+    },
+    {
+      "name": "round_shield",
+      "category": "armor"
+    },
+    {
+      "name": "kite_shield",
+      "category": "armor"
+    },
+    {
+      "name": "helm",
+      "category": "armor"
+    },
+    {
+      "name": "hood",
+      "category": "armor"
+    },
+    {
+      "name": "cloak",
+      "category": "armor"
+    },
+    {
+      "name": "gauntlet",
+      "category": "armor"
+    },
+    {
+      "name": "boots",
+      "category": "armor"
+    },
+    {
+      "name": "ring",
+      "category": "accessory"
+    },
+    {
+      "name": "torch",
+      "category": "tool"
+    },
+    {
+      "name": "bomb",
+      "category": "tool"
+    },
+    {
+      "name": "rope",
+      "category": "tool"
+    },
+    {
+      "name": "map",
+      "category": "tool"
+    },
+    {
+      "name": "poison_vial",
+      "category": "consumable"
+    },
+    {
+      "name": "chalice",
+      "category": "quest"
+    },
+    {
+      "name": "reliquary",
+      "category": "quest"
+    },
+    {
+      "name": "soul_shard",
+      "category": "treasure"
+    }
+  ]
+}

@@ -11,6 +11,7 @@ Use the existing docs as source of truth for deeper details:
 - `docs/architecture.md` for frame flow, source layout, and engine boundaries.
 - `docs/state-stack-and-input.md` for state contracts, transition policies, and input mapping.
 - `docs/rendering-assets-shaders.md` for SDL_GPU rendering, assets, PNG loading, shaders, and debug overlay.
+- `docs/atlas-asset-workflow.md` for filename-driven atlas packing, JSON sidecars, order manifests, and art swaps.
 - `docs/simulation-tiers-and-pipeline.md` for `SimulationPipeline`, scoped tiers, world/chunk simulation policy, and Slice 22 design.
 - `docs/development-workflow.md` for build options, release modes, testing, and GPU smoke usage.
 
@@ -113,7 +114,7 @@ Add new code under the matching owner directory. Keep executable-only code near
 - `zig build test` runs reusable module tests plus SDL-linked compile coverage.
 - `zig build check` compiles the game, benchmark, and GPU smoke executables without installing.
 - `zig build bench` runs non-interactive CPU gameplay processor benchmarks.
-- `zig build verify` runs check, tests, and shader compilation.
+- `zig build verify` runs check, tests, shader compilation, and atlas lint.
 - `zig build shaders` compiles platform GPU shaders.
 - `zig build gpu-smoke` runs a display-gated renderer pipeline smoke that
   installs assets/shaders, creates SDL_GPU resources, draws, and submits one

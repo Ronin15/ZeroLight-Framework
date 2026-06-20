@@ -1,0 +1,1310 @@
+{
+  "atlas": {
+    "name": "grim_dark_world_tileset",
+    "theme": "grim_dark_fantasy",
+    "png": "sprites/world_tileset.png",
+    "json": "sprites/world_tileset.json",
+    "sprite_asset_id": "world_tileset",
+    "tile_size": 32,
+    "columns": 16,
+    "append_unlisted": true
+  },
+  "category_info": {
+    "terrain_base": {
+      "label": "Terrain Base",
+      "description": "Core walkable ground tiles for overworld and dungeon floors.",
+      "row": 0,
+      "tile_names": [
+        "grass",
+        "grass_patchy",
+        "grass_bones",
+        "grass_rocky",
+        "dirt",
+        "dirt_dark",
+        "mud",
+        "cobblestone",
+        "stone_floor",
+        "stone_cracked",
+        "stone_mossy",
+        "blood_stained_stone",
+        "rotten_planks",
+        "ash_waste",
+        "dark_sand",
+        "void_pit"
+      ]
+    },
+    "fluids": {
+      "label": "Fluids",
+      "description": "Water, swamp, blood, sludge, lava, and atmospheric fluid tiles.",
+      "row": 1,
+      "tile_names": [
+        "water_1",
+        "water_2",
+        "water_3",
+        "water_4",
+        "swamp_water",
+        "blood_pool",
+        "toxic_sludge",
+        "lava_cracks",
+        "foggy_grass",
+        "dungeon_floor",
+        "gravel",
+        "deep_mud",
+        "charred_earth",
+        "broken_cobble",
+        "slick_stone",
+        "murky_depths"
+      ]
+    },
+    "grass_dirt_transitions": {
+      "label": "Grass/Dirt Transitions",
+      "description": "16-tile edge blend set for grass meeting dirt.",
+      "row": 2,
+      "tile_names": [
+        "grass_dirt_0",
+        "grass_dirt_1",
+        "grass_dirt_2",
+        "grass_dirt_3",
+        "grass_dirt_4",
+        "grass_dirt_5",
+        "grass_dirt_6",
+        "grass_dirt_7",
+        "grass_dirt_8",
+        "grass_dirt_9",
+        "grass_dirt_10",
+        "grass_dirt_11",
+        "grass_dirt_12",
+        "grass_dirt_13",
+        "grass_dirt_14",
+        "grass_dirt_15"
+      ]
+    },
+    "water_shore_transitions": {
+      "label": "Water Shores",
+      "description": "16-tile shoreline blend set for water meeting land.",
+      "row": 3,
+      "tile_names": [
+        "water_shore_0",
+        "water_shore_1",
+        "water_shore_2",
+        "water_shore_3",
+        "water_shore_4",
+        "water_shore_5",
+        "water_shore_6",
+        "water_shore_7",
+        "water_shore_8",
+        "water_shore_9",
+        "water_shore_10",
+        "water_shore_11",
+        "water_shore_12",
+        "water_shore_13",
+        "water_shore_14",
+        "water_shore_15"
+      ]
+    },
+    "cliffs": {
+      "label": "Cliffs",
+      "description": "Cliff tops, vertical faces, and rocky elevation edges.",
+      "row": 4,
+      "tile_names": [
+        "cliff_0",
+        "cliff_1",
+        "cliff_2",
+        "cliff_3",
+        "cliff_4",
+        "cliff_5",
+        "cliff_6",
+        "cliff_7",
+        "cliff_8",
+        "cliff_9",
+        "cliff_10",
+        "cliff_11",
+        "cliff_12",
+        "cliff_13",
+        "cliff_14",
+        "cliff_15"
+      ]
+    },
+    "dungeon_walls": {
+      "label": "Dungeon Walls",
+      "description": "Brick wall segments for interior and ruin construction.",
+      "row": 5,
+      "tile_names": [
+        "brick_wall_0",
+        "brick_wall_1",
+        "brick_wall_2",
+        "brick_wall_3",
+        "brick_wall_4",
+        "brick_wall_5",
+        "brick_wall_6",
+        "brick_wall_7",
+        "brick_wall_8",
+        "brick_wall_9",
+        "brick_wall_10",
+        "brick_wall_11",
+        "brick_wall_12",
+        "brick_wall_13",
+        "brick_wall_14",
+        "brick_wall_15"
+      ]
+    },
+    "decorations_a": {
+      "label": "Decorations A",
+      "description": "Small props: rocks, bones, fences, containers, and hazards.",
+      "row": 6,
+      "tile_names": [
+        "deco_0",
+        "deco_1",
+        "deco_2",
+        "deco_3",
+        "deco_4",
+        "deco_5",
+        "deco_6",
+        "deco_7",
+        "deco_8",
+        "deco_9",
+        "deco_10",
+        "deco_11",
+        "deco_12",
+        "deco_13",
+        "deco_14",
+        "deco_15"
+      ]
+    },
+    "decorations_b": {
+      "label": "Decorations B",
+      "description": "Additional prop variants and dungeon clutter.",
+      "row": 7,
+      "tile_names": [
+        "deco_16",
+        "deco_17",
+        "deco_18",
+        "deco_19",
+        "deco_20",
+        "deco_21",
+        "deco_22",
+        "deco_23",
+        "deco_24",
+        "deco_25",
+        "deco_26",
+        "deco_27",
+        "deco_28",
+        "deco_29",
+        "deco_30",
+        "deco_31"
+      ]
+    },
+    "decorations_c": {
+      "label": "Decorations C",
+      "description": "More prop variants for scene dressing.",
+      "row": 8,
+      "tile_names": [
+        "deco_32",
+        "deco_33",
+        "deco_34",
+        "deco_35",
+        "deco_36",
+        "deco_37",
+        "deco_38",
+        "deco_39",
+        "deco_40",
+        "deco_41",
+        "deco_42",
+        "deco_43",
+        "deco_44",
+        "deco_45",
+        "deco_46",
+        "deco_47"
+      ]
+    },
+    "paths": {
+      "label": "Paths",
+      "description": "Dirt road and trail junction tiles.",
+      "row": 9,
+      "tile_names": [
+        "path_0",
+        "path_1",
+        "path_2",
+        "path_3",
+        "path_4",
+        "path_5",
+        "path_6",
+        "path_7",
+        "path_8",
+        "path_9",
+        "path_10",
+        "path_11",
+        "path_12",
+        "path_13",
+        "path_14",
+        "path_15"
+      ]
+    },
+    "trees_foliage": {
+      "label": "Trees & Foliage",
+      "description": "Large organic obstacles and dead woodland features.",
+      "row": 10,
+      "tile_names": [
+        "tree_0",
+        "tree_1",
+        "tree_2",
+        "tree_3",
+        "tree_4",
+        "tree_5",
+        "tree_6",
+        "tree_7",
+        "tree_8",
+        "tree_9",
+        "tree_10",
+        "tree_11",
+        "tree_12",
+        "tree_13",
+        "tree_14",
+        "tree_15"
+      ]
+    },
+    "cave_underground": {
+      "label": "Cave Underground",
+      "description": "Cavern floors, stone, and underground hazard tiles.",
+      "row": 11,
+      "tile_names": [
+        "cave_0",
+        "cave_1",
+        "cave_2",
+        "cave_3",
+        "cave_4",
+        "cave_5",
+        "cave_6",
+        "cave_7",
+        "cave_8",
+        "cave_9",
+        "cave_10",
+        "cave_11",
+        "cave_12",
+        "cave_13",
+        "cave_14",
+        "cave_15"
+      ]
+    },
+    "structures": {
+      "label": "Structures",
+      "description": "Doors, bridges, altars, and interactive set pieces.",
+      "row": 12,
+      "tile_names": [
+        "structure_0",
+        "structure_1",
+        "structure_2",
+        "structure_3",
+        "structure_4",
+        "structure_5",
+        "structure_6",
+        "structure_7",
+        "structure_8",
+        "structure_9",
+        "structure_10",
+        "structure_11",
+        "structure_12",
+        "structure_13",
+        "structure_14",
+        "structure_15"
+      ]
+    },
+    "frost_wasteland": {
+      "label": "Frost Wasteland",
+      "description": "Frozen ground, ice, and frost-covered terrain.",
+      "row": 13,
+      "tile_names": [
+        "frost_0",
+        "frost_1",
+        "frost_2",
+        "frost_3",
+        "frost_4",
+        "frost_5",
+        "frost_6",
+        "frost_7",
+        "frost_8",
+        "frost_9",
+        "frost_10",
+        "frost_11",
+        "frost_12",
+        "frost_13",
+        "frost_14",
+        "frost_15"
+      ]
+    }
+  },
+  "tiles": [
+    {
+      "name": "grass",
+      "category": "terrain_base"
+    },
+    {
+      "name": "grass_patchy",
+      "category": "terrain_base"
+    },
+    {
+      "name": "grass_bones",
+      "category": "terrain_base"
+    },
+    {
+      "name": "grass_rocky",
+      "category": "terrain_base"
+    },
+    {
+      "name": "dirt",
+      "category": "terrain_base"
+    },
+    {
+      "name": "dirt_dark",
+      "category": "terrain_base"
+    },
+    {
+      "name": "mud",
+      "category": "terrain_base"
+    },
+    {
+      "name": "cobblestone",
+      "category": "terrain_base"
+    },
+    {
+      "name": "stone_floor",
+      "category": "terrain_base"
+    },
+    {
+      "name": "stone_cracked",
+      "category": "terrain_base"
+    },
+    {
+      "name": "stone_mossy",
+      "category": "terrain_base"
+    },
+    {
+      "name": "blood_stained_stone",
+      "category": "terrain_base"
+    },
+    {
+      "name": "rotten_planks",
+      "category": "terrain_base"
+    },
+    {
+      "name": "ash_waste",
+      "category": "terrain_base"
+    },
+    {
+      "name": "dark_sand",
+      "category": "terrain_base"
+    },
+    {
+      "name": "void_pit",
+      "category": "terrain_base"
+    },
+    {
+      "name": "water_1",
+      "category": "fluids"
+    },
+    {
+      "name": "water_2",
+      "category": "fluids"
+    },
+    {
+      "name": "water_3",
+      "category": "fluids"
+    },
+    {
+      "name": "water_4",
+      "category": "fluids"
+    },
+    {
+      "name": "swamp_water",
+      "category": "fluids"
+    },
+    {
+      "name": "blood_pool",
+      "category": "fluids"
+    },
+    {
+      "name": "toxic_sludge",
+      "category": "fluids"
+    },
+    {
+      "name": "lava_cracks",
+      "category": "fluids"
+    },
+    {
+      "name": "foggy_grass",
+      "category": "fluids"
+    },
+    {
+      "name": "dungeon_floor",
+      "category": "fluids"
+    },
+    {
+      "name": "gravel",
+      "category": "fluids"
+    },
+    {
+      "name": "deep_mud",
+      "category": "fluids"
+    },
+    {
+      "name": "charred_earth",
+      "category": "fluids"
+    },
+    {
+      "name": "broken_cobble",
+      "category": "fluids"
+    },
+    {
+      "name": "slick_stone",
+      "category": "fluids"
+    },
+    {
+      "name": "murky_depths",
+      "category": "fluids"
+    },
+    {
+      "name": "grass_dirt_0",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_1",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_2",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_3",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_4",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_5",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_6",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_7",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_8",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_9",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_10",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_11",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_12",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_13",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_14",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "grass_dirt_15",
+      "category": "grass_dirt_transitions"
+    },
+    {
+      "name": "water_shore_0",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_1",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_2",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_3",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_4",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_5",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_6",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_7",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_8",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_9",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_10",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_11",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_12",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_13",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_14",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "water_shore_15",
+      "category": "water_shore_transitions"
+    },
+    {
+      "name": "cliff_0",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_1",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_2",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_3",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_4",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_5",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_6",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_7",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_8",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_9",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_10",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_11",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_12",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_13",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_14",
+      "category": "cliffs"
+    },
+    {
+      "name": "cliff_15",
+      "category": "cliffs"
+    },
+    {
+      "name": "brick_wall_0",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_1",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_2",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_3",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_4",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_5",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_6",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_7",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_8",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_9",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_10",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_11",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_12",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_13",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_14",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "brick_wall_15",
+      "category": "dungeon_walls"
+    },
+    {
+      "name": "deco_0",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_1",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_2",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_3",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_4",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_5",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_6",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_7",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_8",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_9",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_10",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_11",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_12",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_13",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_14",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_15",
+      "category": "decorations_a"
+    },
+    {
+      "name": "deco_16",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_17",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_18",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_19",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_20",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_21",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_22",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_23",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_24",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_25",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_26",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_27",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_28",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_29",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_30",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_31",
+      "category": "decorations_b"
+    },
+    {
+      "name": "deco_32",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_33",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_34",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_35",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_36",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_37",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_38",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_39",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_40",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_41",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_42",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_43",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_44",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_45",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_46",
+      "category": "decorations_c"
+    },
+    {
+      "name": "deco_47",
+      "category": "decorations_c"
+    },
+    {
+      "name": "path_0",
+      "category": "paths"
+    },
+    {
+      "name": "path_1",
+      "category": "paths"
+    },
+    {
+      "name": "path_2",
+      "category": "paths"
+    },
+    {
+      "name": "path_3",
+      "category": "paths"
+    },
+    {
+      "name": "path_4",
+      "category": "paths"
+    },
+    {
+      "name": "path_5",
+      "category": "paths"
+    },
+    {
+      "name": "path_6",
+      "category": "paths"
+    },
+    {
+      "name": "path_7",
+      "category": "paths"
+    },
+    {
+      "name": "path_8",
+      "category": "paths"
+    },
+    {
+      "name": "path_9",
+      "category": "paths"
+    },
+    {
+      "name": "path_10",
+      "category": "paths"
+    },
+    {
+      "name": "path_11",
+      "category": "paths"
+    },
+    {
+      "name": "path_12",
+      "category": "paths"
+    },
+    {
+      "name": "path_13",
+      "category": "paths"
+    },
+    {
+      "name": "path_14",
+      "category": "paths"
+    },
+    {
+      "name": "path_15",
+      "category": "paths"
+    },
+    {
+      "name": "tree_0",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_1",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_2",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_3",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_4",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_5",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_6",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_7",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_8",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_9",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_10",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_11",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_12",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_13",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_14",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "tree_15",
+      "category": "trees_foliage"
+    },
+    {
+      "name": "cave_0",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_1",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_2",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_3",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_4",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_5",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_6",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_7",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_8",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_9",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_10",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_11",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_12",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_13",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_14",
+      "category": "cave_underground"
+    },
+    {
+      "name": "cave_15",
+      "category": "cave_underground"
+    },
+    {
+      "name": "structure_0",
+      "category": "structures"
+    },
+    {
+      "name": "structure_1",
+      "category": "structures"
+    },
+    {
+      "name": "structure_2",
+      "category": "structures"
+    },
+    {
+      "name": "structure_3",
+      "category": "structures"
+    },
+    {
+      "name": "structure_4",
+      "category": "structures"
+    },
+    {
+      "name": "structure_5",
+      "category": "structures"
+    },
+    {
+      "name": "structure_6",
+      "category": "structures"
+    },
+    {
+      "name": "structure_7",
+      "category": "structures"
+    },
+    {
+      "name": "structure_8",
+      "category": "structures"
+    },
+    {
+      "name": "structure_9",
+      "category": "structures"
+    },
+    {
+      "name": "structure_10",
+      "category": "structures"
+    },
+    {
+      "name": "structure_11",
+      "category": "structures"
+    },
+    {
+      "name": "structure_12",
+      "category": "structures"
+    },
+    {
+      "name": "structure_13",
+      "category": "structures"
+    },
+    {
+      "name": "structure_14",
+      "category": "structures"
+    },
+    {
+      "name": "structure_15",
+      "category": "structures"
+    },
+    {
+      "name": "frost_0",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_1",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_2",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_3",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_4",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_5",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_6",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_7",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_8",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_9",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_10",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_11",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_12",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_13",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_14",
+      "category": "frost_wasteland"
+    },
+    {
+      "name": "frost_15",
+      "category": "frost_wasteland"
+    }
+  ],
+  "animations": {
+    "water": {
+      "frame_duration_ms": 250,
+      "names": [
+        "water_1",
+        "water_2",
+        "water_3",
+        "water_4"
+      ]
+    }
+  },
+  "autotile_sets": {
+    "grass_dirt": {
+      "layout": "transition_16",
+      "names": [
+        "grass_dirt_0",
+        "grass_dirt_1",
+        "grass_dirt_2",
+        "grass_dirt_3",
+        "grass_dirt_4",
+        "grass_dirt_5",
+        "grass_dirt_6",
+        "grass_dirt_7",
+        "grass_dirt_8",
+        "grass_dirt_9",
+        "grass_dirt_10",
+        "grass_dirt_11",
+        "grass_dirt_12",
+        "grass_dirt_13",
+        "grass_dirt_14",
+        "grass_dirt_15"
+      ]
+    },
+    "water_shore": {
+      "layout": "transition_16",
+      "names": [
+        "water_shore_0",
+        "water_shore_1",
+        "water_shore_2",
+        "water_shore_3",
+        "water_shore_4",
+        "water_shore_5",
+        "water_shore_6",
+        "water_shore_7",
+        "water_shore_8",
+        "water_shore_9",
+        "water_shore_10",
+        "water_shore_11",
+        "water_shore_12",
+        "water_shore_13",
+        "water_shore_14",
+        "water_shore_15"
+      ]
+    },
+    "path": {
+      "layout": "transition_16",
+      "names": [
+        "path_0",
+        "path_1",
+        "path_2",
+        "path_3",
+        "path_4",
+        "path_5",
+        "path_6",
+        "path_7",
+        "path_8",
+        "path_9",
+        "path_10",
+        "path_11",
+        "path_12",
+        "path_13",
+        "path_14",
+        "path_15"
+      ]
+    }
+  }
+}

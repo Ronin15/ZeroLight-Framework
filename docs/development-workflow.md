@@ -9,7 +9,7 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
 zig build bench     # run CPU gameplay processor benchmarks
-zig build verify    # run check, test, and shader compilation
+zig build verify    # run check, test, shader compilation, and atlas lint
 zig build package   # install selected-mode binaries and runtime assets
 ```
 
@@ -128,6 +128,30 @@ zig build -Dlog-level=debug
 zig build --release=safe -Dlog-level=err
 ```
 
+## Atlas Packing
+
+Loose source sprites under `source_assets/` pack into runtime atlases under
+`assets/sprites/`. See `docs/atlas-asset-workflow.md` for the full filename-driven
+workflow, order manifests, and art-swap steps.
+
+Atlas packing and lint require Python 3 and Pillow (`pip install pillow`).
+
+Common commands:
+
+```sh
+cd tools
+python3 pack_atlas.py --kind all
+python3 pack_atlas.py --kind world --lint
+python3 export_source_sprites.py
+python3 gen_atlas_orders.py
+```
+
+After packing, run `zig build test` or `zig build verify` to validate metadata
+loaders against the refreshed JSON sidecars. `verify` always validates the
+registered runtime atlas PNG/JSON sidecars. When `source_assets/` is present,
+lint also compares the source-driven generated manifests against the runtime
+sidecars so additions and art swaps are caught before commit.
+
 ## Testing
 
 Tests follow Zig conventions: small unit tests live beside the code they cover
@@ -146,7 +170,7 @@ zig build test
 zig build verify
 ```
 
-`verify` runs compile coverage, unit tests, and shader compilation.
+`verify` runs compile coverage, unit tests, shader compilation, and atlas lint.
 
 ## Benchmarks
 

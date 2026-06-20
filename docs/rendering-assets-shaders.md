@@ -112,10 +112,19 @@ Sprite coordinate spaces:
 
 ## Runtime Assets
 
+Atlas PNGs ship with JSON sidecar manifests. Loose source art packs through
+`tools/pack_atlas.py`; gameplay resolves tiles and sprites by filename through
+`world_tileset_meta.zig` and `sprite_atlas_meta.zig`. See
+`docs/atlas-asset-workflow.md` for the pack, export, and swap workflow.
+
 Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
-`Engine` owns `RuntimeAssets`, preloads declared sprites through `AssetCache`,
-preloads declared audio through `AudioService`, and passes the catalog to render
-contexts. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
+`Engine` owns `RuntimeAssets`, preloads every registered sprite texture through
+`AssetCache`, parses atlas JSON sidecars once at init, preloads declared audio
+through `AudioService`, and passes the catalog to render contexts. Atlas
+lookups use `RuntimeAssets.worldTilesetMeta()` for the world tileset and
+`RuntimeAssets.spriteAtlasMeta(id)` for character/item atlases. When a texture
+is available but its sidecar is missing or invalid, startup fails instead of
+leaving partial metadata behind. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
 sprite for player, AI squares, and obstacles, with primitive rectangle fallback
 when a sprite ID is unavailable. The default text path uses the bundled
 `assets/fonts/NotoSansMono-Regular.ttf` font.
