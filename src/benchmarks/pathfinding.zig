@@ -12,6 +12,7 @@ const RangeOutputStream = @import("../game/simulation.zig").RangeOutputStream;
 const PathfindingCapacity = @import("../game/systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
+const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const suite = @import("suite.zig");
 
@@ -43,6 +44,12 @@ pub const hard_fallback_group = suite.BenchmarkGroup{
     .name = "pathfinding-hard-fallback",
     .defaultItemCounts = fallbackDefaultItemCounts,
     .runCase = runHardFallbackCase,
+};
+
+pub const hard_fallback_budget_group = suite.BenchmarkGroup{
+    .name = "pathfinding-hard-fallback-budget",
+    .defaultItemCounts = fallbackDefaultItemCounts,
+    .runCase = runHardFallbackBudgetCase,
 };
 
 const quick_counts = [_]usize{ 128, 512, 1024 };
@@ -155,6 +162,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         .max_goal_fields = 8,
         .max_worker_scratch_slots = 64,
         .max_solved_requests_per_step = item_count,
+        .max_fallback_requests_per_step = item_count,
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
@@ -168,17 +176,17 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer if (threads) |*thread_system| thread_system.deinit();
 
     system.clearRuntimeState();
-    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count);
     for (0..options.warmup_iterations) |_| {
         system.clearTransientRequestsRetainingFields();
-        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!system.field_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearTransientRequestsRetainingFields();
-            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count);
         }
     }
     const solve_settled_before_measurement = if (case.adaptive) system.field_tuner.isSettled() else false;
@@ -188,7 +196,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     for (0..options.iterations) |_| {
         system.clearTransientRequestsRetainingFields();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
     }
@@ -203,22 +211,31 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 }
 
 pub fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_unreachable, .hot_cache);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
 }
 
 pub fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, item_count, item_count);
 }
 
-fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode) !suite.RunStats {
+pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    const fallback_budget = @min(options.fallback_budget orelse hardFallbackBudget(item_count), item_count);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, fallback_budget, fallback_budget);
+}
+
+fn hardFallbackBudget(item_count: usize) usize {
+    return @min(item_count, default_max_fallback_requests_per_step);
+}
+
+fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var fixture = try createFixture(allocator, item_count, workload);
@@ -237,7 +254,8 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
         .max_cached_results = item_count * 2,
         .max_goal_fields = 8,
         .max_worker_scratch_slots = 64,
-        .max_solved_requests_per_step = item_count,
+        .max_solved_requests_per_step = solve_budget,
+        .max_fallback_requests_per_step = fallback_budget,
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
@@ -251,18 +269,18 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
     defer if (threads) |*thread_system| thread_system.deinit();
 
     system.clearRuntimeState();
-    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, solve_budget, fallback_budget);
 
     for (0..options.warmup_iterations) |_| {
         if (mode == .cold_hard_fallback) system.clearRuntimeState();
-        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, solve_budget, fallback_budget);
     }
     if (case.adaptive and mode == .cold_hard_fallback) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearRuntimeState();
-            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, solve_budget, fallback_budget);
         }
     }
     const fallback_settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
@@ -272,7 +290,7 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
     for (0..options.iterations) |_| {
         if (mode == .cold_hard_fallback) system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
     }
@@ -280,23 +298,28 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
     stats.candidate_pairs = if (mode == .hot_cache) last_stats.cache_hits else last_stats.fallback_requests;
+    stats.deferred_count = last_stats.deferred_requests;
+    stats.fallback_deferred_count = last_stats.fallback_deferred_requests;
+    stats.cache_evictions = last_stats.cache_evictions;
     if (case.adaptive and mode == .cold_hard_fallback) {
         stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), fallback_settled_before_measurement);
     }
     return stats;
 }
 
-fn runColdOnce(system: *PathfindingSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !PathfindingStats {
+fn runColdOnce(system: *PathfindingSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     if (!case.usesThreadSystem()) {
         return try system.updateSerial(&fixture.requests, .{
-            .max_solved_requests_per_step = fixture.requests.mergedItems().len,
+            .max_solved_requests_per_step = solve_budget,
+            .max_fallback_requests_per_step = fallback_budget,
         });
     }
     return try system.update(&fixture.requests, thread_system.?, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
-        .max_solved_requests_per_step = fixture.requests.mergedItems().len,
+        .max_solved_requests_per_step = solve_budget,
+        .max_fallback_requests_per_step = fallback_budget,
     });
 }
 

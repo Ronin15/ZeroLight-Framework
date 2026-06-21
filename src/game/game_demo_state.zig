@@ -24,6 +24,7 @@ const CollisionResponseSystem = @import("systems/collision_response.zig").Collis
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
@@ -96,6 +97,7 @@ pub const GameDemoState = struct {
             .max_goal_fields = 4,
             .max_worker_scratch_slots = 64,
             .max_solved_requests_per_step = test_square_count,
+            .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
         });
         try pathfinding.rebuildStaticNavGrid(&data, bounds_width, bounds_height, 32.0);
         var collision_response = CollisionResponseSystem.init(allocator);

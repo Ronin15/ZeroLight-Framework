@@ -25,11 +25,11 @@ adding broad abstraction.
 - Finish Slice 7 parallel CPU render prep on top of the Slice 17
   `RuntimeAssets` catalog. Keep it incomplete until serial and parallel prep
   produce identical draw order, grouping, and invalid-resource handling.
-- Finish Slice 20 navigation hardening before scaling to large maps or many NPC
-  path users. Rare true-A* work, pending budgets, cache aging/capacity, and
-  hard-path benchmark visibility should remain explicit.
 - Track collision-response merge/apply, renderer batch capacity, text-cache
   lifetime policy, and manual registry guardrails as hardening follow-ups.
+- Treat Slice 20 pathfinding budgets, deterministic pending retention, and
+  fixed-capacity cache contracts as the navigation hardening base before
+  scaling to large maps or many NPC path users.
 - Add a typed simulation event system slice before broad domain features such as
   tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
   and spawning start depending on cross-system change signals.
@@ -1296,6 +1296,8 @@ Current foundation:
 - Slice 18 benchmark profiles expose common fast paths and fallback counters.
 - Pathfinding stats already distinguish field requests, cache hits,
   unavailable-path cache hits, and fallback requests.
+- `PathfindingSystem` keeps solver queues, result caches, unavailable-key state,
+  goal fields, scratch, and tuners out of `DataSystem`.
 
 Architecture notes:
 
@@ -1305,33 +1307,52 @@ Architecture notes:
 - Solve budgets should prefer deterministic deferral over unbounded same-frame
   work. If the pathfinder cannot finish all fallback work inside the budget, it
   should report pending work explicitly.
-- Module splitting is justified only if it improves maintainability without
-  weakening the system boundary. The pathfinder should remain a system, not a
-  controller that owns gameplay state.
+- The current per-step solve and hard-fallback budgets default to 128 requests.
+  This is a ReleaseFast-tuned crowd baseline: a 2000 hard-request pressure run
+  solves 128 and reports the remaining backlog instead of stalling the fixed
+  update.
+- Slice 20 intentionally keeps cache aging, incremental A* continuation, module
+  splitting, and pipeline extraction out of scope. The completed feature is the
+  bounded hard-path contract, fixed-capacity cache coverage, and benchmark
+  visibility.
 
 Checklist:
 
-- [ ] Add true-A*-required fixtures that cannot be solved by direct, field,
+- [x] Add true-A*-required fixtures that cannot be solved by direct, field,
       component, or portal fast paths.
-- [ ] Add per-frame fallback solve budgets and deterministic pending/deferred
+- [x] Add per-frame fallback solve budgets and deterministic pending/deferred
       behavior for overflow work.
-- [ ] Add cache, goal-field, and unavailable-entry aging or capacity tests if
-      long-running sessions need eviction.
-- [ ] Add regression thresholds or benchmark callouts for Debug and ReleaseFast
-      hard-path workloads.
-- [ ] Audit heap use and scratch sizing for worst-case fallback fixtures.
-- [ ] Consider splitting solver internals into smaller files once hard-path
-      contracts are stable.
+- [x] Add completed-result, entity-result, unavailable-key, and goal-field
+      fixed-capacity tests.
+- [x] Add benchmark callouts for Debug and ReleaseFast hard-path throughput and
+      budget-pressure workloads.
+- [x] Audit heap use and scratch sizing for worst-case fallback fixtures through
+      warmed no-allocation hard-path tests.
+- [x] Keep pathfinding as a gameplay system; do not split modules or promote it
+      into a controller as part of this slice.
 
 Acceptance checks:
 
-- [ ] Benchmarks report true fallback count and timing separately from fast-path
-      work.
-- [ ] Unreachable or impossible destinations are rejected once and cached rather
+- [x] Benchmarks report true fallback count, deferred budget pressure, and
+      timing separately from fast-path work.
+- [x] Unreachable or impossible destinations are rejected once and cached rather
       than re-solved every frame.
-- [ ] Fallback overflow defers deterministically instead of stalling the fixed
+- [x] Fallback overflow defers deterministically instead of stalling the fixed
       update.
-- [ ] Hard-path changes cannot silently regress common request throughput.
+- [x] Hard-path changes cannot silently regress common request throughput because
+      benchmark detail rows expose fallback, deferred, result, and eviction
+      counters.
+- [x] `zig build fmt`, `zig build test --summary all`, `zig build check`,
+      `zig build verify`, and targeted Debug/ReleaseFast pathfinding benchmarks
+      pass.
+
+Slice 20 lands navigation hardening as a complete foundation feature. True A*
+fallback work now has a separate per-step request budget, budget overflow stays
+pending in stable order, cache capacity behavior is tested, and hard-fallback
+benchmarks expose executed fallback work, deferred fallback work, remaining
+pending work, results, and cache evictions across raw-throughput and
+budget-pressure groups. The runtime defaults allow 128 true fallback solves per
+step, with `--fallback-budget` available for ReleaseFast tuning sweeps.
 
 ## Slice 21: Typed Simulation Event System And Domain Signals
 
@@ -1546,9 +1567,8 @@ This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
 Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
-startup runtime assets, and frame-delayed pathfinding now form the
-source-of-truth foundation for future slices. Steering/local avoidance and
-navigation hardening are the next navigation-focused gameplay candidates.
+startup runtime assets, frame-delayed pathfinding, steering/local avoidance, and
+navigation hardening now form the source-of-truth foundation for future slices.
 `SimulationPipeline` and scoped tiers should land before broad multi-chunk or
 multi-world gameplay duplicates `GameDemoState` orchestration. Typed
 simulation/domain events should land before broad tile, weather, obstacle,

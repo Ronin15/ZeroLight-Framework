@@ -37,6 +37,7 @@ pub const Options = struct {
     case_filter: ?[]const u8 = null,
     group_filter: ?[]const u8 = null,
     item_count_filter: ?usize = null,
+    fallback_budget: ?usize = null,
     details: bool = false,
 };
 
@@ -165,6 +166,9 @@ pub const RunStats = struct {
     candidate_pairs: usize = 0,
     sample_count: usize = 0,
     output_count: usize = 0,
+    deferred_count: usize = 0,
+    fallback_deferred_count: usize = 0,
+    cache_evictions: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
@@ -394,6 +398,12 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.item_count_filter = try parsePositiveUsize(args[index]);
         } else if (stripPrefix(arg, "--items=")) |value| {
             options.item_count_filter = try parsePositiveUsize(value);
+        } else if (std.mem.eql(u8, arg, "--fallback-budget")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.fallback_budget = try parsePositiveUsize(args[index]);
+        } else if (stripPrefix(arg, "--fallback-budget=")) |value| {
+            options.fallback_budget = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--details")) {
             options.details = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -411,17 +421,14 @@ pub fn parseOptions(args: []const []const u8) !Options {
 pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const BenchmarkGroup, options: Options) !void {
     printHeader(options);
     var matched_group = options.group_filter == null;
-    var matched_item_count = options.item_count_filter == null;
     for (groups) |group| {
         if (options.group_filter) |filter| {
             if (!std.mem.eql(u8, filter, group.name)) continue;
             matched_group = true;
         }
-        for (group.defaultItemCounts(options.profile)) |item_count| {
-            if (options.item_count_filter) |filter| {
-                if (filter != item_count) continue;
-                matched_item_count = true;
-            }
+        var explicit_item_count: [1]usize = undefined;
+        const item_counts = itemCountsForOptions(group, options, &explicit_item_count);
+        for (item_counts) |item_count| {
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
@@ -441,10 +448,14 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter.?});
         return error.InvalidArgument;
     }
-    if (!matched_item_count) {
-        std.debug.print("no benchmark workload matched --items={}\n", .{options.item_count_filter.?});
-        return error.InvalidArgument;
+}
+
+fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_count: *[1]usize) []const usize {
+    if (options.item_count_filter) |item_count| {
+        explicit_item_count[0] = item_count;
+        return explicit_item_count[0..1];
     }
+    return group.defaultItemCounts(options.profile);
 }
 
 pub fn printUsage() void {
@@ -458,6 +469,7 @@ pub fn printUsage() void {
         \\  --case name
         \\  --group name
         \\  --items N
+        \\  --fallback-budget N
         \\  --details
         \\
         \\Default runs every benchmark case for every registered workload.
@@ -579,7 +591,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
-    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
+    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
@@ -702,7 +714,12 @@ fn printValidationSummary(
         std.debug.print("adaptive flow not selected in this run. ", .{});
     }
 
-    if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
+    if (best.stats.candidate_pairs != 0 or
+        best.stats.output_count != 0 or
+        best.stats.deferred_count != 0 or
+        best.stats.fallback_deferred_count != 0 or
+        best.stats.cache_evictions != 0)
+    {
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
                 "workload separation_checks={} intents={}. ",
@@ -718,10 +735,10 @@ fn printValidationSummary(
                 "workload cache_hits={} results={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
-        } else if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+        } else if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
             std.debug.print(
-                "workload fallback_requests={} results={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
+                "workload fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}. ",
+                .{ best.stats.candidate_pairs, best.stats.fallback_deferred_count, best.stats.deferred_count, best.stats.output_count, best.stats.cache_evictions },
             );
         } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
             std.debug.print(
@@ -876,7 +893,7 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 }
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
-    if (stats.candidate_pairs == 0 and stats.output_count == 0) return "-";
+    if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {
             const tuning = stats.secondary_work_tuning;
@@ -909,8 +926,12 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
         return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
-    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
-        return std.fmt.bufPrint(buffer, "fallback_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
+        return std.fmt.bufPrint(
+            buffer,
+            "fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}",
+            .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions },
+        ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
@@ -1056,6 +1077,7 @@ test "benchmark options parse scaling and filtering arguments" {
         "--group=movement",
         "--items",
         "65536",
+        "--fallback-budget=64",
         "--details",
     };
     const options = try parseOptions(&args);
@@ -1065,6 +1087,7 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expectEqualStrings("thread-fixed-1", options.case_filter.?);
     try std.testing.expectEqualStrings("movement", options.group_filter.?);
     try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
+    try std.testing.expectEqual(@as(usize, 64), options.fallback_budget.?);
     try std.testing.expect(options.details);
 }
 
@@ -1123,6 +1146,36 @@ test "event scale profiles cover low through high signal counts" {
     try std.testing.expectEqualSlices(usize, &[_]usize{ 10_000, 25_000, 50_000 }, eventScaleCounts(.stress));
 }
 
+const test_item_counts = [_]usize{ 4, 8 };
+
+fn testItemCounts(_: Profile) []const usize {
+    return &test_item_counts;
+}
+
+fn testRunCase(_: std.mem.Allocator, _: std.Io, _: Options, _: BenchmarkCase, _: usize) anyerror!RunStats {
+    return .{};
+}
+
+test "benchmark items option overrides registered counts" {
+    const group = BenchmarkGroup{
+        .name = "test",
+        .defaultItemCounts = testItemCounts,
+        .runCase = testRunCase,
+    };
+    var explicit_item_count: [1]usize = undefined;
+
+    try std.testing.expectEqualSlices(
+        usize,
+        &test_item_counts,
+        itemCountsForOptions(group, .{}, &explicit_item_count),
+    );
+    try std.testing.expectEqualSlices(
+        usize,
+        &[_]usize{256},
+        itemCountsForOptions(group, .{ .item_count_filter = 256 }, &explicit_item_count),
+    );
+}
+
 test "benchmark table formatters keep compact text" {
     var throughput_buffer: [32]u8 = undefined;
     var speedup_buffer: [16]u8 = undefined;
@@ -1147,6 +1200,16 @@ test "benchmark table formatters keep compact text" {
             .final_items_per_range = 256,
             .settled_before_measurement = true,
             .has_threaded_profile = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "fallback_requests=4 fallback_deferred=2 deferred=2 results=4 evictions=1",
+        formatWorkloadInto(&range_buffer, "pathfinding-hard-fallback-budget", .{
+            .candidate_pairs = 4,
+            .fallback_deferred_count = 2,
+            .deferred_count = 2,
+            .output_count = 4,
+            .cache_evictions = 1,
         }),
     );
 }

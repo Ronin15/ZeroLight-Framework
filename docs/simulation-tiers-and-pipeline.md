@@ -222,7 +222,7 @@ Interpretation:
 | Slice | Relationship |
 |-------|----------------|
 | 12 | `SimulationFrame`, streams, deferred structural commits remain the per-step contract. |
-| 20 | Pathfinding budgets and cache aging protect cognition-heavy scopes. |
+| 20 | Pathfinding budgets and fixed-capacity cache contracts protect cognition-heavy scopes. |
 | 21 | Typed events/controllers promote, demote, or wake entities; pipeline owns reaction order. |
 | 7 | Parallel render prep and visibility culling complement scoped simulation. |
 

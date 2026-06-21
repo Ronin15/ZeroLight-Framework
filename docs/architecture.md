@@ -349,7 +349,11 @@ frontier expansion remains scalar inside threaded request ranges. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall
 same-step movement, and unavailable keys are cached by
 `nav_version + agent_class + start_cell + goal_cell` to avoid repeated request
-spam.
+spam. True fallback A* work has its own per-step request budget; overflow stays
+pending in stable order and is retried on later fixed steps. Completed-result,
+entity-result, unavailable-key, and goal-field caches are fixed-capacity runtime
+structures with explicit eviction or saturation behavior rather than unbounded
+growth.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects

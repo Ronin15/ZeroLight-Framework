@@ -237,7 +237,17 @@ stages can settle on separate threaded profiles. This is expected when the
 stages have different work shapes. Pathfinding follows this same rule: request
 preparation/grid marking can use SIMD lane batches, while the branch-heavy A*
 solve stage owns its own pathfinding tuner and benchmark row instead of sharing
-another system's profile.
+another system's profile. Hard-fallback pathfinding rows expose true fallback
+requests, fallback requests deferred by the per-step budget, total pending work,
+results, and cache evictions so rare A* cost stays visible instead of being
+hidden by cache-shaped or field-reuse workloads. Use
+`pathfinding-hard-fallback` for raw true-A* throughput and
+`pathfinding-hard-fallback-budget` for budget-pressure regression tracking; the
+budgeted group uses the same hard fixture but caps fallback solves at the runtime
+frame budget so solved fallback count and total `deferred` backlog are expected
+signals under larger request counts. `--items N` overrides the registered profile counts for
+the selected group, and `--fallback-budget N` lets ReleaseFast tuning compare
+candidate hard-fallback caps against the runtime default.
 Use other optional arguments only to narrow or scale the run:
 
 ```sh
@@ -247,6 +257,9 @@ zig build bench -- --case thread-adaptive-tuned-range
 zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
 zig build bench -- --group steering --details
+zig build bench -- --group pathfinding-hard-fallback --details
+zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
+zig build -Doptimize=ReleaseFast bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```
 
