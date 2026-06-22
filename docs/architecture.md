@@ -61,6 +61,24 @@ game-specific behavior under `src/game/`.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
 
+## Cross-Cutting Ownership Rules
+
+The main thread is not a fallback owner for work that lacks a better home.
+Main-thread code must preserve a concrete boundary such as SDL/GPU/audio
+ownership, state transitions, structural commits, asset loading, save/load
+streaming, renderer resource ownership, or deliberately light orchestration.
+Work that can scale with entity count, event count, asset count, draw count,
+map size, file size, or tool complexity needs a named owner in app, game,
+render, assets, platform, or tooling code. When it can become expensive, use
+immutable inputs plus deterministic owned outputs instead of hiding the cost in
+the frame coordinator or another convenient caller.
+
+Production contracts expose runtime concepts only. Do not add test-only enum
+tags, union payloads, marker fields, fake stages, fixture hooks, or service
+shortcuts to production APIs just to make tests easier. Tests should use private
+helper types, local fixtures, test-only mocks, or real runtime payloads without
+changing the shape of app, game, render, asset, platform, or tool contracts.
+
 ## Frame Flow
 
 `src/main.zig` keeps the high-level loop:
@@ -381,18 +399,43 @@ deferred structural commands use typed range-owned output buffers: count outputs
 per stable range, prefix offsets on the main thread, write contiguous output
 slices, merge by range index, and consume the result as a batch. Output order
 comes from stable input/range order, not worker timing or worker IDs. Structural
-mutation remains behind `DataSystem` batch commit boundaries; event and intent
-streams are transient simulation data, not persistent `DataSystem` state.
+mutation remains behind `DataSystem` batch commit boundaries. `DataSystem` is
+the single source for applying structural commands and may report plain
+structural change records to `SimulationFrame`, which maps them into transient
+events after the commit succeeds; event and intent streams are transient
+simulation data, not persistent `DataSystem` state.
 
-Future simulation/domain event work should stay inside this same simulation
-contract. These events are typed, transient cross-system signals owned by the
-gameplay state's pipeline, useful for any important domain change that other
-systems must react to: tile changes, obstacle changes, weather changes, AI
-perception, navigation invalidation, combat, spawning, resources, or rule
-interactions. They are not a global pub/sub service. Persistent gameplay/domain
-facts stay in `DataSystem` or state-owned domain storage, high-volume streams
-remain specialized, and controllers consume immutable event slices in explicit
-pipeline stages before emitting typed outputs or deferred structural commands.
+`SimulationFrame` owns `SimulationEvents` as the typed domain-signal hub for
+lower-volume system changes. Events are phase outputs, not immediate callbacks:
+a producer stage finishes, the event stream merges deterministically, and later
+explicit reaction points consume immutable event slices. Consumers may emit
+specialized outputs, later-phase events, or deferred structural commands, but
+they do not recursively redispatch events or mutate `DataSystem` structurally
+outside the commit boundary. The current event payloads cover structural
+entity/component changes and navigation-region invalidation. Event records carry
+only stable entity IDs, component enums, reason enums, and small scalar payloads;
+they do not carry pointers, app/render/audio handles, asset paths, allocators,
+or service references.
+
+High-volume streams stay specialized. Collision contacts, collision triggers,
+navigation intents, movement intents, path requests, render-queue records, and
+structural commands are not collapsed into the generic event stream. The event
+hub exists for cross-system change signals and diagnostics. Event producers own
+their range writes and range-local stats; the stream merges per-type and
+per-stage counters deterministically after producer completion. A configured
+per-step event capacity is enforced for both appended and range-owned event
+producers: required events fail before structural mutation or domain reaction
+side effects, while diagnostic events are dropped and counted. Reaction work has
+explicit ownership rather than a generic main-thread fallback: light
+orchestration may run inline, and expensive consumers should split over
+immutable event slices and write range-owned outputs. `GameDemoState` currently
+consumes structural events after the commit point and rebuilds the state-owned
+pathfinding nav grid once when static obstacle-affecting changes occur, then
+emits a `nav_region_invalidated` event.
+
+The cross-cutting ownership rules apply here too: event reactions may have
+main-thread commit points, but scalable reaction work still needs a named owner,
+and event/intent contracts must not grow test-only variants or marker payloads.
 
 ## SIMD Helpers
 

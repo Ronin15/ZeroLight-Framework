@@ -59,6 +59,21 @@ pub/sub buses, string-topic dispatchers, callback chains, or event payloads that
 carry pointers, app/render/audio handles, asset paths, allocators, or service
 references.
 
+Do not use the main thread as a generic fallback for scalable work in any
+subsystem. Main-thread work must name the ownership boundary it preserves:
+SDL/GPU/audio ownership, state transitions, structural commits, asset loading,
+save/load streaming, renderer resource ownership, or measured light
+orchestration. Expensive app, gameplay, render-prep, event, asset, platform, or
+tool work should keep an explicit owner and write deterministic owned outputs
+over immutable inputs when it can grow.
+
+Do not put test-only enum tags, union variants, marker fields, fake stages,
+fixture-only payloads, service shortcuts, or test-only code paths into
+production contracts. This applies to app, game, render, asset, platform,
+tooling, events, intents, structural commands, IDs, components, and service
+APIs. Use private test helper types, local fixtures, test-only mocks, or real
+production payloads in tests.
+
 ## Implementation Workflow
 
 1. Inspect the existing owner file and adjacent tests before editing.

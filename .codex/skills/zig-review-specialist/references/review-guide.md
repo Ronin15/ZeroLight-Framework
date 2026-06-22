@@ -51,6 +51,15 @@ Use concrete severity judgment:
   commands should not be collapsed into one generic event stream for uniformity.
 - Threaded event producers use deterministic count/prefix/write/range-index
   merge, not worker-completion order or global per-command atomics.
+- Event consumers own their reaction work instead of using the main thread as a
+  generic dumping ground. This is the same project-wide rule used for app,
+  gameplay, render-prep, asset, platform, and tooling work: inline main-thread
+  work should be deliberately light or tied to an explicit ownership boundary;
+  scalable work should have an owner and deterministic owned outputs.
+- Production contracts should not include test-only stages, marker payloads,
+  fixture variants, fake diagnostics, service shortcuts, or test-only paths.
+  Tests should use private helper records, test-only mocks, or real production
+  payloads.
 
 ## Rendering And Resource Checks
 
@@ -72,6 +81,12 @@ Use concrete severity judgment:
 Prefer tests that directly verify behavior: input routing, state policy, viewport math, resource ID validation, descriptor validation, player/gameplay movement, and pure timing decisions.
 
 Do not require a display for unit tests. Treat GPU smoke and runnable window checks as separate validation with environmental prerequisites.
+
+Do not let test convenience shape production contracts in any subsystem. Flag
+test-only enum tags, union payloads, marker fields, fake stages, fixture-only
+service hooks, service shortcuts, or test-only paths in production code; prefer
+private test helper types, local fixtures, test-only mocks, or real runtime
+payloads.
 
 When tests are weak, say exactly what contract remains untested and give a narrow scenario that would expose the bug.
 

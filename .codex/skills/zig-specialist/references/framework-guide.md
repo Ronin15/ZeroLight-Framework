@@ -102,6 +102,20 @@ deferred or main-thread boundary. Use serial fallbacks for tests, unsupported
 thread targets, explicit fallback behavior, and deterministic comparisons; do
 not gate production worker participation with static item-count floors.
 
+Do not let those main-thread boundaries become a dumping ground for scalable
+work in any subsystem. If app flow, event reaction, intent application, tier
+policy, pathfinding, AI, collision, render prep, asset handling, platform glue,
+or tooling can grow with workload size, give it an explicit owner and write
+deterministic owned outputs over immutable inputs. Inline main-thread work
+should be deliberately light or tied to a concrete ownership boundary.
+
+Production contracts should not carry test-only scaffolding. Do not add testing
+stages, marker payloads, fake enum variants, fixture fields, service hooks, or
+test-only paths to app, game, render, asset, platform, tooling, events, intents,
+structural commands, IDs, components, or service APIs just to make tests
+convenient. Use private test helper types, local fixtures, test-only mocks, or
+real runtime payloads.
+
 For threaded/SIMD ECS work, treat cache-line behavior as part of the contract.
 Document hot SoA column alignment before relying on wider or target-specific
 loads, choose worker ranges so workers do not write the same cache line, and use

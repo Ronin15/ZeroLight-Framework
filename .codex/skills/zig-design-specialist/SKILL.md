@@ -48,7 +48,14 @@ save/load, or roadmap-slice design.
 - Ordered processor list, including what each processor reads and writes.
 - Deferred/main-thread boundary for structural changes, SDL/GPU calls, asset
   loading, save/load streaming, and renderer resource ownership.
+- Explicit owner for scalable work in any subsystem. Do not default app,
+  gameplay, render-prep, event, asset, platform, or tooling work to the main
+  thread; use the owning layer with deterministic owned outputs when the work
+  can grow.
 - Threading/SIMD policy, including serial fallback and range-safety constraints.
+- Test strategy that proves contracts without adding test-only enum tags,
+  marker payloads, fake stages, fixture hooks, service shortcuts, or test-only
+  paths to production APIs.
 - Diagnostics and tests that prove behavior without requiring a display unless
   the feature is specifically GPU/display-gated.
 

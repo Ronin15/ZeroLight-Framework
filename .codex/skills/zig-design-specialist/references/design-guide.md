@@ -47,6 +47,14 @@ own renderer/audio/SDL handles, hide random choices, or replace SoA processors
 for hot loops. Persistent gameplay/domain facts live in `DataSystem` or
 state-owned domain storage; per-step outputs live in `SimulationFrame`.
 
+Do not use the main thread as the default home for work that lacks an owner.
+Main-thread boundaries are for explicit ownership constraints such as
+SDL/GPU/audio calls, state transitions, structural commits, asset loading,
+save/load streaming, renderer resource ownership, or deliberately light
+orchestration. If app, gameplay, render-prep, event, asset, platform, or
+tooling work can scale with workload size, assign it to the owning layer and
+define immutable inputs plus deterministic owned outputs.
+
 ## Data Ownership
 
 - `DataSystem` owns persistent gameplay data for the owning gameplay state:
@@ -88,6 +96,12 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
   deterministic comparison.
 - If a processor emits events or intents, define whether they are persistent
   state, transient per-frame data, or deferred commands, and where they merge.
+- Production contracts should expose runtime concepts only. Do not design
+  test-only tags, marker payloads, fake stages, fixture hooks, service
+  shortcuts, or test-only paths into app, game, render, asset, platform,
+  tooling, event, intent, structural-command, ID, component, or service APIs;
+  tests should use private helper records, local fixtures, test-only mocks, or
+  real payloads.
 - If a gameplay/render-prep processor emits draw records, define the final
   `RenderOrder`, queue ownership, allocation/reserve policy, and whether records
   are sorted, bucketed, or emitted in already ordered spans before `Renderer`

@@ -28,11 +28,18 @@ Stay review-only unless the user explicitly asks for fixes. Recommend `zig-debug
 - ECS/DataSystem shape: `DataSystem` should remain the persistent gameplay data owner and ECS storage foundation with entity IDs, component masks, and dense typed SoA stores. Systems/processors such as movement, AI, collision, pathfinding, and render preparation should mostly borrow `DataSystem` slices and runtime services, not own persistent gameplay state.
 - Simulation pipeline/domain events: when orchestration is shared or complex, check that `StateStack` only dispatches states, the gameplay state owns its `DataSystem`, `SimulationFrame`, and state-owned pipeline, and the pipeline owns controller order. Domain controllers may coordinate budgets, queues, cooldowns, conflict policy, and processor handoff, but should not hide persistent entity/component facts or replace hot SoA processors.
 - Typed simulation events: events should be transient pipeline/`SimulationFrame` signals for important system changes. Flag global pub/sub buses, string-topic dispatchers, callback chains, recursive immediate redispatch, pointer/handle/allocator/service payloads, event streams used as persistent state, and collapsed generic streams that should remain specialized contacts/intents/path requests/render prep/structural commands.
+- Main-thread dumping: flag scalable work in any subsystem moved to the main
+  thread without an explicit ownership boundary such as SDL/GPU/audio
+  ownership, state transitions, structural commits, asset loading, save/load
+  streaming, renderer resource ownership, or measured light orchestration. App,
+  gameplay, render-prep, event, asset, platform, and tooling work that can grow
+  should have an owning layer and deterministic owned outputs over immutable
+  inputs.
 - SIMD/threaded processor shape: hot ECS data should stay in direct SoA column iteration. Component masks are for membership/query decisions, not dynamic joins in hot loops. Structural changes, state transitions, SDL/GPU calls, asset loading, save/load streaming, and renderer resource ownership should stay behind explicit deferred or main-thread boundaries. Flag nondeterministic worker-order merges, per-command global atomics for high-volume outputs, hidden hot-path allocation, broad event buses, direct worker mutation of `DataSystem`, and unbatched structural commits.
 - Multi-stage processor performance: if a processor has independently expensive stages, check that each stage has explicit ownership, deterministic merge points, and visible timing/tuning stats or a deliberate inline policy.
 - Cache-line behavior: when reviewing threaded/SIMD ECS work, check hot SoA column alignment, worker range splitting, false-sharing risks, and whether any 64-byte padding is applied only to concurrently written thread-shared records rather than cold entity slot metadata.
 - Diagnostics: new features and roadmap slices should include scoped `std.log` diagnostics for useful lifecycle, configuration, fallback, and failure context. Debug logs can be detailed but should avoid routine hot-path formatting unless clearly justified; `warn` and `err` should stay rare and actionable.
-- Tests: behavior-focused tests should cover pure logic; GPU/display checks should stay separate from ordinary unit coverage.
+- Tests: behavior-focused tests should cover pure logic; GPU/display checks should stay separate from ordinary unit coverage. Flag test-only enum tags, union variants, marker fields, fake stages, fixture hooks, service shortcuts, or test-only paths leaking into production contracts in any subsystem.
 
 ## Output Format
 

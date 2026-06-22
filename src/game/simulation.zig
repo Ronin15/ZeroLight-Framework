@@ -11,9 +11,13 @@ const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const Component = @import("data_system.zig").Component;
+const ComponentMask = @import("data_system.zig").ComponentMask;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
+const StructuralChange = @import("data_system.zig").StructuralChange;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 
 pub const SimulationPhase = enum {
@@ -26,10 +30,237 @@ pub const SimulationPhase = enum {
     finished,
 };
 
-pub const SimulationEvent = union(enum) {
+pub const SimulationEventStage = enum {
+    structural_commit,
+    domain_reaction,
+};
+
+pub const NavInvalidationReason = enum {
+    static_obstacle_changed,
+};
+
+pub const NavRegionInvalidatedEvent = struct {
+    reason: NavInvalidationReason,
+};
+
+pub const ComponentChangedEvent = struct {
+    entity: EntityId,
+    component: Component,
+    was_static_navigation_obstacle: bool = false,
+    is_static_navigation_obstacle: bool = false,
+};
+
+pub const EntityDestroyedEvent = struct {
+    entity: EntityId,
+    component_mask: ComponentMask,
+    was_static_navigation_obstacle: bool = false,
+};
+
+pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
-    entity_destroyed: EntityId,
-    marker: u32,
+    entity_destroyed: EntityDestroyedEvent,
+    component_changed: ComponentChangedEvent,
+    nav_region_invalidated: NavRegionInvalidatedEvent,
+};
+
+pub const SimulationEvent = struct {
+    stage: SimulationEventStage,
+    payload: SimulationEventPayload,
+};
+
+pub const SimulationEventStats = struct {
+    total: usize = 0,
+    dropped: usize = 0,
+    entity_created: usize = 0,
+    entity_destroyed: usize = 0,
+    component_changed: usize = 0,
+    nav_region_invalidated: usize = 0,
+    structural_commit_stage: usize = 0,
+    domain_reaction_stage: usize = 0,
+
+    fn record(self: *SimulationEventStats, event: SimulationEvent) void {
+        self.total += 1;
+        switch (event.stage) {
+            .structural_commit => self.structural_commit_stage += 1,
+            .domain_reaction => self.domain_reaction_stage += 1,
+        }
+        switch (event.payload) {
+            .entity_created => self.entity_created += 1,
+            .entity_destroyed => self.entity_destroyed += 1,
+            .component_changed => self.component_changed += 1,
+            .nav_region_invalidated => self.nav_region_invalidated += 1,
+        }
+    }
+
+    fn addProduced(self: *SimulationEventStats, produced: SimulationEventStats) void {
+        self.total += produced.total;
+        self.entity_created += produced.entity_created;
+        self.entity_destroyed += produced.entity_destroyed;
+        self.component_changed += produced.component_changed;
+        self.nav_region_invalidated += produced.nav_region_invalidated;
+        self.structural_commit_stage += produced.structural_commit_stage;
+        self.domain_reaction_stage += produced.domain_reaction_stage;
+    }
+};
+
+pub const SimulationEvents = struct {
+    stream: RangeOutputStream(SimulationEvent),
+    range_stats: std.ArrayList(SimulationEventStats) = .empty,
+    stats: SimulationEventStats = .{},
+    capacity_limit: ?usize = null,
+
+    pub const RangeWriter = struct {
+        inner: RangeOutputStream(SimulationEvent).RangeWriter,
+        stats: *SimulationEventStats,
+
+        pub fn write(self: *RangeWriter, event: SimulationEvent) void {
+            self.inner.write(event);
+            self.stats.record(event);
+        }
+
+        pub fn finish(self: *RangeWriter) void {
+            self.inner.finish();
+        }
+    };
+
+    pub fn init(allocator: std.mem.Allocator) SimulationEvents {
+        return .{ .stream = RangeOutputStream(SimulationEvent).init(allocator) };
+    }
+
+    pub fn deinit(self: *SimulationEvents) void {
+        self.range_stats.deinit(self.stream.allocator);
+        self.stream.deinit();
+        self.* = undefined;
+    }
+
+    pub fn clearRetainingCapacity(self: *SimulationEvents) void {
+        self.stream.clearRetainingCapacity();
+        self.range_stats.clearRetainingCapacity();
+        self.stats = .{};
+    }
+
+    pub fn reserve(self: *SimulationEvents, range_count: usize, value_capacity: usize) !void {
+        try self.stream.reserve(range_count, value_capacity);
+        try self.range_stats.ensureTotalCapacity(self.stream.allocator, range_count);
+    }
+
+    pub fn setCapacityLimit(self: *SimulationEvents, value_capacity: ?usize) void {
+        self.capacity_limit = value_capacity;
+    }
+
+    pub fn prepareRangeCounts(self: *SimulationEvents, range_count: usize) !void {
+        self.clearRetainingCapacity();
+        _ = try self.appendRangeCounts(range_count);
+    }
+
+    pub fn appendRangeCounts(self: *SimulationEvents, range_count: usize) !usize {
+        const first_range = self.stream.counts.items.len;
+        try self.range_stats.ensureTotalCapacity(self.stream.allocator, first_range + range_count);
+        const stream_first_range = try self.stream.appendRangeCounts(range_count);
+        std.debug.assert(stream_first_range == first_range);
+        for (0..range_count) |_| {
+            self.range_stats.appendAssumeCapacity(.{});
+        }
+        return first_range;
+    }
+
+    pub fn addCount(self: *SimulationEvents, range_index: usize, count: usize) void {
+        self.stream.addCount(range_index, count);
+    }
+
+    pub fn prefix(self: *SimulationEvents) !void {
+        try self.ensureCanAppend(self.pendingCountFrom(0));
+        try self.stream.prefix();
+    }
+
+    pub fn prefixAppendedRanges(self: *SimulationEvents, first_range: usize) !void {
+        try self.ensureCanAppend(self.pendingCountFrom(first_range));
+        try self.stream.prefixAppendedRanges(first_range);
+    }
+
+    pub fn rangeWriter(self: *SimulationEvents, range_index: usize) RangeWriter {
+        std.debug.assert(range_index < self.range_stats.items.len);
+        return .{
+            .inner = self.stream.rangeWriter(range_index),
+            .stats = &self.range_stats.items[range_index],
+        };
+    }
+
+    pub fn finishWrite(self: *SimulationEvents) void {
+        self.stream.finishWrite();
+        self.rebuildStatsFromRanges();
+    }
+
+    pub fn mergedItems(self: *const SimulationEvents) []const SimulationEvent {
+        return self.stream.mergedItems();
+    }
+
+    pub fn rangeCount(self: *const SimulationEvents) usize {
+        return self.stream.rangeCount();
+    }
+
+    pub fn appendRequired(self: *SimulationEvents, event: SimulationEvent) !void {
+        try self.ensureCanAppend(1);
+        try self.reserveAppendCapacity(1, 1);
+        const first_range = try self.appendRangeCounts(1);
+        self.addCount(first_range, 1);
+        try self.prefixAppendedRanges(first_range);
+        var writer = self.rangeWriter(first_range);
+        writer.write(event);
+        writer.finish();
+        self.finishWrite();
+    }
+
+    pub fn appendDiagnostic(self: *SimulationEvents, event: SimulationEvent) void {
+        self.appendRequired(event) catch {
+            self.stats.dropped += 1;
+        };
+    }
+
+    pub fn ensureCanAppend(self: *const SimulationEvents, count: usize) !void {
+        const limit = self.capacity_limit orelse return;
+        if (count > limit or self.stream.mergedItems().len > limit - count) {
+            return error.EventCapacityExceeded;
+        }
+    }
+
+    fn pendingCountFrom(self: *const SimulationEvents, first_range: usize) usize {
+        var count: usize = 0;
+        for (self.stream.counts.items[first_range..]) |range_count| {
+            count += range_count;
+        }
+        return count;
+    }
+
+    fn reserveAppendCapacity(self: *SimulationEvents, range_count: usize, value_count: usize) !void {
+        const new_range_count = self.stream.counts.items.len + range_count;
+        try self.stream.counts.ensureTotalCapacity(self.stream.allocator, new_range_count);
+        try self.stream.offsets.ensureTotalCapacity(self.stream.allocator, new_range_count);
+        try self.stream.write_offsets.ensureTotalCapacity(self.stream.allocator, new_range_count);
+        try self.range_stats.ensureTotalCapacity(self.stream.allocator, new_range_count);
+
+        const new_value_count = if (self.stream.prefix_ready)
+            self.stream.mergedItems().len + value_count
+        else
+            self.pendingCountFrom(0) + value_count;
+        try self.stream.values.ensureTotalCapacity(self.stream.allocator, new_value_count);
+    }
+
+    fn rebuildStatsFromRanges(self: *SimulationEvents) void {
+        const dropped = self.stats.dropped;
+        self.stats = .{ .dropped = dropped };
+        for (self.range_stats.items) |range_stat| {
+            self.stats.addProduced(range_stat);
+        }
+    }
+};
+
+const StructuralChangeSink = struct {
+    changes: *std.ArrayList(StructuralChange),
+
+    pub fn record(self: *StructuralChangeSink, change: StructuralChange) void {
+        self.changes.appendAssumeCapacity(change);
+    }
 };
 
 pub const CollisionTriggerEvent = struct {
@@ -65,7 +296,6 @@ pub const NavigationIntent = struct {
 
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
-    marker: u32,
 };
 
 pub const CollisionContact = struct {
@@ -83,7 +313,7 @@ pub const CollisionContact = struct {
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
-    events: RangeOutputStream(SimulationEvent),
+    events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
@@ -94,7 +324,7 @@ pub const SimulationFrame = struct {
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
             .allocator = allocator,
-            .events = RangeOutputStream(SimulationEvent).init(allocator),
+            .events = SimulationEvents.init(allocator),
             .navigation_intents = RangeOutputStream(NavigationIntent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
             .path_requests = RangeOutputStream(PathRequest).init(allocator),
@@ -140,6 +370,7 @@ pub const SimulationFrame = struct {
         structural_command_capacity: usize,
     ) !void {
         try self.events.reserve(range_count, event_capacity);
+        self.events.setCapacityLimit(event_capacity);
         try self.navigation_intents.reserve(range_count, intent_capacity);
         try self.intents.reserve(range_count, intent_capacity);
         try self.contacts.reserve(range_count, contact_capacity);
@@ -157,9 +388,120 @@ pub const SimulationFrame = struct {
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
         self.phase = .commit_structural;
-        return try data.applyStructuralCommands(self.structural_commands.mergedItems());
+        const commands = self.structural_commands.mergedItems();
+        try DataSystem.validateStructuralCommands(commands);
+        const event_count = try structuralEventCount(self.events.stream.allocator, data, commands);
+        try self.events.ensureCanAppend(event_count);
+        try self.reserveStructuralEvents(event_count);
+
+        var changes = std.ArrayList(StructuralChange).empty;
+        defer changes.deinit(self.events.stream.allocator);
+        try changes.ensureTotalCapacity(self.events.stream.allocator, event_count);
+        var sink = StructuralChangeSink{ .changes = &changes };
+        const stats = try data.applyStructuralCommandsWithChangeSink(commands, &sink);
+        std.debug.assert(changes.items.len <= event_count);
+        try self.publishStructuralChanges(changes.items);
+        return stats;
+    }
+
+    fn reserveStructuralEvents(self: *SimulationFrame, event_count: usize) !void {
+        if (event_count == 0) return;
+        try self.events.reserve(self.events.rangeCount() + event_count, self.events.mergedItems().len + event_count);
+    }
+
+    fn publishStructuralChanges(self: *SimulationFrame, changes: []const StructuralChange) !void {
+        for (changes) |change| {
+            try self.events.appendRequired(switch (change) {
+                .entity_created => |entity| .{
+                    .stage = .structural_commit,
+                    .payload = .{ .entity_created = entity },
+                },
+                .entity_destroyed => |destroyed| .{
+                    .stage = .structural_commit,
+                    .payload = .{ .entity_destroyed = .{
+                        .entity = destroyed.entity,
+                        .component_mask = destroyed.component_mask,
+                        .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
+                    } },
+                },
+                .component_changed => |changed| .{
+                    .stage = .structural_commit,
+                    .payload = .{ .component_changed = .{
+                        .entity = changed.entity,
+                        .component = changed.component,
+                        .was_static_navigation_obstacle = changed.was_static_navigation_obstacle,
+                        .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
+                    } },
+                },
+            });
+        }
     }
 };
+
+fn structuralEventCount(allocator: std.mem.Allocator, data: *const DataSystem, commands: []const StructuralCommand) !usize {
+    var destroyed_entities = std.ArrayList(EntityId).empty;
+    defer destroyed_entities.deinit(allocator);
+    try destroyed_entities.ensureTotalCapacity(allocator, commands.len);
+
+    var count: usize = 0;
+    for (commands) |command| {
+        switch (command) {
+            .create_entity => |template| count += 1 + templateComponentCount(template),
+            .destroy_entity => |entity| {
+                if (isAliveForStructuralCount(data, entity, destroyed_entities.items)) {
+                    count += 1;
+                    destroyed_entities.appendAssumeCapacity(entity);
+                }
+            },
+            .set_movement_body => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_facing => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_primitive_visual => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_asset_reference => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_collision_bounds => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_collision_response => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_ai_agent => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+            .set_steering_agent => |set| {
+                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
+            },
+        }
+    }
+    return count;
+}
+
+fn isAliveForStructuralCount(data: *const DataSystem, entity: EntityId, destroyed_entities: []const EntityId) bool {
+    if (!data.isAlive(entity)) return false;
+    for (destroyed_entities) |destroyed| {
+        if (entity.index == destroyed.index and entity.generation == destroyed.generation) return false;
+    }
+    return true;
+}
+
+fn templateComponentCount(template: EntityTemplate) usize {
+    var count: usize = 0;
+    if (template.movement_body != null) count += 1;
+    if (template.facing != null) count += 1;
+    if (template.primitive_visual != null) count += 1;
+    if (template.asset_reference != null) count += 1;
+    if (template.collision_bounds != null) count += 1;
+    if (template.collision_response != null) count += 1;
+    if (template.ai_agent != null) count += 1;
+    if (template.steering_agent != null) count += 1;
+    return count;
+}
 
 pub fn RangeOutputStream(comptime T: type) type {
     return struct {
@@ -326,9 +668,42 @@ pub fn RangeOutputStream(comptime T: type) type {
     };
 }
 
-const StreamJobContext = struct {
-    stream: *RangeOutputStream(SimulationEvent),
+const TestStreamEvent = struct {
+    marker: u32,
 };
+
+const StreamJobContext = struct {
+    stream: *RangeOutputStream(TestStreamEvent),
+};
+
+fn testStreamEvent(marker: u32) TestStreamEvent {
+    return .{ .marker = marker };
+}
+
+fn expectTestStreamEvent(event: TestStreamEvent, expected: u32) !void {
+    try std.testing.expectEqual(@as(u32, expected), event.marker);
+}
+
+fn entityCreatedEvent(index: u32) SimulationEvent {
+    return .{ .stage = .structural_commit, .payload = .{ .entity_created = .{ .index = index, .generation = 1 } } };
+}
+
+fn expectEntityCreatedEvent(event: SimulationEvent, expected_index: u32) !void {
+    try std.testing.expectEqual(SimulationEventStage.structural_commit, event.stage);
+    try std.testing.expectEqual(@as(u32, expected_index), event.payload.entity_created.index);
+}
+
+fn writeStructuralCommands(frame: *SimulationFrame, commands: []const StructuralCommand) !void {
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, commands.len);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    for (commands) |command| {
+        writer.write(command);
+    }
+    writer.finish();
+    frame.structural_commands.finishWrite();
+}
 
 fn countEvenEvents(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *StreamJobContext = @ptrCast(@alignCast(context));
@@ -344,14 +719,14 @@ fn writeEvenEvents(context: *anyopaque, range: ParallelRange, _: WorkerId) void 
     var writer = job.stream.rangeWriter(range.index);
     for (range.start..range.end) |item| {
         if (item % 2 == 0) {
-            writer.write(.{ .marker = @intCast(item) });
+            writer.write(testStreamEvent(@intCast(item)));
         }
     }
     writer.finish();
 }
 
 test "range output stream merges by range index" {
-    var stream = RangeOutputStream(SimulationEvent).init(std.testing.allocator);
+    var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();
 
     try stream.prepareRangeCounts(3);
@@ -360,29 +735,29 @@ test "range output stream merges by range index" {
     stream.addCount(1, 1);
     try stream.prefix();
     var writer_2 = stream.rangeWriter(2);
-    writer_2.write(.{ .marker = 30 });
+    writer_2.write(testStreamEvent(30));
     writer_2.finish();
     var writer_0 = stream.rangeWriter(0);
-    writer_0.write(.{ .marker = 10 });
-    writer_0.write(.{ .marker = 11 });
+    writer_0.write(testStreamEvent(10));
+    writer_0.write(testStreamEvent(11));
     writer_0.finish();
     var writer_1 = stream.rangeWriter(1);
-    writer_1.write(.{ .marker = 20 });
+    writer_1.write(testStreamEvent(20));
     writer_1.finish();
     stream.finishWrite();
 
     const merged = stream.mergedItems();
     try std.testing.expectEqual(@as(usize, 4), merged.len);
-    try std.testing.expectEqual(@as(u32, 10), merged[0].marker);
-    try std.testing.expectEqual(@as(u32, 11), merged[1].marker);
-    try std.testing.expectEqual(@as(u32, 20), merged[2].marker);
-    try std.testing.expectEqual(@as(u32, 30), merged[3].marker);
+    try expectTestStreamEvent(merged[0], 10);
+    try expectTestStreamEvent(merged[1], 11);
+    try expectTestStreamEvent(merged[2], 20);
+    try expectTestStreamEvent(merged[3], 30);
 }
 
 test "range output stream keeps deterministic order across threaded passes" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var stream = RangeOutputStream(SimulationEvent).init(std.testing.allocator);
+    var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -405,8 +780,84 @@ test "range output stream keeps deterministic order across threaded passes" {
     const merged = stream.mergedItems();
     try std.testing.expectEqual(@as(usize, 20), merged.len);
     for (merged, 0..) |event, index| {
-        try std.testing.expectEqual(@as(u32, @intCast(index * 2)), event.marker);
+        try expectTestStreamEvent(event, @intCast(index * 2));
     }
+}
+
+test "simulation events collect deterministic threaded records and stats" {
+    var events = SimulationEvents.init(std.testing.allocator);
+    defer events.deinit();
+
+    try events.prepareRangeCounts(2);
+    events.addCount(1, 1);
+    events.addCount(0, 2);
+    try events.prefix();
+    var writer_1 = events.rangeWriter(1);
+    writer_1.write(entityCreatedEvent(30));
+    writer_1.finish();
+    var writer_0 = events.rangeWriter(0);
+    writer_0.write(entityCreatedEvent(10));
+    writer_0.write(entityCreatedEvent(20));
+    writer_0.finish();
+    try std.testing.expectEqual(@as(usize, 0), events.stats.total);
+    try std.testing.expectEqual(@as(usize, 2), events.range_stats.items[0].total);
+    try std.testing.expectEqual(@as(usize, 1), events.range_stats.items[1].total);
+    events.finishWrite();
+
+    const merged = events.mergedItems();
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try expectEntityCreatedEvent(merged[0], 10);
+    try expectEntityCreatedEvent(merged[1], 20);
+    try expectEntityCreatedEvent(merged[2], 30);
+    try std.testing.expectEqual(@as(usize, 3), events.stats.total);
+    try std.testing.expectEqual(@as(usize, 3), events.stats.entity_created);
+    try std.testing.expectEqual(@as(usize, 3), events.stats.structural_commit_stage);
+}
+
+test "simulation events drop diagnostic records when capacity cannot grow" {
+    for (0..5) |fail_index| {
+        var events = SimulationEvents.init(std.testing.allocator);
+        defer events.deinit();
+
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        const original_allocator = events.stream.allocator;
+        events.stream.allocator = failing_allocator.allocator();
+        defer events.stream.allocator = original_allocator;
+
+        events.appendDiagnostic(entityCreatedEvent(1));
+
+        try std.testing.expectEqual(@as(usize, 0), events.stream.counts.items.len);
+        try std.testing.expectEqual(@as(usize, 0), events.range_stats.items.len);
+        try std.testing.expectEqual(@as(usize, 0), events.mergedItems().len);
+        try std.testing.expectEqual(@as(usize, 0), events.stats.total);
+        try std.testing.expectEqual(@as(usize, 1), events.stats.dropped);
+    }
+}
+
+test "simulation events enforce explicit per-step event capacity" {
+    var events = SimulationEvents.init(std.testing.allocator);
+    defer events.deinit();
+
+    try events.reserve(1, 1);
+    events.setCapacityLimit(1);
+
+    try events.appendRequired(entityCreatedEvent(1));
+    events.appendDiagnostic(entityCreatedEvent(2));
+
+    try std.testing.expectError(error.EventCapacityExceeded, events.appendRequired(entityCreatedEvent(3)));
+    try std.testing.expectEqual(@as(usize, 1), events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), events.stats.total);
+    try std.testing.expectEqual(@as(usize, 1), events.stats.dropped);
+
+    var ranged_events = SimulationEvents.init(std.testing.allocator);
+    defer ranged_events.deinit();
+    try ranged_events.reserve(1, 1);
+    ranged_events.setCapacityLimit(1);
+    try ranged_events.prepareRangeCounts(1);
+    ranged_events.addCount(0, 2);
+    try std.testing.expectError(error.EventCapacityExceeded, ranged_events.prefix());
+    try std.testing.expectEqual(@as(usize, 0), ranged_events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), ranged_events.stats.total);
 }
 
 test "simulation frame applies deferred structural commands" {
@@ -438,10 +889,86 @@ test "simulation frame applies deferred structural commands" {
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 1), stats.components_set);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.stats.entity_created);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.stats.component_changed);
+}
+
+test "simulation frame rejects structural commit before mutation when event capacity is too small" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    try frame.reserveStreams(1, 1, 0, 0, 0, 1);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{.{ .create_entity = .{
+        .movement_body = .{
+            .position = .{ .x = 2, .y = 3 },
+            .previous_position = .{ .x = 2, .y = 3 },
+            .velocity = .{},
+            .speed = 1,
+        },
+    } }});
+
+    try std.testing.expectError(error.EventCapacityExceeded, frame.applyStructuralCommands(&data));
+    try std.testing.expectEqual(@as(usize, 0), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.total);
+}
+
+test "simulation frame emits structural destroy event with prior component mask" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 1, .y = 2 },
+        .previous_position = .{ .x = 1, .y = 2 },
+        .velocity = .{},
+        .speed = 1,
+    });
+
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{.{ .destroy_entity = entity }});
+    const stats = try frame.applyStructuralCommands(&data);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expect(!data.isAlive(entity));
+    const event = frame.events.mergedItems()[0];
+    try std.testing.expectEqual(SimulationEventStage.structural_commit, event.stage);
+    try std.testing.expectEqual(entity.index, event.payload.entity_destroyed.entity.index);
+    try std.testing.expect((event.payload.entity_destroyed.component_mask & @import("data_system.zig").component_masks.movement_body) != 0);
+    try std.testing.expect(!event.payload.entity_destroyed.was_static_navigation_obstacle);
+}
+
+test "simulation frame skips structural events for stale commands" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &.{.{ .set_movement_body = .{
+        .entity = EntityId.invalid,
+        .body = .{
+            .position = .{ .x = 1, .y = 2 },
+            .previous_position = .{ .x = 1, .y = 2 },
+            .velocity = .{},
+            .speed = 1,
+        },
+    } }});
+    const stats = try frame.applyStructuralCommands(&data);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.stale_skipped);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.total);
 }
 
 test "range output stream reuses warmed capacity without allocation" {
-    var stream = RangeOutputStream(SimulationEvent).init(std.testing.allocator);
+    var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();
 
     try stream.prepareRangeCounts(2);
@@ -449,11 +976,11 @@ test "range output stream reuses warmed capacity without allocation" {
     stream.addCount(1, 1);
     try stream.prefix();
     var first_writer_0 = stream.rangeWriter(0);
-    first_writer_0.write(.{ .marker = 1 });
-    first_writer_0.write(.{ .marker = 2 });
+    first_writer_0.write(testStreamEvent(1));
+    first_writer_0.write(testStreamEvent(2));
     first_writer_0.finish();
     var first_writer_1 = stream.rangeWriter(1);
-    first_writer_1.write(.{ .marker = 3 });
+    first_writer_1.write(testStreamEvent(3));
     first_writer_1.finish();
     stream.finishWrite();
 
@@ -467,28 +994,28 @@ test "range output stream reuses warmed capacity without allocation" {
     stream.addCount(1, 1);
     try stream.prefix();
     var second_writer_0 = stream.rangeWriter(0);
-    second_writer_0.write(.{ .marker = 4 });
+    second_writer_0.write(testStreamEvent(4));
     second_writer_0.finish();
     var second_writer_1 = stream.rangeWriter(1);
-    second_writer_1.write(.{ .marker = 5 });
+    second_writer_1.write(testStreamEvent(5));
     second_writer_1.finish();
     stream.finishWrite();
 
     const merged = stream.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), merged.len);
-    try std.testing.expectEqual(@as(u32, 4), merged[0].marker);
-    try std.testing.expectEqual(@as(u32, 5), merged[1].marker);
+    try expectTestStreamEvent(merged[0], 4);
+    try expectTestStreamEvent(merged[1], 5);
 }
 
 test "range output stream appends ranges after completed output" {
-    var stream = RangeOutputStream(SimulationIntent).init(std.testing.allocator);
+    var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();
 
     try stream.prepareRangeCounts(1);
     stream.addCount(0, 1);
     try stream.prefix();
     var first_writer = stream.rangeWriter(0);
-    first_writer.write(.{ .marker = 7 });
+    first_writer.write(testStreamEvent(7));
     first_writer.finish();
     stream.finishWrite();
 
@@ -498,20 +1025,20 @@ test "range output stream appends ranges after completed output" {
     stream.addCount(appended_range + 1, 2);
     try stream.prefixAppendedRanges(appended_range);
     var writer_1 = stream.rangeWriter(appended_range);
-    writer_1.write(.{ .marker = 8 });
+    writer_1.write(testStreamEvent(8));
     writer_1.finish();
     var writer_2 = stream.rangeWriter(appended_range + 1);
-    writer_2.write(.{ .marker = 9 });
-    writer_2.write(.{ .marker = 10 });
+    writer_2.write(testStreamEvent(9));
+    writer_2.write(testStreamEvent(10));
     writer_2.finish();
     stream.finishWrite();
 
     const merged = stream.mergedItems();
     try std.testing.expectEqual(@as(usize, 4), merged.len);
-    try std.testing.expectEqual(@as(u32, 7), merged[0].marker);
-    try std.testing.expectEqual(@as(u32, 8), merged[1].marker);
-    try std.testing.expectEqual(@as(u32, 9), merged[2].marker);
-    try std.testing.expectEqual(@as(u32, 10), merged[3].marker);
+    try expectTestStreamEvent(merged[0], 7);
+    try expectTestStreamEvent(merged[1], 8);
+    try expectTestStreamEvent(merged[2], 9);
+    try expectTestStreamEvent(merged[3], 10);
 }
 
 test "simulation frame reserves stream capacity for warmed fixed-step output" {
@@ -521,7 +1048,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     try frame.reserveStreams(2, 2, 2, 2, 2, 1);
 
     const original_allocator = frame.allocator;
-    const original_events_allocator = frame.events.allocator;
+    const original_events_allocator = frame.events.stream.allocator;
     const original_navigation_intents_allocator = frame.navigation_intents.allocator;
     const original_intents_allocator = frame.intents.allocator;
     const original_triggers_allocator = frame.collision_triggers.allocator;
@@ -529,14 +1056,14 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const fail = failing_allocator.allocator();
     frame.allocator = fail;
-    frame.events.allocator = fail;
+    frame.events.stream.allocator = fail;
     frame.navigation_intents.allocator = fail;
     frame.intents.allocator = fail;
     frame.collision_triggers.allocator = fail;
     frame.structural_commands.allocator = fail;
     defer {
         frame.allocator = original_allocator;
-        frame.events.allocator = original_events_allocator;
+        frame.events.stream.allocator = original_events_allocator;
         frame.navigation_intents.allocator = original_navigation_intents_allocator;
         frame.intents.allocator = original_intents_allocator;
         frame.collision_triggers.allocator = original_triggers_allocator;
@@ -548,10 +1075,10 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.events.addCount(1, 1);
     try frame.events.prefix();
     var event_writer = frame.events.rangeWriter(0);
-    event_writer.write(.{ .marker = 1 });
+    event_writer.write(entityCreatedEvent(1));
     event_writer.finish();
     event_writer = frame.events.rangeWriter(1);
-    event_writer.write(.{ .marker = 2 });
+    event_writer.write(entityCreatedEvent(2));
     event_writer.finish();
     frame.events.finishWrite();
 
@@ -582,10 +1109,10 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.intents.addCount(1, 1);
     try frame.intents.prefix();
     var intent_writer = frame.intents.rangeWriter(0);
-    intent_writer.write(.{ .marker = 3 });
+    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 1, .direction_y = 0 } });
     intent_writer.finish();
     intent_writer = frame.intents.rangeWriter(1);
-    intent_writer.write(.{ .marker = 4 });
+    intent_writer.write(.{ .movement = .{ .entity = EntityId.invalid, .direction_x = 0, .direction_y = 1 } });
     intent_writer.finish();
     frame.intents.finishWrite();
 

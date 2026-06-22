@@ -61,6 +61,13 @@ Add new code under the matching owner directory. Keep executable-only code near
   important system changes. Do not add a global pub/sub bus, string-topic
   dispatcher, callback chain, or event payloads carrying pointers,
   app/render/audio handles, asset paths, allocators, or service references.
+- Do not use the main thread as a generic dumping ground for scalable work in
+  any subsystem. Main-thread work must name the explicit boundary it is
+  preserving, such as SDL/GPU/audio ownership, state transitions, structural
+  commits, asset loading, save/load streaming, renderer resource ownership, or
+  measured light orchestration. Expensive app, gameplay, render-prep, event,
+  asset, or tool work should keep a clear owner, split over immutable inputs
+  when appropriate, and write deterministic owned outputs.
 - Treat ECS systems/processors such as movement, AI, collision, pathfinding, and
   render preparation as mostly stateless processors over `DataSystem` slices;
   they borrow data and services, but do not own persistent gameplay state.
@@ -108,6 +115,10 @@ Add new code under the matching owner directory. Keep executable-only code near
 - Do not mark a slice complete until its runtime behavior, docs, tests, and acceptance checks are integrated.
 - If a dependent system does not exist yet, label the work as foundation or preparation, and leave the actual feature checklist incomplete.
 - Avoid half-wired states: either finish the feature end to end or keep the roadmap honest about what remains.
+- Do not add test-only enum tags, union payloads, marker fields, fake stages,
+  fixture hooks, or test-only service paths to production contracts in any
+  subsystem. Tests should use private test helper types, local fixtures, mocks
+  kept behind test-only code, or real production payloads.
 
 ## Build, Test, And Development Commands
 

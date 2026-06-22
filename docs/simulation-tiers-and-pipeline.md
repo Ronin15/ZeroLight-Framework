@@ -100,6 +100,11 @@ The pipeline keeps today's processor order. Tiers only shrink stage inputs.
 
 Processors should not reorder this contract. Controllers and events may request
 tier changes, but mutation commits at the existing deferred structural boundary.
+Main-thread entries in this table are ownership boundaries or current sparse
+commit points, not a default home for scalable system work. This is not limited
+to simulation: if any app, gameplay, render-prep, asset, platform, or tooling
+work can grow with workload size, the design must name the owner and move
+scalable work into deterministic owned outputs over immutable inputs.
 
 ## Simulation Scope
 
@@ -154,6 +159,8 @@ Responsibilities:
 
 Non-responsibilities:
 
+- becoming a main-thread dumping ground for any subsystem work that needs its
+  own scalable owner
 - global cross-state scheduling
 - dynamic dependency graphs or string-topic dispatch
 - renderer, audio device, or GPU resource ownership
@@ -200,6 +207,12 @@ Allowed sources:
 Apply tier changes through deferred structural commands or an explicit
 main-thread commit at the end of the step. Processors must not mutate tier
 metadata mid-range.
+
+Production contracts should expose real runtime concepts only. Tests for scope
+or tier behavior follow the same project-wide rule as every other subsystem:
+use private fixtures, test-only mocks, or real payloads, not test-only enum
+tags, marker payloads, fake stages, fixture hooks, or service shortcuts in
+production APIs.
 
 ## Benchmarks And Budget Posture
 

@@ -29,6 +29,8 @@ const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapaci
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
+const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const RenderContext = @import("../app/state.zig").RenderContext;
@@ -207,6 +209,7 @@ pub const GameDemoState = struct {
 
         self.simulation_frame.phase = .merge_outputs;
         _ = try self.simulation_frame.applyStructuralCommands(&self.data);
+        try self.processPostCommitEvents();
         self.simulation_frame.phase = .finished;
     }
 
@@ -242,6 +245,42 @@ pub const GameDemoState = struct {
         var movement_slice = self.data.movementBodySlice();
         self.movement.syncPreviousPositions(&movement_slice);
         self.particles.syncPreviousPositions();
+    }
+
+    fn processPostCommitEvents(self: *GameDemoState) !void {
+        var invalidate_navigation = false;
+        for (self.simulation_frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (eventInvalidatesNavigation(event)) {
+                invalidate_navigation = true;
+            }
+        }
+
+        if (!invalidate_navigation) return;
+        try self.simulation_frame.events.ensureCanAppend(1);
+        try self.pathfinding.rebuildStaticNavGrid(&self.data, self.bounds_width, self.bounds_height, 32.0);
+        try self.simulation_frame.events.appendRequired(.{
+            .stage = .domain_reaction,
+            .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
+        });
+    }
+
+    fn eventInvalidatesNavigation(event: SimulationEvent) bool {
+        switch (event.payload) {
+            .entity_destroyed => |destroyed| {
+                return destroyed.was_static_navigation_obstacle;
+            },
+            .component_changed => |changed| switch (changed.component) {
+                .movement_body, .collision_bounds => {
+                    return changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle;
+                },
+                .collision_response => {
+                    return changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle;
+                },
+                else => return false,
+            },
+            else => return false,
+        }
     }
 
     fn clampAiSquaresToBounds(self: *GameDemoState, bounds_width: f32, bounds_height: f32) void {
@@ -867,6 +906,108 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     // vels zeroed on the violated axes (was pushed out)
     try std.testing.expectEqual(@as(f32, 0), after.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), after.velocity.y);
+}
+
+test "demo structural static obstacle change emits one navigation invalidation event" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .create_entity = .{
+        .movement_body = .{
+            .position = .{ .x = 360, .y = 180 },
+            .previous_position = .{ .x = 360, .y = 180 },
+            .velocity = .{},
+            .speed = 0,
+        },
+        .collision_bounds = .{ .size = .{ .x = 32, .y = 32 } },
+        .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.simulation_frame.applyStructuralCommands(&demo.data);
+    try demo.processPostCommitEvents();
+
+    var nav_invalidations: usize = 0;
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => |nav| {
+                nav_invalidations += 1;
+                try std.testing.expectEqual(NavInvalidationReason.static_obstacle_changed, nav.reason);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nav_invalidations);
+    try std.testing.expectEqual(@as(usize, 1), demo.simulation_frame.events.stats.nav_region_invalidated);
+}
+
+test "demo unrelated structural component change does not invalidate navigation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_asset_reference = .{
+        .entity = demo.player.entity,
+        .asset_reference = .{ .sprite = .demo_tile },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.simulation_frame.applyStructuralCommands(&demo.data);
+    try demo.processPostCommitEvents();
+
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => return error.UnexpectedNavInvalidation,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
+}
+
+test "demo dynamic entity structural destruction does not invalidate navigation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const dynamic = try demo.data.createEntity();
+    try demo.data.setMovementBody(dynamic, .{
+        .position = .{ .x = 360, .y = 180 },
+        .previous_position = .{ .x = 360, .y = 180 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try demo.data.setCollisionBounds(dynamic, .{ .size = .{ .x = 32, .y = 32 } });
+    try demo.data.setCollisionResponse(dynamic, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .destroy_entity = dynamic });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.simulation_frame.applyStructuralCommands(&demo.data);
+    try demo.processPostCommitEvents();
+
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => return error.UnexpectedNavInvalidation,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
 }
 
 test "collision sfx cooldowns harden: cap<=32, full evicts min-remaining, tick compacts for re-add, keyFor pair order" {
