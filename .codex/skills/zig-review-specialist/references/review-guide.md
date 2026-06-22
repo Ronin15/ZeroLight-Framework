@@ -27,6 +27,10 @@ Use concrete severity judgment:
 - State stack mutation happens through queued transitions or explicit stack APIs, not ad hoc ownership transfer.
 - Lower states receive update/input/render only according to policy.
 - Game code draws through renderer-facing APIs rather than owning raw SDL_GPU resources.
+- When multiple game/effect/UI producers can interleave render depths, game code
+  should emit transient records into `RenderQueue` or another explicit render-prep
+  ordering phase. Flag ad hoc demo-local ordering lists and renderer-side
+  fallback sorting that hides producer-order bugs.
 - Shared gameplay orchestration stays state-owned: `StateStack` dispatches,
   gameplay states own `DataSystem`/`SimulationFrame`/pipeline instances, and
   pipelines own controller order.
@@ -52,8 +56,14 @@ Use concrete severity judgment:
 
 - Texture, shader, buffer, sampler, pipeline, transfer buffer, and device lifetimes are paired and ordered safely.
 - Swapchain acquisition failure paths cancel or skip frame work deterministically.
+- CPU render prep, draw-record ordering, and worker vertex expansion should not
+  hold an acquired swapchain image unless the code has a narrow resize/revalidate
+  reason. Flag `SDL_WaitAndAcquireGPUSwapchainTexture` before substantial CPU
+  prep as latency and swapchain-pressure risk.
 - Per-frame draw submission does not add avoidable allocation, string lookup, or hash-map lookup.
-- Sprite ordering remains stable when sorting or batching changes.
+- Sprite ordering remains stable when render queue ordering or batching changes.
+  `SpriteBatch` should consume ordered streams; it should not be the compatibility
+  fallback sorter for unordered producers.
 - Upload validation rejects bad dimensions, pitch, and buffer lengths before GPU work.
 - Shader build changes preserve platform formats and installed runtime asset paths.
 

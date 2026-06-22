@@ -8,9 +8,11 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
 const particle_range_alignment_items = @import("../game/systems/particle.zig").particle_range_alignment_items;
 const ParticleSystem = @import("../game/systems/particle.zig").ParticleSystem;
+const WorldDepth = @import("../game/render_depth.zig").WorldDepth;
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
+const benchmark_particle_depths = [_]WorldDepth{ .actor, .effect, .marker };
 
 pub const group = suite.BenchmarkGroup{
     .name = "particles",
@@ -46,7 +48,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !ParticleSystem
             .end_size = 1,
             .start_color = .{ .r = 0.9, .g = 0.7, .b = 0.2, .a = 1 },
             .end_color = .{ .r = 0.3, .g = 0.5, .b = 1, .a = 0 },
-            .layer = @intCast(index % 4),
+            .depth = benchmark_particle_depths[index % benchmark_particle_depths.len],
         });
         std.debug.assert(emitted);
     }

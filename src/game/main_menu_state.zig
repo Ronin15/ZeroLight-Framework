@@ -37,11 +37,6 @@ pub const MainMenuState = struct {
         "Quit",
     };
 
-    const overlay_layer: i32 = 8_500;
-    const panel_layer: i32 = 8_501;
-    const highlight_layer: i32 = 8_502;
-    const text_layer: i32 = 8_503;
-
     const overlay_color = config.Color{ .r = 0.04, .g = 0.06, .b = 0.08, .a = 0.95 };
     const panel_color = config.Color{ .r = 0.08, .g = 0.10, .b = 0.12, .a = 0.92 };
     const accent_color = config.Color{ .r = 1.0, .g = 0.86, .b = 0.2, .a = 1.0 };
@@ -124,10 +119,11 @@ pub const MainMenuState = struct {
             overlay_color,
             panel_color,
             .{ .r = 0.16, .g = 0.18, .b = 0.20, .a = 0.85 },
-            overlay_layer,
-            panel_layer,
-            highlight_layer,
-            text_layer,
+            context.ui_stack_order,
+            .background,
+            .panel,
+            .highlight,
+            .text,
         );
     }
 

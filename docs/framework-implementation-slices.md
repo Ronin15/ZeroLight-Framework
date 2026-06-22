@@ -22,9 +22,10 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish Slice 7 parallel CPU render prep on top of the Slice 17
-  `RuntimeAssets` catalog. Keep it incomplete until serial and parallel prep
-  produce identical draw order, grouping, and invalid-resource handling.
+- Use the completed Slice 7 render-prep benchmark to guard current sprite/rect
+  CPU prep. Future tile rendering and richer UI paths should feed the same
+  handle-based command surface or add a later batcher without moving SDL_GPU
+  submission off the render thread.
 - Track collision-response merge/apply, renderer batch capacity, text-cache
   lifetime policy, and manual registry guardrails as hardening follow-ups.
 - Treat Slice 20 pathfinding budgets, deterministic pending retention, and
@@ -244,11 +245,12 @@ Future render-data slice:
 
 - Entity creation and world loading should bind stable sprite or atlas-region
   IDs before render-time. `DataSystem` render data should store stable asset
-  references plus source intent such as tint, layer, and coordinate-space
+  references plus source intent such as tint, render depth band, and coordinate-space
   intent, not live renderer handles.
-- A state-owned render-prep system should read immutable `DataSystem` slices and
-  submit prepared `Sprite` commands to `Renderer`. The renderer should not look
-  up gameplay entities, world data, asset paths, or texture assignments.
+- A state-owned render-prep system should read immutable `DataSystem` slices,
+  emit transient draw records into a `RenderQueue`, and submit the queue's
+  ordered stream to `Renderer`. The renderer should not look up gameplay
+  entities, world data, asset paths, or texture assignments.
 - Atlas work should build on the same boundary: assets decode source images,
   atlas code packs CPU pixels, render uploads the final atlas texture, and
   entities reference atlas regions.
@@ -310,8 +312,10 @@ Implemented foundation:
 
 - `Renderer` owns frame coordination, public draw APIs, texture IDs, swapchain
   acquisition, render-pass encoding, and command submission.
-- `SpriteBatch` owns sprite command sorting, vertex expansion, and draw-group
-  construction.
+- `RenderQueue` owns transient draw-record ordering across world, UI, effect,
+  and debug producers.
+- `SpriteBatch` owns strict ordered-stream validation, vertex expansion, and
+  draw-group construction.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, pipeline creation,
   upload buffers, and texture upload helpers.
 - Build now has a shader-program table for the existing sprite shader pair.
@@ -322,8 +326,8 @@ Architecture notes:
   `renderer.zig`, so texture ownership does not migrate across several files at
   the same time as the handle model changes.
 - The first split uses `src/render/gpu/` for SDL_GPU device/window setup,
-  shader/pipeline creation, buffers, and texture upload, with sprite command
-  sorting and vertex expansion moved to `sprite_batch.zig`.
+  shader/pipeline creation, buffers, and texture upload, with draw-record
+  ordering in `render_queue.zig` and vertex expansion in `sprite_batch.zig`.
 - Keep `Renderer` as the game-facing facade and frame coordinator; the split
   should hide GPU details behind narrower render-owned modules, not expose more
   SDL_GPU surface area to game states.
@@ -335,9 +339,9 @@ Checklist:
 - [x] If `renderer.zig` remains too broad after resource IDs land, split GPU
       setup, pipeline, buffer, and texture helpers under `src/render/gpu/`.
 - [x] Introduce static material/pipeline records for the current sprite pipeline.
-- [x] Keep draw command sorting stable by layer and submission order.
-- [x] Preserve `drawSprite` and `drawRect` as the game-facing API during the
-      first split.
+- [x] Keep draw record ordering stable by `RenderOrder` and submission order.
+- [x] Preserve explicit `Renderer.submitOrdered*` calls for already ordered
+      renderer-owned paths and route unordered producers through `RenderQueue`.
 - [x] Add tests for batch grouping, invalid texture skipping, and ordering.
 - [x] Re-run `gpu-smoke` when display access is available.
 
@@ -363,6 +367,8 @@ Current foundation:
 - `TimeLoop` already enforces fixed-step gameplay updates.
 - Renderer command submission is currently serial and owns SDL_GPU command
   buffers, swapchain acquisition, vertex upload, and submit.
+- Current sprite and rectangle drawing flows through `SpriteBatch`, with stable
+  sprite IDs resolved by `RuntimeAssets` before draw submission.
 - Zig 0.16 provides `std.Thread.spawn`, atomics, and `std.Io` blocking
   primitives; this checkout does not rely on a std thread-pool abstraction.
 
@@ -432,17 +438,27 @@ Parallel render-prep design:
 - [x] Keep SDL_GPU command-buffer acquisition, swapchain acquisition, GPU
       upload, render-pass encoding, and submit on the main/render thread for
       the first implementation.
-- [ ] Parallelize CPU render prep only: visibility/culling, layer bucketing,
-      stable sort by layer and submission sequence, sprite-to-vertex expansion,
-      draw-group construction, and per-worker temporary vertex/group buffers.
-- [ ] Snapshot texture/resource metadata needed by workers before dispatch so
+- [x] Split CPU render prep into explicit phases: `RenderQueue` owns intentional
+      transient draw-record ordering, then `SpriteBatch` consumes the ordered
+      stream for texture validation, sprite-to-vertex expansion, and draw-group
+      construction. The renderer does not keep compatibility fallback sorting
+      that hides producer-order bugs.
+- [x] Keep the render prep tuner and stats owned by `SpriteBatch`/`Renderer`
+      instead of relying on the generic `ThreadSystem` fallback tuner.
+- [x] Snapshot texture/resource metadata needed by workers before dispatch so
       worker jobs never observe renderer arrays while they are being mutated.
-- [ ] Merge worker outputs on the main thread in deterministic layer and
-      sequence order, then upload the final vertex buffer and submit one GPU
-      command buffer.
-- [x] Preserve the current serial path and choose it for low command counts,
-      low layer counts, unsupported thread targets, or debug comparisons.
-- [ ] Defer threaded SDL_GPU command buffers until profiling proves main-thread
+- [x] Merge worker outputs on the main thread in command-stream order, then
+      upload the final vertex buffer and submit one GPU command buffer.
+- [x] Preserve the inline path and let the adaptive tuner choose it for work
+      that does not benefit from worker dispatch.
+- [x] Add a non-interactive `render-prep` benchmark group that reports draw
+      commands, valid sprites, skipped invalid resources, vertex count, draw
+      groups, worker use, range size, and adaptive tuning state.
+      Interpret `thread-fixed-*` rows as forced scheduler/range controls and
+      `thread-adaptive-*` rows as the production-style measured scheduling
+      signal; cheap sprite/rect prep should stay inline until the adaptive
+      tuner proves worker participation wins.
+- [x] Defer threaded SDL_GPU command buffers until profiling proves main-thread
       command encoding is the bottleneck. If added later, command buffers must
       be acquired, used, and submitted on the same worker thread; swapchain
       acquisition must remain on the window thread.
@@ -458,8 +474,8 @@ Acceptance checks:
 - [x] Shutdown wakes and joins parked workers without leaking or deadlocking.
 - [x] Worker idle policy parks on a condition variable; no spin loop or unused
       spin configuration remains in the config.
-- [ ] Serial and parallel render prep produce identical vertex order, draw
-      group order, layer ordering, and invalid-texture skipping for the same
+- [x] Serial and parallel render prep produce identical vertex order, draw
+      group order, render ordering, and invalid-texture skipping for the same
       command input.
 - [x] Existing visible rendering remains swapchain/vsync paced, hidden/minimized
       fallback pacing remains unchanged, and visible no-swapchain results block
@@ -467,14 +483,15 @@ Acceptance checks:
 - [x] `zig build test`, `zig build check`, and `zig build verify` pass before
       the slice is considered complete.
 
-Core pass landed: this slice now has a pre-spawned app-owned `ThreadSystem`,
-explicit update/render contexts, synchronous `parallelFor`, adaptive per-batch
-background-worker participation, per-worker scratch slot indexing, and a serial
-renderer prep hook. Adaptive scheduling only changes how many already
-pre-spawned parked workers participate in each batch; workers are spawned during
-`ThreadSystem.init`, reused across frame batches, parked when idle, and joined
-only during `ThreadSystem.deinit`. Remaining unchecked work is the actual
-parallel CPU render-prep pipeline.
+Slice 7 is complete for the current sprite/rect renderer path. It has a
+pre-spawned app-owned `ThreadSystem`, explicit update/render contexts,
+synchronous `parallelFor`, adaptive per-batch background-worker participation,
+per-worker scratch slot indexing, and render-owned parallel CPU sprite prep.
+`SpriteBatch` snapshots texture metadata on the main thread, expands prepared
+sprites into disjoint vertex spans through the thread system, builds draw
+groups deterministically on the main thread, and leaves SDL_GPU command-buffer
+work on the render thread. Future tile rendering, UI widgets, material
+registries, or threaded GPU command buffers remain separate slices.
 
 ## Slice 8: Shader And Platform Expansion
 
@@ -719,10 +736,10 @@ Movement and particle passes landed: the demo maps player input to movement
 velocity, exposes a movement-body slice to `MovementSystem`, applies player-only
 bounds clamping, emits a small particle trail, updates particles, and renders
 transient particle rectangles. A few colored moving squares remain as non-player
-movement processor coverage. Parallel render prep remains open under Slice 7,
-while simulation contracts, collision, and the first AI intent processor are
-covered by Slices 12-14. Pathfinding and broader rule processing remain future
-systems that should build on the same typed-output contracts.
+movement processor coverage. Simulation contracts, collision, and the first AI
+intent processor are covered by Slices 12-14. Pathfinding and broader rule
+processing remain future systems that should build on the same typed-output
+contracts.
 
 ## Slice 12: Simulation Contracts And Deferred Structural Changes
 
@@ -986,8 +1003,11 @@ Current foundation:
 
 - `StateStack` + `StateTransitions` (replaceGameplay, replaceOwnedGameplay, pushModal, pop support added in this slice) and the four policies (gameplay / modal_overlay / pass_through_overlay / opaque_screen).
 - `InputState` / `FrameCommands` + `input_router` with explicit `.ui` context and `modalUi`/`opaqueScreen` policies that already block gameplay movement while allowing app/debug/ui commands. Consumed state events suppress fallback routing into global frame commands.
-- `TextService` cached text drawing/preparation (Slice 5) and `Renderer.drawSprite` / `drawRectInSpace(..., .logical)` for UI.
-- `PauseState` provides the concrete drawing, layering (~9000+), color, text-measurement, and centered-panel precedent.
+- `TextService` cached text drawing/preparation (Slice 5) and explicit
+  `Renderer.submitOrdered*` logical-space calls for already ordered UI helpers.
+- `PauseState` provides the concrete drawing, stack-aware
+  `UiDepth`/`RenderOrder.uiInStack(...)`, color, text-measurement, and
+  centered-panel precedent.
 - `AudioCommandBuffer.setMasterGain` / `setBusGain` + `AudioBus` (Slice 15) for live settings feedback without owning mixer resources. MainMenuState owns the runtime audio-setting values so they persist across settings reopen and into gameplay launch.
 - `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
 - `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.

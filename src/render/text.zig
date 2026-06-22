@@ -13,6 +13,7 @@ const config = @import("../config.zig");
 const log = @import("../core/logging.zig").render;
 const renderer_file = @import("renderer.zig");
 const CoordinateSpace = renderer_file.CoordinateSpace;
+const RenderOrder = renderer_file.RenderOrder;
 const Rect = renderer_file.Rect;
 const Renderer = renderer_file.Renderer;
 const TextureId = @import("resources.zig").TextureId;
@@ -175,7 +176,7 @@ pub const TextPlacement = struct {
     x: f32,
     y: f32,
     anchor: TextAnchor = .top_left,
-    layer: i32,
+    order: RenderOrder = RenderOrder.ui(.text),
     coordinate_space: CoordinateSpace = .logical,
 };
 
@@ -452,10 +453,10 @@ pub const TextService = struct {
 
 pub fn drawPreparedText(renderer: *Renderer, prepared: PreparedText, placement: TextPlacement) !void {
     if (!prepared.isValid()) return;
-    try renderer.drawSprite(.{
+    try renderer.submitOrderedSprite(.{
         .texture = prepared.texture,
         .dest = textDest(prepared, placement),
-        .layer = placement.layer,
+        .order = placement.order,
         .coordinate_space = placement.coordinate_space,
     });
 }
@@ -822,12 +823,10 @@ test "text placement supports top left and top center anchors" {
     try std.testing.expectEqual(Rect{ .x = 10, .y = 30, .w = 80, .h = 20 }, textDest(prepared, .{
         .x = 10,
         .y = 30,
-        .layer = 1,
     }));
     try std.testing.expectEqual(Rect{ .x = 60, .y = 30, .w = 80, .h = 20 }, textDest(prepared, .{
         .x = 100,
         .y = 30,
         .anchor = .top_center,
-        .layer = 1,
     }));
 }

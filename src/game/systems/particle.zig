@@ -11,7 +11,10 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
-const Renderer = @import("../../render/renderer.zig").Renderer;
+const RenderOrder = @import("../../render/renderer.zig").RenderOrder;
+const RenderQueue = @import("../../render/render_queue.zig").RenderQueue;
+const render_depth = @import("../render_depth.zig");
+const WorldDepth = render_depth.WorldDepth;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -45,6 +48,7 @@ pub const ParticleUpdateStats = struct {
 
 pub const ParticleSpawn = struct {
     position: math.Vec2 = .{},
+    base_z: i32 = 0,
     velocity: math.Vec2 = .{},
     acceleration: math.Vec2 = .{},
     lifetime: f32 = 1,
@@ -52,12 +56,13 @@ pub const ParticleSpawn = struct {
     end_size: f32 = 0,
     start_color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     end_color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 0 },
-    layer: i32 = 10,
+    depth: WorldDepth = .effect,
 };
 
 pub const ParticleEmitterConfig = struct {
     count: usize = 1,
     position: math.Vec2 = .{},
+    base_z: i32 = 0,
     base_velocity: math.Vec2 = .{},
     velocity_step: math.Vec2 = .{},
     acceleration: math.Vec2 = .{},
@@ -67,7 +72,7 @@ pub const ParticleEmitterConfig = struct {
     end_size: f32 = 0,
     start_color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     end_color: config.Color = .{ .r = 1, .g = 1, .b = 1, .a = 0 },
-    layer: i32 = 10,
+    depth: WorldDepth = .effect,
 };
 
 pub const ParticleSlice = struct {
@@ -96,7 +101,7 @@ pub const ParticleSlice = struct {
     end_color_g: HotF32Slice,
     end_color_b: HotF32Slice,
     end_color_a: HotF32Slice,
-    layers: []i32,
+    z: []i32,
 
     pub fn len(self: ParticleSlice) usize {
         return self.position_x.len;
@@ -129,7 +134,7 @@ pub const ConstParticleSlice = struct {
     end_color_g: ConstHotF32Slice,
     end_color_b: ConstHotF32Slice,
     end_color_a: ConstHotF32Slice,
-    layers: []const i32,
+    z: []const i32,
 
     pub fn len(self: ConstParticleSlice) usize {
         return self.position_x.len;
@@ -164,7 +169,7 @@ pub const ParticleSystem = struct {
     end_color_g: HotF32List = .empty,
     end_color_b: HotF32List = .empty,
     end_color_a: HotF32List = .empty,
-    layers: std.ArrayList(i32) = .empty,
+    z: std.ArrayList(i32) = .empty,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator, system_config: ParticleSystemConfig) !ParticleSystem {
@@ -204,7 +209,7 @@ pub const ParticleSystem = struct {
         self.end_color_g.deinit(self.allocator);
         self.end_color_b.deinit(self.allocator);
         self.end_color_a.deinit(self.allocator);
-        self.layers.deinit(self.allocator);
+        self.z.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -239,7 +244,7 @@ pub const ParticleSystem = struct {
             .end_color_g = self.end_color_g.items,
             .end_color_b = self.end_color_b.items,
             .end_color_a = self.end_color_a.items,
-            .layers = self.layers.items,
+            .z = self.z.items,
         };
     }
 
@@ -270,7 +275,7 @@ pub const ParticleSystem = struct {
             .end_color_g = self.end_color_g.items,
             .end_color_b = self.end_color_b.items,
             .end_color_a = self.end_color_a.items,
-            .layers = self.layers.items,
+            .z = self.z.items,
         };
     }
 
@@ -303,7 +308,7 @@ pub const ParticleSystem = struct {
         self.end_color_g.appendAssumeCapacity(spawn.end_color.g);
         self.end_color_b.appendAssumeCapacity(spawn.end_color.b);
         self.end_color_a.appendAssumeCapacity(spawn.end_color.a);
-        self.layers.appendAssumeCapacity(spawn.layer);
+        self.z.appendAssumeCapacity(render_depth.worldZWithOffset(spawn.base_z, spawn.depth));
         return true;
     }
 
@@ -313,6 +318,7 @@ pub const ParticleSystem = struct {
             const index_f: f32 = @floatFromInt(index);
             if (self.emit(.{
                 .position = emitter_config.position,
+                .base_z = emitter_config.base_z,
                 .velocity = .{
                     .x = emitter_config.base_velocity.x + emitter_config.velocity_step.x * index_f,
                     .y = emitter_config.base_velocity.y + emitter_config.velocity_step.y * index_f,
@@ -323,7 +329,7 @@ pub const ParticleSystem = struct {
                 .end_size = emitter_config.end_size,
                 .start_color = emitter_config.start_color,
                 .end_color = emitter_config.end_color,
-                .layer = emitter_config.layer,
+                .depth = emitter_config.depth,
             })) {
                 emitted += 1;
             }
@@ -387,7 +393,7 @@ pub const ParticleSystem = struct {
         };
     }
 
-    pub fn render(self: *const ParticleSystem, renderer: *Renderer, interpolation_alpha: f32) !void {
+    pub fn enqueueRender(self: *const ParticleSystem, queue: *RenderQueue, interpolation_alpha: f32) !void {
         const particles = self.sliceConst();
         for (0..particles.len()) |index| {
             const size = particles.size[index];
@@ -398,7 +404,7 @@ pub const ParticleSystem = struct {
                 .{ .x = particles.position_x[index], .y = particles.position_y[index] },
                 interpolation_alpha,
             );
-            try renderer.drawRect(.{
+            try queue.addRect(.{
                 .x = position.x - size * 0.5,
                 .y = position.y - size * 0.5,
                 .w = size,
@@ -408,7 +414,7 @@ pub const ParticleSystem = struct {
                 .g = particles.color_g[index],
                 .b = particles.color_b[index],
                 .a = particles.color_a[index],
-            }, particles.layers[index]);
+            }, RenderOrder.world(particles.z[index]), .world);
         }
     }
 
@@ -445,7 +451,7 @@ pub const ParticleSystem = struct {
         self.end_color_g.clearRetainingCapacity();
         self.end_color_b.clearRetainingCapacity();
         self.end_color_a.clearRetainingCapacity();
-        self.layers.clearRetainingCapacity();
+        self.z.clearRetainingCapacity();
     }
 
     fn reserveStorage(self: *ParticleSystem, capacity: usize) !void {
@@ -474,7 +480,7 @@ pub const ParticleSystem = struct {
         try self.end_color_g.ensureTotalCapacity(self.allocator, capacity);
         try self.end_color_b.ensureTotalCapacity(self.allocator, capacity);
         try self.end_color_a.ensureTotalCapacity(self.allocator, capacity);
-        try self.layers.ensureTotalCapacity(self.allocator, capacity);
+        try self.z.ensureTotalCapacity(self.allocator, capacity);
     }
 
     fn removeExpiredSwap(self: *ParticleSystem) usize {
@@ -523,7 +529,7 @@ pub const ParticleSystem = struct {
         self.end_color_g.items[dst] = self.end_color_g.items[src];
         self.end_color_b.items[dst] = self.end_color_b.items[src];
         self.end_color_a.items[dst] = self.end_color_a.items[src];
-        self.layers.items[dst] = self.layers.items[src];
+        self.z.items[dst] = self.z.items[src];
     }
 
     fn popAll(self: *ParticleSystem) void {
@@ -552,7 +558,7 @@ pub const ParticleSystem = struct {
         _ = self.end_color_g.pop();
         _ = self.end_color_b.pop();
         _ = self.end_color_a.pop();
-        _ = self.layers.pop();
+        _ = self.z.pop();
     }
 };
 
@@ -700,7 +706,7 @@ fn fillParticles(system: *ParticleSystem, count: usize) void {
             .end_size = 2,
             .start_color = .{ .r = 1, .g = 0.5, .b = 0.25, .a = 1 },
             .end_color = .{ .r = 0.25, .g = 0.1, .b = 1, .a = 0 },
-            .layer = 5,
+            .depth = .effect,
         });
     }
 }
@@ -718,7 +724,7 @@ fn expectParticleColumnsAligned(system: *const ParticleSystem) !void {
     try std.testing.expectEqual(count, particles.age.len);
     try std.testing.expectEqual(count, particles.lifetime.len);
     try std.testing.expectEqual(count, particles.size.len);
-    try std.testing.expectEqual(count, particles.layers.len);
+    try std.testing.expectEqual(count, particles.z.len);
 }
 
 fn expectParticlesApproxEqual(actual: *const ParticleSystem, expected: *const ParticleSystem) !void {
@@ -787,6 +793,58 @@ test "particle columns remain aligned after expired swap removal" {
     try expectParticleColumnsAligned(&particles);
     const alive = particles.sliceConst();
     try std.testing.expectEqual(@as(f32, 2), alive.velocity_x[0]);
+}
+
+test "particle render records are ordered by render queue instead of storage order" {
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 2 });
+    defer particles.deinit();
+    var queue = RenderQueue.init(std.testing.allocator);
+    defer queue.deinit();
+
+    try std.testing.expect(particles.emit(.{ .depth = .marker, .start_size = 4 }));
+    try std.testing.expect(particles.emit(.{ .depth = .effect, .start_size = 4 }));
+
+    try particles.enqueueRender(&queue, 1.0);
+    try std.testing.expectEqual(@as(usize, 2), queue.recordCount());
+    queue.sortForSubmit();
+
+    try std.testing.expect(queue.recordOrder(0).lessOrEqual(queue.recordOrder(1)));
+    try std.testing.expectEqual(render_depth.worldZ(.effect), queue.recordOrder(0).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.marker), queue.recordOrder(1).depth);
+}
+
+test "particle render z is relative to emitter base z" {
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    try std.testing.expect(particles.emit(.{
+        .base_z = 20,
+        .depth = .effect,
+        .start_size = 4,
+    }));
+
+    const slice_data = particles.sliceConst();
+    try std.testing.expectEqual(render_depth.worldZWithOffset(20, .effect), slice_data.z[0]);
+}
+
+test "particle render z saturates extreme emitter base z" {
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 2 });
+    defer particles.deinit();
+
+    try std.testing.expect(particles.emit(.{
+        .base_z = std.math.maxInt(i32),
+        .depth = .marker,
+        .start_size = 4,
+    }));
+    try std.testing.expect(particles.emit(.{
+        .base_z = std.math.minInt(i32),
+        .depth = .floor,
+        .start_size = 4,
+    }));
+
+    const slice_data = particles.sliceConst();
+    try std.testing.expectEqual(std.math.maxInt(i32), slice_data.z[0]);
+    try std.testing.expectEqual(std.math.minInt(i32), slice_data.z[1]);
 }
 
 test "serial particle simd path matches scalar path" {

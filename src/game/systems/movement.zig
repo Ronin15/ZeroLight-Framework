@@ -89,6 +89,7 @@ fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
     for (0..slice.entities.len) |index| {
         slice.previous_x[index] = slice.position_x[index];
         slice.previous_y[index] = slice.position_y[index];
+        slice.previous_z[index] = slice.position_z[index];
     }
 }
 
@@ -113,6 +114,9 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
 
         storeFloat4(slice.previous_x[index..], position_x);
         storeFloat4(slice.previous_y[index..], position_y);
+        for (index..index + simd.lane_count) |z_index| {
+            slice.previous_z[z_index] = slice.position_z[z_index];
+        }
         storeFloat4(slice.position_x[index..], next_x);
         storeFloat4(slice.position_y[index..], next_y);
     }
@@ -122,6 +126,7 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
         const position_y = slice.position_y[index];
         slice.previous_x[index] = position_x;
         slice.previous_y[index] = position_y;
+        slice.previous_z[index] = slice.position_z[index];
         slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
         slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
     }
@@ -136,6 +141,7 @@ fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delt
         const position_y = slice.position_y[index];
         slice.previous_x[index] = position_x;
         slice.previous_y[index] = position_y;
+        slice.previous_z[index] = slice.position_z[index];
         slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
         slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
     }

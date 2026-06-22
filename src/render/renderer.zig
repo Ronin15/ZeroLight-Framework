@@ -17,6 +17,7 @@ const resources = @import("resources.zig");
 const resolution = @import("../app/resolution.zig");
 const sdl = @import("../platform/sdl.zig");
 const sprite_batch = @import("sprite_batch.zig");
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const c = sdl.c;
 
 const initial_batch_vertices = 4096 * 6;
@@ -25,7 +26,13 @@ const initial_batch_commands = initial_batch_vertices / 6;
 pub const TextureId = resources.TextureId;
 pub const Rect = sprite_batch.Rect;
 pub const CoordinateSpace = sprite_batch.CoordinateSpace;
+pub const RenderDomain = sprite_batch.RenderDomain;
+pub const RenderOrder = sprite_batch.RenderOrder;
+pub const UiDepth = sprite_batch.UiDepth;
+pub const UiStackOrder = sprite_batch.UiStackOrder;
+pub const DebugDepth = sprite_batch.DebugDepth;
 pub const Sprite = sprite_batch.Sprite;
+pub const SpritePrepStats = sprite_batch.SpritePrepStats;
 
 pub const FrameResult = enum {
     submitted,
@@ -141,20 +148,16 @@ pub const Renderer = struct {
         self.clear_color = clear_color;
     }
 
-    pub fn drawSprite(self: *Renderer, sprite: Sprite) !void {
+    pub fn submitOrderedSprite(self: *Renderer, sprite: Sprite) !void {
         try self.batch.drawSprite(sprite);
     }
 
-    pub fn drawRect(self: *Renderer, rect: Rect, color: config.Color, layer: i32) !void {
-        try self.drawRectInSpace(rect, color, layer, .world);
-    }
-
-    pub fn drawRectInSpace(self: *Renderer, rect: Rect, color: config.Color, layer: i32, coordinate_space: CoordinateSpace) !void {
-        try self.drawSprite(.{
+    pub fn submitOrderedRectInSpace(self: *Renderer, rect: Rect, color: config.Color, order: RenderOrder, coordinate_space: CoordinateSpace) !void {
+        try self.submitOrderedSprite(.{
             .texture = self.white_texture,
             .dest = rect,
             .tint = color,
-            .layer = layer,
+            .order = order,
             .coordinate_space = coordinate_space,
         });
     }
@@ -191,9 +194,15 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn endFrame(self: *Renderer) !FrameResult {
+    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
+        const pre_acquire_drawable_size = self.currentDrawableSize() catch |err| switch (err) {
+            error.InvalidDrawableSize => return .skipped_no_swapchain,
+            else => return err,
+        };
+        var presentation = self.updatePresentation(window_size, pre_acquire_drawable_size);
+        try self.prepareFrameCommands(presentation, thread_system);
 
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
             return sdlError("SDL_AcquireGPUCommandBuffer");
@@ -230,12 +239,14 @@ pub const Renderer = struct {
 
         self.viewport_width = width;
         self.viewport_height = height;
-        const presentation = self.updatePresentation(window_size, .{
+        const acquired_drawable_size = resolution.DrawableSize{
             .width = width,
             .height = height,
-        });
-
-        self.prepareFrameCommands(presentation);
+        };
+        if (width != pre_acquire_drawable_size.width or height != pre_acquire_drawable_size.height) {
+            presentation = self.updatePresentation(window_size, acquired_drawable_size);
+            try self.prepareFrameCommands(presentation, thread_system);
+        }
 
         if (self.batch.vertices.items.len > 0) {
             self.stageVertices() catch {
@@ -308,6 +319,20 @@ pub const Renderer = struct {
         return .{
             .width = @intCast(window_width),
             .height = @intCast(window_height),
+        };
+    }
+
+    fn currentDrawableSize(self: *Renderer) !resolution.DrawableSize {
+        var drawable_width: c_int = 0;
+        var drawable_height: c_int = 0;
+        if (!c.SDL_GetWindowSizeInPixels(self.window, &drawable_width, &drawable_height)) {
+            return sdlError("SDL_GetWindowSizeInPixels");
+        }
+        if (drawable_width <= 0 or drawable_height <= 0) return error.InvalidDrawableSize;
+
+        return .{
+            .width = @intCast(drawable_width),
+            .height = @intCast(drawable_height),
         };
     }
 
@@ -520,8 +545,12 @@ pub const Renderer = struct {
         try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_transfer_buffer, self.vertex_buffer, self.batch.vertices.items);
     }
 
-    fn prepareFrameCommands(self: *Renderer, frame_presentation: resolution.Presentation) void {
-        self.batch.buildSerial(self.textureResolver(), frame_presentation);
+    pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {
+        return self.batch.lastPrepStats();
+    }
+
+    fn prepareFrameCommands(self: *Renderer, frame_presentation: resolution.Presentation, thread_system: ?*ThreadSystem) !void {
+        _ = self.batch.buildAssumeCapacity(self.textureResolver(), frame_presentation, thread_system, .{});
     }
 };
 

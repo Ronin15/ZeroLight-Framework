@@ -15,7 +15,7 @@ Use this guidance for lean Zig SDL3/SDL_GPU 2D game projects. Treat the codebase
 - `src/core/` owns small shared helpers such as math primitives.
 - `src/root.zig` should stay limited to math aliases and compile coverage; feature code should live under the matching `src/` area.
 
-Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and transition application. Keep renderer APIs as the path game code uses for drawing instead of calling SDL_GPU directly from game states.
+Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and transition application. Game states should emit transient draw records through `RenderQueue` by default. Use `Renderer.submitOrdered*` only for renderer-owned or tightly controlled paths that already submit in nondecreasing `RenderOrder`; game states should never call SDL_GPU directly.
 
 ## Slice Completion
 
@@ -40,7 +40,9 @@ Default optimize mode is `Debug`. Use explicit release modes only for release ca
 
 ## Rendering And Timing Rules
 
-The app uses SDL_GPU directly and does not call Vulkan APIs itself. Game code should draw through `Renderer`. Shader sources live in `assets/shaders/*.glsl` and build into installed runtime shader files.
+The app uses SDL_GPU directly and does not call Vulkan APIs itself. Game code should draw through `RenderQueue` unless it is a tightly controlled already ordered path. `RenderQueue` is the intentional ordering phase for world/effect/UI/debug records; `SpriteBatch` is a strict ordered-stream consumer, not a compatibility sorter. Shader sources live in `assets/shaders/*.glsl` and build into installed runtime shader files.
+
+Keep CPU render prep outside the acquired swapchain window where practical. Snapshot, draw-record ordering, and worker vertex expansion should happen before `SDL_WaitAndAcquireGPUSwapchainTexture`; the acquired section should stay focused on upload, render-pass encoding, and submit.
 
 Preserve fixed 60Hz simulation through the time loop. Visible rendering is paced by SDL_GPU swapchain acquisition and may follow higher refresh displays. Hidden, minimized, or no-swapchain frames may skip rendering and use fallback delay pacing so gameplay does not advance while the player cannot see it.
 
@@ -54,7 +56,7 @@ Apply state transitions after dispatch. State stack code should own state lifeti
 
 ## Asset And Shader Rules
 
-Runtime assets live under `assets/` and are installed to `zig-out/bin/assets` unless `-Dasset-root` changes the root. Keep asset paths relative and traversal-safe. PNG texture loading uses core SDL3 support; do not add SDL3_image unless the user explicitly asks. Runtime gameplay and render prep should use stable manifest IDs through `RuntimeAssets`, not per-frame path lookup or live renderer/audio handles in `DataSystem`.
+Runtime assets live under `assets/` and are installed to `zig-out/bin/assets` unless `-Dasset-root` changes the root. Keep asset paths relative and traversal-safe. PNG texture loading uses core SDL3 support; do not add SDL3_image unless the user explicitly asks. Runtime gameplay and render prep should use stable manifest IDs through `RuntimeAssets`, not per-frame path lookup or live renderer/audio handles in `DataSystem`. Convert stable asset IDs to renderer texture IDs at the render-prep/queue boundary, not inside `DataSystem`.
 
 Shader tools are required for runnable builds. Linux uses SPIR-V output; macOS uses SPIR-V converted to MSL. If shader compilation fails, separate shader tool availability from Zig compile errors.
 

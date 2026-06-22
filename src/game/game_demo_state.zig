@@ -34,10 +34,13 @@ const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
-const Rect = @import("../render/renderer.zig").Rect;
-const Renderer = @import("../render/renderer.zig").Renderer;
+const RenderOrder = @import("../render/renderer.zig").RenderOrder;
+const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const render_prep = @import("render_prep.zig");
+const render_depth = @import("render_depth.zig");
+const WorldDepth = render_depth.WorldDepth;
 const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 8;
@@ -58,6 +61,7 @@ pub const GameDemoState = struct {
     collision: CollisionSystem,
     collision_response: CollisionResponseSystem,
     particles: ParticleSystem,
+    render_queue: RenderQueue,
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
@@ -79,6 +83,9 @@ pub const GameDemoState = struct {
         const obstacles = try spawnObstacles(&data);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
+        var render_queue = RenderQueue.init(allocator);
+        errdefer render_queue.deinit();
+        try render_queue.ensureTotalCapacity(1 + obstacle_count + test_square_count + 2 + particles.capacity);
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
@@ -112,6 +119,7 @@ pub const GameDemoState = struct {
             .collision = CollisionSystem.init(allocator),
             .collision_response = collision_response,
             .particles = particles,
+            .render_queue = render_queue,
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
@@ -126,6 +134,7 @@ pub const GameDemoState = struct {
         self.pathfinding.deinit();
         self.steering.deinit();
         self.ai.deinit();
+        self.render_queue.deinit();
         self.particles.deinit();
         self.collision_response.deinit();
         self.collision.deinit();
@@ -203,20 +212,22 @@ pub const GameDemoState = struct {
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
-        for (self.obstacles) |entity| {
-            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
-        }
-        for (self.test_squares) |entity| {
-            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
-        }
-        try self.particles.render(context.renderer, context.interpolation_alpha);
-        try self.player.render(&self.data, context.runtime_assets, context.renderer, context.interpolation_alpha);
-        try context.renderer.drawRect(.{
+        self.render_queue.clearRetainingCapacity();
+        try self.render_queue.addRect(.{
             .x = 0,
             .y = self.bounds_height - 4,
             .w = self.bounds_width,
             .h = 4,
-        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, -1);
+        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, RenderOrder.world(render_depth.worldZ(.floor)), .world);
+        for (self.obstacles) |entity| {
+            try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, context.runtime_assets, context.interpolation_alpha);
+        }
+        for (self.test_squares) |entity| {
+            try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, context.runtime_assets, context.interpolation_alpha);
+        }
+        try self.player.enqueueRender(&self.data, context.runtime_assets, &self.render_queue, context.interpolation_alpha);
+        try self.particles.enqueueRender(&self.render_queue, context.interpolation_alpha);
+        try self.render_queue.submit(context.renderer);
     }
 
     pub fn onPause(self: *GameDemoState) void {
@@ -261,6 +272,7 @@ pub const GameDemoState = struct {
         _ = self.particles.emitBurst(.{
             .count = 2,
             .position = .{ .x = position.x + 16, .y = position.y + 16 },
+            .base_z = body.position_z,
             .base_velocity = .{ .x = -24, .y = -36 },
             .velocity_step = .{ .x = 48, .y = -4 },
             .acceleration = .{ .x = 0, .y = 80 },
@@ -270,7 +282,7 @@ pub const GameDemoState = struct {
             .end_size = 1,
             .start_color = .{ .r = 1.0, .g = 0.78, .b = 0.28, .a = 0.85 },
             .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
-            .layer = 0,
+            .depth = .effect,
         });
     }
 
@@ -408,14 +420,14 @@ const CollisionSfxCooldown = struct {
 
 fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
     const specs = [_]TestSquareSpec{
-        .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 180, .y = 140 }, .velocity = .{ .x = 5, .y = 18 }, .size = .{ .x = 26, .y = 26 }, .color = .{ .r = 0.46, .g = 0.86, .b = 0.38, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 280, .y = 260 }, .velocity = .{ .x = -14, .y = 9 }, .size = .{ .x = 18, .y = 18 }, .color = .{ .r = 0.95, .g = 0.42, .b = 0.59, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 420, .y = 90 }, .velocity = .{ .x = 11, .y = -10 }, .size = .{ .x = 24, .y = 24 }, .color = .{ .r = 0.7, .g = 0.54, .b = 1.0, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 120, .y = 320 }, .velocity = .{ .x = 8, .y = -16 }, .size = .{ .x = 20, .y = 20 }, .color = .{ .r = 0.95, .g = 0.65, .b = 0.25, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 550, .y = 200 }, .velocity = .{ .x = -9, .y = 12 }, .size = .{ .x = 30, .y = 18 }, .color = .{ .r = 0.55, .g = 0.82, .b = 0.92, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 650, .y = 340 }, .velocity = .{ .x = 15, .y = -7 }, .size = .{ .x = 19, .y = 19 }, .color = .{ .r = 0.85, .g = 0.45, .b = 0.78, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 300, .y = 70 }, .velocity = .{ .x = -6, .y = 22 }, .size = .{ .x = 25, .y = 25 }, .color = .{ .r = 0.4, .g = 0.95, .b = 0.75, .a = 1.0 }, .layer = 0 },
+        .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 180, .y = 140 }, .velocity = .{ .x = 5, .y = 18 }, .size = .{ .x = 26, .y = 26 }, .color = .{ .r = 0.46, .g = 0.86, .b = 0.38, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 280, .y = 260 }, .velocity = .{ .x = -14, .y = 9 }, .size = .{ .x = 18, .y = 18 }, .color = .{ .r = 0.95, .g = 0.42, .b = 0.59, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 420, .y = 90 }, .velocity = .{ .x = 11, .y = -10 }, .size = .{ .x = 24, .y = 24 }, .color = .{ .r = 0.7, .g = 0.54, .b = 1.0, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 120, .y = 320 }, .velocity = .{ .x = 8, .y = -16 }, .size = .{ .x = 20, .y = 20 }, .color = .{ .r = 0.95, .g = 0.65, .b = 0.25, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 550, .y = 200 }, .velocity = .{ .x = -9, .y = 12 }, .size = .{ .x = 30, .y = 18 }, .color = .{ .r = 0.55, .g = 0.82, .b = 0.92, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 650, .y = 340 }, .velocity = .{ .x = 15, .y = -7 }, .size = .{ .x = 19, .y = 19 }, .color = .{ .r = 0.85, .g = 0.45, .b = 0.78, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 300, .y = 70 }, .velocity = .{ .x = -6, .y = 22 }, .size = .{ .x = 25, .y = 25 }, .color = .{ .r = 0.4, .g = 0.95, .b = 0.75, .a = 1.0 }, .depth = .actor },
     };
     var entities: [test_square_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
@@ -433,9 +445,9 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                     .primitive_visual = .{
                         .size = spec.size,
                         .color = spec.color,
-                        .layer = spec.layer,
+                        .depth = spec.depth,
                         .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                        .marker_layer = spec.layer,
+                        .marker_depth_band = .marker,
                         .marker_length = 0,
                         .marker_depth = 0,
                         .marker_margin = 0,
@@ -464,9 +476,9 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
             try data.setPrimitiveVisual(e, .{
                 .size = spec.size,
                 .color = spec.color,
-                .layer = spec.layer,
+                .depth = spec.depth,
                 .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                .marker_layer = spec.layer,
+                .marker_depth_band = .marker,
                 .marker_length = 0,
                 .marker_depth = 0,
                 .marker_margin = 0,
@@ -538,9 +550,9 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
         try data.setPrimitiveVisual(entity, .{
             .size = spec.size,
             .color = spec.color,
-            .layer = -1,
+            .depth = .obstacle,
             .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-            .marker_layer = -1,
+            .marker_depth_band = .obstacle,
             .marker_length = 0,
             .marker_depth = 0,
             .marker_margin = 0,
@@ -553,43 +565,12 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
     return entities;
 }
 
-fn renderEntity(
-    data: *const DataSystem,
-    entity: EntityId,
-    runtime_assets: *const RuntimeAssets,
-    renderer: *Renderer,
-    interpolation_alpha: f32,
-) !void {
-    const body = data.movementBodyConst(entity) orelse return;
-    const visual = data.primitiveVisualConst(entity) orelse return;
-    const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-    const dest = Rect{
-        .x = render_position.x,
-        .y = render_position.y,
-        .w = visual.size.x,
-        .h = visual.size.y,
-    };
-    if (data.assetReferenceConst(entity)) |asset_ref| {
-        if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
-            try renderer.drawSprite(.{
-                .texture = sprite.texture,
-                .source = sprite.source_rect,
-                .dest = dest,
-                .tint = visual.color,
-                .layer = visual.layer,
-            });
-            return;
-        }
-    }
-    try renderer.drawRect(dest, visual.color, visual.layer);
-}
-
 const TestSquareSpec = struct {
     position: math.Vec2,
     velocity: math.Vec2,
     size: math.Vec2,
     color: config.Color,
-    layer: i32,
+    depth: WorldDepth,
 };
 
 const ObstacleSpec = struct {
@@ -629,6 +610,28 @@ test "demo spawns colored moving test squares" {
         try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
         try std.testing.expectEqual(CollisionResponseMobility.static, demo.data.collisionResponseConst(entity).?.mobility);
     }
+}
+
+test "demo render queue orders mixed world z records after grouped emission" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    demo.render_queue.clearRetainingCapacity();
+    const high_obstacle = demo.data.movementBodyPtr(demo.obstacles[0]).?;
+    high_obstacle.position_z.* = 20;
+    high_obstacle.previous_z.* = 20;
+    const low_actor = demo.data.movementBodyPtr(demo.test_squares[0]).?;
+    low_actor.position_z.* = -20;
+    low_actor.previous_z.* = -20;
+
+    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.obstacles[0], &runtime_assets, 1.0);
+    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.test_squares[0], &runtime_assets, 1.0);
+    demo.render_queue.sortForSubmit();
+
+    try std.testing.expectEqual(@as(usize, 2), demo.render_queue.recordCount());
+    try std.testing.expect(demo.render_queue.recordOrder(0).lessOrEqual(demo.render_queue.recordOrder(1)));
+    try std.testing.expect(demo.render_queue.recordOrder(0).depth < demo.render_queue.recordOrder(1).depth);
 }
 
 test "demo owns and completes a simulation frame during update" {

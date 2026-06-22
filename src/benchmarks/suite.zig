@@ -178,6 +178,7 @@ pub const RunStats = struct {
     secondary_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
+    render_prep_phases: ?RenderPrepPhaseSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -222,6 +223,13 @@ pub const BatchSummary = struct {
     batch_duration_ns: u64 = 0,
     main_thread_wait_ns: u64 = 0,
     ran_inline: bool = true,
+};
+
+pub const RenderPrepPhaseSummary = struct {
+    queue_order_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    vertex_emit_ns: u64 = 0,
+    draw_group_ns: u64 = 0,
 };
 
 pub const WorkTuningSummary = struct {
@@ -551,6 +559,8 @@ fn printHeader(options: Options) void {
     );
     std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
     std.debug.print("purpose: exercise benchmark flows, prove adaptive behavior, and catch regressions\n", .{});
+    std.debug.print("case roles: serial-direct is baseline; thread-fixed-* rows are forced scheduler controls\n", .{});
+    std.debug.print("case roles: thread-adaptive-* rows reflect production-style measured scheduling policy\n", .{});
 }
 
 fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options: Options) void {
@@ -593,6 +603,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
+    if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -660,7 +671,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [128]u8 = undefined;
+        var workload_buffer: [256]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -682,11 +693,29 @@ fn printValidationSummary(
     adaptive: ?CaseResult,
     results: []const CaseResult,
 ) void {
-    const speedup = speedupBasisPoints(baseline.stats, best.stats);
-    std.debug.print(
-        "summary: best {s} at {f} ({d}.{d:0>2}x serial). ",
-        .{ best.case.name, formatDuration(best.stats.mean_ns), speedup / 100, speedup % 100 },
-    );
+    const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
+    if (is_render_prep) {
+        const focus = adaptive orelse best;
+        const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
+        const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
+        std.debug.print(
+            "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
+            .{ focus_label, focus.case.name, formatDuration(focus.stats.mean_ns), focus_speedup / 100, focus_speedup % 100 },
+        );
+        if (!std.mem.eql(u8, focus.case.name, best.case.name)) {
+            const best_speedup = speedupBasisPoints(baseline.stats, best.stats);
+            std.debug.print(
+                "best_control {s} at {f} ({d}.{d:0>2}x serial). ",
+                .{ best.case.name, formatDuration(best.stats.mean_ns), best_speedup / 100, best_speedup % 100 },
+            );
+        }
+    } else {
+        const speedup = speedupBasisPoints(baseline.stats, best.stats);
+        std.debug.print(
+            "summary: best {s} at {f} ({d}.{d:0>2}x serial). ",
+            .{ best.case.name, formatDuration(best.stats.mean_ns), speedup / 100, speedup % 100 },
+        );
+    }
 
     if (adaptive) |adaptive_result| {
         if (adaptive_result.stats.work_tuning) |summary| {
@@ -745,6 +774,26 @@ fn printValidationSummary(
                 "workload triggers={} intents={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
+        } else if (std.mem.eql(u8, group_name, "render-prep")) {
+            const render_prep_focus = adaptive orelse best;
+            const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
+            std.debug.print(
+                "{s}={s} workload vertices={} sprites={} skipped={} groups={}. ",
+                .{
+                    focus_label,
+                    render_prep_focus.case.name,
+                    render_prep_focus.stats.candidate_pairs,
+                    render_prep_focus.stats.output_count,
+                    render_prep_focus.stats.deferred_count,
+                    render_prep_focus.stats.sample_count,
+                },
+            );
+            if (render_prep_focus.stats.render_prep_phases) |phases| {
+                std.debug.print(
+                    "phases queue_order={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
+                    .{ formatDuration(phases.queue_order_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
+                );
+            }
         } else {
             std.debug.print(
                 "workload candidates={} outputs={}. ",
@@ -935,6 +984,25 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "render-prep")) {
+        if (stats.render_prep_phases) |phases| {
+            return std.fmt.bufPrint(
+                buffer,
+                "vertices={} sprites={} skipped={} groups={} phases queue_order={f} snapshot={f} vertex={f} groups={f}",
+                .{
+                    stats.candidate_pairs,
+                    stats.output_count,
+                    stats.deferred_count,
+                    stats.sample_count,
+                    formatDuration(phases.queue_order_ns),
+                    formatDuration(phases.snapshot_ns),
+                    formatDuration(phases.vertex_emit_ns),
+                    formatDuration(phases.draw_group_ns),
+                },
+            ) catch "workload";
+        }
+        return std.fmt.bufPrint(buffer, "vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count }) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";

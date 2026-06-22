@@ -3,7 +3,11 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const config = @import("../config.zig");
-const Renderer = @import("../render/renderer.zig").Renderer;
+const renderer_file = @import("../render/renderer.zig");
+const RenderOrder = renderer_file.RenderOrder;
+const Renderer = renderer_file.Renderer;
+const UiDepth = renderer_file.UiDepth;
+const UiStackOrder = renderer_file.UiStackOrder;
 const text = @import("../render/text.zig");
 const PreparedText = text.PreparedText;
 const RenderContext = @import("../app/state.zig").RenderContext;
@@ -16,9 +20,6 @@ pub const PauseState = struct {
     height: f32,
     prompt: PreparedText = .invalid,
 
-    const overlay_layer: i32 = 9_000;
-    const icon_layer: i32 = 9_001;
-    const text_layer: i32 = 9_002;
     const panel_width: f32 = 220;
     const panel_height: f32 = 132;
     const prompt_gap_below_panel: f32 = 18;
@@ -53,7 +54,7 @@ pub const PauseState = struct {
         _ = context.interpolation_alpha;
         _ = context.thread_system;
 
-        try drawScreenRect(context.renderer, .{ .x = 0, .y = 0, .w = self.width, .h = self.height }, overlay_color, overlay_layer);
+        try drawScreenRect(context.renderer, .{ .x = 0, .y = 0, .w = self.width, .h = self.height }, overlay_color, context.ui_stack_order, .background);
 
         const panel_x = (self.width - panel_width) * 0.5;
         const panel_y = (self.height - panel_height) * 0.5;
@@ -62,7 +63,7 @@ pub const PauseState = struct {
             .y = panel_y,
             .w = panel_width,
             .h = panel_height,
-        }, panel_color, icon_layer);
+        }, panel_color, context.ui_stack_order, .panel);
 
         const bar_width: f32 = 28;
         const bar_height: f32 = 72;
@@ -71,8 +72,8 @@ pub const PauseState = struct {
         const right_x = (self.width + gap) * 0.5;
         const bar_y = (self.height - bar_height) * 0.5;
 
-        try drawScreenRect(context.renderer, .{ .x = left_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
-        try drawScreenRect(context.renderer, .{ .x = right_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, icon_layer + 1);
+        try drawScreenRect(context.renderer, .{ .x = left_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, context.ui_stack_order, .highlight);
+        try drawScreenRect(context.renderer, .{ .x = right_x, .y = bar_y, .w = bar_width, .h = bar_height }, accent_color, context.ui_stack_order, .highlight);
 
         try drawPrompt(self, context);
     }
@@ -82,8 +83,8 @@ pub const PauseState = struct {
     }
 };
 
-fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").Rect, color: config.Color, layer: i32) !void {
-    try renderer.drawRectInSpace(rect, color, layer, .logical);
+fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").Rect, color: config.Color, ui_stack_order: UiStackOrder, depth: UiDepth) !void {
+    try renderer.submitOrderedRectInSpace(rect, color, uiOrder(ui_stack_order, depth), .logical);
 }
 
 fn drawPrompt(self: *PauseState, context: RenderContext) !void {
@@ -101,6 +102,10 @@ fn drawPrompt(self: *PauseState, context: RenderContext) !void {
         .x = self.width * 0.5,
         .y = prompt_y,
         .anchor = .top_center,
-        .layer = PauseState.text_layer,
+        .order = uiOrder(context.ui_stack_order, .text),
     });
+}
+
+fn uiOrder(ui_stack_order: UiStackOrder, depth: UiDepth) RenderOrder {
+    return RenderOrder.uiInStack(ui_stack_order, depth);
 }

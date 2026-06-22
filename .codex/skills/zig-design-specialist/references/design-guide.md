@@ -16,6 +16,10 @@ repo. Keep the final design compact, but make the decisions below explicit.
   overlay policies can let lower states receive events, updates, or rendering.
 - New designs should keep gameplay behavior in states or processors, not in
   `main.zig` or broad `Engine` conditionals.
+- Rendering designs should treat `RenderQueue` as the transient ordering phase
+  for records from world, effects, UI, and debug producers. `Renderer` and
+  `SpriteBatch` consume already ordered commands; do not design fallback sorting
+  inside the renderer to hide producer-order bugs.
 
 ## Simulation Pipeline And Controllers
 
@@ -60,6 +64,9 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
 - Runtime gameplay and render-prep data should carry stable asset IDs such as
   `SpriteAssetId` and `AudioAssetId`; path validation, PNG decode, GPU upload,
   audio load/predecode, and string lookup belong in asset/app services.
+- Transient render queues may carry renderer-facing handles after `RuntimeAssets`
+  resolution, but persistent gameplay storage should keep stable asset IDs and
+  enum render-depth intent instead of live renderer handles or raw layer numbers.
 
 ## Processor Contracts
 
@@ -81,6 +88,10 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
   deterministic comparison.
 - If a processor emits events or intents, define whether they are persistent
   state, transient per-frame data, or deferred commands, and where they merge.
+- If a gameplay/render-prep processor emits draw records, define the final
+  `RenderOrder`, queue ownership, allocation/reserve policy, and whether records
+  are sorted, bucketed, or emitted in already ordered spans before `Renderer`
+  submission.
 
 ## Hardware And Hot Paths
 
@@ -101,6 +112,9 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
 - Treat thread-system thresholds as heuristics until representative workloads
   prove them. Designs should say what metrics or tests would reveal bad
   scheduling choices.
+- For SDL_GPU rendering, keep CPU prep and worker expansion outside the acquired
+  swapchain interval where possible. Designs should keep swapchain acquisition,
+  upload, render-pass encoding, and submit tightly scoped on the render thread.
 
 ## Emergent Gameplay Design
 

@@ -37,7 +37,11 @@ Add new code under the matching owner directory. Keep executable-only code near
 - Keep `src/main.zig` timing-centric; move coordination details into `src/app/`.
 - `StateStack` owns state lifetimes, state destruction, policies, and transition application.
 - Queue state transitions through `StateTransitions` from state dispatch, then apply them after dispatch completes.
-- Game states draw through `Renderer`; keep SDL_GPU device, swapchain, shader, texture, and command submission details in render/platform layers.
+- Game states emit transient draw records through `RenderQueue` by default. Use
+  `Renderer.submitOrdered*` only for renderer-owned or tightly controlled paths
+  that already submit in nondecreasing `RenderOrder`; keep SDL_GPU device,
+  swapchain, shader, texture, and command submission details in render/platform
+  layers.
 - Game states request sound through `AudioCommandBuffer`; keep SDL_mixer
   device, mixer, track, bus, and loaded-audio ownership in the app audio service.
 - Map raw input to named actions. Keep held gameplay input in `InputState` separate from one-frame app commands in `FrameCommands`.
@@ -113,7 +117,7 @@ Add new code under the matching owner directory. Keep executable-only code near
 - `zig build dev` builds shaders, installs assets, and runs the app for normal development.
 - `zig build test` runs reusable module tests plus SDL-linked compile coverage.
 - `zig build check` compiles the game, benchmark, and GPU smoke executables without installing.
-- `zig build bench` runs non-interactive CPU gameplay processor benchmarks.
+- `zig build bench` runs non-interactive CPU gameplay and render-prep benchmarks.
 - `zig build verify` runs check, tests, shader compilation, and atlas lint.
 - `zig build shaders` compiles platform GPU shaders.
 - `zig build gpu-smoke` runs a display-gated renderer pipeline smoke that

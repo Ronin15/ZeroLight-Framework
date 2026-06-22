@@ -8,7 +8,7 @@ zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
-zig build bench     # run CPU gameplay processor benchmarks
+zig build bench     # run CPU gameplay and render-prep benchmarks
 zig build verify    # run check, test, shader compilation, and atlas lint
 zig build package   # install selected-mode binaries and runtime assets
 ```
@@ -176,17 +176,19 @@ zig build verify
 
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
 transient particle rows, AI agents, steering agents, dense collision bodies,
-sparse collision bodies, and collision-response contacts. The default run exercises one serial baseline,
-fixed-worker, fixed small-range, fixed large-range, and adaptive cases so the
-full processor flow can be checked for regressions.
+sparse collision bodies, collision-response contacts, and renderer sprite CPU
+prep. The default run exercises one serial baseline, fixed-worker, fixed
+small-range, fixed large-range, and adaptive cases so the full processor flow
+can be checked for regressions.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
 fixed range size, while `thread-adaptive-tuned-range` uses the same
 processor-owned adaptive worker and range tuner path as production systems. The
 fixed cases are controls for scheduler overhead, worker-count scaling, and
-range-size effects. Gameplay processor benchmarks use a shared event-scale
-count ladder so each system shows a performance curve across small, medium, and
-high counts: quick runs 1,024, 4,096, and 10,000 items; standard adds 25,000 and
-50,000; stress keeps the high-count 10,000, 25,000, and 50,000 signal points.
+range-size effects. Gameplay processor and render-prep benchmarks use a shared
+event-scale count ladder so each system shows a performance curve across small,
+medium, and high counts: quick runs 1,024, 4,096, and 10,000 items; standard
+adds 25,000 and 50,000; stress keeps the high-count 10,000, 25,000, and 50,000
+signal points.
 AI separation uses a transient spatial grid with bounded neighbor and candidate
 samples, then intent emission runs as its own stage.
 Collision output includes candidate-pair and contact counts so dense stress
@@ -199,6 +201,21 @@ Steering output reports bounded avoidance candidate checks, accepted avoidance
 samples, and emitted movement-intent counts. Steering movement emission is a
 threaded processor stage with serial fallback, per-system adaptive tuning, and
 deterministic range-owned output.
+Render-prep output reports draw commands, valid sprites, skipped invalid
+resources, generated vertices, draw groups, worker usage, range size, and the
+render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
+does not open a window or submit SDL_GPU command buffers. Each measured
+iteration builds and sorts the `RenderQueue`, appends its sorted sprites into
+the same `SpriteBatch` command stream, then snapshots, emits vertices, and
+builds draw groups. The benchmark owns its phase timers around that shared path
+and reports queue-order, snapshot, vertex-emission, and draw-group timings; the
+production renderer does not run those benchmark timers.
+For runtime performance judgment, read the adaptive rows as the production-style
+scheduling signal: they start from measured inline work and only use workers
+when the adaptive tuner finds a batch large enough and a threaded profile that
+wins. The fixed-thread rows are forced controls for scheduler/range behavior,
+not evidence that runtime rendering will force worker participation for cheap
+sprite/rect prep.
 
 Benchmark output is grouped by workload and count. Each block prints an aligned
 plain-text table with per-case timing, speedup, throughput, worker-thread use,
@@ -257,6 +274,7 @@ zig build bench -- --case thread-adaptive-tuned-range
 zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
 zig build bench -- --group steering --details
+zig build bench -- --group render-prep --details
 zig build bench -- --group pathfinding-hard-fallback --details
 zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
 zig build -Doptimize=ReleaseFast bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details

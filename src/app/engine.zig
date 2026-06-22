@@ -273,7 +273,7 @@ pub const Engine = struct {
             });
             try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
             try self.debug_overlay.render(&self.renderer);
-            switch (try self.renderer.endFrame()) {
+            switch (try self.renderer.endFrame(&self.thread_system)) {
                 .submitted => {
                     if (self.swapchain_blocked) {
                         log.debug("swapchain available again; clearing render-blocked gameplay pause", .{});

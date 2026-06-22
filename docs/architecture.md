@@ -29,7 +29,7 @@ game-specific behavior under `src/game/`.
 - `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
 - `src/render/camera.zig` owns simple world-to-screen camera transforms.
 - `src/render/resources.zig` defines generational renderer resource IDs and descriptors.
-- `src/render/sprite_batch.zig` owns sprite draw command sorting, vertex construction, draw grouping, and allocation-free warmed batch prep.
+- `src/render/sprite_batch.zig` owns ordered sprite command storage, vertex construction, draw grouping, and allocation-free warmed batch prep.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
@@ -94,14 +94,23 @@ state stays in the SDL_GPU renderer path.
 
 ## Coordination Boundaries
 
-Game states draw through `Renderer`; they should not call SDL_GPU directly.
+Game states emit transient draw records through `RenderQueue` when multiple
+world/effect/UI producers need ordering. Direct `Renderer.submitOrdered*` calls
+are reserved for renderer-owned or tightly controlled paths that already submit
+in nondecreasing `RenderOrder`; game states should not call SDL_GPU directly.
 Window, GPU device, swapchain, shader, texture, text, and frame submission code
 stays under `src/render/` and `src/app/`.
 
-`Renderer` preserves the public `drawSprite` and `drawRect` API while delegating
-sprite-specific CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition,
-swapchain acquisition, vertex upload, render-pass encoding, and submit remain
-coordinated by `Renderer` on the main/render thread.
+`Renderer` preserves strict ordered submission while delegating sprite-specific
+CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
+acquisition, vertex upload, render-pass encoding, and submit remain coordinated
+by `Renderer` on the main/render thread.
+`SpriteBatch` owns a render-specific adaptive tuner and can use the app
+`ThreadSystem` to expand prepared sprite commands into disjoint vertex spans.
+Texture metadata is snapshotted before worker dispatch, workers do not read
+live renderer resource slots, and draw groups are built on the main thread from
+the already ordered command stream. Small or cheap frames may stay inline
+through the same adaptive policy.
 
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer

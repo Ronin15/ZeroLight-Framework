@@ -10,9 +10,11 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
-const Renderer = @import("../render/renderer.zig").Renderer;
+const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Rect = @import("../render/renderer.zig").Rect;
+const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const render_depth = @import("render_depth.zig");
 
 pub const Player = struct {
     entity: EntityId = EntityId.invalid,
@@ -81,11 +83,12 @@ pub const Player = struct {
         );
     }
 
-    pub fn render(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, renderer_instance: *Renderer, interpolation_alpha: f32) !void {
+    pub fn enqueueRender(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, queue: *RenderQueue, interpolation_alpha: f32) !void {
         const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
         const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
         const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
         const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
+        const body_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.depth));
 
         const dest = Rect{
             .x = render_position.x,
@@ -95,20 +98,26 @@ pub const Player = struct {
         };
         if (data.assetReferenceConst(self.entity)) |asset_ref| {
             if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
-                try renderer_instance.drawSprite(.{
+                try queue.addSprite(.{
                     .texture = sprite.texture,
                     .source = sprite.source_rect,
                     .dest = dest,
                     .tint = visual.color,
-                    .layer = visual.layer,
+                    .order = body_order,
                 });
             } else {
-                try renderer_instance.drawRect(dest, visual.color, visual.layer);
+                try queue.addRect(dest, visual.color, body_order, .world);
             }
         } else {
-            try renderer_instance.drawRect(dest, visual.color, visual.layer);
+            try queue.addRect(dest, visual.color, body_order, .world);
         }
-        try renderer_instance.drawRect(markerRect(render_position, facing.direction, visual), visual.marker_color, visual.marker_layer);
+        const marker_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.marker_depth_band));
+        try queue.addRect(
+            markerRect(render_position, facing.direction, visual),
+            visual.marker_color,
+            marker_order,
+            .world,
+        );
     }
 
     pub fn onPause(self: Player, data: *DataSystem) void {
@@ -123,6 +132,7 @@ pub const Player = struct {
         const body = data.movementBodyPtr(self.entity) orelse return;
         body.previous_x.* = body.position_x.*;
         body.previous_y.* = body.position_y.*;
+        body.previous_z.* = body.position_z.*;
     }
 };
 
@@ -130,13 +140,17 @@ fn playerVisual() PrimitiveVisual {
     return .{
         .size = Player.size,
         .color = Player.color,
-        .layer = 0,
+        .depth = .actor,
         .marker_color = Player.marker_color,
-        .marker_layer = 1,
+        .marker_depth_band = .actor,
         .marker_length = Player.marker_length,
         .marker_depth = Player.marker_depth,
         .marker_margin = Player.marker_margin,
     };
+}
+
+fn worldOrder(depth: i32) RenderOrder {
+    return RenderOrder.world(depth);
 }
 
 fn markerRect(position: math.Vec2, facing: Facing, visual: PrimitiveVisual) Rect {
@@ -211,6 +225,16 @@ test "player facing updates from movement and remains while idle" {
     try std.testing.expectEqual(Facing.up, data.facingConst(player.entity).?.direction);
 }
 
+test "player facing marker remains in actor render depth band" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+
+    const visual = data.primitiveVisualConst(player.entity).?;
+    try std.testing.expectEqual(render_depth.WorldDepth.actor, visual.depth);
+    try std.testing.expectEqual(render_depth.WorldDepth.actor, visual.marker_depth_band);
+}
+
 test "player horizontal facing wins for diagonal movement" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -234,18 +258,23 @@ test "player pause and resume sync previous position to current data position" {
     body.position_y.* = 24;
     body.previous_x.* = 2;
     body.previous_y.* = 4;
+    body.position_z.* = 12;
+    body.previous_z.* = 2;
 
     player.onPause(&data);
 
     const paused = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(paused.position.x, paused.previous_position.x);
     try std.testing.expectEqual(paused.position.y, paused.previous_position.y);
+    try std.testing.expectEqual(paused.position_z, paused.previous_z);
 
     body.position_x.* = 48;
     body.position_y.* = 96;
+    body.position_z.* = 24;
     player.onResume(&data);
 
     const resumed = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(resumed.position.x, resumed.previous_position.x);
     try std.testing.expectEqual(resumed.position.y, resumed.previous_position.y);
+    try std.testing.expectEqual(resumed.position_z, resumed.previous_z);
 }

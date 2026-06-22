@@ -10,6 +10,7 @@ const collision_response = @import("collision_response.zig");
 const movement = @import("movement.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
+const render_prep = @import("render_prep.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
 
@@ -31,6 +32,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.fallback_unreachable_group,
     pathfinding.hard_fallback_group,
     pathfinding.hard_fallback_budget_group,
+    render_prep.group,
     steering.group,
 };
 

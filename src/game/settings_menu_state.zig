@@ -58,11 +58,6 @@ pub const SettingsMenuState = struct {
         "Back",
     };
 
-    const overlay_layer: i32 = 9_000;
-    const panel_layer: i32 = 9_001;
-    const highlight_layer: i32 = 9_002;
-    const text_layer: i32 = 9_003;
-
     const overlay_color = config.Color{ .r = 0.02, .g = 0.025, .b = 0.03, .a = 0.82 };
     const panel_color = config.Color{ .r = 0.10, .g = 0.13, .b = 0.16, .a = 0.95 };
     const accent_color = config.Color{ .r = 1.0, .g = 0.86, .b = 0.2, .a = 1.0 };
@@ -155,10 +150,11 @@ pub const SettingsMenuState = struct {
             overlay_color,
             panel_color,
             .{ .r = 0.18, .g = 0.20, .b = 0.22, .a = 0.9 },
-            overlay_layer,
-            panel_layer,
-            highlight_layer,
-            text_layer,
+            context.ui_stack_order,
+            .background,
+            .panel,
+            .highlight,
+            .text,
         );
     }
 

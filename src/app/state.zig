@@ -9,7 +9,9 @@ const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const inputRouter = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
-const Renderer = @import("../render/renderer.zig").Renderer;
+const renderer_file = @import("../render/renderer.zig");
+const Renderer = renderer_file.Renderer;
+const UiStackOrder = renderer_file.UiStackOrder;
 const TextService = @import("../render/text.zig").TextService;
 const ThreadSystem = @import("thread_system.zig").ThreadSystem;
 const c = @import("../platform/sdl.zig").c;
@@ -64,6 +66,7 @@ pub const RenderContext = struct {
     text_service: ?*TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
+    ui_stack_order: UiStackOrder = .base,
 };
 
 pub const State = struct {
@@ -442,8 +445,10 @@ pub const StateStack = struct {
             if (!self.states.items[index].policy.render_below) break;
         }
 
-        for (self.states.items[first_rendered..]) |entry| {
-            try entry.state.render(context);
+        for (self.states.items[first_rendered..], 0..) |entry, render_offset| {
+            var state_context = context;
+            state_context.ui_stack_order = UiStackOrder.fromRenderOffset(render_offset);
+            try entry.state.render(state_context);
         }
     }
 

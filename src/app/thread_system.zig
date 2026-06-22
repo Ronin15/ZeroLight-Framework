@@ -34,9 +34,9 @@ pub const BatchStats = struct {
     active_worker_threads: usize = 0,
     main_thread_ranges: usize = 0,
     worker_thread_ranges: usize = 0,
-    worker_utilization: f32 = 0,
     batch_duration_ns: u64 = 0,
     main_thread_wait_ns: u64 = 0,
+    worker_utilization: f32 = 0,
     ran_inline: bool = true,
 };
 
@@ -1080,6 +1080,11 @@ fn recordRangeIndex(context: *anyopaque, range: ParallelRange, _: WorkerId) void
     std.debug.assert(range.start == range.index * indices.items_per_range);
     indices.starts[range.index] = range.start;
     indices.ends[range.index] = range.end;
+}
+
+test "batch stats stay lean scalar telemetry" {
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(BatchStats));
+    try std.testing.expect(@alignOf(BatchStats) <= @alignOf(usize));
 }
 
 test "inline parallel for covers every item exactly once" {

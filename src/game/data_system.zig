@@ -10,7 +10,9 @@ const std = @import("std");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
+const render_depth = @import("render_depth.zig");
 const simd = @import("../core/simd.zig");
+const WorldDepth = render_depth.WorldDepth;
 
 pub const hot_soa_column_alignment: usize = 64;
 pub const movement_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
@@ -80,6 +82,8 @@ pub const Facing = enum {
 pub const MovementBody = struct {
     position: math.Vec2 = .{},
     previous_position: math.Vec2 = .{},
+    position_z: i32 = 0,
+    previous_z: i32 = 0,
     velocity: math.Vec2 = .{},
     speed: f32 = 0,
 };
@@ -87,8 +91,10 @@ pub const MovementBody = struct {
 pub const MovementBodyPtr = struct {
     position_x: *f32,
     position_y: *f32,
+    position_z: *i32,
     previous_x: *f32,
     previous_y: *f32,
+    previous_z: *i32,
     velocity_x: *f32,
     velocity_y: *f32,
     speed: *f32,
@@ -98,8 +104,10 @@ pub const MovementBodySlice = struct {
     entities: []const EntityId,
     position_x: HotF32Slice,
     position_y: HotF32Slice,
+    position_z: []i32,
     previous_x: HotF32Slice,
     previous_y: HotF32Slice,
+    previous_z: []i32,
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
@@ -109,8 +117,10 @@ pub const ConstMovementBodySlice = struct {
     entities: []const EntityId,
     position_x: ConstHotF32Slice,
     position_y: ConstHotF32Slice,
+    position_z: []const i32,
     previous_x: ConstHotF32Slice,
     previous_y: ConstHotF32Slice,
+    previous_z: []const i32,
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
@@ -133,9 +143,9 @@ pub const ConstFacingSlice = struct {
 pub const PrimitiveVisual = struct {
     size: math.Vec2,
     color: config.Color,
-    layer: i32 = 0,
+    depth: WorldDepth = .actor,
     marker_color: config.Color,
-    marker_layer: i32 = 1,
+    marker_depth_band: WorldDepth = .marker,
     marker_length: f32 = 0,
     marker_depth: f32 = 0,
     marker_margin: f32 = 0,
@@ -149,12 +159,12 @@ pub const ConstPrimitiveVisualSlice = struct {
     color_g: []const f32,
     color_b: []const f32,
     color_a: []const f32,
-    layers: []const i32,
+    depth_values: []const i32,
     marker_color_r: []const f32,
     marker_color_g: []const f32,
     marker_color_b: []const f32,
     marker_color_a: []const f32,
-    marker_layers: []const i32,
+    marker_depth_values: []const i32,
     marker_lengths: []const f32,
     marker_depths: []const f32,
     marker_margins: []const f32,
@@ -956,8 +966,10 @@ const MovementBodyStore = struct {
     entities: std.ArrayList(EntityId) = .empty,
     position_x: HotF32List = .empty,
     position_y: HotF32List = .empty,
+    position_z: std.ArrayList(i32) = .empty,
     previous_x: HotF32List = .empty,
     previous_y: HotF32List = .empty,
+    previous_z: std.ArrayList(i32) = .empty,
     velocity_x: HotF32List = .empty,
     velocity_y: HotF32List = .empty,
     speed: HotF32List = .empty,
@@ -969,8 +981,10 @@ const MovementBodyStore = struct {
         self.entities.appendAssumeCapacity(entity);
         self.position_x.appendAssumeCapacity(body.position.x);
         self.position_y.appendAssumeCapacity(body.position.y);
+        self.position_z.appendAssumeCapacity(body.position_z);
         self.previous_x.appendAssumeCapacity(body.previous_position.x);
         self.previous_y.appendAssumeCapacity(body.previous_position.y);
+        self.previous_z.appendAssumeCapacity(body.previous_z);
         self.velocity_x.appendAssumeCapacity(body.velocity.x);
         self.velocity_y.appendAssumeCapacity(body.velocity.y);
         self.speed.appendAssumeCapacity(body.speed);
@@ -980,8 +994,10 @@ const MovementBodyStore = struct {
     fn set(self: *MovementBodyStore, index: usize, body: MovementBody) void {
         self.position_x.items[index] = body.position.x;
         self.position_y.items[index] = body.position.y;
+        self.position_z.items[index] = body.position_z;
         self.previous_x.items[index] = body.previous_position.x;
         self.previous_y.items[index] = body.previous_position.y;
+        self.previous_z.items[index] = body.previous_z;
         self.velocity_x.items[index] = body.velocity.x;
         self.velocity_y.items[index] = body.velocity.y;
         self.speed.items[index] = body.speed;
@@ -991,6 +1007,8 @@ const MovementBodyStore = struct {
         return .{
             .position = .{ .x = self.position_x.items[index], .y = self.position_y.items[index] },
             .previous_position = .{ .x = self.previous_x.items[index], .y = self.previous_y.items[index] },
+            .position_z = self.position_z.items[index],
+            .previous_z = self.previous_z.items[index],
             .velocity = .{ .x = self.velocity_x.items[index], .y = self.velocity_y.items[index] },
             .speed = self.speed.items[index],
         };
@@ -1000,8 +1018,10 @@ const MovementBodyStore = struct {
         return .{
             .position_x = &self.position_x.items[index],
             .position_y = &self.position_y.items[index],
+            .position_z = &self.position_z.items[index],
             .previous_x = &self.previous_x.items[index],
             .previous_y = &self.previous_y.items[index],
+            .previous_z = &self.previous_z.items[index],
             .velocity_x = &self.velocity_x.items[index],
             .velocity_y = &self.velocity_y.items[index],
             .speed = &self.speed.items[index],
@@ -1014,16 +1034,20 @@ const MovementBodyStore = struct {
         self.entities.items[index] = self.entities.items[last];
         self.position_x.items[index] = self.position_x.items[last];
         self.position_y.items[index] = self.position_y.items[last];
+        self.position_z.items[index] = self.position_z.items[last];
         self.previous_x.items[index] = self.previous_x.items[last];
         self.previous_y.items[index] = self.previous_y.items[last];
+        self.previous_z.items[index] = self.previous_z.items[last];
         self.velocity_x.items[index] = self.velocity_x.items[last];
         self.velocity_y.items[index] = self.velocity_y.items[last];
         self.speed.items[index] = self.speed.items[last];
         _ = self.entities.pop();
         _ = self.position_x.pop();
         _ = self.position_y.pop();
+        _ = self.position_z.pop();
         _ = self.previous_x.pop();
         _ = self.previous_y.pop();
+        _ = self.previous_z.pop();
         _ = self.velocity_x.pop();
         _ = self.velocity_y.pop();
         _ = self.speed.pop();
@@ -1035,8 +1059,10 @@ const MovementBodyStore = struct {
             .entities = self.entities.items,
             .position_x = self.position_x.items,
             .position_y = self.position_y.items,
+            .position_z = self.position_z.items,
             .previous_x = self.previous_x.items,
             .previous_y = self.previous_y.items,
+            .previous_z = self.previous_z.items,
             .velocity_x = self.velocity_x.items,
             .velocity_y = self.velocity_y.items,
             .speed = self.speed.items,
@@ -1048,8 +1074,10 @@ const MovementBodyStore = struct {
             .entities = self.entities.items,
             .position_x = self.position_x.items,
             .position_y = self.position_y.items,
+            .position_z = self.position_z.items,
             .previous_x = self.previous_x.items,
             .previous_y = self.previous_y.items,
+            .previous_z = self.previous_z.items,
             .velocity_x = self.velocity_x.items,
             .velocity_y = self.velocity_y.items,
             .speed = self.speed.items,
@@ -1060,8 +1088,10 @@ const MovementBodyStore = struct {
         self.entities.clearRetainingCapacity();
         self.position_x.clearRetainingCapacity();
         self.position_y.clearRetainingCapacity();
+        self.position_z.clearRetainingCapacity();
         self.previous_x.clearRetainingCapacity();
         self.previous_y.clearRetainingCapacity();
+        self.previous_z.clearRetainingCapacity();
         self.velocity_x.clearRetainingCapacity();
         self.velocity_y.clearRetainingCapacity();
         self.speed.clearRetainingCapacity();
@@ -1071,8 +1101,10 @@ const MovementBodyStore = struct {
         self.entities.deinit(allocator);
         self.position_x.deinit(allocator);
         self.position_y.deinit(allocator);
+        self.position_z.deinit(allocator);
         self.previous_x.deinit(allocator);
         self.previous_y.deinit(allocator);
+        self.previous_z.deinit(allocator);
         self.velocity_x.deinit(allocator);
         self.velocity_y.deinit(allocator);
         self.speed.deinit(allocator);
@@ -1084,8 +1116,10 @@ const MovementBodyStore = struct {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.position_x.ensureTotalCapacity(allocator, capacity);
         try self.position_y.ensureTotalCapacity(allocator, capacity);
+        try self.position_z.ensureTotalCapacity(allocator, capacity);
         try self.previous_x.ensureTotalCapacity(allocator, capacity);
         try self.previous_y.ensureTotalCapacity(allocator, capacity);
+        try self.previous_z.ensureTotalCapacity(allocator, capacity);
         try self.velocity_x.ensureTotalCapacity(allocator, capacity);
         try self.velocity_y.ensureTotalCapacity(allocator, capacity);
         try self.speed.ensureTotalCapacity(allocator, capacity);
@@ -1145,12 +1179,12 @@ const PrimitiveVisualStore = struct {
     color_g: std.ArrayList(f32) = .empty,
     color_b: std.ArrayList(f32) = .empty,
     color_a: std.ArrayList(f32) = .empty,
-    layers: std.ArrayList(i32) = .empty,
+    depth_values: std.ArrayList(i32) = .empty,
     marker_color_r: std.ArrayList(f32) = .empty,
     marker_color_g: std.ArrayList(f32) = .empty,
     marker_color_b: std.ArrayList(f32) = .empty,
     marker_color_a: std.ArrayList(f32) = .empty,
-    marker_layers: std.ArrayList(i32) = .empty,
+    marker_depth_values: std.ArrayList(i32) = .empty,
     marker_lengths: std.ArrayList(f32) = .empty,
     marker_depths: std.ArrayList(f32) = .empty,
     marker_margins: std.ArrayList(f32) = .empty,
@@ -1171,12 +1205,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.items[index] = visual.color.g;
         self.color_b.items[index] = visual.color.b;
         self.color_a.items[index] = visual.color.a;
-        self.layers.items[index] = visual.layer;
+        self.depth_values.items[index] = render_depth.worldZ(visual.depth);
         self.marker_color_r.items[index] = visual.marker_color.r;
         self.marker_color_g.items[index] = visual.marker_color.g;
         self.marker_color_b.items[index] = visual.marker_color.b;
         self.marker_color_a.items[index] = visual.marker_color.a;
-        self.marker_layers.items[index] = visual.marker_layer;
+        self.marker_depth_values.items[index] = render_depth.worldZ(visual.marker_depth_band);
         self.marker_lengths.items[index] = visual.marker_length;
         self.marker_depths.items[index] = visual.marker_depth;
         self.marker_margins.items[index] = visual.marker_margin;
@@ -1191,14 +1225,14 @@ const PrimitiveVisualStore = struct {
                 .b = self.color_b.items[index],
                 .a = self.color_a.items[index],
             },
-            .layer = self.layers.items[index],
+            .depth = @enumFromInt(self.depth_values.items[index]),
             .marker_color = .{
                 .r = self.marker_color_r.items[index],
                 .g = self.marker_color_g.items[index],
                 .b = self.marker_color_b.items[index],
                 .a = self.marker_color_a.items[index],
             },
-            .marker_layer = self.marker_layers.items[index],
+            .marker_depth_band = @enumFromInt(self.marker_depth_values.items[index]),
             .marker_length = self.marker_lengths.items[index],
             .marker_depth = self.marker_depths.items[index],
             .marker_margin = self.marker_margins.items[index],
@@ -1215,12 +1249,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.items[index] = self.color_g.items[last];
         self.color_b.items[index] = self.color_b.items[last];
         self.color_a.items[index] = self.color_a.items[last];
-        self.layers.items[index] = self.layers.items[last];
+        self.depth_values.items[index] = self.depth_values.items[last];
         self.marker_color_r.items[index] = self.marker_color_r.items[last];
         self.marker_color_g.items[index] = self.marker_color_g.items[last];
         self.marker_color_b.items[index] = self.marker_color_b.items[last];
         self.marker_color_a.items[index] = self.marker_color_a.items[last];
-        self.marker_layers.items[index] = self.marker_layers.items[last];
+        self.marker_depth_values.items[index] = self.marker_depth_values.items[last];
         self.marker_lengths.items[index] = self.marker_lengths.items[last];
         self.marker_depths.items[index] = self.marker_depths.items[last];
         self.marker_margins.items[index] = self.marker_margins.items[last];
@@ -1237,12 +1271,12 @@ const PrimitiveVisualStore = struct {
             .color_g = self.color_g.items,
             .color_b = self.color_b.items,
             .color_a = self.color_a.items,
-            .layers = self.layers.items,
+            .depth_values = self.depth_values.items,
             .marker_color_r = self.marker_color_r.items,
             .marker_color_g = self.marker_color_g.items,
             .marker_color_b = self.marker_color_b.items,
             .marker_color_a = self.marker_color_a.items,
-            .marker_layers = self.marker_layers.items,
+            .marker_depth_values = self.marker_depth_values.items,
             .marker_lengths = self.marker_lengths.items,
             .marker_depths = self.marker_depths.items,
             .marker_margins = self.marker_margins.items,
@@ -1257,12 +1291,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.clearRetainingCapacity();
         self.color_b.clearRetainingCapacity();
         self.color_a.clearRetainingCapacity();
-        self.layers.clearRetainingCapacity();
+        self.depth_values.clearRetainingCapacity();
         self.marker_color_r.clearRetainingCapacity();
         self.marker_color_g.clearRetainingCapacity();
         self.marker_color_b.clearRetainingCapacity();
         self.marker_color_a.clearRetainingCapacity();
-        self.marker_layers.clearRetainingCapacity();
+        self.marker_depth_values.clearRetainingCapacity();
         self.marker_lengths.clearRetainingCapacity();
         self.marker_depths.clearRetainingCapacity();
         self.marker_margins.clearRetainingCapacity();
@@ -1276,12 +1310,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.deinit(allocator);
         self.color_b.deinit(allocator);
         self.color_a.deinit(allocator);
-        self.layers.deinit(allocator);
+        self.depth_values.deinit(allocator);
         self.marker_color_r.deinit(allocator);
         self.marker_color_g.deinit(allocator);
         self.marker_color_b.deinit(allocator);
         self.marker_color_a.deinit(allocator);
-        self.marker_layers.deinit(allocator);
+        self.marker_depth_values.deinit(allocator);
         self.marker_lengths.deinit(allocator);
         self.marker_depths.deinit(allocator);
         self.marker_margins.deinit(allocator);
@@ -1297,12 +1331,12 @@ const PrimitiveVisualStore = struct {
         try self.color_g.ensureTotalCapacity(allocator, capacity);
         try self.color_b.ensureTotalCapacity(allocator, capacity);
         try self.color_a.ensureTotalCapacity(allocator, capacity);
-        try self.layers.ensureTotalCapacity(allocator, capacity);
+        try self.depth_values.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_r.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_g.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_b.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_a.ensureTotalCapacity(allocator, capacity);
-        try self.marker_layers.ensureTotalCapacity(allocator, capacity);
+        try self.marker_depth_values.ensureTotalCapacity(allocator, capacity);
         try self.marker_lengths.ensureTotalCapacity(allocator, capacity);
         try self.marker_depths.ensureTotalCapacity(allocator, capacity);
         try self.marker_margins.ensureTotalCapacity(allocator, capacity);
@@ -1315,12 +1349,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.appendAssumeCapacity(visual.color.g);
         self.color_b.appendAssumeCapacity(visual.color.b);
         self.color_a.appendAssumeCapacity(visual.color.a);
-        self.layers.appendAssumeCapacity(visual.layer);
+        self.depth_values.appendAssumeCapacity(render_depth.worldZ(visual.depth));
         self.marker_color_r.appendAssumeCapacity(visual.marker_color.r);
         self.marker_color_g.appendAssumeCapacity(visual.marker_color.g);
         self.marker_color_b.appendAssumeCapacity(visual.marker_color.b);
         self.marker_color_a.appendAssumeCapacity(visual.marker_color.a);
-        self.marker_layers.appendAssumeCapacity(visual.marker_layer);
+        self.marker_depth_values.appendAssumeCapacity(render_depth.worldZ(visual.marker_depth_band));
         self.marker_lengths.appendAssumeCapacity(visual.marker_length);
         self.marker_depths.appendAssumeCapacity(visual.marker_depth);
         self.marker_margins.appendAssumeCapacity(visual.marker_margin);
@@ -1334,12 +1368,12 @@ const PrimitiveVisualStore = struct {
         _ = self.color_g.pop();
         _ = self.color_b.pop();
         _ = self.color_a.pop();
-        _ = self.layers.pop();
+        _ = self.depth_values.pop();
         _ = self.marker_color_r.pop();
         _ = self.marker_color_g.pop();
         _ = self.marker_color_b.pop();
         _ = self.marker_color_a.pop();
-        _ = self.marker_layers.pop();
+        _ = self.marker_depth_values.pop();
         _ = self.marker_lengths.pop();
         _ = self.marker_depths.pop();
         _ = self.marker_margins.pop();
@@ -1771,8 +1805,10 @@ fn nextGeneration(generation: u32) u32 {
 fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.position_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.position_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.position_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.previous_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
@@ -1799,12 +1835,12 @@ fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.color_g.len);
     try std.testing.expectEqual(slice.entities.len, slice.color_b.len);
     try std.testing.expectEqual(slice.entities.len, slice.color_a.len);
-    try std.testing.expectEqual(slice.entities.len, slice.layers.len);
+    try std.testing.expectEqual(slice.entities.len, slice.depth_values.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_r.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_g.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_b.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_a.len);
-    try std.testing.expectEqual(slice.entities.len, slice.marker_layers.len);
+    try std.testing.expectEqual(slice.entities.len, slice.marker_depth_values.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_lengths.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_depths.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_margins.len);
@@ -1902,8 +1938,10 @@ test "movement body store is row aligned and compact after removal" {
         const expected = if (entity.matches(first.index, first.generation)) @as(f32, 1) else @as(f32, 3);
         try std.testing.expectEqual(expected, slice.position_x[index]);
         try std.testing.expectEqual(expected + 10, slice.position_y[index]);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 2, slice.position_z[index]);
         try std.testing.expectEqual(expected + 20, slice.previous_x[index]);
         try std.testing.expectEqual(expected + 30, slice.previous_y[index]);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 1, slice.previous_z[index]);
         try std.testing.expectEqual(expected + 40, slice.velocity_x[index]);
         try std.testing.expectEqual(expected + 50, slice.velocity_y[index]);
         try std.testing.expectEqual(expected + 60, slice.speed[index]);
@@ -2419,6 +2457,8 @@ fn testBody(base: f32) MovementBody {
     return .{
         .position = .{ .x = base, .y = base + 10 },
         .previous_position = .{ .x = base + 20, .y = base + 30 },
+        .position_z = @as(i32, @intFromFloat(base)) - 2,
+        .previous_z = @as(i32, @intFromFloat(base)) - 1,
         .velocity = .{ .x = base + 40, .y = base + 50 },
         .speed = base + 60,
     };
