@@ -283,34 +283,11 @@ pub const GameDemoState = struct {
         return switch (command) {
             .create_entity => |template| templateCreatesStaticNavigationObstacle(template),
             .destroy_entity => |entity| self.data.isStaticNavigationObstacle(entity),
-            .set_movement_body => |set| self.data.isAlive(set.entity) and
-                (self.data.isStaticNavigationObstacle(set.entity) or self.entityWouldBeStaticNavigationObstacleAfterMovement(set.entity)),
-            .set_collision_bounds => |set| self.data.isAlive(set.entity) and
-                (self.data.isStaticNavigationObstacle(set.entity) or self.entityWouldBeStaticNavigationObstacleAfterBounds(set.entity)),
-            .set_collision_response => |set| self.data.isAlive(set.entity) and
-                (self.data.isStaticNavigationObstacle(set.entity) or self.entityWouldBeStaticNavigationObstacleAfterResponse(set.entity, set.response.mobility)),
+            .set_movement_body => |set| self.data.isAlive(set.entity),
+            .set_collision_bounds => |set| self.data.isAlive(set.entity),
+            .set_collision_response => |set| self.data.isAlive(set.entity),
             else => false,
         };
-    }
-
-    fn entityWouldBeStaticNavigationObstacleAfterMovement(self: *const GameDemoState, entity: EntityId) bool {
-        return self.data.collisionBoundsConst(entity) != null and
-            if (self.data.collisionResponseConst(entity)) |response| response.mobility == .static else false;
-    }
-
-    fn entityWouldBeStaticNavigationObstacleAfterBounds(self: *const GameDemoState, entity: EntityId) bool {
-        return self.data.movementBodyConst(entity) != null and
-            if (self.data.collisionResponseConst(entity)) |response| response.mobility == .static else false;
-    }
-
-    fn entityWouldBeStaticNavigationObstacleAfterResponse(
-        self: *const GameDemoState,
-        entity: EntityId,
-        mobility: CollisionResponseMobility,
-    ) bool {
-        return mobility == .static and
-            self.data.movementBodyConst(entity) != null and
-            self.data.collisionBoundsConst(entity) != null;
     }
 
     fn eventInvalidatesNavigation(event: SimulationEvent) bool {
@@ -1028,6 +1005,42 @@ test "demo preflights navigation invalidation event before structural mutation" 
 
     try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
     try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
+}
+
+test "demo preflights same-batch static obstacle promotion before mutation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const entity = try demo.data.createEntity();
+    try demo.data.setMovementBody(entity, .{
+        .position = .{ .x = 360, .y = 180 },
+        .previous_position = .{ .x = 360, .y = 180 },
+        .velocity = .{},
+        .speed = 0,
+    });
+
+    demo.simulation_frame.beginStep();
+    demo.simulation_frame.events.setCapacityLimit(2);
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 2);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_collision_bounds = .{
+        .entity = entity,
+        .bounds = .{ .size = .{ .x = 32, .y = 32 } },
+    } });
+    writer.write(.{ .set_collision_response = .{
+        .entity = entity,
+        .response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
+    try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
+    try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
 }

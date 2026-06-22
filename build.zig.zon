@@ -36,6 +36,7 @@
         "build.zig",
         "build.zig.zon",
         "docs/architecture.md",
+        "docs/atlas-asset-workflow.md",
         "docs/development-workflow.md",
         "docs/rendering-assets-shaders.md",
         "docs/setup.md",
@@ -43,5 +44,6 @@
         "docs/state-stack-and-input.md",
         "LICENSE",
         "src",
+        "tools",
     },
 }
