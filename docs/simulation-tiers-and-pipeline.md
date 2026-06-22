@@ -214,8 +214,9 @@ Interpretation:
   guards and spike-absorption proof.
 - **Pathfinding:** keep hard-path and cache behavior bounded (Slice 20) even when
   cognition scope is small.
-- **Rendering:** culling and render prep remain outside this document; GPU cost
-  may dominate before CPU sim does.
+- **Rendering:** scope and visibility can provide input lists to render prep,
+  but draw-record ownership stays in `RenderQueue` and SDL_GPU submission stays
+  in `Renderer`. GPU cost may dominate before CPU sim does.
 
 ## Relationship To Other Slices
 
@@ -224,7 +225,7 @@ Interpretation:
 | 12 | `SimulationFrame`, streams, deferred structural commits remain the per-step contract. |
 | 20 | Pathfinding budgets and fixed-capacity cache contracts protect cognition-heavy scopes. |
 | 21 | Typed events/controllers promote, demote, or wake entities; pipeline owns reaction order. |
-| 7 | Parallel render prep and visibility culling complement scoped simulation. |
+| 7 | Parallel render prep and `RenderQueue` ordering complement scoped simulation; scoped lists may feed render prep, but the pipeline does not own renderer calls. |
 
 Suggested implementation order:
 

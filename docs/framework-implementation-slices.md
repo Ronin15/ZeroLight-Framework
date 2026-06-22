@@ -22,12 +22,16 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Use the completed Slice 7 render-prep benchmark to guard current sprite/rect
-  CPU prep. Future tile rendering and richer UI paths should feed the same
-  handle-based command surface or add a later batcher without moving SDL_GPU
-  submission off the render thread.
-- Track collision-response merge/apply, renderer batch capacity, text-cache
-  lifetime policy, and manual registry guardrails as hardening follow-ups.
+- Use the completed Slice 7 render-prep benchmark to guard the current
+  `RenderQueue` -> `SpriteBatch` CPU prep path. Future tile rendering, richer
+  UI, particles, lighting sprites, and debug records should feed typed
+  `RenderOrder` records through `RenderQueue` first, then add specialized
+  batchers only after measurement shows the sprite/rect batcher is the wrong
+  representation. Keep SDL_GPU command-buffer, swapchain, upload, render-pass,
+  and submit ownership on the render thread.
+- Track collision-response merge/apply, render-queue and batch capacity,
+  text-cache lifetime policy, shader/material registry guardrails, and manual
+  registry guardrails as hardening follow-ups.
 - Treat Slice 20 pathfinding budgets, deterministic pending retention, and
   fixed-capacity cache contracts as the navigation hardening base before
   scaling to large maps or many NPC path users.
@@ -241,19 +245,21 @@ Current foundation:
 - `assets/test/cache_probe.png` provides a tiny installed PNG fixture for cache
   and asset-root checks.
 
-Future render-data slice:
+Render-data boundary:
 
 - Entity creation and world loading should bind stable sprite or atlas-region
   IDs before render-time. `DataSystem` render data should store stable asset
-  references plus source intent such as tint, render depth band, and coordinate-space
-  intent, not live renderer handles.
-- A state-owned render-prep system should read immutable `DataSystem` slices,
-  emit transient draw records into a `RenderQueue`, and submit the queue's
-  ordered stream to `Renderer`. The renderer should not look up gameplay
-  entities, world data, asset paths, or texture assignments.
-- Atlas work should build on the same boundary: assets decode source images,
-  atlas code packs CPU pixels, render uploads the final atlas texture, and
-  entities reference atlas regions.
+  references plus source intent such as tint, typed render-depth intent, and
+  coordinate-space intent, not live renderer handles or raw layer numbers.
+- State-owned render-prep code reads immutable `DataSystem` slices, resolves
+  stable IDs through `RuntimeAssets`, emits transient draw records into
+  `RenderQueue`, and submits the queue's ordered stream to `Renderer`. The
+  renderer should not look up gameplay entities, world data, asset paths, or
+  texture assignments.
+- Atlas and tile work should build on the same boundary: assets decode source
+  images, atlas code packs CPU pixels, render uploads the final atlas texture,
+  entities or tile cells reference atlas regions, and render prep converts those
+  IDs into queue records with explicit `RenderOrder`.
 
 Checklist:
 
@@ -485,13 +491,17 @@ Acceptance checks:
 
 Slice 7 is complete for the current sprite/rect renderer path. It has a
 pre-spawned app-owned `ThreadSystem`, explicit update/render contexts,
-synchronous `parallelFor`, adaptive per-batch background-worker participation,
+synchronous `parallelFor`, adaptive per-batch worker-thread participation,
 per-worker scratch slot indexing, and render-owned parallel CPU sprite prep.
-`SpriteBatch` snapshots texture metadata on the main thread, expands prepared
-sprites into disjoint vertex spans through the thread system, builds draw
-groups deterministically on the main thread, and leaves SDL_GPU command-buffer
-work on the render thread. Future tile rendering, UI widgets, material
-registries, or threaded GPU command buffers remain separate slices.
+`RenderQueue` owns draw-record ordering by `RenderOrder`, including world z,
+stack-aware UI depth, effects, and debug records. `SpriteBatch` consumes only an
+already ordered stream, snapshots texture metadata on the main thread, expands
+prepared sprites into disjoint vertex spans through the thread system, builds
+draw groups deterministically on the main thread, and leaves SDL_GPU
+command-buffer work on the render thread. Future tile rendering, UI widgets,
+material registries, lighting/fire effects, or threaded GPU command buffers
+remain separate slices that must preserve this queue-first ordering contract
+unless they replace it with an explicitly measured render-owned ordering phase.
 
 ## Slice 8: Shader And Platform Expansion
 
@@ -505,6 +515,21 @@ Current foundation:
 - Build metadata and runtime pipeline metadata are still updated in separate
   places until a shared shader/material manifest exists.
 
+Architecture notes:
+
+- Shader expansion should add render-owned material/pipeline metadata; it should
+  not push shader, pipeline, or SDL_GPU handles into `DataSystem` or gameplay
+  state.
+- Lighting, fire, post-effect, and tile shaders should keep draw intent as
+  stable asset/material IDs plus typed render order until render prep resolves
+  them into queue records or a render-owned batcher stream.
+- New batchers may be added for tile spans, light volumes, or effect particles,
+  but they should consume sorted `RenderQueue` records or a documented
+  render-owned phase with the same ordering guarantees. Do not add renderer
+  fallback sorting to hide unordered producers.
+- Build-time shader manifests and runtime pipeline registries should converge so
+  adding a material does not require unrelated parallel edits.
+
 Checklist:
 
 - [x] Keep generated runtime shader files under `assets/shaders` in the install
@@ -513,6 +538,9 @@ Checklist:
 - [x] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
 - [ ] Consolidate shader-program, material, and runtime pipeline metadata so
       new pipelines do not need parallel registry edits.
+- [ ] Define the material/batcher routing contract for sprites, tile spans,
+      lighting/fire effects, and post-effect passes without exposing SDL_GPU
+      handles to game code.
 - [ ] Validate the right shader format list for each target OS.
 - [ ] Add direct runtime asset/shader lookup guidance or tests for direct binary
       execution outside the installed binary directory.
@@ -1422,8 +1450,10 @@ Architecture notes:
   `NavRegionInvalidated`, `PerceptionStimulus`, `NoiseEmitted`,
   `InteractionRequested`, `DamageRequested`, and `SpawnRequested`.
 - Keep existing high-volume streams specialized. Collision contacts, movement
-  intents, navigation intents, path requests, and render-prep outputs should not
-  be collapsed into one generic simulation-event stream just for uniformity.
+  intents, navigation intents, path requests, and render-prep queue records
+  should not be collapsed into one generic simulation-event stream just for
+  uniformity. Events may invalidate or wake a render producer, but render prep
+  still emits explicit `RenderQueue` records with typed `RenderOrder`.
 - Threaded producers must use the same count/prefix/write/range-index merge
   model as other `SimulationFrame` streams. Output order must come from stable
   phase, input, range, and per-range sequence order, not worker timing.
@@ -1462,8 +1492,8 @@ Checklist:
       applicable, and stage/controller attribution for benchmarks or debug UI.
 - [ ] Document which cross-system communication should use simulation/domain
       events and which should remain a specialized stream such as contacts,
-      movement intents, navigation intents, path requests, render prep, or
-      structural commands.
+      movement intents, navigation intents, path requests, render-queue records,
+      or structural commands.
 - [ ] Document the architecture mapping for event producers and consumers:
       pipeline phase, controller owner, persistent data owner, transient event
       stream, processor outputs, and deferred mutation point.
@@ -1520,6 +1550,11 @@ Architecture notes:
   chunk policy is the first concrete source.
 - Benchmark 50k counts prove spike absorption; typical gameplay should scope
   active cognition/collision far lower every frame.
+- Render preparation remains a separate render-facing phase after fixed-step
+  simulation data is ready. The pipeline can determine which entities are in
+  active scope, visible scope, or dirty regions, but it should hand immutable
+  slices and scope lists to render prep rather than calling `Renderer` or
+  owning `RenderQueue`.
 
 Checklist:
 
@@ -1531,6 +1566,9 @@ Checklist:
       storage with validation helpers and tests.
 - [ ] Add scoped gather entry points for movement, collision, AI, and steering
       without changing hot processor math or merge rules.
+- [ ] Add a render-prep handoff that exposes active/visible entity lists and
+      dirty world regions without moving SDL_GPU calls, renderer handles, or
+      queue ownership into the simulation pipeline.
 - [ ] Keep the existing processor stage order identical to the current
       `GameDemoState` pipeline while scope shrinks participation.
 - [ ] Add stagger and reduced-cadence policy for cognition without adding a
@@ -1556,6 +1594,9 @@ Acceptance checks:
       pipeline phase transitions without opening a window.
 - [ ] Benchmarks or debug stats report active scope counts so typical runs stay
       far below 50k stress scales by policy rather than by accident.
+- [ ] Render-prep benchmarks still measure the queue-to-batch path outside the
+      production render path, and scoped simulation changes do not add benchmark
+      timers or logging to runtime rendering.
 
 ## Suggested Order
 
@@ -1589,6 +1630,10 @@ Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
 startup runtime assets, frame-delayed pathfinding, steering/local avoidance, and
 navigation hardening now form the source-of-truth foundation for future slices.
+Render ordering is also part of that foundation: game/world/UI/effect producers
+emit typed draw records through `RenderQueue`, persistent data stores stable IDs
+and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
+benchmark-owned render-prep timing stays out of the production path.
 `SimulationPipeline` and scoped tiers should land before broad multi-chunk or
 multi-world gameplay duplicates `GameDemoState` orchestration. Typed
 simulation/domain events should land before broad tile, weather, obstacle,
