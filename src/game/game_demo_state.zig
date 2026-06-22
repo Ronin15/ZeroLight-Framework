@@ -336,7 +336,7 @@ pub const GameDemoState = struct {
         _ = self.particles.emitBurst(.{
             .count = 2,
             .position = .{ .x = position.x + 16, .y = position.y + 16 },
-            .base_z = body.position_z,
+            .base_z = render_depth.worldZWithOffset(body.position_z, .obstacle),
             .base_velocity = .{ .x = -24, .y = -36 },
             .velocity_step = .{ .x = 48, .y = -4 },
             .acceleration = .{ .x = 0, .y = 80 },
@@ -346,7 +346,7 @@ pub const GameDemoState = struct {
             .end_size = 1,
             .start_color = .{ .r = 1.0, .g = 0.78, .b = 0.28, .a = 0.85 },
             .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
-            .depth = .effect,
+            .depth = .actor,
         });
     }
 
@@ -703,6 +703,26 @@ test "demo render queue orders mixed world z records after grouped emission" {
     try std.testing.expectEqual(@as(usize, 2), demo.render_queue.recordCount());
     try std.testing.expect(demo.render_queue.recordOrder(0).lessOrEqual(demo.render_queue.recordOrder(1)));
     try std.testing.expect(demo.render_queue.recordOrder(0).depth < demo.render_queue.recordOrder(1).depth);
+}
+
+test "demo player trail renders behind player body" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    demo.render_queue.clearRetainingCapacity();
+    demo.emitPlayerTrail();
+    try std.testing.expectEqual(@as(usize, 2), demo.particles.activeCount());
+
+    try demo.player.enqueueRender(&demo.data, &runtime_assets, &demo.render_queue, 1.0);
+    try demo.particles.enqueueRender(&demo.render_queue, 1.0);
+    demo.render_queue.sortForSubmit();
+
+    try std.testing.expectEqual(@as(usize, 4), demo.render_queue.recordCount());
+    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(0).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(1).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(2).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(3).depth);
 }
 
 test "demo owns and completes a simulation frame during update" {
