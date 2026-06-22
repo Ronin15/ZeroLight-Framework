@@ -389,10 +389,7 @@ pub const SimulationFrame = struct {
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
         self.phase = .commit_structural;
         const commands = self.structural_commands.mergedItems();
-        try DataSystem.validateStructuralCommands(commands);
-        const event_count = try structuralEventCount(self.events.stream.allocator, data, commands);
-        try self.events.ensureCanAppend(event_count);
-        try self.reserveStructuralEvents(event_count);
+        const event_count = try self.preflightStructuralCommit(data, 0);
 
         var changes = std.ArrayList(StructuralChange).empty;
         defer changes.deinit(self.events.stream.allocator);
@@ -402,6 +399,16 @@ pub const SimulationFrame = struct {
         std.debug.assert(changes.items.len <= event_count);
         try self.publishStructuralChanges(changes.items);
         return stats;
+    }
+
+    pub fn preflightStructuralCommit(self: *SimulationFrame, data: *const DataSystem, extra_required_events: usize) !usize {
+        const commands = self.structural_commands.mergedItems();
+        try DataSystem.validateStructuralCommands(commands);
+        const structural_event_count = try structuralEventCount(self.events.stream.allocator, data, commands);
+        const required_event_count = try std.math.add(usize, structural_event_count, extra_required_events);
+        try self.events.ensureCanAppend(required_event_count);
+        try self.reserveStructuralEvents(required_event_count);
+        return structural_event_count;
     }
 
     fn reserveStructuralEvents(self: *SimulationFrame, event_count: usize) !void {

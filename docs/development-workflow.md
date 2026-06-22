@@ -140,9 +140,9 @@ Common commands:
 
 ```sh
 cd tools
+python3 export_source_sprites.py
 python3 pack_atlas.py --kind all
 python3 pack_atlas.py --kind world --lint
-python3 export_source_sprites.py
 python3 gen_atlas_orders.py
 ```
 

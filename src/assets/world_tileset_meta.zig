@@ -278,12 +278,18 @@ fn validateRoot(root: *const JsonRoot) !void {
     if (root.tile_count != root.tiles.len) {
         return atlas_meta_common.LayoutMismatch.AtlasSpriteCountMismatch;
     }
-    if (root.tile_count > root.columns * root.rows) {
+    const cell_count = try atlas_meta_common.checkedGridCellCount(root.columns, root.rows);
+    if (@as(u64, root.tile_count) > cell_count) {
         return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
     }
-    if (root.atlas.width != root.columns * root.tile_size or root.atlas.height != root.rows * root.tile_size) {
-        return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
-    }
+    try atlas_meta_common.validateAtlasDimensions(
+        root.atlas.width,
+        root.atlas.height,
+        root.columns,
+        root.rows,
+        root.tile_size,
+        root.tile_size,
+    );
     for (root.tiles) |tile| {
         try atlas_meta_common.validateGridEntry(
             tile.id,
@@ -371,6 +377,16 @@ test "world tileset parse rejects invalid layout without leaking" {
 test "world tileset parse rejects source rects that do not match grid position" {
     const json =
         \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/world_tileset.png","sprite_asset_id":"world_tileset","width":32,"height":32},"tile_size":32,"columns":1,"rows":1,"tile_count":1,"tiles":[{"id":0,"name":"x","category":"x","column":0,"row":0,"x":16,"y":0,"width":32,"height":32,"properties":{"layer":"ground","terrain":"x","walkable":true,"blocks_movement":false,"blocks_vision":false}}]}
+    ;
+    try std.testing.expectError(
+        atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,
+        parse(std.testing.allocator, json, .world_tileset),
+    );
+}
+
+test "world tileset parse rejects oversized grid products without overflow" {
+    const json =
+        \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/world_tileset.png","sprite_asset_id":"world_tileset","width":1,"height":1},"tile_size":32,"columns":4294967295,"rows":4294967295,"tile_count":0,"tiles":[]}
     ;
     try std.testing.expectError(
         atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,

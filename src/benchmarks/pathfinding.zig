@@ -228,7 +228,7 @@ pub fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
 pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const fallback_budget = @min(options.fallback_budget orelse hardFallbackBudget(item_count), item_count);
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, fallback_budget, fallback_budget);
+    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, item_count, fallback_budget);
 }
 
 fn hardFallbackBudget(item_count: usize) usize {
@@ -460,4 +460,19 @@ test "pathfinding benchmark tiny serial case runs without display" {
     try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
     try std.testing.expect(stats.batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 32), stats.output_count);
+}
+
+test "pathfinding hard fallback budget preserves request denominator" {
+    const options = suite.Options{
+        .warmup_iterations = 0,
+        .iterations = 1,
+        .fallback_budget = 8,
+    };
+    const stats = try runHardFallbackBudgetCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 16);
+
+    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+    try std.testing.expectEqual(@as(usize, 16), stats.item_count);
+    try std.testing.expectEqual(@as(usize, 8), stats.output_count);
+    try std.testing.expectEqual(@as(usize, 8), stats.fallback_deferred_count);
+    try std.testing.expectEqual(@as(usize, 8), stats.deferred_count);
 }

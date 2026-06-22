@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from atlas_pack_common import SOURCE_DIR, SPRITES_DIR
+from atlas_pack_common import SOURCE_DIR, SPRITES_DIR, safe_asset_component, safe_child_path
 
 
 def export_world_tiles(sprites_dir: Path, source_dir: Path) -> int:
@@ -20,9 +20,11 @@ def export_world_tiles(sprites_dir: Path, source_dir: Path) -> int:
 
     count = 0
     for tile in manifest["tiles"]:
-        out_dir = source_dir / "world_tiles" / tile["category"]
+        category = safe_asset_component(tile["category"], "tile category")
+        name = safe_asset_component(tile["name"], "tile name")
+        out_dir = safe_child_path(source_dir, "world_tiles", category)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{tile['name']}.png"
+        out_path = safe_child_path(out_dir, f"{name}.png")
         frame = atlas.crop(
             (
                 tile["x"],
@@ -51,9 +53,11 @@ def export_sprite_atlas(
 
     count = 0
     for sprite in manifest["sprites"]:
-        out_dir = source_dir / source_subdir / sprite["category"]
+        category = safe_asset_component(sprite["category"], "sprite category")
+        name = safe_asset_component(sprite["name"], "sprite name")
+        out_dir = safe_child_path(source_dir, source_subdir, category)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{sprite['name']}.png"
+        out_path = safe_child_path(out_dir, f"{name}.png")
         frame = atlas.crop(
             (
                 sprite["x"],

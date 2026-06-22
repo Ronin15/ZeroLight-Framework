@@ -127,6 +127,28 @@ pub fn validateGridEntry(
     }
 }
 
+pub fn checkedGridCellCount(columns: u32, rows: u32) LayoutMismatch!u64 {
+    return std.math.mul(u64, @as(u64, columns), @as(u64, rows)) catch error.AtlasLayoutMismatch;
+}
+
+pub fn validateAtlasDimensions(
+    atlas_width: u32,
+    atlas_height: u32,
+    columns: u32,
+    rows: u32,
+    frame_width: u32,
+    frame_height: u32,
+) LayoutMismatch!void {
+    const expected_width = std.math.mul(u64, @as(u64, columns), @as(u64, frame_width)) catch return error.AtlasLayoutMismatch;
+    const expected_height = std.math.mul(u64, @as(u64, rows), @as(u64, frame_height)) catch return error.AtlasLayoutMismatch;
+    if (expected_width > std.math.maxInt(u32) or expected_height > std.math.maxInt(u32)) {
+        return error.AtlasLayoutMismatch;
+    }
+    if (atlas_width != @as(u32, @intCast(expected_width)) or atlas_height != @as(u32, @intCast(expected_height))) {
+        return error.AtlasLayoutMismatch;
+    }
+}
+
 pub fn parseAnimationValue(
     allocator: std.mem.Allocator,
     animations_value: ?std.json.Value,

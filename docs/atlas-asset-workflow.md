@@ -114,6 +114,14 @@ python3 gen_atlas_orders.py
 ```
 
 After editing an order file by hand, run the packer to refresh `assets/sprites/`.
+The default packer input is `source_assets/`, which is local generated source
+art. Bootstrap it from the checked-in atlases first when starting from a clean
+checkout:
+
+```sh
+cd tools
+python3 export_source_sprites.py
+```
 
 ## Packing Commands
 

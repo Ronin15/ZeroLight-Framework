@@ -288,7 +288,10 @@ def main() -> None:
     had_issue = False
     for kind, input_dir, order_path in jobs:
         if not input_dir.is_dir():
-            raise FileNotFoundError(f"missing source directory: {input_dir}")
+            raise FileNotFoundError(
+                f"missing source directory: {input_dir} "
+                "(run tools/export_source_sprites.py to bootstrap source_assets from installed atlases)"
+            )
         if not order_path.is_file():
             raise FileNotFoundError(
                 f"missing order manifest: {order_path} (run tools/gen_atlas_orders.py)"

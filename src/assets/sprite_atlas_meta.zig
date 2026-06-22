@@ -202,12 +202,18 @@ fn validateRoot(root: *const JsonRoot) !void {
     if (root.columns == 0 or root.rows == 0 or root.frame_width == 0 or root.frame_height == 0) {
         return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
     }
-    if (root.sprite_count > root.columns * root.rows) {
+    const cell_count = try atlas_meta_common.checkedGridCellCount(root.columns, root.rows);
+    if (@as(u64, root.sprite_count) > cell_count) {
         return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
     }
-    if (root.atlas.width != root.columns * root.frame_width or root.atlas.height != root.rows * root.frame_height) {
-        return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
-    }
+    try atlas_meta_common.validateAtlasDimensions(
+        root.atlas.width,
+        root.atlas.height,
+        root.columns,
+        root.rows,
+        root.frame_width,
+        root.frame_height,
+    );
     for (root.sprites) |sprite| {
         try atlas_meta_common.validateGridEntry(
             sprite.id,
@@ -246,6 +252,19 @@ test "sprite atlas load rejects linked sprite id mismatches" {
 test "sprite atlas parse rejects source rects that do not match grid position" {
     const json =
         \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/grim_items.png","sprite_asset_id":"grim_items","width":16,"height":16},"frame_width":16,"frame_height":16,"columns":1,"rows":1,"sprite_count":1,"sprites":[{"id":0,"name":"x","category":"x","column":0,"row":0,"x":8,"y":0,"width":16,"height":16}]}
+    ;
+    const parsed = try std.json.parseFromSlice(JsonRoot, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch,
+        validateRoot(&parsed.value),
+    );
+}
+
+test "sprite atlas parse rejects oversized grid products without overflow" {
+    const json =
+        \\{"version":1,"name":"x","theme":"x","atlas":{"path":"sprites/grim_items.png","sprite_asset_id":"grim_items","width":1,"height":1},"frame_width":65536,"frame_height":65536,"columns":65536,"rows":65536,"sprite_count":0,"sprites":[]}
     ;
     const parsed = try std.json.parseFromSlice(JsonRoot, std.testing.allocator, json, .{});
     defer parsed.deinit();

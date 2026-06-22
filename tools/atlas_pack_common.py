@@ -31,6 +31,27 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def safe_asset_component(value: str, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if value in ("", ".", ".."):
+        raise ValueError(f"{label} must be a non-empty filename component")
+    if "/" in value or "\\" in value or Path(value).name != value:
+        raise ValueError(f"{label} must not contain path separators: {value!r}")
+    return value
+
+
+def safe_child_path(root: Path, *components: str) -> Path:
+    root_resolved = root.resolve(strict=False)
+    path = root.joinpath(*components)
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as err:
+        raise ValueError(f"path escapes root {root}: {path}") from err
+    return path
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
@@ -51,21 +72,23 @@ def compare_json_manifest(path: Path, expected: dict[str, Any]) -> list[str]:
 
 
 def resolve_source_png(input_dir: Path, name: str, category: str) -> Path | None:
+    safe_name = safe_asset_component(name, "sprite name")
+    safe_category = safe_asset_component(category, "sprite category")
     candidates = [
-        input_dir / category / f"{name}.png",
-        input_dir / f"{name}.png",
+        safe_child_path(input_dir, safe_category, f"{safe_name}.png"),
+        safe_child_path(input_dir, f"{safe_name}.png"),
     ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
 
-    matches = [png for png in input_dir.rglob("*.png") if png.stem == name]
+    matches = [png for png in input_dir.rglob("*.png") if png.stem == safe_name]
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
         raise ValueError(
-            f"Ambiguous sprite filename '{name}' under {input_dir}; "
-            f"use {category}/{name}.png"
+            f"Ambiguous sprite filename '{safe_name}' under {input_dir}; "
+            f"use {safe_category}/{safe_name}.png"
         )
     return None
 
