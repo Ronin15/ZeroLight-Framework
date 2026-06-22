@@ -7,6 +7,7 @@ const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const runtime_perf_log = @import("runtime_perf_log.zig");
 const inputRouter = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
 const renderer_file = @import("../render/renderer.zig");
@@ -58,6 +59,7 @@ pub const UpdateContext = struct {
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
+    perf: runtime_perf_log.Context = .{},
 };
 
 pub const RenderContext = struct {
@@ -67,6 +69,7 @@ pub const RenderContext = struct {
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
     ui_stack_order: UiStackOrder = .base,
+    perf: runtime_perf_log.Context = .{},
 };
 
 pub const State = struct {
@@ -431,6 +434,9 @@ pub const StateStack = struct {
 
         for (self.states.items[first_updated..]) |entry| {
             try entry.state.update(context);
+            if (comptime runtime_perf_log.enabled) {
+                context.perf.recordMetric(.state_updates, 1);
+            }
         }
     }
 
@@ -449,6 +455,9 @@ pub const StateStack = struct {
             var state_context = context;
             state_context.ui_stack_order = UiStackOrder.fromRenderOffset(render_offset);
             try entry.state.render(state_context);
+            if (comptime runtime_perf_log.enabled) {
+                context.perf.recordMetric(.state_renders, 1);
+            }
         }
     }
 

@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const component_masks = @import("data_system.zig").component_masks;
@@ -17,21 +18,30 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
+const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
+const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
+const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
+const MovementStats = @import("systems/movement.zig").MovementStats;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
+const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
+const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
 const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
+const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
+const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
+const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const RenderContext = @import("../app/state.zig").RenderContext;
@@ -173,14 +183,14 @@ pub const GameDemoState = struct {
         else
             math.Vec2{ .x = 400, .y = 225 };
 
-        _ = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
+        const ai_stats = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
             .navigation_intents = &self.simulation_frame.navigation_intents,
         });
 
-        _ = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
-        _ = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
+        const steering_stats = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
+        const pathfinding_stats = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
 
         // Intent application step (main thread): consume merged MovementIntents from AI (and future), write velocities
         // for ai_agent entities only via direct MovementBodyPtr (hot column mutation). Stale IDs rejected. Player
@@ -198,19 +208,34 @@ pub const GameDemoState = struct {
         }
 
         var movement_slice = self.data.movementBodySlice();
-        _ = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
 
         self.clampAiSquaresToBounds(self.bounds_width, self.bounds_height);
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
-        _ = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
-        _ = try self.collision_response.update(&self.data, &self.simulation_frame);
+        const collision_stats = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
+        const collision_response_stats = try self.collision_response.update(&self.data, &self.simulation_frame);
         self.queueCollisionAudio(context.audio, context.delta_seconds);
         self.emitPlayerTrail();
-        _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
+        const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
 
         self.simulation_frame.phase = .merge_outputs;
-        try self.applyStructuralCommandsAndPostCommitEvents();
+        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents();
         self.simulation_frame.phase = .finished;
+
+        if (comptime runtime_perf_log.enabled) {
+            recordRuntimePerfStats(
+                context.perf,
+                ai_stats,
+                steering_stats,
+                pathfinding_stats,
+                movement_stats,
+                collision_stats,
+                collision_response_stats,
+                particle_stats,
+                structural_stats,
+                self.simulation_frame.events.stats,
+            );
+        }
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -230,7 +255,104 @@ pub const GameDemoState = struct {
         }
         try self.player.enqueueRender(&self.data, context.runtime_assets, &self.render_queue, context.interpolation_alpha);
         try self.particles.enqueueRender(&self.render_queue, context.interpolation_alpha);
+        if (comptime runtime_perf_log.enabled) {
+            context.perf.recordMetric(.render_queue_records, self.render_queue.recordCount());
+        }
         try self.render_queue.submit(context.renderer);
+    }
+
+    fn recordRuntimePerfStats(
+        perf: runtime_perf_log.Context,
+        ai_stats: AiStats,
+        steering_stats: SteeringStats,
+        pathfinding_stats: PathfindingStats,
+        movement_stats: MovementStats,
+        collision_stats: CollisionStats,
+        collision_response_stats: CollisionResponseStats,
+        particle_stats: ParticleUpdateStats,
+        structural_stats: StructuralCommitStats,
+        event_stats: SimulationEventStats,
+    ) void {
+        perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
+        perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
+        perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
+        perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.separation_candidate_checks));
+        perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.separation_neighbor_samples));
+        perf.recordBatch(.ai_separation, ai_stats.separation_batch);
+        perf.recordBatch(.ai_intent, ai_stats.intent_batch);
+
+        perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
+        perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
+        perf.recordMetric(.steering_movement_intents, metric(steering_stats.movement_intent_count));
+        perf.recordMetric(.steering_path_requests, metric(steering_stats.path_request_count));
+        perf.recordMetric(.steering_paths_available, metric(steering_stats.path_available_count));
+        perf.recordMetric(.steering_paths_pending, metric(steering_stats.path_pending_count));
+        perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.path_unavailable_count));
+        perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
+        perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
+        perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
+        perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.agent_neighbor_samples));
+        perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
+        perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
+        perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
+        perf.recordBatch(.steering, steering_stats.batch);
+
+        perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
+        perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
+        perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
+        perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
+        perf.recordMetric(.path_field_requests, metric(pathfinding_stats.field_requests));
+        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
+        perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
+        perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
+        perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
+        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
+        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
+        perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
+        perf.recordMetric(.path_field_cache_hits, metric(pathfinding_stats.field_cache_hits));
+        perf.recordMetric(.path_goal_fields_built, metric(pathfinding_stats.goal_fields_built));
+        perf.recordMetric(.path_goal_fields_reused, metric(pathfinding_stats.goal_fields_reused));
+        perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
+        perf.recordBatch(.path_field_results, pathfinding_stats.field_result_batch);
+        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+
+        perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
+        perf.recordBatch(.movement, movement_stats.batch);
+
+        perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
+        perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
+        perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
+        perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
+        if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
+        perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
+        perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
+
+        perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
+        perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
+        perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+
+        perf.recordMetric(.particle_active_before, metric(particle_stats.active_before));
+        perf.recordMetric(.particle_active_after, metric(particle_stats.active_after));
+        perf.recordMetric(.particle_removed, metric(particle_stats.removed_count));
+        perf.recordBatch(.particles, particle_stats.batch);
+
+        perf.recordMetric(.structural_created, metric(structural_stats.created));
+        perf.recordMetric(.structural_destroyed, metric(structural_stats.destroyed));
+        perf.recordMetric(.structural_components_set, metric(structural_stats.components_set));
+        perf.recordMetric(.structural_stale_skipped, metric(structural_stats.stale_skipped));
+
+        perf.recordMetric(.simulation_events_total, metric(event_stats.total));
+        perf.recordMetric(.simulation_events_dropped, metric(event_stats.dropped));
+        perf.recordMetric(.simulation_events_entity_created, metric(event_stats.entity_created));
+        perf.recordMetric(.simulation_events_entity_destroyed, metric(event_stats.entity_destroyed));
+        perf.recordMetric(.simulation_events_component_changed, metric(event_stats.component_changed));
+        perf.recordMetric(.simulation_events_nav_region_invalidated, metric(event_stats.nav_region_invalidated));
+        perf.recordMetric(.simulation_events_structural_commit_stage, metric(event_stats.structural_commit_stage));
+        perf.recordMetric(.simulation_events_domain_reaction_stage, metric(event_stats.domain_reaction_stage));
+    }
+
+    fn metric(value: usize) u64 {
+        return @intCast(value);
     }
 
     pub fn onPause(self: *GameDemoState) void {
@@ -265,11 +387,12 @@ pub const GameDemoState = struct {
         });
     }
 
-    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState) !void {
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState) !StructuralCommitStats {
         const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
         _ = try self.simulation_frame.preflightStructuralCommit(&self.data, extra_event_count);
-        _ = try self.simulation_frame.applyStructuralCommands(&self.data);
+        const stats = try self.simulation_frame.applyStructuralCommands(&self.data);
         try self.processPostCommitEvents();
+        return stats;
     }
 
     fn structuralCommandsMayInvalidateNavigation(self: *const GameDemoState) bool {
@@ -982,7 +1105,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
 
     var nav_invalidations: usize = 0;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1081,7 +1204,7 @@ test "demo unrelated structural component change does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -1115,7 +1238,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {

@@ -21,3 +21,4 @@ pub const game = std.log.scoped(.game);
 pub const render = std.log.scoped(.render);
 pub const platform = std.log.scoped(.platform);
 pub const debug_overlay = std.log.scoped(.debug_overlay);
+pub const perf = std.log.scoped(.perf);
