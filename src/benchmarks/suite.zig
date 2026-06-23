@@ -53,6 +53,8 @@ pub const BenchmarkGroup = struct {
 };
 
 pub const BenchmarkCase = struct {
+    // Cases are registered by subsystem modules. The suite owns selection,
+    // warmup/measurement policy, and report formatting around the callback.
     name: []const u8,
     worker_mode: WorkerMode,
     adaptive: bool = false,
@@ -165,6 +167,8 @@ pub const RunStatus = enum {
 };
 
 pub const RunStats = struct {
+    // Plain scalar result surface shared by every benchmark group. Subsystem
+    // counters are optional so the report formatter stays generic.
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
     item_count: usize = 0,
@@ -216,6 +220,8 @@ const CaseResult = struct {
 };
 
 pub const BatchSummary = struct {
+    // Compact copy of ThreadSystem batch telemetry used after a case returns,
+    // keeping report code independent from mutable tuner/batch state.
     item_count: usize = 0,
     range_count: usize = 0,
     items_per_range: usize = 0,
@@ -238,6 +244,8 @@ pub const RenderPrepPhaseSummary = struct {
 };
 
 pub const WorkTuningSummary = struct {
+    // Captures tuner state at the measurement boundary. Unsettled adaptive
+    // results stay visible instead of being treated as final policy.
     phase: AdaptiveWorkPhase = .learning,
     initial_worker_threads: usize = 0,
     initial_range_items: usize = 0,
@@ -260,6 +268,8 @@ pub const WorkTuningSummary = struct {
 };
 
 pub const StatsAccumulator = struct {
+    // Accumulates successful measurement iterations only. Skipped cases keep
+    // their reason in RunStats and never affect timing means.
     item_count: usize,
     iterations: usize = 0,
     total_ns: u128 = 0,
@@ -349,6 +359,8 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
 }
 
 pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?AdaptiveWorkTuner {
+    // Fixed-adaptive cases reuse tuner reporting but clamp range probing so they
+    // can act as a stable control against fully adaptive policy.
     if (!case.adaptive) return null;
     return switch (case.adaptive_range_mode) {
         .none, .tuned => null,
@@ -432,6 +444,8 @@ pub fn parseOptions(args: []const []const u8) !Options {
 }
 
 pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const BenchmarkGroup, options: Options) !void {
+    // Run order is deterministic and stdout-first. The benchmark is a regression
+    // detector, so reporting favors comparable tables over machine-specific tuning.
     printHeader(options);
     var matched_group = options.group_filter == null;
     for (groups) |group| {
@@ -569,6 +583,8 @@ fn printHeader(options: Options) void {
 }
 
 fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options: Options) void {
+    // Compact mode keeps the key comparison visible in the terminal; detail mode
+    // exposes the supporting batch/tuner telemetry.
     const baseline = findResult(results, "serial-direct") orelse {
         std.debug.print("\n{s}\n", .{group.name});
         std.debug.print("  no serial baseline was run\n", .{});
@@ -845,6 +861,8 @@ fn printFlowCoverage(results: []const CaseResult) void {
 }
 
 fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_control: ?CaseResult) ?[]const u8 {
+    // Attention messages flag suspicious policy gaps against fixed controls. The
+    // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
@@ -864,6 +882,8 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
 }
 
 fn printCell(value: []const u8, width: usize) void {
+    // Table output stays plain text and width-based so diffs remain readable in
+    // terminals and CI logs.
     std.debug.print("{s}", .{value});
     const padding = if (value.len < width) width - value.len else 1;
     for (0..padding + 2) |_| {
@@ -918,6 +938,8 @@ fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
 }
 
 fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
+    // Keep tuner state compact enough for aligned tables; detailed conclusions
+    // belong in validation text, not in every cell.
     const summary = maybe_summary orelse return "-";
     if (!summary.has_threaded_profile) {
         if (summary.candidate_items_per_range) |candidate| {
@@ -950,6 +972,8 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 }
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
+    // Workload labels translate shared counters into subsystem language so the
+    // report remains compact without hiding what was measured.
     if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {

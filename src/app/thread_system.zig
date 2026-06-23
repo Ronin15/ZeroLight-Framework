@@ -72,6 +72,8 @@ pub const AdaptiveWorkProfile = struct {
 };
 
 pub const AdaptiveWorkTunerConfig = struct {
+    // Tuning is measurement-driven. These limits shape probing and settling, but
+    // do not impose static item-count floors for threaded participation.
     initial_range_items: usize = (ThreadSystemConfig{}).items_per_range,
     smallest_range_items: usize = 1,
     largest_range_items: usize = std.math.maxInt(usize),
@@ -124,6 +126,8 @@ pub const AdaptiveWorkReport = struct {
 
 pub const AdaptiveWorkTuner = struct {
     config: AdaptiveWorkTunerConfig,
+    // The tuner starts with inline measurement, probes predicted threaded
+    // profiles, and settles on the best verified profile until workload drift.
     phase: AdaptiveWorkPhase = .learning,
     initial_profile: AdaptiveWorkProfile,
     current_profile: AdaptiveWorkProfile,
@@ -142,6 +146,8 @@ pub const AdaptiveWorkTuner = struct {
     last_request: ?AdaptiveWorkRequest = null,
     sampled_profile: ?AdaptiveWorkProfile = null,
     model_work_ns_per_item: f64 = 0,
+    // Cost-model terms are learned from observed batches and used only to pick
+    // the next candidate profile. Actual commits still require measured wins.
     model_participant_overhead_ns: f64 = 0,
     model_range_overhead_ns: f64 = 0,
     model_imbalance_work_ns: f64 = 0,
@@ -232,6 +238,8 @@ pub const AdaptiveWorkTuner = struct {
         return self.phase == .settled;
     }
 
+    // Benchmarks use this to give the tuner enough windows to try useful
+    // range sizes before measurement begins.
     pub fn settleWarmupLimit(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
         const normalized_request = self.normalizeRequest(request);
         const max_range = self.effectiveMaxItemsPerRange(normalized_request);
@@ -242,6 +250,8 @@ pub const AdaptiveWorkTuner = struct {
         return saturatingMul(windows, self.config.sample_window);
     }
 
+    // Learning establishes the baseline for the currently sampled profile.
+    // Cheap inline work settles immediately instead of probing workers.
     fn finishLearningWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
         const profile = self.sampled_profile orelse self.current_profile;
         self.baseline_mean_batch_duration_ns = sample_mean_ns;
@@ -253,6 +263,8 @@ pub const AdaptiveWorkTuner = struct {
         self.startPredictedProbe(profile, sample_mean_ns);
     }
 
+    // A probe only becomes policy after it beats the baseline by the commit
+    // threshold. Failed probes either settle or try another predicted shape.
     fn finishProfileWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
         const candidate = self.candidate_profile orelse {
             self.settle();
@@ -285,6 +297,8 @@ pub const AdaptiveWorkTuner = struct {
         self.startPredictedProbe(self.best_profile, self.best_mean_batch_duration_ns);
     }
 
+    // Settled profiles keep sampling. After enough windows, or when inline work
+    // becomes expensive, the tuner re-enters probing.
     fn finishSettledWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
         const profile = self.sampled_profile orelse self.current_profile;
         self.baseline_mean_batch_duration_ns = sample_mean_ns;
@@ -311,6 +325,8 @@ pub const AdaptiveWorkTuner = struct {
         self.recordBest(profile, sample_mean_ns);
     }
 
+    // Prediction chooses the next profile, but the phase switch only happens
+    // when there is a real threaded candidate to verify.
     fn startPredictedProbe(self: *AdaptiveWorkTuner, baseline_profile: AdaptiveWorkProfile, baseline_mean_ns: u64) void {
         const request = self.last_request orelse {
             self.settle();
@@ -431,6 +447,8 @@ pub const AdaptiveWorkTuner = struct {
         }, request);
     }
 
+    // Inline batches teach per-item work. Threaded batches add participant,
+    // range, and tail-wait estimates used for future candidate selection.
     fn updateCostModel(self: *AdaptiveWorkTuner, stats: BatchStats) void {
         const duration_ns: f64 = @floatFromInt(stats.batch_duration_ns);
         const item_count_f: f64 = @floatFromInt(stats.item_count);
@@ -490,6 +508,8 @@ pub const AdaptiveWorkTuner = struct {
         self.settled_window_count = 0;
     }
 
+    // Workload shifts clear learned policy and samples. The next selection
+    // starts from the initial profile against the new item-count regime.
     fn resetForLearning(self: *AdaptiveWorkTuner) void {
         self.phase = .learning;
         self.current_profile = self.initial_profile;
@@ -583,6 +603,8 @@ pub const JobFn = *const fn (*anyopaque, ParallelRange, WorkerId) void;
 pub const ThreadSystem = struct {
     allocator: std.mem.Allocator,
     config: ThreadSystemConfig,
+    // Shared batch state is protected only while publishing work and waiting for
+    // completion. Actual jobs run outside the mutex over caller-owned ranges.
     shared: *Shared,
     workers: []WorkerRecord = &.{},
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -678,6 +700,8 @@ pub const ThreadSystem = struct {
         job_fn: JobFn,
         options: ParallelForOptions,
     ) BatchStats {
+        // Selection happens before worker wake-up so every participant observes
+        // one immutable batch shape: range size, count, job pointer, and context.
         if (item_count == 0) return .{};
 
         const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
@@ -797,6 +821,8 @@ pub const ThreadSystem = struct {
 };
 
 const Shared = struct {
+    // `Batch` is single-producer per call from the main thread, multi-consumer
+    // from workers plus the main thread stealing ranges.
     io: std.Io,
     batch: Batch = .{},
     mutex: std.Io.Mutex = .init,
@@ -804,6 +830,8 @@ const Shared = struct {
     next_batch_id: u64 = 1,
     accepting_work: bool = true,
 
+    // Each worker claims its first deterministic range by ID, then joins the
+    // shared atomic range queue for remaining work.
     fn workerLoop(self: *Shared, id: WorkerId, wake: *std.Io.Semaphore) void {
         var seen_batch_id: u64 = 0;
         while (true) {
@@ -840,6 +868,8 @@ const Shared = struct {
         }
     }
 
+    // Atomic fetch-add is the only synchronization inside the hot work loop.
+    // Job functions must provide their own range-local write discipline.
     fn runBatchRanges(self: *Shared, id: WorkerId) void {
         while (true) {
             const range_index = self.batch.next_range.fetchAdd(1, .monotonic);
@@ -880,6 +910,8 @@ const WorkerRecord = struct {
 };
 
 const Batch = struct {
+    // Optional context/job fields are valid only while pending_workers is nonzero
+    // or the main thread is helping the active batch.
     id: u64 = 0,
     item_count: usize = 0,
     items_per_range: usize = 1,
@@ -912,6 +944,7 @@ fn resolveWorkerThreadCount(override_count: ?usize) !usize {
     return if (cpu_count > 1) cpu_count - 1 else 0;
 }
 
+// Callers normalize items_per_range before entering this helper.
 pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
     return (item_count + items_per_range - 1) / items_per_range;
 }
@@ -1054,6 +1087,8 @@ fn elapsedNs(start_ns: i96, end_ns: i96) u64 {
     return if (end_ns > start_ns) @intCast(end_ns - start_ns) else 0;
 }
 
+// Utilization is diagnostic telemetry for work distribution, not a scheduling
+// input for the current batch.
 fn workerUtilization(worker_thread_ranges: usize, active_worker_threads: usize, range_count: usize) f32 {
     if (active_worker_threads == 0 or range_count == 0) return 0;
     const expected_worker_ranges = @min(range_count, active_worker_threads);

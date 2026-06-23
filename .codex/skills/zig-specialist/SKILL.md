@@ -81,12 +81,13 @@ production payloads in tests.
 3. Make the smallest coherent change in the owning layer.
 4. Keep Zig imports and names idiomatic: use `const std = @import("std");`, import project declarations directly when that keeps call sites clear, avoid `_mod` suffixes, avoid `const Type = file.Type` bridge aliases, and avoid double names such as `thread.ThreadSystem`.
 5. Use a concise lowerCamelCase file namespace only when the call site is clearer as a function or namespace lookup, such as `assets.validateRelativePath(...)`; do not rewrite SDL/C symbols, generated build-option names, or `std.Build` field names.
-6. Keep raw input mapped to named actions; keep latched frame commands separate from held gameplay input.
-7. Let state-stack policies decide whether lower states receive update, input, or render passes.
-8. Preserve fixed-step simulation with varying-refresh rendering; do not add a blanket 60 FPS render cap.
-9. Pair SDL resource creation with cleanup close to the creation site.
-10. Add scoped `std.log` diagnostics for useful lifecycle, configuration, fallback, and failure context. Keep hot-path debug logging minimal and deliberate, keep `warn`/`err` rare and actionable, and keep pure helpers log-free.
-11. Add behavior-focused Zig tests when logic can be tested without opening a window.
+6. Comment for contracts and non-obvious intent, not straight-line narration. Use `///` immediately above public exported declarations when callers need ownership, lifetime, invariant, ordering, threading, allocation, failure, or performance context. Use `//` for private helpers, implementation phase markers, local invariants, hot-path rationale, and test fixture context. Keep declaration-level comments above declarations and local comments near the block they explain; avoid comments that restate names or obvious assignments.
+7. Keep raw input mapped to named actions; keep latched frame commands separate from held gameplay input.
+8. Let state-stack policies decide whether lower states receive update, input, or render passes.
+9. Preserve fixed-step simulation with varying-refresh rendering; do not add a blanket 60 FPS render cap.
+10. Pair SDL resource creation with cleanup close to the creation site.
+11. Add scoped `std.log` diagnostics for useful lifecycle, configuration, fallback, and failure context. Keep hot-path debug logging minimal and deliberate, keep `warn`/`err` rare and actionable, and keep pure helpers log-free.
+12. Add behavior-focused Zig tests when logic can be tested without opening a window.
 
 ## Performance Rules
 

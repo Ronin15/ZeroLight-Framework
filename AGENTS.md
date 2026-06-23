@@ -164,6 +164,18 @@ not rewrite SDL/C symbols, generated build-option names, or `std.Build` field
 names. Keep `Renderer` as the render facade for app/game code; do not import
 `src/render/gpu/*` outside the render/platform boundary.
 
+Use comments to preserve contracts and non-obvious intent, not to narrate
+straight-line code. Public exported declarations that form a cross-module API
+should use Zig doc comments (`///`) immediately above the declaration when the
+caller needs to understand ownership, lifetime, invariants, ordering,
+threading, allocation behavior, failure behavior, or performance assumptions.
+Use ordinary `//` comments for private helpers, implementation phase markers,
+local invariants, hot-path rationale, and test fixture context. Put
+declaration-level comments above the declaration they describe; put local
+implementation comments near the block they explain. Avoid comments that merely
+repeat the identifier or obvious assignment, stale roadmap notes, and broad
+claims that are not enforced by code or tests.
+
 Use Zig `test` blocks and `std.testing`. Put reusable module tests beside the
 code they cover, and name tests by behavior, such as
 `test "player movement clamps to window bounds"`.

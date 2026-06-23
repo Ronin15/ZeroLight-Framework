@@ -66,7 +66,11 @@ pub const SteeringStats = struct {
 
 pub const SteeringSystem = struct {
     allocator: std.mem.Allocator,
+    // Runtime rows keep per-entity cooldown/progress state outside DataSystem.
+    // They are pruned by entity ID whenever steering components disappear.
     runtime_rows: std.ArrayList(RuntimeRow) = .empty,
+    // Selection and index scratch convert many navigation intents into one
+    // deterministic steering job per entity.
     selected: std.ArrayList(SelectedIntent) = .empty,
     selected_index_by_steering: std.ArrayList(usize) = .empty,
     runtime_index_by_steering: std.ArrayList(usize) = .empty,
@@ -74,6 +78,8 @@ pub const SteeringSystem = struct {
     obstacle_counts: std.ArrayList(u16) = .empty,
     agent_candidate_counts: std.ArrayList(u16) = .empty,
     obstacle_candidate_counts: std.ArrayList(u16) = .empty,
+    // Selected-work columns are range-written by workers and aligned with
+    // `selected` by index.
     start_x: HotF32List = .empty,
     start_y: HotF32List = .empty,
     base_dir_x: HotF32List = .empty,
@@ -84,6 +90,8 @@ pub const SteeringSystem = struct {
     selected_avoidance_radii: HotF32List = .empty,
     selected_avoidance_weights: HotF32List = .empty,
     selected_max_neighbor_samples: std.ArrayList(u16) = .empty,
+    // World snapshots are immutable during worker dispatch. DataSystem is not
+    // touched from steering worker jobs.
     all_agent_entities: std.ArrayList(EntityId) = .empty,
     all_agent_x: HotF32List = .empty,
     all_agent_y: HotF32List = .empty,
@@ -146,6 +154,8 @@ pub const SteeringSystem = struct {
     }
 
     pub fn reserveForCapacity(self: *SteeringSystem, max_agents: usize, max_obstacles: usize) !void {
+        // Reserve separates agent and obstacle budgets because dense static
+        // obstacle scenes can be larger than the steering-agent population.
         try self.runtime_rows.ensureTotalCapacity(self.allocator, max_agents);
         try self.selected.ensureTotalCapacity(self.allocator, max_agents);
         try self.selected_index_by_steering.ensureTotalCapacity(self.allocator, max_agents);
@@ -214,6 +224,8 @@ pub const SteeringSystem = struct {
         pathfinding: *const PathfindingSystem,
         config: SteeringConfig,
     ) !SteeringStats {
+        // Preparation is single-threaded by design: it owns intent arbitration,
+        // runtime-row mutation, path query decisions, and snapshot construction.
         const steering = data.steeringAgentSliceConst();
         self.pruneRuntimeRows(data);
         self.tickRuntimeRows();
@@ -245,6 +257,8 @@ pub const SteeringSystem = struct {
     }
 
     fn tickRuntimeRows(self: *SteeringSystem) void {
+        // Cooldowns are fixed-step counters so path request cadence remains
+        // deterministic under variable render frame timing.
         for (self.runtime_rows.items) |*row| {
             if (row.replan_cooldown > 0) row.replan_cooldown -= 1;
             if (row.unavailable_backoff > 0) row.unavailable_backoff -= 1;
@@ -343,6 +357,8 @@ pub const SteeringSystem = struct {
         collision_bounds: ConstCollisionBoundsSlice,
         collision_responses: ConstCollisionResponseSlice,
     ) !void {
+        // The snapshot uses previous fixed-step positions. Steering output for
+        // this step should not depend on partially updated movement columns.
         self.all_agent_entities.clearRetainingCapacity();
         self.all_agent_x.clearRetainingCapacity();
         self.all_agent_y.clearRetainingCapacity();
@@ -396,6 +412,8 @@ pub const SteeringSystem = struct {
     }
 
     fn buildSpatialIndexes(self: *SteeringSystem) !void {
+        // Entries are sorted into compact cell ranges so worker queries do a
+        // binary search per neighboring cell instead of scanning every actor.
         for (self.all_agent_entities.items, 0..) |_, index| {
             const cell_x = spatialCell(self.all_agent_x.items[index], self.spatial_cell_size);
             const cell_y = spatialCell(self.all_agent_y.items[index], self.spatial_cell_size);
@@ -429,6 +447,8 @@ pub const SteeringSystem = struct {
         pathfinding: *const PathfindingSystem,
         stats: *SteeringStats,
     ) !void {
+        // This stage turns pathfinding status into base directions and marks any
+        // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
         try self.start_x.ensureTotalCapacity(self.allocator, count);
         try self.start_y.ensureTotalCapacity(self.allocator, count);
@@ -500,6 +520,8 @@ pub const SteeringSystem = struct {
         thread_system: *ThreadSystem,
         config: SteeringConfig,
     ) !BatchStats {
+        // Each worker range writes a matching SimulationFrame output range. The
+        // range prefixing happens before dispatch so writers never resize.
         const count = self.selected.items.len;
         if (count == 0) return .{};
         const work = selectSteeringWork(thread_system, count, config, self);
@@ -546,6 +568,8 @@ pub const SteeringSystem = struct {
         request_count: *usize,
     ) PathDirection {
         _ = self;
+        // Missing paths request work, pending paths hold direction, unavailable
+        // paths enter backoff, and available paths steer toward the next waypoint.
         const view = pathfinding.statusForEntityWorld(selected.entity, start, selected.intent.goal, selected.intent.agent_class);
         switch (view.status) {
             .available => {
@@ -596,6 +620,8 @@ pub const SteeringSystem = struct {
         request_count: *usize,
     ) void {
         _ = self;
+        // Stuck detection watches goal distance, not instantaneous velocity, so
+        // local avoidance jitter does not immediately trigger replans.
         const progress_epsilon: f32 = 0.25;
         if (runtime.has_previous_distance and goal_distance + progress_epsilon >= runtime.previous_goal_distance) {
             if (runtime.stuck_steps < std.math.maxInt(u16)) runtime.stuck_steps += 1;
@@ -679,6 +705,8 @@ pub const SteeringSystem = struct {
 };
 
 const SelectedIntent = struct {
+    // Stable source_order keeps arbitration deterministic when priorities tie or
+    // capped selection has to replace an earlier choice.
     entity: EntityId,
     movement_index: usize,
     steering_index: usize,
@@ -688,6 +716,8 @@ const SelectedIntent = struct {
 };
 
 const RuntimeRow = struct {
+    // Runtime state is intentionally separate from SteeringAgent component data;
+    // it is simulation-local and safe to discard when the component is removed.
     entity: EntityId,
     previous_goal_distance: f32 = 0,
     has_previous_distance: bool = false,
@@ -722,6 +752,8 @@ const SteeringWorkSelection = struct {
 };
 
 const SteeringJobContext = struct {
+    // Worker context is immutable input plus range-indexed output columns and a
+    // pre-prefixed SimulationFrame stream.
     selected: []const SelectedIntent,
     start_x: []const f32,
     start_y: []const f32,
@@ -777,6 +809,8 @@ const SpatialCellRange = struct {
 };
 
 fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    // Jobs never append outside their assigned output range, which keeps the
+    // transient intent stream deterministic across serial and threaded runs.
     const job: *SteeringJobContext = @ptrCast(@alignCast(context));
     var writer = job.intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |index| {
@@ -797,6 +831,8 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
 }
 
 fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResult {
+    // Start with the path/direct base direction, then add bounded local pushes
+    // from nearby agents and static obstacle boxes.
     var ax = job.base_dir_x[index];
     var ay = job.base_dir_y[index];
     var sample_count: u16 = 0;
@@ -851,6 +887,8 @@ fn accumulateObstacleSample(
     ay: *f32,
     obstacle_count: *u16,
 ) void {
+    // Axis-aligned obstacle push uses the closest point on the box. If the agent
+    // is inside the box, push away from the center to avoid a zero vector.
     const min_x = job.obstacle_min_x[obstacle_index];
     const min_y = job.obstacle_min_y[obstacle_index];
     const max_x = job.obstacle_max_x[obstacle_index];
@@ -882,6 +920,8 @@ fn accumulateAgentAvoidanceBounded(
     candidate_count: *u16,
     max_samples: u16,
 ) void {
+    // Candidate and sample caps are separate: candidate caps bound dense-cell
+    // cost, while sample caps keep behavior stable for configured agents.
     const start_x = job.start_x[index];
     const start_y = job.start_y[index];
     const avoidance_radius = job.selected_avoidance_radii[index];
@@ -938,6 +978,8 @@ fn selectSteeringWork(
     config: SteeringConfig,
     system: *SteeringSystem,
 ) SteeringWorkSelection {
+    // Steering owns its tuner because avoidance cost differs from movement,
+    // pathfinding, and render-prep work even when item counts are similar.
     const available_workers = thread_system.workerThreadCount();
     const max_worker_threads = @min(config.max_worker_threads orelse available_workers, available_workers);
     const requested_items_per_range = config.items_per_range orelse thread_system.config.items_per_range;
@@ -1025,6 +1067,8 @@ fn resetIndexScratch(values: *std.ArrayList(usize), allocator: std.mem.Allocator
 }
 
 fn buildCellRanges(entries: []SpatialCellEntry, ranges: *std.ArrayList(SpatialCellRange), allocator: std.mem.Allocator) !void {
+    // The sorted entry array remains the payload; ranges only mark contiguous
+    // windows for each occupied spatial cell.
     ranges.clearRetainingCapacity();
     if (entries.len == 0) return;
 

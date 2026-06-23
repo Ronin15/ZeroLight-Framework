@@ -76,6 +76,8 @@ pub const ParticleEmitterConfig = struct {
 };
 
 pub const ParticleSlice = struct {
+    // Mutable slice handed to serial or threaded update code. All columns share
+    // the same active length and range ownership contract.
     position_x: HotF32Slice,
     position_y: HotF32Slice,
     previous_x: HotF32Slice,
@@ -109,6 +111,8 @@ pub const ParticleSlice = struct {
 };
 
 pub const ConstParticleSlice = struct {
+    // Render code reads const slices after update/removal has completed, so it
+    // never observes rows while swap-removal is compacting the pool.
     position_x: ConstHotF32Slice,
     position_y: ConstHotF32Slice,
     previous_x: ConstHotF32Slice,
@@ -144,6 +148,8 @@ pub const ConstParticleSlice = struct {
 pub const ParticleSystem = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
+    // Fixed-capacity SoA pool. Every active particle is a dense row across all
+    // columns, and expired rows are removed by swap-compaction after update.
     position_x: HotF32List = .empty,
     position_y: HotF32List = .empty,
     previous_x: HotF32List = .empty,
@@ -280,6 +286,8 @@ pub const ParticleSystem = struct {
     }
 
     pub fn emit(self: *ParticleSystem, spawn: ParticleSpawn) bool {
+        // Emission is best-effort and allocation-free after init. Full pools or
+        // nonpositive lifetimes simply reject the particle.
         if (self.activeCount() >= self.capacity) return false;
         if (spawn.lifetime <= 0) return false;
 
@@ -343,6 +351,8 @@ pub const ParticleSystem = struct {
         delta_seconds: f32,
         update_config: ParticleUpdateConfig,
     ) ParticleUpdateStats {
+        // Workers update disjoint dense rows. Expiration removal is a separate
+        // main-thread compaction pass so row movement never races worker writes.
         const active_before = self.activeCount();
         if (active_before == 0) return .{};
 
@@ -394,6 +404,8 @@ pub const ParticleSystem = struct {
     }
 
     pub fn enqueueRender(self: *const ParticleSystem, queue: *RenderQueue, interpolation_alpha: f32) !void {
+        // Particles emit transient draw records; the render queue owns ordering,
+        // while this system keeps only simulation columns.
         const particles = self.sliceConst();
         for (0..particles.len()) |index| {
             const size = particles.size[index];
@@ -484,6 +496,8 @@ pub const ParticleSystem = struct {
     }
 
     fn removeExpiredSwap(self: *ParticleSystem) usize {
+        // Swap removal is intentionally unordered. Render ordering comes from
+        // RenderQueue depth/order, not particle storage order.
         var removed: usize = 0;
         var index: usize = 0;
         while (index < self.activeCount()) {
@@ -563,11 +577,15 @@ pub const ParticleSystem = struct {
 };
 
 fn particleJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    // ThreadSystem guarantees ranges do not overlap; processRange only writes
+    // columns for the assigned row interval.
     const job: *ParticleJobContext = @ptrCast(@alignCast(context));
     processRange(&job.particles, range, job.delta_seconds);
 }
 
 fn processRange(particles: *ParticleSlice, range: ParallelRange, delta_seconds: f32) void {
+    // SIMD handles full lane groups, then scalar tail code preserves exact
+    // behavior for counts that are not lane-aligned.
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= particles.len());
 
@@ -640,6 +658,7 @@ fn processRangeScalar(particles: *ParticleSlice, range: ParallelRange, delta_sec
 }
 
 fn processParticleScalar(particles: *ParticleSlice, index: usize, delta_seconds: f32) void {
+    // Scalar update mirrors the SIMD path for tests and lane tails.
     const position_x = particles.position_x[index];
     const position_y = particles.position_y[index];
     particles.previous_x[index] = position_x;

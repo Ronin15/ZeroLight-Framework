@@ -25,6 +25,9 @@ pub const ConstHotI32Slice = []align(hot_soa_column_alignment) const i32;
 const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
 const HotI32List = std.ArrayListAligned(i32, .fromByteUnits(hot_soa_column_alignment));
 
+/// Stable entity handle. The index points at an entity slot and the generation
+/// changes whenever that slot is retired, so stale IDs cannot resolve after
+/// free-list reuse.
 pub const EntityId = struct {
     index: u32,
     generation: u32,
@@ -103,6 +106,8 @@ pub const MovementBodyPtr = struct {
     speed: *f32,
 };
 
+/// Mutable dense movement columns. Entity order matches every movement column
+/// so processors can use one row index for positions, velocities, and identity.
 pub const MovementBodySlice = struct {
     entities: []const EntityId,
     position_x: HotF32Slice,
@@ -143,6 +148,8 @@ pub const ConstFacingSlice = struct {
     directions: []const Facing,
 };
 
+/// Data-only primitive visual component. Render order and colors live here, but
+/// prepared draw records and renderer handles stay outside DataSystem.
 pub const PrimitiveVisual = struct {
     size: math.Vec2,
     color: config.Color,
@@ -288,6 +295,8 @@ pub const ConstSteeringAgentSlice = struct {
     unavailable_backoff_steps: []const u16,
 };
 
+/// Component bundle consumed by create_entity during structural commits. Each
+/// optional payload still goes through normal validation and change reporting.
 pub const EntityTemplate = struct {
     movement_body: ?MovementBody = null,
     facing: ?FacingData = null,
@@ -319,10 +328,10 @@ pub const AssetReferenceCommand = struct {
     asset_reference: AssetReference,
 };
 
+/// Deferred structural work committed after processors finish. Commands carry
+/// stable entity IDs and component values only, never borrowed slices or service
+/// references from the frame that produced them.
 pub const StructuralCommand = union(enum) {
-    // Deferred structural work is committed after processors finish. Commands
-    // carry stable entity IDs and component values only, never borrowed slices or
-    // service references from the frame that produced them.
     create_entity: EntityTemplate,
     destroy_entity: EntityId,
     set_movement_body: MovementBodyCommand,
@@ -370,6 +379,8 @@ const NullStructuralCommitPreparer = struct {
 };
 
 const StructuralCapacityNeeds = struct {
+    // Preflight reserves every storage target before the commit loop. That
+    // keeps structural commits all-or-fail before DataSystem mutates.
     slots: usize,
     movement_bodies: usize,
     facings: usize,
@@ -408,6 +419,8 @@ const StructuralCapacityNeeds = struct {
 };
 
 const StructuralCapacityProjection = struct {
+    // Projection follows command-order creates, destroys, and first-time
+    // component additions without touching real slots or dense component stores.
     current: StructuralCapacityNeeds,
     required: StructuralCapacityNeeds,
     free_slots: usize,
@@ -490,12 +503,16 @@ fn addCapacity(value: usize, amount: usize) !usize {
 }
 
 const StructuralCommitPlan = struct {
+    // `structural_event_count` lets callers reserve their change sink before
+    // mutation so event publishing cannot fail halfway through commit.
     command_count: usize,
     capacity_needs: StructuralCapacityNeeds,
     structural_event_count: usize,
 };
 
 const ProjectedEntityState = struct {
+    // Scratch copy of just the liveness and component membership needed for
+    // preflight. Dense row indices are irrelevant until the real commit pass.
     alive: bool,
     component_mask: ComponentMask,
 
@@ -524,6 +541,8 @@ const ProjectedEntityState = struct {
     }
 };
 
+/// Reusable scratch for prepared structural commits. Simulation pipelines keep
+/// this around to avoid per-step hash-map allocation churn.
 pub const StructuralPlanScratch = struct {
     allocator: std.mem.Allocator,
     projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
@@ -580,6 +599,9 @@ fn templateComponentCount(template: EntityTemplate) usize {
     return count;
 }
 
+/// Persistent gameplay data owner and ECS storage foundation. Entity slots are
+/// stable handles, while component stores are dense SoA columns referenced from
+/// live slots.
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
@@ -685,6 +707,8 @@ pub const DataSystem = struct {
     }
 
     pub fn clearRetainingCapacity(self: *DataSystem) void {
+        // Reset invalidates all existing IDs while keeping allocated component
+        // columns warm for the next state/session.
         self.steering_agents.clearRetainingCapacity();
         self.ai_agents.clearRetainingCapacity();
         self.asset_refs.clearRetainingCapacity(self.allocator);
@@ -718,6 +742,8 @@ pub const DataSystem = struct {
     }
 
     pub fn setMovementBody(self: *DataSystem, id: EntityId, body: MovementBody) !void {
+        // Public set* calls are upserts: existing component rows are overwritten,
+        // while missing rows are appended and registered in the entity slot.
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.movement_body_index) |index| {
             self.movement_bodies.set(@intCast(index), body);
@@ -961,6 +987,8 @@ pub const DataSystem = struct {
         preparer: anytype,
         change_sink: anytype,
     ) !StructuralCommitStats {
+        // Prepared commits split allocation/preparation from mutation so callers
+        // can reuse scratch and reserve their own event buffers ahead of time.
         const plan = try self.preflightStructuralCommands(commands, scratch);
         try preparer.prepare(plan.structural_event_count);
         // No allocations or event-capacity failures should occur after this
@@ -973,6 +1001,8 @@ pub const DataSystem = struct {
         commands: []const StructuralCommand,
         change_sink: anytype,
     ) !StructuralCommitStats {
+        // Commit preserves command order. Stale entity commands are skipped, but
+        // valid commands still produce deterministic component-change events.
         var stats = StructuralCommitStats{};
         for (commands) |command| {
             switch (command) {
@@ -1171,6 +1201,8 @@ pub const DataSystem = struct {
     }
 
     pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
+        // Validate fallible payloads up front so the later command-order commit
+        // does not partially mutate before rejecting bad component data.
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
@@ -1197,6 +1229,9 @@ pub const DataSystem = struct {
     }
 
     fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype, entity: EntityId, template: EntityTemplate) void {
+        // Navigation-obstacle notifications compare before/after state across
+        // the component sequence because movement, bounds, and response together
+        // define whether pathfinding needs a grid rebuild.
         var was_static_navigation_obstacle = false;
         if (template.movement_body != null) {
             self.recordComponentChange(change_sink, entity, .movement_body, was_static_navigation_obstacle);
@@ -1264,6 +1299,8 @@ pub const DataSystem = struct {
     }
 
     fn resolveSlot(self: *DataSystem, id: EntityId) ?*EntitySlot {
+        // Resolution checks both liveness and generation. Slot index alone is
+        // never enough because free-list reuse is intentional.
         if (!id.isValid()) return null;
         const index: usize = @intCast(id.index);
         if (index >= self.slots.items.len) return null;
@@ -1286,6 +1323,8 @@ pub const DataSystem = struct {
     }
 
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
+        // Store removals swap the tail row into the removed row. If a row moved,
+        // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
     }
@@ -1327,6 +1366,8 @@ pub const DataSystem = struct {
 };
 
 const EntitySlot = struct {
+    // Per-entity slot metadata stays cold compared with component columns. Hot
+    // systems query masks once, then iterate dense component slices directly.
     generation: u32 = 1,
     alive: bool = false,
     next_free: ?u32 = null,
@@ -1394,6 +1435,8 @@ fn validateSteeringAgent(agent: SteeringAgent) !void {
 }
 
 const MovementBodyStore = struct {
+    // Movement is the hottest component, so scalar fields are separate aligned
+    // columns for SIMD loads and cache-line-aware range splitting.
     entities: std.ArrayList(EntityId) = .empty,
     position_x: HotF32List = .empty,
     position_y: HotF32List = .empty,
@@ -1561,6 +1604,8 @@ const MovementBodyStore = struct {
 };
 
 const FacingStore = struct {
+    // Facing is compact and cold enough to keep as enum rows, but it still
+    // follows the dense entity-row contract for fast membership scans.
     entities: std.ArrayList(EntityId) = .empty,
     directions: std.ArrayList(Facing) = .empty,
 
@@ -1609,6 +1654,8 @@ const FacingStore = struct {
 };
 
 const PrimitiveVisualStore = struct {
+    // Visual columns keep render-prep reads linear and avoid touching gameplay
+    // systems that do not care about color, marker, or depth fields.
     entities: std.ArrayList(EntityId) = .empty,
     size_x: std.ArrayList(f32) = .empty,
     size_y: std.ArrayList(f32) = .empty,
@@ -1821,6 +1868,8 @@ const PrimitiveVisualStore = struct {
 };
 
 const AssetReferenceStore = struct {
+    // Persistent render identity is a stable asset ID. Loaded textures and
+    // prepared sprite records are renderer/cache concerns, not component data.
     entities: std.ArrayList(EntityId) = .empty,
     sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
 
@@ -1867,6 +1916,8 @@ const AssetReferenceStore = struct {
 };
 
 const CollisionBoundsStore = struct {
+    // Bounds columns are aligned because collision and pathfinding both scan
+    // them in tight loops.
     entities: std.ArrayList(EntityId) = .empty,
     offset_x: HotF32List = .empty,
     offset_y: HotF32List = .empty,
@@ -1956,6 +2007,8 @@ const CollisionBoundsStore = struct {
 };
 
 const CollisionResponseStore = struct {
+    // Response rows describe collision policy and static/dynamic mobility; they
+    // intentionally do not point at collision-system runtime state.
     entities: std.ArrayList(EntityId) = .empty,
     modes: std.ArrayList(CollisionResponseMode) = .empty,
     mobilities: std.ArrayList(CollisionResponseMobility) = .empty,
@@ -2037,6 +2090,8 @@ const CollisionResponseStore = struct {
 };
 
 const AiAgentStore = struct {
+    // AI agent data stays small and persistent here. Per-step decisions are
+    // emitted through SimulationFrame streams instead of stored on the entity.
     entities: std.ArrayList(EntityId) = .empty,
     behaviors: std.ArrayList(AiBehavior) = .empty,
     wander_amplitudes: HotF32List = .empty,
@@ -2118,6 +2173,8 @@ const AiAgentStore = struct {
 };
 
 const SteeringAgentStore = struct {
+    // Steering configuration is persistent, while path cooldowns and local
+    // avoidance scratch live in SteeringSystem runtime rows.
     entities: std.ArrayList(EntityId) = .empty,
     agent_radii: HotF32List = .empty,
     waypoint_tolerances: HotF32List = .empty,
