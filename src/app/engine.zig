@@ -196,6 +196,7 @@ pub const Engine = struct {
         while (c.SDL_PollEvent(&event)) {
             if (comptime runtime_perf_log.enabled) {
                 event_count += 1;
+                self.recordPresentationEventMetrics(event.type);
             }
             const routing_policy = self.states.inputRoutingPolicy();
             switch (event.type) {
@@ -234,6 +235,11 @@ pub const Engine = struct {
         frame_policy: frame_pacer.FramePolicy,
         time_loop: *TimeLoop,
     ) !void {
+        const perf_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+        defer if (comptime runtime_perf_log.enabled) {
+            self.perf_log.recordTiming(.frame_controls, elapsedNs(perf_start_ns, self.nowNs()));
+        };
+
         const was_paused = self.pause.isPaused();
         if (frame_policy.should_pause_gameplay and !self.pause.isPaused() and self.states.isGameplayActive()) {
             log.debug("pausing gameplay while window cannot render", .{});
@@ -424,10 +430,61 @@ pub const Engine = struct {
         }
         self.audio_service.setPaused(self.pause.isPaused());
     }
+
+    fn recordPresentationEventMetrics(self: *Engine, event_type: u32) void {
+        if (!isPresentationEvent(event_type)) return;
+
+        self.perf_log.recordMetric(.sdl_presentation_events, 1);
+        switch (event_type) {
+            c.SDL_EVENT_WINDOW_RESIZED,
+            c.SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED,
+            c.SDL_EVENT_WINDOW_METAL_VIEW_RESIZED,
+            => self.perf_log.recordMetric(.sdl_window_resize_events, 1),
+
+            c.SDL_EVENT_WINDOW_ENTER_FULLSCREEN,
+            c.SDL_EVENT_WINDOW_LEAVE_FULLSCREEN,
+            => self.perf_log.recordMetric(.sdl_window_fullscreen_events, 1),
+
+            c.SDL_EVENT_WINDOW_DISPLAY_CHANGED,
+            c.SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED,
+            c.SDL_EVENT_DISPLAY_ORIENTATION,
+            c.SDL_EVENT_DISPLAY_ADDED,
+            c.SDL_EVENT_DISPLAY_REMOVED,
+            c.SDL_EVENT_DISPLAY_MOVED,
+            c.SDL_EVENT_DISPLAY_DESKTOP_MODE_CHANGED,
+            c.SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED,
+            c.SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED,
+            c.SDL_EVENT_DISPLAY_USABLE_BOUNDS_CHANGED,
+            => self.perf_log.recordMetric(.sdl_window_display_events, 1),
+
+            c.SDL_EVENT_WINDOW_FOCUS_GAINED,
+            c.SDL_EVENT_WINDOW_FOCUS_LOST,
+            => self.perf_log.recordMetric(.sdl_window_focus_events, 1),
+
+            c.SDL_EVENT_WINDOW_SHOWN,
+            c.SDL_EVENT_WINDOW_HIDDEN,
+            c.SDL_EVENT_WINDOW_EXPOSED,
+            c.SDL_EVENT_WINDOW_MINIMIZED,
+            c.SDL_EVENT_WINDOW_MAXIMIZED,
+            c.SDL_EVENT_WINDOW_RESTORED,
+            c.SDL_EVENT_WINDOW_OCCLUDED,
+            => self.perf_log.recordMetric(.sdl_window_visibility_events, 1),
+
+            c.SDL_EVENT_WINDOW_MOVED,
+            => self.perf_log.recordMetric(.sdl_window_move_events, 1),
+
+            else => {},
+        }
+    }
 };
 
 fn validateConfig(app_config: config.AppConfig) !void {
     try app_config.validate();
+}
+
+fn isPresentationEvent(event_type: u32) bool {
+    return (event_type >= c.SDL_EVENT_WINDOW_FIRST and event_type <= c.SDL_EVENT_WINDOW_LAST) or
+        (event_type >= c.SDL_EVENT_DISPLAY_FIRST and event_type <= c.SDL_EVENT_DISPLAY_LAST);
 }
 
 fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
@@ -499,4 +556,11 @@ test "non integer fit policies do not request minimum window size" {
     try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .fit }));
     try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .stretch }));
     try std.testing.expectEqual(@as(?resolution.LogicalSize, null), minimumWindowSizeForPolicy(.{ .scale_mode = .overscan }));
+}
+
+test "presentation timing classifier recognizes window and display event ranges" {
+    try std.testing.expect(isPresentationEvent(c.SDL_EVENT_WINDOW_RESIZED));
+    try std.testing.expect(isPresentationEvent(c.SDL_EVENT_WINDOW_ENTER_FULLSCREEN));
+    try std.testing.expect(isPresentationEvent(c.SDL_EVENT_DISPLAY_CONTENT_SCALE_CHANGED));
+    try std.testing.expect(!isPresentationEvent(c.SDL_EVENT_QUIT));
 }

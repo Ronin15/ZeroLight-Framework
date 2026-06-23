@@ -21,6 +21,13 @@ pub const FrameResult = enum {
 
 pub const Metric = enum {
     sdl_events,
+    sdl_presentation_events,
+    sdl_window_resize_events,
+    sdl_window_fullscreen_events,
+    sdl_window_display_events,
+    sdl_window_focus_events,
+    sdl_window_visibility_events,
+    sdl_window_move_events,
     state_updates,
     state_renders,
     fixed_updates,
@@ -98,6 +105,7 @@ pub const Metric = enum {
 pub const Timing = enum {
     frame_interval,
     events,
+    frame_controls,
     update,
     render_total,
     render_enqueue,
@@ -240,6 +248,7 @@ const EnabledRuntimePerfLog = struct {
     fn emit(self: *const EnabledRuntimePerfLog, elapsed_ns: u64) void {
         const frame_interval_timing = self.timingValue(.frame_interval);
         const events_timing = self.timingValue(.events);
+        const frame_controls_timing = self.timingValue(.frame_controls);
         const update_timing = self.timingValue(.update);
         const render_total_timing = self.timingValue(.render_total);
         const render_enqueue_timing = self.timingValue(.render_enqueue);
@@ -251,7 +260,7 @@ const EnabledRuntimePerfLog = struct {
             self.metricValue(.skipped_no_swapchain_frames);
 
         log.debug(
-            "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} update_avg_ms={d:.3} render_total_avg_ms={d:.3} event_count={}",
+            "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} events_max_ms={d:.3} controls_avg_ms={d:.3} controls_max_ms={d:.3} update_avg_ms={d:.3} update_max_ms={d:.3} render_total_avg_ms={d:.3} render_total_max_ms={d:.3} event_count={} presentation_events={} resize={} fullscreen={} display={} focus={} visibility={} move={}",
             .{
                 elapsed_s,
                 self.frames,
@@ -263,20 +272,35 @@ const EnabledRuntimePerfLog = struct {
                 millis(frame_interval_timing.averageNs()),
                 millis(frame_interval_timing.max_ns),
                 millis(events_timing.averageNs()),
+                millis(events_timing.max_ns),
+                millis(frame_controls_timing.averageNs()),
+                millis(frame_controls_timing.max_ns),
                 millis(update_timing.averageNs()),
+                millis(update_timing.max_ns),
                 millis(render_total_timing.averageNs()),
+                millis(render_total_timing.max_ns),
                 self.metricValue(.sdl_events),
+                self.metricValue(.sdl_presentation_events),
+                self.metricValue(.sdl_window_resize_events),
+                self.metricValue(.sdl_window_fullscreen_events),
+                self.metricValue(.sdl_window_display_events),
+                self.metricValue(.sdl_window_focus_events),
+                self.metricValue(.sdl_window_visibility_events),
+                self.metricValue(.sdl_window_move_events),
             },
         );
         log.debug(
-            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} overlay_avg_ms={d:.3} end_frame_avg_ms={d:.3} render_queue_records={} records_per_frame={d:.1} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
+            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} render_queue_records={} records_per_frame={d:.1} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
             .{
                 elapsed_s,
                 self.metricValue(.state_updates),
                 self.metricValue(.state_renders),
                 millis(render_enqueue_timing.averageNs()),
+                millis(render_enqueue_timing.max_ns),
                 millis(render_overlay_timing.averageNs()),
+                millis(render_overlay_timing.max_ns),
                 millis(render_end_frame_timing.averageNs()),
+                millis(render_end_frame_timing.max_ns),
                 self.metricValue(.render_queue_records),
                 averagePer(self.metricValue(.render_queue_records), rendered_frame_count),
                 self.metricValue(.sprite_commands),
