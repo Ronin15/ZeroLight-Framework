@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
+const build_options = @import("build_options");
 const config = @import("../config.zig");
 const log = @import("../core/logging.zig").platform;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
@@ -22,8 +23,10 @@ pub fn main(init: std.process.Init) !void {
     const app_config = config.AppConfig{
         .app_name = "gpu-smoke",
         .window_title = "SDL_GPU Smoke",
+        .asset_root = build_options.asset_root,
         .gpu_debug = true,
     };
+    try app_config.validate();
     var window = try sdl.Window.create(
         "SDL_GPU Smoke",
         320,

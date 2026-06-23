@@ -742,6 +742,7 @@ pub const DataSystem = struct {
     }
 
     pub fn setMovementBody(self: *DataSystem, id: EntityId, body: MovementBody) !void {
+        try validateMovementBody(body);
         // Public set* calls are upserts: existing component rows are overwritten,
         // while missing rows are appended and registered in the entity slot.
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
@@ -814,6 +815,7 @@ pub const DataSystem = struct {
     }
 
     pub fn setPrimitiveVisual(self: *DataSystem, id: EntityId, visual: PrimitiveVisual) !void {
+        try validatePrimitiveVisual(visual);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.primitive_visual_index) |index| {
             self.primitive_visuals.set(@intCast(index), visual);
@@ -1206,6 +1208,12 @@ pub const DataSystem = struct {
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
+                    if (template.movement_body) |body| {
+                        try validateMovementBody(body);
+                    }
+                    if (template.primitive_visual) |visual| {
+                        try validatePrimitiveVisual(visual);
+                    }
                     if (template.collision_bounds) |bounds| {
                         try validateCollisionBounds(bounds);
                     }
@@ -1219,6 +1227,8 @@ pub const DataSystem = struct {
                         try validateSteeringAgent(agent);
                     }
                 },
+                .set_movement_body => |set| try validateMovementBody(set.body),
+                .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
                 .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
                 .set_collision_response => |set| try validateCollisionResponse(set.response),
                 .set_ai_agent => |set| try validateAiAgent(set.agent),
@@ -1389,6 +1399,31 @@ const EntitySlot = struct {
         return (self.component_mask & mask) == mask;
     }
 };
+
+fn validateMovementBody(body: MovementBody) !void {
+    if (!std.math.isFinite(body.position.x) or !std.math.isFinite(body.position.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.previous_position.x) or !std.math.isFinite(body.previous_position.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.velocity.x) or !std.math.isFinite(body.velocity.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.speed) or body.speed < 0) return error.InvalidMovementBody;
+}
+
+fn validatePrimitiveVisual(visual: PrimitiveVisual) !void {
+    if (!std.math.isFinite(visual.size.x) or !std.math.isFinite(visual.size.y)) return error.InvalidPrimitiveVisual;
+    if (visual.size.x <= 0 or visual.size.y <= 0) return error.InvalidPrimitiveVisual;
+    try validatePrimitiveColor(visual.color);
+    try validatePrimitiveColor(visual.marker_color);
+    if (!std.math.isFinite(visual.marker_length) or visual.marker_length < 0) return error.InvalidPrimitiveVisual;
+    if (!std.math.isFinite(visual.marker_depth) or visual.marker_depth < 0) return error.InvalidPrimitiveVisual;
+    if (!std.math.isFinite(visual.marker_margin) or visual.marker_margin < 0) return error.InvalidPrimitiveVisual;
+}
+
+fn validatePrimitiveColor(color: config.Color) !void {
+    if (!std.math.isFinite(color.r) or !std.math.isFinite(color.g) or
+        !std.math.isFinite(color.b) or !std.math.isFinite(color.a))
+    {
+        return error.InvalidPrimitiveVisual;
+    }
+}
 
 fn validateCollisionBounds(bounds: CollisionBounds) !void {
     if (!std.math.isFinite(bounds.offset.x) or !std.math.isFinite(bounds.offset.y)) return error.InvalidCollisionBounds;
@@ -2481,6 +2516,34 @@ test "movement body store is row aligned and compact after removal" {
     }
 }
 
+test "movement body ingress rejects invalid payloads without mutating existing rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+
+    var bad = testBody(99);
+    bad.position.x = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.previous_position.y = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.velocity.x = -std.math.inf(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.speed = -0.1;
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+}
+
 test "component masks track entity membership for system queries" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2607,6 +2670,44 @@ test "primitive visual store is columnar and compact after removal" {
         try std.testing.expectEqual(expected, slice.size_x[index]);
         try std.testing.expectEqual(expected, slice.size_y[index]);
     }
+}
+
+test "primitive visual ingress rejects invalid payloads without mutating existing rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setPrimitiveVisual(entity, testVisualWithSize(8));
+
+    var bad = testVisualWithSize(99);
+    bad.size.x = 0;
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.size.y = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.color.g = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_length = -0.1;
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_depth = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_margin = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
 }
 
 test "reset invalidates old ids while keeping system reusable" {
@@ -2958,6 +3059,35 @@ test "structural commands prevalidate steering agents before mutating" {
     try std.testing.expectError(error.InvalidSteeringAgent, data.applyStructuralCommands(&commands));
     try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+}
+
+test "structural commands prevalidate movement and primitive visuals before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+    try data.setPrimitiveVisual(existing, testVisualWithSize(8));
+
+    var invalid_body = testBody(2);
+    invalid_body.speed = std.math.nan(f32);
+    const movement_commands = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
+        .{ .create_entity = .{ .movement_body = invalid_body } },
+    };
+    try std.testing.expectError(error.InvalidMovementBody, data.applyStructuralCommands(&movement_commands));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+
+    var invalid_visual = testVisualWithSize(16);
+    invalid_visual.marker_margin = -1;
+    const visual_commands = [_]StructuralCommand{
+        .{ .set_primitive_visual = .{ .entity = existing, .visual = testVisualWithSize(99) } },
+        .{ .create_entity = .{ .primitive_visual = invalid_visual } },
+    };
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.applyStructuralCommands(&visual_commands));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(existing).?.size.x);
+    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
 }
 
 test "structural commands reserve capacity before mutating" {

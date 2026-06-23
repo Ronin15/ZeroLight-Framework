@@ -183,9 +183,10 @@ generated-output rules live in `docs/coding-standards.md`.
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
 transient particle rows, AI agents, steering agents, dense collision bodies,
 sparse collision bodies, collision-response contacts, and renderer sprite CPU
-prep. The default run exercises one serial baseline, fixed-worker, fixed
-small-range, fixed large-range, and adaptive cases so the full processor flow
-can be checked for regressions.
+prep, plus pathfinding open-list, common-goal, cached-result, and hard-fallback
+workloads. The default run exercises one serial baseline, fixed-worker, fixed
+small-range, fixed large-range, and adaptive cases so the full processor flow can
+be checked for regressions.
 `thread-adaptive-fixed-range` isolates adaptive worker-count selection with a
 fixed range size, while `thread-adaptive-tuned-range` uses the same
 processor-owned adaptive worker and range tuner path as production systems. The

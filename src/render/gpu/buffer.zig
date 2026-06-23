@@ -10,7 +10,7 @@ const c = sdl.c;
 pub fn createVertexBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) !*c.SDL_GPUBuffer {
     var buffer_info = std.mem.zeroes(c.SDL_GPUBufferCreateInfo);
     buffer_info.usage = c.SDL_GPU_BUFFERUSAGE_VERTEX;
-    buffer_info.size = @intCast(vertex_capacity * @sizeOf(sprite_batch.Vertex));
+    buffer_info.size = try vertexByteSize(vertex_capacity);
     return c.SDL_CreateGPUBuffer(device, &buffer_info) orelse {
         return sdlError("SDL_CreateGPUBuffer");
     };
@@ -19,7 +19,7 @@ pub fn createVertexBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) !*c.
 pub fn createVertexTransferBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) !*c.SDL_GPUTransferBuffer {
     var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
     transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = @intCast(vertex_capacity * @sizeOf(sprite_batch.Vertex));
+    transfer_info.size = try vertexByteSize(vertex_capacity);
     return c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
@@ -42,9 +42,15 @@ pub fn recordVertexUpload(
     vertices: []const sprite_batch.Vertex,
 ) !void {
     const bytes = std.mem.sliceAsBytes(vertices);
+    const upload_size = try checkedGpuBytes(bytes.len);
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
+    var copy_pass_open = true;
+    errdefer if (copy_pass_open) {
+        c.SDL_EndGPUCopyPass(copy_pass);
+    };
+
     var source = c.SDL_GPUTransferBufferLocation{
         .transfer_buffer = transfer_buffer,
         .offset = 0,
@@ -52,12 +58,39 @@ pub fn recordVertexUpload(
     var destination = c.SDL_GPUBufferRegion{
         .buffer = vertex_buffer,
         .offset = 0,
-        .size = @intCast(bytes.len),
+        .size = upload_size,
     };
     c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, true);
     c.SDL_EndGPUCopyPass(copy_pass);
+    copy_pass_open = false;
+}
+
+fn vertexByteSize(vertex_capacity: usize) error{GpuBufferTooLarge}!u32 {
+    const bytes = std.math.mul(usize, vertex_capacity, @sizeOf(sprite_batch.Vertex)) catch return error.GpuBufferTooLarge;
+    return checkedGpuBytes(bytes);
+}
+
+fn checkedGpuBytes(byte_count: usize) error{GpuBufferTooLarge}!u32 {
+    return std.math.cast(u32, byte_count) orelse error.GpuBufferTooLarge;
 }
 
 fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
+}
+
+test "vertex buffer byte sizing rejects overflow and SDL u32 overflow" {
+    try std.testing.expectEqual(
+        @as(u32, @sizeOf(sprite_batch.Vertex) * 4),
+        try vertexByteSize(4),
+    );
+    try std.testing.expectError(error.GpuBufferTooLarge, vertexByteSize(std.math.maxInt(usize)));
+    try std.testing.expectError(
+        error.GpuBufferTooLarge,
+        vertexByteSize(@as(usize, std.math.maxInt(u32)) / @sizeOf(sprite_batch.Vertex) + 1),
+    );
+}
+
+test "GPU byte sizing rejects values above SDL u32 limit" {
+    try std.testing.expectEqual(@as(u32, 4096), try checkedGpuBytes(4096));
+    try std.testing.expectError(error.GpuBufferTooLarge, checkedGpuBytes(@as(usize, std.math.maxInt(u32)) + 1));
 }

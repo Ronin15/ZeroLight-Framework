@@ -555,9 +555,9 @@ Checklist:
 
 Acceptance checks:
 
-- [ ] `zig build shaders` emits the same sprite shader outputs as before.
-- [ ] `zig build verify` exercises shader compilation.
-- [ ] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
+- [x] `zig build shaders` emits the same sprite shader outputs as before.
+- [x] `zig build verify` exercises shader compilation.
+- [x] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
 
 ## Slice 9: Platform-Neutral SIMD Helper Layer
 
