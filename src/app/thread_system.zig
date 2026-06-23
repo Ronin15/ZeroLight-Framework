@@ -2,6 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Fixed worker pool plus adaptive range selection for hot CPU stages.
+//! Callers own the data contract: worker jobs must write only their assigned
+//! ranges or range-indexed scratch, and main-thread-only commits happen after
+//! `parallelForWithOptions` returns.
+
 const std = @import("std");
 const logging = @import("../core/logging.zig");
 const log = logging.app;
@@ -352,6 +357,9 @@ pub const AdaptiveWorkTuner = struct {
             }, request);
         }
 
+        // The model chooses participants from observed work, participant
+        // overhead, range overhead, and tail wait. Item-count floors are kept
+        // out of this path so production scheduling stays measurement-driven.
         const participant_overhead_ns = @max(self.model_participant_overhead_ns, default_participant_overhead_ns);
         const ideal_participants_f = @sqrt(estimated_work_ns / participant_overhead_ns);
         const max_participants = request.max_worker_threads + 1;
@@ -675,6 +683,8 @@ pub const ThreadSystem = struct {
         const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
         const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
         const requested_items_per_range = @max(options.items_per_range orelse self.config.items_per_range, @as(usize, 1));
+        // Explicit items_per_range opts out of the shared adaptive tuner. Stage
+        // owners that need independent timing should pass their own tuner.
         const adaptive_tuner = if (options.adaptive and (max_worker_threads > 0 or options.selected_profile != null))
             if (options.selected_profile != null)
                 options.adaptive_tuner
@@ -758,6 +768,9 @@ pub const ThreadSystem = struct {
             worker.wake.post(self.shared.io);
         }
 
+        // Worker 1 starts with range 0, worker N with range N-1, and the main
+        // thread steals from `next_range`. That preserves deterministic range
+        // ownership while allowing the main thread to help instead of only wait.
         self.shared.runBatchRanges(WorkerId.main);
 
         const wait_start_ns = nowNs(self.shared.io);

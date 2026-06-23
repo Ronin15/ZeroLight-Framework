@@ -2,6 +2,10 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Borrowed state-stack facade with explicit ownership at push/replace time.
+//! States queue transitions during dispatch; the stack applies them afterward
+//! so callbacks never mutate the active stack while it is being walked.
+
 const std = @import("std");
 const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
@@ -373,6 +377,8 @@ pub const StateStack = struct {
     pub fn inputRoutingPolicy(self: *const StateStack) InputRoutingPolicy {
         if (self.states.items.len == 0) return state_policy.gameplay.input_routing;
 
+        // Fold policies from the top down. Pass-through overlays can leave lower
+        // gameplay held input enabled; modal and opaque policies explicitly block it.
         var index = self.states.items.len - 1;
         var routing = self.states.items[index].policy.input_routing;
         while (true) {
@@ -473,6 +479,9 @@ pub const StateStack = struct {
 
     pub fn applyTransitions(self: *StateStack, transitions: *StateTransitions) !TransitionApplyResult {
         var result = TransitionApplyResult{};
+        // Requests are FIFO and own any state payloads until consumed here.
+        // `transitions.clear` must run after the loop to avoid destroying states
+        // that were moved into the stack.
         for (transitions.requests.items) |*request| {
             switch (request.*) {
                 .none => {},

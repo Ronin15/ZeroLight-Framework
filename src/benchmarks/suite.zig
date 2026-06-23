@@ -2,6 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Non-interactive benchmark harness for runtime processors.
+//! Rows are regression signals and scheduler diagnostics, not runtime policy:
+//! production adaptive cases report what the measured tuner selected for this
+//! workload, while fixed cases are controls for comparison.
+
 const std = @import("std");
 const AdaptiveWorkPhase = @import("../app/thread_system.zig").AdaptiveWorkPhase;
 const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkReport;
@@ -694,6 +699,9 @@ fn printValidationSummary(
     results: []const CaseResult,
 ) void {
     const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
+    // Keep the summary terse and action-oriented: it should call out unusual
+    // scheduler behavior or workload counters without pretending to choose
+    // runtime tuning policy from one benchmark run.
     if (is_render_prep) {
         const focus = adaptive orelse best;
         const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";

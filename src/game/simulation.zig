@@ -7,6 +7,7 @@
 //! per-step streams for processor events, intents, and deferred structure.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
@@ -24,7 +25,10 @@ pub const SimulationPhase = enum {
     idle,
     begin_step,
     main_thread_inputs,
-    processors, // includes ai decision (emit intents) + intent apply + movement + collision + response + particles (explicit order in GameDemoState)
+    // The concrete processor order is state-owned. GameDemoState currently uses
+    // AI -> steering -> pathfinding -> intent apply -> movement -> collision ->
+    // response -> particles before structural commits.
+    processors,
     merge_outputs,
     commit_structural,
     finished,
@@ -328,6 +332,9 @@ pub const CollisionContact = struct {
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
+    // These streams are transient frame outputs. Producers reserve/count per
+    // range, write range-owned records, then consumers read mergedItems only
+    // after the producer stage has finished.
     events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
     intents: RangeOutputStream(SimulationIntent),
@@ -716,7 +723,7 @@ test "range output stream merges by range index" {
 }
 
 test "range output stream keeps deterministic order across threaded passes" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var stream = RangeOutputStream(TestStreamEvent).init(std.testing.allocator);
     defer stream.deinit();

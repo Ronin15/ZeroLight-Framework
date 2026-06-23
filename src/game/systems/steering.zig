@@ -4,6 +4,8 @@
 //! Steering and local avoidance system for Slice 19.
 //! Consumes high-level navigation intents, pathfinding status, and steering
 //! component data, then emits final movement intents for NPC movement.
+//! Selection, path requests, and world snapshots run on the main thread; worker
+//! jobs read immutable slices and write range-owned movement intents.
 
 const std = @import("std");
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
@@ -216,9 +218,13 @@ pub const SteeringSystem = struct {
         self.pruneRuntimeRows(data);
         self.tickRuntimeRows();
         const navigation_intents = frame.navigation_intents.mergedItems();
+        // Multiple systems may target the same entity. Selection keeps one
+        // intent per steering row by priority, then source order for ties.
         try self.selectIntents(data, steering, navigation_intents, config);
 
         const movement = data.movementBodySliceConst();
+        // Snapshot all avoidance inputs before dispatch so worker jobs never
+        // touch DataSystem or pathfinding mutable state.
         try self.gatherWorldSnapshot(data, movement, steering, data.collisionBoundsSliceConst(), data.collisionResponseSliceConst());
 
         var stats = SteeringStats{
@@ -310,6 +316,8 @@ pub const SteeringSystem = struct {
             self.obstacle_candidate_counts.appendAssumeCapacity(0);
         }
         if (config.max_selected_intents != null) {
+            // Capped selection can replace lower-priority entries out of source
+            // order; sort restores deterministic emission order.
             std.mem.sort(SelectedIntent, self.selected.items, {}, selectedIntentLessThan);
         }
     }
@@ -471,6 +479,8 @@ pub const SteeringSystem = struct {
         frame.path_requests.addCount(request_range_base, request_count);
         try frame.path_requests.prefixAppendedRanges(request_range_base);
         var request_writer = frame.path_requests.rangeWriter(request_range_base);
+        // Path requests are appended as their own range so steering can coexist
+        // with future producers without rebuilding earlier stream offsets.
         for (self.selected.items, 0..) |selected, index| {
             if (!selected.emit_path_request) continue;
             request_writer.write(PathRequest{

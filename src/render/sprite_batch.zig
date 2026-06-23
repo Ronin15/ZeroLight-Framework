@@ -2,7 +2,13 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Ordered sprite command stream and CPU-side vertex preparation.
+//! This module is not a broad sorter: callers submit in nondecreasing
+//! RenderOrder, then SpriteBatch snapshots texture metadata before any worker
+//! stage expands vertices.
+
 const std = @import("std");
+const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const Camera2D = @import("camera.zig").Camera2D;
@@ -182,6 +188,8 @@ pub const SpriteBatch = struct {
         if (self.last_order) |previous| {
             std.debug.assert(previous.lessOrEqual(sprite.order));
         }
+        // Ordered submission keeps the renderer cheap: grouping can preserve
+        // stream order instead of sorting every frame.
         try self.commands.append(self.allocator, .{ .sprite = sprite });
         self.last_order = sprite.order;
     }
@@ -273,6 +281,9 @@ pub const SpriteBatch = struct {
 
         var batch: BatchStats = .{};
         if (valid_count > 0) {
+            // Worker jobs write disjoint vertex ranges derived from prepared
+            // command indices. Draw groups remain serial because they depend on
+            // ordered texture/presentation transitions.
             if (thread_system) |threads| {
                 var system_config = prep_config;
                 if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
@@ -808,7 +819,7 @@ test "ui stack order keeps upper state background above lower state text" {
 }
 
 test "parallel sprite prep matches serial vertices and draw groups" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
@@ -848,7 +859,7 @@ test "parallel sprite prep matches serial vertices and draw groups" {
 }
 
 test "sprite prep uses batch owned adaptive tuner instead of thread system fallback" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{

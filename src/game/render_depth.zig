@@ -26,10 +26,10 @@ pub fn worldZWithOffset(base_z: i32, depth: WorldDepth) i32 {
 }
 
 test "world depth bands are ordered from lower world to overlays" {
-    try @import("std").testing.expect(worldZ(.floor) < worldZ(.obstacle));
-    try @import("std").testing.expect(worldZ(.obstacle) < worldZ(.actor));
-    try @import("std").testing.expect(worldZ(.actor) <= worldZ(.effect));
-    try @import("std").testing.expect(worldZ(.effect) < worldZ(.marker));
+    try std.testing.expect(worldZ(.floor) < worldZ(.obstacle));
+    try std.testing.expect(worldZ(.obstacle) < worldZ(.actor));
+    try std.testing.expect(worldZ(.actor) <= worldZ(.effect));
+    try std.testing.expect(worldZ(.effect) < worldZ(.marker));
 }
 
 test "world z offset saturates at i32 bounds" {

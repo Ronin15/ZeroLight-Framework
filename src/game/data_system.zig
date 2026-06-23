@@ -320,6 +320,9 @@ pub const AssetReferenceCommand = struct {
 };
 
 pub const StructuralCommand = union(enum) {
+    // Deferred structural work is committed after processors finish. Commands
+    // carry stable entity IDs and component values only, never borrowed slices or
+    // service references from the frame that produced them.
     create_entity: EntityTemplate,
     destroy_entity: EntityId,
     set_movement_body: MovementBodyCommand,
@@ -616,6 +619,8 @@ pub const DataSystem = struct {
             self.free_slot_count -= 1;
             slot.alive = true;
             slot.next_free = null;
+            // Reused slots keep their incremented generation so stale IDs cannot
+            // address the new entity.
             return EntityId.init(index, slot.generation) catch unreachable;
         }
 
@@ -629,6 +634,8 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return false;
         const index = id.index;
 
+        // Component stores stay dense. Removing an entity may swap the tail row
+        // into this entity's dense index and patch that moved entity's slot.
         if (slot.movement_body_index) |dense_index| self.removeMovementBodyAt(@intCast(dense_index));
         if (slot.facing_index) |dense_index| self.removeFacingAt(@intCast(dense_index));
         if (slot.primitive_visual_index) |dense_index| self.removePrimitiveVisualAt(@intCast(dense_index));
@@ -956,6 +963,8 @@ pub const DataSystem = struct {
     ) !StructuralCommitStats {
         const plan = try self.preflightStructuralCommands(commands, scratch);
         try preparer.prepare(plan.structural_event_count);
+        // No allocations or event-capacity failures should occur after this
+        // point; the commit loop can mutate DataSystem in command order.
         return try self.commitStructuralCommands(commands, change_sink);
     }
 
@@ -1093,6 +1102,8 @@ pub const DataSystem = struct {
         var projection = StructuralCapacityProjection.init(self);
         var structural_event_count: usize = 0;
 
+        // Preflight simulates the command stream against projected liveness and
+        // masks so capacity and event reservations match what commit will do.
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {

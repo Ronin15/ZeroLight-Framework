@@ -5,8 +5,11 @@
 //! Frame-delayed grid pathfinding system.
 //! Owns transient request queues, result caches, nav-grid state, fixed scratch,
 //! and stage tuners. Fixed-step update is allocation-free after reserve/rebuild.
+//! Most requests resolve through cached goal fields; hard fallbacks are budgeted
+//! so expensive searches can spill across frames without reordering requests.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -856,6 +859,8 @@ pub const PathfindingSystem = struct {
         for (self.scratch_slots.items) |*scratch| {
             try scratch.reserve(self.allocator, cell_count);
         }
+        // Grid versions are part of query keys. A rebuild invalidates pending
+        // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
     }
 
@@ -926,6 +931,8 @@ pub const PathfindingSystem = struct {
         self.prepareGoalGroups(solve_count);
         self.buildGroupedFields(&stats);
         stats.field_result_batch = self.emitFieldResults(solve_count, thread_system, &system_config, &stats);
+        // Field queries reject most paths cheaply. Only unresolved hard cases
+        // enter the fallback list, and that list is capped before worker dispatch.
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(system_config), &stats);
 
         if (self.fallback_indices.items.len != 0) {
@@ -1169,6 +1176,8 @@ pub const PathfindingSystem = struct {
     fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             if (result == .deferred) {
+                // `fastSolve` covers portal and disconnected-region shortcuts.
+                // Remaining deferred entries keep pending order and are budgeted.
                 if (fastSolve(&self.grid, self.pending.items[pending_index])) |fast_result| {
                     self.solve_results.items[pending_index] = fast_result;
                 } else if (self.fallback_indices.items.len < fallback_limit) {
@@ -2156,7 +2165,7 @@ test "pathfinding warmed hard fallback update does not allocate" {
 }
 
 test "pathfinding threaded solve matches serial solve" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2193,7 +2202,7 @@ test "pathfinding threaded solve matches serial solve" {
 }
 
 test "pathfinding threaded hard fallback matches serial solve" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

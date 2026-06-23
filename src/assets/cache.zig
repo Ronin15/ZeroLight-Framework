@@ -5,6 +5,8 @@
 //! Runtime asset cache for renderer-backed resources.
 //! Cache lookups are intended for setup, state transitions, and explicit release
 //! points. Hot render paths should keep drawing with retained TextureId values.
+//! TextureLease is a non-owning token: the cache remains the owner of retain
+//! counts and the renderer remains the owner of GPU texture destruction.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -119,6 +121,8 @@ pub const AssetCache = struct {
         const handle = lease.handle;
         const texture = lease.id;
         const owner_id = lease.owner_id;
+        // Invalidate the caller's token before touching cache state so repeated
+        // releases or copied stale leases cannot retire the same texture twice.
         lease.handle = LeaseHandle.invalid;
         lease.id = TextureId.invalid;
         lease.owner_id = 0;
@@ -135,6 +139,8 @@ pub const AssetCache = struct {
         if (expected_owner_id == 0 or expected_owner_id != self.owner_id) return;
         if (!expected_texture.isValid()) return;
         const slot = self.resolveLeaseSlot(handle) orelse return;
+        // The lease slot generation validates handle freshness; the texture ID
+        // and cache owner checks reject copied or forged lease tokens.
         if (!textureIdsEqual(slot.texture, expected_texture)) return;
 
         const path = slot.path.?;

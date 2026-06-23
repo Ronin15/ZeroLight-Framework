@@ -2,7 +2,13 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Stateless collision processor over DataSystem movement/bounds/response SoA.
+//! Broadphase writes range-owned candidate buffers; narrowphase writes
+//! range-owned contact buffers; both merge by range index to preserve
+//! deterministic contact order before response consumes the stream.
+
 const std = @import("std");
+const builtin = @import("builtin");
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -96,11 +102,15 @@ const NarrowphaseRangeBuffer = struct {
 };
 
 const BroadphaseRangeSlot = struct {
+    // Each worker writes only its assigned slot. Padding keeps hot append state
+    // from sharing cache lines across concurrently written range records.
     buffer: BroadphaseRangeBuffer = .{},
     padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(BroadphaseRangeBuffer),
 };
 
 const NarrowphaseRangeSlot = struct {
+    // Narrowphase has the same ownership contract as broadphase: one range, one
+    // slot, merged serially after all workers finish.
     buffer: NarrowphaseRangeBuffer = .{},
     padding: [paddingForCacheLine(NarrowphaseRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(NarrowphaseRangeBuffer),
 };
@@ -434,6 +444,9 @@ pub const CollisionSystem = struct {
         const max_percent = @min(full_sort_disorder_percent, @as(u8, 100));
         const inversion_count = self.adjacentInversionCount();
         if (inversion_count == 0) return false;
+        // Movement between fixed steps is usually small, so insertion sort keeps
+        // the sweep order warm. Full sort is reserved for genuinely disordered
+        // frames where insertion sort would become the expensive path.
         const full_sort = @as(u128, inversion_count) * 100 > @as(u128, self.order.items.len) * max_percent;
         if (full_sort) {
             std.mem.sort(usize, self.order.items, self, proxyIndexLessThan);
@@ -548,6 +561,8 @@ pub const CollisionSystem = struct {
             else
                 combineStageBatches(result.batch, batch);
 
+            // Broadphase jobs do not allocate. If a range overflows its warmed
+            // buffer, grow after the batch and replay the stage deterministically.
             if (try self.growBroadphaseRangeBuffersIfNeeded(selection.range_count)) {
                 continue;
             }
@@ -992,7 +1007,7 @@ test "warm sorted collision order skips repair when already ordered" {
 }
 
 test "threaded collision matches serial contact order" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var serial_data = DataSystem.init(std.testing.allocator);
     defer serial_data.deinit();
@@ -1092,7 +1107,7 @@ test "thread-written collision range scratch uses cache-line sized slots" {
 }
 
 test "threaded broadphase prewarms empty range buffers before dispatch" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1154,7 +1169,7 @@ test "collision update reuses warmed scratch without steady state allocation" {
 }
 
 test "threaded collision update reuses warmed range scratch without steady state allocation" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

@@ -2,13 +2,18 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! SDL_GPU renderer facade for app/game code.
+//! CPU render prep happens before swapchain acquisition; the acquired section
+//! stays limited to upload, render-pass encoding, and command submission.
+//! TextureId values are generational handles backed by renderer-owned slots.
+
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
 const logging = @import("../core/logging.zig");
-const log = @import("../core/logging.zig").render;
+const log = logging.render;
 const gpu_buffer = @import("gpu/buffer.zig");
 const gpu_device = @import("gpu/device.zig");
 const gpu_pipeline = @import("gpu/sprite_pipeline.zig");
@@ -202,6 +207,8 @@ pub const Renderer = struct {
             else => return err,
         };
         _ = self.updatePresentation(window_size, pre_acquire_drawable_size);
+        // Sorting, texture metadata snapshots, and optional worker vertex prep
+        // happen before acquiring the swapchain to keep the acquired window short.
         try self.prepareFrameCommands(thread_system);
         if (self.batch.vertices.items.len > 0) {
             try self.stageVertices();
@@ -212,6 +219,9 @@ pub const Renderer = struct {
         };
         var command_buffer_finished = false;
         var swapchain_acquired = false;
+        // Before a swapchain texture is acquired, canceling the command buffer is
+        // enough cleanup. After acquisition, error paths submit or cancel through
+        // helpers that release the acquired texture correctly.
         errdefer if (!command_buffer_finished and !swapchain_acquired) {
             _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
         };
@@ -555,6 +565,8 @@ pub const Renderer = struct {
     fn retireTextureSlot(self: *Renderer, index: u32, slot: *TextureSlot) void {
         std.debug.assert(slot.alive);
         c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
+        // Retired slots keep their index but advance generation, invalidating
+        // stale TextureId values while allowing slot reuse without path lookup.
         retireTextureSlotForReuse(slot, self.first_free_texture_slot);
         self.first_free_texture_slot = index;
     }

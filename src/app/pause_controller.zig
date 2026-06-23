@@ -2,6 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const std = @import("std");
 const FramePolicy = @import("frame_pacer.zig").FramePolicy;
 const InputState = @import("input.zig").InputState;
 const PauseState = @import("../game/pause_state.zig").PauseState;
@@ -137,8 +138,6 @@ pub const PauseController = struct {
 };
 
 test "pause controller enter and exit are idempotent" {
-    const std = @import("std");
-
     const TestingState = struct {
         pause_count: *u32,
         resume_count: *u32,
@@ -206,8 +205,6 @@ test "pause controller enter and exit are idempotent" {
 }
 
 test "pause controller applies forced pause policy once" {
-    const std = @import("std");
-
     const TestingState = struct {
         pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
@@ -257,8 +254,6 @@ test "pause controller applies forced pause policy once" {
 }
 
 test "pause controller exits only policy-owned pause when window restores" {
-    const std = @import("std");
-
     const TestingState = struct {
         pause_count: *u32,
         resume_count: *u32,
@@ -331,8 +326,6 @@ test "pause controller exits only policy-owned pause when window restores" {
 }
 
 test "pause controller clears stale handle after stack replacement" {
-    const std = @import("std");
-
     const TestingState = struct {
         pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
             _ = self;
@@ -378,8 +371,6 @@ test "pause controller clears stale handle after stack replacement" {
 }
 
 test "enterUser from opaque non-gameplay is no-op (no push, no count++, !isPaused)" {
-    const std = @import("std");
-
     const TestingState = struct {
         pause_count: *u32,
         resume_count: *u32,
@@ -435,8 +426,6 @@ test "enterUser from opaque non-gameplay is no-op (no push, no count++, !isPause
 }
 
 test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op from non-gameplay)" {
-    const std = @import("std");
-
     const TestingState = struct {
         pause_count: *u32,
 
@@ -502,8 +491,6 @@ test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op 
 }
 
 test "pause enter does not mutate gameplay when modal allocation fails" {
-    const std = @import("std");
-
     const TestingState = struct {
         pause_count: *u32,
 

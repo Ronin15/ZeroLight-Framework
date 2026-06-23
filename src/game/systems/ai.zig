@@ -13,6 +13,7 @@
 //! Serial fallback, read-only workers, range aligned to ai_range_alignment_items, no hot alloc after init, direct SoA.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
@@ -826,7 +827,7 @@ test "ai processor appends navigation intents without clearing existing stream o
 }
 
 test "ai processor uses committed adaptive threaded profiles with default thread worker config" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .items_per_range = 1,
@@ -1024,7 +1025,7 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 }
 
 test "ai serial and threaded (0 workers) produce identical intents with separation + seek_target" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
@@ -1065,7 +1066,7 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
 }
 
 test "ai serial and real threaded workers produce identical navigation intents" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();

@@ -2,6 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const std = @import("std");
 const math = @import("../core/math.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
@@ -55,13 +56,11 @@ test "world render order combines entity z with depth band" {
     const obstacle = worldOrder(0, .obstacle);
     const actor = worldOrder(0, .actor);
 
-    try @import("std").testing.expect(below_actor.lessOrEqual(obstacle));
-    try @import("std").testing.expect(obstacle.lessOrEqual(actor));
+    try std.testing.expect(below_actor.lessOrEqual(obstacle));
+    try std.testing.expect(obstacle.lessOrEqual(actor));
 }
 
 test "world render order saturates extreme entity z" {
-    const std = @import("std");
-
     try std.testing.expectEqual(std.math.maxInt(i32), worldOrder(std.math.maxInt(i32), .marker).depth);
     try std.testing.expectEqual(std.math.minInt(i32), worldOrder(std.math.minInt(i32), .floor).depth);
 }

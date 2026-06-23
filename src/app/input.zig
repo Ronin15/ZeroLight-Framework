@@ -2,6 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const std = @import("std");
 const math = @import("../core/math.zig");
 const c = @import("../platform/sdl.zig").c;
 
@@ -151,8 +152,6 @@ const ActionFlags = struct {
 };
 
 test "default key bindings map keyboard keys to actions" {
-    const std = @import("std");
-
     try std.testing.expectEqual(Action.moveLeft, actionForKey(c.SDLK_A).?);
     try std.testing.expectEqual(Action.moveRight, actionForKey(c.SDLK_D).?);
     try std.testing.expectEqual(Action.moveUp, actionForKey(c.SDLK_W).?);
@@ -169,7 +168,6 @@ test "default key bindings map keyboard keys to actions" {
 }
 
 test "input key mapping tracks held gameplay actions" {
-    const std = @import("std");
     var input = InputState{};
 
     input.setHeld(.moveLeft, true);
@@ -185,7 +183,6 @@ test "input key mapping tracks held gameplay actions" {
 }
 
 test "input ignores command actions for held gameplay state" {
-    const std = @import("std");
     var input = InputState{};
 
     input.setHeld(.pause, true);
@@ -195,7 +192,6 @@ test "input ignores command actions for held gameplay state" {
 }
 
 test "movement vector resolves held movement actions" {
-    const std = @import("std");
     var input = InputState{};
 
     input.setHeld(.moveRight, true);
@@ -207,7 +203,6 @@ test "movement vector resolves held movement actions" {
 }
 
 test "frame commands latch non-repeated key down events" {
-    const std = @import("std");
     var commands = FrameCommands{};
 
     commands.pressed_actions.set(.toggleDebugOverlay, true);
@@ -227,7 +222,6 @@ test "frame commands latch non-repeated key down events" {
 }
 
 test "frame commands survive key up in the same frame" {
-    const std = @import("std");
     var commands = FrameCommands{};
     var input = InputState{};
     var down_event = c.SDL_Event{ .key = .{
@@ -266,7 +260,6 @@ test "frame commands survive key up in the same frame" {
 }
 
 test "frame commands ignore repeated command keys" {
-    const std = @import("std");
     var commands = FrameCommands{};
     var event = c.SDL_Event{ .key = .{
         .type = c.SDL_EVENT_KEY_DOWN,
@@ -288,7 +281,6 @@ test "frame commands ignore repeated command keys" {
 }
 
 test "input can release held movement when gameplay is paused" {
-    const std = @import("std");
     var input = InputState{};
     input.setHeld(.moveLeft, true);
     input.setHeld(.moveRight, true);
