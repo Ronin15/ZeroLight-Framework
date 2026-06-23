@@ -30,7 +30,7 @@ Use scoped `std.log` diagnostics as part of feature work. Debug logs may include
 - `zig build dev`: shader build, asset install, and run loop for normal development.
 - `zig build test`: run Zig unit tests.
 - `zig build check`: compile the game, benchmark, and GPU smoke executables.
-- `zig build verify`: run check, tests, and shader compilation.
+- `zig build verify`: run check, tests, shader compilation, and atlas lint.
 - `zig build shaders`: compile platform GPU shaders.
 - `zig build gpu-smoke`: open a small display-gated renderer pipeline smoke window, load installed shaders/assets, draw, and submit one frame.
 - `zig build package`: install selected-mode binaries and runtime assets.

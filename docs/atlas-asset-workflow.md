@@ -233,7 +233,7 @@ The metadata loaders call `validateAtlasMetadata` at load time to catch mismatch
 After packing:
 
 ```sh
-cd tools && python3 pack_atlas.py --kind all --lint
+python3 tools/pack_atlas.py --kind all --lint
 zig build test
 ```
 

@@ -15,10 +15,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PACK_SCRIPT = REPO_ROOT / "tools" / "pack_atlas.py"
 SOURCE_ASSETS_DIR = REPO_ROOT / "source_assets"
 SPRITES_DIR = REPO_ROOT / "assets" / "sprites"
+MANIFEST_PATH = REPO_ROOT / "src" / "assets" / "manifest.zig"
 
 REGISTERED_ATLASES = (
     {
         "kind": "world",
+        "metadata_kind": "world_tileset",
         "sprite_asset_id": "world_tileset",
         "runtime_path": "sprites/world_tileset.png",
         "json": SPRITES_DIR / "world_tileset.json",
@@ -30,6 +32,7 @@ REGISTERED_ATLASES = (
     },
     {
         "kind": "characters",
+        "metadata_kind": "sprite_atlas",
         "sprite_asset_id": "grim_characters",
         "runtime_path": "sprites/grim_characters.png",
         "json": SPRITES_DIR / "grim_characters.json",
@@ -41,6 +44,7 @@ REGISTERED_ATLASES = (
     },
     {
         "kind": "items",
+        "metadata_kind": "sprite_atlas",
         "sprite_asset_id": "grim_items",
         "runtime_path": "sprites/grim_items.png",
         "json": SPRITES_DIR / "grim_items.json",
@@ -64,6 +68,139 @@ def load_json(path: Path, label: str) -> tuple[dict[str, Any] | None, list[str]]
         return json.loads(path.read_text(encoding="utf-8")), []
     except json.JSONDecodeError as err:
         return None, [issue(label, f"invalid json: {err}")]
+
+
+def strip_line_comment(line: str) -> str:
+    return line.split("//", 1)[0]
+
+
+def field_value(entry: str, field_name: str) -> str | None:
+    token = f".{field_name}"
+    for raw_line in entry.splitlines():
+        line = strip_line_comment(raw_line).strip()
+        if not line.startswith(token):
+            continue
+        _, _, value = line.partition("=")
+        return value.strip().rstrip(",")
+    return None
+
+
+def parse_enum_value(value: str | None) -> str | None:
+    if value is None or value == "null":
+        return None
+    if not value.startswith("."):
+        return None
+    return value[1:]
+
+
+def parse_string_value(value: str | None) -> str | None:
+    if value is None or value == "null":
+        return None
+    if len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return None
+    return value[1:-1]
+
+
+def sprite_asset_entries(manifest_text: str) -> list[str]:
+    marker = "pub const sprite_assets = [_]SpriteAssetSpec{"
+    start = manifest_text.find(marker)
+    if start < 0:
+        raise ValueError("missing sprite_assets table")
+
+    entries_start = manifest_text.find("{", start)
+    depth = 0
+    entry_start: int | None = None
+    entries: list[str] = []
+    index = entries_start
+    while index < len(manifest_text):
+        char = manifest_text[index]
+        if char == "{":
+            depth += 1
+            if depth == 2:
+                entry_start = index
+        elif char == "}":
+            if depth == 2 and entry_start is not None:
+                entries.append(manifest_text[entry_start : index + 1])
+                entry_start = None
+            depth -= 1
+            if depth == 0:
+                return entries
+        index += 1
+
+    raise ValueError("unterminated sprite_assets table")
+
+
+def manifest_sprite_atlases() -> tuple[list[dict[str, str]], list[str]]:
+    try:
+        text = MANIFEST_PATH.read_text(encoding="utf-8")
+        entries = sprite_asset_entries(text)
+    except (OSError, ValueError) as err:
+        return [], [issue("manifest", f"could not read sprite asset registry: {err}")]
+
+    atlases: list[dict[str, str]] = []
+    issues: list[str] = []
+    for entry in entries:
+        sprite_asset_id = parse_enum_value(field_value(entry, "id"))
+        path = parse_string_value(field_value(entry, "path"))
+        metadata_path = parse_string_value(field_value(entry, "metadata_path"))
+        metadata_kind = parse_enum_value(field_value(entry, "metadata_kind"))
+        if metadata_kind is None:
+            continue
+        label = sprite_asset_id or "<unknown>"
+        if sprite_asset_id is None or path is None or metadata_path is None:
+            issues.append(issue(label, "metadata-backed manifest entry is missing id/path/metadata_path"))
+            continue
+        atlases.append(
+            {
+                "sprite_asset_id": sprite_asset_id,
+                "runtime_path": path,
+                "metadata_path": metadata_path,
+                "metadata_kind": metadata_kind,
+            }
+        )
+    return atlases, issues
+
+
+def validate_lint_registry_covers_manifest() -> list[str]:
+    manifest_atlases, issues = manifest_sprite_atlases()
+    if issues:
+        return issues
+
+    registered_by_id = {str(spec["sprite_asset_id"]): spec for spec in REGISTERED_ATLASES}
+    manifest_by_id = {spec["sprite_asset_id"]: spec for spec in manifest_atlases}
+
+    for sprite_asset_id, manifest_spec in manifest_by_id.items():
+        registered = registered_by_id.get(sprite_asset_id)
+        if registered is None:
+            issues.append(issue(sprite_asset_id, "metadata-backed manifest atlas is missing from atlas lint registry"))
+            continue
+        if registered["runtime_path"] != manifest_spec["runtime_path"]:
+            issues.append(
+                issue(
+                    sprite_asset_id,
+                    f"lint runtime_path={registered['runtime_path']!r}, manifest path={manifest_spec['runtime_path']!r}",
+                )
+            )
+        if str(Path(registered["json"]).relative_to(REPO_ROOT / "assets")) != manifest_spec["metadata_path"]:
+            issues.append(
+                issue(
+                    sprite_asset_id,
+                    f"lint json={registered['json']!s}, manifest metadata_path={manifest_spec['metadata_path']!r}",
+                )
+            )
+        if registered["metadata_kind"] != manifest_spec["metadata_kind"]:
+            issues.append(
+                issue(
+                    sprite_asset_id,
+                    f"lint metadata_kind={registered['metadata_kind']!r}, manifest metadata_kind={manifest_spec['metadata_kind']!r}",
+                )
+            )
+
+    for sprite_asset_id in registered_by_id:
+        if sprite_asset_id not in manifest_by_id:
+            issues.append(issue(sprite_asset_id, "atlas lint registry entry is not metadata-backed in manifest.zig"))
+
+    return issues
 
 
 def validate_entry_grid(
@@ -241,7 +378,7 @@ def run_source_consistency_lint() -> None:
 
 
 def main() -> None:
-    issues: list[str] = []
+    issues: list[str] = validate_lint_registry_covers_manifest()
     for spec in REGISTERED_ATLASES:
         issues.extend(validate_runtime_atlas(spec))
 

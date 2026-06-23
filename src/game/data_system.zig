@@ -19,8 +19,11 @@ pub const movement_range_alignment_items: usize = hot_soa_column_alignment / @si
 
 pub const HotF32Slice = []align(hot_soa_column_alignment) f32;
 pub const ConstHotF32Slice = []align(hot_soa_column_alignment) const f32;
+pub const HotI32Slice = []align(hot_soa_column_alignment) i32;
+pub const ConstHotI32Slice = []align(hot_soa_column_alignment) const i32;
 
 const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
+const HotI32List = std.ArrayListAligned(i32, .fromByteUnits(hot_soa_column_alignment));
 
 pub const EntityId = struct {
     index: u32,
@@ -104,10 +107,10 @@ pub const MovementBodySlice = struct {
     entities: []const EntityId,
     position_x: HotF32Slice,
     position_y: HotF32Slice,
-    position_z: []i32,
+    position_z: HotI32Slice,
     previous_x: HotF32Slice,
     previous_y: HotF32Slice,
-    previous_z: []i32,
+    previous_z: HotI32Slice,
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
@@ -117,10 +120,10 @@ pub const ConstMovementBodySlice = struct {
     entities: []const EntityId,
     position_x: ConstHotF32Slice,
     position_y: ConstHotF32Slice,
-    position_z: []const i32,
+    position_z: ConstHotI32Slice,
     previous_x: ConstHotF32Slice,
     previous_y: ConstHotF32Slice,
-    previous_z: []const i32,
+    previous_z: ConstHotI32Slice,
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
@@ -1383,10 +1386,10 @@ const MovementBodyStore = struct {
     entities: std.ArrayList(EntityId) = .empty,
     position_x: HotF32List = .empty,
     position_y: HotF32List = .empty,
-    position_z: std.ArrayList(i32) = .empty,
+    position_z: HotI32List = .empty,
     previous_x: HotF32List = .empty,
     previous_y: HotF32List = .empty,
-    previous_z: std.ArrayList(i32) = .empty,
+    previous_z: HotI32List = .empty,
     velocity_x: HotF32List = .empty,
     velocity_y: HotF32List = .empty,
     speed: HotF32List = .empty,
@@ -2258,14 +2261,16 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
 fn expectHotColumnPointersAligned(slice: ConstMovementBodySlice) !void {
     try expectPointerAligned(slice.position_x.ptr);
     try expectPointerAligned(slice.position_y.ptr);
+    try expectPointerAligned(slice.position_z.ptr);
     try expectPointerAligned(slice.previous_x.ptr);
     try expectPointerAligned(slice.previous_y.ptr);
+    try expectPointerAligned(slice.previous_z.ptr);
     try expectPointerAligned(slice.velocity_x.ptr);
     try expectPointerAligned(slice.velocity_y.ptr);
     try expectPointerAligned(slice.speed.ptr);
 }
 
-fn expectPointerAligned(ptr: [*]align(hot_soa_column_alignment) const f32) !void {
+fn expectPointerAligned(ptr: anytype) !void {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % hot_soa_column_alignment);
 }
 
