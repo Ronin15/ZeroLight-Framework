@@ -22,28 +22,17 @@ const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
-const CollisionStats = @import("systems/collision.zig").CollisionStats;
-const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
-const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
-const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
-const MovementStats = @import("systems/movement.zig").MovementStats;
-const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
-const AiStats = @import("systems/ai.zig").AiStats;
-const AiSystem = @import("systems/ai.zig").AiSystem;
 const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
-const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
-const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
-const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
-const SteeringStats = @import("systems/steering.zig").SteeringStats;
-const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
+const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
+const SimulationPipelineStats = @import("simulation_pipeline.zig").SimulationPipelineStats;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -69,15 +58,10 @@ const player_jet_loop_id = LoopingSfxId{ .value = 1 };
 pub const GameDemoState = struct {
     data: DataSystem,
     simulation_frame: SimulationFrame,
+    pipeline: SimulationPipeline,
     player: Player,
-    movement: MovementSystem,
-    collision: CollisionSystem,
-    collision_response: CollisionResponseSystem,
     particles: ParticleSystem,
     render_queue: RenderQueue,
-    ai: AiSystem,
-    steering: SteeringSystem,
-    pathfinding: PathfindingSystem,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
@@ -99,43 +83,33 @@ pub const GameDemoState = struct {
         var render_queue = RenderQueue.init(allocator);
         errdefer render_queue.deinit();
         try render_queue.ensureTotalCapacity(1 + obstacle_count + test_square_count + 2 + particles.capacity);
-        var ai = AiSystem.init(allocator);
-        errdefer ai.deinit();
-        var steering = SteeringSystem.init(allocator);
-        errdefer steering.deinit();
-        try steering.reserveForCapacity(test_square_count, obstacle_count);
-        var pathfinding = PathfindingSystem.init(allocator);
-        errdefer pathfinding.deinit();
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
         try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, 8);
         try simulation_frame.reservePathRequests(8, test_square_count);
-        try pathfinding.reserve(PathfindingCapacity{
-            .max_frame_requests = test_square_count,
-            .max_pending_requests = test_square_count,
-            .max_cached_results = test_square_count * 4,
-            .max_goal_fields = 4,
-            .max_worker_scratch_slots = 64,
-            .max_solved_requests_per_step = test_square_count,
-            .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
+        var pipeline = try SimulationPipeline.init(allocator, &data, bounds_width, bounds_height, .{
+            .steering_agent_capacity = test_square_count,
+            .static_obstacle_capacity = obstacle_count,
+            .contact_capacity = demo_contact_capacity,
+            .pathfinding = .{
+                .max_frame_requests = test_square_count,
+                .max_pending_requests = test_square_count,
+                .max_cached_results = test_square_count * 4,
+                .max_goal_fields = 4,
+                .max_worker_scratch_slots = 64,
+                .max_solved_requests_per_step = test_square_count,
+                .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
+            },
         });
-        try pathfinding.rebuildStaticNavGrid(&data, bounds_width, bounds_height, 32.0);
-        var collision_response = CollisionResponseSystem.init(allocator);
-        errdefer collision_response.deinit();
-        try collision_response.reserveForContacts(demo_contact_capacity);
+        errdefer pipeline.deinit();
 
         return .{
             .data = data,
             .simulation_frame = simulation_frame,
+            .pipeline = pipeline,
             .player = player,
-            .movement = MovementSystem.init(),
-            .collision = CollisionSystem.init(allocator),
-            .collision_response = collision_response,
             .particles = particles,
             .render_queue = render_queue,
-            .ai = ai,
-            .steering = steering,
-            .pathfinding = pathfinding,
             .test_squares = test_squares,
             .obstacles = obstacles,
             .bounds_width = bounds_width,
@@ -144,13 +118,9 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
-        self.pathfinding.deinit();
-        self.steering.deinit();
-        self.ai.deinit();
         self.render_queue.deinit();
         self.particles.deinit();
-        self.collision_response.deinit();
-        self.collision.deinit();
+        self.pipeline.deinit();
         self.simulation_frame.deinit();
         self.data.deinit();
     }
@@ -169,51 +139,15 @@ pub const GameDemoState = struct {
         try self.player.applyInput(&self.data, context.input);
         self.queueAmbientAudio(context.audio, context.input);
 
-        self.simulation_frame.phase = .processors;
-        // AI emits high-level navigation intents. Steering consumes those intents,
-        // path status, and dense steering data before it writes final NPC MovementIntents.
-        const ai_slice = self.data.aiAgentSliceConst();
-        const move_slice = self.data.movementBodySliceConst();
-
-        // Provide the player's position so "seek" behaviors head toward the player
-        // (instead of the global center-of-mass of all bodies, which caused seekers
-        // to clump on each other and spam collisions/bounce audio).
-        const player_target = if (self.data.movementBodyConst(self.player.entity)) |pbody|
-            pbody.previous_position
-        else
-            math.Vec2{ .x = 400, .y = 225 };
-
-        const ai_stats = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
-            .intent_seed = 0xfeedf00d,
-            .seek_target = player_target,
-            .navigation_intents = &self.simulation_frame.navigation_intents,
+        const pipeline_stats = try self.pipeline.update(.{
+            .data = &self.data,
+            .frame = &self.simulation_frame,
+            .player = self.player,
+            .thread_system = context.thread_system,
+            .delta_seconds = context.delta_seconds,
+            .bounds_width = self.bounds_width,
+            .bounds_height = self.bounds_height,
         });
-
-        const steering_stats = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
-        const pathfinding_stats = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
-
-        // Intent application step (main thread): consume merged MovementIntents from AI (and future), write velocities
-        // for ai_agent entities only via direct MovementBodyPtr (hot column mutation). Stale IDs rejected. Player
-        // remains 100% special-cased (applyInput + no ai_agent component). Collision/response/particle paths unchanged.
-        for (self.simulation_frame.intents.mergedItems()) |item| {
-            if (item != .movement) continue;
-            const mi = item.movement;
-            if (!self.data.isAlive(mi.entity)) continue;
-            if (self.data.aiAgentConst(mi.entity) == null) continue;
-            if (self.data.movementBodyPtr(mi.entity)) |body| {
-                const spd = if (body.speed.* > 0) body.speed.* else 40.0;
-                body.velocity_x.* = mi.direction_x * spd;
-                body.velocity_y.* = mi.direction_y * spd;
-            }
-        }
-
-        var movement_slice = self.data.movementBodySlice();
-        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
-
-        self.clampAiSquaresToBounds(self.bounds_width, self.bounds_height);
-        try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
-        const collision_stats = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
-        const collision_response_stats = try self.collision_response.update(&self.data, &self.simulation_frame);
         self.queueCollisionAudio(context.audio, context.delta_seconds);
         self.emitPlayerTrail();
         const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
@@ -226,12 +160,7 @@ pub const GameDemoState = struct {
         if (comptime runtime_perf_log.enabled) {
             recordRuntimePerfStats(
                 context.perf,
-                ai_stats,
-                steering_stats,
-                pathfinding_stats,
-                movement_stats,
-                collision_stats,
-                collision_response_stats,
+                pipeline_stats,
                 particle_stats,
                 structural_stats,
                 self.simulation_frame.events.stats,
@@ -269,16 +198,30 @@ pub const GameDemoState = struct {
 
     fn recordRuntimePerfStats(
         perf: runtime_perf_log.Context,
-        ai_stats: AiStats,
-        steering_stats: SteeringStats,
-        pathfinding_stats: PathfindingStats,
-        movement_stats: MovementStats,
-        collision_stats: CollisionStats,
-        collision_response_stats: CollisionResponseStats,
+        pipeline_stats: SimulationPipelineStats,
         particle_stats: ParticleUpdateStats,
         structural_stats: StructuralCommitStats,
         event_stats: SimulationEventStats,
     ) void {
+        const scope_stats = pipeline_stats.scope.stats;
+        const ai_stats = pipeline_stats.ai;
+        const steering_stats = pipeline_stats.steering;
+        const pathfinding_stats = pipeline_stats.pathfinding;
+        const movement_stats = pipeline_stats.movement;
+        const collision_stats = pipeline_stats.collision;
+        const collision_response_stats = pipeline_stats.collision_response;
+
+        perf.recordMetric(.scope_total_entities, metric(scope_stats.total_entities));
+        perf.recordMetric(.scope_dormant_entities, metric(scope_stats.dormant_entities));
+        perf.recordMetric(.scope_kinematic_entities, metric(scope_stats.kinematic_entities));
+        perf.recordMetric(.scope_locomotion_entities, metric(scope_stats.locomotion_entities));
+        perf.recordMetric(.scope_cognition_entities, metric(scope_stats.cognition_entities));
+        perf.recordMetric(.scope_movement_stage_entities, metric(scope_stats.movement_stage_entities));
+        perf.recordMetric(.scope_collision_stage_entities, metric(scope_stats.collision_stage_entities));
+        perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
+        perf.recordMetric(.scope_ai_stage_entities, metric(scope_stats.ai_stage_entities));
+        perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
+
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
         perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
@@ -370,8 +313,7 @@ pub const GameDemoState = struct {
     }
 
     fn syncInterpolatedState(self: *GameDemoState) void {
-        var movement_slice = self.data.movementBodySlice();
-        self.movement.syncPreviousPositions(&movement_slice);
+        self.pipeline.syncPreviousPositions(&self.data);
         self.particles.syncPreviousPositions();
     }
 
@@ -386,7 +328,7 @@ pub const GameDemoState = struct {
 
         if (!invalidate_navigation) return;
         try self.simulation_frame.events.ensureCanAppend(1);
-        try self.pathfinding.rebuildStaticNavGrid(&self.data, self.bounds_width, self.bounds_height, 32.0);
+        try self.pipeline.rebuildStaticNavigation(&self.data, self.bounds_width, self.bounds_height);
         try self.simulation_frame.events.appendRequired(.{
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
@@ -440,28 +382,6 @@ pub const GameDemoState = struct {
                 else => return false,
             },
             else => return false,
-        }
-    }
-
-    fn clampAiSquaresToBounds(self: *GameDemoState, bounds_width: f32, bounds_height: f32) void {
-        const ai_slice = self.data.aiAgentSliceConst();
-        for (ai_slice.entities) |entity| {
-            const body = self.data.movementBodyPtr(entity) orelse continue;
-            const visual = self.data.primitiveVisualConst(entity) orelse continue;
-
-            // Use math.clamp (same as Player.clampToBounds) for positions. Zero velocity on
-            // clamp for AI (main-thread only) so infrequent decisions do not cause wall-push
-            // until next ai update; player does not zero because input re-applies each step.
-            // Preserves prior AI demo behavior and collision response expectations.
-            const max_x = bounds_width - visual.size.x;
-            const new_x = math.clamp(body.position_x.*, 0, max_x);
-            if (new_x != body.position_x.*) body.velocity_x.* = 0;
-            body.position_x.* = new_x;
-
-            const max_y = bounds_height - visual.size.y;
-            const new_y = math.clamp(body.position_y.*, 0, max_y);
-            if (new_y != body.position_y.*) body.velocity_y.* = 0;
-            body.position_y.* = new_y;
         }
     }
 

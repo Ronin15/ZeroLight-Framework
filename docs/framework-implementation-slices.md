@@ -1561,7 +1561,7 @@ invalidation from static obstacle-affecting structural changes.
 
 ## Slice 22: Simulation Pipeline And Tier/Scope Scaffolding
 
-Goal: extract state-owned fixed-step orchestration into `SimulationPipeline`,
+Goal: make `SimulationPipeline` the state-owned fixed-step simulation owner,
 add the tier/scope scaffolding in its final ownership locations, and preserve
 today's full active-set processor behavior. This is the architectural landing
 zone for later scoped simulation, not the slice that turns on world/chunk tier
@@ -1579,23 +1579,27 @@ Current foundation:
 
 - Slice 12 provides `SimulationFrame`, `SimulationPhase`, typed streams, and
   deferred structural commits.
-- `GameDemoState.update` already runs the full processor order explicitly.
-- `GameDemoState.update` applies structural commits and reserves the render
-  queue for the current primitive-visual rows before render enqueue.
+- `SimulationPipeline` owns reusable fixed-step simulation systems and today's
+  ordered processor dispatch for one gameplay state instance.
+- `GameDemoState.update` applies main-thread input/audio, delegates processor
+  dispatch to `SimulationPipeline`, applies structural commits, and reserves
+  the render queue for the current primitive-visual rows before render enqueue.
 - `GameDemoState.render` emits transient draw records by iterating current
   primitive visual rows through render prep, with the player marker and
   particles handled as explicit render producers outside fixed-step simulation.
 - Processors gather dense `DataSystem` slices and support threaded serial
   parity paths with benchmarks into the 50k stress scale.
-- Architecture docs already describe `SimulationPipeline` as the future owner of
-  phase order, budgets, and domain-controller composition.
+- Architecture docs describe `SimulationPipeline` as the long-term owner of
+  phase order, budgets, system ownership, and concrete domain-controller
+  composition.
 
 Architecture notes:
 
 - Tiers are persistent membership; scope is per-step active filtering; the
   pipeline is one ordered stage list with gated inputs. Slice 22 defines those
-  contracts and default full-active behavior, while later scoped runtime
-  behavior waits for world rendering and chunk/visibility data.
+  contracts, stores cold tier/chunk metadata, reports default full-active
+  stats, and keeps runtime filtering deferred until world rendering and
+  chunk/visibility data exist.
 - Tier and chunk metadata stay on cold `EntitySlot` data, not hot movement SoA
   columns, unless profiling proves otherwise.
 - Processors stay dumb: scoped gather entry points filter inputs without
@@ -1619,10 +1623,10 @@ Implementation context to preserve:
   `SimulationTier`, `ActiveRegion`, cold tier/chunk metadata, full-active scope
   construction, and scope stats in the places where later scoped runtime
   behavior will hook in.
-- The first extraction should make the next implementation easier by moving
-  phase driving and ordered processor dispatch behind a state-owned helper. It
-  should not erase the already-decided tier, scope, controller, render-handoff,
-  or event-driven transition plan.
+- The extraction makes the next implementation easier by moving system
+  ownership, phase driving, and ordered processor dispatch behind a state-owned
+  simulation owner. It should not erase the already-decided tier, scope,
+  controller, render-handoff, or event-driven transition plan.
 - Keep the current order visible while extracting it: main-thread inputs,
   AI navigation intent production, steering/path status consumption,
   pathfinding, sparse movement-intent application, movement integration,
@@ -1635,28 +1639,28 @@ Implementation context to preserve:
 
 Checklist:
 
-- [ ] Add `src/game/simulation_pipeline.zig` with a thin state-owned
-      `SimulationPipeline` that drives today's ordered fixed-step sequence over
-      existing systems, `DataSystem`, and `SimulationFrame`.
-- [ ] Change `GameDemoState` to own one `SimulationPipeline` and delegate the
+- [x] Add `src/game/simulation_pipeline.zig` with a state-owned
+      `SimulationPipeline` that owns today's reusable systems and drives the
+      ordered fixed-step sequence over `DataSystem` and `SimulationFrame`.
+- [x] Change `GameDemoState` to own one `SimulationPipeline` and delegate the
       processor dispatch from `update` without changing behavior for the full
       active set.
-- [ ] Add `src/game/simulation_scope.zig` with `SimulationTier`, `ActiveRegion`,
+- [x] Add `src/game/simulation_scope.zig` with `SimulationTier`, `ActiveRegion`,
       `SimulationScope`, full-active default construction, scope stats, and
       validation helpers.
-- [ ] Add cold tier/chunk metadata on `EntitySlot` or equivalent compact storage
+- [x] Add cold tier/chunk metadata on `EntitySlot` or equivalent compact storage
       with default values that preserve today's behavior for all existing
       entities.
-- [ ] Keep player input, audio command emission, structural commit/domain
+- [x] Keep player input, audio command emission, structural commit/domain
       reactions, render enqueue, and private clamp/sync helpers in
-      `GameDemoState` for the first extraction step unless a real controller
-      boundary is implemented with tests.
-- [ ] Add full-set delegation/parity tests that prove the pipeline extraction
+      `GameDemoState`, while interpolation sync delegates pipeline-owned
+      movement history to `SimulationPipeline`.
+- [x] Add full-set delegation/parity tests that prove the pipeline extraction
       preserves phase order, stream outputs, structural commit behavior, render
       queue reservation, and simulation stats.
-- [ ] Add tests proving tier/chunk metadata defaults, validation, and full-active
+- [x] Add tests proving tier/chunk metadata defaults, validation, and full-active
       scope construction do not change current simulation output.
-- [ ] Leave scoped processor filtering, stagger/reduced cadence, and real
+- [x] Leave scoped processor filtering, stagger/reduced cadence, and real
       chunk/visibility gates disabled until the post-world-rendering scoped tier
       slice.
 
@@ -1679,19 +1683,27 @@ Deferred until after world rendering:
 
 Acceptance checks:
 
-- [ ] `GameDemoState` delegates fixed-step processor dispatch to
+- [x] `GameDemoState` delegates fixed-step processor dispatch to
       `SimulationPipeline` with no behavior change for today's full active set.
-- [ ] Tier/scope scaffolding exists in the final owner modules and storage
+- [x] Tier/scope scaffolding exists in the final owner modules and storage
       locations, with default full-active behavior and validation tests.
-- [ ] Scope stats report the full-active counts without changing processor
+- [x] Scope stats report the full-active counts without changing processor
       participation, adding per-frame logging, or adding benchmark timers to
       runtime rendering.
-- [ ] The slice does not claim scoped-tier completion: scoped gathers, stagger
+- [x] The slice does not claim scoped-tier completion: scoped gathers, stagger
       policy, real chunk gates, and tier transitions remain unchecked in this
       slice until world rendering supplies concrete world/chunk inputs.
-- [ ] `zig build test` covers pipeline phase transitions, full-active scope
+- [x] `zig build test` covers pipeline phase transitions, full-active scope
       construction, metadata defaults, and no behavior change without opening a
       window.
+
+Slice 22 lands the long-term fixed-step simulation owner. `SimulationPipeline`
+now owns the reusable gameplay systems and concrete stage order for the demo
+state, while `GameDemoState` keeps app/state boundaries such as input, audio,
+particles, structural commit reactions, and render enqueue. `SimulationScope`
+and cold tier/chunk metadata exist with full-active stats, but scoped gathers,
+staggered cadence, real chunk gates, and tier transitions remain deferred until
+world rendering supplies concrete world/chunk/visibility inputs.
 
 ## Slice 23: Atlas-Backed World Rendering Addition
 

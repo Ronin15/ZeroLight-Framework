@@ -38,6 +38,10 @@ game-specific behavior under `src/game/`.
   SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
+- `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
+  orchestration, reusable gameplay systems, and full-active scope stats.
+- `src/game/simulation_scope.zig` defines simulation tiers, active-region
+  scaffolding, cold entity scope metadata, and scope counters.
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
@@ -274,38 +278,40 @@ to `data_system.movement_range_alignment_items`, which maps one cache line to
 sixteen `f32` elements. Component masks decide whether an entity belongs to a
 system; hot processors iterate already aligned SoA slices.
 
-Gameplay states own a transient `SimulationFrame` for each fixed step. The
-state clears the frame, runs main-thread input writes, dispatches processors,
-merges transient outputs, and applies deferred structural commands at explicit
-main-thread commit points. `DataSystem` remains persistent storage, not the
-simulation scheduler.
+Gameplay states own their `DataSystem`, a transient `SimulationFrame`, and a
+state-owned `SimulationPipeline` for each fixed step. The state clears the
+frame, runs main-thread input writes, delegates fixed-step processor dispatch to
+the pipeline, and applies deferred structural commands at explicit main-thread
+commit points. `DataSystem` remains persistent storage, not the simulation
+scheduler.
 
 The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
-3. Run AI decision output, steering, and frame-delayed pathfinding.
-4. Apply merged movement intents on the main thread.
-5. Run movement over dense `DataSystem` movement slices.
-6. Clamp bounds, generate collision contacts, and apply collision response.
+3. `SimulationPipeline` runs AI decision output, steering, and frame-delayed pathfinding.
+4. `SimulationPipeline` applies merged AI movement intents.
+5. `SimulationPipeline` runs movement over dense `DataSystem` movement slices.
+6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
 7. Queue contact audio, emit/update transient particles, and merge outputs.
 8. Commit deferred structural commands to `DataSystem`.
 9. Render current `DataSystem` and particle state with interpolation.
 
-When multiple gameplay states or simulation instances need this same ordering,
-move the ordered processor sequence into a state-owned pipeline helper, such as
-`SimulationPipeline`, while keeping `StateStack` as the dispatch/lifetime owner.
-The helper should own phase order, budgets, queues, conflict policy, and output
-application for one gameplay state instance; it should not become a global
-engine scheduler, reflection system, or dynamic dependency graph.
+`SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
+stage order, scope stats, budgets, and processor handoff for one gameplay state
+instance, while `StateStack` remains the dispatch/lifetime owner. Future domain
+features should add concrete pipeline-owned controllers rather than growing
+`GameDemoState.update` or introducing a global engine scheduler, reflection
+system, dynamic dependency graph, or callback registry.
 
 Simulation tiers and active scope belong in the same pipeline boundary.
-Persistent tier and chunk metadata live on cold entity slot data; each fixed step
-builds a transient `SimulationScope` that decides which entities enter AI,
-steering, movement, and collision stages. Processors keep today's hot loops and
-receive scoped gathers instead of learning world/chunk policy. CPU benchmarks at
-50k scale are throughput ceilings for rare spikes; typical frames should scope
-active work far lower.
+Persistent tier and chunk metadata live on cold entity slot data. The current
+pipeline builds a full-active `SimulationScope` and reports tier/stage counts;
+later scoped slices will use world/chunk/visibility inputs to decide which
+entities enter AI, steering, movement, and collision stages. Processors keep
+today's hot loops and receive scoped gathers instead of learning world/chunk
+policy. CPU benchmarks at 50k scale are throughput ceilings for rare spikes;
+typical frames should scope active work far lower.
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope, `kinematic`

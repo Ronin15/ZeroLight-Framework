@@ -16,9 +16,10 @@ Related docs:
 
 ## Module Role
 
-`simulation.zig` owns state-local transient fixed-step data. Persistent gameplay
-facts stay in `DataSystem`; app, render, audio, SDL, allocator, and thread
-service ownership stay outside simulation payloads.
+`simulation.zig` owns state-local transient fixed-step data. The state-owned
+`SimulationPipeline` owns fixed-step processor orchestration and reusable
+systems. Persistent gameplay facts stay in `DataSystem`; app, render, audio,
+SDL, allocator, and thread service ownership stay outside simulation payloads.
 
 The module currently provides:
 
@@ -34,8 +35,9 @@ The module currently provides:
 ## Fixed-Step Ownership
 
 A gameplay state owns one `SimulationFrame` for its fixed-step update. The state
-calls `beginStep()`, runs the ordered processors it owns, merges outputs, and
-applies deferred structural commands at the explicit commit point.
+calls `beginStep()`, runs main-thread input writes, delegates ordered processor
+dispatch to its state-owned `SimulationPipeline`, and applies deferred
+structural commands at the explicit commit point.
 
 `SimulationFrame` is transient. Callers should expect stream contents to be
 valid only for the current fixed step after the producing stage has finished
@@ -51,11 +53,12 @@ and before the next `beginStep()`.
 - `commit_structural`
 - `finished`
 
-The concrete processor order is state-owned. `GameDemoState` currently uses
-main-thread input, AI navigation-intent production, steering/path status,
+The concrete processor order is pipeline-owned for one gameplay state instance.
+`GameDemoState` currently keeps main-thread input, audio, particles, structural
+commit/domain reactions, and render-queue reservation at the state boundary.
+`SimulationPipeline` owns AI navigation-intent production, steering/path status,
 pathfinding, sparse movement-intent application, movement, bounds clamp,
-collision detection, collision response, particles/domain reactions, structural
-commit, and post-commit render-queue reservation.
+collision detection, and collision response.
 
 ## Range Output Streams
 
@@ -144,13 +147,12 @@ capacity fails.
 
 ## Current Integration
 
-`GameDemoState` owns the current concrete orchestration around
-`SimulationFrame`. It:
+`GameDemoState` owns app/state boundaries around `SimulationFrame` and
+`SimulationPipeline`. It:
 
 - starts each fixed step with `beginStep()`;
 - writes player input and audio commands at the main-thread boundary;
-- lets AI, steering, pathfinding, movement, collision, and response systems use
-  typed streams;
+- delegates reusable fixed-step systems and stage order to `SimulationPipeline`;
 - consumes structural/domain events to rebuild navigation when static
   obstacle-affecting changes require it;
 - applies structural commands at the fixed-step commit boundary;
@@ -173,8 +175,9 @@ emits transient draw records through `RenderQueue`.
 - pathfinding queues, caches, or solver scratch;
 - long-lived domain controller state.
 
-Those belong to their owning state, `DataSystem`, systems/processors, app
-services, render services, or future pipeline/controller modules.
+Those belong to their owning state, `DataSystem`, `SimulationPipeline`,
+systems/processors, app services, render services, or future concrete
+pipeline-owned controller modules.
 
 ## Test Expectations
 

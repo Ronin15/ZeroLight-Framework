@@ -45,6 +45,8 @@ comptime {
     _ = @import("game/render_depth.zig");
     _ = @import("game/render_prep.zig");
     _ = @import("game/simulation.zig");
+    _ = @import("game/simulation_pipeline.zig");
+    _ = @import("game/simulation_scope.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");

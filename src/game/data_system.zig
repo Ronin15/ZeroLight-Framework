@@ -11,6 +11,8 @@ const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const render_depth = @import("render_depth.zig");
+const EntitySimulationMetadata = @import("simulation_scope.zig").EntitySimulationMetadata;
+const SimulationScopeStats = @import("simulation_scope.zig").SimulationScopeStats;
 const simd = @import("../core/simd.zig");
 const WorldDepth = render_depth.WorldDepth;
 
@@ -641,6 +643,7 @@ pub const DataSystem = struct {
             self.free_slot_count -= 1;
             slot.alive = true;
             slot.next_free = null;
+            slot.simulation = .{};
             // Reused slots keep their incremented generation so stale IDs cannot
             // address the new entity.
             return EntityId.init(index, slot.generation) catch unreachable;
@@ -672,6 +675,7 @@ pub const DataSystem = struct {
         retired_slot.alive = false;
         retired_slot.next_free = self.first_free_slot;
         retired_slot.component_mask = 0;
+        retired_slot.simulation = .{};
         retired_slot.movement_body_index = null;
         retired_slot.facing_index = null;
         retired_slot.primitive_visual_index = null;
@@ -697,6 +701,38 @@ pub const DataSystem = struct {
     pub fn hasComponents(self: *const DataSystem, id: EntityId, mask: ComponentMask) bool {
         const slot = self.resolveSlotConst(id) orelse return false;
         return slot.hasComponents(mask);
+    }
+
+    /// Returns cold simulation metadata for a live entity.
+    /// Stale, dead, or invalid IDs return null instead of exposing retired slots.
+    pub fn simulationMetadata(self: *const DataSystem, id: EntityId) ?EntitySimulationMetadata {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        return slot.simulation;
+    }
+
+    /// Updates cold tier/chunk metadata without touching hot component stores.
+    /// This is storage-only in Slice 22; it does not change processor participation.
+    pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
+        try metadata.validate();
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        slot.simulation = metadata;
+    }
+
+    /// Builds the current full-active scope counters from live slots and dense
+    /// component slices. Later scoped slices should compare against this parity baseline.
+    pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
+        var stats = SimulationScopeStats{
+            .movement_stage_entities = self.movement_bodies.entities.items.len,
+            .collision_stage_entities = self.collision_bounds.entities.items.len,
+            .collision_response_stage_entities = self.collision_responses.entities.items.len,
+            .ai_stage_entities = self.ai_agents.entities.items.len,
+            .steering_stage_entities = self.steering_agents.entities.items.len,
+        };
+        for (self.slots.items) |slot| {
+            if (!slot.alive) continue;
+            stats.recordEntity(slot.simulation);
+        }
+        return stats;
     }
 
     pub fn isStaticNavigationObstacle(self: *const DataSystem, id: EntityId) bool {
@@ -725,6 +761,7 @@ pub const DataSystem = struct {
             slot.alive = false;
             slot.next_free = self.first_free_slot;
             slot.component_mask = 0;
+            slot.simulation = .{};
             slot.movement_body_index = null;
             slot.facing_index = null;
             slot.primitive_visual_index = null;
@@ -1382,6 +1419,7 @@ const EntitySlot = struct {
     alive: bool = false,
     next_free: ?u32 = null,
     component_mask: ComponentMask = 0,
+    simulation: EntitySimulationMetadata = .{},
     movement_body_index: ?u32 = null,
     facing_index: ?u32 = null,
     primitive_visual_index: ?u32 = null,
@@ -2461,6 +2499,74 @@ test "entity generations reject stale ids after removal and reuse" {
     try std.testing.expect(reused.generation != first.generation);
     try std.testing.expect(data.isAlive(reused));
     try std.testing.expect(!data.destroyEntity(first));
+}
+
+test "entity simulation metadata defaults and rejects stale ids" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(entity).?);
+    try data.setSimulationMetadata(entity, .{
+        .tier = .locomotion,
+        .chunk = .{ .x = 4, .y = -2 },
+    });
+    try std.testing.expectEqual(EntitySimulationMetadata{
+        .tier = .locomotion,
+        .chunk = .{ .x = 4, .y = -2 },
+    }, data.simulationMetadata(entity).?);
+
+    try std.testing.expect(data.destroyEntity(entity));
+    try std.testing.expect(data.simulationMetadata(entity) == null);
+    try std.testing.expectError(error.InvalidEntity, data.setSimulationMetadata(entity, .{}));
+
+    const reused = try data.createEntity();
+    try std.testing.expectEqual(entity.index, reused.index);
+    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
+}
+
+test "entity simulation metadata resets with retained capacity" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setSimulationMetadata(entity, .{
+        .tier = .dormant,
+        .chunk = .{ .x = 9, .y = 3 },
+    });
+    data.clearRetainingCapacity();
+
+    const reused = try data.createEntity();
+    try std.testing.expectEqual(entity.index, reused.index);
+    try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
+}
+
+test "full active scope stats count tiers and current stage slices" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const mover = try data.createEntity();
+    const thinker = try data.createEntity();
+    const dormant = try data.createEntity();
+    try data.setMovementBody(mover, .{});
+    try data.setCollisionBounds(mover, .{ .size = .{ .x = 8, .y = 8 } });
+    try data.setCollisionResponse(mover, .{});
+    try data.setMovementBody(thinker, .{});
+    try data.setAiAgent(thinker, .{});
+    try data.setSteeringAgent(thinker, .{});
+    try data.setSimulationMetadata(mover, .{ .tier = .locomotion });
+    try data.setSimulationMetadata(dormant, .{ .tier = .dormant });
+
+    const stats = data.simulationScopeStatsFullActive();
+    try std.testing.expectEqual(@as(usize, 3), stats.total_entities);
+    try std.testing.expectEqual(@as(usize, 1), stats.dormant_entities);
+    try std.testing.expectEqual(@as(usize, 1), stats.locomotion_entities);
+    try std.testing.expectEqual(@as(usize, 1), stats.cognition_entities);
+    try std.testing.expectEqual(data.movementBodySliceConst().entities.len, stats.movement_stage_entities);
+    try std.testing.expectEqual(data.collisionBoundsSliceConst().entities.len, stats.collision_stage_entities);
+    try std.testing.expectEqual(data.collisionResponseSliceConst().entities.len, stats.collision_response_stage_entities);
+    try std.testing.expectEqual(data.aiAgentSliceConst().entities.len, stats.ai_stage_entities);
+    try std.testing.expectEqual(data.steeringAgentSliceConst().entities.len, stats.steering_stage_entities);
 }
 
 test "entity free slot count tracks destroy reuse and reset" {
