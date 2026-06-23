@@ -2,13 +2,14 @@
 
 This is a lean 2D game framework built with Zig 0.16.0, SDL3, and SDL_GPU. It
 is organized around predictable frame flow, SDL_GPU rendering, explicit
-state/input policy, runtime assets and text, data-oriented architecture,
+state/input policy, atlas-backed runtime assets, data-oriented architecture,
 multi-threaded processing, and tests that keep those systems reliable as the
 framework grows.
 
 The goal is a framework that stays easy to reason about while still covering the
 hard parts of a real-time 2D game: state flow, input routing, rendering,
-resource ownership, fixed-step simulation, and processor-friendly gameplay data.
+resource ownership, fixed-step simulation, world-scale asset workflows, and
+processor-friendly gameplay data.
 
 ## Features
 
@@ -18,13 +19,16 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
   gain controls, gameplay launch flow, pause overlay, and debug overlay all run
   through the same state stack and input-routing rules.
 - **SDL_GPU rendering:** a game-facing `Renderer` with shader loading, texture
-  ownership, sprite batching, and frame submission kept behind render/platform
-  boundaries.
+  ownership, sprite batching, queue-first render prep, world depth ordering, and
+  frame submission kept behind render/platform boundaries.
+- **Atlas-backed world assets:** filename-driven atlas packing for world tiles,
+  characters, and items, with JSON sidecar metadata, stable sprite IDs, and
+  name-based lookup at runtime.
 - **Data-oriented architecture:** dense component stores for direct,
   cache-friendly processor iteration over gameplay data.
 - **Threaded and SIMD processors:** movement, particles, AI, collision,
-  pathfinding, and steering use dense data, deterministic outputs, serial
-  baselines, and worker-thread/SIMD paths where appropriate.
+  pathfinding, and steering use dense data, typed simulation streams, deterministic
+  outputs, serial baselines, and worker-thread/SIMD paths where appropriate.
 - **Comprehensive tests:** coverage for state transitions, input routing,
   resource lifetime, renderer math, threaded CPU range batches, and SIMD/scalar
   parity so framework behavior stays stable as it grows.
@@ -34,7 +38,8 @@ resource ownership, fixed-step simulation, and processor-friendly gameplay data.
 
 For deeper details, see [architecture](docs/architecture.md),
 [state stack and input](docs/state-stack-and-input.md),
-[rendering, assets, and shaders](docs/rendering-assets-shaders.md), and
+[rendering, assets, and shaders](docs/rendering-assets-shaders.md),
+[atlas asset workflow](docs/atlas-asset-workflow.md), and
 [simulation tiers and pipeline](docs/simulation-tiers-and-pipeline.md).
 
 ## Requirements
@@ -75,7 +80,7 @@ zig build run       # build, install assets/shaders, and run the app
 zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, benchmark, and GPU smoke executables
 zig build test      # run Zig unit tests
-zig build bench     # run non-interactive CPU processor benchmarks
+zig build bench     # run non-interactive CPU gameplay and render-prep benchmarks
 zig build verify    # run check, test, shader compilation, and atlas lint
 zig build package   # install selected-mode binaries and runtime assets
 zig build gpu-smoke # run a display-gated renderer pipeline smoke
@@ -93,9 +98,10 @@ build options, formatting, shader commands, and GPU smoke details.
 - `src/render/` contains SDL_GPU rendering, camera transforms, GPU resources, text, and the debug overlay.
 - `src/game/` contains game states, gameplay data, and ECS-style processors.
 - `src/platform/` contains SDL/platform helpers and GPU smoke-test code.
-- `src/assets/` contains runtime path resolution, installed-file loading, the typed asset manifest, runtime asset catalog, and cache-backed texture ownership.
+- `src/assets/` contains runtime path resolution, installed-file loading, the typed asset manifest, atlas metadata loaders, runtime asset catalog, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
-- `assets/` contains runtime assets, bundled fonts, and shader sources.
+- `assets/` contains runtime atlases, audio, bundled fonts, and shader sources.
+- `tools/` contains atlas packing, export, lint, and art-generation helpers.
 
 Generated build output goes under `zig-out/` and should not be committed.
 
@@ -106,6 +112,7 @@ Generated build output goes under `zig-out/` and should not be committed.
 - [Architecture](docs/architecture.md)
 - [State Stack And Input](docs/state-stack-and-input.md)
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
+- [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
 
 ## License
