@@ -359,10 +359,226 @@ const NullStructuralChangeSink = struct {
     fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
 };
 
+const NullStructuralCommitPreparer = struct {
+    fn prepare(_: *NullStructuralCommitPreparer, _: usize) !void {}
+};
+
+const StructuralCapacityNeeds = struct {
+    slots: usize,
+    movement_bodies: usize,
+    facings: usize,
+    primitive_visuals: usize,
+    asset_refs: usize,
+    collision_bounds: usize,
+    collision_responses: usize,
+    ai_agents: usize,
+    steering_agents: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityNeeds {
+        return .{
+            .slots = data.slots.items.len,
+            .movement_bodies = data.movement_bodies.entities.items.len,
+            .facings = data.facings.entities.items.len,
+            .primitive_visuals = data.primitive_visuals.entities.items.len,
+            .asset_refs = data.asset_refs.entities.items.len,
+            .collision_bounds = data.collision_bounds.entities.items.len,
+            .collision_responses = data.collision_responses.entities.items.len,
+            .ai_agents = data.ai_agents.entities.items.len,
+            .steering_agents = data.steering_agents.entities.items.len,
+        };
+    }
+
+    fn validateLimits(self: StructuralCapacityNeeds) !void {
+        if (self.slots > std.math.maxInt(u32)) return error.TooManyEntities;
+        if (self.movement_bodies > std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        if (self.facings > std.math.maxInt(u32)) return error.TooManyFacingRows;
+        if (self.primitive_visuals > std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
+        if (self.asset_refs > std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
+        if (self.collision_bounds > std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
+        if (self.collision_responses > std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
+        if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+    }
+};
+
+const StructuralCapacityProjection = struct {
+    current: StructuralCapacityNeeds,
+    required: StructuralCapacityNeeds,
+    free_slots: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityProjection {
+        const current = StructuralCapacityNeeds.init(data);
+        return .{
+            .current = current,
+            .required = current,
+            .free_slots = data.free_slot_count,
+        };
+    }
+
+    fn createSlot(self: *StructuralCapacityProjection) !void {
+        if (self.free_slots > 0) {
+            self.free_slots -= 1;
+            return;
+        }
+        self.current.slots = try addCapacity(self.current.slots, 1);
+        self.required.slots = @max(self.required.slots, self.current.slots);
+    }
+
+    fn destroySlot(self: *StructuralCapacityProjection) !void {
+        self.free_slots = try addCapacity(self.free_slots, 1);
+    }
+
+    fn addTemplate(self: *StructuralCapacityProjection, template: EntityTemplate) !void {
+        if (template.movement_body != null) try self.addComponent(.movement_body);
+        if (template.facing != null) try self.addComponent(.facing);
+        if (template.primitive_visual != null) try self.addComponent(.primitive_visual);
+        if (template.asset_reference != null) try self.addComponent(.asset_reference);
+        if (template.collision_bounds != null) try self.addComponent(.collision_bounds);
+        if (template.collision_response != null) try self.addComponent(.collision_response);
+        if (template.ai_agent != null) try self.addComponent(.ai_agent);
+        if (template.steering_agent != null) try self.addComponent(.steering_agent);
+    }
+
+    fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
+        const current = self.currentField(component);
+        const required = self.requiredField(component);
+        current.* = try addCapacity(current.*, 1);
+        required.* = @max(required.*, current.*);
+    }
+
+    fn removeComponent(self: *StructuralCapacityProjection, component: Component) void {
+        const current = self.currentField(component);
+        std.debug.assert(current.* > 0);
+        current.* -= 1;
+    }
+
+    fn currentField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.current.movement_bodies,
+            .facing => &self.current.facings,
+            .primitive_visual => &self.current.primitive_visuals,
+            .asset_reference => &self.current.asset_refs,
+            .collision_bounds => &self.current.collision_bounds,
+            .collision_response => &self.current.collision_responses,
+            .ai_agent => &self.current.ai_agents,
+            .steering_agent => &self.current.steering_agents,
+        };
+    }
+
+    fn requiredField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.required.movement_bodies,
+            .facing => &self.required.facings,
+            .primitive_visual => &self.required.primitive_visuals,
+            .asset_reference => &self.required.asset_refs,
+            .collision_bounds => &self.required.collision_bounds,
+            .collision_response => &self.required.collision_responses,
+            .ai_agent => &self.required.ai_agents,
+            .steering_agent => &self.required.steering_agents,
+        };
+    }
+};
+
+fn addCapacity(value: usize, amount: usize) !usize {
+    return std.math.add(usize, value, amount);
+}
+
+const StructuralCommitPlan = struct {
+    command_count: usize,
+    capacity_needs: StructuralCapacityNeeds,
+    structural_event_count: usize,
+};
+
+const ProjectedEntityState = struct {
+    alive: bool,
+    component_mask: ComponentMask,
+
+    fn init(data: *const DataSystem, entity: EntityId) ProjectedEntityState {
+        const slot = data.resolveSlotConst(entity) orelse return .{
+            .alive = false,
+            .component_mask = 0,
+        };
+        return .{
+            .alive = true,
+            .component_mask = slot.component_mask,
+        };
+    }
+
+    fn hasComponent(self: ProjectedEntityState, component: Component) bool {
+        return (self.component_mask & componentMask(component)) != 0;
+    }
+
+    fn addComponent(self: *ProjectedEntityState, component: Component) void {
+        self.component_mask |= componentMask(component);
+    }
+
+    fn destroy(self: *ProjectedEntityState) void {
+        self.alive = false;
+        self.component_mask = 0;
+    }
+};
+
+pub const StructuralPlanScratch = struct {
+    allocator: std.mem.Allocator,
+    projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) StructuralPlanScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *StructuralPlanScratch) void {
+        self.projected_entities.deinit(self.allocator);
+        self.projected_entities = .{};
+    }
+
+    pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
+        self.projected_entities.clearRetainingCapacity();
+    }
+
+    fn projectedState(
+        self: *StructuralPlanScratch,
+        data: *const DataSystem,
+        entity: EntityId,
+    ) !*ProjectedEntityState {
+        const result = try self.projected_entities.getOrPut(self.allocator, structuralEntityKey(entity));
+        if (!result.found_existing) {
+            result.value_ptr.* = ProjectedEntityState.init(data, entity);
+        }
+        return result.value_ptr;
+    }
+};
+
+fn structuralEntityKey(entity: EntityId) u64 {
+    return (@as(u64, entity.index) << 32) | @as(u64, entity.generation);
+}
+
+fn removeProjectedComponents(component_mask: ComponentMask, projection: *StructuralCapacityProjection) void {
+    inline for (std.meta.fields(Component)) |field| {
+        const component: Component = @enumFromInt(field.value);
+        if ((component_mask & componentMask(component)) != 0) {
+            projection.removeComponent(component);
+        }
+    }
+}
+
+fn templateComponentCount(template: EntityTemplate) usize {
+    var count: usize = 0;
+    if (template.movement_body != null) count += 1;
+    if (template.facing != null) count += 1;
+    if (template.primitive_visual != null) count += 1;
+    if (template.asset_reference != null) count += 1;
+    if (template.collision_bounds != null) count += 1;
+    if (template.collision_response != null) count += 1;
+    if (template.ai_agent != null) count += 1;
+    if (template.steering_agent != null) count += 1;
+    return count;
+}
+
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
     first_free_slot: ?u32 = null,
+    free_slot_count: usize = 0,
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
     primitive_visuals: PrimitiveVisualStore = .{},
@@ -393,6 +609,8 @@ pub const DataSystem = struct {
         if (self.first_free_slot) |index| {
             const slot = &self.slots.items[@intCast(index)];
             self.first_free_slot = slot.next_free;
+            std.debug.assert(self.free_slot_count > 0);
+            self.free_slot_count -= 1;
             slot.alive = true;
             slot.next_free = null;
             return EntityId.init(index, slot.generation) catch unreachable;
@@ -431,6 +649,7 @@ pub const DataSystem = struct {
         retired_slot.ai_agent_index = null;
         retired_slot.steering_agent_index = null;
         self.first_free_slot = index;
+        self.free_slot_count += 1;
         return true;
     }
 
@@ -466,6 +685,7 @@ pub const DataSystem = struct {
         self.movement_bodies.clearRetainingCapacity();
 
         self.first_free_slot = null;
+        self.free_slot_count = self.slots.items.len;
         for (self.slots.items, 0..) |*slot, index| {
             slot.generation = nextGeneration(slot.generation);
             slot.alive = false;
@@ -718,7 +938,29 @@ pub const DataSystem = struct {
     }
 
     pub fn applyStructuralCommandsWithChangeSink(self: *DataSystem, commands: []const StructuralCommand, change_sink: anytype) !StructuralCommitStats {
-        try validateStructuralCommands(commands);
+        var scratch = StructuralPlanScratch.init(self.allocator);
+        defer scratch.deinit();
+        var preparer = NullStructuralCommitPreparer{};
+        return try self.applyStructuralCommandsPrepared(commands, &scratch, &preparer, change_sink);
+    }
+
+    pub fn applyStructuralCommandsPrepared(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        scratch: *StructuralPlanScratch,
+        preparer: anytype,
+        change_sink: anytype,
+    ) !StructuralCommitStats {
+        const plan = try self.preflightStructuralCommands(commands, scratch);
+        try preparer.prepare(plan.structural_event_count);
+        return try self.commitStructuralCommands(commands, change_sink);
+    }
+
+    fn commitStructuralCommands(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        change_sink: anytype,
+    ) !StructuralCommitStats {
         var stats = StructuralCommitStats{};
         for (commands) |command| {
             switch (command) {
@@ -827,6 +1069,91 @@ pub const DataSystem = struct {
             }
         }
         return stats;
+    }
+
+    fn preflightStructuralCommands(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        scratch: *StructuralPlanScratch,
+    ) !StructuralCommitPlan {
+        try validateStructuralCommands(commands);
+        scratch.clearRetainingCapacity();
+        if (commands.len == 0) {
+            return .{
+                .command_count = 0,
+                .capacity_needs = StructuralCapacityNeeds.init(self),
+                .structural_event_count = 0,
+            };
+        }
+        try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(commands.len));
+
+        var projection = StructuralCapacityProjection.init(self);
+        var structural_event_count: usize = 0;
+
+        for (commands) |command| {
+            switch (command) {
+                .create_entity => |template| {
+                    try projection.createSlot();
+                    try projection.addTemplate(template);
+                    structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
+                },
+                .destroy_entity => |entity| {
+                    const state = try scratch.projectedState(self, entity);
+                    if (state.alive) {
+                        structural_event_count = try addCapacity(structural_event_count, 1);
+                        try projection.destroySlot();
+                        removeProjectedComponents(state.component_mask, &projection);
+                        state.destroy();
+                    }
+                },
+                .set_movement_body => |set| try self.preflightSetComponent(set.entity, .movement_body, scratch, &projection, &structural_event_count),
+                .set_facing => |set| try self.preflightSetComponent(set.entity, .facing, scratch, &projection, &structural_event_count),
+                .set_primitive_visual => |set| try self.preflightSetComponent(set.entity, .primitive_visual, scratch, &projection, &structural_event_count),
+                .set_asset_reference => |set| try self.preflightSetComponent(set.entity, .asset_reference, scratch, &projection, &structural_event_count),
+                .set_collision_bounds => |set| try self.preflightSetComponent(set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
+                .set_collision_response => |set| try self.preflightSetComponent(set.entity, .collision_response, scratch, &projection, &structural_event_count),
+                .set_ai_agent => |set| try self.preflightSetComponent(set.entity, .ai_agent, scratch, &projection, &structural_event_count),
+                .set_steering_agent => |set| try self.preflightSetComponent(set.entity, .steering_agent, scratch, &projection, &structural_event_count),
+            }
+        }
+
+        try projection.required.validateLimits();
+        const plan = StructuralCommitPlan{
+            .command_count = commands.len,
+            .capacity_needs = projection.required,
+            .structural_event_count = structural_event_count,
+        };
+        try self.reserveStructuralPlanCapacity(plan);
+        return plan;
+    }
+
+    fn preflightSetComponent(
+        self: *DataSystem,
+        entity: EntityId,
+        component: Component,
+        scratch: *StructuralPlanScratch,
+        projection: *StructuralCapacityProjection,
+        structural_event_count: *usize,
+    ) !void {
+        const state = try scratch.projectedState(self, entity);
+        if (!state.alive) return;
+        structural_event_count.* = try addCapacity(structural_event_count.*, 1);
+        if (!state.hasComponent(component)) {
+            try projection.addComponent(component);
+            state.addComponent(component);
+        }
+    }
+
+    fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) !void {
+        try self.slots.ensureTotalCapacity(self.allocator, plan.capacity_needs.slots);
+        try self.movement_bodies.ensureCapacity(self.allocator, plan.capacity_needs.movement_bodies);
+        try self.facings.ensureCapacity(self.allocator, plan.capacity_needs.facings);
+        try self.primitive_visuals.ensureCapacity(self.allocator, plan.capacity_needs.primitive_visuals);
+        try self.asset_refs.ensureCapacity(self.allocator, plan.capacity_needs.asset_refs);
+        try self.collision_bounds.ensureCapacity(self.allocator, plan.capacity_needs.collision_bounds);
+        try self.collision_responses.ensureCapacity(self.allocator, plan.capacity_needs.collision_responses);
+        try self.ai_agents.ensureCapacity(self.allocator, plan.capacity_needs.ai_agents);
+        try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
     }
 
     pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -1202,7 +1529,10 @@ const MovementBodyStore = struct {
     }
 
     fn ensureCapacityForOne(self: *MovementBodyStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.position_x.ensureTotalCapacity(allocator, capacity);
         try self.position_y.ensureTotalCapacity(allocator, capacity);
@@ -1222,9 +1552,7 @@ const FacingStore = struct {
 
     fn append(self: *FacingStore, allocator: std.mem.Allocator, entity: EntityId, facing: FacingData) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
-        const capacity = self.entities.items.len + 1;
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.directions.ensureTotalCapacity(allocator, capacity);
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
         self.directions.appendAssumeCapacity(facing.direction);
@@ -1258,6 +1586,11 @@ const FacingStore = struct {
         self.entities.deinit(allocator);
         self.directions.deinit(allocator);
         self.* = .{};
+    }
+
+    fn ensureCapacity(self: *FacingStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.directions.ensureTotalCapacity(allocator, capacity);
     }
 };
 
@@ -1413,7 +1746,10 @@ const PrimitiveVisualStore = struct {
     }
 
     fn ensureCapacityForOne(self: *PrimitiveVisualStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *PrimitiveVisualStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.size_x.ensureTotalCapacity(allocator, capacity);
         try self.size_y.ensureTotalCapacity(allocator, capacity);
@@ -1476,9 +1812,7 @@ const AssetReferenceStore = struct {
 
     fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, sprite: SpriteAssetId) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
-        const capacity = self.entities.items.len + 1;
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
         self.sprite_ids.appendAssumeCapacity(sprite);
@@ -1510,6 +1844,11 @@ const AssetReferenceStore = struct {
         self.entities.deinit(allocator);
         self.sprite_ids.deinit(allocator);
         self.* = .{};
+    }
+
+    fn ensureCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
     }
 };
 
@@ -1590,7 +1929,10 @@ const CollisionBoundsStore = struct {
     }
 
     fn ensureCapacityForOne(self: *CollisionBoundsStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *CollisionBoundsStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.offset_x.ensureTotalCapacity(allocator, capacity);
         try self.offset_y.ensureTotalCapacity(allocator, capacity);
@@ -1669,7 +2011,10 @@ const CollisionResponseStore = struct {
     }
 
     fn ensureCapacityForOne(self: *CollisionResponseStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *CollisionResponseStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.modes.ensureTotalCapacity(allocator, capacity);
         try self.mobilities.ensureTotalCapacity(allocator, capacity);
@@ -1747,7 +2092,10 @@ const AiAgentStore = struct {
     }
 
     fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *AiAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.behaviors.ensureTotalCapacity(allocator, capacity);
         try self.wander_amplitudes.ensureTotalCapacity(allocator, capacity);
@@ -1863,7 +2211,10 @@ const SteeringAgentStore = struct {
     }
 
     fn ensureCapacityForOne(self: *SteeringAgentStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *SteeringAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.agent_radii.ensureTotalCapacity(allocator, capacity);
         try self.waypoint_tolerances.ensureTotalCapacity(allocator, capacity);
@@ -2002,6 +2353,25 @@ test "entity generations reject stale ids after removal and reuse" {
     try std.testing.expect(reused.generation != first.generation);
     try std.testing.expect(data.isAlive(reused));
     try std.testing.expect(!data.destroyEntity(first));
+}
+
+test "entity free slot count tracks destroy reuse and reset" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    try std.testing.expectEqual(@as(usize, 0), data.free_slot_count);
+
+    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expectEqual(@as(usize, 2), data.free_slot_count);
+
+    _ = try data.createEntity();
+    try std.testing.expectEqual(@as(usize, 1), data.free_slot_count);
+
+    data.clearRetainingCapacity();
+    try std.testing.expectEqual(data.slots.items.len, data.free_slot_count);
 }
 
 test "movement body store is row aligned and compact after removal" {
@@ -2515,6 +2885,150 @@ test "structural commands prevalidate steering agents before mutating" {
     try std.testing.expectError(error.InvalidSteeringAgent, data.applyStructuralCommands(&commands));
     try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+}
+
+test "structural commands reserve capacity before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try commands.append(std.testing.allocator, .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } });
+    for (0..64) |index| {
+        try commands.append(std.testing.allocator, .{ .create_entity = .{
+            .movement_body = testBody(@floatFromInt(index + 2)),
+            .primitive_visual = testVisual(),
+            .collision_bounds = testBounds(1),
+        } });
+    }
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    try std.testing.expectError(error.OutOfMemory, data.preflightStructuralCommands(commands.items, &scratch));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);
+}
+
+test "structural command preflight follows destroy then create slot reuse" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .destroy_entity = entity },
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+        } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    _ = try data.preflightStructuralCommands(&commands, &scratch);
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var sink = NullStructuralChangeSink{};
+    const stats = try data.commitStructuralCommands(&commands, &sink);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), stats.created);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+    try std.testing.expect(data.movementBodyConst(entity) == null);
+}
+
+test "structural command preflight counts duplicate component sets once" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const target = try data.createEntity();
+    const seed = try data.createEntity();
+    try data.setPrimitiveVisual(seed, testVisualWithSize(8));
+    try std.testing.expect(data.destroyEntity(seed));
+
+    const commands = [_]StructuralCommand{
+        .{ .set_primitive_visual = .{ .entity = target, .visual = testVisualWithSize(16) } },
+        .{ .set_primitive_visual = .{ .entity = target, .visual = testVisualWithSize(32) } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    _ = try data.preflightStructuralCommands(&commands, &scratch);
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var sink = NullStructuralChangeSink{};
+    const stats = try data.commitStructuralCommands(&commands, &sink);
+    try std.testing.expectEqual(@as(usize, 2), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(f32, 32), data.primitiveVisualConst(target).?.size.x);
+}
+
+test "structural command plan counts only projected live structural events" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const destroyed = try data.createEntity();
+    try data.setMovementBody(destroyed, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .destroy_entity = destroyed },
+        .{ .set_movement_body = .{ .entity = destroyed, .body = testBody(2) } },
+        .{ .set_facing = .{ .entity = EntityId.invalid, .facing = .{ .direction = .left } } },
+        .{ .create_entity = .{
+            .movement_body = testBody(3),
+            .facing = .{ .direction = .right },
+        } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const plan = try data.preflightStructuralCommands(&commands, &scratch);
+    try std.testing.expectEqual(@as(usize, 4), plan.structural_event_count);
+
+    const stats = try data.applyStructuralCommands(&commands);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
+    try std.testing.expectEqual(@as(usize, 1), stats.created);
+    try std.testing.expectEqual(@as(usize, 2), stats.components_set);
+}
+
+test "structural command preflight returns before projection for empty command batches" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    for (0..8) |_| {
+        const entity = try data.createEntity();
+        try std.testing.expect(data.destroyEntity(entity));
+    }
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    const plan = try data.preflightStructuralCommands(&.{}, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), plan.structural_event_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.projected_entities.count());
 }
 
 test "movement body slice access performs no allocations" {

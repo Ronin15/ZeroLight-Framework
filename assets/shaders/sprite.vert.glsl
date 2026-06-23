@@ -13,14 +13,16 @@ layout(location = 0) out vec2 out_uv;
 layout(location = 1) out vec4 out_color;
 
 layout(set = 1, binding = 0) uniform FrameUniform {
-    vec2 viewport_size;
-    vec2 padding;
+    vec4 drawable_size;
+    vec4 position_transform;
 } u;
 
 void main() {
+    vec2 drawable_position =
+        in_position * u.position_transform.xy + u.position_transform.zw;
     vec2 ndc = vec2(
-        (in_position.x / u.viewport_size.x) * 2.0 - 1.0,
-        1.0 - (in_position.y / u.viewport_size.y) * 2.0
+        (drawable_position.x / u.drawable_size.x) * 2.0 - 1.0,
+        1.0 - (drawable_position.y / u.drawable_size.y) * 2.0
     );
     gl_Position = vec4(ndc, 0.0, 1.0);
     out_uv = in_uv;

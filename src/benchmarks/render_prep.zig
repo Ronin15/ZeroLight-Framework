@@ -87,17 +87,16 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         batch.adaptive_tuner = tuner;
     }
 
-    const presentation = try suitePresentation();
     for (0..options.warmup_iterations) |_| {
         try queueToBatchOnce(&queue, &batch, item_count);
-        _ = try runOnce(&batch, table.resolver(), presentation, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             try queueToBatchOnce(&queue, &batch, item_count);
-            _ = try runOnce(&batch, table.resolver(), presentation, if (threads) |*thread_system| thread_system else null, case);
+            _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
         }
     }
     const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
@@ -107,7 +106,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_prep = sprite_batch.SpritePrepStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const measured = try runMeasuredOnce(&queue, item_count, &batch, table.resolver(), presentation, if (threads) |*thread_system| thread_system else null, case, io);
+        const measured = try runMeasuredOnce(&queue, item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
         phase_accumulator.record(measured.phases);
@@ -129,15 +128,14 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 fn runOnce(
     batch: *sprite_batch.SpriteBatch,
     resolver: sprite_batch.TextureResolver,
-    presentation: @import("../app/resolution.zig").Presentation,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
 ) !sprite_batch.SpritePrepStats {
     if (!case.usesThreadSystem()) {
-        return batch.buildAssumeCapacity(resolver, presentation, null, .{ .adaptive = false });
+        return batch.buildAssumeCapacity(resolver, null, .{ .adaptive = false });
     }
 
-    return batch.buildAssumeCapacity(resolver, presentation, thread_system.?, .{
+    return batch.buildAssumeCapacity(resolver, thread_system.?, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -185,7 +183,6 @@ fn runMeasuredOnce(
     item_count: usize,
     batch: *sprite_batch.SpriteBatch,
     resolver: sprite_batch.TextureResolver,
-    presentation: @import("../app/resolution.zig").Presentation,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
     io: std.Io,
@@ -199,7 +196,7 @@ fn runMeasuredOnce(
     const snapshot_end_ns = suite.nowNs(io);
 
     const vertex_start_ns = suite.nowNs(io);
-    const vertex_batch = emitVertices(batch, presentation, thread_system, case);
+    const vertex_batch = emitVertices(batch, thread_system, case);
     const vertex_end_ns = suite.nowNs(io);
 
     const group_start_ns = suite.nowNs(io);
@@ -220,15 +217,14 @@ fn runMeasuredOnce(
 
 fn emitVertices(
     batch: *sprite_batch.SpriteBatch,
-    presentation: @import("../app/resolution.zig").Presentation,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,
 ) BatchStats {
     if (!case.usesThreadSystem()) {
-        return batch.emitVerticesAssumeCapacity(presentation, null, .{ .adaptive = false });
+        return batch.emitVerticesAssumeCapacity(null, .{ .adaptive = false });
     }
 
-    return batch.emitVerticesAssumeCapacity(presentation, thread_system.?, .{
+    return batch.emitVerticesAssumeCapacity(thread_system.?, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -343,14 +339,6 @@ fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
     return sprite_batch.TextureId.init(index, generation) catch unreachable;
 }
 
-fn suitePresentation() !@import("../app/resolution.zig").Presentation {
-    return @import("../app/resolution.zig").computePresentation(
-        .{},
-        .{ .width = 1280, .height = 720 },
-        .{ .width = 2560, .height = 1440 },
-    );
-}
-
 test "render prep benchmark fixture creates requested commands" {
     var batch = sprite_batch.SpriteBatch.init(std.testing.allocator);
     defer batch.deinit();
@@ -408,7 +396,7 @@ test "render prep benchmark preserves ordered command stream before prep" {
     defer original_commands.deinit(allocator);
     try snapshotCommands(&original_commands, allocator, batch.commands.items);
 
-    _ = batch.buildAssumeCapacity(table.resolver(), try suitePresentation(), null, .{ .adaptive = false });
+    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
     try std.testing.expect(commandsEqual(original_commands.items, batch.commands.items));
 
     batch.commands.items[0] = batch.commands.items[1];

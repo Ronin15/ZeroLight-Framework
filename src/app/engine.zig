@@ -290,68 +290,109 @@ pub const Engine = struct {
         }
         const perf_context = if (comptime runtime_perf_log.enabled) runtime_perf_log.Context.bind(&self.perf_log) else runtime_perf_log.Context{};
         if (frame_policy.can_render) {
-            self.renderer.beginFrame(self.app_config.clear_color);
-            const perf_enqueue_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
-            try self.states.render(RenderContext{
-                .renderer = &self.renderer,
-                .runtime_assets = &self.runtime_assets,
-                .text_service = &self.text_service,
-                .interpolation_alpha = interpolation_alpha,
-                .thread_system = &self.thread_system,
-                .perf = perf_context,
-            });
-            if (comptime runtime_perf_log.enabled) {
-                self.perf_log.recordTiming(.render_enqueue, elapsedNs(perf_enqueue_start_ns, self.nowNs()));
-            }
-            const perf_overlay_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
-            try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
-            try self.debug_overlay.render(&self.renderer);
-            if (comptime runtime_perf_log.enabled) {
-                self.perf_log.recordTiming(.render_overlay, elapsedNs(perf_overlay_start_ns, self.nowNs()));
-            }
-            const perf_end_frame_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
-            const frame_result = try self.renderer.endFrame(&self.thread_system);
-            if (comptime runtime_perf_log.enabled) {
-                self.perf_log.recordTiming(.render_end_frame, elapsedNs(perf_end_frame_start_ns, self.nowNs()));
-            }
-            switch (frame_result) {
-                .submitted => {
-                    if (comptime runtime_perf_log.enabled) {
-                        perf_result = .submitted;
-                        perf_sprite_prep = self.renderer.spritePrepStats();
-                    }
-                    if (self.swapchain_blocked) {
-                        log.debug("swapchain available again; clearing render-blocked gameplay pause", .{});
-                    }
-                    self.swapchain_blocked = false;
-                    self.debug_overlay.recordSubmittedFrame(frame_delta_ns);
-                    if (comptime runtime_perf_log.enabled) {
-                        self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
-                    }
-                    if (frame_policy.target_frame_ns) |target_frame_ns| {
-                        frame_pacer.paceTargetFrame(frame_start_ns, target_frame_ns);
-                    }
-                },
-                .skipped_no_swapchain => {
-                    if (comptime runtime_perf_log.enabled) {
-                        perf_result = .skipped_no_swapchain;
-                        perf_sprite_prep = self.renderer.spritePrepStats();
-                    }
-                    self.swapchain_blocked = true;
-                    if (self.states.isGameplayActive()) {
-                        if (!self.pause.isPaused()) {
-                            log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
+            if (self.swapchain_blocked) {
+                const perf_end_frame_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+                const frame_result = try self.renderer.submitSwapchainRecoveryFrame(self.app_config.clear_color);
+                if (comptime runtime_perf_log.enabled) {
+                    self.perf_log.recordTiming(.render_end_frame, elapsedNs(perf_end_frame_start_ns, self.nowNs()));
+                }
+                switch (frame_result) {
+                    .submitted => {
+                        if (comptime runtime_perf_log.enabled) {
+                            perf_result = .submitted;
+                            perf_sprite_prep = .{};
                         }
-                        try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
-                    }
-                    if (comptime runtime_perf_log.enabled) {
-                        self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
-                    }
-                    frame_pacer.paceFallbackFrame(frame_start_ns);
-                },
+                        log.debug("swapchain available again; clearing render-blocked gameplay pause", .{});
+                        self.swapchain_blocked = false;
+                        self.debug_overlay.recordSubmittedFrame(frame_delta_ns);
+                        if (comptime runtime_perf_log.enabled) {
+                            self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
+                        }
+                        if (frame_policy.target_frame_ns) |target_frame_ns| {
+                            frame_pacer.paceTargetFrame(frame_start_ns, target_frame_ns);
+                        }
+                    },
+                    .skipped_no_swapchain => {
+                        if (comptime runtime_perf_log.enabled) {
+                            perf_result = .skipped_no_swapchain;
+                            perf_sprite_prep = .{};
+                        }
+                        self.swapchain_blocked = true;
+                        if (self.states.isGameplayActive()) {
+                            if (!self.pause.isPaused()) {
+                                log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
+                            }
+                            try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                        }
+                        if (comptime runtime_perf_log.enabled) {
+                            self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
+                        }
+                        frame_pacer.paceFallbackFrame(frame_start_ns);
+                    },
+                }
+            } else {
+                self.renderer.beginFrame(self.app_config.clear_color);
+                const perf_enqueue_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+                try self.states.render(RenderContext{
+                    .renderer = &self.renderer,
+                    .runtime_assets = &self.runtime_assets,
+                    .text_service = &self.text_service,
+                    .interpolation_alpha = interpolation_alpha,
+                    .thread_system = &self.thread_system,
+                    .perf = perf_context,
+                });
+                if (comptime runtime_perf_log.enabled) {
+                    self.perf_log.recordTiming(.render_enqueue, elapsedNs(perf_enqueue_start_ns, self.nowNs()));
+                }
+                const perf_overlay_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+                try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
+                try self.debug_overlay.render(&self.renderer);
+                if (comptime runtime_perf_log.enabled) {
+                    self.perf_log.recordTiming(.render_overlay, elapsedNs(perf_overlay_start_ns, self.nowNs()));
+                }
+                const perf_end_frame_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+                const frame_result = try self.renderer.endFrame(&self.thread_system);
+                if (comptime runtime_perf_log.enabled) {
+                    self.perf_log.recordTiming(.render_end_frame, elapsedNs(perf_end_frame_start_ns, self.nowNs()));
+                }
+                switch (frame_result) {
+                    .submitted => {
+                        if (comptime runtime_perf_log.enabled) {
+                            perf_result = .submitted;
+                            perf_sprite_prep = self.renderer.spritePrepStats();
+                        }
+                        if (self.swapchain_blocked) {
+                            log.debug("swapchain available again; clearing render-blocked gameplay pause", .{});
+                        }
+                        self.swapchain_blocked = false;
+                        self.debug_overlay.recordSubmittedFrame(frame_delta_ns);
+                        if (comptime runtime_perf_log.enabled) {
+                            self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
+                        }
+                        if (frame_policy.target_frame_ns) |target_frame_ns| {
+                            frame_pacer.paceTargetFrame(frame_start_ns, target_frame_ns);
+                        }
+                    },
+                    .skipped_no_swapchain => {
+                        if (comptime runtime_perf_log.enabled) {
+                            perf_result = .skipped_no_swapchain;
+                            perf_sprite_prep = self.renderer.spritePrepStats();
+                        }
+                        self.swapchain_blocked = true;
+                        if (self.states.isGameplayActive()) {
+                            if (!self.pause.isPaused()) {
+                                log.debug("swapchain unavailable; pausing gameplay and using fallback pacing", .{});
+                            }
+                            try self.pause.enterPolicy(&self.states, &self.input, time_loop, self.nowNs());
+                        }
+                        if (comptime runtime_perf_log.enabled) {
+                            self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
+                        }
+                        frame_pacer.paceFallbackFrame(frame_start_ns);
+                    },
+                }
             }
         } else {
-            self.swapchain_blocked = false;
             if (comptime runtime_perf_log.enabled) {
                 self.perf_log.recordTiming(.render_total, elapsedNs(perf_start_ns, self.nowNs()));
             }

@@ -97,9 +97,10 @@ differ on macOS Retina and similar displays.
 The renderer does not use `SDL_Renderer` or SDL's renderer-only logical
 presentation helpers. After each successful SDL_GPU swapchain acquisition it
 computes presentation from the acquired drawable size and current SDL window
-size. World and logical vertices are transformed into drawable pixels before
-upload; SDL_GPU viewport stays in drawable space and scissor clips logical
-content to the computed viewport.
+size. World and logical vertices stay in logical coordinates through CPU prep
+and transfer-buffer staging; the vertex shader applies the acquired-size
+presentation uniform. SDL_GPU viewport stays in drawable space and scissor
+clips logical content to the computed viewport.
 
 Default scale mode is aspect-preserving fit. If the drawable aspect differs from
 1280x720, the configured clear color shows through the letterbox or pillarbox
@@ -111,10 +112,10 @@ user resizing should not produce sub-1x cropped presentation.
 
 Sprite coordinate spaces:
 
-- `.world`: gameplay/world coordinates. The camera is applied, then vertices are
-  transformed through the logical presentation into drawable pixels.
-- `.logical`: logical UI coordinates. The camera is ignored, and vertices are
-  transformed through the logical presentation into drawable pixels.
+- `.world`: gameplay/world coordinates. CPU prep applies the camera and leaves
+  vertices in logical presentation coordinates.
+- `.logical`: logical UI coordinates. The camera is ignored, and vertices stay
+  in logical presentation coordinates.
 - `.drawable`: raw swapchain pixel coordinates. The camera and logical viewport
   are ignored; this is for debug overlays that should stay pixel-exact.
 

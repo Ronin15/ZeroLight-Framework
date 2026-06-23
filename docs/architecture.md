@@ -130,6 +130,12 @@ live renderer resource slots, and draw groups are built on the main thread from
 the already ordered command stream. Small or cheap frames may stay inline
 through the same adaptive policy.
 
+CPU sprite command preparation stays before SDL_GPU swapchain acquisition where
+practical, including transfer-buffer staging for the normal steady-state path.
+Sprite prep emits presentation-independent world/logical or drawable positions;
+the acquired swapchain interval stays focused on acquired-size presentation
+uniforms, copy-pass upload, render-pass encoding, and submit.
+
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
 texture creation starts from decoded pixels and owns only the GPU texture

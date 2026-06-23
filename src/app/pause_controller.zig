@@ -6,6 +6,7 @@ const FramePolicy = @import("frame_pacer.zig").FramePolicy;
 const InputState = @import("input.zig").InputState;
 const PauseState = @import("../game/pause_state.zig").PauseState;
 const RenderContext = @import("state.zig").RenderContext;
+const State = @import("state.zig").State;
 const StateHandle = @import("state.zig").StateHandle;
 const StateStack = @import("state.zig").StateStack;
 const StateTransitions = @import("state.zig").StateTransitions;
@@ -79,7 +80,7 @@ pub const PauseController = struct {
         try self.enter(.window_policy, states, input, time_loop, now_ns);
     }
 
-    /// Only enters (and calls pauseActive + pushModal(PauseState)) when !isPaused() and
+    /// Only enters (and calls pauseActive + pushes PauseState) when !isPaused() and
     /// states.isGameplayActive(). Non-gameplay tops (menus) cause early return: no notification,
     /// no overlay, no time reset, no audio duck side-effect from this path.
     fn enter(
@@ -93,9 +94,13 @@ pub const PauseController = struct {
         if (self.isPaused()) return;
         if (!states.isGameplayActive()) return;
 
+        try states.reserveForAdditionalStates(1);
+        const pause_state = try State.create(PauseState, states.allocator, PauseState.init(self.width, self.height));
+        errdefer pause_state.destroy(states.allocator);
+
         states.pauseActive();
         input.releaseMovement();
-        self.handle = try states.pushModal(PauseState, PauseState.init(self.width, self.height));
+        self.handle = states.pushModalOwnedAfterReserve(pause_state);
         self.source = source;
         time_loop.reset(now_ns);
     }
@@ -494,4 +499,64 @@ test "policy enter (applyWindowPolicy) is also gated by isGameplayActive (no-op 
     try std.testing.expect(pause.isPolicyPaused());
     try std.testing.expectEqual(@as(usize, 2), states.len());
     try std.testing.expectEqual(@as(u32, 1), pause_count);
+}
+
+test "pause enter does not mutate gameplay when modal allocation fails" {
+    const std = @import("std");
+
+    const TestingState = struct {
+        pause_count: *u32,
+
+        pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        pub fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn onPause(self: *@This()) void {
+            self.pause_count.* += 1;
+        }
+
+        pub fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var pause_count: u32 = 0;
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+    var time_loop = TimeLoop.init(42);
+    time_loop.accumulator_ns = TimeLoop.fixed_delta_ns;
+    var states = StateStack.init(std.testing.allocator);
+    defer states.deinit();
+    _ = try states.replaceGameplay(TestingState, .{ .pause_count = &pause_count });
+    var pause = PauseController.init(800, 450);
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_allocator = states.allocator;
+    states.allocator = failing_allocator.allocator();
+    defer states.allocator = original_allocator;
+
+    try std.testing.expectError(error.OutOfMemory, pause.enterUser(&states, &input, &time_loop, 100));
+    try std.testing.expect(!pause.isPaused());
+    try std.testing.expectEqual(@as(usize, 1), states.len());
+    try std.testing.expectEqual(@as(u32, 0), pause_count);
+    try std.testing.expect(input.isHeld(.moveRight));
+    try std.testing.expectEqual(@as(u64, 42), time_loop.last_time_ns);
+    try std.testing.expectEqual(TimeLoop.fixed_delta_ns, time_loop.accumulator_ns);
 }

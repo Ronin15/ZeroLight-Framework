@@ -10,7 +10,6 @@ const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const resources = @import("resources.zig");
-const resolution = @import("../app/resolution.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 
@@ -213,19 +212,18 @@ pub const SpriteBatch = struct {
         try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
     }
 
-    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver, frame_presentation: resolution.Presentation) void {
-        _ = self.build(texture_resolver, frame_presentation, null, .{ .adaptive = false }) catch unreachable;
+    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver) void {
+        _ = self.build(texture_resolver, null, .{ .adaptive = false }) catch unreachable;
     }
 
     pub fn build(
         self: *SpriteBatch,
         texture_resolver: TextureResolver,
-        frame_presentation: resolution.Presentation,
         thread_system: ?*ThreadSystem,
         prep_config: SpritePrepConfig,
     ) !SpritePrepStats {
         try self.ensureFrameStorage();
-        return self.buildAssumeCapacity(texture_resolver, frame_presentation, thread_system, prep_config);
+        return self.buildAssumeCapacity(texture_resolver, thread_system, prep_config);
     }
 
     /// Builds prepared vertices and draw groups without allocating. Callers must
@@ -233,12 +231,11 @@ pub const SpriteBatch = struct {
     pub fn buildAssumeCapacity(
         self: *SpriteBatch,
         texture_resolver: TextureResolver,
-        frame_presentation: resolution.Presentation,
         thread_system: ?*ThreadSystem,
         prep_config: SpritePrepConfig,
     ) SpritePrepStats {
         _ = self.snapshotCommandsAssumeCapacity(texture_resolver);
-        const batch = self.emitVerticesAssumeCapacity(frame_presentation, thread_system, prep_config);
+        const batch = self.emitVerticesAssumeCapacity(thread_system, prep_config);
         self.buildDrawGroupsAssumeCapacity();
         return self.finishPrepStats(batch);
     }
@@ -268,7 +265,6 @@ pub const SpriteBatch = struct {
     /// currently thread-schedulable render-prep phase.
     pub fn emitVerticesAssumeCapacity(
         self: *SpriteBatch,
-        frame_presentation: resolution.Presentation,
         thread_system: ?*ThreadSystem,
         prep_config: SpritePrepConfig,
     ) BatchStats {
@@ -286,7 +282,6 @@ pub const SpriteBatch = struct {
                     .commands = self.prepared_commands.items,
                     .vertices = self.vertices.items,
                     .camera = self.camera,
-                    .presentation = frame_presentation,
                 };
                 batch = threads.parallelForWithOptions(valid_count, &context, writePreparedSpritesJob, .{
                     .items_per_range = system_config.items_per_range,
@@ -298,7 +293,7 @@ pub const SpriteBatch = struct {
                 fillPreparedRange(self.prepared_commands.items, self.vertices.items, .{
                     .start = 0,
                     .end = valid_count,
-                }, self.camera, frame_presentation);
+                }, self.camera);
                 batch = .{
                     .item_count = valid_count,
                     .range_count = 1,
@@ -385,12 +380,11 @@ const SpritePrepJobContext = struct {
     commands: []const PreparedSpriteCommand,
     vertices: []Vertex,
     camera: Camera2D,
-    presentation: resolution.Presentation,
 };
 
 fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpritePrepJobContext = @ptrCast(@alignCast(context));
-    fillPreparedRange(job.commands, job.vertices, range, job.camera, job.presentation);
+    fillPreparedRange(job.commands, job.vertices, range, job.camera);
 }
 
 fn fillPreparedRange(
@@ -398,7 +392,6 @@ fn fillPreparedRange(
     vertices: []Vertex,
     range: ParallelRange,
     camera: Camera2D,
-    presentation: resolution.Presentation,
 ) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= commands.len);
@@ -407,7 +400,6 @@ fn fillPreparedRange(
             commands[index],
             vertices[index * 6 ..][0..6],
             camera,
-            presentation,
         );
     }
 }
@@ -416,7 +408,6 @@ fn writePreparedSpriteVertices(
     prepared: PreparedSpriteCommand,
     out: []Vertex,
     camera: Camera2D,
-    presentation: resolution.Presentation,
 ) void {
     const sprite = prepared.sprite;
     std.debug.assert(out.len == 6);
@@ -464,10 +455,7 @@ fn writePreparedSpriteVertices(
             .world => camera.worldToScreen(world),
             .logical, .drawable => world,
         };
-        positions[index] = switch (sprite.coordinate_space) {
-            .world, .logical => logicalToDrawable(screen, presentation),
-            .drawable => screen,
-        };
+        positions[index] = screen;
     }
 
     for (indices, 0..) |source_index, out_index| {
@@ -493,24 +481,8 @@ pub fn presentationForCoordinateSpace(coordinate_space: CoordinateSpace) Coordin
     };
 }
 
-fn logicalToDrawable(point: math.Vec2, presentation: resolution.Presentation) math.Vec2 {
-    const viewport = presentation.viewport;
-    return .{
-        .x = @as(f32, @floatFromInt(viewport.x)) + point.x * viewport.scale_x,
-        .y = @as(f32, @floatFromInt(viewport.y)) + point.y * viewport.scale_y,
-    };
-}
-
 fn textureIdsEqual(lhs: TextureId, rhs: TextureId) bool {
     return lhs.index == rhs.index and lhs.generation == rhs.generation;
-}
-
-fn batchTestPresentation() !resolution.Presentation {
-    return resolution.computePresentation(
-        .{},
-        .{ .width = 1280, .height = 720 },
-        .{ .width = 1280, .height = 720 },
-    );
 }
 
 fn testTextureId(index: u32, generation: u32) TextureId {
@@ -579,7 +551,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
 
-    batch.buildSerial(table.resolver(), try batchTestPresentation());
+    batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
@@ -614,7 +586,7 @@ test "batch builder groups by texture and coordinate presentation" {
         .coordinate_space = .drawable,
     });
 
-    batch.buildSerial(table.resolver(), try batchTestPresentation());
+    batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 18), batch.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
@@ -655,7 +627,7 @@ test "world sprites apply camera while logical and drawable sprites ignore camer
         .coordinate_space = .drawable,
     });
 
-    batch.buildSerial(table.resolver(), try batchTestPresentation());
+    batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[0]);
     try std.testing.expectEqual(@as(f32, 40), batch.vertices.items[0].position[1]);
@@ -695,14 +667,14 @@ test "batch builder preserves ordered submission stream" {
         .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
     });
 
-    batch.buildSerial(table.resolver(), try batchTestPresentation());
+    batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(f32, 10), batch.vertices.items[0].position[0]);
     try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[0]);
 }
 
-test "world and logical vertices are submitted in drawable pixels" {
+test "world and logical vertices stay independent of drawable presentation" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 8, .height = 8 } },
@@ -710,12 +682,6 @@ test "world and logical vertices are submitted in drawable pixels" {
     const table = TestTextureTable{ .slots = &slots };
     var batch = try initBatchTest(allocator, &table);
     defer batch.deinit();
-
-    const presentation = try resolution.computePresentation(
-        .{},
-        .{ .width = 1280, .height = 720 },
-        .{ .width = 2560, .height = 1440 },
-    );
 
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
@@ -733,17 +699,17 @@ test "world and logical vertices are submitted in drawable pixels" {
         .coordinate_space = .drawable,
     });
 
-    batch.buildSerial(table.resolver(), presentation);
+    batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(f32, 40), batch.vertices.items[0].position[0]);
-    try std.testing.expectEqual(@as(f32, 60), batch.vertices.items[0].position[1]);
-    try std.testing.expectEqual(@as(f32, 40), batch.vertices.items[6].position[0]);
-    try std.testing.expectEqual(@as(f32, 60), batch.vertices.items[6].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[0].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[6].position[1]);
     try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[12].position[0]);
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[1]);
 }
 
-test "world vertices include camera then letterbox viewport offset" {
+test "world vertices include camera without presentation offset" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 8, .height = 8 } },
@@ -756,22 +722,16 @@ test "world vertices include camera then letterbox viewport offset" {
         .zoom = 2,
     });
 
-    const presentation = try resolution.computePresentation(
-        .{},
-        .{ .width = 1800, .height = 1130 },
-        .{ .width = 3600, .height = 2260 },
-    );
-
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .world,
     });
 
-    batch.buildSerial(table.resolver(), presentation);
+    batch.buildSerial(table.resolver());
 
-    try std.testing.expectApproxEqAbs(@as(f32, 84.375), batch.vertices.items[0].position[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 229.5), batch.vertices.items[0].position[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 30), batch.vertices.items[0].position[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), batch.vertices.items[0].position[1], 0.001);
 }
 
 test "safe sprite batch build reserves missing frame storage" {
@@ -787,7 +747,7 @@ test "safe sprite batch build reserves missing frame storage" {
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
-    const stats = try batch.build(table.resolver(), try batchTestPresentation(), null, .{ .adaptive = false });
+    const stats = try batch.build(table.resolver(), null, .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), stats.command_count);
     try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
@@ -813,7 +773,7 @@ test "warmed sprite batch prep does not allocate" {
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
-    _ = batch.buildAssumeCapacity(table.resolver(), try batchTestPresentation(), null, .{ .adaptive = false });
+    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
     try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
@@ -867,15 +827,14 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try addParallelParityCommands(&serial);
     try addParallelParityCommands(&threaded);
 
-    const presentation = try batchTestPresentation();
-    serial.buildSerial(table.resolver(), presentation);
+    serial.buildSerial(table.resolver());
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{
         .max_worker_threads = 2,
         .items_per_range = 1,
     });
     defer threads.deinit();
-    const stats = try threaded.build(table.resolver(), presentation, &threads, .{
+    const stats = try threaded.build(table.resolver(), &threads, .{
         .items_per_range = 1,
         .max_worker_threads = 2,
         .adaptive = false,
@@ -916,7 +875,7 @@ test "sprite prep uses batch owned adaptive tuner instead of thread system fallb
         .items_per_range = 1,
     });
     defer threads.deinit();
-    _ = try batch.build(table.resolver(), try batchTestPresentation(), &threads, .{});
+    _ = try batch.build(table.resolver(), &threads, .{});
 
     try std.testing.expect(batch.adaptive_tuner.report().sample_count > 0);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);

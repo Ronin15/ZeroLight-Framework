@@ -15,10 +15,10 @@ const Component = @import("data_system.zig").Component;
 const ComponentMask = @import("data_system.zig").ComponentMask;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
-const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
+const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
 
 pub const SimulationPhase = enum {
     idle,
@@ -263,6 +263,21 @@ const StructuralChangeSink = struct {
     }
 };
 
+const StructuralCommitPreparer = struct {
+    frame: *SimulationFrame,
+    changes: *std.ArrayList(StructuralChange),
+    extra_required_events: usize,
+    structural_event_count: usize = 0,
+
+    pub fn prepare(self: *StructuralCommitPreparer, structural_event_count: usize) !void {
+        self.structural_event_count = structural_event_count;
+        const required_event_count = try std.math.add(usize, structural_event_count, self.extra_required_events);
+        try self.frame.events.ensureCanAppend(required_event_count);
+        try self.frame.reserveStructuralEvents(required_event_count);
+        try self.changes.ensureTotalCapacity(self.frame.events.stream.allocator, structural_event_count);
+    }
+};
+
 pub const CollisionTriggerEvent = struct {
     a: EntityId,
     b: EntityId,
@@ -320,6 +335,7 @@ pub const SimulationFrame = struct {
     contacts: RangeOutputStream(CollisionContact),
     collision_triggers: RangeOutputStream(CollisionTriggerEvent),
     structural_commands: RangeOutputStream(StructuralCommand),
+    structural_plan_scratch: StructuralPlanScratch,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
@@ -331,10 +347,12 @@ pub const SimulationFrame = struct {
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
             .collision_triggers = RangeOutputStream(CollisionTriggerEvent).init(allocator),
             .structural_commands = RangeOutputStream(StructuralCommand).init(allocator),
+            .structural_plan_scratch = StructuralPlanScratch.init(allocator),
         };
     }
 
     pub fn deinit(self: *SimulationFrame) void {
+        self.structural_plan_scratch.deinit();
         self.structural_commands.deinit();
         self.collision_triggers.deinit();
         self.contacts.deinit();
@@ -358,6 +376,7 @@ pub const SimulationFrame = struct {
         self.contacts.clearRetainingCapacity();
         self.collision_triggers.clearRetainingCapacity();
         self.structural_commands.clearRetainingCapacity();
+        self.structural_plan_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -387,28 +406,28 @@ pub const SimulationFrame = struct {
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
-        self.phase = .commit_structural;
-        const commands = self.structural_commands.mergedItems();
-        const event_count = try self.preflightStructuralCommit(data, 0);
-
-        var changes = std.ArrayList(StructuralChange).empty;
-        defer changes.deinit(self.events.stream.allocator);
-        try changes.ensureTotalCapacity(self.events.stream.allocator, event_count);
-        var sink = StructuralChangeSink{ .changes = &changes };
-        const stats = try data.applyStructuralCommandsWithChangeSink(commands, &sink);
-        std.debug.assert(changes.items.len <= event_count);
-        try self.publishStructuralChanges(changes.items);
-        return stats;
+        return try self.applyStructuralCommandsWithExtraEvents(data, 0);
     }
 
-    pub fn preflightStructuralCommit(self: *SimulationFrame, data: *const DataSystem, extra_required_events: usize) !usize {
+    pub fn applyStructuralCommandsWithExtraEvents(
+        self: *SimulationFrame,
+        data: *DataSystem,
+        extra_required_events: usize,
+    ) !StructuralCommitStats {
+        self.phase = .commit_structural;
         const commands = self.structural_commands.mergedItems();
-        try DataSystem.validateStructuralCommands(commands);
-        const structural_event_count = try structuralEventCount(self.events.stream.allocator, data, commands);
-        const required_event_count = try std.math.add(usize, structural_event_count, extra_required_events);
-        try self.events.ensureCanAppend(required_event_count);
-        try self.reserveStructuralEvents(required_event_count);
-        return structural_event_count;
+        var changes = std.ArrayList(StructuralChange).empty;
+        defer changes.deinit(self.events.stream.allocator);
+        var preparer = StructuralCommitPreparer{
+            .frame = self,
+            .changes = &changes,
+            .extra_required_events = extra_required_events,
+        };
+        var sink = StructuralChangeSink{ .changes = &changes };
+        const stats = try data.applyStructuralCommandsPrepared(commands, &self.structural_plan_scratch, &preparer, &sink);
+        std.debug.assert(changes.items.len <= preparer.structural_event_count);
+        try self.publishStructuralChanges(changes.items);
+        return stats;
     }
 
     fn reserveStructuralEvents(self: *SimulationFrame, event_count: usize) !void {
@@ -444,71 +463,6 @@ pub const SimulationFrame = struct {
         }
     }
 };
-
-fn structuralEventCount(allocator: std.mem.Allocator, data: *const DataSystem, commands: []const StructuralCommand) !usize {
-    var destroyed_entities = std.ArrayList(EntityId).empty;
-    defer destroyed_entities.deinit(allocator);
-    try destroyed_entities.ensureTotalCapacity(allocator, commands.len);
-
-    var count: usize = 0;
-    for (commands) |command| {
-        switch (command) {
-            .create_entity => |template| count += 1 + templateComponentCount(template),
-            .destroy_entity => |entity| {
-                if (isAliveForStructuralCount(data, entity, destroyed_entities.items)) {
-                    count += 1;
-                    destroyed_entities.appendAssumeCapacity(entity);
-                }
-            },
-            .set_movement_body => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_facing => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_primitive_visual => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_asset_reference => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_collision_bounds => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_collision_response => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_ai_agent => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-            .set_steering_agent => |set| {
-                if (isAliveForStructuralCount(data, set.entity, destroyed_entities.items)) count += 1;
-            },
-        }
-    }
-    return count;
-}
-
-fn isAliveForStructuralCount(data: *const DataSystem, entity: EntityId, destroyed_entities: []const EntityId) bool {
-    if (!data.isAlive(entity)) return false;
-    for (destroyed_entities) |destroyed| {
-        if (entity.index == destroyed.index and entity.generation == destroyed.generation) return false;
-    }
-    return true;
-}
-
-fn templateComponentCount(template: EntityTemplate) usize {
-    var count: usize = 0;
-    if (template.movement_body != null) count += 1;
-    if (template.facing != null) count += 1;
-    if (template.primitive_visual != null) count += 1;
-    if (template.asset_reference != null) count += 1;
-    if (template.collision_bounds != null) count += 1;
-    if (template.collision_response != null) count += 1;
-    if (template.ai_agent != null) count += 1;
-    if (template.steering_agent != null) count += 1;
-    return count;
-}
 
 pub fn RangeOutputStream(comptime T: type) type {
     return struct {

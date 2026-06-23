@@ -389,8 +389,7 @@ pub const GameDemoState = struct {
 
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState) !StructuralCommitStats {
         const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
-        _ = try self.simulation_frame.preflightStructuralCommit(&self.data, extra_event_count);
-        const stats = try self.simulation_frame.applyStructuralCommands(&self.data);
+        const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         try self.processPostCommitEvents();
         return stats;
     }

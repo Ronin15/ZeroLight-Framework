@@ -287,6 +287,16 @@ pub const StateStack = struct {
         return self.push(T, value, state_policy.modal_overlay);
     }
 
+    pub fn reserveForAdditionalStates(self: *StateStack, additional: usize) !void {
+        try self.states.ensureUnusedCapacity(self.allocator, additional);
+    }
+
+    /// Pushes an already-created modal state after `reserveForAdditionalStates`
+    /// has reserved stack storage for it.
+    pub fn pushModalOwnedAfterReserve(self: *StateStack, state: State) StateHandle {
+        return self.pushOwnedAssumeCapacity(state, state_policy.modal_overlay);
+    }
+
     pub fn pushOverlay(self: *StateStack, comptime T: type, value: T) !StateHandle {
         return self.push(T, value, state_policy.pass_through_overlay);
     }
@@ -493,6 +503,16 @@ pub const StateStack = struct {
     fn pushOwned(self: *StateStack, state: State, policy: StatePolicy) !StateHandle {
         const handle = self.nextHandle();
         try self.states.append(self.allocator, .{
+            .handle = handle,
+            .state = state,
+            .policy = policy,
+        });
+        return handle;
+    }
+
+    fn pushOwnedAssumeCapacity(self: *StateStack, state: State, policy: StatePolicy) StateHandle {
+        const handle = self.nextHandle();
+        self.states.appendAssumeCapacity(.{
             .handle = handle,
             .state = state,
             .policy = policy,

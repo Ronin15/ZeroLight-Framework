@@ -792,6 +792,10 @@ Implemented foundation:
   deterministic range-index merge.
 - `DataSystem.applyStructuralCommands` applies deferred entity/component changes
   at explicit main-thread commit points.
+- `SimulationFrame.applyStructuralCommandsWithExtraEvents` commits deferred
+  structural commands through `DataSystem`'s single planning path: event-stream
+  capacity stays with `SimulationFrame`, while `DataSystem` validates commands
+  and reserves persistent component storage capacity before mutation.
 - `GameDemoState` owns a `SimulationFrame`, clears it each fixed step, runs
   processor phases, and applies deferred structural commands before the step
   finishes.
