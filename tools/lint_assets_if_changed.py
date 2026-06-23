@@ -4,57 +4,18 @@
 from __future__ import annotations
 
 import json
+import struct
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACK_SCRIPT = REPO_ROOT / "tools" / "pack_atlas.py"
 SOURCE_ASSETS_DIR = REPO_ROOT / "source_assets"
-SPRITES_DIR = REPO_ROOT / "assets" / "sprites"
 MANIFEST_PATH = REPO_ROOT / "src" / "assets" / "manifest.zig"
 
-REGISTERED_ATLASES = (
-    {
-        "kind": "world",
-        "metadata_kind": "world_tileset",
-        "sprite_asset_id": "world_tileset",
-        "runtime_path": "sprites/world_tileset.png",
-        "json": SPRITES_DIR / "world_tileset.json",
-        "png": SPRITES_DIR / "world_tileset.png",
-        "entries_key": "tiles",
-        "count_key": "tile_count",
-        "width_key": "tile_size",
-        "height_key": "tile_size",
-    },
-    {
-        "kind": "characters",
-        "metadata_kind": "sprite_atlas",
-        "sprite_asset_id": "grim_characters",
-        "runtime_path": "sprites/grim_characters.png",
-        "json": SPRITES_DIR / "grim_characters.json",
-        "png": SPRITES_DIR / "grim_characters.png",
-        "entries_key": "sprites",
-        "count_key": "sprite_count",
-        "width_key": "frame_width",
-        "height_key": "frame_height",
-    },
-    {
-        "kind": "items",
-        "metadata_kind": "sprite_atlas",
-        "sprite_asset_id": "grim_items",
-        "runtime_path": "sprites/grim_items.png",
-        "json": SPRITES_DIR / "grim_items.json",
-        "png": SPRITES_DIR / "grim_items.png",
-        "entries_key": "sprites",
-        "count_key": "sprite_count",
-        "width_key": "frame_width",
-        "height_key": "frame_height",
-    },
-)
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def issue(label: str, message: str) -> str:
@@ -161,46 +122,53 @@ def manifest_sprite_atlases() -> tuple[list[dict[str, str]], list[str]]:
     return atlases, issues
 
 
-def validate_lint_registry_covers_manifest() -> list[str]:
+def runtime_atlas_specs() -> tuple[list[dict[str, Any]], list[str]]:
     manifest_atlases, issues = manifest_sprite_atlases()
     if issues:
-        return issues
+        return [], issues
 
-    registered_by_id = {str(spec["sprite_asset_id"]): spec for spec in REGISTERED_ATLASES}
-    manifest_by_id = {spec["sprite_asset_id"]: spec for spec in manifest_atlases}
-
-    for sprite_asset_id, manifest_spec in manifest_by_id.items():
-        registered = registered_by_id.get(sprite_asset_id)
-        if registered is None:
-            issues.append(issue(sprite_asset_id, "metadata-backed manifest atlas is missing from atlas lint registry"))
+    specs: list[dict[str, Any]] = []
+    for manifest_spec in manifest_atlases:
+        metadata_kind = manifest_spec["metadata_kind"]
+        sprite_asset_id = manifest_spec["sprite_asset_id"]
+        metadata_path = manifest_spec["metadata_path"]
+        if metadata_kind == "world_tileset":
+            spec = {
+                "metadata_kind": metadata_kind,
+                "sprite_asset_id": sprite_asset_id,
+                "runtime_path": manifest_spec["runtime_path"],
+                "json": REPO_ROOT / "assets" / metadata_path,
+                "png": REPO_ROOT / "assets" / manifest_spec["runtime_path"],
+                "entries_key": "tiles",
+                "count_key": "tile_count",
+                "width_key": "tile_size",
+                "height_key": "tile_size",
+            }
+        elif metadata_kind == "sprite_atlas":
+            spec = {
+                "metadata_kind": metadata_kind,
+                "sprite_asset_id": sprite_asset_id,
+                "runtime_path": manifest_spec["runtime_path"],
+                "json": REPO_ROOT / "assets" / metadata_path,
+                "png": REPO_ROOT / "assets" / manifest_spec["runtime_path"],
+                "entries_key": "sprites",
+                "count_key": "sprite_count",
+                "width_key": "frame_width",
+                "height_key": "frame_height",
+            }
+        else:
+            issues.append(issue(sprite_asset_id, f"unsupported metadata_kind {metadata_kind!r}"))
             continue
-        if registered["runtime_path"] != manifest_spec["runtime_path"]:
-            issues.append(
-                issue(
-                    sprite_asset_id,
-                    f"lint runtime_path={registered['runtime_path']!r}, manifest path={manifest_spec['runtime_path']!r}",
-                )
-            )
-        if str(Path(registered["json"]).relative_to(REPO_ROOT / "assets")) != manifest_spec["metadata_path"]:
-            issues.append(
-                issue(
-                    sprite_asset_id,
-                    f"lint json={registered['json']!s}, manifest metadata_path={manifest_spec['metadata_path']!r}",
-                )
-            )
-        if registered["metadata_kind"] != manifest_spec["metadata_kind"]:
-            issues.append(
-                issue(
-                    sprite_asset_id,
-                    f"lint metadata_kind={registered['metadata_kind']!r}, manifest metadata_kind={manifest_spec['metadata_kind']!r}",
-                )
-            )
+        specs.append(spec)
+    return specs, issues
 
-    for sprite_asset_id in registered_by_id:
-        if sprite_asset_id not in manifest_by_id:
-            issues.append(issue(sprite_asset_id, "atlas lint registry entry is not metadata-backed in manifest.zig"))
 
-    return issues
+def png_size(path: Path) -> tuple[int, int]:
+    with path.open("rb") as file:
+        header = file.read(24)
+    if len(header) < 24 or header[0:8] != PNG_SIGNATURE or header[12:16] != b"IHDR":
+        raise ValueError("invalid PNG header")
+    return struct.unpack(">II", header[16:24])
 
 
 def validate_entry_grid(
@@ -299,9 +267,13 @@ def validate_runtime_atlas(spec: dict[str, Any]) -> list[str]:
         return issues
 
     expected_size = (columns * frame_w, rows * frame_h)
-    with Image.open(png_path) as image:
-        if image.size != expected_size:
-            issues.append(issue(label, f"{png_path.name} is {image.size[0]}x{image.size[1]}, expected {expected_size[0]}x{expected_size[1]}"))
+    try:
+        image_size = png_size(png_path)
+    except (OSError, ValueError) as err:
+        issues.append(issue(label, f"could not read png atlas dimensions: {err}"))
+        return issues
+    if image_size != expected_size:
+        issues.append(issue(label, f"{png_path.name} is {image_size[0]}x{image_size[1]}, expected {expected_size[0]}x{expected_size[1]}"))
 
     atlas_width = atlas.get("width")
     atlas_height = atlas.get("height")
@@ -378,8 +350,8 @@ def run_source_consistency_lint() -> None:
 
 
 def main() -> None:
-    issues: list[str] = validate_lint_registry_covers_manifest()
-    for spec in REGISTERED_ATLASES:
+    runtime_specs, issues = runtime_atlas_specs()
+    for spec in runtime_specs:
         issues.extend(validate_runtime_atlas(spec))
 
     if issues:
@@ -387,7 +359,7 @@ def main() -> None:
             print(found, file=sys.stderr)
         raise SystemExit(1)
 
-    print(f"Validated {len(REGISTERED_ATLASES)} registered runtime atlases")
+    print(f"Validated {len(runtime_specs)} registered runtime atlases")
     run_source_consistency_lint()
 
 

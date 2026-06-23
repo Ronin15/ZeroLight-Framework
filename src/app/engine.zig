@@ -210,8 +210,8 @@ pub const Engine = struct {
             if (!consumed) {
                 input_router.routeEvent(routing_policy, &event, &self.input, &self.commands);
             }
-            try self.applyTransitions();
         }
+        try self.applyTransitions();
 
         self.debug_overlay.applyCommands(&self.commands);
         if (self.commands.wasPressed(.quit)) {

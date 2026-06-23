@@ -220,6 +220,7 @@ pub const GameDemoState = struct {
 
         self.simulation_frame.phase = .merge_outputs;
         const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents();
+        try self.reserveRenderQueueForCurrentData();
         self.simulation_frame.phase = .finished;
 
         if (comptime runtime_perf_log.enabled) {
@@ -240,6 +241,14 @@ pub const GameDemoState = struct {
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
+        try self.enqueueRenderRecords(context.runtime_assets, context.interpolation_alpha);
+        if (comptime runtime_perf_log.enabled) {
+            context.perf.recordMetric(.render_queue_records, self.render_queue.recordCount());
+        }
+        try self.render_queue.submit(context.renderer);
+    }
+
+    fn enqueueRenderRecords(self: *GameDemoState, runtime_assets: *const RuntimeAssets, interpolation_alpha: f32) !void {
         self.render_queue.clearRetainingCapacity();
         try self.render_queue.addRect(.{
             .x = 0,
@@ -247,18 +256,15 @@ pub const GameDemoState = struct {
             .w = self.bounds_width,
             .h = 4,
         }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, RenderOrder.world(render_depth.worldZ(.floor)), .world);
-        for (self.obstacles) |entity| {
-            try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, context.runtime_assets, context.interpolation_alpha);
+
+        for (self.data.primitiveVisualSliceConst().entities) |entity| {
+            if (sameEntity(entity, self.player.entity)) {
+                try self.player.enqueueRender(&self.data, runtime_assets, &self.render_queue, interpolation_alpha);
+            } else {
+                try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, runtime_assets, interpolation_alpha);
+            }
         }
-        for (self.test_squares) |entity| {
-            try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, context.runtime_assets, context.interpolation_alpha);
-        }
-        try self.player.enqueueRender(&self.data, context.runtime_assets, &self.render_queue, context.interpolation_alpha);
-        try self.particles.enqueueRender(&self.render_queue, context.interpolation_alpha);
-        if (comptime runtime_perf_log.enabled) {
-            context.perf.recordMetric(.render_queue_records, self.render_queue.recordCount());
-        }
-        try self.render_queue.submit(context.renderer);
+        try self.particles.enqueueRender(&self.render_queue, interpolation_alpha);
     }
 
     fn recordRuntimePerfStats(
@@ -392,6 +398,13 @@ pub const GameDemoState = struct {
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         try self.processPostCommitEvents();
         return stats;
+    }
+
+    fn reserveRenderQueueForCurrentData(self: *GameDemoState) !void {
+        const visual_count = self.data.primitiveVisualSliceConst().entities.len;
+        const floor_count: usize = 1;
+        const player_marker_count: usize = 1;
+        try self.render_queue.ensureTotalCapacity(floor_count + visual_count + player_marker_count + self.particles.capacity);
     }
 
     fn structuralCommandsMayInvalidateNavigation(self: *const GameDemoState) bool {
@@ -603,6 +616,10 @@ const CollisionSfxCooldown = struct {
         return (@as(u64, entity.generation) << 32) | entity.index;
     }
 };
+
+fn sameEntity(lhs: EntityId, rhs: EntityId) bool {
+    return lhs.index == rhs.index and lhs.generation == rhs.generation;
+}
 
 fn templateCreatesStaticNavigationObstacle(template: EntityTemplate) bool {
     const response = template.collision_response orelse return false;
@@ -845,6 +862,91 @@ test "demo player trail renders behind player body" {
     try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(1).depth);
     try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(2).depth);
     try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(3).depth);
+}
+
+test "demo render queue reserves for structural visual growth before render enqueue" {
+    const created_visual_count = 528;
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    var created: usize = 0;
+    while (created < created_visual_count) {
+        const batch_count = @min(created_visual_count - created, 4);
+        demo.simulation_frame.beginStep();
+        try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+        demo.simulation_frame.structural_commands.addCount(0, batch_count);
+        try demo.simulation_frame.structural_commands.prefix();
+        var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+        for (0..batch_count) |batch_index| {
+            const index = created + batch_index;
+            const x: f32 = @floatFromInt(index % 64);
+            const y: f32 = @floatFromInt(index / 64);
+            writer.write(.{ .create_entity = .{
+                .movement_body = .{
+                    .position = .{ .x = x, .y = y },
+                    .previous_position = .{ .x = x, .y = y },
+                },
+                .primitive_visual = .{
+                    .size = .{ .x = 1, .y = 1 },
+                    .color = .{ .r = 0.5, .g = 0.6, .b = 0.7, .a = 1 },
+                    .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+                },
+            } });
+        }
+        writer.finish();
+        demo.simulation_frame.structural_commands.finishWrite();
+
+        const stats = try demo.applyStructuralCommandsAndPostCommitEvents();
+        try std.testing.expectEqual(batch_count, stats.created);
+        created += batch_count;
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, test_square_count + obstacle_count + 1 + created_visual_count),
+        demo.data.primitiveVisualSliceConst().entities.len,
+    );
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .items_per_range = movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
+    defer audio.deinit();
+    var input = InputState{};
+
+    try demo.update(.{
+        .input = &input,
+        .audio = &audio,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+
+    const original_allocator = demo.render_queue.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    demo.render_queue.allocator = failing_allocator.allocator();
+    defer demo.render_queue.allocator = original_allocator;
+
+    while (demo.particles.activeCount() < demo.particles.capacity) {
+        try std.testing.expect(demo.particles.emit(.{
+            .position = .{},
+            .lifetime = 1,
+            .start_size = 1,
+            .end_size = 1,
+            .start_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+            .end_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        }));
+    }
+    try demo.enqueueRenderRecords(&runtime_assets, 1.0);
+
+    try std.testing.expectEqual(
+        1 + demo.data.primitiveVisualSliceConst().entities.len + 1 + demo.particles.capacity,
+        demo.render_queue.recordCount(),
+    );
 }
 
 test "demo owns and completes a simulation frame during update" {

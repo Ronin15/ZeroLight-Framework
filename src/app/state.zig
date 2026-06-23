@@ -1270,6 +1270,70 @@ test "queued transition from handleEvent waits until applyTransitions" {
     try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
 }
 
+test "event dispatch batch keeps stack stable until applyTransitions" {
+    const QueuingState = struct {
+        event_count: *usize,
+        queued: *bool,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = event;
+            self.event_count.* += 1;
+            if (!self.queued.*) {
+                self.queued.* = true;
+                try transitions.pushModal(@This(), .{
+                    .event_count = self.event_count,
+                    .queued = self.queued,
+                });
+            }
+            return true;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+    var event_count: usize = 0;
+    var queued = false;
+
+    _ = try stack.replaceGameplay(QueuingState, .{
+        .event_count = &event_count,
+        .queued = &queued,
+    });
+    const first = c.SDL_Event{ .type = c.SDL_EVENT_KEY_DOWN };
+    const second = c.SDL_Event{ .type = c.SDL_EVENT_KEY_UP };
+
+    try std.testing.expect(try stack.handleEvent(&first, &transitions));
+    try std.testing.expect(try stack.handleEvent(&second, &transitions));
+
+    try std.testing.expectEqual(@as(usize, 2), event_count);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+
+    _ = try stack.applyTransitions(&transitions);
+
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
+}
+
 test "stale duplicate and remove after replace transitions are no-ops" {
     const TestingState = struct {
         fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
