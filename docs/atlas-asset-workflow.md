@@ -1,8 +1,8 @@
 # Atlas Asset Workflow
 
 This project packs loose source sprites into runtime atlas PNGs plus JSON sidecar
-manifests. Gameplay resolves sprites and tiles by **filename** (the PNG stem), not
-by hardcoded numeric IDs in Zig.
+manifests. Filenames are authoring/setup identifiers; runtime gameplay stores
+stable `SpriteAssetId` values plus numeric tile or atlas entry IDs.
 
 Build tools live under `tools/`. Runtime atlases install to `assets/sprites/` and
 are registered in `src/assets/manifest.zig`.
@@ -67,23 +67,28 @@ tools/
 | Grid slot | Position in the order manifest; drives `id`, `column`, `row`, and `x/y` rects |
 | Uniqueness | Names must be **globally unique within an atlas** |
 
-Gameplay should store `SpriteAssetId` plus a name string (for example `"grass"` or
-`"adventurer"`). Resolve source rectangles at load or setup time through the
+Gameplay should store stable `SpriteAssetId` values plus numeric tile or atlas
+entry IDs. Names such as `"grass"` or `"adventurer"` are authoring/setup
+identifiers used to find IDs during world or entity construction; they should
+not become hot runtime lookup keys. Resolve source rectangles through prepared
 metadata loaders:
 
 - `world_tileset_meta.zig` — `tileByName`, `sourceRectByName`, `sourceRectForId`,
   `animationByName` (JSON-driven animation table built at load)
 - `sprite_atlas_meta.zig` — `spriteByName`, `sourceRectByName`, `sourceRectForId`
 
-Metadata paths resolve through `manifest.spriteSpec(id).metadata_path`. Name lookup
-uses load-time hash indexes; missing IDs or names return null instead of guessing
-grid positions.
+Metadata paths resolve through `manifest.spriteSpec(id).metadata_path`. Name
+lookup uses load-time hash indexes; hot render prep should use stable numeric
+IDs and direct metadata tables. Missing IDs or names return null instead of
+guessing grid positions.
 
 `Engine.init()` preloads every registered sprite texture and atlas JSON metadata
 through `RuntimeAssets.preload(...)`. Gameplay reads prepared textures by
-`SpriteAssetId` and filename lookups through `worldTilesetMeta()` /
-`spriteAtlasMeta(...)`. When a sprite texture is available, its JSON sidecar must
-also load successfully or startup fails.
+`SpriteAssetId`, and world/entity construction can translate authoring names to
+stable tile or atlas entry IDs through `worldTilesetMeta()` /
+`spriteAtlasMeta(...)`. Every registered metadata sidecar must parse at startup;
+optional character/item textures may fall back to primitive rendering, but their
+metadata remains required so numeric gameplay IDs can be validated.
 
 ## Order Manifests
 
@@ -199,7 +204,8 @@ No Zig changes required.
 1. Rename source PNGs.
 2. Update the matching entries in `tools/atlas_orders/*.json`.
 3. Repack.
-4. Update gameplay name strings if any call sites used the old filename.
+4. Update setup-time name lookups or stored atlas entry IDs if the renamed art
+   changes the intended runtime identity.
 
 ### Additional trailing slots
 

@@ -15,6 +15,7 @@ const Rect = @import("../render/renderer.zig").Rect;
 const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const render_depth = @import("render_depth.zig");
+const render_prep = @import("render_prep.zig");
 
 pub const Player = struct {
     entity: EntityId = EntityId.invalid,
@@ -40,7 +41,7 @@ pub const Player = struct {
         });
         try data.setFacing(entity, .{ .direction = .down });
         try data.setPrimitiveVisual(entity, playerVisual());
-        try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+        try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
 
         return .{ .entity = entity };
     }
@@ -98,13 +99,18 @@ pub const Player = struct {
         };
         if (data.assetReferenceConst(self.entity)) |asset_ref| {
             if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
-                try queue.addSprite(.{
-                    .texture = sprite.texture,
-                    .source = sprite.source_rect,
-                    .dest = dest,
-                    .tint = visual.color,
-                    .order = body_order,
-                });
+                const source = render_prep.sourceRectForAsset(runtime_assets, asset_ref, sprite.source_rect);
+                if (!asset_ref.hasAtlasEntry() or source != null) {
+                    try queue.addSprite(.{
+                        .texture = sprite.texture,
+                        .source = source,
+                        .dest = dest,
+                        .tint = visual.color,
+                        .order = body_order,
+                    });
+                } else {
+                    try queue.addRect(dest, visual.color, body_order, .world);
+                }
             } else {
                 try queue.addRect(dest, visual.color, body_order, .world);
             }

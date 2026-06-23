@@ -1048,9 +1048,10 @@ Current foundation:
   `UiDepth`/`RenderOrder.uiInStack(...)`, color, text-measurement, and
   centered-panel precedent.
 - `AudioCommandBuffer.setMasterGain` / `setBusGain` + `AudioBus` (Slice 15) for live settings feedback without owning mixer resources. MainMenuState owns the runtime audio-setting values so they persist across settings reopen and into gameplay launch.
-- `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
+- `MainMenuState` launches `LoadingState`, which constructs `GameDemoState`
+  from Engine-owned `RuntimeAssets` before replacing itself with gameplay.
 - `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.
-- Menus use `handleEvent` (raw SDL events, which reach top state for modal/opaque policies) and translate keys through `input.actionForKey(...)` before acting on named ui/app actions. `UpdateContext` carries audio for gain commands, transitions, input, and thread_system; `RenderContext` carries renderer + optional text_service. This matches the actual `UpdateContext` definition (no one-frame commands field).
+- Menus use `handleEvent` (raw SDL events, which reach top state for modal/opaque policies) and translate keys through `input.actionForKey(...)` before acting on named ui/app actions. `UpdateContext` carries input, audio for gain commands, runtime_assets for loading-state construction, transitions, and thread_system; `RenderContext` carries renderer + runtime_assets + optional text_service. This matches the actual `UpdateContext` definition (no one-frame commands field).
 - All states follow the vtable shape with `init`/`deinit`/`update`/`render`/`handleEvent` and required `onPause`; `onResume` is optional.
 
 Architecture notes:
@@ -1140,10 +1141,10 @@ Architecture notes:
 - Missing declared assets are logged and exposed as unavailable handles;
   allocation failures, invalid config, and SDL/GPU/audio service initialization
   failures still return errors.
-- A dedicated loading state is future work for larger asset sets, streamed
-  content, or visible progress. This slice keeps startup preload in `Engine.init`
-  but should keep enough catalog status to let a later loading state report
-  loaded, missing, and unavailable assets without changing ownership.
+- Startup preload remains in `Engine.init`; `LoadingState` now covers
+  runtime-asset-backed gameplay construction. Larger streamed asset sets can
+  extend that state with visible progress using the existing catalog status
+  without changing ownership.
 
 Checklist:
 
@@ -1722,36 +1723,48 @@ Current foundation:
 
 Architecture notes:
 
-- World/tile state should live in game-owned world data or `DataSystem` stable
-  IDs, not in renderer resources.
-- Render prep resolves tile IDs through `RuntimeAssets.worldTilesetMeta()` and
-  emits ordered draw records; it does not store string paths or live texture
-  handles in persistent gameplay data.
-- The first world renderer should expose enough chunk/visibility shape for the
-  later scoped tier slice, but it should not enable simulation tier filtering by
-  itself.
+- World/tile state lives in the state-owned `WorldSystem`, not in renderer
+  resources and not inside `SimulationPipeline`.
+- `GameDemoState` is constructed from Engine-owned `RuntimeAssets` through a
+  loading state; world construction requires `.world_tileset` metadata and
+  world rendering requires the `.world_tileset` texture.
+- Persistent world storage is SoA: stable tile IDs, atlas source-rect columns,
+  level z metadata, dense/sparse tile columns, and chunk/visibility columns.
+- The first world renderer exposes enough chunk/visibility shape for the later
+  scoped tier slice, but it does not enable simulation tier filtering by itself.
+- Demo actors can use character atlas entries with primitive-visual rectangle
+  fallback; world tiles do not have a rectangle fallback path.
 
 Checklist:
 
-- [ ] Add a small world/tile data owner with tile IDs, world coordinates, and
+- [x] Add a small world/tile data owner with tile IDs, world coordinates, and
       chunk/visibility metadata suitable for later `ActiveRegion` construction.
-- [ ] Render at least one world/tile layer from `.world_tileset` atlas metadata
+- [x] Render at least one world/tile layer from `.world_tileset` atlas metadata
       through render prep and `RenderQueue`.
-- [ ] Keep tile draw ordering explicit by `RenderOrder` and stable source rects.
-- [ ] Add tests for tile lookup, world-to-render enqueue, missing metadata
-      fallback, and deterministic queue record order.
-- [ ] Update rendering/assets docs and roadmap cross-links after runtime wiring
+- [x] Keep tile draw ordering explicit by `RenderOrder` and stable source rects.
+- [x] Add tests for tile lookup, strict missing atlas texture behavior,
+      actor primitive fallback, and deterministic queue record order.
+- [x] Update rendering/assets docs and roadmap cross-links after runtime wiring
       lands.
 
 Acceptance checks:
 
-- [ ] Demo/world rendering uses atlas metadata instead of per-tile textures or
+- [x] Demo/world rendering uses atlas metadata instead of per-tile textures or
       runtime string lookup.
-- [ ] World/chunk/visibility data exists in a form the later scoped tier slice
+- [x] World/chunk/visibility data exists in a form the later scoped tier slice
       can consume without ownership rewrites.
-- [ ] Render-prep benchmarks still measure the queue-to-batch path outside the
+- [x] Render-prep benchmarks still measure the queue-to-batch path outside the
       production render path.
-- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
+- [x] `zig build test`, `zig build check`, and `zig build verify` pass.
+
+Slice 23 adds `WorldSystem` as `GameDemoState`-owned SoA world storage and
+render prep. `LoadingState` now bridges menu activation to runtime-asset-backed
+gameplay construction, fixing the old direct demo-state constructor boundary.
+The demo renders a dense atlas-backed floor layer plus sparse world decoration
+through `RenderQueue`, carries level/chunk/visibility columns for future scoped
+simulation, and keeps `SimulationPipeline` focused on fixed-step entity
+processors. Demo actors now reference `.grim_characters` atlas entries while
+retaining primitive visuals as missing-character placeholders.
 
 ## Slice 24: Scoped Simulation Tiers And Chunk Policy
 
@@ -1831,10 +1844,9 @@ Render ordering is also part of that foundation: game/world/UI/effect producers
 emit typed draw records through `RenderQueue`, persistent data stores stable IDs
 and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
 benchmark-owned render-prep timing stays out of the production path.
-Slice 21 typed simulation/domain events are in place for current structural and
-navigation signals. `SimulationPipeline` extraction plus tier/scope scaffolding
-should land next, before broad multi-chunk or multi-world gameplay duplicates
-`GameDemoState` orchestration. Atlas-backed world rendering should then provide
-the concrete world/chunk/visibility data that scoped tiers consume. Scoped
+Slice 21 typed simulation/domain events, Slice 22 `SimulationPipeline`
+extraction, and Slice 23 atlas-backed world rendering are in place for the
+current structural, navigation, and world/chunk visibility foundation. Slice 24
+scoped simulation tiers should consume those world/chunk views next. Scoped
 tiers, chunk policy, and tier transitions should use those event signals through
 pipeline-owned controllers instead of adding parallel orchestration paths.

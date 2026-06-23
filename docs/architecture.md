@@ -33,7 +33,10 @@ game-specific behavior under `src/game/`.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
-- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via transitions.
+- `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
+- `src/game/world_system.zig` owns state-local world/tile data in SoA stores
+  for levels, dense layers, sparse tiles, catalog source rects, and chunk
+  visibility.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
   SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
@@ -155,9 +158,11 @@ texture creation starts from decoded pixels and owns only the GPU texture
 resource. `Engine` owns `RuntimeAssets`, which preloads declared sprites through
 `AssetCache`, keeps retained texture lease tokens, releases them through the
 live cache/renderer owner, and exposes `SpriteAssetId` lookup as atlas-ready
-`{ texture, source_rect }` records. Hot render paths resolve stable IDs through
-this catalog and fall back to primitive rectangles when a declared sprite is
-unavailable. Engine-owned services must not persist pointers to sibling service
+`{ texture, source_rect }` records. Hot entity render paths resolve stable IDs
+through this catalog and fall back to primitive rectangles when a declared actor
+sprite is unavailable. World tile rendering is strict: `WorldSystem` requires
+world atlas metadata during construction and the world tileset texture during
+render. Engine-owned services must not persist pointers to sibling service
 fields; release paths take the live owner explicitly. Cache lease tokens include
 cache-owner identity, slot generation, and texture identity so release paths can
 reject stale, forged, or wrong-owner tokens. Missing declared startup content is
@@ -285,6 +290,15 @@ the pipeline, and applies deferred structural commands at explicit main-thread
 commit points. `DataSystem` remains persistent storage, not the simulation
 scheduler.
 
+Large world surfaces belong to state-owned world storage rather than
+`DataSystem` entities or the simulation pipeline. `GameDemoState` owns its
+`WorldSystem`, whose persistent storage is SoA: stable tile IDs, atlas
+source-rect columns, level base-z columns, dense/sparse tile columns, and
+chunk/visibility columns. `WorldSystem` prepares world draw records during
+render, using explicit world-depth bands from `src/game/render_depth.zig`.
+Future scoped simulation slices may consume its chunk/visibility view, but
+`SimulationPipeline` should not own tile storage or runtime atlas metadata.
+
 The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
@@ -295,7 +309,8 @@ The current gameplay fixed-step pipeline is:
 6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
 7. Queue contact audio, emit/update transient particles, and merge outputs.
 8. Commit deferred structural commands to `DataSystem`.
-9. Render current `DataSystem` and particle state with interpolation.
+9. Render current `WorldSystem`, `DataSystem`, and particle state with
+   interpolation.
 
 `SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
 stage order, scope stats, budgets, and processor handoff for one gameplay state
@@ -338,11 +353,12 @@ failures do not partially apply a command batch.
 
 Update processors receive typed slices or views from `DataSystem` during
 fixed-step updates instead of broad structural access. Render systems read
-immutable `DataSystem` slices during state render, resolve stable sprite IDs
-through `RuntimeAssets`, and submit draw calls through `Renderer`. `DataSystem`
-does not own SDL handles, GPU handles, SDL_mixer handles, live renderer texture
-IDs, prepared sprite records, asset leases, audio command buffers, input frame
-state, thread-system state, transient events, or scratch buffers.
+immutable world and entity slices during state render, resolve stable tile IDs,
+sprite IDs, and atlas-entry IDs through `RuntimeAssets`, and submit draw calls
+through `Renderer`. `DataSystem` does not own SDL handles, GPU handles,
+SDL_mixer handles, live renderer texture IDs, prepared sprite records, asset
+leases, audio command buffers, input frame state, thread-system state,
+transient events, tile maps, or scratch buffers.
 
 `MovementSystem` updates movement-body slices as an ordered gameplay data
 processor, using SIMD lanes inside each assigned range and

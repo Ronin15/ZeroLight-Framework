@@ -267,6 +267,7 @@ pub const Engine = struct {
         try self.states.update(UpdateContext{
             .input = &self.input,
             .audio = &self.audio_commands,
+            .runtime_assets = &self.runtime_assets,
             .delta_seconds = delta_seconds,
             .transitions = &self.transitions,
             .thread_system = &self.thread_system,

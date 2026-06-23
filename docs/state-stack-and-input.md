@@ -69,13 +69,13 @@ try context.transitions.replaceGameplay(MainMenuState, MainMenuState.init());
 try context.transitions.replaceOwnedGameplay(owned_state);
 try context.transitions.pushModal(PauseMenuState, PauseMenuState.init());
 try context.transitions.pushOverlay(HudState, HudState.init());
-try context.transitions.pushOpaque(LoadingState, LoadingState.init());
+try context.transitions.replaceOwnedState(loading_state, state_policy.opaque_screen);
 try context.transitions.quit();
 ```
 
 Use `replaceOwnedState` / `replaceOwnedGameplay` only when a state has to be
 allocated before the transition can be enqueued, such as a fallible gameplay
-launch from a menu. Ownership transfers to `StateTransitions`; if enqueueing
+launch from a menu or a runtime-asset-backed loading screen. Ownership transfers to `StateTransitions`; if enqueueing
 fails, the transition API destroys the owned state.
 
 Use `StateStack` directly only in app/bootstrap code, such as replacing the
@@ -84,6 +84,11 @@ startup state in `src/app/engine.zig`.
 `StateStack` owns state allocation and destruction. It calls `deinit` when
 states are removed or replaced, and destroys remaining states from top to bottom
 when the stack shuts down.
+
+Menu activation should not directly construct gameplay states that require
+runtime catalogs. `MainMenuState` installs an opaque `LoadingState`; that state
+receives `UpdateContext.runtime_assets`, builds the `GameDemoState` world from
+Engine-owned runtime assets, and replaces itself with owned gameplay.
 
 ## Policies
 
@@ -169,8 +174,11 @@ to `events_below`; input routing only decides whether named actions mutate
 Menu states (e.g. main menu as an opaque screen, settings as a modal overlay)
 receive raw key-down events in `handleEvent`, translate them through
 `input.actionForKey(...)`, and act on named `Action` values for confirm, back,
-and navigation. They use `context.transitions.pop()` (added alongside Slice 16)
-or `quit()` / `replaceOwnedGameplay(...)`. When a state returns `true` from
-`handleEvent`, `Engine` does not route that same event into global `FrameCommands`,
-so menu Enter/Escape handling does not also resume/pause/quit through the app
-command path.
+and navigation. Settings-style modal states use `context.transitions.pop()`;
+quit rows use `quit()`. Main menu Start installs an opaque owned `LoadingState`
+with `replaceOwnedState(...)`, and `LoadingState` later queues
+`replaceOwnedGameplay(...)` after constructing gameplay from
+`UpdateContext.runtime_assets`. When a state returns `true` from `handleEvent`,
+`Engine` does not route that same event into global `FrameCommands`, so menu
+Enter/Escape handling does not also resume/pause/quit through the app command
+path.

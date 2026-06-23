@@ -2,8 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Sprite atlas metadata loaded once at setup. Resolve sprite filenames to source
-//! rectangles through `sourceRectByName` and cache results in gameplay code.
+//! Sprite atlas metadata loaded once at setup. Construction can resolve authoring
+//! names to stable numeric IDs; hot render prep resolves IDs through direct
+//! source-rect tables instead of storing names or rects in gameplay state.
 
 const std = @import("std");
 const atlas_meta_common = @import("atlas_meta_common.zig");
@@ -66,8 +67,12 @@ pub const SpriteAtlasMeta = struct {
     parsed: std.json.Parsed(JsonRoot),
     name_to_id: std.StringHashMap(u16),
     id_to_index: std.AutoHashMap(u16, usize),
+    source_rect_valid: []bool,
+    source_rects: []manifest.SourceRect,
 
     pub fn deinit(self: *SpriteAtlasMeta) void {
+        self.allocator.free(self.source_rects);
+        self.allocator.free(self.source_rect_valid);
         self.id_to_index.deinit();
         self.name_to_id.deinit();
         atlas_meta_common.deinitJsonAsset(self.allocator, self.bytes, &self.parsed);
@@ -114,8 +119,9 @@ pub const SpriteAtlasMeta = struct {
     }
 
     pub fn sourceRectForId(self: SpriteAtlasMeta, id: u16) ?manifest.SourceRect {
-        const index = self.id_to_index.get(id) orelse return null;
-        return sourceRectFromSprite(self.parsed.value.sprites[index]);
+        const index: usize = id;
+        if (index >= self.source_rect_valid.len or !self.source_rect_valid[index]) return null;
+        return self.source_rects[index];
     }
 
     pub fn spriteByName(self: SpriteAtlasMeta, sprite_name: []const u8) ?SpriteEntry {
@@ -184,7 +190,16 @@ pub fn load(
         ids[index] = sprite.id;
     }
 
-    const indexes = try atlas_meta_common.buildEntryIndexes(allocator, names, ids);
+    var indexes = try atlas_meta_common.buildEntryIndexes(allocator, names, ids);
+    errdefer {
+        indexes.id_to_index.deinit();
+        indexes.name_to_id.deinit();
+    }
+    const source_rect_table = try buildSourceRectTable(allocator, loaded.parsed.value.sprites);
+    errdefer {
+        allocator.free(source_rect_table.rects);
+        allocator.free(source_rect_table.valid);
+    }
 
     return .{
         .allocator = allocator,
@@ -192,7 +207,35 @@ pub fn load(
         .parsed = loaded.parsed,
         .name_to_id = indexes.name_to_id,
         .id_to_index = indexes.id_to_index,
+        .source_rect_valid = source_rect_table.valid,
+        .source_rects = source_rect_table.rects,
     };
+}
+
+const SourceRectTable = struct {
+    valid: []bool,
+    rects: []manifest.SourceRect,
+};
+
+fn buildSourceRectTable(allocator: std.mem.Allocator, sprites: []const JsonSpriteEntry) !SourceRectTable {
+    var max_id: usize = 0;
+    for (sprites) |sprite| {
+        max_id = @max(max_id, sprite.id);
+    }
+    const count = if (sprites.len == 0) 0 else max_id + 1;
+    const valid = try allocator.alloc(bool, count);
+    errdefer allocator.free(valid);
+    const rects = try allocator.alloc(manifest.SourceRect, count);
+    errdefer allocator.free(rects);
+
+    @memset(valid, false);
+    @memset(rects, manifest.SourceRect{ .x = 0, .y = 0, .w = 0, .h = 0 });
+    for (sprites) |sprite| {
+        const index: usize = sprite.id;
+        valid[index] = true;
+        rects[index] = sourceRectFromSprite(sprite);
+    }
+    return .{ .valid = valid, .rects = rects };
 }
 
 fn validateRoot(root: *const JsonRoot) !void {

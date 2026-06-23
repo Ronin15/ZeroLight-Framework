@@ -7,10 +7,12 @@ const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const State = @import("../app/state.zig").State;
+const StateStack = @import("../app/state.zig").StateStack;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
+const state_policy = @import("../app/state.zig").state_policy;
 const inputFile = @import("../app/input.zig");
-const GameDemoState = @import("game_demo_state.zig").GameDemoState;
+const LoadingState = @import("loading_state.zig").LoadingState;
 const SettingsMenuState = @import("settings_menu_state.zig").SettingsMenuState;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const menu_view = @import("menu_view.zig");
@@ -140,19 +142,19 @@ pub const MainMenuState = struct {
         log.debug("main menu activating item {d}", .{self.selected});
         switch (self.selected) {
             0 => {
-                const game_ptr = try self.allocator.create(GameDemoState);
+                const loading_ptr = try self.allocator.create(LoadingState);
                 var initialized = false;
                 var owned_by_transition = false;
                 errdefer if (!owned_by_transition) {
-                    if (initialized) game_ptr.deinit();
-                    self.allocator.destroy(game_ptr);
+                    if (initialized) loading_ptr.deinit();
+                    self.allocator.destroy(loading_ptr);
                 };
 
-                game_ptr.* = try GameDemoState.init(self.allocator, self.width, self.height);
+                loading_ptr.* = LoadingState.init(self.allocator, .game_demo, self.width, self.height);
                 initialized = true;
-                const state = State.fromOwnedPtr(GameDemoState, game_ptr);
+                const state = State.fromOwnedPtr(LoadingState, loading_ptr);
                 owned_by_transition = true;
-                try transitions.replaceOwnedGameplay(state);
+                try transitions.replaceOwnedState(state, state_policy.opaque_screen);
             },
             1 => {
                 try transitions.pushModal(SettingsMenuState, SettingsMenuState.init(&self.audio_settings, self.width, self.height));
@@ -196,7 +198,14 @@ test "main menu selection wraps and activates produce transitions" {
     // Force start
     menu.selected = 0;
     try menu.activate(&transitions);
-    try std.testing.expect(transitions.requests.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+    _ = try stack.applyTransitions(&transitions);
+    const active = stack.active() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(@typeName(LoadingState), active.type_name);
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.gameplay));
 }
 
 test "main menu handleEvent uses named input actions" {

@@ -38,6 +38,7 @@ comptime {
     _ = @import("core/simd.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/game_demo_state.zig");
+    _ = @import("game/loading_state.zig");
     _ = @import("game/main_menu_state.zig");
     _ = @import("game/menu_view.zig");
     _ = @import("game/settings_menu_state.zig");
@@ -47,6 +48,7 @@ comptime {
     _ = @import("game/simulation.zig");
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");
+    _ = @import("game/world_system.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");

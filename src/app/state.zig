@@ -12,6 +12,7 @@ const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const runtime_perf_log = @import("runtime_perf_log.zig");
+const log = @import("../core/logging.zig").app;
 const inputRouter = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
 const renderer_file = @import("../render/renderer.zig");
@@ -60,6 +61,7 @@ pub const TransitionApplyResult = struct {
 pub const UpdateContext = struct {
     input: *const InputState,
     audio: *AudioCommandBuffer,
+    runtime_assets: *const RuntimeAssets,
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
@@ -68,7 +70,7 @@ pub const UpdateContext = struct {
 
 pub const RenderContext = struct {
     renderer: *Renderer,
-    runtime_assets: *RuntimeAssets,
+    runtime_assets: *const RuntimeAssets,
     text_service: ?*TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
@@ -79,6 +81,7 @@ pub const RenderContext = struct {
 pub const State = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    type_name: []const u8,
 
     pub const VTable = struct {
         handle_event: *const fn (*anyopaque, *const c.SDL_Event, *StateTransitions) anyerror!bool,
@@ -143,6 +146,7 @@ pub const State = struct {
         return .{
             .ptr = ptr,
             .vtable = &Adapter.vtable,
+            .type_name = @typeName(T),
         };
     }
 
@@ -215,6 +219,11 @@ pub const StateTransitions = struct {
     pub fn replaceOwnedState(self: *StateTransitions, state: State, policy: StatePolicy) !void {
         errdefer state.destroy(self.allocator);
         try self.requests.append(self.allocator, .{ .replace = .{ .state = state, .policy = policy } });
+        log.debug("queued state transition replace type={s} policy={s} pending={d}", .{
+            state.type_name,
+            policyLabel(policy),
+            self.requests.items.len,
+        });
     }
 
     pub fn replaceOwnedGameplay(self: *StateTransitions, state: State) !void {
@@ -225,6 +234,11 @@ pub const StateTransitions = struct {
         const state = try State.create(T, self.allocator, value);
         errdefer state.destroy(self.allocator);
         try self.requests.append(self.allocator, .{ .push = .{ .state = state, .policy = policy } });
+        log.debug("queued state transition push type={s} policy={s} pending={d}", .{
+            state.type_name,
+            policyLabel(policy),
+            self.requests.items.len,
+        });
     }
 
     pub fn pushModal(self: *StateTransitions, comptime T: type, value: T) !void {
@@ -241,14 +255,17 @@ pub const StateTransitions = struct {
 
     pub fn remove(self: *StateTransitions, handle: StateHandle) !void {
         try self.requests.append(self.allocator, .{ .remove = handle });
+        log.debug("queued state transition remove handle={d} pending={d}", .{ handle.id, self.requests.items.len });
     }
 
     pub fn quit(self: *StateTransitions) !void {
         try self.requests.append(self.allocator, .quit);
+        log.debug("queued state transition quit pending={d}", .{self.requests.items.len});
     }
 
     pub fn pop(self: *StateTransitions) !void {
         try self.requests.append(self.allocator, .pop);
+        log.debug("queued state transition pop pending={d}", .{self.requests.items.len});
     }
 
     fn destroyPendingStates(self: *StateTransitions) void {
@@ -486,22 +503,48 @@ pub const StateStack = struct {
             switch (request.*) {
                 .none => {},
                 .replace => |state_request| {
-                    _ = try self.replaceOwned(state_request.state, state_request.policy);
+                    const state_type = state_request.state.type_name;
+                    const policy_label = policyLabel(state_request.policy);
+                    const handle = try self.replaceOwned(state_request.state, state_request.policy);
+                    log.debug("applied state transition replace type={s} handle={d} policy={s} stack_len={d}", .{
+                        state_type,
+                        handle.id,
+                        policy_label,
+                        self.states.items.len,
+                    });
                     request.* = .none;
                 },
                 .push => |state_request| {
-                    _ = try self.pushOwned(state_request.state, state_request.policy);
+                    const state_type = state_request.state.type_name;
+                    const policy_label = policyLabel(state_request.policy);
+                    const handle = try self.pushOwned(state_request.state, state_request.policy);
+                    log.debug("applied state transition push type={s} handle={d} policy={s} stack_len={d}", .{
+                        state_type,
+                        handle.id,
+                        policy_label,
+                        self.states.items.len,
+                    });
                     request.* = .none;
                 },
                 .remove => |handle| {
-                    _ = self.remove(handle);
+                    const removed = self.remove(handle);
+                    log.debug("applied state transition remove handle={d} removed={} stack_len={d}", .{
+                        handle.id,
+                        removed,
+                        self.states.items.len,
+                    });
                 },
                 .pop => {
-                    _ = self.pop();
+                    const popped = self.pop();
+                    log.debug("applied state transition pop popped={} stack_len={d}", .{
+                        popped,
+                        self.states.items.len,
+                    });
                     request.* = .none;
                 },
                 .quit => {
                     result.quit_requested = true;
+                    log.debug("applied state transition quit", .{});
                 },
             }
         }
@@ -557,6 +600,14 @@ pub const StateStack = struct {
     }
 };
 
+fn policyLabel(policy: StatePolicy) []const u8 {
+    if (policy.gameplay) return "gameplay";
+    if (!policy.render_below and !policy.update_below and !policy.events_below) return "opaque_screen";
+    if (policy.update_below and policy.events_below and policy.render_below) return "pass_through_overlay";
+    if (!policy.update_below and !policy.events_below and policy.render_below) return "modal_overlay";
+    return "custom";
+}
+
 fn initTestThreadSystem() !ThreadSystem {
     return try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
 }
@@ -564,6 +615,7 @@ fn initTestThreadSystem() !ThreadSystem {
 fn testUpdateContext(
     input: *const InputState,
     audio: *AudioCommandBuffer,
+    runtime_assets: *const RuntimeAssets,
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
@@ -571,6 +623,7 @@ fn testUpdateContext(
     return .{
         .input = input,
         .audio = audio,
+        .runtime_assets = runtime_assets,
         .delta_seconds = delta_seconds,
         .transitions = transitions,
         .thread_system = thread_system,
@@ -579,7 +632,7 @@ fn testUpdateContext(
 
 fn testRenderContext(
     renderer: *Renderer,
-    runtime_assets: *RuntimeAssets,
+    runtime_assets: *const RuntimeAssets,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
 ) RenderContext {
@@ -829,18 +882,19 @@ test "modal state blocks updates below and pass-through state allows them" {
     defer threads.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
     _ = try stack.replaceGameplay(TestingState, .{ .update_count = &bottom_updates });
     const modal_handle = try stack.pushModal(TestingState, .{ .update_count = &top_updates });
-    try stack.update(testUpdateContext(&InputState{}, &audio, 0.0, &transitions, &threads));
+    try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 0), bottom_updates);
     try std.testing.expectEqual(@as(u32, 1), top_updates);
 
     try std.testing.expect(stack.remove(modal_handle));
     _ = try stack.pushOverlay(TestingState, .{ .update_count = &top_updates });
-    try stack.update(testUpdateContext(&InputState{}, &audio, 0.0, &transitions, &threads));
+    try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
     try std.testing.expectEqual(@as(u32, 1), bottom_updates);
     try std.testing.expectEqual(@as(u32, 2), top_updates);
 }
@@ -1208,11 +1262,12 @@ test "queued transition from update waits until applyTransitions" {
     defer threads.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
     _ = try stack.replaceGameplay(QueuingState, .{});
-    try stack.update(testUpdateContext(&InputState{}, &audio, 0.0, &transitions, &threads));
+    try stack.update(testUpdateContext(&InputState{}, &audio, &runtime_assets, 0.0, &transitions, &threads));
 
     try std.testing.expectEqual(@as(usize, 1), stack.len());
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);

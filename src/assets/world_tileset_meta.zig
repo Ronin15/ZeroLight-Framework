@@ -2,8 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! World tileset metadata loaded once at setup. Resolve tile names to source
-//! rectangles through `sourceRectByName` and cache results in gameplay code.
+//! World tileset metadata loaded once at setup. World construction resolves
+//! authoring names to stable tile IDs; `WorldSystem` keeps source rectangles in
+//! SoA catalog columns instead of storing names or renderer handles.
 
 const std = @import("std");
 const atlas_meta_common = @import("atlas_meta_common.zig");
@@ -133,6 +134,11 @@ pub const WorldTilesetMeta = struct {
 
     pub fn tileCount(self: WorldTilesetMeta) u32 {
         return self.parsed.value.tile_count;
+    }
+
+    pub fn tileAtIndex(self: WorldTilesetMeta, index: usize) ?TileEntry {
+        if (index >= self.parsed.value.tiles.len) return null;
+        return jsonTileToEntry(self.parsed.value.tiles[index]);
     }
 
     pub fn sourceRectByName(self: WorldTilesetMeta, tile_name: []const u8) ?manifest.SourceRect {

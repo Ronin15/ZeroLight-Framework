@@ -77,11 +77,12 @@ for renderer-owned or tightly controlled paths that already submit in
 nondecreasing `RenderOrder`, such as a sorted `RenderQueue`, simple smoke tests,
 or stack-aware UI helpers.
 
-For atlases or future tile rendering, keep entity data on stable
-`SpriteAssetId` values and let `RuntimeAssets` map those IDs to one atlas
-`TextureId` plus `Sprite.source` rectangles. Tilemap batching should build on
-the same ID-to-texture/source model rather than creating one texture per tile or
-storing live renderer handles in gameplay data.
+For atlas-backed actors, keep entity data on stable `SpriteAssetId` values plus
+numeric atlas entry IDs. Authoring names stay in source assets and metadata;
+runtime render prep resolves entry IDs through `RuntimeAssets` metadata to
+source rectangles. Tilemap batching follows the same stable-ID model rather than
+creating one texture per tile, storing atlas names in hot gameplay data, or
+persisting live renderer handles/source rectangles in `DataSystem`.
 
 Large sprite, tile, or particle scenes should reserve or surface render-queue
 and sprite-batch capacity before relying on allocation-free render frames. The
@@ -122,8 +123,9 @@ Sprite coordinate spaces:
 ## Runtime Assets
 
 Atlas PNGs ship with JSON sidecar manifests. Loose source art packs through
-`tools/pack_atlas.py`; gameplay resolves tiles and sprites by filename through
-`world_tileset_meta.zig` and `sprite_atlas_meta.zig`. See
+`tools/pack_atlas.py`; setup code can resolve authoring names through
+`world_tileset_meta.zig` and `sprite_atlas_meta.zig`, while hot gameplay and
+render prep use stable numeric IDs. See
 `docs/atlas-asset-workflow.md` for the pack, export, and swap workflow.
 
 Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
@@ -131,11 +133,20 @@ Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
 `AssetCache`, parses atlas JSON sidecars once at init, preloads declared audio
 through `AudioService`, and passes the catalog to render contexts. Atlas
 lookups use `RuntimeAssets.worldTilesetMeta()` for the world tileset and
-`RuntimeAssets.spriteAtlasMeta(id)` for character/item atlases. When a texture
-is available but its sidecar is missing or invalid, startup fails instead of
-leaving partial metadata behind. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
-sprite for player, AI squares, and obstacles, with primitive rectangle fallback
-when a sprite ID is unavailable. The default text path uses the bundled
+`RuntimeAssets.spriteAtlasMeta(id)` for character/item atlases. Registered
+metadata sidecars are required even when optional character/item textures fall
+back to primitive rendering; missing or invalid sidecars fail startup instead
+of leaving partial metadata behind.
+
+`GameDemoState` owns `WorldSystem`, which stores tile IDs, atlas source-rect
+columns, level z columns, and chunk/visibility columns in SoA form. World
+construction requires `.world_tileset` metadata, and world render enqueue
+requires the `.world_tileset` texture; missing world atlas data is an error, not
+a primitive rectangle fallback. Demo actors reference stable `.grim_characters`
+atlas-entry IDs through `DataSystem` asset references and keep primitive visual
+rectangles as placeholders when character art is unavailable. Obstacles can
+still use `assets/sprites/demo_tile.png` as a reusable tintable sprite. The
+default text path uses the bundled
 `assets/fonts/NotoSansMono-Regular.ttf` font.
 
 Runtime assets are installed under `zig-out/bin/<asset-root>`. The default

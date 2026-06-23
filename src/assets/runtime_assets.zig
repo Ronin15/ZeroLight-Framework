@@ -130,19 +130,27 @@ pub const RuntimeAssets = struct {
         return self.audio_status[manifest.audioIndex(id)];
     }
 
-    /// Skips metadata when the atlas texture is unavailable. Requires metadata
-    /// when the texture loaded successfully.
+    /// Loads atlas metadata at startup so gameplay can validate numeric IDs even
+    /// when optional sprite textures fall back to primitives.
     fn loadAtlasMetadata(self: *RuntimeAssets, asset_store: AssetStore, options: LoadAtlasMetadataOptions) !void {
         for (manifest.sprite_assets) |spec| {
             if (spec.metadata_kind == null) continue;
             if (self.spriteStatus(spec.id) != .available) {
+                if (isRequiredStartupSprite(spec.id)) {
+                    if (options.log_unavailable) {
+                        log.warn(
+                            "required startup sprite asset unavailable \"{s}\"",
+                            .{spec.path},
+                        );
+                    }
+                    return error.RequiredStartupSpriteUnavailable;
+                }
                 if (options.log_unavailable) {
                     log.warn(
-                        "skipping atlas metadata for {s}: sprite texture unavailable",
+                        "loading atlas metadata for {s} while sprite texture falls back to primitives",
                         .{@tagName(spec.id)},
                     );
                 }
-                continue;
             }
             try self.loadMetadataFor(asset_store, spec);
         }
@@ -179,6 +187,10 @@ pub const RuntimeAssets = struct {
             asset_store.allocator.free(path);
         } else |err| switch (err) {
             error.FileNotFound => {
+                if (isRequiredStartupSprite(spec.id)) {
+                    log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                    return error.RequiredStartupSpriteUnavailable;
+                }
                 log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
                 self.releaseSpriteSlot(cache, renderer, index);
                 self.sprite_slots[index].status = .unavailable;
@@ -224,6 +236,13 @@ fn initAtlasMetaSlots() [manifest.sprite_asset_count]?AtlasMetaSlot {
     return .{null} ** manifest.sprite_asset_count;
 }
 
+fn isRequiredStartupSprite(id: SpriteAssetId) bool {
+    return switch (id) {
+        .world_tileset => true,
+        else => false,
+    };
+}
+
 fn deinitAtlasMetaSlots(slots: *[manifest.sprite_asset_count]?AtlasMetaSlot) void {
     for (slots) |*slot| {
         if (slot.*) |*meta| {
@@ -265,6 +284,26 @@ test "missing startup sprite marks id unavailable without requiring renderer acc
 
     try std.testing.expectEqual(AssetStatus.unavailable, runtime_assets.spriteStatus(.demo_tile));
     try std.testing.expect(runtime_assets.sprite(.demo_tile) == null);
+}
+
+test "missing required startup sprite fails preload" {
+    const cache_testing = @import("cache.zig").testing;
+    var runtime_assets = RuntimeAssets.init();
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var fake = cache_testing.Backend{};
+    var cache = cache_testing.initCache(std.testing.allocator, asset_store);
+    defer cache_testing.deinitCache(&cache, &fake);
+
+    try std.testing.expectError(
+        error.RequiredStartupSpriteUnavailable,
+        preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
+            .id = .world_tileset,
+            .path = "missing/world_tileset.png",
+        }),
+    );
+
+    try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.spriteStatus(.world_tileset));
+    try std.testing.expect(runtime_assets.sprite(.world_tileset) == null);
 }
 
 test "runtime assets deinit releases preloaded sprites exactly once" {
@@ -402,28 +441,41 @@ test "sprite catalog rollback releases leases acquired before a later error" {
     try std.testing.expectEqual(@as(usize, 0), cache_testing.entryCount(&cache));
 }
 
-test "startup metadata load skips atlases with unavailable textures" {
+test "startup metadata load requires world tileset texture" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var runtime_assets = RuntimeAssets.init();
     runtime_assets.allocator = std.testing.allocator;
-    const atlas_sprite_ids = [_]SpriteAssetId{ .world_tileset, .grim_characters, .grim_items };
-    for (atlas_sprite_ids) |id| {
-        runtime_assets.sprite_slots[manifest.spriteIndex(id)] = .{ .status = .unavailable };
-    }
+    runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .unavailable };
+
+    try std.testing.expectError(
+        error.RequiredStartupSpriteUnavailable,
+        runtime_assets.loadAtlasMetadata(asset_store, .{ .log_unavailable = false }),
+    );
+
+    try std.testing.expect(runtime_assets.worldTilesetMeta() == null);
+}
+
+test "startup metadata load parses optional atlases with unavailable textures" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var runtime_assets = RuntimeAssets.init();
+    runtime_assets.allocator = std.testing.allocator;
+    defer deinitAtlasMetaSlots(&runtime_assets.atlas_meta);
+
+    runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
+    runtime_assets.sprite_slots[manifest.spriteIndex(.grim_characters)] = .{ .status = .unavailable };
+    runtime_assets.sprite_slots[manifest.spriteIndex(.grim_items)] = .{ .status = .unavailable };
 
     try runtime_assets.loadAtlasMetadata(asset_store, .{ .log_unavailable = false });
 
-    try std.testing.expect(runtime_assets.worldTilesetMeta() == null);
-    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_characters) == null);
-    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_items) == null);
+    try std.testing.expect(runtime_assets.worldTilesetMeta() != null);
+    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_characters) != null);
+    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_items) != null);
 }
 
-test "metadata load fails when texture is available but sidecar is missing" {
+test "metadata load fails when sidecar is missing" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var runtime_assets = RuntimeAssets.init();
     runtime_assets.allocator = std.testing.allocator;
-
-    runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
 
     var spec = manifest.spriteSpec(.world_tileset);
     spec.metadata_path = "sprites/missing_world_tileset.json";
@@ -567,6 +619,9 @@ fn preloadSpriteWithTestBackend(
         asset_store.allocator.free(path);
     } else |err| switch (err) {
         error.FileNotFound => {
+            if (isRequiredStartupSprite(spec.id)) {
+                return error.RequiredStartupSpriteUnavailable;
+            }
             releaseSpriteSlotWithTestBackend(runtime_assets, cache, fake, index);
             runtime_assets.sprite_slots[index].status = .unavailable;
             return;

@@ -103,6 +103,7 @@ pub fn validateGridEntry(
     width: f32,
     height: f32,
 ) LayoutMismatch!void {
+    if (id == std.math.maxInt(u16)) return error.AtlasLayoutMismatch;
     if (columns == 0 or rows == 0 or frame_w == 0 or frame_h == 0) {
         return error.AtlasLayoutMismatch;
     }
@@ -244,6 +245,25 @@ test "buildEntryIndexes rejects duplicate ids and names" {
     try std.testing.expectError(
         error.DuplicateEntryId,
         buildEntryIndexes(std.testing.allocator, &names, &ids),
+    );
+}
+
+test "validateGridEntry rejects sentinel ids" {
+    try std.testing.expectError(
+        error.AtlasLayoutMismatch,
+        validateGridEntry(
+            std.math.maxInt(u16),
+            256,
+            256,
+            32,
+            32,
+            255,
+            255,
+            8160,
+            8160,
+            32,
+            32,
+        ),
     );
 }
 

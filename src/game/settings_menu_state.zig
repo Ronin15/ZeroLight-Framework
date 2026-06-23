@@ -6,9 +6,12 @@ const std = @import("std");
 const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
+const InputState = @import("../app/input.zig").InputState;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const inputFile = @import("../app/input.zig");
 const menu_view = @import("menu_view.zig");
 const text = @import("../render/text.zig");
@@ -242,13 +245,20 @@ test "settings volumes clamp and emit gain commands" {
 
     var audio = AudioCommandBuffer.init(std.testing.allocator, 16);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
+    var input = InputState{};
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
 
     const ctx = UpdateContext{
-        .input = undefined,
+        .input = &input,
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0,
-        .transitions = undefined,
-        .thread_system = undefined,
+        .transitions = &transitions,
+        .thread_system = &threads,
     };
 
     try std.testing.expectEqual(@as(u8, 10), runtime_settings.master);

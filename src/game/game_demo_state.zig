@@ -9,8 +9,12 @@ const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
+const AssetStore = @import("../assets/assets.zig").AssetStore;
+const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
+const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
+const AssetReference = @import("data_system.zig").AssetReference;
 const component_masks = @import("data_system.zig").component_masks;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
@@ -37,12 +41,14 @@ const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
+const TextureId = @import("../render/resources.zig").TextureId;
 const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const render_prep = @import("render_prep.zig");
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
+const WorldSystem = @import("world_system.zig").WorldSystem;
 const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 8;
@@ -59,6 +65,7 @@ pub const GameDemoState = struct {
     data: DataSystem,
     simulation_frame: SimulationFrame,
     pipeline: SimulationPipeline,
+    world: WorldSystem,
     player: Player,
     particles: ParticleSystem,
     render_queue: RenderQueue,
@@ -70,7 +77,40 @@ pub const GameDemoState = struct {
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
 
-    pub fn init(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        runtime_assets: *const RuntimeAssets,
+        bounds_width: f32,
+        bounds_height: f32,
+    ) !GameDemoState {
+        return try initWithRuntimeAssets(allocator, runtime_assets, bounds_width, bounds_height);
+    }
+
+    pub fn initWithRuntimeAssets(
+        allocator: std.mem.Allocator,
+        runtime_assets: *const RuntimeAssets,
+        bounds_width: f32,
+        bounds_height: f32,
+    ) !GameDemoState {
+        var state = try initWithWorld(allocator, bounds_width, bounds_height, try WorldSystem.initDemo(
+            allocator,
+            runtime_assets,
+            bounds_width,
+            bounds_height,
+        ));
+        errdefer state.deinit();
+        try state.validateAtlasReferences(runtime_assets);
+        return state;
+    }
+
+    fn initWithWorld(
+        allocator: std.mem.Allocator,
+        bounds_width: f32,
+        bounds_height: f32,
+        world_value: WorldSystem,
+    ) !GameDemoState {
+        var world = world_value;
+        errdefer world.deinit();
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
         const player = try Player.spawn(&data);
@@ -82,7 +122,7 @@ pub const GameDemoState = struct {
         errdefer particles.deinit();
         var render_queue = RenderQueue.init(allocator);
         errdefer render_queue.deinit();
-        try render_queue.ensureTotalCapacity(1 + obstacle_count + test_square_count + 2 + particles.capacity);
+        try render_queue.ensureTotalCapacity(world.reserveRenderRecords() + obstacle_count + test_square_count + 2 + particles.capacity);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
         try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, 8);
@@ -107,6 +147,7 @@ pub const GameDemoState = struct {
             .data = data,
             .simulation_frame = simulation_frame,
             .pipeline = pipeline,
+            .world = world,
             .player = player,
             .particles = particles,
             .render_queue = render_queue,
@@ -120,6 +161,7 @@ pub const GameDemoState = struct {
     pub fn deinit(self: *GameDemoState) void {
         self.render_queue.deinit();
         self.particles.deinit();
+        self.world.deinit();
         self.pipeline.deinit();
         self.simulation_frame.deinit();
         self.data.deinit();
@@ -153,7 +195,7 @@ pub const GameDemoState = struct {
         const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
 
         self.simulation_frame.phase = .merge_outputs;
-        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents();
+        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets);
         try self.reserveRenderQueueForCurrentData();
         self.simulation_frame.phase = .finished;
 
@@ -179,12 +221,7 @@ pub const GameDemoState = struct {
 
     fn enqueueRenderRecords(self: *GameDemoState, runtime_assets: *const RuntimeAssets, interpolation_alpha: f32) !void {
         self.render_queue.clearRetainingCapacity();
-        try self.render_queue.addRect(.{
-            .x = 0,
-            .y = self.bounds_height - 4,
-            .w = self.bounds_width,
-            .h = 4,
-        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, RenderOrder.world(render_depth.worldZ(.floor)), .world);
+        _ = try self.world.enqueueRender(&self.render_queue, runtime_assets);
 
         for (self.data.primitiveVisualSliceConst().entities) |entity| {
             if (sameEntity(entity, self.player.entity)) {
@@ -335,7 +372,8 @@ pub const GameDemoState = struct {
         });
     }
 
-    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState) !StructuralCommitStats {
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets) !StructuralCommitStats {
+        try self.validateStructuralAssetReferences(runtime_assets);
         const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         try self.processPostCommitEvents();
@@ -344,9 +382,26 @@ pub const GameDemoState = struct {
 
     fn reserveRenderQueueForCurrentData(self: *GameDemoState) !void {
         const visual_count = self.data.primitiveVisualSliceConst().entities.len;
-        const floor_count: usize = 1;
         const player_marker_count: usize = 1;
-        try self.render_queue.ensureTotalCapacity(floor_count + visual_count + player_marker_count + self.particles.capacity);
+        try self.render_queue.ensureTotalCapacity(self.world.reserveRenderRecords() + visual_count + player_marker_count + self.particles.capacity);
+    }
+
+    fn validateAtlasReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
+        try validateAtlasReferencesInData(&self.data, runtime_assets);
+    }
+
+    fn validateStructuralAssetReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
+        for (self.simulation_frame.structural_commands.mergedItems()) |command| {
+            switch (command) {
+                .create_entity => |template| {
+                    if (template.asset_reference) |asset_ref| try validateAtlasReference(asset_ref, runtime_assets);
+                },
+                .set_asset_reference => |set| {
+                    if (self.data.isAlive(set.entity)) try validateAtlasReference(set.asset_reference, runtime_assets);
+                },
+                else => {},
+            }
+        }
     }
 
     fn structuralCommandsMayInvalidateNavigation(self: *const GameDemoState) bool {
@@ -548,6 +603,19 @@ fn templateCreatesStaticNavigationObstacle(template: EntityTemplate) bool {
         template.collision_bounds != null;
 }
 
+fn validateAtlasReferencesInData(data: *const DataSystem, runtime_assets: *const RuntimeAssets) !void {
+    const asset_refs = data.assetReferenceSliceConst();
+    for (asset_refs.sprite_ids, asset_refs.atlas_entry_ids) |sprite_id, atlas_entry_id| {
+        try validateAtlasReference(.{ .sprite = sprite_id, .atlas_entry_id = atlas_entry_id }, runtime_assets);
+    }
+}
+
+fn validateAtlasReference(asset_ref: AssetReference, runtime_assets: *const RuntimeAssets) !void {
+    if (!asset_ref.hasAtlasEntry()) return;
+    const meta = runtime_assets.spriteAtlasMeta(asset_ref.sprite) orelse return error.SpriteAtlasMetadataUnavailable;
+    if (meta.sourceRectForId(asset_ref.atlas_entry_id) == null) return error.InvalidSpriteAtlasEntry;
+}
+
 fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
     const specs = [_]TestSquareSpec{
         .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .depth = .actor },
@@ -582,7 +650,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                         .marker_depth = 0,
                         .marker_margin = 0,
                     },
-                    .asset_reference = .{ .sprite = .demo_tile },
+                    .asset_reference = demoCharacterAssetReference(index),
                     .collision_bounds = .{ .size = spec.size },
                     .collision_response = .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 },
                     .ai_agent = if (index == 3)
@@ -613,7 +681,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                 .marker_depth = 0,
                 .marker_margin = 0,
             });
-            try data.setAssetReference(e, .{ .sprite = .demo_tile });
+            try data.setAssetReference(e, demoCharacterAssetReference(index));
             try data.setCollisionBounds(e, .{ .size = spec.size });
             try data.setCollisionResponse(e, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
             break :blk e;
@@ -652,6 +720,11 @@ fn demoSteeringAgent(size: math.Vec2) @import("data_system.zig").SteeringAgent {
         .replan_cooldown_steps = 10,
         .unavailable_backoff_steps = 45,
     };
+}
+
+fn demoCharacterAssetReference(index: usize) AssetReference {
+    const character_ids = [_]u16{ 8, 9, 10, 11, 12, 13, 14, 15 };
+    return .{ .sprite = .grim_characters, .atlas_entry_id = character_ids[index % character_ids.len] };
 }
 
 fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
@@ -709,19 +782,83 @@ const ObstacleSpec = struct {
     color: config.Color,
 };
 
-test "demo spawns colored moving test squares" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+fn initDemoForTest(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
+    const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
+    const world = try WorldSystem.initDemoFromAssetStore(allocator, asset_store, bounds_width, bounds_height);
+    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, world);
+}
+
+fn runtimeAssetsWithWorldTexture() !RuntimeAssets {
+    var runtime_assets = RuntimeAssets.init();
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+    return runtime_assets;
+}
+
+fn runtimeAssetsWithWorldMetadataForTest() !RuntimeAssets {
+    var runtime_assets = try runtimeAssetsWithWorldTexture();
+    runtime_assets.allocator = std.testing.allocator;
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    runtime_assets.atlas_meta[manifest.spriteIndex(.world_tileset)] = .{
+        .world_tileset = try @import("../assets/world_tileset_meta.zig").load(
+            std.testing.allocator,
+            asset_store,
+            manifest.spriteSpec(.world_tileset).metadata_path.?,
+        ),
+    };
+    return runtime_assets;
+}
+
+fn runtimeAssetsWithDemoMetadataForTest() !RuntimeAssets {
+    var runtime_assets = try runtimeAssetsWithWorldMetadataForTest();
+    errdefer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    runtime_assets.atlas_meta[manifest.spriteIndex(.grim_characters)] = .{
+        .sprite_atlas = try sprite_atlas_meta.load(
+            std.testing.allocator,
+            asset_store,
+            .grim_characters,
+            manifest.spriteSpec(.grim_characters).metadata_path.?,
+        ),
+    };
+    return runtime_assets;
+}
+
+fn deinitRuntimeAssetMetadataForTest(runtime_assets: *RuntimeAssets) void {
+    for (&runtime_assets.atlas_meta) |*slot| {
+        if (slot.*) |*meta| {
+            switch (meta.*) {
+                .world_tileset => |*world_meta| world_meta.deinit(),
+                .sprite_atlas => |*atlas_meta| atlas_meta.deinit(),
+            }
+        }
+        slot.* = null;
+    }
+}
+
+fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: SpriteAssetId, texture: TextureId) void {
+    runtime_assets.sprite_slots[@import("../assets/manifest.zig").spriteIndex(id)] = .{
+        .status = .available,
+        .lease = .{ .id = texture },
+    };
+}
+
+test "demo spawns atlas-backed moving actors" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
-    try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(demo.player.entity).?.sprite);
+    const player_asset = demo.data.assetReferenceConst(demo.player.entity).?;
+    try std.testing.expectEqual(SpriteAssetId.grim_characters, player_asset.sprite);
+    try std.testing.expect(player_asset.hasAtlasEntry());
     try std.testing.expectEqual(@as(usize, 0), demo.particles.activeCount());
     for (demo.test_squares) |entity| {
         try std.testing.expect(demo.data.hasComponents(entity, component_masks.movement_body | component_masks.primitive_visual | component_masks.asset_reference | component_masks.collision_bounds | component_masks.collision_response));
-        try std.testing.expectEqual(SpriteAssetId.demo_tile, demo.data.assetReferenceConst(entity).?.sprite);
+        const asset_ref = demo.data.assetReferenceConst(entity).?;
+        try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
+        try std.testing.expect(asset_ref.hasAtlasEntry());
         const body = demo.data.movementBodyConst(entity).?;
         const has_ai = demo.data.hasComponents(entity, component_masks.ai_agent);
         try std.testing.expect(has_ai or body.velocity.x != 0 or body.velocity.y != 0);
@@ -742,10 +879,92 @@ test "demo spawns colored moving test squares" {
     }
 }
 
-test "demo render queue orders mixed world z records after grouped emission" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+test "demo actor atlas entries resolve in installed character metadata" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try sprite_atlas_meta.load(
+        std.testing.allocator,
+        asset_store,
+        .grim_characters,
+        manifest.spriteSpec(.grim_characters).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    const player_asset = @import("data_system.zig").AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
+    try std.testing.expect(meta.sourceRectForId(player_asset.atlas_entry_id) != null);
+    for (0..test_square_count) |index| {
+        const asset_ref = demoCharacterAssetReference(index);
+        try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
+        try std.testing.expect(meta.sourceRectForId(asset_ref.atlas_entry_id) != null);
+    }
+}
+
+test "demo init validates atlas-backed references at loading boundary" {
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+
+    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
+
+    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+}
+
+test "demo init rejects missing character atlas metadata" {
+    var runtime_assets = try runtimeAssetsWithWorldMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+
+    try std.testing.expectError(
+        error.SpriteAtlasMetadataUnavailable,
+        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, 800, 450),
+    );
+}
+
+test "demo atlas validation rejects invalid character entry ids" {
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 4096 });
+
+    try std.testing.expectError(
+        error.InvalidSpriteAtlasEntry,
+        validateAtlasReferencesInData(&data, &runtime_assets),
+    );
+}
+
+test "demo structural asset reference validation rejects invalid atlas entry before mutation" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    const entity = demo.test_squares[0];
+    const previous = demo.data.assetReferenceConst(entity).?;
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_asset_reference = .{
+        .entity = entity,
+        .asset_reference = .{ .sprite = .grim_characters, .atlas_entry_id = 4096 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    try std.testing.expectError(
+        error.InvalidSpriteAtlasEntry,
+        demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets),
+    );
+    const current = demo.data.assetReferenceConst(entity).?;
+    try std.testing.expectEqual(previous.sprite, current.sprite);
+    try std.testing.expectEqual(previous.atlas_entry_id, current.atlas_entry_id);
+}
+
+test "demo render queue orders mixed world z records after grouped emission" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
     demo.render_queue.clearRetainingCapacity();
     const high_obstacle = demo.data.movementBodyPtr(demo.obstacles[0]).?;
@@ -765,9 +984,9 @@ test "demo render queue orders mixed world z records after grouped emission" {
 }
 
 test "demo player trail renders behind player body" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
     demo.render_queue.clearRetainingCapacity();
     demo.emitPlayerTrail();
@@ -786,9 +1005,9 @@ test "demo player trail renders behind player body" {
 
 test "demo render queue reserves for structural visual growth before render enqueue" {
     const created_visual_count = 528;
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
     var created: usize = 0;
     while (created < created_visual_count) {
@@ -817,7 +1036,7 @@ test "demo render queue reserves for structural visual growth before render enqu
         writer.finish();
         demo.simulation_frame.structural_commands.finishWrite();
 
-        const stats = try demo.applyStructuralCommandsAndPostCommitEvents();
+        const stats = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
         try std.testing.expectEqual(batch_count, stats.created);
         created += batch_count;
     }
@@ -836,11 +1055,13 @@ test "demo render queue reserves for structural visual growth before render enqu
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var update_runtime_assets = RuntimeAssets.init();
     var input = InputState{};
 
     try demo.update(.{
         .input = &input,
         .audio = &audio,
+        .runtime_assets = &update_runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -864,7 +1085,7 @@ test "demo render queue reserves for structural visual growth before render enqu
     try demo.enqueueRenderRecords(&runtime_assets, 1.0);
 
     try std.testing.expectEqual(
-        1 + demo.data.primitiveVisualSliceConst().entities.len + 1 + demo.particles.capacity,
+        demo.world.reserveRenderRecords() + demo.data.primitiveVisualSliceConst().entities.len + 1 + demo.particles.capacity,
         demo.render_queue.recordCount(),
     );
 }
@@ -872,7 +1093,7 @@ test "demo render queue reserves for structural visual growth before render enqu
 test "demo owns and completes a simulation frame during update" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -883,6 +1104,7 @@ test "demo owns and completes a simulation frame during update" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
     var input = InputState{};
     input.setHeld(.moveRight, true);
     const player_before = demo.data.movementBodyConst(demo.player.entity).?;
@@ -894,6 +1116,7 @@ test "demo owns and completes a simulation frame during update" {
     try demo.update(.{
         .input = &input,
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -921,7 +1144,7 @@ test "demo owns and completes a simulation frame during update" {
 test "demo collision response blocks player against obstacles" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -932,6 +1155,7 @@ test "demo collision response blocks player against obstacles" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     const obstacle = demo.obstacles[0];
     const obstacle_body = demo.data.movementBodyConst(obstacle).?;
@@ -946,6 +1170,7 @@ test "demo collision response blocks player against obstacles" {
     try demo.update(.{
         .input = &input,
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -960,7 +1185,7 @@ test "demo collision response blocks player against obstacles" {
 test "demo ai processor drives non-player squares via intents (seek_target deterministic, 0-worker serial path)" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -971,6 +1196,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     // Record pre positions for sample ai squares (ai on 0=wander/1=seek/3=template-seek per 8-square spawn mix with pronounced behaviors; ai on 4/5/7 also).
     const ai0 = demo.test_squares[0];
@@ -983,6 +1209,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     try demo.update(.{
         .input = &InputState{},
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1008,7 +1235,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
 test "demo collision response handles player contacts with moving entities" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1019,6 +1246,7 @@ test "demo collision response handles player contacts with moving entities" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     const square = demo.test_squares[0];
     for (demo.test_squares[1..], 0..) |other, index| {
@@ -1053,6 +1281,7 @@ test "demo collision response handles player contacts with moving entities" {
     try demo.update(.{
         .input = &InputState{},
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1065,7 +1294,7 @@ test "demo collision response handles player contacts with moving entities" {
 }
 
 test "ai squares use consistent math.clamp and zero velocity on bounds (main thread only)" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1076,6 +1305,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     // Pick an ai square (index 0 is wander ai), force it out of bounds + outward vel.
     const ai_ent = demo.test_squares[0];
@@ -1090,6 +1320,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     try demo.update(.{
         .input = &InputState{},
         .audio = &audio,
+        .runtime_assets = &runtime_assets,
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1105,8 +1336,9 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
 }
 
 test "demo structural static obstacle change emits one navigation invalidation event" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     demo.simulation_frame.beginStep();
     try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
@@ -1126,7 +1358,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
 
     var nav_invalidations: usize = 0;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1143,8 +1375,9 @@ test "demo structural static obstacle change emits one navigation invalidation e
 }
 
 test "demo preflights navigation invalidation event before structural mutation" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     const entity_count_before = demo.data.movementBodySliceConst().entities.len;
 
@@ -1167,15 +1400,16 @@ test "demo preflights navigation invalidation event before structural mutation" 
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets));
     try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
 }
 
 test "demo preflights same-batch static obstacle promotion before mutation" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     const entity = try demo.data.createEntity();
     try demo.data.setMovementBody(entity, .{
@@ -1202,7 +1436,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets));
     try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
     try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
@@ -1210,8 +1444,9 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
 }
 
 test "demo unrelated structural component change does not invalidate navigation" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     demo.simulation_frame.beginStep();
     try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
@@ -1225,7 +1460,7 @@ test "demo unrelated structural component change does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -1237,8 +1472,9 @@ test "demo unrelated structural component change does not invalidate navigation"
 }
 
 test "demo dynamic entity structural destruction does not invalidate navigation" {
-    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
 
     const dynamic = try demo.data.createEntity();
     try demo.data.setMovementBody(dynamic, .{
@@ -1259,7 +1495,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {

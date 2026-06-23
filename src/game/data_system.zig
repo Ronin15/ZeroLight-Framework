@@ -183,12 +183,20 @@ pub const ConstPrimitiveVisualSlice = struct {
 };
 
 pub const AssetReference = struct {
+    pub const no_atlas_entry: u16 = std.math.maxInt(u16);
+
     sprite: SpriteAssetId,
+    atlas_entry_id: u16 = no_atlas_entry,
+
+    pub fn hasAtlasEntry(self: AssetReference) bool {
+        return self.atlas_entry_id != no_atlas_entry;
+    }
 };
 
 pub const ConstAssetReferenceSlice = struct {
     entities: []const EntityId,
     sprite_ids: []const SpriteAssetId,
+    atlas_entry_ids: []const u16,
 };
 
 pub const CollisionBounds = struct {
@@ -879,10 +887,11 @@ pub const DataSystem = struct {
 
         if (slot.asset_ref_index) |index| {
             self.asset_refs.sprite_ids.items[@intCast(index)] = asset_ref.sprite;
+            self.asset_refs.atlas_entry_ids.items[@intCast(index)] = asset_ref.atlas_entry_id;
             return;
         }
 
-        const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref.sprite);
+        const dense_index = try self.asset_refs.append(self.allocator, id, asset_ref);
         slot.asset_ref_index = dense_index;
         slot.addComponent(.asset_reference);
     }
@@ -890,7 +899,11 @@ pub const DataSystem = struct {
     pub fn assetReferenceConst(self: *const DataSystem, id: EntityId) ?AssetReference {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.asset_ref_index orelse return null;
-        return .{ .sprite = self.asset_refs.sprite_ids.items[@intCast(dense_index)] };
+        const index: usize = @intCast(dense_index);
+        return .{
+            .sprite = self.asset_refs.sprite_ids.items[index],
+            .atlas_entry_id = self.asset_refs.atlas_entry_ids.items[index],
+        };
     }
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
@@ -1945,13 +1958,15 @@ const AssetReferenceStore = struct {
     // prepared sprite records are renderer/cache concerns, not component data.
     entities: std.ArrayList(EntityId) = .empty,
     sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
+    atlas_entry_ids: std.ArrayList(u16) = .empty,
 
-    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, sprite: SpriteAssetId) !u32 {
+    fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, asset_ref: AssetReference) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
         try self.ensureCapacity(allocator, self.entities.items.len + 1);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
-        self.sprite_ids.appendAssumeCapacity(sprite);
+        self.sprite_ids.appendAssumeCapacity(asset_ref.sprite);
+        self.atlas_entry_ids.appendAssumeCapacity(asset_ref.atlas_entry_id);
         return index;
     }
 
@@ -1961,22 +1976,30 @@ const AssetReferenceStore = struct {
         const moved_entity = if (index != last) self.entities.items[last] else null;
         self.entities.items[index] = self.entities.items[last];
         self.sprite_ids.items[index] = self.sprite_ids.items[last];
+        self.atlas_entry_ids.items[index] = self.atlas_entry_ids.items[last];
         _ = self.entities.pop();
         _ = self.sprite_ids.pop();
+        _ = self.atlas_entry_ids.pop();
         return moved_entity;
     }
 
     fn sliceConst(self: *const AssetReferenceStore) ConstAssetReferenceSlice {
-        return .{ .entities = self.entities.items, .sprite_ids = self.sprite_ids.items };
+        return .{
+            .entities = self.entities.items,
+            .sprite_ids = self.sprite_ids.items,
+            .atlas_entry_ids = self.atlas_entry_ids.items,
+        };
     }
 
     fn clearRetainingCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
         _ = allocator;
         self.entities.clearRetainingCapacity();
         self.sprite_ids.clearRetainingCapacity();
+        self.atlas_entry_ids.clearRetainingCapacity();
     }
 
     fn deinit(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
+        self.atlas_entry_ids.deinit(allocator);
         self.entities.deinit(allocator);
         self.sprite_ids.deinit(allocator);
         self.* = .{};
@@ -1985,6 +2008,7 @@ const AssetReferenceStore = struct {
     fn ensureCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
+        try self.atlas_entry_ids.ensureTotalCapacity(allocator, capacity);
     }
 };
 
@@ -2834,17 +2858,20 @@ test "reset invalidates old ids while keeping system reusable" {
     try std.testing.expect(reused.generation != entity.generation);
 }
 
-test "asset references store stable sprite ids" {
+test "asset references store stable sprite ids and optional atlas entries" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
     const entity = try data.createEntity();
-    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
-    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
+    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 8 });
+    const asset_ref = data.assetReferenceConst(entity).?;
+    try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
+    try std.testing.expectEqual(@as(u16, 8), asset_ref.atlas_entry_id);
 
     const slice = data.assetReferenceSliceConst();
     try std.testing.expectEqual(@as(usize, 1), slice.entities.len);
-    try std.testing.expectEqual(SpriteAssetId.demo_tile, slice.sprite_ids[0]);
+    try std.testing.expectEqual(SpriteAssetId.grim_characters, slice.sprite_ids[0]);
+    try std.testing.expectEqual(@as(u16, 8), slice.atlas_entry_ids[0]);
 }
 
 test "collision bounds store is columnar compact and rejects invalid bounds" {
@@ -3098,13 +3125,15 @@ test "structural commands set stable asset references" {
     const commands = [_]StructuralCommand{
         .{ .create_entity = .{
             .movement_body = testBody(1),
-            .asset_reference = .{ .sprite = .demo_tile },
+            .asset_reference = .{ .sprite = .grim_characters, .atlas_entry_id = 9 },
         } },
     };
 
     _ = try data.applyStructuralCommands(&commands);
     const entity = data.assetReferenceSliceConst().entities[0];
-    try std.testing.expectEqual(SpriteAssetId.demo_tile, data.assetReferenceConst(entity).?.sprite);
+    const asset_ref = data.assetReferenceConst(entity).?;
+    try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
+    try std.testing.expectEqual(@as(u16, 9), asset_ref.atlas_entry_id);
 }
 
 test "structural commands prevalidate fallible data before mutating" {
