@@ -16,6 +16,9 @@ lookup, shader/toolchain, and frame-pacing policy before changing code.
 Prefer small reproduction commands and targeted file inspection. Do not broaden the fix until the failing layer is clear.
 
 Read `references/debug-guide.md` when a failure involves build steps, SDL linkage, shader tools, assets, GPU smoke, frame pacing, input/state behavior, or runtime SDL errors.
+When the confirmed fix requires code, performance-sensitive changes, tests,
+comments, or generated-output cleanup, follow `docs/coding-standards.md` in the
+checkout.
 
 ## Coordination
 

@@ -41,6 +41,13 @@ becoming mostly orchestration. Keep the pipeline state-owned; do not promote it
 into a global ECS scheduler, reflection system, dynamic dependency graph, or
 app-level service.
 
+When designing tier/scope scaffolding, put contracts in final owner locations:
+`SimulationScope`, `SimulationTier`, `ActiveRegion`, cold tier/chunk metadata
+defaults, validation helpers, default full-scope construction, and stats. Do
+not enable or claim scoped tier runtime behavior until concrete
+world/chunk/visibility inputs exist and filtered gathers, cadence policy, and
+tier transitions are actually wired.
+
 Controllers may own small feature-local queues, budgets, cooldowns, transient
 scratch, and arbitration rules. They should not become hidden per-entity stores,
 own renderer/audio/SDL handles, hide random choices, or replace SoA processors
@@ -165,3 +172,8 @@ Do not rewrite completed slices to tell history. Preserve completed work, add
 the next finishable feature slices, and keep open work honest. A slice is only
 complete when runtime behavior, diagnostics, docs, tests, and acceptance checks
 are integrated.
+
+When a slice intentionally lands foundation or scaffolding, say exactly what is
+scaffolded, where future behavior hooks in, and which runtime checklist remains
+deferred. Scaffolding should reduce implementation guesswork; it should not
+rename deferred behavior as complete.

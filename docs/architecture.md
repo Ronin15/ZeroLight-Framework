@@ -33,7 +33,7 @@ game-specific behavior under `src/game/`.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
-- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state (Slice 16); gameplay is launched from it via transitions.
+- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via transitions.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
   SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
@@ -103,12 +103,17 @@ render-blocked gameplay pause before the next update, keeps using fallback
 pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
+Frame pacing policy should stay explicit and situational. Do not add broad
+frame-rate caps that hide timing problems or harm high-refresh rendering unless
+the cap preserves a named boundary and is measured.
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
 transformed through that presentation into drawable pixels, then clipped to the
 logical viewport; drawable overlays use raw swapchain pixels. All presentation
 state stays in the SDL_GPU renderer path.
+Debug UI state belongs in the debug overlay and render-service path, not in
+gameplay state or persistent gameplay data.
 
 ## Coordination Boundaries
 
@@ -118,6 +123,10 @@ are reserved for renderer-owned or tightly controlled paths that already submit
 in nondecreasing `RenderOrder`; game states should not call SDL_GPU directly.
 Window, GPU device, swapchain, shader, texture, text, and frame submission code
 stays under `src/render/` and `src/app/`.
+SDL, SDL_ttf, SDL_mixer, and SDL_GPU resources should pair creation and cleanup
+close to the owning site. Ownership wrappers may centralize cleanup, but generic
+state or gameplay teardown should not receive renderer, text, audio, or GPU
+services merely to recover escaped resource ownership.
 
 `Renderer` preserves strict ordered submission while delegating sprite-specific
 CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
@@ -296,9 +305,15 @@ builds a transient `SimulationScope` that decides which entities enter AI,
 steering, movement, and collision stages. Processors keep today's hot loops and
 receive scoped gathers instead of learning world/chunk policy. CPU benchmarks at
 50k scale are throughput ceilings for rare spikes; typical frames should scope
-active work far lower. See
-[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for tier
-definitions, stage map, multi-world scope rules, and Slice 22 tracking.
+active work far lower.
+
+The durable tier model is capability-based, not visibility-based:
+`dormant` entities exist but do not enter normal active scope, `kinematic`
+entities run movement integration, `locomotion` entities add collision
+detection/response, and `cognition` entities add AI, steering, and path
+requests. Scope then decides which loaded worlds, chunks, chunk halos, or
+staggered/reduced-cadence groups enter those tiered stages for the current
+fixed step.
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay

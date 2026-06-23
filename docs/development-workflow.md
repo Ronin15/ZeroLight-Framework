@@ -134,7 +134,10 @@ Loose source sprites under `source_assets/` pack into runtime atlases under
 `assets/sprites/`. See `docs/atlas-asset-workflow.md` for the full filename-driven
 workflow, order manifests, and art-swap steps.
 
-Atlas packing and lint require Python 3 and Pillow (`pip install pillow`).
+Atlas packing, source-art export, and placeholder generation require Python 3
+and Pillow (`pip install pillow`). Runtime atlas lint reads registered PNG/JSON
+sidecars directly; it only needs Pillow when `source_assets/` is present and the
+source-to-runtime comparison invokes the packer.
 
 Common commands:
 
@@ -171,6 +174,9 @@ zig build verify
 ```
 
 `verify` runs compile coverage, unit tests, shader compilation, and atlas lint.
+
+Coding style, performance standards, comment policy, test standards, and
+generated-output rules live in `docs/coding-standards.md`.
 
 ## Benchmarks
 

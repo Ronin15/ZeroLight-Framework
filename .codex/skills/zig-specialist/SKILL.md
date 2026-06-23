@@ -1,11 +1,15 @@
 ---
 name: zig-specialist
-description: Zig game engine implementation specialist for SDL3/SDL_GPU-style projects. Use when Codex is asked to change Zig code, build wiring, tests, shaders, SDL3/SDL_GPU integration, app flow, state stack behavior, input routing, rendering, assets, frame pacing, pause policy, performance-sensitive paths, or related game-engine implementation details.
+description: Senior performance-focused Zig game-engine implementation specialist for SDL3/SDL_GPU-style projects. Use when Codex is asked to change Zig code, build wiring, tests, shaders, SDL3/SDL_GPU integration, app flow, state stack behavior, input routing, rendering, assets, frame pacing, pause policy, performance-sensitive paths, or related game-engine implementation details.
 ---
 
 # Zig Specialist
 
 ## Operating Mode
+
+Act as a senior Zig game-engine engineer: preserve ownership boundaries, keep
+hot paths allocation-free after reserve/warmup, and treat performance-sensitive
+runtime behavior as correctness-critical.
 
 Start by reading the relevant files and current behavior before proposing or editing. Treat the codebase as a normal 2D game project. Prefer existing patterns over new abstractions unless the change clearly removes real complexity or unlocks an intended extension point.
 
@@ -13,7 +17,16 @@ Keep changes scoped, performance-critical, and SDL_GPU-first. Do not introduce n
 
 For engine conventions, commands, and pitfalls, read `references/framework-guide.md` when a task touches more than one ownership boundary, build/test behavior, rendering, state flow, assets, or shaders.
 
+For repo-enforced Zig style, imports, performance, comments, tests,
+generated-output rules, and production-contract boundaries, follow
+`docs/coding-standards.md` in the checkout.
+
 When implementing a roadmap slice, treat it as a full feature. Do not mark a slice complete unless runtime behavior, diagnostics, docs, tests, and acceptance checks are all integrated. If a dependency does not exist yet, call the work foundation or preparation and leave the feature checklist incomplete.
+
+Scaffolding can be valid implementation work when it lands final owner modules,
+storage defaults, validation, and tests that future runtime behavior can hook
+into without rewrites. Keep current behavior preserved by default, and do not
+claim deferred runtime behavior as complete when only scaffolding exists.
 
 ## Coordination
 
@@ -78,34 +91,21 @@ production payloads in tests.
 
 1. Inspect the existing owner file and adjacent tests before editing.
 2. Identify whether the task is app flow, rendering, game behavior, platform integration, assets, or shared primitives.
-3. Make the smallest coherent change in the owning layer.
-4. Keep Zig imports and names idiomatic: use `const std = @import("std");`, import project declarations directly when that keeps call sites clear, avoid `_mod` suffixes, avoid `const Type = file.Type` bridge aliases, and avoid double names such as `thread.ThreadSystem`.
-5. Use a concise lowerCamelCase file namespace only when the call site is clearer as a function or namespace lookup, such as `assets.validateRelativePath(...)`; do not rewrite SDL/C symbols, generated build-option names, or `std.Build` field names.
-6. Comment for contracts and non-obvious intent, not straight-line narration. Use `///` immediately above public exported declarations when callers need ownership, lifetime, invariant, ordering, threading, allocation, failure, or performance context. Use `//` for private helpers, implementation phase markers, local invariants, hot-path rationale, and test fixture context. Keep declaration-level comments above declarations and local comments near the block they explain; avoid comments that restate names or obvious assignments.
-7. Keep raw input mapped to named actions; keep latched frame commands separate from held gameplay input.
-8. Let state-stack policies decide whether lower states receive update, input, or render passes.
-9. Preserve fixed-step simulation with varying-refresh rendering; do not add a blanket 60 FPS render cap.
-10. Pair SDL resource creation with cleanup close to the creation site.
-11. Add scoped `std.log` diagnostics for useful lifecycle, configuration, fallback, and failure context. Keep hot-path debug logging minimal and deliberate, keep `warn`/`err` rare and actionable, and keep pure helpers log-free.
-12. Add behavior-focused Zig tests when logic can be tested without opening a window.
-
-## Performance Rules
-
-Treat performance as part of correctness. Before adding work to per-frame,
-per-event, per-draw, fixed-step update, input dispatch, renderer submission, or
-asset/text lookup paths, identify whether it can be moved to initialization,
-asset loading, state transitions, configuration, or an explicit cache.
-
-- Keep hot paths allocation-free unless the allocation is measured, bounded, and intentionally isolated.
-- Prefer enums, bitsets, arrays, slices, direct indices, ring buffers, and generational IDs for runtime dispatch and resource lookup.
-- Treat `DataSystem` as the persistent gameplay data owner and ECS storage foundation. Entity IDs, component masks, and dense typed SoA component stores live there; ECS systems/processors such as movement, AI, collision, pathfinding, and render preparation should be mostly stateless processors over `DataSystem` slices.
-- Store stable asset IDs such as `SpriteAssetId` and `AudioAssetId` in gameplay/render-prep data. Do not store string paths, `TextureId`, `TextureLease`, prepared sprite records, SDL_mixer handles, or loaded audio handles in `DataSystem`.
-- Keep hot ECS component data in dense SoA columns. Component masks are for membership/query decisions, not a replacement for direct slice iteration in hot processors.
-- Keep entity structural changes, state transitions, SDL/GPU calls, asset loading, save/load streaming, and renderer resource ownership out of threaded SIMD processors unless an explicit deferred/main-thread boundary is designed.
-- For threaded/SIMD ECS work, document hot SoA column alignment, split worker ranges so workers do not write the same cache line, and use 64-byte padding only for thread-shared records where false sharing is a real risk. Do not pad cold entity slot metadata by default.
-- Avoid string-key lookup, hash-map dispatch, broad dynamic dispatch, callback chains, repeated descriptor validation, and formatted logging in hot paths unless justified by measured behavior.
-- Preserve fixed-step simulation with varying-refresh rendering; do not add broad frame-rate caps that harm high-refresh displays.
-- Keep renderer-facing data prepared, batchable, and handle-based rather than reconstructing resources or lookup state each frame.
+3. Apply `docs/coding-standards.md` before changing imports, comments, tests,
+   generated files, or performance-sensitive paths.
+4. Make the smallest coherent change in the owning layer.
+5. Keep raw input mapped to named actions; keep latched frame commands separate
+   from held gameplay input.
+6. Let state-stack policies decide whether lower states receive update, input,
+   or render passes.
+7. Preserve fixed-step simulation with varying-refresh rendering; do not add a
+   blanket render cap.
+8. Pair SDL resource creation with cleanup close to the owning site.
+9. Add scoped `std.log` diagnostics for useful lifecycle, configuration,
+   fallback, and failure context. Keep hot-path debug logging minimal and
+   deliberate.
+10. Add behavior-focused Zig tests when logic can be tested without opening a
+    window.
 
 ## Validation Defaults
 

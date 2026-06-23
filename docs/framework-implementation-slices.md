@@ -29,19 +29,26 @@ adding broad abstraction.
   batchers only after measurement shows the sprite/rect batcher is the wrong
   representation. Keep SDL_GPU command-buffer, swapchain, upload, render-pass,
   and submit ownership on the render thread.
-- Track collision-response merge/apply, render-queue and batch capacity,
-  text-cache lifetime policy, shader/material registry guardrails, and manual
-  registry guardrails as hardening follow-ups.
+- Track collision-response merge/apply, SpriteBatch high-water/capacity policy,
+  text-cache lifetime policy, shader/material registry guardrails, and remaining
+  manual registry guardrails as hardening follow-ups.
 - Treat Slice 20 pathfinding budgets, deterministic pending retention, and
   fixed-capacity cache contracts as the navigation hardening base before
   scaling to large maps or many NPC path users.
-- Add a typed simulation event system slice before broad domain features such as
-  tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
-  and spawning start depending on cross-system change signals.
-- Extract Slice 22 `SimulationPipeline` and scoped simulation tiers before
-  broad world/chunk gameplay depends on manual `GameDemoState` orchestration.
-  See [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for
-  tier definitions, scope rules, stage map, and acceptance themes.
+- Use the completed Slice 21 typed simulation events as the cross-system signal
+  foundation before broad domain features such as tiles, weather, obstacle
+  state, AI perception, combat, spawning, resources, and rules depend on those
+  changes.
+- Start Slice 22 with a behavior-preserving `SimulationPipeline` extraction
+  plus tier/scope scaffolding in the final owner locations. The first runtime
+  behavior stays full active-set parity, but `SimulationTier`, `ActiveRegion`,
+  cold tier/chunk metadata, and scope stats should be shaped so later world and
+  chunk hooks do not require guesswork or contract rewrites.
+- Add atlas-backed world rendering before enabling scoped tier behavior. World
+  rendering should provide the concrete tile/chunk/visibility data that scoped
+  simulation consumes instead of inventing abstract chunk policy in isolation.
+  See [architecture.md](architecture.md) for durable tier and pipeline
+  boundaries; this roadmap owns the implementation order and acceptance themes.
 - When multiple gameplay states need the same ordered processor flow, share the
   state-owned pipeline helper instead of duplicating orchestration or adding a
   global ECS scheduler. The pipeline may own lightweight domain controllers,
@@ -67,7 +74,7 @@ live in `DataSystem` or state-owned domain storage, per-step outputs live in
 typed slices and emit deterministic outputs.
 Simulation tiers and per-step active scope filter which entities enter each
 pipeline stage without changing processor hot paths. See
-[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md).
+[architecture.md](architecture.md) for the durable tier and pipeline boundary.
 Pathfinding provides a navigation substrate; immersive NPC behavior still needs
 steering, local avoidance, perception, and rule arbitration layered above it.
 
@@ -1552,22 +1559,32 @@ explicit reaction points, and high-volume streams remain specialized. The first
 concrete domain reaction is navigation
 invalidation from static obstacle-affecting structural changes.
 
-## Slice 22: Simulation Pipeline And Scoped Tiers
+## Slice 22: Simulation Pipeline And Tier/Scope Scaffolding
 
 Goal: extract state-owned fixed-step orchestration into `SimulationPipeline`,
-add `SimulationScope` and simulation tiers, and keep today's processor order
-while scoping which entities run each stage. This is the world-scale policy
-layer on top of the existing fast processor stack.
+add the tier/scope scaffolding in its final ownership locations, and preserve
+today's full active-set processor behavior. This is the architectural landing
+zone for later scoped simulation, not the slice that turns on world/chunk tier
+filtering.
 
 Design source of truth:
 
-- [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md)
+- [architecture.md](architecture.md) for durable pipeline, controller,
+  tier/scope, and ownership guidance.
+- [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for the
+  current `SimulationFrame` streams, events, and structural-command contracts
+  that the pipeline extraction must preserve.
 
 Current foundation:
 
 - Slice 12 provides `SimulationFrame`, `SimulationPhase`, typed streams, and
   deferred structural commits.
 - `GameDemoState.update` already runs the full processor order explicitly.
+- `GameDemoState.update` applies structural commits and reserves the render
+  queue for the current primitive-visual rows before render enqueue.
+- `GameDemoState.render` emits transient draw records by iterating current
+  primitive visual rows through render prep, with the player marker and
+  particles handled as explicit render producers outside fixed-step simulation.
 - Processors gather dense `DataSystem` slices and support threaded serial
   parity paths with benchmarks into the 50k stress scale.
 - Architecture docs already describe `SimulationPipeline` as the future owner of
@@ -1576,7 +1593,9 @@ Current foundation:
 Architecture notes:
 
 - Tiers are persistent membership; scope is per-step active filtering; the
-  pipeline is one ordered stage list with gated inputs.
+  pipeline is one ordered stage list with gated inputs. Slice 22 defines those
+  contracts and default full-active behavior, while later scoped runtime
+  behavior waits for world rendering and chunk/visibility data.
 - Tier and chunk metadata stay on cold `EntitySlot` data, not hot movement SoA
   columns, unless profiling proves otherwise.
 - Processors stay dumb: scoped gather entry points filter inputs without
@@ -1584,7 +1603,7 @@ Architecture notes:
 - Tier promotion/demotion commits at the deferred structural boundary or an
   explicit main-thread commit, not inside worker ranges.
 - Slice 21 events/controllers are the long-term tier transition source; spatial
-  chunk policy is the first concrete source.
+  chunk policy is the first concrete source after world rendering lands.
 - Benchmark 50k counts prove spike absorption; typical gameplay should scope
   active cognition/collision far lower every frame.
 - Render preparation remains a separate render-facing phase after fixed-step
@@ -1593,14 +1612,56 @@ Architecture notes:
   slices and scope lists to render prep rather than calling `Renderer` or
   owning `RenderQueue`.
 
+Implementation context to preserve:
+
+- This slice is still the planned pipeline + tier/scope architecture, not a
+  reduced pipeline-only cleanup. It should scaffold `SimulationScope`,
+  `SimulationTier`, `ActiveRegion`, cold tier/chunk metadata, full-active scope
+  construction, and scope stats in the places where later scoped runtime
+  behavior will hook in.
+- The first extraction should make the next implementation easier by moving
+  phase driving and ordered processor dispatch behind a state-owned helper. It
+  should not erase the already-decided tier, scope, controller, render-handoff,
+  or event-driven transition plan.
+- Keep the current order visible while extracting it: main-thread inputs,
+  AI navigation intent production, steering/path status consumption,
+  pathfinding, sparse movement-intent application, movement integration,
+  player bounds clamp, collision detection, collision response, particle/domain
+  reactions, structural commit, and post-commit render-queue reservation.
+- Scoped runtime behavior remains required after world rendering provides real
+  tile/chunk/visibility data. The initial full-active-set pipeline and tier
+  scaffolding are architectural stepping stones; they must not be documented as
+  completed scoped tier behavior.
+
 Checklist:
 
-- [ ] Add `src/game/simulation_pipeline.zig` and move the ordered fixed-step
-      sequence out of `GameDemoState.update`.
+- [ ] Add `src/game/simulation_pipeline.zig` with a thin state-owned
+      `SimulationPipeline` that drives today's ordered fixed-step sequence over
+      existing systems, `DataSystem`, and `SimulationFrame`.
+- [ ] Change `GameDemoState` to own one `SimulationPipeline` and delegate the
+      processor dispatch from `update` without changing behavior for the full
+      active set.
 - [ ] Add `src/game/simulation_scope.zig` with `SimulationTier`, `ActiveRegion`,
-      and per-step gather lists or dense index subsets.
-- [ ] Introduce cold tier/chunk metadata on `EntitySlot` or equivalent compact
-      storage with validation helpers and tests.
+      `SimulationScope`, full-active default construction, scope stats, and
+      validation helpers.
+- [ ] Add cold tier/chunk metadata on `EntitySlot` or equivalent compact storage
+      with default values that preserve today's behavior for all existing
+      entities.
+- [ ] Keep player input, audio command emission, structural commit/domain
+      reactions, render enqueue, and private clamp/sync helpers in
+      `GameDemoState` for the first extraction step unless a real controller
+      boundary is implemented with tests.
+- [ ] Add full-set delegation/parity tests that prove the pipeline extraction
+      preserves phase order, stream outputs, structural commit behavior, render
+      queue reservation, and simulation stats.
+- [ ] Add tests proving tier/chunk metadata defaults, validation, and full-active
+      scope construction do not change current simulation output.
+- [ ] Leave scoped processor filtering, stagger/reduced cadence, and real
+      chunk/visibility gates disabled until the post-world-rendering scoped tier
+      slice.
+
+Deferred until after world rendering:
+
 - [ ] Add scoped gather entry points for movement, collision, AI, and steering
       without changing hot processor math or merge rules.
 - [ ] Add a render-prep handoff that exposes active/visible entity lists and
@@ -1619,8 +1680,96 @@ Checklist:
 Acceptance checks:
 
 - [ ] `GameDemoState` delegates fixed-step processor dispatch to
-      `SimulationPipeline` with no behavior change when all entities are treated
-      as full-tier active scope.
+      `SimulationPipeline` with no behavior change for today's full active set.
+- [ ] Tier/scope scaffolding exists in the final owner modules and storage
+      locations, with default full-active behavior and validation tests.
+- [ ] Scope stats report the full-active counts without changing processor
+      participation, adding per-frame logging, or adding benchmark timers to
+      runtime rendering.
+- [ ] The slice does not claim scoped-tier completion: scoped gathers, stagger
+      policy, real chunk gates, and tier transitions remain unchecked in this
+      slice until world rendering supplies concrete world/chunk inputs.
+- [ ] `zig build test` covers pipeline phase transitions, full-active scope
+      construction, metadata defaults, and no behavior change without opening a
+      window.
+
+## Slice 23: Atlas-Backed World Rendering Addition
+
+Goal: add a minimal world/tile rendering foundation that uses the existing
+world tileset atlas metadata and render-prep boundary. This gives scoped
+simulation concrete world, chunk, and visibility data to consume later.
+
+Current foundation:
+
+- Runtime assets preload atlas textures and metadata for `.world_tileset`,
+  `.grim_characters`, and `.grim_items`.
+- `world_tileset_meta.zig` validates tile JSON and exposes tile lookup by name,
+  id, category, animation, and source rect.
+- `RenderQueue` owns transient draw-record ordering and `Renderer` owns SDL_GPU
+  submission.
+
+Architecture notes:
+
+- World/tile state should live in game-owned world data or `DataSystem` stable
+  IDs, not in renderer resources.
+- Render prep resolves tile IDs through `RuntimeAssets.worldTilesetMeta()` and
+  emits ordered draw records; it does not store string paths or live texture
+  handles in persistent gameplay data.
+- The first world renderer should expose enough chunk/visibility shape for the
+  later scoped tier slice, but it should not enable simulation tier filtering by
+  itself.
+
+Checklist:
+
+- [ ] Add a small world/tile data owner with tile IDs, world coordinates, and
+      chunk/visibility metadata suitable for later `ActiveRegion` construction.
+- [ ] Render at least one world/tile layer from `.world_tileset` atlas metadata
+      through render prep and `RenderQueue`.
+- [ ] Keep tile draw ordering explicit by `RenderOrder` and stable source rects.
+- [ ] Add tests for tile lookup, world-to-render enqueue, missing metadata
+      fallback, and deterministic queue record order.
+- [ ] Update rendering/assets docs and roadmap cross-links after runtime wiring
+      lands.
+
+Acceptance checks:
+
+- [ ] Demo/world rendering uses atlas metadata instead of per-tile textures or
+      runtime string lookup.
+- [ ] World/chunk/visibility data exists in a form the later scoped tier slice
+      can consume without ownership rewrites.
+- [ ] Render-prep benchmarks still measure the queue-to-batch path outside the
+      production render path.
+- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
+
+## Slice 24: Scoped Simulation Tiers And Chunk Policy
+
+Goal: turn the Slice 22 scaffolding into real scoped simulation behavior after
+Slice 23 provides world/chunk/visibility inputs.
+
+Current foundation:
+
+- `SimulationPipeline`, `SimulationScope`, `SimulationTier`, `ActiveRegion`,
+  cold tier/chunk metadata, and full-active scope stats exist from Slice 22.
+- World rendering provides concrete tile/chunk/visibility data from Slice 23.
+- Slice 21 events provide typed signals for future wake/promotion/demotion
+  policy.
+
+Checklist:
+
+- [ ] Add scoped gather entry points for movement, collision, AI, and steering
+      without changing hot processor math or merge rules.
+- [ ] Wire `ActiveRegion` from world/chunk/visibility data.
+- [ ] Keep the existing processor stage order identical while scope shrinks
+      participation.
+- [ ] Add stagger and reduced-cadence policy for cognition without adding a
+      second pipeline.
+- [ ] Wire tier changes through deferred structural commands or explicit
+      main-thread commits; processors must not mutate tier metadata in ranges.
+- [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
+      stagger skips, and wake promotions.
+
+Acceptance checks:
+
 - [ ] Scoped and unscoped processor paths produce identical outputs for the same
       entity subset in tests.
 - [ ] Tier/chunk filtering changes which entities enter each stage without
@@ -1631,9 +1780,6 @@ Acceptance checks:
       pipeline phase transitions without opening a window.
 - [ ] Benchmarks or debug stats report active scope counts so typical runs stay
       far below 50k stress scales by policy rather than by accident.
-- [ ] Render-prep benchmarks still measure the queue-to-batch path outside the
-      production render path, and scoped simulation changes do not add benchmark
-      timers or logging to runtime rendering.
 
 ## Suggested Order
 
@@ -1659,7 +1805,9 @@ Acceptance checks:
 19. Steering and local avoidance.
 20. Navigation hardening and hard-path budgets.
 21. Typed simulation event system and domain signals.
-22. Simulation pipeline and scoped tiers.
+22. Simulation pipeline and tier/scope scaffolding.
+23. Atlas-backed world rendering addition.
+24. Scoped simulation tiers and chunk policy.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
@@ -1671,9 +1819,10 @@ Render ordering is also part of that foundation: game/world/UI/effect producers
 emit typed draw records through `RenderQueue`, persistent data stores stable IDs
 and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
 benchmark-owned render-prep timing stays out of the production path.
-`SimulationPipeline` and scoped tiers should land before broad multi-chunk or
-multi-world gameplay duplicates `GameDemoState` orchestration. Typed
-simulation/domain events should land before broad tile, weather, obstacle,
-perception, combat, spawning, resource, and rule-system interactions depend on
-cross-system communication; tier transitions should eventually consume those
-event signals through pipeline-owned controllers.
+Slice 21 typed simulation/domain events are in place for current structural and
+navigation signals. `SimulationPipeline` extraction plus tier/scope scaffolding
+should land next, before broad multi-chunk or multi-world gameplay duplicates
+`GameDemoState` orchestration. Atlas-backed world rendering should then provide
+the concrete world/chunk/visibility data that scoped tiers consume. Scoped
+tiers, chunk policy, and tier transitions should use those event signals through
+pipeline-owned controllers instead of adding parallel orchestration paths.

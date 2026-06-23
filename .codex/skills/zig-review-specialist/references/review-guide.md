@@ -1,5 +1,10 @@
 # Zig Game Engine Review Guide
 
+Use `docs/coding-standards.md` in the checkout as the canonical source for
+style, performance, comments, tests, generated-output rules, and production
+contract boundaries. This guide defines review priorities and engine-specific
+checks; the standards doc defines the enforceable baseline.
+
 ## Severity Priorities
 
 Start with issues that can cause wrong runtime behavior, crashes, leaks, undefined behavior, missed cleanup, broken build/test workflows, or performance regressions in hot paths. Style-only concerns belong last or should be omitted.
@@ -36,6 +41,10 @@ Use concrete severity judgment:
   pipelines own controller order.
 - Domain controllers coordinate feature policy and handoff, but persistent
   gameplay/domain facts stay in `DataSystem` or state-owned domain storage.
+- Pipeline and tier/scope scaffolding should preserve current behavior while
+  placing contracts in final owner locations. Flag changes that claim scoped
+  tier runtime behavior before concrete world/chunk/visibility inputs exist, or
+  that leave scaffolding in throwaway/test-only shapes.
 
 ## Simulation Event Checks
 
@@ -87,6 +96,12 @@ test-only enum tags, union payloads, marker fields, fake stages, fixture-only
 service hooks, service shortcuts, or test-only paths in production code; prefer
 private test helper types, local fixtures, test-only mocks, or real runtime
 payloads.
+
+When reviewing roadmap scaffolding, distinguish final-location scaffolding from
+half-wired behavior. Good scaffolding has production owner modules, defaults,
+validation, and tests that preserve current behavior. It should not add fake
+runtime payloads, hidden test contracts, or docs that mark deferred runtime
+behavior complete.
 
 When tests are weak, say exactly what contract remains untested and give a narrow scenario that would expose the bug.
 

@@ -4,6 +4,11 @@
 
 Use this guidance for lean Zig SDL3/SDL_GPU 2D game projects. Treat the codebase as a normal game project. Keep the base Linux-friendly, SDL_GPU-first, and dependency-conscious. Prefer SDL3 plus Zig standard library facilities unless the user explicitly chooses a dependency.
 
+In this repo, `AGENTS.md` is the short routing and guardrail file.
+`docs/architecture.md` owns durable architecture, `docs/framework-implementation-slices.md`
+owns roadmap status, and `docs/coding-standards.md` owns enforced Zig style,
+performance, comment, test, and generated-output standards.
+
 ## Ownership Boundaries
 
 - `src/main.zig` owns the executable entry point and high-level fixed-step timing loop.
@@ -20,6 +25,13 @@ Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and t
 ## Slice Completion
 
 Roadmap slices are full features. Runtime behavior, diagnostics, docs, tests, and acceptance checks must all be integrated before a slice is complete. If a needed dependency does not exist yet, label the result as foundation or preparation and leave the feature checklist incomplete.
+
+Scaffolding is acceptable only when it lands final owner modules, storage
+defaults, validation, and tests that future runtime behavior can hook into
+without rewrites. It should preserve current behavior by default and must not
+be documented as completed gameplay/runtime behavior. For scope/tier work,
+defer real filtering, cadence, and transition behavior until concrete
+world/chunk/visibility inputs exist.
 
 Use scoped `std.log` diagnostics as part of feature work. Debug logs may include detailed low-frequency lifecycle, configuration, fallback, and failure context. Avoid routine per-frame, per-event, or per-draw formatting unless the diagnostic value is clear and the impact is minimal. Keep `warn` for recovered degraded behavior, `err` for real failure context, and pure helper/validation functions log-free unless they are runtime wrappers.
 
@@ -60,11 +72,16 @@ Runtime assets live under `assets/` and are installed to `zig-out/bin/assets` un
 
 Shader tools are required for runnable builds. Linux uses SPIR-V output; macOS uses SPIR-V converted to MSL. If shader compilation fails, separate shader tool availability from Zig compile errors.
 
+Atlas packing, source-art export, and placeholder generation require Python 3
+plus Pillow. Runtime atlas lint validates registered PNG/JSON sidecars directly
+and only needs Pillow when `source_assets/` is present and the source-to-runtime
+comparison invokes the atlas packer.
+
 ## Testing Guidance
 
-Use Zig `test` blocks and `std.testing`. Put reusable module tests beside the code they cover. Name tests by behavior, such as `test "player movement clamps to window bounds"`.
-
-Prefer tests that validate contracts directly: input routing behavior, state policy flow, resource ID validation, viewport math, descriptor validation, or timing decisions. Do not require a window for ordinary unit tests.
+Use `docs/coding-standards.md` as the canonical source for test shape,
+production-contract boundaries, performance rules, comment policy, import
+style, and generated output rules.
 
 Use an aggregate test root when nested imports would otherwise cross module paths. Keep GPU smoke checks separate from non-interactive unit behavior because they require a usable display and GPU backend.
 

@@ -20,6 +20,9 @@ and hardware-aware hot paths.
 Read `references/design-guide.md` when a request touches `DataSystem`, gameplay
 processors, emergent simulation, AI, collision, pathfinding, render prep,
 save/load, or roadmap-slice design.
+When a design specifies performance policy, tests, public contracts, generated
+outputs, comments, or implementation handoff details, align those requirements with
+`docs/coding-standards.md` in the checkout.
 
 ## Design Workflow
 

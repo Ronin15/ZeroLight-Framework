@@ -152,7 +152,9 @@ Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
-project does not require `SDL3_image`.
+project does not require `SDL3_image`. Do not add `SDL3_image` unless that
+dependency is explicitly chosen for a feature that core SDL3 PNG loading cannot
+reasonably cover.
 
 The asset cache maps validated relative PNG paths to renderer `TextureId`
 values. Loading the same path decodes PNG data through `AssetStore`, uploads
