@@ -4,7 +4,9 @@
 
 const std = @import("std");
 const config = @import("../config.zig");
-const Renderer = @import("renderer.zig").Renderer;
+const renderer_file = @import("renderer.zig");
+const Renderer = renderer_file.Renderer;
+const RenderOrder = renderer_file.RenderOrder;
 const text = @import("text.zig");
 const FontId = text.FontId;
 const PreparedText = text.PreparedText;
@@ -15,7 +17,6 @@ const yellow = config.Color{ .r = 1.0, .g = 0.902, .b = 0.157, .a = 1.0 };
 const sample_window_ns = std.time.ns_per_s / 4;
 const font_size: f32 = 18;
 const font_size_epsilon: f32 = 0.1;
-const overlay_layer: i32 = 10_000;
 
 pub const FpsCounter = struct {
     font: FontId = FontId.invalid,
@@ -85,7 +86,7 @@ pub const FpsCounter = struct {
         try text.drawPreparedText(renderer, self.prefix, .{
             .x = x,
             .y = y,
-            .layer = overlay_layer,
+            .order = RenderOrder.debug(.overlay),
             .coordinate_space = .drawable,
         });
         x += @floatFromInt(self.prefix.width);
@@ -97,7 +98,7 @@ pub const FpsCounter = struct {
             try text.drawPreparedText(renderer, prepared, .{
                 .x = x,
                 .y = y,
-                .layer = overlay_layer,
+                .order = RenderOrder.debug(.overlay),
                 .coordinate_space = .drawable,
             });
             x += @floatFromInt(prepared.width);

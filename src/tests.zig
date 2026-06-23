@@ -10,8 +10,11 @@ comptime {
     _ = @import("assets/assets.zig");
     _ = @import("assets/cache.zig");
     _ = @import("assets/image.zig");
+    _ = @import("assets/atlas_meta_common.zig");
     _ = @import("assets/manifest.zig");
     _ = @import("assets/runtime_assets.zig");
+    _ = @import("assets/world_tileset_meta.zig");
+    _ = @import("assets/sprite_atlas_meta.zig");
     _ = @import("app/audio.zig");
     _ = @import("app/frame_pacer.zig");
     _ = @import("app/input.zig");
@@ -28,6 +31,7 @@ comptime {
     _ = @import("benchmarks/movement.zig");
     _ = @import("benchmarks/particles.zig");
     _ = @import("benchmarks/pathfinding.zig");
+    _ = @import("benchmarks/render_prep.zig");
     _ = @import("benchmarks/steering.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
@@ -38,7 +42,10 @@ comptime {
     _ = @import("game/menu_view.zig");
     _ = @import("game/settings_menu_state.zig");
     _ = @import("game/player.zig");
+    _ = @import("game/render_depth.zig");
+    _ = @import("game/render_prep.zig");
     _ = @import("game/simulation.zig");
+    _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
@@ -52,6 +59,7 @@ comptime {
     _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");
+    _ = @import("render/render_queue.zig");
     _ = @import("render/resources.zig");
     _ = @import("render/sprite_batch.zig");
     _ = @import("render/text.zig");

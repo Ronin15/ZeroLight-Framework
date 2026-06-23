@@ -1,0 +1,111 @@
+{
+  "atlas": {
+    "name": "grim_dark_characters",
+    "theme": "grim_dark_fantasy",
+    "png": "sprites/grim_characters.png",
+    "json": "sprites/grim_characters.json",
+    "sprite_asset_id": "grim_characters",
+    "frame_width": 32,
+    "frame_height": 48,
+    "columns": 8,
+    "append_unlisted": true
+  },
+  "sprites": [
+    {
+      "name": "adventurer",
+      "category": "hero"
+    },
+    {
+      "name": "knight",
+      "category": "hero"
+    },
+    {
+      "name": "rogue",
+      "category": "hero"
+    },
+    {
+      "name": "mage",
+      "category": "hero"
+    },
+    {
+      "name": "merchant",
+      "category": "npc"
+    },
+    {
+      "name": "priest",
+      "category": "npc"
+    },
+    {
+      "name": "wounded_soldier",
+      "category": "npc"
+    },
+    {
+      "name": "hooded_stranger",
+      "category": "npc"
+    },
+    {
+      "name": "skeleton",
+      "category": "enemy"
+    },
+    {
+      "name": "bone_archer",
+      "category": "enemy"
+    },
+    {
+      "name": "cultist",
+      "category": "enemy"
+    },
+    {
+      "name": "dark_hound",
+      "category": "enemy"
+    },
+    {
+      "name": "plague_rat",
+      "category": "enemy"
+    },
+    {
+      "name": "revenant",
+      "category": "enemy"
+    },
+    {
+      "name": "wraith",
+      "category": "enemy"
+    },
+    {
+      "name": "bone_golem",
+      "category": "enemy"
+    },
+    {
+      "name": "witch",
+      "category": "enemy"
+    },
+    {
+      "name": "bandit",
+      "category": "enemy"
+    },
+    {
+      "name": "royal_guard",
+      "category": "npc"
+    },
+    {
+      "name": "ghoul",
+      "category": "enemy"
+    },
+    {
+      "name": "crow_beast",
+      "category": "enemy"
+    },
+    {
+      "name": "death_knight",
+      "category": "enemy"
+    },
+    {
+      "name": "torchbearer",
+      "category": "enemy"
+    },
+    {
+      "name": "grave_digger",
+      "category": "npc"
+    }
+  ]
+}

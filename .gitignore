@@ -6,3 +6,5 @@ docs/benchmarks/
 zig-pkg/
 zig-out/
 test-sdl
+__pycache__/
+source_assets/

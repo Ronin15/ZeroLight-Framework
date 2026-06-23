@@ -5,8 +5,11 @@
 //! Frame-delayed grid pathfinding system.
 //! Owns transient request queues, result caches, nav-grid state, fixed scratch,
 //! and stage tuners. Fixed-step update is allocation-free after reserve/rebuild.
+//! Most requests resolve through cached goal fields; hard fallbacks are budgeted
+//! so expensive searches can spill across frames without reordering requests.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -28,7 +31,8 @@ const default_max_pending_requests: usize = 1024;
 const default_max_cached_results: usize = 1024;
 const default_max_goal_fields: usize = 8;
 const default_max_worker_scratch_slots: usize = 64;
-const default_max_solved_requests_per_step: usize = 64;
+const default_max_solved_requests_per_step: usize = 128;
+pub const default_max_fallback_requests_per_step: usize = 128;
 const no_parent: usize = std.math.maxInt(usize);
 const no_component: u32 = 0;
 const diagonal_cost: u32 = 14;
@@ -54,6 +58,8 @@ pub const GridCell = struct {
 };
 
 pub const PathQueryKey = struct {
+    // nav_version is part of every key so a rebuilt grid invalidates old
+    // pending work and cache entries without needing pointer comparisons.
     nav_version: u32,
     agent_class: PathAgentClass,
     start: GridCell,
@@ -73,6 +79,7 @@ pub const PathfindingCapacity = struct {
     max_goal_fields: usize = default_max_goal_fields,
     max_worker_scratch_slots: usize = default_max_worker_scratch_slots,
     max_solved_requests_per_step: usize = default_max_solved_requests_per_step,
+    max_fallback_requests_per_step: usize = default_max_fallback_requests_per_step,
 };
 
 pub const PathfindingConfig = struct {
@@ -82,6 +89,7 @@ pub const PathfindingConfig = struct {
     field_result_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     fallback_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     max_solved_requests_per_step: ?usize = null,
+    max_fallback_requests_per_step: ?usize = null,
 };
 
 pub const PathfindingStats = struct {
@@ -95,6 +103,7 @@ pub const PathfindingStats = struct {
     unavailable_results: usize = 0,
     dropped_requests: usize = 0,
     deferred_requests: usize = 0,
+    fallback_deferred_requests: usize = 0,
     cache_hits: usize = 0,
     field_cache_hits: usize = 0,
     goal_fields_built: usize = 0,
@@ -155,6 +164,9 @@ const Portal = struct {
 };
 
 const NavGrid = struct {
+    // Static navigation grid derived from DataSystem collision rows. It owns
+    // component labels for cheap disconnected-goal rejection and portal hints
+    // for common wall-gap detours before heap fallback.
     cell_size: f32 = default_cell_size,
     width: usize = 0,
     height: usize = 0,
@@ -174,6 +186,8 @@ const NavGrid = struct {
     }
 
     fn rebuild(self: *NavGrid, allocator: std.mem.Allocator, data: *const DataSystem, bounds_width: f32, bounds_height: f32, cell_size: f32) !void {
+        // Rebuild is the only path that reads static obstacles from DataSystem.
+        // Once complete, workers query immutable grid arrays and scratch only.
         self.cell_size = cell_size;
         self.width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(bounds_width / cell_size))));
         self.height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(bounds_height / cell_size))));
@@ -270,6 +284,8 @@ const NavGrid = struct {
     }
 
     fn markBlockedRectSimd(self: *NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
+        // Obstacle marking is row-local and bounded by clamped cells. SIMD is
+        // used only for column membership; writes still happen per active lane.
         if (!self.valid()) return;
         const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
         const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - 0.001), .y = @max(min_y, max_y - 0.001) });
@@ -305,6 +321,8 @@ const NavGrid = struct {
     }
 
     fn buildComponentsAndWaypoints(self: *NavGrid) void {
+        // Components identify connected open regions. Portals are lightweight
+        // waypoints discovered from one-cell gaps between blocked bands.
         @memset(self.components.items, no_component);
         self.component_queue.clearRetainingCapacity();
         self.portals.clearRetainingCapacity();
@@ -372,6 +390,8 @@ const NavGrid = struct {
 };
 
 const KeySet = struct {
+    // Fixed-capacity linear-probe set for pending/unavailable requests. Full
+    // sets drop new inserts instead of allocating during the fixed-step update.
     slots: std.ArrayList(KeySetSlot) = .empty,
     len: usize = 0,
 
@@ -432,6 +452,8 @@ const KeySetSlot = struct {
 };
 
 const ResultCache = struct {
+    // Deterministic fixed-size cache. Open addressing handles lookups, while a
+    // simple rotating slot chooses evictions when the table is full.
     slots: std.ArrayList(ResultCacheSlot) = .empty,
     len: usize = 0,
     next_evict: usize = 0,
@@ -495,6 +517,8 @@ const ResultCacheSlot = struct {
 };
 
 const EntityResultCache = struct {
+    // Per-entity status cache lets steering ask for one actor's most recent
+    // result without changing the shared path-key cache semantics.
     slots: std.ArrayList(EntityResultCacheSlot) = .empty,
     len: usize = 0,
     next_evict: usize = 0,
@@ -565,6 +589,8 @@ const EntityResultCacheSlot = struct {
 };
 
 const GoalField = struct {
+    // Reverse search from a popular goal. Once built, each request only chooses
+    // the neighboring cell with the lowest stored cost.
     occupied: bool = false,
     key: GoalKey = emptyGoalKey(0),
     generation: u32 = 1,
@@ -591,6 +617,8 @@ const GoalField = struct {
     }
 
     fn build(self: *GoalField, grid: *const NavGrid, key: GoalKey) bool {
+        // Generation stamps avoid clearing the cost array for every rebuild; a
+        // stale row behaves as unreachable until written in this generation.
         const goal_index = grid.indexForCell(key.goal) orelse return false;
         if (grid.isBlockedIndex(goal_index)) return false;
         self.occupied = false;
@@ -687,6 +715,8 @@ const GoalField = struct {
 };
 
 const SearchScratch = struct {
+    // One scratch slot per ThreadSystem participant. A worker owns its scratch
+    // for the whole range, so fallback A* does not allocate or share queues.
     generation: u32 = 1,
     open: std.ArrayList(OpenNode) = .empty,
     touched: std.ArrayList(usize) = .empty,
@@ -776,6 +806,8 @@ const SearchScratch = struct {
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
     capacity: PathfindingCapacity = .{},
+    // Runtime state is split by phase: pending input, solve buffers, grouping
+    // scratch, result caches, reusable fields, and per-worker fallback scratch.
     grid: NavGrid = .{},
     pending: std.ArrayList(PendingRequest) = .empty,
     prepared_requests: std.ArrayList(PreparedRequest) = .empty,
@@ -818,6 +850,8 @@ pub const PathfindingSystem = struct {
         self.* = undefined;
     }
 
+    // Fixes the maximum per-step work and cache sizes. Later update calls
+    // should reuse these buffers rather than allocating mid-frame.
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) !void {
         self.capacity = capacity;
         try self.pending.ensureTotalCapacity(self.allocator, capacity.max_pending_requests);
@@ -852,6 +886,8 @@ pub const PathfindingSystem = struct {
         for (self.scratch_slots.items) |*scratch| {
             try scratch.reserve(self.allocator, cell_count);
         }
+        // Grid versions are part of query keys. A rebuild invalidates pending
+        // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
     }
 
@@ -869,6 +905,8 @@ pub const PathfindingSystem = struct {
         self.next_field_evict = 0;
     }
 
+    // Clears request/result state while keeping the nav grid and useful goal
+    // fields valid.
     pub fn clearTransientRequestsRetainingFields(self: *PathfindingSystem) void {
         self.pending.clearRetainingCapacity();
         self.prepared_requests.clearRetainingCapacity();
@@ -894,6 +932,8 @@ pub const PathfindingSystem = struct {
         return self.statusForKey(key);
     }
 
+    // Lookup favors goal fields, then completed/unavailable caches, then
+    // pending state. Missing means the caller may enqueue a request.
     pub fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
         if (self.findGoalField(NavGrid.goalKey(key))) |field| {
             if (field.resultFor(&self.grid, key)) |result| {
@@ -909,6 +949,8 @@ pub const PathfindingSystem = struct {
         return .{ .status = .missing };
     }
 
+    // Accepts/dedupes requests, builds reusable fields for common goals, emits
+    // cheap field results, then budgets hard fallbacks.
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         var stats = self.acceptRequests(requests.mergedItems());
         const solve_count = self.effectiveSolveLimit(config);
@@ -922,7 +964,9 @@ pub const PathfindingSystem = struct {
         self.prepareGoalGroups(solve_count);
         self.buildGroupedFields(&stats);
         stats.field_result_batch = self.emitFieldResults(solve_count, thread_system, &system_config, &stats);
-        self.prepareFallbackIndices(solve_count);
+        // Field queries reject most paths cheaply. Only unresolved hard cases
+        // enter the fallback list, and that list is capped before worker dispatch.
+        self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(system_config), &stats);
 
         if (self.fallback_indices.items.len != 0) {
             if (system_config.adaptive and system_config.fallback_adaptive_tuner == null and system_config.items_per_range == null) {
@@ -941,8 +985,9 @@ pub const PathfindingSystem = struct {
         }
 
         self.publishSolvedResults(solve_count, &stats);
-        self.removeSolvedPending(solve_count);
+        self.compactPendingAfterSolve(solve_count);
         stats.pending_requests = self.pending.items.len;
+        stats.deferred_requests = stats.pending_requests;
         return stats;
     }
 
@@ -958,7 +1003,7 @@ pub const PathfindingSystem = struct {
         self.prepareGoalGroups(solve_count);
         self.buildGroupedFields(&stats);
         self.emitFieldResultsSerial(solve_count, &stats);
-        self.prepareFallbackIndices(solve_count);
+        self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(config), &stats);
         if (self.fallback_indices.items.len != 0) {
             if (self.scratch_slots.items.len == 0) return error.PathfindingScratchCapacityExceeded;
             const scratch = &self.scratch_slots.items[0];
@@ -975,11 +1020,14 @@ pub const PathfindingSystem = struct {
             .ran_inline = true,
         };
         self.publishSolvedResults(solve_count, &stats);
-        self.removeSolvedPending(solve_count);
+        self.compactPendingAfterSolve(solve_count);
         stats.pending_requests = self.pending.items.len;
+        stats.deferred_requests = stats.pending_requests;
         return stats;
     }
 
+    // Acceptance is the only stage that mutates the pending-key set. Cached
+    // hits publish entity results immediately and never enter pending work.
     fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest) PathfindingStats {
         var stats = PathfindingStats{};
         if (requests.len == 0 or !self.grid.valid()) return stats;
@@ -1015,6 +1063,8 @@ pub const PathfindingSystem = struct {
         return stats;
     }
 
+    // Batches world-to-cell conversion because request streams are often
+    // produced by steering for many entities at once.
     fn prepareRequestKeysSimd(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
         self.prepared_requests.clearRetainingCapacity();
         if (!self.grid.valid()) return;
@@ -1077,6 +1127,13 @@ pub const PathfindingSystem = struct {
         );
     }
 
+    fn effectiveFallbackLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
+        const requested_limit = config.max_fallback_requests_per_step orelse self.capacity.max_fallback_requests_per_step;
+        return @min(requested_limit, self.capacity.max_fallback_requests_per_step);
+    }
+
+    // Goal grouping decides whether a reverse field is worthwhile. Single
+    // requests stay on the fast/direct/fallback path.
     fn prepareGoalGroups(self: *PathfindingSystem, solve_count: usize) void {
         self.groups.clearRetainingCapacity();
         for (self.pending.items[0..solve_count]) |pending_request| {
@@ -1155,18 +1212,24 @@ pub const PathfindingSystem = struct {
         return count;
     }
 
-    fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize) void {
+    fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             if (result == .deferred) {
+                // `fastSolve` covers portal and disconnected-region shortcuts.
+                // Remaining deferred entries keep pending order and are budgeted.
                 if (fastSolve(&self.grid, self.pending.items[pending_index])) |fast_result| {
                     self.solve_results.items[pending_index] = fast_result;
-                } else {
+                } else if (self.fallback_indices.items.len < fallback_limit) {
                     self.fallback_indices.appendAssumeCapacity(pending_index);
+                } else {
+                    stats.fallback_deferred_requests += 1;
                 }
             }
         }
     }
 
+    // Publishes to both shared path-key caches and entity-local status so
+    // consumers can query by either request key or actor.
     fn publishSolvedResults(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             const entity = self.pending.items[pending_index].entity;
@@ -1184,7 +1247,7 @@ pub const PathfindingSystem = struct {
                     stats.unavailable_results += 1;
                 },
                 .deferred => {
-                    stats.deferred_requests += 1;
+                    continue;
                 },
             }
         }
@@ -1209,13 +1272,21 @@ pub const PathfindingSystem = struct {
         }, stats);
     }
 
-    fn removeSolvedPending(self: *PathfindingSystem, solve_count: usize) void {
+    // Deferred entries keep relative order. Solved entries are removed, then
+    // pending_keys is rebuilt to match the compacted queue exactly.
+    fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize) void {
         if (solve_count == 0) return;
-        const remaining = self.pending.items.len - solve_count;
-        for (0..remaining) |index| {
-            self.pending.items[index] = self.pending.items[index + solve_count];
+        var write_index: usize = 0;
+        for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
+            if (result != .deferred) continue;
+            self.pending.items[write_index] = self.pending.items[pending_index];
+            write_index += 1;
         }
-        self.pending.items.len = remaining;
+        for (self.pending.items[solve_count..]) |pending_request| {
+            self.pending.items[write_index] = pending_request;
+            write_index += 1;
+        }
+        self.pending.items.len = write_index;
         self.pending_keys.clear();
         for (self.pending.items) |pending_request| {
             _ = self.pending_keys.insert(pending_request.key);
@@ -1229,6 +1300,8 @@ pub const PathfindingSystem = struct {
         return null;
     }
 
+    // Goal fields are scarce by design. Empty slots are used first; after that,
+    // deterministic rotating eviction keeps behavior reproducible.
     fn ensureGoalField(self: *PathfindingSystem, key: GoalKey, stats: *PathfindingStats) ?*GoalField {
         for (self.goal_fields.items) |*field| {
             if (field.occupied and goalKeysEqual(field.key, key)) {
@@ -1270,6 +1343,8 @@ const FieldResultJobContext = struct {
     solve_count: usize,
 };
 
+// Each range writes distinct solve_results slots; fields and pending inputs are
+// immutable for the duration of the worker batch.
 fn emitFieldResultJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *FieldResultJobContext = @ptrCast(@alignCast(context));
     for (range.start..range.end) |pending_index| {
@@ -1278,6 +1353,8 @@ fn emitFieldResultJob(context: *anyopaque, range: ParallelRange, _: WorkerId) vo
     }
 }
 
+// Fallback workers share the system for read-only grid/pending access but use
+// worker-indexed scratch to keep heap/search memory private.
 fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *SolveJobContext = @ptrCast(@alignCast(context));
     const scratch = &job.system.scratch_slots.items[worker_id.index];
@@ -1287,6 +1364,8 @@ fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: Worker
     }
 }
 
+// Full A* is deliberately last: direct lines, portals, disconnected checks, and
+// goal fields handle the common cases with bounded work first.
 fn solveOne(grid: *const NavGrid, request: PendingRequest, scratch: *SearchScratch) PathSolveResult {
     if (fastSolve(grid, request)) |result| return result;
 
@@ -1330,6 +1409,8 @@ fn solveOne(grid: *const NavGrid, request: PendingRequest, scratch: *SearchScrat
     return .{ .unavailable = request.key };
 }
 
+// Returns definitive answers for invalid, disconnected, and direct cases.
+// `null` means the request is valid but needs heap search.
 fn fastSolve(grid: *const NavGrid, request: PendingRequest) ?PathSolveResult {
     if (!grid.valid()) return .{ .unavailable = request.key };
     const start_index = grid.indexForCell(request.key.start) orelse return .{ .unavailable = request.key };
@@ -1423,6 +1504,8 @@ fn reconstructResult(grid: *const NavGrid, key: PathQueryKey, start_index: usize
     };
 }
 
+// Direct-line paths provide stable first-waypoint results without filling
+// per-cell parent arrays.
 fn directLineResult(grid: *const NavGrid, key: PathQueryKey) ?PathResult {
     if (grid.blocked_count == 0) return openGridLineResult(grid, key);
     const direct = directLinePath(grid, key.start, key.goal) orelse return null;
@@ -1445,6 +1528,8 @@ fn openGridLineResult(grid: *const NavGrid, key: PathQueryKey) ?PathResult {
     };
 }
 
+// Portals are a cheap middle ground for common single-gap detours; they are not
+// a replacement for the full fallback search.
 fn portalDetourResult(grid: *const NavGrid, key: PathQueryKey) ?PathResult {
     if (grid.portals.items.len == 0) return null;
     var best: ?PathResult = null;
@@ -1657,6 +1742,36 @@ fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: b
     return entity;
 }
 
+const HardFallbackRequest = struct {
+    entity: EntityId,
+    start: math.Vec2,
+    goal: math.Vec2,
+};
+
+fn appendHardFallbackRequest(data: *DataSystem, stream: *RangeOutputStream(PathRequest), row: usize) !HardFallbackRequest {
+    const y_cell = 2 + row * 3;
+    const y = @as(f32, @floatFromInt(y_cell)) * 32.0;
+    const entity = try addNavBody(data, .{ .x = 32, .y = y }, .{ .x = 8, .y = 8 }, false);
+    _ = try addNavBody(data, .{ .x = 1024, .y = y }, .{ .x = 8, .y = 8 }, true);
+    const request = HardFallbackRequest{
+        .entity = entity,
+        .start = .{ .x = 40, .y = y + 8 },
+        .goal = .{ .x = 1992, .y = y + 8 },
+    };
+    try appendPathRequest(stream, .{
+        .entity = request.entity,
+        .start = request.start,
+        .goal = request.goal,
+    });
+    return request;
+}
+
+fn expectTrueFallbackRequest(system: *const PathfindingSystem, request: HardFallbackRequest) !void {
+    const key = system.grid.keyForWorld(request.start, request.goal, .default).?;
+    try std.testing.expect(directLineResult(&system.grid, key) == null);
+    try std.testing.expect(fastSolve(&system.grid, .{ .entity = request.entity, .key = key }) == null);
+}
+
 test "pathfinding caches unavailable requests without requeueing duplicates" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1778,6 +1893,71 @@ test "pathfinding blocked direct line falls back to obstacle-aware search" {
     const view = system.statusForWorld(.{ .x = 8, .y = 8 }, .{ .x = 128, .y = 128 }, .default);
     try std.testing.expectEqual(PathStatus.available, view.status);
     try std.testing.expect(view.next_waypoint.x != 48 or view.next_waypoint.y != 48);
+}
+
+test "pathfinding true fallback fixture executes heap search" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(1, 1);
+    const request = try appendHardFallbackRequest(&data, &stream, 0);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_frame_requests = 1, .max_pending_requests = 1, .max_cached_results = 4, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 1, .max_fallback_requests_per_step = 1 });
+    try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    try expectTrueFallbackRequest(&system, request);
+
+    const stats = try system.updateSerial(&stream, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.fallback_deferred_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.pending_requests);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(request.start, request.goal, .default).status);
+}
+
+test "pathfinding fallback budget defers hard paths in stable order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(3, 3);
+    const first = try appendHardFallbackRequest(&data, &stream, 0);
+    const second = try appendHardFallbackRequest(&data, &stream, 1);
+    const third = try appendHardFallbackRequest(&data, &stream, 2);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_frame_requests = 3, .max_pending_requests = 3, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 3, .max_fallback_requests_per_step = 1 });
+    try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    try expectTrueFallbackRequest(&system, first);
+    try expectTrueFallbackRequest(&system, second);
+    try expectTrueFallbackRequest(&system, third);
+
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+
+    var stats = try system.updateSerial(&stream, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 2), stats.fallback_deferred_requests);
+    try std.testing.expectEqual(@as(usize, 2), stats.deferred_requests);
+    try std.testing.expectEqual(@as(usize, 2), stats.pending_requests);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(first.start, first.goal, .default).status);
+    try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(second.start, second.goal, .default).status);
+    try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(third.start, third.goal, .default).status);
+
+    stats = try system.updateSerial(&empty, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_deferred_requests);
+    try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(second.start, second.goal, .default).status);
+    try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(third.start, third.goal, .default).status);
+
+    stats = try system.updateSerial(&empty, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.fallback_deferred_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.pending_requests);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(third.start, third.goal, .default).status);
 }
 
 test "pathfinding rejects disconnected goals before heap fallback" {
@@ -1926,6 +2106,75 @@ test "pathfinding failed goal field build is not reusable" {
     try std.testing.expect(!field.occupied);
 }
 
+test "pathfinding fixed-capacity result caches evict deterministically" {
+    var stats = PathfindingStats{};
+    var results = ResultCache{};
+    defer results.deinit(std.testing.allocator);
+    try results.reserve(std.testing.allocator, 1);
+    var first_key = emptyKey(1);
+    first_key.goal.x = 1;
+    var second_key = emptyKey(1);
+    second_key.goal.x = 2;
+
+    results.put(.{ .key = first_key, .next_waypoint = .{ .x = 1, .y = 1 }, .path_len = 2 }, &stats);
+    try std.testing.expect(results.find(first_key) != null);
+    results.put(.{ .key = second_key, .next_waypoint = .{ .x = 2, .y = 2 }, .path_len = 3 }, &stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
+    try std.testing.expect(results.find(first_key) == null);
+    try std.testing.expect(results.find(second_key) != null);
+
+    var entity_results = EntityResultCache{};
+    defer entity_results.deinit(std.testing.allocator);
+    try entity_results.reserve(std.testing.allocator, 1);
+    const entity_a = try EntityId.init(1, 1);
+    const entity_b = try EntityId.init(2, 1);
+    entity_results.put(.{ .entity = entity_a, .key = first_key, .status = .available, .next_waypoint = .{ .x = 1, .y = 1 }, .path_len = 2 }, &stats);
+    try std.testing.expect(entity_results.find(entity_a, first_key) != null);
+    entity_results.put(.{ .entity = entity_b, .key = second_key, .status = .available, .next_waypoint = .{ .x = 2, .y = 2 }, .path_len = 3 }, &stats);
+    try std.testing.expectEqual(@as(usize, 2), stats.cache_evictions);
+    try std.testing.expect(entity_results.find(entity_a, first_key) == null);
+    try std.testing.expect(entity_results.find(entity_b, second_key) != null);
+}
+
+test "pathfinding unavailable key set has explicit fixed capacity" {
+    var keys = KeySet{};
+    defer keys.deinit(std.testing.allocator);
+    try keys.reserve(std.testing.allocator, 1);
+    var first_key = emptyKey(1);
+    first_key.goal.x = 1;
+    var second_key = emptyKey(1);
+    second_key.goal.x = 2;
+
+    try std.testing.expect(keys.insert(first_key));
+    try std.testing.expect(keys.contains(first_key));
+    try std.testing.expect(!keys.insert(second_key));
+    try std.testing.expect(keys.contains(first_key));
+    try std.testing.expect(!keys.contains(second_key));
+}
+
+test "pathfinding goal fields evict by fixed slot order" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 2, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 2 });
+    try system.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    var stats = PathfindingStats{};
+    const first = NavGrid.goalKey(system.grid.keyForWorld(.{ .x = 8, .y = 8 }, .{ .x = 96, .y = 96 }, .default).?);
+    const second = NavGrid.goalKey(system.grid.keyForWorld(.{ .x = 8, .y = 8 }, .{ .x = 96, .y = 8 }, .default).?);
+    try std.testing.expect(system.ensureGoalField(first, &stats) != null);
+    try std.testing.expectEqual(@as(usize, 1), stats.goal_fields_built);
+    try std.testing.expect(system.findGoalField(first) != null);
+    try std.testing.expect(system.ensureGoalField(second, &stats) != null);
+    try std.testing.expectEqual(@as(usize, 2), stats.goal_fields_built);
+    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
+    try std.testing.expect(system.findGoalField(first) == null);
+    try std.testing.expect(system.findGoalField(second) != null);
+}
+
 test "pathfinding warmed update does not allocate" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1949,8 +2198,31 @@ test "pathfinding warmed update does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
 }
 
+test "pathfinding warmed hard fallback update does not allocate" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(1, 1);
+    const request = try appendHardFallbackRequest(&data, &stream, 0);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_frame_requests = 1, .max_pending_requests = 1, .max_cached_results = 4, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 1, .max_fallback_requests_per_step = 1 });
+    try system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    try expectTrueFallbackRequest(&system, request);
+
+    const original_allocator = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    const stats = try system.updateSerial(&stream, .{});
+    system.allocator = original_allocator;
+
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 1), stats.available_results);
+}
+
 test "pathfinding threaded solve matches serial solve" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (builtin.single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1984,4 +2256,46 @@ test "pathfinding threaded solve matches serial solve" {
     try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
     try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
     try std.testing.expectEqual(serial_view.path_len, threaded_view.path_len);
+}
+
+test "pathfinding threaded hard fallback matches serial solve" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(2, 2);
+    const first = try appendHardFallbackRequest(&data, &stream, 0);
+    const second = try appendHardFallbackRequest(&data, &stream, 1);
+
+    var serial_system = PathfindingSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    try serial_system.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 2, .max_fallback_requests_per_step = 2 });
+    try serial_system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    var threaded_system = PathfindingSystem.init(std.testing.allocator);
+    defer threaded_system.deinit();
+    try threaded_system.reserve(.{ .max_frame_requests = 2, .max_pending_requests = 2, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 3, .max_solved_requests_per_step = 2, .max_fallback_requests_per_step = 2 });
+    try threaded_system.rebuildStaticNavGrid(&data, 2048, 2048, 32);
+    try expectTrueFallbackRequest(&serial_system, first);
+    try expectTrueFallbackRequest(&serial_system, second);
+
+    const serial_stats = try serial_system.updateSerial(&stream, .{});
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = 1,
+    });
+    defer threads.deinit();
+    const threaded_stats = try threaded_system.update(&stream, &threads, .{ .adaptive = false, .items_per_range = 1 });
+
+    try std.testing.expectEqual(@as(usize, 2), serial_stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 2), threaded_stats.fallback_requests);
+    for ([_]HardFallbackRequest{ first, second }) |request| {
+        const serial_view = serial_system.statusForWorld(request.start, request.goal, .default);
+        const threaded_view = threaded_system.statusForWorld(request.start, request.goal, .default);
+        try std.testing.expectEqual(serial_view.status, threaded_view.status);
+        try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
+        try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
+        try std.testing.expectEqual(serial_view.path_len, threaded_view.path_len);
+    }
 }

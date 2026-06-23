@@ -29,11 +29,11 @@ game-specific behavior under `src/game/`.
 - `src/render/renderer.zig` is the game-facing render facade and frame coordinator.
 - `src/render/camera.zig` owns simple world-to-screen camera transforms.
 - `src/render/resources.zig` defines generational renderer resource IDs and descriptors.
-- `src/render/sprite_batch.zig` owns sprite draw command sorting, vertex construction, draw grouping, and allocation-free warmed batch prep.
+- `src/render/sprite_batch.zig` owns ordered sprite command storage, vertex construction, draw grouping, and allocation-free warmed batch prep.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, upload buffers, texture uploads, and sprite material/pipeline creation.
 - `src/render/text.zig` owns SDL3_ttf lifecycle, asset-backed fonts, and cached text textures.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
-- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state (Slice 16); gameplay is launched from it via transitions.
+- `src/game/game_demo_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via transitions.
 - `src/game/data_system.zig` owns state-local persistent entity data in dense
   SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
@@ -61,6 +61,24 @@ game-specific behavior under `src/game/`.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
 
+## Cross-Cutting Ownership Rules
+
+The main thread is not a fallback owner for work that lacks a better home.
+Main-thread code must preserve a concrete boundary such as SDL/GPU/audio
+ownership, state transitions, structural commits, asset loading, save/load
+streaming, renderer resource ownership, or deliberately light orchestration.
+Work that can scale with entity count, event count, asset count, draw count,
+map size, file size, or tool complexity needs a named owner in app, game,
+render, assets, platform, or tooling code. When it can become expensive, use
+immutable inputs plus deterministic owned outputs instead of hiding the cost in
+the frame coordinator or another convenient caller.
+
+Production contracts expose runtime concepts only. Do not add test-only enum
+tags, union payloads, marker fields, fake stages, fixture hooks, or service
+shortcuts to production APIs just to make tests easier. Tests should use private
+helper types, local fixtures, test-only mocks, or real runtime payloads without
+changing the shape of app, game, render, asset, platform, or tool contracts.
+
 ## Frame Flow
 
 `src/main.zig` keeps the high-level loop:
@@ -85,23 +103,47 @@ render-blocked gameplay pause before the next update, keeps using fallback
 pacing, and clears that policy after a later frame is submitted. Occluded or
 unfocused visible windows keep rendering but apply a 60Hz cap to avoid
 background render runaway.
+Frame pacing policy should stay explicit and situational. Do not add broad
+frame-rate caps that hide timing problems or harm high-refresh rendering unless
+the cap preserves a named boundary and is measured.
 
 Each submitted frame computes presentation from the acquired SDL_GPU swapchain
 texture size and current SDL window size. World and logical UI draws are
 transformed through that presentation into drawable pixels, then clipped to the
 logical viewport; drawable overlays use raw swapchain pixels. All presentation
 state stays in the SDL_GPU renderer path.
+Debug UI state belongs in the debug overlay and render-service path, not in
+gameplay state or persistent gameplay data.
 
 ## Coordination Boundaries
 
-Game states draw through `Renderer`; they should not call SDL_GPU directly.
+Game states emit transient draw records through `RenderQueue` when multiple
+world/effect/UI producers need ordering. Direct `Renderer.submitOrdered*` calls
+are reserved for renderer-owned or tightly controlled paths that already submit
+in nondecreasing `RenderOrder`; game states should not call SDL_GPU directly.
 Window, GPU device, swapchain, shader, texture, text, and frame submission code
 stays under `src/render/` and `src/app/`.
+SDL, SDL_ttf, SDL_mixer, and SDL_GPU resources should pair creation and cleanup
+close to the owning site. Ownership wrappers may centralize cleanup, but generic
+state or gameplay teardown should not receive renderer, text, audio, or GPU
+services merely to recover escaped resource ownership.
 
-`Renderer` preserves the public `drawSprite` and `drawRect` API while delegating
-sprite-specific CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition,
-swapchain acquisition, vertex upload, render-pass encoding, and submit remain
-coordinated by `Renderer` on the main/render thread.
+`Renderer` preserves strict ordered submission while delegating sprite-specific
+CPU prep to `SpriteBatch`. SDL_GPU command-buffer acquisition, swapchain
+acquisition, vertex upload, render-pass encoding, and submit remain coordinated
+by `Renderer` on the main/render thread.
+`SpriteBatch` owns a render-specific adaptive tuner and can use the app
+`ThreadSystem` to expand prepared sprite commands into disjoint vertex spans.
+Texture metadata is snapshotted before worker dispatch, workers do not read
+live renderer resource slots, and draw groups are built on the main thread from
+the already ordered command stream. Small or cheap frames may stay inline
+through the same adaptive policy.
+
+CPU sprite command preparation stays before SDL_GPU swapchain acquisition where
+practical, including transfer-buffer staging for the normal steady-state path.
+Sprite prep emits presentation-independent world/logical or drawable positions;
+the acquired swapchain interval stays focused on acquired-size presentation
+uniforms, copy-pass upload, render-pass encoding, and submit.
 
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
@@ -263,9 +305,15 @@ builds a transient `SimulationScope` that decides which entities enter AI,
 steering, movement, and collision stages. Processors keep today's hot loops and
 receive scoped gathers instead of learning world/chunk policy. CPU benchmarks at
 50k scale are throughput ceilings for rare spikes; typical frames should scope
-active work far lower. See
-[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for tier
-definitions, stage map, multi-world scope rules, and Slice 22 tracking.
+active work far lower.
+
+The durable tier model is capability-based, not visibility-based:
+`dormant` entities exist but do not enter normal active scope, `kinematic`
+entities run movement integration, `locomotion` entities add collision
+detection/response, and `cognition` entities add AI, steering, and path
+requests. Scope then decides which loaded worlds, chunks, chunk halos, or
+staggered/reduced-cadence groups enter those tiered stages for the current
+fixed step.
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
@@ -349,7 +397,11 @@ frontier expansion remains scalar inside threaded request ranges. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall
 same-step movement, and unavailable keys are cached by
 `nav_version + agent_class + start_cell + goal_cell` to avoid repeated request
-spam.
+spam. True fallback A* work has its own per-step request budget; overflow stays
+pending in stable order and is retried on later fixed steps. Completed-result,
+entity-result, unavailable-key, and goal-field caches are fixed-capacity runtime
+structures with explicit eviction or saturation behavior rather than unbounded
+growth.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects
@@ -368,18 +420,43 @@ deferred structural commands use typed range-owned output buffers: count outputs
 per stable range, prefix offsets on the main thread, write contiguous output
 slices, merge by range index, and consume the result as a batch. Output order
 comes from stable input/range order, not worker timing or worker IDs. Structural
-mutation remains behind `DataSystem` batch commit boundaries; event and intent
-streams are transient simulation data, not persistent `DataSystem` state.
+mutation remains behind `DataSystem` batch commit boundaries. `DataSystem` is
+the single source for applying structural commands and may report plain
+structural change records to `SimulationFrame`, which maps them into transient
+events after the commit succeeds; event and intent streams are transient
+simulation data, not persistent `DataSystem` state.
 
-Future simulation/domain event work should stay inside this same simulation
-contract. These events are typed, transient cross-system signals owned by the
-gameplay state's pipeline, useful for any important domain change that other
-systems must react to: tile changes, obstacle changes, weather changes, AI
-perception, navigation invalidation, combat, spawning, resources, or rule
-interactions. They are not a global pub/sub service. Persistent gameplay/domain
-facts stay in `DataSystem` or state-owned domain storage, high-volume streams
-remain specialized, and controllers consume immutable event slices in explicit
-pipeline stages before emitting typed outputs or deferred structural commands.
+`SimulationFrame` owns `SimulationEvents` as the typed domain-signal hub for
+lower-volume system changes. Events are phase outputs, not immediate callbacks:
+a producer stage finishes, the event stream merges deterministically, and later
+explicit reaction points consume immutable event slices. Consumers may emit
+specialized outputs, later-phase events, or deferred structural commands, but
+they do not recursively redispatch events or mutate `DataSystem` structurally
+outside the commit boundary. The current event payloads cover structural
+entity/component changes and navigation-region invalidation. Event records carry
+only stable entity IDs, component enums, reason enums, and small scalar payloads;
+they do not carry pointers, app/render/audio handles, asset paths, allocators,
+or service references.
+
+High-volume streams stay specialized. Collision contacts, collision triggers,
+navigation intents, movement intents, path requests, render-queue records, and
+structural commands are not collapsed into the generic event stream. The event
+hub exists for cross-system change signals and diagnostics. Event producers own
+their range writes and range-local stats; the stream merges per-type and
+per-stage counters deterministically after producer completion. A configured
+per-step event capacity is enforced for both appended and range-owned event
+producers: required events fail before structural mutation or domain reaction
+side effects, while diagnostic events are dropped and counted. Reaction work has
+explicit ownership rather than a generic main-thread fallback: light
+orchestration may run inline, and expensive consumers should split over
+immutable event slices and write range-owned outputs. `GameDemoState` currently
+consumes structural events after the commit point and rebuilds the state-owned
+pathfinding nav grid once when static obstacle-affecting changes occur, then
+emits a `nav_region_invalidated` event.
+
+The cross-cutting ownership rules apply here too: event reactions may have
+main-thread commit points, but scalable reaction work still needs a named owner,
+and event/intent contracts must not grow test-only variants or marker payloads.
 
 ## SIMD Helpers
 

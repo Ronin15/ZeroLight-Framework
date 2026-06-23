@@ -2,14 +2,21 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Borrowed state-stack facade with explicit ownership at push/replace time.
+//! States queue transitions during dispatch; the stack applies them afterward
+//! so callbacks never mutate the active stack while it is being walked.
+
 const std = @import("std");
 const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const runtime_perf_log = @import("runtime_perf_log.zig");
 const inputRouter = @import("input_router.zig");
 const InputRoutingPolicy = @import("input_router.zig").InputRoutingPolicy;
-const Renderer = @import("../render/renderer.zig").Renderer;
+const renderer_file = @import("../render/renderer.zig");
+const Renderer = renderer_file.Renderer;
+const UiStackOrder = renderer_file.UiStackOrder;
 const TextService = @import("../render/text.zig").TextService;
 const ThreadSystem = @import("thread_system.zig").ThreadSystem;
 const c = @import("../platform/sdl.zig").c;
@@ -56,6 +63,7 @@ pub const UpdateContext = struct {
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
+    perf: runtime_perf_log.Context = .{},
 };
 
 pub const RenderContext = struct {
@@ -64,6 +72,8 @@ pub const RenderContext = struct {
     text_service: ?*TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
+    ui_stack_order: UiStackOrder = .base,
+    perf: runtime_perf_log.Context = .{},
 };
 
 pub const State = struct {
@@ -281,6 +291,16 @@ pub const StateStack = struct {
         return self.push(T, value, state_policy.modal_overlay);
     }
 
+    pub fn reserveForAdditionalStates(self: *StateStack, additional: usize) !void {
+        try self.states.ensureUnusedCapacity(self.allocator, additional);
+    }
+
+    /// Pushes an already-created modal state after `reserveForAdditionalStates`
+    /// has reserved stack storage for it.
+    pub fn pushModalOwnedAfterReserve(self: *StateStack, state: State) StateHandle {
+        return self.pushOwnedAssumeCapacity(state, state_policy.modal_overlay);
+    }
+
     pub fn pushOverlay(self: *StateStack, comptime T: type, value: T) !StateHandle {
         return self.push(T, value, state_policy.pass_through_overlay);
     }
@@ -357,6 +377,8 @@ pub const StateStack = struct {
     pub fn inputRoutingPolicy(self: *const StateStack) InputRoutingPolicy {
         if (self.states.items.len == 0) return state_policy.gameplay.input_routing;
 
+        // Fold policies from the top down. Pass-through overlays can leave lower
+        // gameplay held input enabled; modal and opaque policies explicitly block it.
         var index = self.states.items.len - 1;
         var routing = self.states.items[index].policy.input_routing;
         while (true) {
@@ -428,6 +450,9 @@ pub const StateStack = struct {
 
         for (self.states.items[first_updated..]) |entry| {
             try entry.state.update(context);
+            if (comptime runtime_perf_log.enabled) {
+                context.perf.recordMetric(.state_updates, 1);
+            }
         }
     }
 
@@ -442,13 +467,21 @@ pub const StateStack = struct {
             if (!self.states.items[index].policy.render_below) break;
         }
 
-        for (self.states.items[first_rendered..]) |entry| {
-            try entry.state.render(context);
+        for (self.states.items[first_rendered..], 0..) |entry, render_offset| {
+            var state_context = context;
+            state_context.ui_stack_order = UiStackOrder.fromRenderOffset(render_offset);
+            try entry.state.render(state_context);
+            if (comptime runtime_perf_log.enabled) {
+                context.perf.recordMetric(.state_renders, 1);
+            }
         }
     }
 
     pub fn applyTransitions(self: *StateStack, transitions: *StateTransitions) !TransitionApplyResult {
         var result = TransitionApplyResult{};
+        // Requests are FIFO and own any state payloads until consumed here.
+        // `transitions.clear` must run after the loop to avoid destroying states
+        // that were moved into the stack.
         for (transitions.requests.items) |*request| {
             switch (request.*) {
                 .none => {},
@@ -479,6 +512,16 @@ pub const StateStack = struct {
     fn pushOwned(self: *StateStack, state: State, policy: StatePolicy) !StateHandle {
         const handle = self.nextHandle();
         try self.states.append(self.allocator, .{
+            .handle = handle,
+            .state = state,
+            .policy = policy,
+        });
+        return handle;
+    }
+
+    fn pushOwnedAssumeCapacity(self: *StateStack, state: State, policy: StatePolicy) StateHandle {
+        const handle = self.nextHandle();
+        self.states.appendAssumeCapacity(.{
             .handle = handle,
             .state = state,
             .policy = policy,
@@ -1218,6 +1261,70 @@ test "queued transition from handleEvent waits until applyTransitions" {
     const consumed = try stack.handleEvent(&event, &transitions);
 
     try std.testing.expect(consumed);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+
+    _ = try stack.applyTransitions(&transitions);
+
+    try std.testing.expectEqual(@as(usize, 2), stack.len());
+    try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
+}
+
+test "event dispatch batch keeps stack stable until applyTransitions" {
+    const QueuingState = struct {
+        event_count: *usize,
+        queued: *bool,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = event;
+            self.event_count.* += 1;
+            if (!self.queued.*) {
+                self.queued.* = true;
+                try transitions.pushModal(@This(), .{
+                    .event_count = self.event_count,
+                    .queued = self.queued,
+                });
+            }
+            return true;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var stack = StateStack.init(std.testing.allocator);
+    defer stack.deinit();
+    var event_count: usize = 0;
+    var queued = false;
+
+    _ = try stack.replaceGameplay(QueuingState, .{
+        .event_count = &event_count,
+        .queued = &queued,
+    });
+    const first = c.SDL_Event{ .type = c.SDL_EVENT_KEY_DOWN };
+    const second = c.SDL_Event{ .type = c.SDL_EVENT_KEY_UP };
+
+    try std.testing.expect(try stack.handleEvent(&first, &transitions));
+    try std.testing.expect(try stack.handleEvent(&second, &transitions));
+
+    try std.testing.expectEqual(@as(usize, 2), event_count);
     try std.testing.expectEqual(@as(usize, 1), stack.len());
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 

@@ -14,9 +14,13 @@ native target and do not require an external MinGW or Visual Studio toolchain.
 - `glslc` for GLSL to SPIR-V compilation
 - `spirv-cross` on macOS for SPIR-V to Metal shader conversion
 - `spirv-cross` and `dxc` on Windows for SPIR-V to HLSL to DXIL shader conversion
+- Python 3 plus Pillow for atlas packing, source-art export, and placeholder generation
 
 The app uses core SDL3 PNG loading through `SDL_LoadPNG`; it does not require
 `SDL3_image`.
+
+Normal Zig builds and runtime atlas lint do not require Pillow unless
+`source_assets/` is present and source-to-runtime atlas comparison runs.
 
 ## macOS
 

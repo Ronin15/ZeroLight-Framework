@@ -10,16 +10,24 @@ const std = @import("std");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
+const render_depth = @import("render_depth.zig");
 const simd = @import("../core/simd.zig");
+const WorldDepth = render_depth.WorldDepth;
 
 pub const hot_soa_column_alignment: usize = 64;
 pub const movement_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
 
 pub const HotF32Slice = []align(hot_soa_column_alignment) f32;
 pub const ConstHotF32Slice = []align(hot_soa_column_alignment) const f32;
+pub const HotI32Slice = []align(hot_soa_column_alignment) i32;
+pub const ConstHotI32Slice = []align(hot_soa_column_alignment) const i32;
 
 const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
+const HotI32List = std.ArrayListAligned(i32, .fromByteUnits(hot_soa_column_alignment));
 
+/// Stable entity handle. The index points at an entity slot and the generation
+/// changes whenever that slot is retired, so stale IDs cannot resolve after
+/// free-list reuse.
 pub const EntityId = struct {
     index: u32,
     generation: u32,
@@ -80,6 +88,8 @@ pub const Facing = enum {
 pub const MovementBody = struct {
     position: math.Vec2 = .{},
     previous_position: math.Vec2 = .{},
+    position_z: i32 = 0,
+    previous_z: i32 = 0,
     velocity: math.Vec2 = .{},
     speed: f32 = 0,
 };
@@ -87,19 +97,25 @@ pub const MovementBody = struct {
 pub const MovementBodyPtr = struct {
     position_x: *f32,
     position_y: *f32,
+    position_z: *i32,
     previous_x: *f32,
     previous_y: *f32,
+    previous_z: *i32,
     velocity_x: *f32,
     velocity_y: *f32,
     speed: *f32,
 };
 
+/// Mutable dense movement columns. Entity order matches every movement column
+/// so processors can use one row index for positions, velocities, and identity.
 pub const MovementBodySlice = struct {
     entities: []const EntityId,
     position_x: HotF32Slice,
     position_y: HotF32Slice,
+    position_z: HotI32Slice,
     previous_x: HotF32Slice,
     previous_y: HotF32Slice,
+    previous_z: HotI32Slice,
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
@@ -109,8 +125,10 @@ pub const ConstMovementBodySlice = struct {
     entities: []const EntityId,
     position_x: ConstHotF32Slice,
     position_y: ConstHotF32Slice,
+    position_z: ConstHotI32Slice,
     previous_x: ConstHotF32Slice,
     previous_y: ConstHotF32Slice,
+    previous_z: ConstHotI32Slice,
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
@@ -130,12 +148,14 @@ pub const ConstFacingSlice = struct {
     directions: []const Facing,
 };
 
+/// Data-only primitive visual component. Render order and colors live here, but
+/// prepared draw records and renderer handles stay outside DataSystem.
 pub const PrimitiveVisual = struct {
     size: math.Vec2,
     color: config.Color,
-    layer: i32 = 0,
+    depth: WorldDepth = .actor,
     marker_color: config.Color,
-    marker_layer: i32 = 1,
+    marker_depth_band: WorldDepth = .marker,
     marker_length: f32 = 0,
     marker_depth: f32 = 0,
     marker_margin: f32 = 0,
@@ -149,12 +169,12 @@ pub const ConstPrimitiveVisualSlice = struct {
     color_g: []const f32,
     color_b: []const f32,
     color_a: []const f32,
-    layers: []const i32,
+    depth_values: []const i32,
     marker_color_r: []const f32,
     marker_color_g: []const f32,
     marker_color_b: []const f32,
     marker_color_a: []const f32,
-    marker_layers: []const i32,
+    marker_depth_values: []const i32,
     marker_lengths: []const f32,
     marker_depths: []const f32,
     marker_margins: []const f32,
@@ -275,6 +295,8 @@ pub const ConstSteeringAgentSlice = struct {
     unavailable_backoff_steps: []const u16,
 };
 
+/// Component bundle consumed by create_entity during structural commits. Each
+/// optional payload still goes through normal validation and change reporting.
 pub const EntityTemplate = struct {
     movement_body: ?MovementBody = null,
     facing: ?FacingData = null,
@@ -306,6 +328,9 @@ pub const AssetReferenceCommand = struct {
     asset_reference: AssetReference,
 };
 
+/// Deferred structural work committed after processors finish. Commands carry
+/// stable entity IDs and component values only, never borrowed slices or service
+/// references from the frame that produced them.
 pub const StructuralCommand = union(enum) {
     create_entity: EntityTemplate,
     destroy_entity: EntityId,
@@ -326,10 +351,262 @@ pub const StructuralCommitStats = struct {
     stale_skipped: usize = 0,
 };
 
+pub const StructuralEntityDestroyedChange = struct {
+    entity: EntityId,
+    component_mask: ComponentMask,
+    was_static_navigation_obstacle: bool,
+};
+
+pub const StructuralComponentChangedChange = struct {
+    entity: EntityId,
+    component: Component,
+    was_static_navigation_obstacle: bool,
+    is_static_navigation_obstacle: bool,
+};
+
+pub const StructuralChange = union(enum) {
+    entity_created: EntityId,
+    entity_destroyed: StructuralEntityDestroyedChange,
+    component_changed: StructuralComponentChangedChange,
+};
+
+const NullStructuralChangeSink = struct {
+    fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
+};
+
+const NullStructuralCommitPreparer = struct {
+    fn prepare(_: *NullStructuralCommitPreparer, _: usize) !void {}
+};
+
+const StructuralCapacityNeeds = struct {
+    // Preflight reserves every storage target before the commit loop. That
+    // keeps structural commits all-or-fail before DataSystem mutates.
+    slots: usize,
+    movement_bodies: usize,
+    facings: usize,
+    primitive_visuals: usize,
+    asset_refs: usize,
+    collision_bounds: usize,
+    collision_responses: usize,
+    ai_agents: usize,
+    steering_agents: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityNeeds {
+        return .{
+            .slots = data.slots.items.len,
+            .movement_bodies = data.movement_bodies.entities.items.len,
+            .facings = data.facings.entities.items.len,
+            .primitive_visuals = data.primitive_visuals.entities.items.len,
+            .asset_refs = data.asset_refs.entities.items.len,
+            .collision_bounds = data.collision_bounds.entities.items.len,
+            .collision_responses = data.collision_responses.entities.items.len,
+            .ai_agents = data.ai_agents.entities.items.len,
+            .steering_agents = data.steering_agents.entities.items.len,
+        };
+    }
+
+    fn validateLimits(self: StructuralCapacityNeeds) !void {
+        if (self.slots > std.math.maxInt(u32)) return error.TooManyEntities;
+        if (self.movement_bodies > std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        if (self.facings > std.math.maxInt(u32)) return error.TooManyFacingRows;
+        if (self.primitive_visuals > std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
+        if (self.asset_refs > std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
+        if (self.collision_bounds > std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
+        if (self.collision_responses > std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
+        if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+    }
+};
+
+const StructuralCapacityProjection = struct {
+    // Projection follows command-order creates, destroys, and first-time
+    // component additions without touching real slots or dense component stores.
+    current: StructuralCapacityNeeds,
+    required: StructuralCapacityNeeds,
+    free_slots: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityProjection {
+        const current = StructuralCapacityNeeds.init(data);
+        return .{
+            .current = current,
+            .required = current,
+            .free_slots = data.free_slot_count,
+        };
+    }
+
+    fn createSlot(self: *StructuralCapacityProjection) !void {
+        if (self.free_slots > 0) {
+            self.free_slots -= 1;
+            return;
+        }
+        self.current.slots = try addCapacity(self.current.slots, 1);
+        self.required.slots = @max(self.required.slots, self.current.slots);
+    }
+
+    fn destroySlot(self: *StructuralCapacityProjection) !void {
+        self.free_slots = try addCapacity(self.free_slots, 1);
+    }
+
+    fn addTemplate(self: *StructuralCapacityProjection, template: EntityTemplate) !void {
+        if (template.movement_body != null) try self.addComponent(.movement_body);
+        if (template.facing != null) try self.addComponent(.facing);
+        if (template.primitive_visual != null) try self.addComponent(.primitive_visual);
+        if (template.asset_reference != null) try self.addComponent(.asset_reference);
+        if (template.collision_bounds != null) try self.addComponent(.collision_bounds);
+        if (template.collision_response != null) try self.addComponent(.collision_response);
+        if (template.ai_agent != null) try self.addComponent(.ai_agent);
+        if (template.steering_agent != null) try self.addComponent(.steering_agent);
+    }
+
+    fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
+        const current = self.currentField(component);
+        const required = self.requiredField(component);
+        current.* = try addCapacity(current.*, 1);
+        required.* = @max(required.*, current.*);
+    }
+
+    fn removeComponent(self: *StructuralCapacityProjection, component: Component) void {
+        const current = self.currentField(component);
+        std.debug.assert(current.* > 0);
+        current.* -= 1;
+    }
+
+    fn currentField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.current.movement_bodies,
+            .facing => &self.current.facings,
+            .primitive_visual => &self.current.primitive_visuals,
+            .asset_reference => &self.current.asset_refs,
+            .collision_bounds => &self.current.collision_bounds,
+            .collision_response => &self.current.collision_responses,
+            .ai_agent => &self.current.ai_agents,
+            .steering_agent => &self.current.steering_agents,
+        };
+    }
+
+    fn requiredField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.required.movement_bodies,
+            .facing => &self.required.facings,
+            .primitive_visual => &self.required.primitive_visuals,
+            .asset_reference => &self.required.asset_refs,
+            .collision_bounds => &self.required.collision_bounds,
+            .collision_response => &self.required.collision_responses,
+            .ai_agent => &self.required.ai_agents,
+            .steering_agent => &self.required.steering_agents,
+        };
+    }
+};
+
+fn addCapacity(value: usize, amount: usize) !usize {
+    return std.math.add(usize, value, amount);
+}
+
+const StructuralCommitPlan = struct {
+    // `structural_event_count` lets callers reserve their change sink before
+    // mutation so event publishing cannot fail halfway through commit.
+    command_count: usize,
+    capacity_needs: StructuralCapacityNeeds,
+    structural_event_count: usize,
+};
+
+const ProjectedEntityState = struct {
+    // Scratch copy of just the liveness and component membership needed for
+    // preflight. Dense row indices are irrelevant until the real commit pass.
+    alive: bool,
+    component_mask: ComponentMask,
+
+    fn init(data: *const DataSystem, entity: EntityId) ProjectedEntityState {
+        const slot = data.resolveSlotConst(entity) orelse return .{
+            .alive = false,
+            .component_mask = 0,
+        };
+        return .{
+            .alive = true,
+            .component_mask = slot.component_mask,
+        };
+    }
+
+    fn hasComponent(self: ProjectedEntityState, component: Component) bool {
+        return (self.component_mask & componentMask(component)) != 0;
+    }
+
+    fn addComponent(self: *ProjectedEntityState, component: Component) void {
+        self.component_mask |= componentMask(component);
+    }
+
+    fn destroy(self: *ProjectedEntityState) void {
+        self.alive = false;
+        self.component_mask = 0;
+    }
+};
+
+/// Reusable scratch for prepared structural commits. Simulation pipelines keep
+/// this around to avoid per-step hash-map allocation churn.
+pub const StructuralPlanScratch = struct {
+    allocator: std.mem.Allocator,
+    projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) StructuralPlanScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *StructuralPlanScratch) void {
+        self.projected_entities.deinit(self.allocator);
+        self.projected_entities = .{};
+    }
+
+    pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
+        self.projected_entities.clearRetainingCapacity();
+    }
+
+    fn projectedState(
+        self: *StructuralPlanScratch,
+        data: *const DataSystem,
+        entity: EntityId,
+    ) !*ProjectedEntityState {
+        const result = try self.projected_entities.getOrPut(self.allocator, structuralEntityKey(entity));
+        if (!result.found_existing) {
+            result.value_ptr.* = ProjectedEntityState.init(data, entity);
+        }
+        return result.value_ptr;
+    }
+};
+
+fn structuralEntityKey(entity: EntityId) u64 {
+    return (@as(u64, entity.index) << 32) | @as(u64, entity.generation);
+}
+
+fn removeProjectedComponents(component_mask: ComponentMask, projection: *StructuralCapacityProjection) void {
+    inline for (std.meta.fields(Component)) |field| {
+        const component: Component = @enumFromInt(field.value);
+        if ((component_mask & componentMask(component)) != 0) {
+            projection.removeComponent(component);
+        }
+    }
+}
+
+fn templateComponentCount(template: EntityTemplate) usize {
+    var count: usize = 0;
+    if (template.movement_body != null) count += 1;
+    if (template.facing != null) count += 1;
+    if (template.primitive_visual != null) count += 1;
+    if (template.asset_reference != null) count += 1;
+    if (template.collision_bounds != null) count += 1;
+    if (template.collision_response != null) count += 1;
+    if (template.ai_agent != null) count += 1;
+    if (template.steering_agent != null) count += 1;
+    return count;
+}
+
+/// Persistent gameplay data owner and ECS storage foundation. Entity slots are
+/// stable handles, while component stores are dense SoA columns referenced from
+/// live slots.
 pub const DataSystem = struct {
     allocator: std.mem.Allocator,
     slots: std.ArrayList(EntitySlot) = .empty,
     first_free_slot: ?u32 = null,
+    free_slot_count: usize = 0,
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
     primitive_visuals: PrimitiveVisualStore = .{},
@@ -360,8 +637,12 @@ pub const DataSystem = struct {
         if (self.first_free_slot) |index| {
             const slot = &self.slots.items[@intCast(index)];
             self.first_free_slot = slot.next_free;
+            std.debug.assert(self.free_slot_count > 0);
+            self.free_slot_count -= 1;
             slot.alive = true;
             slot.next_free = null;
+            // Reused slots keep their incremented generation so stale IDs cannot
+            // address the new entity.
             return EntityId.init(index, slot.generation) catch unreachable;
         }
 
@@ -375,6 +656,8 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return false;
         const index = id.index;
 
+        // Component stores stay dense. Removing an entity may swap the tail row
+        // into this entity's dense index and patch that moved entity's slot.
         if (slot.movement_body_index) |dense_index| self.removeMovementBodyAt(@intCast(dense_index));
         if (slot.facing_index) |dense_index| self.removeFacingAt(@intCast(dense_index));
         if (slot.primitive_visual_index) |dense_index| self.removePrimitiveVisualAt(@intCast(dense_index));
@@ -398,6 +681,7 @@ pub const DataSystem = struct {
         retired_slot.ai_agent_index = null;
         retired_slot.steering_agent_index = null;
         self.first_free_slot = index;
+        self.free_slot_count += 1;
         return true;
     }
 
@@ -415,7 +699,16 @@ pub const DataSystem = struct {
         return slot.hasComponents(mask);
     }
 
+    pub fn isStaticNavigationObstacle(self: *const DataSystem, id: EntityId) bool {
+        const obstacle_mask = component_masks.movement_body | component_masks.collision_bounds | component_masks.collision_response;
+        if (!self.hasComponents(id, obstacle_mask)) return false;
+        const response = self.collisionResponseConst(id) orelse return false;
+        return response.mobility == .static;
+    }
+
     pub fn clearRetainingCapacity(self: *DataSystem) void {
+        // Reset invalidates all existing IDs while keeping allocated component
+        // columns warm for the next state/session.
         self.steering_agents.clearRetainingCapacity();
         self.ai_agents.clearRetainingCapacity();
         self.asset_refs.clearRetainingCapacity(self.allocator);
@@ -426,6 +719,7 @@ pub const DataSystem = struct {
         self.movement_bodies.clearRetainingCapacity();
 
         self.first_free_slot = null;
+        self.free_slot_count = self.slots.items.len;
         for (self.slots.items, 0..) |*slot, index| {
             slot.generation = nextGeneration(slot.generation);
             slot.alive = false;
@@ -448,6 +742,9 @@ pub const DataSystem = struct {
     }
 
     pub fn setMovementBody(self: *DataSystem, id: EntityId, body: MovementBody) !void {
+        try validateMovementBody(body);
+        // Public set* calls are upserts: existing component rows are overwritten,
+        // while missing rows are appended and registered in the entity slot.
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.movement_body_index) |index| {
             self.movement_bodies.set(@intCast(index), body);
@@ -518,6 +815,7 @@ pub const DataSystem = struct {
     }
 
     pub fn setPrimitiveVisual(self: *DataSystem, id: EntityId, visual: PrimitiveVisual) !void {
+        try validatePrimitiveVisual(visual);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.primitive_visual_index) |index| {
             self.primitive_visuals.set(@intCast(index), visual);
@@ -673,19 +971,61 @@ pub const DataSystem = struct {
     }
 
     pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
-        try validateStructuralCommands(commands);
+        var sink = NullStructuralChangeSink{};
+        return try self.applyStructuralCommandsWithChangeSink(commands, &sink);
+    }
+
+    pub fn applyStructuralCommandsWithChangeSink(self: *DataSystem, commands: []const StructuralCommand, change_sink: anytype) !StructuralCommitStats {
+        var scratch = StructuralPlanScratch.init(self.allocator);
+        defer scratch.deinit();
+        var preparer = NullStructuralCommitPreparer{};
+        return try self.applyStructuralCommandsPrepared(commands, &scratch, &preparer, change_sink);
+    }
+
+    pub fn applyStructuralCommandsPrepared(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        scratch: *StructuralPlanScratch,
+        preparer: anytype,
+        change_sink: anytype,
+    ) !StructuralCommitStats {
+        // Prepared commits split allocation/preparation from mutation so callers
+        // can reuse scratch and reserve their own event buffers ahead of time.
+        const plan = try self.preflightStructuralCommands(commands, scratch);
+        try preparer.prepare(plan.structural_event_count);
+        // No allocations or event-capacity failures should occur after this
+        // point; the commit loop can mutate DataSystem in command order.
+        return try self.commitStructuralCommands(commands, change_sink);
+    }
+
+    fn commitStructuralCommands(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        change_sink: anytype,
+    ) !StructuralCommitStats {
+        // Commit preserves command order. Stale entity commands are skipped, but
+        // valid commands still produce deterministic component-change events.
         var stats = StructuralCommitStats{};
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
                     const entity = try self.createEntity();
                     errdefer _ = self.destroyEntity(entity);
-                    stats.created += 1;
                     stats.components_set += try self.applyTemplateComponents(entity, template);
+                    stats.created += 1;
+                    change_sink.record(.{ .entity_created = entity });
+                    self.recordTemplateComponentChanges(change_sink, entity, template);
                 },
                 .destroy_entity => |entity| {
+                    const component_mask = self.componentMaskFor(entity);
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
                     if (self.destroyEntity(entity)) {
                         stats.destroyed += 1;
+                        change_sink.record(.{ .entity_destroyed = .{
+                            .entity = entity,
+                            .component_mask = component_mask,
+                            .was_static_navigation_obstacle = was_static_navigation_obstacle,
+                        } });
                     } else {
                         stats.stale_skipped += 1;
                     }
@@ -695,74 +1035,185 @@ pub const DataSystem = struct {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setMovementBody(set.entity, set.body);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .movement_body, was_static_navigation_obstacle);
                 },
                 .set_facing => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setFacing(set.entity, set.facing);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .facing, was_static_navigation_obstacle);
                 },
                 .set_primitive_visual => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setPrimitiveVisual(set.entity, set.visual);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .primitive_visual, was_static_navigation_obstacle);
                 },
                 .set_asset_reference => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setAssetReference(set.entity, set.asset_reference);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .asset_reference, was_static_navigation_obstacle);
                 },
                 .set_collision_bounds => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setCollisionBounds(set.entity, set.bounds);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .collision_bounds, was_static_navigation_obstacle);
                 },
                 .set_collision_response => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setCollisionResponse(set.entity, set.response);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .collision_response, was_static_navigation_obstacle);
                 },
                 .set_ai_agent => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setAiAgent(set.entity, set.agent);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .ai_agent, was_static_navigation_obstacle);
                 },
                 .set_steering_agent => |set| {
                     if (!self.isAlive(set.entity)) {
                         stats.stale_skipped += 1;
                         continue;
                     }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                     try self.setSteeringAgent(set.entity, set.agent);
                     stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .steering_agent, was_static_navigation_obstacle);
                 },
             }
         }
         return stats;
     }
 
-    fn validateStructuralCommands(commands: []const StructuralCommand) !void {
+    fn preflightStructuralCommands(
+        self: *DataSystem,
+        commands: []const StructuralCommand,
+        scratch: *StructuralPlanScratch,
+    ) !StructuralCommitPlan {
+        try validateStructuralCommands(commands);
+        scratch.clearRetainingCapacity();
+        if (commands.len == 0) {
+            return .{
+                .command_count = 0,
+                .capacity_needs = StructuralCapacityNeeds.init(self),
+                .structural_event_count = 0,
+            };
+        }
+        try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(commands.len));
+
+        var projection = StructuralCapacityProjection.init(self);
+        var structural_event_count: usize = 0;
+
+        // Preflight simulates the command stream against projected liveness and
+        // masks so capacity and event reservations match what commit will do.
         for (commands) |command| {
             switch (command) {
                 .create_entity => |template| {
+                    try projection.createSlot();
+                    try projection.addTemplate(template);
+                    structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
+                },
+                .destroy_entity => |entity| {
+                    const state = try scratch.projectedState(self, entity);
+                    if (state.alive) {
+                        structural_event_count = try addCapacity(structural_event_count, 1);
+                        try projection.destroySlot();
+                        removeProjectedComponents(state.component_mask, &projection);
+                        state.destroy();
+                    }
+                },
+                .set_movement_body => |set| try self.preflightSetComponent(set.entity, .movement_body, scratch, &projection, &structural_event_count),
+                .set_facing => |set| try self.preflightSetComponent(set.entity, .facing, scratch, &projection, &structural_event_count),
+                .set_primitive_visual => |set| try self.preflightSetComponent(set.entity, .primitive_visual, scratch, &projection, &structural_event_count),
+                .set_asset_reference => |set| try self.preflightSetComponent(set.entity, .asset_reference, scratch, &projection, &structural_event_count),
+                .set_collision_bounds => |set| try self.preflightSetComponent(set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
+                .set_collision_response => |set| try self.preflightSetComponent(set.entity, .collision_response, scratch, &projection, &structural_event_count),
+                .set_ai_agent => |set| try self.preflightSetComponent(set.entity, .ai_agent, scratch, &projection, &structural_event_count),
+                .set_steering_agent => |set| try self.preflightSetComponent(set.entity, .steering_agent, scratch, &projection, &structural_event_count),
+            }
+        }
+
+        try projection.required.validateLimits();
+        const plan = StructuralCommitPlan{
+            .command_count = commands.len,
+            .capacity_needs = projection.required,
+            .structural_event_count = structural_event_count,
+        };
+        try self.reserveStructuralPlanCapacity(plan);
+        return plan;
+    }
+
+    fn preflightSetComponent(
+        self: *DataSystem,
+        entity: EntityId,
+        component: Component,
+        scratch: *StructuralPlanScratch,
+        projection: *StructuralCapacityProjection,
+        structural_event_count: *usize,
+    ) !void {
+        const state = try scratch.projectedState(self, entity);
+        if (!state.alive) return;
+        structural_event_count.* = try addCapacity(structural_event_count.*, 1);
+        if (!state.hasComponent(component)) {
+            try projection.addComponent(component);
+            state.addComponent(component);
+        }
+    }
+
+    fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) !void {
+        try self.slots.ensureTotalCapacity(self.allocator, plan.capacity_needs.slots);
+        try self.movement_bodies.ensureCapacity(self.allocator, plan.capacity_needs.movement_bodies);
+        try self.facings.ensureCapacity(self.allocator, plan.capacity_needs.facings);
+        try self.primitive_visuals.ensureCapacity(self.allocator, plan.capacity_needs.primitive_visuals);
+        try self.asset_refs.ensureCapacity(self.allocator, plan.capacity_needs.asset_refs);
+        try self.collision_bounds.ensureCapacity(self.allocator, plan.capacity_needs.collision_bounds);
+        try self.collision_responses.ensureCapacity(self.allocator, plan.capacity_needs.collision_responses);
+        try self.ai_agents.ensureCapacity(self.allocator, plan.capacity_needs.ai_agents);
+        try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
+    }
+
+    pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
+        // Validate fallible payloads up front so the later command-order commit
+        // does not partially mutate before rejecting bad component data.
+        for (commands) |command| {
+            switch (command) {
+                .create_entity => |template| {
+                    if (template.movement_body) |body| {
+                        try validateMovementBody(body);
+                    }
+                    if (template.primitive_visual) |visual| {
+                        try validatePrimitiveVisual(visual);
+                    }
                     if (template.collision_bounds) |bounds| {
                         try validateCollisionBounds(bounds);
                     }
@@ -776,6 +1227,8 @@ pub const DataSystem = struct {
                         try validateSteeringAgent(agent);
                     }
                 },
+                .set_movement_body => |set| try validateMovementBody(set.body),
+                .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
                 .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
                 .set_collision_response => |set| try validateCollisionResponse(set.response),
                 .set_ai_agent => |set| try validateAiAgent(set.agent),
@@ -783,6 +1236,39 @@ pub const DataSystem = struct {
                 else => {},
             }
         }
+    }
+
+    fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype, entity: EntityId, template: EntityTemplate) void {
+        // Navigation-obstacle notifications compare before/after state across
+        // the component sequence because movement, bounds, and response together
+        // define whether pathfinding needs a grid rebuild.
+        var was_static_navigation_obstacle = false;
+        if (template.movement_body != null) {
+            self.recordComponentChange(change_sink, entity, .movement_body, was_static_navigation_obstacle);
+            was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+        }
+        if (template.facing != null) self.recordComponentChange(change_sink, entity, .facing, was_static_navigation_obstacle);
+        if (template.primitive_visual != null) self.recordComponentChange(change_sink, entity, .primitive_visual, was_static_navigation_obstacle);
+        if (template.asset_reference != null) self.recordComponentChange(change_sink, entity, .asset_reference, was_static_navigation_obstacle);
+        if (template.collision_bounds != null) {
+            self.recordComponentChange(change_sink, entity, .collision_bounds, was_static_navigation_obstacle);
+            was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+        }
+        if (template.collision_response != null) {
+            self.recordComponentChange(change_sink, entity, .collision_response, was_static_navigation_obstacle);
+            was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+        }
+        if (template.ai_agent != null) self.recordComponentChange(change_sink, entity, .ai_agent, was_static_navigation_obstacle);
+        if (template.steering_agent != null) self.recordComponentChange(change_sink, entity, .steering_agent, was_static_navigation_obstacle);
+    }
+
+    fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
+        change_sink.record(.{ .component_changed = .{
+            .entity = entity,
+            .component = component,
+            .was_static_navigation_obstacle = was_static_navigation_obstacle,
+            .is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity),
+        } });
     }
 
     fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
@@ -823,6 +1309,8 @@ pub const DataSystem = struct {
     }
 
     fn resolveSlot(self: *DataSystem, id: EntityId) ?*EntitySlot {
+        // Resolution checks both liveness and generation. Slot index alone is
+        // never enough because free-list reuse is intentional.
         if (!id.isValid()) return null;
         const index: usize = @intCast(id.index);
         if (index >= self.slots.items.len) return null;
@@ -845,6 +1333,8 @@ pub const DataSystem = struct {
     }
 
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
+        // Store removals swap the tail row into the removed row. If a row moved,
+        // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].movement_body_index = @intCast(index);
     }
@@ -886,6 +1376,8 @@ pub const DataSystem = struct {
 };
 
 const EntitySlot = struct {
+    // Per-entity slot metadata stays cold compared with component columns. Hot
+    // systems query masks once, then iterate dense component slices directly.
     generation: u32 = 1,
     alive: bool = false,
     next_free: ?u32 = null,
@@ -907,6 +1399,31 @@ const EntitySlot = struct {
         return (self.component_mask & mask) == mask;
     }
 };
+
+fn validateMovementBody(body: MovementBody) !void {
+    if (!std.math.isFinite(body.position.x) or !std.math.isFinite(body.position.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.previous_position.x) or !std.math.isFinite(body.previous_position.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.velocity.x) or !std.math.isFinite(body.velocity.y)) return error.InvalidMovementBody;
+    if (!std.math.isFinite(body.speed) or body.speed < 0) return error.InvalidMovementBody;
+}
+
+fn validatePrimitiveVisual(visual: PrimitiveVisual) !void {
+    if (!std.math.isFinite(visual.size.x) or !std.math.isFinite(visual.size.y)) return error.InvalidPrimitiveVisual;
+    if (visual.size.x <= 0 or visual.size.y <= 0) return error.InvalidPrimitiveVisual;
+    try validatePrimitiveColor(visual.color);
+    try validatePrimitiveColor(visual.marker_color);
+    if (!std.math.isFinite(visual.marker_length) or visual.marker_length < 0) return error.InvalidPrimitiveVisual;
+    if (!std.math.isFinite(visual.marker_depth) or visual.marker_depth < 0) return error.InvalidPrimitiveVisual;
+    if (!std.math.isFinite(visual.marker_margin) or visual.marker_margin < 0) return error.InvalidPrimitiveVisual;
+}
+
+fn validatePrimitiveColor(color: config.Color) !void {
+    if (!std.math.isFinite(color.r) or !std.math.isFinite(color.g) or
+        !std.math.isFinite(color.b) or !std.math.isFinite(color.a))
+    {
+        return error.InvalidPrimitiveVisual;
+    }
+}
 
 fn validateCollisionBounds(bounds: CollisionBounds) !void {
     if (!std.math.isFinite(bounds.offset.x) or !std.math.isFinite(bounds.offset.y)) return error.InvalidCollisionBounds;
@@ -953,11 +1470,15 @@ fn validateSteeringAgent(agent: SteeringAgent) !void {
 }
 
 const MovementBodyStore = struct {
+    // Movement is the hottest component, so scalar fields are separate aligned
+    // columns for SIMD loads and cache-line-aware range splitting.
     entities: std.ArrayList(EntityId) = .empty,
     position_x: HotF32List = .empty,
     position_y: HotF32List = .empty,
+    position_z: HotI32List = .empty,
     previous_x: HotF32List = .empty,
     previous_y: HotF32List = .empty,
+    previous_z: HotI32List = .empty,
     velocity_x: HotF32List = .empty,
     velocity_y: HotF32List = .empty,
     speed: HotF32List = .empty,
@@ -969,8 +1490,10 @@ const MovementBodyStore = struct {
         self.entities.appendAssumeCapacity(entity);
         self.position_x.appendAssumeCapacity(body.position.x);
         self.position_y.appendAssumeCapacity(body.position.y);
+        self.position_z.appendAssumeCapacity(body.position_z);
         self.previous_x.appendAssumeCapacity(body.previous_position.x);
         self.previous_y.appendAssumeCapacity(body.previous_position.y);
+        self.previous_z.appendAssumeCapacity(body.previous_z);
         self.velocity_x.appendAssumeCapacity(body.velocity.x);
         self.velocity_y.appendAssumeCapacity(body.velocity.y);
         self.speed.appendAssumeCapacity(body.speed);
@@ -980,8 +1503,10 @@ const MovementBodyStore = struct {
     fn set(self: *MovementBodyStore, index: usize, body: MovementBody) void {
         self.position_x.items[index] = body.position.x;
         self.position_y.items[index] = body.position.y;
+        self.position_z.items[index] = body.position_z;
         self.previous_x.items[index] = body.previous_position.x;
         self.previous_y.items[index] = body.previous_position.y;
+        self.previous_z.items[index] = body.previous_z;
         self.velocity_x.items[index] = body.velocity.x;
         self.velocity_y.items[index] = body.velocity.y;
         self.speed.items[index] = body.speed;
@@ -991,6 +1516,8 @@ const MovementBodyStore = struct {
         return .{
             .position = .{ .x = self.position_x.items[index], .y = self.position_y.items[index] },
             .previous_position = .{ .x = self.previous_x.items[index], .y = self.previous_y.items[index] },
+            .position_z = self.position_z.items[index],
+            .previous_z = self.previous_z.items[index],
             .velocity = .{ .x = self.velocity_x.items[index], .y = self.velocity_y.items[index] },
             .speed = self.speed.items[index],
         };
@@ -1000,8 +1527,10 @@ const MovementBodyStore = struct {
         return .{
             .position_x = &self.position_x.items[index],
             .position_y = &self.position_y.items[index],
+            .position_z = &self.position_z.items[index],
             .previous_x = &self.previous_x.items[index],
             .previous_y = &self.previous_y.items[index],
+            .previous_z = &self.previous_z.items[index],
             .velocity_x = &self.velocity_x.items[index],
             .velocity_y = &self.velocity_y.items[index],
             .speed = &self.speed.items[index],
@@ -1014,16 +1543,20 @@ const MovementBodyStore = struct {
         self.entities.items[index] = self.entities.items[last];
         self.position_x.items[index] = self.position_x.items[last];
         self.position_y.items[index] = self.position_y.items[last];
+        self.position_z.items[index] = self.position_z.items[last];
         self.previous_x.items[index] = self.previous_x.items[last];
         self.previous_y.items[index] = self.previous_y.items[last];
+        self.previous_z.items[index] = self.previous_z.items[last];
         self.velocity_x.items[index] = self.velocity_x.items[last];
         self.velocity_y.items[index] = self.velocity_y.items[last];
         self.speed.items[index] = self.speed.items[last];
         _ = self.entities.pop();
         _ = self.position_x.pop();
         _ = self.position_y.pop();
+        _ = self.position_z.pop();
         _ = self.previous_x.pop();
         _ = self.previous_y.pop();
+        _ = self.previous_z.pop();
         _ = self.velocity_x.pop();
         _ = self.velocity_y.pop();
         _ = self.speed.pop();
@@ -1035,8 +1568,10 @@ const MovementBodyStore = struct {
             .entities = self.entities.items,
             .position_x = self.position_x.items,
             .position_y = self.position_y.items,
+            .position_z = self.position_z.items,
             .previous_x = self.previous_x.items,
             .previous_y = self.previous_y.items,
+            .previous_z = self.previous_z.items,
             .velocity_x = self.velocity_x.items,
             .velocity_y = self.velocity_y.items,
             .speed = self.speed.items,
@@ -1048,8 +1583,10 @@ const MovementBodyStore = struct {
             .entities = self.entities.items,
             .position_x = self.position_x.items,
             .position_y = self.position_y.items,
+            .position_z = self.position_z.items,
             .previous_x = self.previous_x.items,
             .previous_y = self.previous_y.items,
+            .previous_z = self.previous_z.items,
             .velocity_x = self.velocity_x.items,
             .velocity_y = self.velocity_y.items,
             .speed = self.speed.items,
@@ -1060,8 +1597,10 @@ const MovementBodyStore = struct {
         self.entities.clearRetainingCapacity();
         self.position_x.clearRetainingCapacity();
         self.position_y.clearRetainingCapacity();
+        self.position_z.clearRetainingCapacity();
         self.previous_x.clearRetainingCapacity();
         self.previous_y.clearRetainingCapacity();
+        self.previous_z.clearRetainingCapacity();
         self.velocity_x.clearRetainingCapacity();
         self.velocity_y.clearRetainingCapacity();
         self.speed.clearRetainingCapacity();
@@ -1071,8 +1610,10 @@ const MovementBodyStore = struct {
         self.entities.deinit(allocator);
         self.position_x.deinit(allocator);
         self.position_y.deinit(allocator);
+        self.position_z.deinit(allocator);
         self.previous_x.deinit(allocator);
         self.previous_y.deinit(allocator);
+        self.previous_z.deinit(allocator);
         self.velocity_x.deinit(allocator);
         self.velocity_y.deinit(allocator);
         self.speed.deinit(allocator);
@@ -1080,12 +1621,17 @@ const MovementBodyStore = struct {
     }
 
     fn ensureCapacityForOne(self: *MovementBodyStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.position_x.ensureTotalCapacity(allocator, capacity);
         try self.position_y.ensureTotalCapacity(allocator, capacity);
+        try self.position_z.ensureTotalCapacity(allocator, capacity);
         try self.previous_x.ensureTotalCapacity(allocator, capacity);
         try self.previous_y.ensureTotalCapacity(allocator, capacity);
+        try self.previous_z.ensureTotalCapacity(allocator, capacity);
         try self.velocity_x.ensureTotalCapacity(allocator, capacity);
         try self.velocity_y.ensureTotalCapacity(allocator, capacity);
         try self.speed.ensureTotalCapacity(allocator, capacity);
@@ -1093,14 +1639,14 @@ const MovementBodyStore = struct {
 };
 
 const FacingStore = struct {
+    // Facing is compact and cold enough to keep as enum rows, but it still
+    // follows the dense entity-row contract for fast membership scans.
     entities: std.ArrayList(EntityId) = .empty,
     directions: std.ArrayList(Facing) = .empty,
 
     fn append(self: *FacingStore, allocator: std.mem.Allocator, entity: EntityId, facing: FacingData) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
-        const capacity = self.entities.items.len + 1;
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.directions.ensureTotalCapacity(allocator, capacity);
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
         self.directions.appendAssumeCapacity(facing.direction);
@@ -1135,9 +1681,16 @@ const FacingStore = struct {
         self.directions.deinit(allocator);
         self.* = .{};
     }
+
+    fn ensureCapacity(self: *FacingStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.directions.ensureTotalCapacity(allocator, capacity);
+    }
 };
 
 const PrimitiveVisualStore = struct {
+    // Visual columns keep render-prep reads linear and avoid touching gameplay
+    // systems that do not care about color, marker, or depth fields.
     entities: std.ArrayList(EntityId) = .empty,
     size_x: std.ArrayList(f32) = .empty,
     size_y: std.ArrayList(f32) = .empty,
@@ -1145,12 +1698,12 @@ const PrimitiveVisualStore = struct {
     color_g: std.ArrayList(f32) = .empty,
     color_b: std.ArrayList(f32) = .empty,
     color_a: std.ArrayList(f32) = .empty,
-    layers: std.ArrayList(i32) = .empty,
+    depth_values: std.ArrayList(i32) = .empty,
     marker_color_r: std.ArrayList(f32) = .empty,
     marker_color_g: std.ArrayList(f32) = .empty,
     marker_color_b: std.ArrayList(f32) = .empty,
     marker_color_a: std.ArrayList(f32) = .empty,
-    marker_layers: std.ArrayList(i32) = .empty,
+    marker_depth_values: std.ArrayList(i32) = .empty,
     marker_lengths: std.ArrayList(f32) = .empty,
     marker_depths: std.ArrayList(f32) = .empty,
     marker_margins: std.ArrayList(f32) = .empty,
@@ -1171,12 +1724,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.items[index] = visual.color.g;
         self.color_b.items[index] = visual.color.b;
         self.color_a.items[index] = visual.color.a;
-        self.layers.items[index] = visual.layer;
+        self.depth_values.items[index] = render_depth.worldZ(visual.depth);
         self.marker_color_r.items[index] = visual.marker_color.r;
         self.marker_color_g.items[index] = visual.marker_color.g;
         self.marker_color_b.items[index] = visual.marker_color.b;
         self.marker_color_a.items[index] = visual.marker_color.a;
-        self.marker_layers.items[index] = visual.marker_layer;
+        self.marker_depth_values.items[index] = render_depth.worldZ(visual.marker_depth_band);
         self.marker_lengths.items[index] = visual.marker_length;
         self.marker_depths.items[index] = visual.marker_depth;
         self.marker_margins.items[index] = visual.marker_margin;
@@ -1191,14 +1744,14 @@ const PrimitiveVisualStore = struct {
                 .b = self.color_b.items[index],
                 .a = self.color_a.items[index],
             },
-            .layer = self.layers.items[index],
+            .depth = @enumFromInt(self.depth_values.items[index]),
             .marker_color = .{
                 .r = self.marker_color_r.items[index],
                 .g = self.marker_color_g.items[index],
                 .b = self.marker_color_b.items[index],
                 .a = self.marker_color_a.items[index],
             },
-            .marker_layer = self.marker_layers.items[index],
+            .marker_depth_band = @enumFromInt(self.marker_depth_values.items[index]),
             .marker_length = self.marker_lengths.items[index],
             .marker_depth = self.marker_depths.items[index],
             .marker_margin = self.marker_margins.items[index],
@@ -1215,12 +1768,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.items[index] = self.color_g.items[last];
         self.color_b.items[index] = self.color_b.items[last];
         self.color_a.items[index] = self.color_a.items[last];
-        self.layers.items[index] = self.layers.items[last];
+        self.depth_values.items[index] = self.depth_values.items[last];
         self.marker_color_r.items[index] = self.marker_color_r.items[last];
         self.marker_color_g.items[index] = self.marker_color_g.items[last];
         self.marker_color_b.items[index] = self.marker_color_b.items[last];
         self.marker_color_a.items[index] = self.marker_color_a.items[last];
-        self.marker_layers.items[index] = self.marker_layers.items[last];
+        self.marker_depth_values.items[index] = self.marker_depth_values.items[last];
         self.marker_lengths.items[index] = self.marker_lengths.items[last];
         self.marker_depths.items[index] = self.marker_depths.items[last];
         self.marker_margins.items[index] = self.marker_margins.items[last];
@@ -1237,12 +1790,12 @@ const PrimitiveVisualStore = struct {
             .color_g = self.color_g.items,
             .color_b = self.color_b.items,
             .color_a = self.color_a.items,
-            .layers = self.layers.items,
+            .depth_values = self.depth_values.items,
             .marker_color_r = self.marker_color_r.items,
             .marker_color_g = self.marker_color_g.items,
             .marker_color_b = self.marker_color_b.items,
             .marker_color_a = self.marker_color_a.items,
-            .marker_layers = self.marker_layers.items,
+            .marker_depth_values = self.marker_depth_values.items,
             .marker_lengths = self.marker_lengths.items,
             .marker_depths = self.marker_depths.items,
             .marker_margins = self.marker_margins.items,
@@ -1257,12 +1810,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.clearRetainingCapacity();
         self.color_b.clearRetainingCapacity();
         self.color_a.clearRetainingCapacity();
-        self.layers.clearRetainingCapacity();
+        self.depth_values.clearRetainingCapacity();
         self.marker_color_r.clearRetainingCapacity();
         self.marker_color_g.clearRetainingCapacity();
         self.marker_color_b.clearRetainingCapacity();
         self.marker_color_a.clearRetainingCapacity();
-        self.marker_layers.clearRetainingCapacity();
+        self.marker_depth_values.clearRetainingCapacity();
         self.marker_lengths.clearRetainingCapacity();
         self.marker_depths.clearRetainingCapacity();
         self.marker_margins.clearRetainingCapacity();
@@ -1276,12 +1829,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.deinit(allocator);
         self.color_b.deinit(allocator);
         self.color_a.deinit(allocator);
-        self.layers.deinit(allocator);
+        self.depth_values.deinit(allocator);
         self.marker_color_r.deinit(allocator);
         self.marker_color_g.deinit(allocator);
         self.marker_color_b.deinit(allocator);
         self.marker_color_a.deinit(allocator);
-        self.marker_layers.deinit(allocator);
+        self.marker_depth_values.deinit(allocator);
         self.marker_lengths.deinit(allocator);
         self.marker_depths.deinit(allocator);
         self.marker_margins.deinit(allocator);
@@ -1289,7 +1842,10 @@ const PrimitiveVisualStore = struct {
     }
 
     fn ensureCapacityForOne(self: *PrimitiveVisualStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *PrimitiveVisualStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.size_x.ensureTotalCapacity(allocator, capacity);
         try self.size_y.ensureTotalCapacity(allocator, capacity);
@@ -1297,12 +1853,12 @@ const PrimitiveVisualStore = struct {
         try self.color_g.ensureTotalCapacity(allocator, capacity);
         try self.color_b.ensureTotalCapacity(allocator, capacity);
         try self.color_a.ensureTotalCapacity(allocator, capacity);
-        try self.layers.ensureTotalCapacity(allocator, capacity);
+        try self.depth_values.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_r.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_g.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_b.ensureTotalCapacity(allocator, capacity);
         try self.marker_color_a.ensureTotalCapacity(allocator, capacity);
-        try self.marker_layers.ensureTotalCapacity(allocator, capacity);
+        try self.marker_depth_values.ensureTotalCapacity(allocator, capacity);
         try self.marker_lengths.ensureTotalCapacity(allocator, capacity);
         try self.marker_depths.ensureTotalCapacity(allocator, capacity);
         try self.marker_margins.ensureTotalCapacity(allocator, capacity);
@@ -1315,12 +1871,12 @@ const PrimitiveVisualStore = struct {
         self.color_g.appendAssumeCapacity(visual.color.g);
         self.color_b.appendAssumeCapacity(visual.color.b);
         self.color_a.appendAssumeCapacity(visual.color.a);
-        self.layers.appendAssumeCapacity(visual.layer);
+        self.depth_values.appendAssumeCapacity(render_depth.worldZ(visual.depth));
         self.marker_color_r.appendAssumeCapacity(visual.marker_color.r);
         self.marker_color_g.appendAssumeCapacity(visual.marker_color.g);
         self.marker_color_b.appendAssumeCapacity(visual.marker_color.b);
         self.marker_color_a.appendAssumeCapacity(visual.marker_color.a);
-        self.marker_layers.appendAssumeCapacity(visual.marker_layer);
+        self.marker_depth_values.appendAssumeCapacity(render_depth.worldZ(visual.marker_depth_band));
         self.marker_lengths.appendAssumeCapacity(visual.marker_length);
         self.marker_depths.appendAssumeCapacity(visual.marker_depth);
         self.marker_margins.appendAssumeCapacity(visual.marker_margin);
@@ -1334,12 +1890,12 @@ const PrimitiveVisualStore = struct {
         _ = self.color_g.pop();
         _ = self.color_b.pop();
         _ = self.color_a.pop();
-        _ = self.layers.pop();
+        _ = self.depth_values.pop();
         _ = self.marker_color_r.pop();
         _ = self.marker_color_g.pop();
         _ = self.marker_color_b.pop();
         _ = self.marker_color_a.pop();
-        _ = self.marker_layers.pop();
+        _ = self.marker_depth_values.pop();
         _ = self.marker_lengths.pop();
         _ = self.marker_depths.pop();
         _ = self.marker_margins.pop();
@@ -1347,14 +1903,14 @@ const PrimitiveVisualStore = struct {
 };
 
 const AssetReferenceStore = struct {
+    // Persistent render identity is a stable asset ID. Loaded textures and
+    // prepared sprite records are renderer/cache concerns, not component data.
     entities: std.ArrayList(EntityId) = .empty,
     sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
 
     fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, sprite: SpriteAssetId) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
-        const capacity = self.entities.items.len + 1;
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
         const index: u32 = @intCast(self.entities.items.len);
         self.entities.appendAssumeCapacity(entity);
         self.sprite_ids.appendAssumeCapacity(sprite);
@@ -1387,9 +1943,16 @@ const AssetReferenceStore = struct {
         self.sprite_ids.deinit(allocator);
         self.* = .{};
     }
+
+    fn ensureCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.entities.ensureTotalCapacity(allocator, capacity);
+        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
+    }
 };
 
 const CollisionBoundsStore = struct {
+    // Bounds columns are aligned because collision and pathfinding both scan
+    // them in tight loops.
     entities: std.ArrayList(EntityId) = .empty,
     offset_x: HotF32List = .empty,
     offset_y: HotF32List = .empty,
@@ -1466,7 +2029,10 @@ const CollisionBoundsStore = struct {
     }
 
     fn ensureCapacityForOne(self: *CollisionBoundsStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *CollisionBoundsStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.offset_x.ensureTotalCapacity(allocator, capacity);
         try self.offset_y.ensureTotalCapacity(allocator, capacity);
@@ -1476,6 +2042,8 @@ const CollisionBoundsStore = struct {
 };
 
 const CollisionResponseStore = struct {
+    // Response rows describe collision policy and static/dynamic mobility; they
+    // intentionally do not point at collision-system runtime state.
     entities: std.ArrayList(EntityId) = .empty,
     modes: std.ArrayList(CollisionResponseMode) = .empty,
     mobilities: std.ArrayList(CollisionResponseMobility) = .empty,
@@ -1545,7 +2113,10 @@ const CollisionResponseStore = struct {
     }
 
     fn ensureCapacityForOne(self: *CollisionResponseStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *CollisionResponseStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.modes.ensureTotalCapacity(allocator, capacity);
         try self.mobilities.ensureTotalCapacity(allocator, capacity);
@@ -1554,6 +2125,8 @@ const CollisionResponseStore = struct {
 };
 
 const AiAgentStore = struct {
+    // AI agent data stays small and persistent here. Per-step decisions are
+    // emitted through SimulationFrame streams instead of stored on the entity.
     entities: std.ArrayList(EntityId) = .empty,
     behaviors: std.ArrayList(AiBehavior) = .empty,
     wander_amplitudes: HotF32List = .empty,
@@ -1623,7 +2196,10 @@ const AiAgentStore = struct {
     }
 
     fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *AiAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.behaviors.ensureTotalCapacity(allocator, capacity);
         try self.wander_amplitudes.ensureTotalCapacity(allocator, capacity);
@@ -1632,6 +2208,8 @@ const AiAgentStore = struct {
 };
 
 const SteeringAgentStore = struct {
+    // Steering configuration is persistent, while path cooldowns and local
+    // avoidance scratch live in SteeringSystem runtime rows.
     entities: std.ArrayList(EntityId) = .empty,
     agent_radii: HotF32List = .empty,
     waypoint_tolerances: HotF32List = .empty,
@@ -1739,7 +2317,10 @@ const SteeringAgentStore = struct {
     }
 
     fn ensureCapacityForOne(self: *SteeringAgentStore, allocator: std.mem.Allocator) !void {
-        const capacity = self.entities.items.len + 1;
+        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+    }
+
+    fn ensureCapacity(self: *SteeringAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.entities.ensureTotalCapacity(allocator, capacity);
         try self.agent_radii.ensureTotalCapacity(allocator, capacity);
         try self.waypoint_tolerances.ensureTotalCapacity(allocator, capacity);
@@ -1771,8 +2352,10 @@ fn nextGeneration(generation: u32) u32 {
 fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.position_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.position_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.position_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_y.len);
+    try std.testing.expectEqual(slice.entities.len, slice.previous_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
@@ -1781,14 +2364,16 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
 fn expectHotColumnPointersAligned(slice: ConstMovementBodySlice) !void {
     try expectPointerAligned(slice.position_x.ptr);
     try expectPointerAligned(slice.position_y.ptr);
+    try expectPointerAligned(slice.position_z.ptr);
     try expectPointerAligned(slice.previous_x.ptr);
     try expectPointerAligned(slice.previous_y.ptr);
+    try expectPointerAligned(slice.previous_z.ptr);
     try expectPointerAligned(slice.velocity_x.ptr);
     try expectPointerAligned(slice.velocity_y.ptr);
     try expectPointerAligned(slice.speed.ptr);
 }
 
-fn expectPointerAligned(ptr: [*]align(hot_soa_column_alignment) const f32) !void {
+fn expectPointerAligned(ptr: anytype) !void {
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % hot_soa_column_alignment);
 }
 
@@ -1799,12 +2384,12 @@ fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.color_g.len);
     try std.testing.expectEqual(slice.entities.len, slice.color_b.len);
     try std.testing.expectEqual(slice.entities.len, slice.color_a.len);
-    try std.testing.expectEqual(slice.entities.len, slice.layers.len);
+    try std.testing.expectEqual(slice.entities.len, slice.depth_values.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_r.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_g.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_b.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_color_a.len);
-    try std.testing.expectEqual(slice.entities.len, slice.marker_layers.len);
+    try std.testing.expectEqual(slice.entities.len, slice.marker_depth_values.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_lengths.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_depths.len);
     try std.testing.expectEqual(slice.entities.len, slice.marker_margins.len);
@@ -1878,6 +2463,25 @@ test "entity generations reject stale ids after removal and reuse" {
     try std.testing.expect(!data.destroyEntity(first));
 }
 
+test "entity free slot count tracks destroy reuse and reset" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    try std.testing.expectEqual(@as(usize, 0), data.free_slot_count);
+
+    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expect(data.destroyEntity(second));
+    try std.testing.expectEqual(@as(usize, 2), data.free_slot_count);
+
+    _ = try data.createEntity();
+    try std.testing.expectEqual(@as(usize, 1), data.free_slot_count);
+
+    data.clearRetainingCapacity();
+    try std.testing.expectEqual(data.slots.items.len, data.free_slot_count);
+}
+
 test "movement body store is row aligned and compact after removal" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1902,12 +2506,42 @@ test "movement body store is row aligned and compact after removal" {
         const expected = if (entity.matches(first.index, first.generation)) @as(f32, 1) else @as(f32, 3);
         try std.testing.expectEqual(expected, slice.position_x[index]);
         try std.testing.expectEqual(expected + 10, slice.position_y[index]);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 2, slice.position_z[index]);
         try std.testing.expectEqual(expected + 20, slice.previous_x[index]);
         try std.testing.expectEqual(expected + 30, slice.previous_y[index]);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 1, slice.previous_z[index]);
         try std.testing.expectEqual(expected + 40, slice.velocity_x[index]);
         try std.testing.expectEqual(expected + 50, slice.velocity_y[index]);
         try std.testing.expectEqual(expected + 60, slice.speed[index]);
     }
+}
+
+test "movement body ingress rejects invalid payloads without mutating existing rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+
+    var bad = testBody(99);
+    bad.position.x = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.previous_position.y = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.velocity.x = -std.math.inf(f32);
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
+
+    bad = testBody(99);
+    bad.speed = -0.1;
+    try std.testing.expectError(error.InvalidMovementBody, data.setMovementBody(entity, bad));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(entity).?.position.x);
 }
 
 test "component masks track entity membership for system queries" {
@@ -2036,6 +2670,44 @@ test "primitive visual store is columnar and compact after removal" {
         try std.testing.expectEqual(expected, slice.size_x[index]);
         try std.testing.expectEqual(expected, slice.size_y[index]);
     }
+}
+
+test "primitive visual ingress rejects invalid payloads without mutating existing rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setPrimitiveVisual(entity, testVisualWithSize(8));
+
+    var bad = testVisualWithSize(99);
+    bad.size.x = 0;
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.size.y = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.color.g = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_length = -0.1;
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_depth = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
+
+    bad = testVisualWithSize(99);
+    bad.marker_margin = std.math.nan(f32);
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.setPrimitiveVisual(entity, bad));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(entity).?.size.x);
 }
 
 test "reset invalidates old ids while keeping system reusable" {
@@ -2389,6 +3061,179 @@ test "structural commands prevalidate steering agents before mutating" {
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
 }
 
+test "structural commands prevalidate movement and primitive visuals before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+    try data.setPrimitiveVisual(existing, testVisualWithSize(8));
+
+    var invalid_body = testBody(2);
+    invalid_body.speed = std.math.nan(f32);
+    const movement_commands = [_]StructuralCommand{
+        .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
+        .{ .create_entity = .{ .movement_body = invalid_body } },
+    };
+    try std.testing.expectError(error.InvalidMovementBody, data.applyStructuralCommands(&movement_commands));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+
+    var invalid_visual = testVisualWithSize(16);
+    invalid_visual.marker_margin = -1;
+    const visual_commands = [_]StructuralCommand{
+        .{ .set_primitive_visual = .{ .entity = existing, .visual = testVisualWithSize(99) } },
+        .{ .create_entity = .{ .primitive_visual = invalid_visual } },
+    };
+    try std.testing.expectError(error.InvalidPrimitiveVisual, data.applyStructuralCommands(&visual_commands));
+    try std.testing.expectEqual(@as(f32, 8), data.primitiveVisualConst(existing).?.size.x);
+    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
+}
+
+test "structural commands reserve capacity before mutating" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const existing = try data.createEntity();
+    try data.setMovementBody(existing, testBody(1));
+
+    var commands: std.ArrayList(StructuralCommand) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    try commands.append(std.testing.allocator, .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } });
+    for (0..64) |index| {
+        try commands.append(std.testing.allocator, .{ .create_entity = .{
+            .movement_body = testBody(@floatFromInt(index + 2)),
+            .primitive_visual = testVisual(),
+            .collision_bounds = testBounds(1),
+        } });
+    }
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    try std.testing.expectError(error.OutOfMemory, data.preflightStructuralCommands(commands.items, &scratch));
+    try std.testing.expectEqual(@as(f32, 1), data.movementBodyConst(existing).?.position.x);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), data.collisionBoundsSliceConst().entities.len);
+}
+
+test "structural command preflight follows destroy then create slot reuse" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .destroy_entity = entity },
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+        } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    _ = try data.preflightStructuralCommands(&commands, &scratch);
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var sink = NullStructuralChangeSink{};
+    const stats = try data.commitStructuralCommands(&commands, &sink);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 1), stats.created);
+    try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
+    try std.testing.expect(data.movementBodyConst(entity) == null);
+}
+
+test "structural command preflight counts duplicate component sets once" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const target = try data.createEntity();
+    const seed = try data.createEntity();
+    try data.setPrimitiveVisual(seed, testVisualWithSize(8));
+    try std.testing.expect(data.destroyEntity(seed));
+
+    const commands = [_]StructuralCommand{
+        .{ .set_primitive_visual = .{ .entity = target, .visual = testVisualWithSize(16) } },
+        .{ .set_primitive_visual = .{ .entity = target, .visual = testVisualWithSize(32) } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    _ = try data.preflightStructuralCommands(&commands, &scratch);
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    var sink = NullStructuralChangeSink{};
+    const stats = try data.commitStructuralCommands(&commands, &sink);
+    try std.testing.expectEqual(@as(usize, 2), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
+    try std.testing.expectEqual(@as(f32, 32), data.primitiveVisualConst(target).?.size.x);
+}
+
+test "structural command plan counts only projected live structural events" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const destroyed = try data.createEntity();
+    try data.setMovementBody(destroyed, testBody(1));
+
+    const commands = [_]StructuralCommand{
+        .{ .destroy_entity = destroyed },
+        .{ .set_movement_body = .{ .entity = destroyed, .body = testBody(2) } },
+        .{ .set_facing = .{ .entity = EntityId.invalid, .facing = .{ .direction = .left } } },
+        .{ .create_entity = .{
+            .movement_body = testBody(3),
+            .facing = .{ .direction = .right },
+        } },
+    };
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+    const plan = try data.preflightStructuralCommands(&commands, &scratch);
+    try std.testing.expectEqual(@as(usize, 4), plan.structural_event_count);
+
+    const stats = try data.applyStructuralCommands(&commands);
+    try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
+    try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
+    try std.testing.expectEqual(@as(usize, 1), stats.created);
+    try std.testing.expectEqual(@as(usize, 2), stats.components_set);
+}
+
+test "structural command preflight returns before projection for empty command batches" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    for (0..8) |_| {
+        const entity = try data.createEntity();
+        try std.testing.expect(data.destroyEntity(entity));
+    }
+
+    var scratch = StructuralPlanScratch.init(std.testing.allocator);
+    defer scratch.deinit();
+
+    const original_allocator = data.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    data.allocator = failing_allocator.allocator();
+    defer data.allocator = original_allocator;
+
+    const plan = try data.preflightStructuralCommands(&.{}, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), plan.structural_event_count);
+    try std.testing.expectEqual(@as(usize, 0), scratch.projected_entities.count());
+}
+
 test "movement body slice access performs no allocations" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2419,6 +3264,8 @@ fn testBody(base: f32) MovementBody {
     return .{
         .position = .{ .x = base, .y = base + 10 },
         .previous_position = .{ .x = base + 20, .y = base + 30 },
+        .position_z = @as(i32, @intFromFloat(base)) - 2,
+        .previous_z = @as(i32, @intFromFloat(base)) - 1,
         .velocity = .{ .x = base + 40, .y = base + 50 },
         .speed = base + 60,
     };

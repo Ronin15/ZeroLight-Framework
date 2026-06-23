@@ -16,6 +16,10 @@ repo. Keep the final design compact, but make the decisions below explicit.
   overlay policies can let lower states receive events, updates, or rendering.
 - New designs should keep gameplay behavior in states or processors, not in
   `main.zig` or broad `Engine` conditionals.
+- Rendering designs should treat `RenderQueue` as the transient ordering phase
+  for records from world, effects, UI, and debug producers. `Renderer` and
+  `SpriteBatch` consume already ordered commands; do not design fallback sorting
+  inside the renderer to hide producer-order bugs.
 
 ## Simulation Pipeline And Controllers
 
@@ -37,11 +41,26 @@ becoming mostly orchestration. Keep the pipeline state-owned; do not promote it
 into a global ECS scheduler, reflection system, dynamic dependency graph, or
 app-level service.
 
+When designing tier/scope scaffolding, put contracts in final owner locations:
+`SimulationScope`, `SimulationTier`, `ActiveRegion`, cold tier/chunk metadata
+defaults, validation helpers, default full-scope construction, and stats. Do
+not enable or claim scoped tier runtime behavior until concrete
+world/chunk/visibility inputs exist and filtered gathers, cadence policy, and
+tier transitions are actually wired.
+
 Controllers may own small feature-local queues, budgets, cooldowns, transient
 scratch, and arbitration rules. They should not become hidden per-entity stores,
 own renderer/audio/SDL handles, hide random choices, or replace SoA processors
 for hot loops. Persistent gameplay/domain facts live in `DataSystem` or
 state-owned domain storage; per-step outputs live in `SimulationFrame`.
+
+Do not use the main thread as the default home for work that lacks an owner.
+Main-thread boundaries are for explicit ownership constraints such as
+SDL/GPU/audio calls, state transitions, structural commits, asset loading,
+save/load streaming, renderer resource ownership, or deliberately light
+orchestration. If app, gameplay, render-prep, event, asset, platform, or
+tooling work can scale with workload size, assign it to the owning layer and
+define immutable inputs plus deterministic owned outputs.
 
 ## Data Ownership
 
@@ -60,6 +79,9 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
 - Runtime gameplay and render-prep data should carry stable asset IDs such as
   `SpriteAssetId` and `AudioAssetId`; path validation, PNG decode, GPU upload,
   audio load/predecode, and string lookup belong in asset/app services.
+- Transient render queues may carry renderer-facing handles after `RuntimeAssets`
+  resolution, but persistent gameplay storage should keep stable asset IDs and
+  enum render-depth intent instead of live renderer handles or raw layer numbers.
 
 ## Processor Contracts
 
@@ -81,6 +103,16 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
   deterministic comparison.
 - If a processor emits events or intents, define whether they are persistent
   state, transient per-frame data, or deferred commands, and where they merge.
+- Production contracts should expose runtime concepts only. Do not design
+  test-only tags, marker payloads, fake stages, fixture hooks, service
+  shortcuts, or test-only paths into app, game, render, asset, platform,
+  tooling, event, intent, structural-command, ID, component, or service APIs;
+  tests should use private helper records, local fixtures, test-only mocks, or
+  real payloads.
+- If a gameplay/render-prep processor emits draw records, define the final
+  `RenderOrder`, queue ownership, allocation/reserve policy, and whether records
+  are sorted, bucketed, or emitted in already ordered spans before `Renderer`
+  submission.
 
 ## Hardware And Hot Paths
 
@@ -101,6 +133,9 @@ state-owned domain storage; per-step outputs live in `SimulationFrame`.
 - Treat thread-system thresholds as heuristics until representative workloads
   prove them. Designs should say what metrics or tests would reveal bad
   scheduling choices.
+- For SDL_GPU rendering, keep CPU prep and worker expansion outside the acquired
+  swapchain interval where possible. Designs should keep swapchain acquisition,
+  upload, render-pass encoding, and submit tightly scoped on the render thread.
 
 ## Emergent Gameplay Design
 
@@ -137,3 +172,8 @@ Do not rewrite completed slices to tell history. Preserve completed work, add
 the next finishable feature slices, and keep open work honest. A slice is only
 complete when runtime behavior, diagnostics, docs, tests, and acceptance checks
 are integrated.
+
+When a slice intentionally lands foundation or scaffolding, say exactly what is
+scaffolded, where future behavior hooks in, and which runtime checklist remains
+deferred. Scaffolding should reduce implementation guesswork; it should not
+rename deferred behavior as complete.

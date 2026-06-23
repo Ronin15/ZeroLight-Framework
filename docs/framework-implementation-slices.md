@@ -22,21 +22,33 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Finish Slice 7 parallel CPU render prep on top of the Slice 17
-  `RuntimeAssets` catalog. Keep it incomplete until serial and parallel prep
-  produce identical draw order, grouping, and invalid-resource handling.
-- Finish Slice 20 navigation hardening before scaling to large maps or many NPC
-  path users. Rare true-A* work, pending budgets, cache aging/capacity, and
-  hard-path benchmark visibility should remain explicit.
-- Track collision-response merge/apply, renderer batch capacity, text-cache
-  lifetime policy, and manual registry guardrails as hardening follow-ups.
-- Add a typed simulation event system slice before broad domain features such as
-  tiles, weather, obstacle state, AI perception, navigation invalidation, combat,
-  and spawning start depending on cross-system change signals.
-- Extract Slice 22 `SimulationPipeline` and scoped simulation tiers before
-  broad world/chunk gameplay depends on manual `GameDemoState` orchestration.
-  See [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for
-  tier definitions, scope rules, stage map, and acceptance themes.
+- Use the completed Slice 7 render-prep benchmark to guard the current
+  `RenderQueue` -> `SpriteBatch` CPU prep path. Future tile rendering, richer
+  UI, particles, lighting sprites, and debug records should feed typed
+  `RenderOrder` records through `RenderQueue` first, then add specialized
+  batchers only after measurement shows the sprite/rect batcher is the wrong
+  representation. Keep SDL_GPU command-buffer, swapchain, upload, render-pass,
+  and submit ownership on the render thread.
+- Track collision-response merge/apply, SpriteBatch high-water/capacity policy,
+  text-cache lifetime policy, shader/material registry guardrails, and remaining
+  manual registry guardrails as hardening follow-ups.
+- Treat Slice 20 pathfinding budgets, deterministic pending retention, and
+  fixed-capacity cache contracts as the navigation hardening base before
+  scaling to large maps or many NPC path users.
+- Use the completed Slice 21 typed simulation events as the cross-system signal
+  foundation before broad domain features such as tiles, weather, obstacle
+  state, AI perception, combat, spawning, resources, and rules depend on those
+  changes.
+- Start Slice 22 with a behavior-preserving `SimulationPipeline` extraction
+  plus tier/scope scaffolding in the final owner locations. The first runtime
+  behavior stays full active-set parity, but `SimulationTier`, `ActiveRegion`,
+  cold tier/chunk metadata, and scope stats should be shaped so later world and
+  chunk hooks do not require guesswork or contract rewrites.
+- Add atlas-backed world rendering before enabling scoped tier behavior. World
+  rendering should provide the concrete tile/chunk/visibility data that scoped
+  simulation consumes instead of inventing abstract chunk policy in isolation.
+  See [architecture.md](architecture.md) for durable tier and pipeline
+  boundaries; this roadmap owns the implementation order and acceptance themes.
 - When multiple gameplay states need the same ordered processor flow, share the
   state-owned pipeline helper instead of duplicating orchestration or adding a
   global ECS scheduler. The pipeline may own lightweight domain controllers,
@@ -62,7 +74,7 @@ live in `DataSystem` or state-owned domain storage, per-step outputs live in
 typed slices and emit deterministic outputs.
 Simulation tiers and per-step active scope filter which entities enter each
 pipeline stage without changing processor hot paths. See
-[simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md).
+[architecture.md](architecture.md) for the durable tier and pipeline boundary.
 Pathfinding provides a navigation substrate; immersive NPC behavior still needs
 steering, local avoidance, perception, and rule arbitration layered above it.
 
@@ -240,18 +252,21 @@ Current foundation:
 - `assets/test/cache_probe.png` provides a tiny installed PNG fixture for cache
   and asset-root checks.
 
-Future render-data slice:
+Render-data boundary:
 
 - Entity creation and world loading should bind stable sprite or atlas-region
   IDs before render-time. `DataSystem` render data should store stable asset
-  references plus source intent such as tint, layer, and coordinate-space
-  intent, not live renderer handles.
-- A state-owned render-prep system should read immutable `DataSystem` slices and
-  submit prepared `Sprite` commands to `Renderer`. The renderer should not look
-  up gameplay entities, world data, asset paths, or texture assignments.
-- Atlas work should build on the same boundary: assets decode source images,
-  atlas code packs CPU pixels, render uploads the final atlas texture, and
-  entities reference atlas regions.
+  references plus source intent such as tint, typed render-depth intent, and
+  coordinate-space intent, not live renderer handles or raw layer numbers.
+- State-owned render-prep code reads immutable `DataSystem` slices, resolves
+  stable IDs through `RuntimeAssets`, emits transient draw records into
+  `RenderQueue`, and submits the queue's ordered stream to `Renderer`. The
+  renderer should not look up gameplay entities, world data, asset paths, or
+  texture assignments.
+- Atlas and tile work should build on the same boundary: assets decode source
+  images, atlas code packs CPU pixels, render uploads the final atlas texture,
+  entities or tile cells reference atlas regions, and render prep converts those
+  IDs into queue records with explicit `RenderOrder`.
 
 Checklist:
 
@@ -310,8 +325,10 @@ Implemented foundation:
 
 - `Renderer` owns frame coordination, public draw APIs, texture IDs, swapchain
   acquisition, render-pass encoding, and command submission.
-- `SpriteBatch` owns sprite command sorting, vertex expansion, and draw-group
-  construction.
+- `RenderQueue` owns transient draw-record ordering across world, UI, effect,
+  and debug producers.
+- `SpriteBatch` owns strict ordered-stream validation, vertex expansion, and
+  draw-group construction.
 - `src/render/gpu/` owns SDL_GPU device/window setup helpers, pipeline creation,
   upload buffers, and texture upload helpers.
 - Build now has a shader-program table for the existing sprite shader pair.
@@ -322,8 +339,8 @@ Architecture notes:
   `renderer.zig`, so texture ownership does not migrate across several files at
   the same time as the handle model changes.
 - The first split uses `src/render/gpu/` for SDL_GPU device/window setup,
-  shader/pipeline creation, buffers, and texture upload, with sprite command
-  sorting and vertex expansion moved to `sprite_batch.zig`.
+  shader/pipeline creation, buffers, and texture upload, with draw-record
+  ordering in `render_queue.zig` and vertex expansion in `sprite_batch.zig`.
 - Keep `Renderer` as the game-facing facade and frame coordinator; the split
   should hide GPU details behind narrower render-owned modules, not expose more
   SDL_GPU surface area to game states.
@@ -335,9 +352,9 @@ Checklist:
 - [x] If `renderer.zig` remains too broad after resource IDs land, split GPU
       setup, pipeline, buffer, and texture helpers under `src/render/gpu/`.
 - [x] Introduce static material/pipeline records for the current sprite pipeline.
-- [x] Keep draw command sorting stable by layer and submission order.
-- [x] Preserve `drawSprite` and `drawRect` as the game-facing API during the
-      first split.
+- [x] Keep draw record ordering stable by `RenderOrder` and submission order.
+- [x] Preserve explicit `Renderer.submitOrdered*` calls for already ordered
+      renderer-owned paths and route unordered producers through `RenderQueue`.
 - [x] Add tests for batch grouping, invalid texture skipping, and ordering.
 - [x] Re-run `gpu-smoke` when display access is available.
 
@@ -363,6 +380,8 @@ Current foundation:
 - `TimeLoop` already enforces fixed-step gameplay updates.
 - Renderer command submission is currently serial and owns SDL_GPU command
   buffers, swapchain acquisition, vertex upload, and submit.
+- Current sprite and rectangle drawing flows through `SpriteBatch`, with stable
+  sprite IDs resolved by `RuntimeAssets` before draw submission.
 - Zig 0.16 provides `std.Thread.spawn`, atomics, and `std.Io` blocking
   primitives; this checkout does not rely on a std thread-pool abstraction.
 
@@ -432,17 +451,27 @@ Parallel render-prep design:
 - [x] Keep SDL_GPU command-buffer acquisition, swapchain acquisition, GPU
       upload, render-pass encoding, and submit on the main/render thread for
       the first implementation.
-- [ ] Parallelize CPU render prep only: visibility/culling, layer bucketing,
-      stable sort by layer and submission sequence, sprite-to-vertex expansion,
-      draw-group construction, and per-worker temporary vertex/group buffers.
-- [ ] Snapshot texture/resource metadata needed by workers before dispatch so
+- [x] Split CPU render prep into explicit phases: `RenderQueue` owns intentional
+      transient draw-record ordering, then `SpriteBatch` consumes the ordered
+      stream for texture validation, sprite-to-vertex expansion, and draw-group
+      construction. The renderer does not keep compatibility fallback sorting
+      that hides producer-order bugs.
+- [x] Keep the render prep tuner and stats owned by `SpriteBatch`/`Renderer`
+      instead of relying on the generic `ThreadSystem` fallback tuner.
+- [x] Snapshot texture/resource metadata needed by workers before dispatch so
       worker jobs never observe renderer arrays while they are being mutated.
-- [ ] Merge worker outputs on the main thread in deterministic layer and
-      sequence order, then upload the final vertex buffer and submit one GPU
-      command buffer.
-- [x] Preserve the current serial path and choose it for low command counts,
-      low layer counts, unsupported thread targets, or debug comparisons.
-- [ ] Defer threaded SDL_GPU command buffers until profiling proves main-thread
+- [x] Merge worker outputs on the main thread in command-stream order, then
+      upload the final vertex buffer and submit one GPU command buffer.
+- [x] Preserve the inline path and let the adaptive tuner choose it for work
+      that does not benefit from worker dispatch.
+- [x] Add a non-interactive `render-prep` benchmark group that reports draw
+      commands, valid sprites, skipped invalid resources, vertex count, draw
+      groups, worker use, range size, and adaptive tuning state.
+      Interpret `thread-fixed-*` rows as forced scheduler/range controls and
+      `thread-adaptive-*` rows as the production-style measured scheduling
+      signal; cheap sprite/rect prep should stay inline until the adaptive
+      tuner proves worker participation wins.
+- [x] Defer threaded SDL_GPU command buffers until profiling proves main-thread
       command encoding is the bottleneck. If added later, command buffers must
       be acquired, used, and submitted on the same worker thread; swapchain
       acquisition must remain on the window thread.
@@ -458,8 +487,8 @@ Acceptance checks:
 - [x] Shutdown wakes and joins parked workers without leaking or deadlocking.
 - [x] Worker idle policy parks on a condition variable; no spin loop or unused
       spin configuration remains in the config.
-- [ ] Serial and parallel render prep produce identical vertex order, draw
-      group order, layer ordering, and invalid-texture skipping for the same
+- [x] Serial and parallel render prep produce identical vertex order, draw
+      group order, render ordering, and invalid-texture skipping for the same
       command input.
 - [x] Existing visible rendering remains swapchain/vsync paced, hidden/minimized
       fallback pacing remains unchanged, and visible no-swapchain results block
@@ -467,14 +496,19 @@ Acceptance checks:
 - [x] `zig build test`, `zig build check`, and `zig build verify` pass before
       the slice is considered complete.
 
-Core pass landed: this slice now has a pre-spawned app-owned `ThreadSystem`,
-explicit update/render contexts, synchronous `parallelFor`, adaptive per-batch
-background-worker participation, per-worker scratch slot indexing, and a serial
-renderer prep hook. Adaptive scheduling only changes how many already
-pre-spawned parked workers participate in each batch; workers are spawned during
-`ThreadSystem.init`, reused across frame batches, parked when idle, and joined
-only during `ThreadSystem.deinit`. Remaining unchecked work is the actual
-parallel CPU render-prep pipeline.
+Slice 7 is complete for the current sprite/rect renderer path. It has a
+pre-spawned app-owned `ThreadSystem`, explicit update/render contexts,
+synchronous `parallelFor`, adaptive per-batch worker-thread participation,
+per-worker scratch slot indexing, and render-owned parallel CPU sprite prep.
+`RenderQueue` owns draw-record ordering by `RenderOrder`, including world z,
+stack-aware UI depth, effects, and debug records. `SpriteBatch` consumes only an
+already ordered stream, snapshots texture metadata on the main thread, expands
+prepared sprites into disjoint vertex spans through the thread system, builds
+draw groups deterministically on the main thread, and leaves SDL_GPU
+command-buffer work on the render thread. Future tile rendering, UI widgets,
+material registries, lighting/fire effects, or threaded GPU command buffers
+remain separate slices that must preserve this queue-first ordering contract
+unless they replace it with an explicitly measured render-owned ordering phase.
 
 ## Slice 8: Shader And Platform Expansion
 
@@ -488,6 +522,21 @@ Current foundation:
 - Build metadata and runtime pipeline metadata are still updated in separate
   places until a shared shader/material manifest exists.
 
+Architecture notes:
+
+- Shader expansion should add render-owned material/pipeline metadata; it should
+  not push shader, pipeline, or SDL_GPU handles into `DataSystem` or gameplay
+  state.
+- Lighting, fire, post-effect, and tile shaders should keep draw intent as
+  stable asset/material IDs plus typed render order until render prep resolves
+  them into queue records or a render-owned batcher stream.
+- New batchers may be added for tile spans, light volumes, or effect particles,
+  but they should consume sorted `RenderQueue` records or a documented
+  render-owned phase with the same ordering guarantees. Do not add renderer
+  fallback sorting to hide unordered producers.
+- Build-time shader manifests and runtime pipeline registries should converge so
+  adding a material does not require unrelated parallel edits.
+
 Checklist:
 
 - [x] Keep generated runtime shader files under `assets/shaders` in the install
@@ -496,6 +545,9 @@ Checklist:
 - [x] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
 - [ ] Consolidate shader-program, material, and runtime pipeline metadata so
       new pipelines do not need parallel registry edits.
+- [ ] Define the material/batcher routing contract for sprites, tile spans,
+      lighting/fire effects, and post-effect passes without exposing SDL_GPU
+      handles to game code.
 - [ ] Validate the right shader format list for each target OS.
 - [ ] Add direct runtime asset/shader lookup guidance or tests for direct binary
       execution outside the installed binary directory.
@@ -503,9 +555,9 @@ Checklist:
 
 Acceptance checks:
 
-- [ ] `zig build shaders` emits the same sprite shader outputs as before.
-- [ ] `zig build verify` exercises shader compilation.
-- [ ] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
+- [x] `zig build shaders` emits the same sprite shader outputs as before.
+- [x] `zig build verify` exercises shader compilation.
+- [x] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
 
 ## Slice 9: Platform-Neutral SIMD Helper Layer
 
@@ -719,10 +771,10 @@ Movement and particle passes landed: the demo maps player input to movement
 velocity, exposes a movement-body slice to `MovementSystem`, applies player-only
 bounds clamping, emits a small particle trail, updates particles, and renders
 transient particle rectangles. A few colored moving squares remain as non-player
-movement processor coverage. Parallel render prep remains open under Slice 7,
-while simulation contracts, collision, and the first AI intent processor are
-covered by Slices 12-14. Pathfinding and broader rule processing remain future
-systems that should build on the same typed-output contracts.
+movement processor coverage. Simulation contracts, collision, and the first AI
+intent processor are covered by Slices 12-14. Pathfinding and broader rule
+processing remain future systems that should build on the same typed-output
+contracts.
 
 ## Slice 12: Simulation Contracts And Deferred Structural Changes
 
@@ -747,6 +799,10 @@ Implemented foundation:
   deterministic range-index merge.
 - `DataSystem.applyStructuralCommands` applies deferred entity/component changes
   at explicit main-thread commit points.
+- `SimulationFrame.applyStructuralCommandsWithExtraEvents` commits deferred
+  structural commands through `DataSystem`'s single planning path: event-stream
+  capacity stays with `SimulationFrame`, while `DataSystem` validates commands
+  and reserves persistent component storage capacity before mutation.
 - `GameDemoState` owns a `SimulationFrame`, clears it each fixed step, runs
   processor phases, and applies deferred structural commands before the step
   finishes.
@@ -986,8 +1042,11 @@ Current foundation:
 
 - `StateStack` + `StateTransitions` (replaceGameplay, replaceOwnedGameplay, pushModal, pop support added in this slice) and the four policies (gameplay / modal_overlay / pass_through_overlay / opaque_screen).
 - `InputState` / `FrameCommands` + `input_router` with explicit `.ui` context and `modalUi`/`opaqueScreen` policies that already block gameplay movement while allowing app/debug/ui commands. Consumed state events suppress fallback routing into global frame commands.
-- `TextService` cached text drawing/preparation (Slice 5) and `Renderer.drawSprite` / `drawRectInSpace(..., .logical)` for UI.
-- `PauseState` provides the concrete drawing, layering (~9000+), color, text-measurement, and centered-panel precedent.
+- `TextService` cached text drawing/preparation (Slice 5) and explicit
+  `Renderer.submitOrdered*` logical-space calls for already ordered UI helpers.
+- `PauseState` provides the concrete drawing, stack-aware
+  `UiDepth`/`RenderOrder.uiInStack(...)`, color, text-measurement, and
+  centered-panel precedent.
 - `AudioCommandBuffer.setMasterGain` / `setBusGain` + `AudioBus` (Slice 15) for live settings feedback without owning mixer resources. MainMenuState owns the runtime audio-setting values so they persist across settings reopen and into gameplay launch.
 - `GameDemoState.init(allocator, w, h)` as the target launched from the menu.
 - `bootstrapStartupState` in Engine with the explicit comment that a real MainMenuState was expected.
@@ -1296,6 +1355,8 @@ Current foundation:
 - Slice 18 benchmark profiles expose common fast paths and fallback counters.
 - Pathfinding stats already distinguish field requests, cache hits,
   unavailable-path cache hits, and fallback requests.
+- `PathfindingSystem` keeps solver queues, result caches, unavailable-key state,
+  goal fields, scratch, and tuners out of `DataSystem`.
 
 Architecture notes:
 
@@ -1305,33 +1366,52 @@ Architecture notes:
 - Solve budgets should prefer deterministic deferral over unbounded same-frame
   work. If the pathfinder cannot finish all fallback work inside the budget, it
   should report pending work explicitly.
-- Module splitting is justified only if it improves maintainability without
-  weakening the system boundary. The pathfinder should remain a system, not a
-  controller that owns gameplay state.
+- The current per-step solve and hard-fallback budgets default to 128 requests.
+  This is a ReleaseFast-tuned crowd baseline: a 2000 hard-request pressure run
+  solves 128 and reports the remaining backlog instead of stalling the fixed
+  update.
+- Slice 20 intentionally keeps cache aging, incremental A* continuation, module
+  splitting, and pipeline extraction out of scope. The completed feature is the
+  bounded hard-path contract, fixed-capacity cache coverage, and benchmark
+  visibility.
 
 Checklist:
 
-- [ ] Add true-A*-required fixtures that cannot be solved by direct, field,
+- [x] Add true-A*-required fixtures that cannot be solved by direct, field,
       component, or portal fast paths.
-- [ ] Add per-frame fallback solve budgets and deterministic pending/deferred
+- [x] Add per-frame fallback solve budgets and deterministic pending/deferred
       behavior for overflow work.
-- [ ] Add cache, goal-field, and unavailable-entry aging or capacity tests if
-      long-running sessions need eviction.
-- [ ] Add regression thresholds or benchmark callouts for Debug and ReleaseFast
-      hard-path workloads.
-- [ ] Audit heap use and scratch sizing for worst-case fallback fixtures.
-- [ ] Consider splitting solver internals into smaller files once hard-path
-      contracts are stable.
+- [x] Add completed-result, entity-result, unavailable-key, and goal-field
+      fixed-capacity tests.
+- [x] Add benchmark callouts for Debug and ReleaseFast hard-path throughput and
+      budget-pressure workloads.
+- [x] Audit heap use and scratch sizing for worst-case fallback fixtures through
+      warmed no-allocation hard-path tests.
+- [x] Keep pathfinding as a gameplay system; do not split modules or promote it
+      into a controller as part of this slice.
 
 Acceptance checks:
 
-- [ ] Benchmarks report true fallback count and timing separately from fast-path
-      work.
-- [ ] Unreachable or impossible destinations are rejected once and cached rather
+- [x] Benchmarks report true fallback count, deferred budget pressure, and
+      timing separately from fast-path work.
+- [x] Unreachable or impossible destinations are rejected once and cached rather
       than re-solved every frame.
-- [ ] Fallback overflow defers deterministically instead of stalling the fixed
+- [x] Fallback overflow defers deterministically instead of stalling the fixed
       update.
-- [ ] Hard-path changes cannot silently regress common request throughput.
+- [x] Hard-path changes cannot silently regress common request throughput because
+      benchmark detail rows expose fallback, deferred, result, and eviction
+      counters.
+- [x] `zig build fmt`, `zig build test --summary all`, `zig build check`,
+      `zig build verify`, and targeted Debug/ReleaseFast pathfinding benchmarks
+      pass.
+
+Slice 20 lands navigation hardening as a complete foundation feature. True A*
+fallback work now has a separate per-step request budget, budget overflow stays
+pending in stable order, cache capacity behavior is tested, and hard-fallback
+benchmarks expose executed fallback work, deferred fallback work, remaining
+pending work, results, and cache evictions across raw-throughput and
+budget-pressure groups. The runtime defaults allow 128 true fallback solves per
+step, with `--fallback-budget` available for ReleaseFast tuning sweeps.
 
 ## Slice 21: Typed Simulation Event System And Domain Signals
 
@@ -1349,10 +1429,18 @@ Current foundation:
 - Collision, AI, steering, and pathfinding already use specialized typed
   streams for high-volume or latency-sensitive outputs: contacts, navigation
   intents, movement intents, path requests, and structural commands.
-- The roadmap now points toward a state-owned `SimulationPipeline` as the owner
-  of ordered gameplay phases and lightweight domain controller composition.
+- `SimulationEvents` now owns lower-volume typed domain-signal records inside
+  `SimulationFrame`, with deterministic range-owned writes, immutable merged
+  reads, explicit per-step event capacity, event stats, and dropped diagnostic
+  counts.
+- `GameDemoState` consumes structural events after the deferred commit point and
+  emits navigation invalidation when static obstacle-affecting structural
+  changes require a pathfinding grid rebuild.
 - `DataSystem` is the persistent gameplay-fact owner; transient event, request,
   scratch, queue, and service state stay outside persistent component storage.
+  `DataSystem` remains the single source for applying structural commands and
+  reports plain structural change records that `SimulationFrame` maps into
+  events after the commit succeeds.
 
 Architecture notes:
 
@@ -1367,29 +1455,38 @@ Architecture notes:
   stage should consider a request. Use `DataSystem` to store what remains true
   after the step. Use controllers to decide how domains react. Use processors
   for scalable data work. Use deferred commands for structural mutation.
-- The event layer should be state-owned and tied to the `SimulationPipeline` for
-  one gameplay state instance. It is not an app service, global singleton,
-  reflection system, string-topic dispatcher, callback chain, or dynamic
-  dependency graph.
+- The event layer is state-owned through `SimulationFrame` for one gameplay
+  state instance. A future `SimulationPipeline` can own event reaction order
+  without changing event storage or producer APIs. The event layer is not an app
+  service, global singleton, reflection system, string-topic dispatcher,
+  callback chain, or dynamic dependency graph.
 - Events communicate domain or system changes that happened this step, or
   requests that a later fixed stage should consider. Persistent facts such as
   tile state, obstacle occupancy, weather fields, faction state, resources,
   actor components, or long-lived rule state still live in `DataSystem` or
   state-owned domain storage.
-- Prefer explicit typed event unions or typed event channels with stable IDs:
-  examples include `TileChanged`, `ObstacleChanged`, `WeatherChanged`,
-  `NavRegionInvalidated`, `PerceptionStimulus`, `NoiseEmitted`,
-  `InteractionRequested`, `DamageRequested`, and `SpawnRequested`.
+- The first concrete payloads are structural lifecycle/component change signals
+  and `NavRegionInvalidated`. Add later domain payloads as explicit union
+  variants with focused emit/read tests; do not add placeholder systems for
+  domains that do not exist yet.
 - Keep existing high-volume streams specialized. Collision contacts, movement
-  intents, navigation intents, path requests, and render-prep outputs should not
-  be collapsed into one generic simulation-event stream just for uniformity.
+  intents, navigation intents, path requests, and render-prep queue records
+  should not be collapsed into one generic simulation-event stream just for
+  uniformity. Events may invalidate or wake a render producer, but render prep
+  still emits explicit `RenderQueue` records with typed `RenderOrder`.
 - Threaded producers must use the same count/prefix/write/range-index merge
   model as other `SimulationFrame` streams. Output order must come from stable
   phase, input, range, and per-range sequence order, not worker timing.
-- The pipeline owns event reaction order. Controllers consume immutable event
-  slices in explicit stages, may emit typed requests or deferred structural
-  commands, and may schedule next-step work in controller-owned queues when a
-  response cannot safely happen in the same fixed step.
+- Event consumers run at explicit reaction points after a producer stage has
+  finished and the stream has merged. Consumers own their reaction work instead
+  of dumping it into a generic main-thread bucket: light orchestration may stay
+  inline, while expensive reactions should split over immutable event slices and
+  write their own range-owned outputs.
+- Main-thread reaction work must name the ownership boundary it preserves, such
+  as structural commit, SDL/GPU/audio ownership, state transition, asset
+  loading, save/load streaming, renderer resource ownership, or measured light
+  orchestration. This is a project-wide rule: do not move scalable work in any
+  subsystem to the main thread simply to make ordering or testing easier.
 - Avoid recursive event storms. If consuming one event emits more events, the
   design must name the next event phase or defer to the next fixed step instead
   of allowing unbounded immediate redispatch.
@@ -1397,69 +1494,97 @@ Architecture notes:
   and small value payloads only. Do not store pointers, renderer/audio/SDL
   handles, asset paths, loaded resources, allocators, or service references in
   event payloads.
+- Production contracts in any subsystem must not gain test-only tags, marker
+  fields, fake stages, fixture hooks, or testing-only service paths. Event,
+  intent, structural-command, ID, component, render, asset, app, platform, and
+  tool APIs should expose runtime concepts only. Tests should use private helper
+  record types, local fixtures, test-only mocks, or real production payloads.
 - Simulation-event diagnostics should expose counts by type and
   producer/controller stage. Logging individual events in hot paths is not
   acceptable outside targeted debug tooling.
 
 Checklist:
 
-- [ ] Define `SimulationEvent` extensions and/or typed event channels with
-      concrete payloads for the first cross-system domains needed by tiles,
-      obstacles, pathfinding invalidation, AI perception, weather interaction,
-      combat, spawning, resource changes, or other system-change signals.
-- [ ] Add a state-owned event collection API under the simulation/pipeline
+- [x] Define `SimulationEvent` payloads for the first concrete cross-system
+      signals: structural entity/component changes and navigation invalidation.
+- [x] Add a state-owned event collection API under the simulation/pipeline
       boundary, reusing `RangeOutputStream` or an equivalent typed
       count/prefix/write collector.
-- [ ] Define pipeline event phases: producer stages, merge points, controller
-      reaction order, derived-event policy, and next-step deferral policy.
-- [ ] Add domain-controller integration points so controllers can consume
-      immutable event slices and emit typed outputs, requests, or deferred
-      structural commands without owning persistent entity/component facts.
-- [ ] Add capacity and reserve policy for event channels, including behavior
-      when a low-priority event channel exceeds its per-step budget.
-- [ ] Add event stats with per-type counts, dropped/deferred counts where
+- [x] Define event phases, producer-stage merge points, explicit reaction
+      points, derived-event policy, and no-recursive-dispatch behavior.
+- [x] Add domain-reaction integration for current gameplay state orchestration:
+      structural events can trigger one nav-grid rebuild and a typed
+      `NavRegionInvalidated` event without moving persistent facts out of
+      `DataSystem`.
+- [x] Add capacity and reserve policy for event channels, including behavior
+      when a low-priority event channel exceeds its per-step budget. Required
+      events preflight the configured event budget before structural mutation or
+      domain-reaction side effects; diagnostic events drop and increment stats.
+- [x] Add event stats with per-type counts, dropped/deferred counts where
       applicable, and stage/controller attribution for benchmarks or debug UI.
-- [ ] Document which cross-system communication should use simulation/domain
+- [x] Document which cross-system communication should use simulation/domain
       events and which should remain a specialized stream such as contacts,
-      movement intents, navigation intents, path requests, render prep, or
-      structural commands.
-- [ ] Document the architecture mapping for event producers and consumers:
+      movement intents, navigation intents, path requests, render-queue records,
+      or structural commands.
+- [x] Document the architecture mapping for event producers and consumers:
       pipeline phase, controller owner, persistent data owner, transient event
       stream, processor outputs, and deferred mutation point.
 
 Acceptance checks:
 
-- [ ] Replaying the same initial `DataSystem`, controller state, fixed-step
+- [x] Replaying the same initial `DataSystem`, controller state, fixed-step
       inputs, and worker split decisions produces the same event order and same
       downstream outputs.
-- [ ] Threaded producers merge events deterministically by stable range order,
+- [x] Threaded producers merge events deterministically by stable range order,
       never by worker completion order.
-- [ ] Event consumption cannot mutate `DataSystem` structurally except through
+- [x] Event consumption cannot mutate `DataSystem` structurally except through
       deferred structural commands applied at the pipeline commit point.
-- [ ] Event payload tests reject or avoid pointers, app/render/audio handles,
+- [x] Event payload tests reject or avoid pointers, app/render/audio handles,
       asset paths, allocator references, and other non-stable runtime state.
-- [ ] Capacity tests cover reserve, overflow, drop/defer policy, and
+- [x] Capacity tests cover reserve, appended and range-owned overflow,
+      diagnostic drop policy, structural preflight before mutation, and
       no-allocation warmed event production.
-- [ ] Benchmarks or debug stats can show event counts by type/stage so weather,
-      tile, obstacle, AI, and navigation interactions do not become invisible
+- [x] Event stats expose counts by type/stage and dropped diagnostic counts so
+      current structural and navigation interactions do not become invisible
       fixed-step cost.
+- [x] Production contracts contain only runtime payloads; tests use private
+      fixtures, test-only mocks, or real payloads instead of leaking testing
+      markers into production enums/unions or service APIs.
 
-## Slice 22: Simulation Pipeline And Scoped Tiers
+Slice 21 lands the typed event infrastructure as a current runtime contract:
+events are deterministic phase outputs inside `SimulationFrame`, threaded
+producers use the same range-owned merge model as other streams, stats are
+range-owned during production and merged deterministically, consumers run at
+explicit reaction points, and high-volume streams remain specialized. The first
+concrete domain reaction is navigation
+invalidation from static obstacle-affecting structural changes.
+
+## Slice 22: Simulation Pipeline And Tier/Scope Scaffolding
 
 Goal: extract state-owned fixed-step orchestration into `SimulationPipeline`,
-add `SimulationScope` and simulation tiers, and keep today's processor order
-while scoping which entities run each stage. This is the world-scale policy
-layer on top of the existing fast processor stack.
+add the tier/scope scaffolding in its final ownership locations, and preserve
+today's full active-set processor behavior. This is the architectural landing
+zone for later scoped simulation, not the slice that turns on world/chunk tier
+filtering.
 
 Design source of truth:
 
-- [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md)
+- [architecture.md](architecture.md) for durable pipeline, controller,
+  tier/scope, and ownership guidance.
+- [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md) for the
+  current `SimulationFrame` streams, events, and structural-command contracts
+  that the pipeline extraction must preserve.
 
 Current foundation:
 
 - Slice 12 provides `SimulationFrame`, `SimulationPhase`, typed streams, and
   deferred structural commits.
 - `GameDemoState.update` already runs the full processor order explicitly.
+- `GameDemoState.update` applies structural commits and reserves the render
+  queue for the current primitive-visual rows before render enqueue.
+- `GameDemoState.render` emits transient draw records by iterating current
+  primitive visual rows through render prep, with the player marker and
+  particles handled as explicit render producers outside fixed-step simulation.
 - Processors gather dense `DataSystem` slices and support threaded serial
   parity paths with benchmarks into the 50k stress scale.
 - Architecture docs already describe `SimulationPipeline` as the future owner of
@@ -1468,7 +1593,9 @@ Current foundation:
 Architecture notes:
 
 - Tiers are persistent membership; scope is per-step active filtering; the
-  pipeline is one ordered stage list with gated inputs.
+  pipeline is one ordered stage list with gated inputs. Slice 22 defines those
+  contracts and default full-active behavior, while later scoped runtime
+  behavior waits for world rendering and chunk/visibility data.
 - Tier and chunk metadata stay on cold `EntitySlot` data, not hot movement SoA
   columns, unless profiling proves otherwise.
 - Processors stay dumb: scoped gather entry points filter inputs without
@@ -1476,20 +1603,70 @@ Architecture notes:
 - Tier promotion/demotion commits at the deferred structural boundary or an
   explicit main-thread commit, not inside worker ranges.
 - Slice 21 events/controllers are the long-term tier transition source; spatial
-  chunk policy is the first concrete source.
+  chunk policy is the first concrete source after world rendering lands.
 - Benchmark 50k counts prove spike absorption; typical gameplay should scope
   active cognition/collision far lower every frame.
+- Render preparation remains a separate render-facing phase after fixed-step
+  simulation data is ready. The pipeline can determine which entities are in
+  active scope, visible scope, or dirty regions, but it should hand immutable
+  slices and scope lists to render prep rather than calling `Renderer` or
+  owning `RenderQueue`.
+
+Implementation context to preserve:
+
+- This slice is still the planned pipeline + tier/scope architecture, not a
+  reduced pipeline-only cleanup. It should scaffold `SimulationScope`,
+  `SimulationTier`, `ActiveRegion`, cold tier/chunk metadata, full-active scope
+  construction, and scope stats in the places where later scoped runtime
+  behavior will hook in.
+- The first extraction should make the next implementation easier by moving
+  phase driving and ordered processor dispatch behind a state-owned helper. It
+  should not erase the already-decided tier, scope, controller, render-handoff,
+  or event-driven transition plan.
+- Keep the current order visible while extracting it: main-thread inputs,
+  AI navigation intent production, steering/path status consumption,
+  pathfinding, sparse movement-intent application, movement integration,
+  player bounds clamp, collision detection, collision response, particle/domain
+  reactions, structural commit, and post-commit render-queue reservation.
+- Scoped runtime behavior remains required after world rendering provides real
+  tile/chunk/visibility data. The initial full-active-set pipeline and tier
+  scaffolding are architectural stepping stones; they must not be documented as
+  completed scoped tier behavior.
 
 Checklist:
 
-- [ ] Add `src/game/simulation_pipeline.zig` and move the ordered fixed-step
-      sequence out of `GameDemoState.update`.
+- [ ] Add `src/game/simulation_pipeline.zig` with a thin state-owned
+      `SimulationPipeline` that drives today's ordered fixed-step sequence over
+      existing systems, `DataSystem`, and `SimulationFrame`.
+- [ ] Change `GameDemoState` to own one `SimulationPipeline` and delegate the
+      processor dispatch from `update` without changing behavior for the full
+      active set.
 - [ ] Add `src/game/simulation_scope.zig` with `SimulationTier`, `ActiveRegion`,
-      and per-step gather lists or dense index subsets.
-- [ ] Introduce cold tier/chunk metadata on `EntitySlot` or equivalent compact
-      storage with validation helpers and tests.
+      `SimulationScope`, full-active default construction, scope stats, and
+      validation helpers.
+- [ ] Add cold tier/chunk metadata on `EntitySlot` or equivalent compact storage
+      with default values that preserve today's behavior for all existing
+      entities.
+- [ ] Keep player input, audio command emission, structural commit/domain
+      reactions, render enqueue, and private clamp/sync helpers in
+      `GameDemoState` for the first extraction step unless a real controller
+      boundary is implemented with tests.
+- [ ] Add full-set delegation/parity tests that prove the pipeline extraction
+      preserves phase order, stream outputs, structural commit behavior, render
+      queue reservation, and simulation stats.
+- [ ] Add tests proving tier/chunk metadata defaults, validation, and full-active
+      scope construction do not change current simulation output.
+- [ ] Leave scoped processor filtering, stagger/reduced cadence, and real
+      chunk/visibility gates disabled until the post-world-rendering scoped tier
+      slice.
+
+Deferred until after world rendering:
+
 - [ ] Add scoped gather entry points for movement, collision, AI, and steering
       without changing hot processor math or merge rules.
+- [ ] Add a render-prep handoff that exposes active/visible entity lists and
+      dirty world regions without moving SDL_GPU calls, renderer handles, or
+      queue ownership into the simulation pipeline.
 - [ ] Keep the existing processor stage order identical to the current
       `GameDemoState` pipeline while scope shrinks participation.
 - [ ] Add stagger and reduced-cadence policy for cognition without adding a
@@ -1503,8 +1680,96 @@ Checklist:
 Acceptance checks:
 
 - [ ] `GameDemoState` delegates fixed-step processor dispatch to
-      `SimulationPipeline` with no behavior change when all entities are treated
-      as full-tier active scope.
+      `SimulationPipeline` with no behavior change for today's full active set.
+- [ ] Tier/scope scaffolding exists in the final owner modules and storage
+      locations, with default full-active behavior and validation tests.
+- [ ] Scope stats report the full-active counts without changing processor
+      participation, adding per-frame logging, or adding benchmark timers to
+      runtime rendering.
+- [ ] The slice does not claim scoped-tier completion: scoped gathers, stagger
+      policy, real chunk gates, and tier transitions remain unchecked in this
+      slice until world rendering supplies concrete world/chunk inputs.
+- [ ] `zig build test` covers pipeline phase transitions, full-active scope
+      construction, metadata defaults, and no behavior change without opening a
+      window.
+
+## Slice 23: Atlas-Backed World Rendering Addition
+
+Goal: add a minimal world/tile rendering foundation that uses the existing
+world tileset atlas metadata and render-prep boundary. This gives scoped
+simulation concrete world, chunk, and visibility data to consume later.
+
+Current foundation:
+
+- Runtime assets preload atlas textures and metadata for `.world_tileset`,
+  `.grim_characters`, and `.grim_items`.
+- `world_tileset_meta.zig` validates tile JSON and exposes tile lookup by name,
+  id, category, animation, and source rect.
+- `RenderQueue` owns transient draw-record ordering and `Renderer` owns SDL_GPU
+  submission.
+
+Architecture notes:
+
+- World/tile state should live in game-owned world data or `DataSystem` stable
+  IDs, not in renderer resources.
+- Render prep resolves tile IDs through `RuntimeAssets.worldTilesetMeta()` and
+  emits ordered draw records; it does not store string paths or live texture
+  handles in persistent gameplay data.
+- The first world renderer should expose enough chunk/visibility shape for the
+  later scoped tier slice, but it should not enable simulation tier filtering by
+  itself.
+
+Checklist:
+
+- [ ] Add a small world/tile data owner with tile IDs, world coordinates, and
+      chunk/visibility metadata suitable for later `ActiveRegion` construction.
+- [ ] Render at least one world/tile layer from `.world_tileset` atlas metadata
+      through render prep and `RenderQueue`.
+- [ ] Keep tile draw ordering explicit by `RenderOrder` and stable source rects.
+- [ ] Add tests for tile lookup, world-to-render enqueue, missing metadata
+      fallback, and deterministic queue record order.
+- [ ] Update rendering/assets docs and roadmap cross-links after runtime wiring
+      lands.
+
+Acceptance checks:
+
+- [ ] Demo/world rendering uses atlas metadata instead of per-tile textures or
+      runtime string lookup.
+- [ ] World/chunk/visibility data exists in a form the later scoped tier slice
+      can consume without ownership rewrites.
+- [ ] Render-prep benchmarks still measure the queue-to-batch path outside the
+      production render path.
+- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
+
+## Slice 24: Scoped Simulation Tiers And Chunk Policy
+
+Goal: turn the Slice 22 scaffolding into real scoped simulation behavior after
+Slice 23 provides world/chunk/visibility inputs.
+
+Current foundation:
+
+- `SimulationPipeline`, `SimulationScope`, `SimulationTier`, `ActiveRegion`,
+  cold tier/chunk metadata, and full-active scope stats exist from Slice 22.
+- World rendering provides concrete tile/chunk/visibility data from Slice 23.
+- Slice 21 events provide typed signals for future wake/promotion/demotion
+  policy.
+
+Checklist:
+
+- [ ] Add scoped gather entry points for movement, collision, AI, and steering
+      without changing hot processor math or merge rules.
+- [ ] Wire `ActiveRegion` from world/chunk/visibility data.
+- [ ] Keep the existing processor stage order identical while scope shrinks
+      participation.
+- [ ] Add stagger and reduced-cadence policy for cognition without adding a
+      second pipeline.
+- [ ] Wire tier changes through deferred structural commands or explicit
+      main-thread commits; processors must not mutate tier metadata in ranges.
+- [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
+      stagger skips, and wake promotions.
+
+Acceptance checks:
+
 - [ ] Scoped and unscoped processor paths produce identical outputs for the same
       entity subset in tests.
 - [ ] Tier/chunk filtering changes which entities enter each stage without
@@ -1540,18 +1805,24 @@ Acceptance checks:
 19. Steering and local avoidance.
 20. Navigation hardening and hard-path budgets.
 21. Typed simulation event system and domain signals.
-22. Simulation pipeline and scoped tiers.
+22. Simulation pipeline and tier/scope scaffolding.
+23. Atlas-backed world rendering addition.
+24. Scoped simulation tiers and chunk policy.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
 Resource ownership, text/UI, renderer composition, threading, SIMD,
 `DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
-startup runtime assets, and frame-delayed pathfinding now form the
-source-of-truth foundation for future slices. Steering/local avoidance and
-navigation hardening are the next navigation-focused gameplay candidates.
-`SimulationPipeline` and scoped tiers should land before broad multi-chunk or
-multi-world gameplay duplicates `GameDemoState` orchestration. Typed
-simulation/domain events should land before broad tile, weather, obstacle,
-perception, combat, spawning, resource, and rule-system interactions depend on
-cross-system communication; tier transitions should eventually consume those
-event signals through pipeline-owned controllers.
+startup runtime assets, frame-delayed pathfinding, steering/local avoidance, and
+navigation hardening now form the source-of-truth foundation for future slices.
+Render ordering is also part of that foundation: game/world/UI/effect producers
+emit typed draw records through `RenderQueue`, persistent data stores stable IDs
+and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
+benchmark-owned render-prep timing stays out of the production path.
+Slice 21 typed simulation/domain events are in place for current structural and
+navigation signals. `SimulationPipeline` extraction plus tier/scope scaffolding
+should land next, before broad multi-chunk or multi-world gameplay duplicates
+`GameDemoState` orchestration. Atlas-backed world rendering should then provide
+the concrete world/chunk/visibility data that scoped tiers consume. Scoped
+tiers, chunk policy, and tier transitions should use those event signals through
+pipeline-owned controllers instead of adding parallel orchestration paths.

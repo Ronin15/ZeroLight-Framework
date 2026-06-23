@@ -5,6 +5,8 @@
 //! Main-thread SDL3_mixer audio service.
 //! Game states queue audio intent through AudioCommandBuffer; AudioService owns
 //! mixer tracks, loaded audio assets, and SDL_mixer lifetime.
+//! Command buffers carry stable asset IDs and scalar parameters only; they never
+//! expose mixer tracks, loaded handles, allocators, or file paths to game code.
 
 const std = @import("std");
 const assets = @import("../assets/assets.zig");
@@ -159,6 +161,8 @@ pub const AudioCommandBuffer = struct {
     }
 
     fn append(self: *AudioCommandBuffer, command: AudioCommand) !void {
+        // Dropping commands silently would hide gameplay/audio bugs, so the
+        // bounded per-step queue reports pressure to the state that emitted it.
         if (self.commands.items.len >= self.max_commands) {
             return error.AudioCommandLimitReached;
         }
@@ -314,6 +318,9 @@ pub const AudioService = struct {
 
     pub fn drain(self: *AudioService, commands: *const AudioCommandBuffer) void {
         if (!self.enabled) return;
+        // Drain is the main-thread handoff from gameplay intent to SDL_mixer.
+        // Individual command failures are contained so one bad asset does not
+        // prevent later commands in the same frame from being attempted.
         for (commands.items()) |command| {
             self.applyCommand(command) catch |err| {
                 log.warn("audio command ignored: {}", .{err});
@@ -590,6 +597,8 @@ pub const AudioService = struct {
         const load_path_z = try self.allocator.dupeZ(u8, load_path);
         defer self.allocator.free(load_path_z);
         const handle = self.backend.load_audio(self.backend_context, load_path_z, predecode) catch |err| {
+            // Failed paths are memoized so missing optional audio does not retry
+            // filesystem/backend work every frame after the first failure.
             try self.rememberFailedPath(owned_path, &owns_path);
             if (self.backend.log_load_failures) {
                 log.warn("audio load failed \"{s}\": {}", .{ relative_path, err });

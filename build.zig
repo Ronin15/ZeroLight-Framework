@@ -89,7 +89,7 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption([]const u8, "asset_root", asset_root);
     benchBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(std.log.Level.warn));
+    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into Zig's package cache");
@@ -197,10 +197,15 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run CPU gameplay processor benchmarks");
     bench_step.dependOn(&bench_run.step);
 
+    const assets_lint_cmd = b.addSystemCommand(&.{ "python3", "tools/lint_assets_if_changed.py" });
+    const assets_lint_step = b.step("assets-lint", "Lint registered runtime atlases and source sprite consistency");
+    assets_lint_step.dependOn(&assets_lint_cmd.step);
+
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);
     verify_step.dependOn(test_step);
     verify_step.dependOn(shaders_step);
+    verify_step.dependOn(&assets_lint_cmd.step);
 
     const gpu_smoke_run = b.addRunArtifact(gpu_smoke_exe);
     addWindowsSdlRunRuntime(gpu_smoke_run, windows_sdl_runtime);

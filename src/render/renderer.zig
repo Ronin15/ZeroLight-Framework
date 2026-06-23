@@ -2,13 +2,18 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! SDL_GPU renderer facade for app/game code.
+//! CPU render prep happens before swapchain acquisition; the acquired section
+//! stays limited to upload, render-pass encoding, and command submission.
+//! TextureId values are generational handles backed by renderer-owned slots.
+
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
 const logging = @import("../core/logging.zig");
-const log = @import("../core/logging.zig").render;
+const log = logging.render;
 const gpu_buffer = @import("gpu/buffer.zig");
 const gpu_device = @import("gpu/device.zig");
 const gpu_pipeline = @import("gpu/sprite_pipeline.zig");
@@ -17,6 +22,7 @@ const resources = @import("resources.zig");
 const resolution = @import("../app/resolution.zig");
 const sdl = @import("../platform/sdl.zig");
 const sprite_batch = @import("sprite_batch.zig");
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const c = sdl.c;
 
 const initial_batch_vertices = 4096 * 6;
@@ -25,7 +31,13 @@ const initial_batch_commands = initial_batch_vertices / 6;
 pub const TextureId = resources.TextureId;
 pub const Rect = sprite_batch.Rect;
 pub const CoordinateSpace = sprite_batch.CoordinateSpace;
+pub const RenderDomain = sprite_batch.RenderDomain;
+pub const RenderOrder = sprite_batch.RenderOrder;
+pub const UiDepth = sprite_batch.UiDepth;
+pub const UiStackOrder = sprite_batch.UiStackOrder;
+pub const DebugDepth = sprite_batch.DebugDepth;
 pub const Sprite = sprite_batch.Sprite;
+pub const SpritePrepStats = sprite_batch.SpritePrepStats;
 
 pub const FrameResult = enum {
     submitted,
@@ -141,20 +153,16 @@ pub const Renderer = struct {
         self.clear_color = clear_color;
     }
 
-    pub fn drawSprite(self: *Renderer, sprite: Sprite) !void {
+    pub fn submitOrderedSprite(self: *Renderer, sprite: Sprite) !void {
         try self.batch.drawSprite(sprite);
     }
 
-    pub fn drawRect(self: *Renderer, rect: Rect, color: config.Color, layer: i32) !void {
-        try self.drawRectInSpace(rect, color, layer, .world);
-    }
-
-    pub fn drawRectInSpace(self: *Renderer, rect: Rect, color: config.Color, layer: i32, coordinate_space: CoordinateSpace) !void {
-        try self.drawSprite(.{
+    pub fn submitOrderedRectInSpace(self: *Renderer, rect: Rect, color: config.Color, order: RenderOrder, coordinate_space: CoordinateSpace) !void {
+        try self.submitOrderedSprite(.{
             .texture = self.white_texture,
             .dest = rect,
             .tint = color,
-            .layer = layer,
+            .order = order,
             .coordinate_space = coordinate_space,
         });
     }
@@ -191,10 +199,126 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn endFrame(self: *Renderer) !FrameResult {
+    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
+        const pre_acquire_drawable_size = self.currentDrawableSize() catch |err| switch (err) {
+            error.InvalidDrawableSize => return .skipped_no_swapchain,
+            else => return err,
+        };
+        _ = self.updatePresentation(window_size, pre_acquire_drawable_size);
+        // Sorting, texture metadata snapshots, and optional worker vertex prep
+        // happen before acquiring the swapchain to keep the acquired window short.
+        try self.prepareFrameCommands(thread_system);
+        if (self.batch.vertices.items.len > 0) {
+            try self.stageVertices();
+        }
 
+        const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
+            return sdlError("SDL_AcquireGPUCommandBuffer");
+        };
+        var command_buffer_finished = false;
+        var swapchain_acquired = false;
+        // Before a swapchain texture is acquired, canceling the command buffer is
+        // enough cleanup. After acquisition, error paths submit or cancel through
+        // helpers that release the acquired texture correctly.
+        errdefer if (!command_buffer_finished and !swapchain_acquired) {
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+        };
+
+        var swapchain_texture: ?*c.SDL_GPUTexture = null;
+        var width: u32 = 0;
+        var height: u32 = 0;
+        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, self.window, &swapchain_texture, &width, &height)) {
+            return sdlError("SDL_WaitAndAcquireGPUSwapchainTexture");
+        }
+
+        if (swapchainUnavailable(swapchain_texture)) {
+            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+            command_buffer_finished = true;
+            return .skipped_no_swapchain;
+        }
+        const acquired_swapchain_texture = swapchain_texture.?;
+        swapchain_acquired = true;
+
+        if (width == 0 or height == 0) {
+            log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
+            if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
+                command_buffer_finished = true;
+                return sdlError("SDL_SubmitGPUCommandBuffer");
+            }
+            command_buffer_finished = true;
+            return .skipped_no_swapchain;
+        }
+
+        self.viewport_width = width;
+        self.viewport_height = height;
+        const acquired_drawable_size = resolution.DrawableSize{
+            .width = width,
+            .height = height,
+        };
+        const presentation = self.updatePresentation(window_size, acquired_drawable_size);
+
+        if (self.batch.vertices.items.len > 0) {
+            self.recordVertexUpload(command_buffer) catch {
+                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
+            };
+        }
+
+        var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
+        color_target.texture = acquired_swapchain_texture;
+        color_target.clear_color = .{
+            .r = self.clear_color.r,
+            .g = self.clear_color.g,
+            .b = self.clear_color.b,
+            .a = self.clear_color.a,
+        };
+        color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
+        color_target.store_op = c.SDL_GPU_STOREOP_STORE;
+
+        const render_pass = c.SDL_BeginGPURenderPass(command_buffer, &color_target, 1, null) orelse {
+            return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPURenderPass");
+        };
+        c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
+
+        if (self.batch.vertices.items.len > 0) {
+            applyDrawableViewport(render_pass, presentation);
+
+            var vertex_binding = c.SDL_GPUBufferBinding{
+                .buffer = self.vertex_buffer,
+                .offset = 0,
+            };
+            c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
+
+            var active_presentation: ?sprite_batch.CoordinatePresentation = null;
+            for (self.batch.draw_groups.items) |group| {
+                const texture = self.resolveTextureSlot(group.texture) orelse continue;
+
+                if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
+                    applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation);
+                }
+                var sampler_binding = c.SDL_GPUTextureSamplerBinding{
+                    .texture = texture.texture.?,
+                    .sampler = self.sampler,
+                };
+                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+                c.SDL_DrawGPUPrimitives(render_pass, group.vertex_count, 1, group.first_vertex, 0);
+            }
+        }
+
+        c.SDL_EndGPURenderPass(render_pass);
+
+        if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
+            command_buffer_finished = true;
+            return sdlError("SDL_SubmitGPUCommandBuffer");
+        }
+        command_buffer_finished = true;
+        return .submitted;
+    }
+
+    pub fn submitSwapchainRecoveryFrame(self: *Renderer, clear_color: config.Color) !FrameResult {
+        self.clear_color = clear_color;
+        const window_size = try self.currentWindowSize();
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
             return sdlError("SDL_AcquireGPUCommandBuffer");
         };
@@ -220,8 +344,9 @@ pub const Renderer = struct {
         swapchain_acquired = true;
 
         if (width == 0 or height == 0) {
-            log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
+            log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{} during recovery; submitting empty frame", .{ width, height });
             if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
+                command_buffer_finished = true;
                 return sdlError("SDL_SubmitGPUCommandBuffer");
             }
             command_buffer_finished = true;
@@ -230,29 +355,18 @@ pub const Renderer = struct {
 
         self.viewport_width = width;
         self.viewport_height = height;
-        const presentation = self.updatePresentation(window_size, .{
+        _ = self.updatePresentation(window_size, .{
             .width = width,
             .height = height,
         });
 
-        self.prepareFrameCommands(presentation);
-
-        if (self.batch.vertices.items.len > 0) {
-            self.stageVertices() catch {
-                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_MapGPUTransferBuffer");
-            };
-            self.recordVertexUpload(command_buffer) catch {
-                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
-            };
-        }
-
         var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
         color_target.texture = acquired_swapchain_texture;
         color_target.clear_color = .{
-            .r = self.clear_color.r,
-            .g = self.clear_color.g,
-            .b = self.clear_color.b,
-            .a = self.clear_color.a,
+            .r = clear_color.r,
+            .g = clear_color.g,
+            .b = clear_color.b,
+            .a = clear_color.a,
         };
         color_target.load_op = c.SDL_GPU_LOADOP_CLEAR;
         color_target.store_op = c.SDL_GPU_STOREOP_STORE;
@@ -260,33 +374,6 @@ pub const Renderer = struct {
         const render_pass = c.SDL_BeginGPURenderPass(command_buffer, &color_target, 1, null) orelse {
             return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPURenderPass");
         };
-        c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-
-        if (self.batch.vertices.items.len > 0) {
-            applyDrawablePresentation(render_pass, command_buffer, presentation);
-
-            var vertex_binding = c.SDL_GPUBufferBinding{
-                .buffer = self.vertex_buffer,
-                .offset = 0,
-            };
-            c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
-
-            var active_presentation: ?sprite_batch.CoordinatePresentation = null;
-            for (self.batch.draw_groups.items) |group| {
-                const texture = self.resolveTextureSlot(group.texture) orelse continue;
-
-                if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
-                    applyGroupScissor(render_pass, presentation, group.presentation);
-                }
-                var sampler_binding = c.SDL_GPUTextureSamplerBinding{
-                    .texture = texture.texture.?,
-                    .sampler = self.sampler,
-                };
-                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
-                c.SDL_DrawGPUPrimitives(render_pass, group.vertex_count, 1, group.first_vertex, 0);
-            }
-        }
-
         c.SDL_EndGPURenderPass(render_pass);
 
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
@@ -308,6 +395,20 @@ pub const Renderer = struct {
         return .{
             .width = @intCast(window_width),
             .height = @intCast(window_height),
+        };
+    }
+
+    fn currentDrawableSize(self: *Renderer) !resolution.DrawableSize {
+        var drawable_width: c_int = 0;
+        var drawable_height: c_int = 0;
+        if (!c.SDL_GetWindowSizeInPixels(self.window, &drawable_width, &drawable_height)) {
+            return sdlError("SDL_GetWindowSizeInPixels");
+        }
+        if (drawable_width <= 0 or drawable_height <= 0) return error.InvalidDrawableSize;
+
+        return .{
+            .width = @intCast(drawable_width),
+            .height = @intCast(drawable_height),
         };
     }
 
@@ -464,6 +565,8 @@ pub const Renderer = struct {
     fn retireTextureSlot(self: *Renderer, index: u32, slot: *TextureSlot) void {
         std.debug.assert(slot.alive);
         c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
+        // Retired slots keep their index but advance generation, invalidating
+        // stale TextureId values while allowing slot reuse without path lookup.
         retireTextureSlotForReuse(slot, self.first_free_texture_slot);
         self.first_free_texture_slot = index;
     }
@@ -520,8 +623,12 @@ pub const Renderer = struct {
         try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_transfer_buffer, self.vertex_buffer, self.batch.vertices.items);
     }
 
-    fn prepareFrameCommands(self: *Renderer, frame_presentation: resolution.Presentation) void {
-        self.batch.buildSerial(self.textureResolver(), frame_presentation);
+    pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {
+        return self.batch.lastPrepStats();
+    }
+
+    fn prepareFrameCommands(self: *Renderer, thread_system: ?*ThreadSystem) !void {
+        _ = self.batch.buildAssumeCapacity(self.textureResolver(), thread_system, .{});
     }
 };
 
@@ -542,13 +649,12 @@ const TextureSlot = struct {
 };
 
 const FrameUniform = extern struct {
-    viewport_size: [2]f32,
-    padding: [2]f32,
+    drawable_size: [4]f32,
+    position_transform: [4]f32,
 };
 
-fn applyDrawablePresentation(
+fn applyDrawableViewport(
     render_pass: *c.SDL_GPURenderPass,
-    command_buffer: *c.SDL_GPUCommandBuffer,
     presentation: resolution.Presentation,
 ) void {
     var gpu_viewport = c.SDL_GPUViewport{
@@ -560,14 +666,15 @@ fn applyDrawablePresentation(
         .max_depth = 1,
     };
     c.SDL_SetGPUViewport(render_pass, &gpu_viewport);
-    pushFrameUniform(command_buffer, presentation.drawable_size.width, presentation.drawable_size.height);
 }
 
-fn applyGroupScissor(
+fn applyGroupPresentation(
     render_pass: *c.SDL_GPURenderPass,
+    command_buffer: *c.SDL_GPUCommandBuffer,
     presentation: resolution.Presentation,
     coordinate_presentation: sprite_batch.CoordinatePresentation,
 ) void {
+    pushFrameUniform(command_buffer, presentation, coordinate_presentation);
     switch (coordinate_presentation) {
         .logical => {
             var scissor = scissorForViewport(presentation.viewport, presentation.drawable_size);
@@ -585,15 +692,37 @@ fn applyGroupScissor(
     }
 }
 
-fn pushFrameUniform(command_buffer: *c.SDL_GPUCommandBuffer, width: u32, height: u32) void {
-    var frame_uniform = FrameUniform{
-        .viewport_size = .{
-            @floatFromInt(width),
-            @floatFromInt(height),
-        },
-        .padding = .{ 0, 0 },
-    };
+fn pushFrameUniform(
+    command_buffer: *c.SDL_GPUCommandBuffer,
+    presentation: resolution.Presentation,
+    coordinate_presentation: sprite_batch.CoordinatePresentation,
+) void {
+    var frame_uniform = frameUniformForPresentation(presentation, coordinate_presentation);
     c.SDL_PushGPUVertexUniformData(command_buffer, 0, &frame_uniform, @sizeOf(FrameUniform));
+}
+
+fn frameUniformForPresentation(
+    presentation: resolution.Presentation,
+    coordinate_presentation: sprite_batch.CoordinatePresentation,
+) FrameUniform {
+    const transform: [4]f32 = switch (coordinate_presentation) {
+        .logical => .{
+            presentation.viewport.scale_x,
+            presentation.viewport.scale_y,
+            @as(f32, @floatFromInt(presentation.viewport.x)),
+            @as(f32, @floatFromInt(presentation.viewport.y)),
+        },
+        .drawable => .{ 1, 1, 0, 0 },
+    };
+    return .{
+        .drawable_size = .{
+            @floatFromInt(presentation.drawable_size.width),
+            @floatFromInt(presentation.drawable_size.height),
+            0,
+            0,
+        },
+        .position_transform = transform,
+    };
 }
 
 fn scissorForViewport(viewport: resolution.Viewport, drawable_size: resolution.DrawableSize) c.SDL_Rect {
@@ -774,6 +903,28 @@ test "null swapchain texture preserves skipped no swapchain result path" {
     try std.testing.expect(swapchainUnavailable(null));
     try std.testing.expect(!swapchainUnavailable(@ptrFromInt(1)));
     try std.testing.expectEqual(FrameResult.skipped_no_swapchain, FrameResult.skipped_no_swapchain);
+}
+
+test "frame uniforms transform logical coordinates after acquisition" {
+    const presentation = try resolution.computePresentation(
+        .{},
+        .{ .width = 1800, .height = 1130 },
+        .{ .width = 3600, .height = 2260 },
+    );
+
+    const logical = frameUniformForPresentation(presentation, .logical);
+    try std.testing.expectEqual(@as(f32, 3600), logical.drawable_size[0]);
+    try std.testing.expectEqual(@as(f32, 2260), logical.drawable_size[1]);
+    try std.testing.expectApproxEqAbs(presentation.viewport.scale_x, logical.position_transform[0], 0.001);
+    try std.testing.expectApproxEqAbs(presentation.viewport.scale_y, logical.position_transform[1], 0.001);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(presentation.viewport.x)), logical.position_transform[2]);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(presentation.viewport.y)), logical.position_transform[3]);
+
+    const drawable = frameUniformForPresentation(presentation, .drawable);
+    try std.testing.expectEqual(@as(f32, 1), drawable.position_transform[0]);
+    try std.testing.expectEqual(@as(f32, 1), drawable.position_transform[1]);
+    try std.testing.expectEqual(@as(f32, 0), drawable.position_transform[2]);
+    try std.testing.expectEqual(@as(f32, 0), drawable.position_transform[3]);
 }
 
 test "presentation state applies first group and changes only" {

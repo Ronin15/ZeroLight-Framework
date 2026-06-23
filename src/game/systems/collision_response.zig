@@ -414,7 +414,7 @@ test "trigger response emits event without physical correction" {
     frame.events.addCount(0, 1);
     try frame.events.prefix();
     var event_writer = frame.events.rangeWriter(0);
-    event_writer.write(.{ .marker = 42 });
+    event_writer.write(.{ .stage = .structural_commit, .payload = .{ .entity_created = trigger } });
     event_writer.finish();
     frame.events.finishWrite();
 
@@ -425,7 +425,7 @@ test "trigger response emits event without physical correction" {
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 1), stats.trigger_count);
     try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
-    try std.testing.expectEqual(@as(u32, 42), frame.events.mergedItems()[0].marker);
+    try std.testing.expect(entityIdsEqual(trigger, frame.events.mergedItems()[0].payload.entity_created));
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
     try std.testing.expect(entityIdsEqual(trigger, frame.collision_triggers.mergedItems()[0].a));
     try std.testing.expect(entityIdsEqual(dynamic, frame.collision_triggers.mergedItems()[0].b));

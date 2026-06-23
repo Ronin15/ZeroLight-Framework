@@ -1,5 +1,10 @@
 # Zig Game Engine Review Guide
 
+Use `docs/coding-standards.md` in the checkout as the canonical source for
+style, performance, comments, tests, generated-output rules, and production
+contract boundaries. This guide defines review priorities and engine-specific
+checks; the standards doc defines the enforceable baseline.
+
 ## Severity Priorities
 
 Start with issues that can cause wrong runtime behavior, crashes, leaks, undefined behavior, missed cleanup, broken build/test workflows, or performance regressions in hot paths. Style-only concerns belong last or should be omitted.
@@ -27,11 +32,19 @@ Use concrete severity judgment:
 - State stack mutation happens through queued transitions or explicit stack APIs, not ad hoc ownership transfer.
 - Lower states receive update/input/render only according to policy.
 - Game code draws through renderer-facing APIs rather than owning raw SDL_GPU resources.
+- When multiple game/effect/UI producers can interleave render depths, game code
+  should emit transient records into `RenderQueue` or another explicit render-prep
+  ordering phase. Flag ad hoc demo-local ordering lists and renderer-side
+  fallback sorting that hides producer-order bugs.
 - Shared gameplay orchestration stays state-owned: `StateStack` dispatches,
   gameplay states own `DataSystem`/`SimulationFrame`/pipeline instances, and
   pipelines own controller order.
 - Domain controllers coordinate feature policy and handoff, but persistent
   gameplay/domain facts stay in `DataSystem` or state-owned domain storage.
+- Pipeline and tier/scope scaffolding should preserve current behavior while
+  placing contracts in final owner locations. Flag changes that claim scoped
+  tier runtime behavior before concrete world/chunk/visibility inputs exist, or
+  that leave scaffolding in throwaway/test-only shapes.
 
 ## Simulation Event Checks
 
@@ -47,13 +60,28 @@ Use concrete severity judgment:
   commands should not be collapsed into one generic event stream for uniformity.
 - Threaded event producers use deterministic count/prefix/write/range-index
   merge, not worker-completion order or global per-command atomics.
+- Event consumers own their reaction work instead of using the main thread as a
+  generic dumping ground. This is the same project-wide rule used for app,
+  gameplay, render-prep, asset, platform, and tooling work: inline main-thread
+  work should be deliberately light or tied to an explicit ownership boundary;
+  scalable work should have an owner and deterministic owned outputs.
+- Production contracts should not include test-only stages, marker payloads,
+  fixture variants, fake diagnostics, service shortcuts, or test-only paths.
+  Tests should use private helper records, test-only mocks, or real production
+  payloads.
 
 ## Rendering And Resource Checks
 
 - Texture, shader, buffer, sampler, pipeline, transfer buffer, and device lifetimes are paired and ordered safely.
 - Swapchain acquisition failure paths cancel or skip frame work deterministically.
+- CPU render prep, draw-record ordering, and worker vertex expansion should not
+  hold an acquired swapchain image unless the code has a narrow resize/revalidate
+  reason. Flag `SDL_WaitAndAcquireGPUSwapchainTexture` before substantial CPU
+  prep as latency and swapchain-pressure risk.
 - Per-frame draw submission does not add avoidable allocation, string lookup, or hash-map lookup.
-- Sprite ordering remains stable when sorting or batching changes.
+- Sprite ordering remains stable when render queue ordering or batching changes.
+  `SpriteBatch` should consume ordered streams; it should not be the compatibility
+  fallback sorter for unordered producers.
 - Upload validation rejects bad dimensions, pitch, and buffer lengths before GPU work.
 - Shader build changes preserve platform formats and installed runtime asset paths.
 
@@ -62,6 +90,18 @@ Use concrete severity judgment:
 Prefer tests that directly verify behavior: input routing, state policy, viewport math, resource ID validation, descriptor validation, player/gameplay movement, and pure timing decisions.
 
 Do not require a display for unit tests. Treat GPU smoke and runnable window checks as separate validation with environmental prerequisites.
+
+Do not let test convenience shape production contracts in any subsystem. Flag
+test-only enum tags, union payloads, marker fields, fake stages, fixture-only
+service hooks, service shortcuts, or test-only paths in production code; prefer
+private test helper types, local fixtures, test-only mocks, or real runtime
+payloads.
+
+When reviewing roadmap scaffolding, distinguish final-location scaffolding from
+half-wired behavior. Good scaffolding has production owner modules, defaults,
+validation, and tests that preserve current behavior. It should not add fake
+runtime payloads, hidden test contracts, or docs that mark deferred runtime
+behavior complete.
 
 When tests are weak, say exactly what contract remains untested and give a narrow scenario that would expose the bug.
 

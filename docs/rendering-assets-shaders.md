@@ -27,27 +27,30 @@ replaces the parallel registries.
 
 ## Sprite Rendering
 
-Sprites and colored rectangles are collected into a CPU sprite batch, uploaded to one
-GPU vertex buffer per frame, sorted by layer and submission order, and submitted
-by texture and coordinate-presentation groups. Texture ownership is tracked with
-generational `TextureId` values so stale or destroyed IDs are rejected
-deterministically during batch prep.
+Sprites and colored rectangles flow through an explicit render-prep queue when
+multiple producers can interleave world, effect, UI, or debug records. The queue
+sorts transient draw records by `RenderOrder`: world z first, then UI, then
+debug. `SpriteBatch` remains a strict ordered-stream consumer: it uploads one
+GPU vertex buffer per frame and submits by texture and coordinate-presentation
+groups. Texture ownership is tracked with generational `TextureId` values so
+stale or destroyed IDs are rejected deterministically during batch prep.
 
 `Renderer` remains the game-facing facade. `src/render/sprite_batch.zig` owns
-sprite command storage, stable ordering, vertex expansion, and draw group
-construction so later UI, tilemap, or effect batchers can be added without
-rewriting SDL_GPU device setup.
+sprite command storage, ordered-stream validation, vertex expansion, and draw
+group construction so later UI, tilemap, or effect batchers can be added without
+rewriting SDL_GPU device setup. `src/render/render_queue.zig` owns transient
+draw-record ordering before commands reach the renderer.
 
-Use `drawSprite` for textured quads:
+Use `RenderQueue.addSprite` for textured quads emitted by game states:
 
 ```zig
 if (context.runtime_assets.sprite(.demo_tile)) |sprite| {
-    try context.renderer.drawSprite(.{
+    try render_queue.addSprite(.{
         .texture = sprite.texture,
         .source = sprite.source_rect,
         .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
         .tint = .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 },
-        .layer = 0,
+        .order = RenderOrder.world(render_depth.worldZ(.actor)),
     });
 }
 ```
@@ -55,19 +58,24 @@ if (context.runtime_assets.sprite(.demo_tile)) |sprite| {
 `TextureId` values are stable while the texture is alive. Destroying a texture
 retires its slot and advances the generation before the slot can be reused, so
 old IDs do not accidentally bind a later texture. The built-in white texture is
-renderer-internal and backs `drawRect`.
+renderer-internal and backs rectangle draw records.
 
-Use `drawRect` for debug or simple primitive rendering. It goes through the same
-sprite batch via a built-in white texture:
+Use `RenderQueue.addRect` for game-state debug or simple primitive rendering.
+Rectangles go through the same sprite batch via a built-in white texture:
 
 ```zig
-try renderer.drawRect(.{
+try render_queue.addRect(.{
     .x = 40,
     .y = 40,
     .w = 64,
     .h = 64,
-}, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, 0);
+}, .{ .r = 0.9, .g = 0.2, .b = 0.2, .a = 1.0 }, RenderOrder.world(render_depth.worldZ(.actor)), .world);
 ```
+
+Direct `Renderer.submitOrderedSprite` and `submitOrderedRectInSpace` calls are
+for renderer-owned or tightly controlled paths that already submit in
+nondecreasing `RenderOrder`, such as a sorted `RenderQueue`, simple smoke tests,
+or stack-aware UI helpers.
 
 For atlases or future tile rendering, keep entity data on stable
 `SpriteAssetId` values and let `RuntimeAssets` map those IDs to one atlas
@@ -75,10 +83,10 @@ For atlases or future tile rendering, keep entity data on stable
 the same ID-to-texture/source model rather than creating one texture per tile or
 storing live renderer handles in gameplay data.
 
-Large sprite, tile, or particle scenes should reserve or surface sprite-batch
-capacity before relying on allocation-free render frames. The warmed path avoids
-per-frame allocation only inside the currently reserved command, vertex, and
-draw-group capacity.
+Large sprite, tile, or particle scenes should reserve or surface render-queue
+and sprite-batch capacity before relying on allocation-free render frames. The
+warmed path avoids per-frame allocation only inside the currently reserved
+draw-record, command, prepared-command, vertex, and draw-group capacity.
 
 ## Logical Presentation
 
@@ -89,9 +97,10 @@ differ on macOS Retina and similar displays.
 The renderer does not use `SDL_Renderer` or SDL's renderer-only logical
 presentation helpers. After each successful SDL_GPU swapchain acquisition it
 computes presentation from the acquired drawable size and current SDL window
-size. World and logical vertices are transformed into drawable pixels before
-upload; SDL_GPU viewport stays in drawable space and scissor clips logical
-content to the computed viewport.
+size. World and logical vertices stay in logical coordinates through CPU prep
+and transfer-buffer staging; the vertex shader applies the acquired-size
+presentation uniform. SDL_GPU viewport stays in drawable space and scissor
+clips logical content to the computed viewport.
 
 Default scale mode is aspect-preserving fit. If the drawable aspect differs from
 1280x720, the configured clear color shows through the letterbox or pillarbox
@@ -103,19 +112,28 @@ user resizing should not produce sub-1x cropped presentation.
 
 Sprite coordinate spaces:
 
-- `.world`: gameplay/world coordinates. The camera is applied, then vertices are
-  transformed through the logical presentation into drawable pixels.
-- `.logical`: logical UI coordinates. The camera is ignored, and vertices are
-  transformed through the logical presentation into drawable pixels.
+- `.world`: gameplay/world coordinates. CPU prep applies the camera and leaves
+  vertices in logical presentation coordinates.
+- `.logical`: logical UI coordinates. The camera is ignored, and vertices stay
+  in logical presentation coordinates.
 - `.drawable`: raw swapchain pixel coordinates. The camera and logical viewport
   are ignored; this is for debug overlays that should stay pixel-exact.
 
 ## Runtime Assets
 
+Atlas PNGs ship with JSON sidecar manifests. Loose source art packs through
+`tools/pack_atlas.py`; gameplay resolves tiles and sprites by filename through
+`world_tileset_meta.zig` and `sprite_atlas_meta.zig`. See
+`docs/atlas-asset-workflow.md` for the pack, export, and swap workflow.
+
 Startup sprite and audio assets are declared in `src/assets/manifest.zig`.
-`Engine` owns `RuntimeAssets`, preloads declared sprites through `AssetCache`,
-preloads declared audio through `AudioService`, and passes the catalog to render
-contexts. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
+`Engine` owns `RuntimeAssets`, preloads every registered sprite texture through
+`AssetCache`, parses atlas JSON sidecars once at init, preloads declared audio
+through `AudioService`, and passes the catalog to render contexts. Atlas
+lookups use `RuntimeAssets.worldTilesetMeta()` for the world tileset and
+`RuntimeAssets.spriteAtlasMeta(id)` for character/item atlases. When a texture
+is available but its sidecar is missing or invalid, startup fails instead of
+leaving partial metadata behind. The demo uses `assets/sprites/demo_tile.png` as a reusable tintable
 sprite for player, AI squares, and obstacles, with primitive rectangle fallback
 when a sprite ID is unavailable. The default text path uses the bundled
 `assets/fonts/NotoSansMono-Regular.ttf` font.
@@ -134,7 +152,9 @@ Asset paths are relative to the configured asset root and reject empty paths,
 absolute paths, `.` components, and `..` traversal.
 
 PNG image loading uses core SDL3 `SDL_LoadPNG` support in the asset layer; this
-project does not require `SDL3_image`.
+project does not require `SDL3_image`. Do not add `SDL3_image` unless that
+dependency is explicitly chosen for a feature that core SDL3 PNG loading cannot
+reasonably cover.
 
 The asset cache maps validated relative PNG paths to renderer `TextureId`
 values. Loading the same path decodes PNG data through `AssetStore`, uploads

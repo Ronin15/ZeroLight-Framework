@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const component_masks = @import("data_system.zig").component_masks;
@@ -15,28 +16,44 @@ const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMo
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
+const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
+const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
+const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
 const CollisionResponseSystem = @import("systems/collision_response.zig").CollisionResponseSystem;
+const MovementStats = @import("systems/movement.zig").MovementStats;
 const MovementSystem = @import("systems/movement.zig").MovementSystem;
+const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
+const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
+const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
+const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
+const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
+const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
-const Rect = @import("../render/renderer.zig").Rect;
-const Renderer = @import("../render/renderer.zig").Renderer;
+const RenderOrder = @import("../render/renderer.zig").RenderOrder;
+const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const render_prep = @import("render_prep.zig");
+const render_depth = @import("render_depth.zig");
+const WorldDepth = render_depth.WorldDepth;
 const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 8;
@@ -57,6 +74,7 @@ pub const GameDemoState = struct {
     collision: CollisionSystem,
     collision_response: CollisionResponseSystem,
     particles: ParticleSystem,
+    render_queue: RenderQueue,
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
@@ -78,6 +96,9 @@ pub const GameDemoState = struct {
         const obstacles = try spawnObstacles(&data);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
+        var render_queue = RenderQueue.init(allocator);
+        errdefer render_queue.deinit();
+        try render_queue.ensureTotalCapacity(1 + obstacle_count + test_square_count + 2 + particles.capacity);
         var ai = AiSystem.init(allocator);
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
@@ -96,6 +117,7 @@ pub const GameDemoState = struct {
             .max_goal_fields = 4,
             .max_worker_scratch_slots = 64,
             .max_solved_requests_per_step = test_square_count,
+            .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
         });
         try pathfinding.rebuildStaticNavGrid(&data, bounds_width, bounds_height, 32.0);
         var collision_response = CollisionResponseSystem.init(allocator);
@@ -110,6 +132,7 @@ pub const GameDemoState = struct {
             .collision = CollisionSystem.init(allocator),
             .collision_response = collision_response,
             .particles = particles,
+            .render_queue = render_queue,
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
@@ -124,6 +147,7 @@ pub const GameDemoState = struct {
         self.pathfinding.deinit();
         self.steering.deinit();
         self.ai.deinit();
+        self.render_queue.deinit();
         self.particles.deinit();
         self.collision_response.deinit();
         self.collision.deinit();
@@ -159,14 +183,14 @@ pub const GameDemoState = struct {
         else
             math.Vec2{ .x = 400, .y = 225 };
 
-        _ = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
+        const ai_stats = try self.ai.update(ai_slice, move_slice, &self.data, &self.simulation_frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
             .navigation_intents = &self.simulation_frame.navigation_intents,
         });
 
-        _ = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
-        _ = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
+        const steering_stats = try self.steering.update(&self.data, &self.simulation_frame, context.thread_system, &self.pathfinding, .{});
+        const pathfinding_stats = try self.pathfinding.update(&self.simulation_frame.path_requests, context.thread_system, .{});
 
         // Intent application step (main thread): consume merged MovementIntents from AI (and future), write velocities
         // for ai_agent entities only via direct MovementBodyPtr (hot column mutation). Stale IDs rejected. Player
@@ -184,37 +208,157 @@ pub const GameDemoState = struct {
         }
 
         var movement_slice = self.data.movementBodySlice();
-        _ = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
 
         self.clampAiSquaresToBounds(self.bounds_width, self.bounds_height);
         try self.player.clampToBounds(&self.data, self.bounds_width, self.bounds_height);
-        _ = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
-        _ = try self.collision_response.update(&self.data, &self.simulation_frame);
+        const collision_stats = try self.collision.update(&self.data, &self.simulation_frame.contacts, context.thread_system, .{});
+        const collision_response_stats = try self.collision_response.update(&self.data, &self.simulation_frame);
         self.queueCollisionAudio(context.audio, context.delta_seconds);
         self.emitPlayerTrail();
-        _ = self.particles.update(context.thread_system, context.delta_seconds, .{});
+        const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
 
         self.simulation_frame.phase = .merge_outputs;
-        _ = try self.simulation_frame.applyStructuralCommands(&self.data);
+        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents();
+        try self.reserveRenderQueueForCurrentData();
         self.simulation_frame.phase = .finished;
+
+        if (comptime runtime_perf_log.enabled) {
+            recordRuntimePerfStats(
+                context.perf,
+                ai_stats,
+                steering_stats,
+                pathfinding_stats,
+                movement_stats,
+                collision_stats,
+                collision_response_stats,
+                particle_stats,
+                structural_stats,
+                self.simulation_frame.events.stats,
+            );
+        }
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
-        for (self.obstacles) |entity| {
-            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
+        try self.enqueueRenderRecords(context.runtime_assets, context.interpolation_alpha);
+        if (comptime runtime_perf_log.enabled) {
+            context.perf.recordMetric(.render_queue_records, self.render_queue.recordCount());
         }
-        for (self.test_squares) |entity| {
-            try renderEntity(&self.data, entity, context.runtime_assets, context.renderer, context.interpolation_alpha);
-        }
-        try self.particles.render(context.renderer, context.interpolation_alpha);
-        try self.player.render(&self.data, context.runtime_assets, context.renderer, context.interpolation_alpha);
-        try context.renderer.drawRect(.{
+        try self.render_queue.submit(context.renderer);
+    }
+
+    fn enqueueRenderRecords(self: *GameDemoState, runtime_assets: *const RuntimeAssets, interpolation_alpha: f32) !void {
+        self.render_queue.clearRetainingCapacity();
+        try self.render_queue.addRect(.{
             .x = 0,
             .y = self.bounds_height - 4,
             .w = self.bounds_width,
             .h = 4,
-        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, -1);
+        }, config.Color{ .r = 0.16, .g = 0.24, .b = 0.29, .a = 1.0 }, RenderOrder.world(render_depth.worldZ(.floor)), .world);
+
+        for (self.data.primitiveVisualSliceConst().entities) |entity| {
+            if (sameEntity(entity, self.player.entity)) {
+                try self.player.enqueueRender(&self.data, runtime_assets, &self.render_queue, interpolation_alpha);
+            } else {
+                try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, runtime_assets, interpolation_alpha);
+            }
+        }
+        try self.particles.enqueueRender(&self.render_queue, interpolation_alpha);
+    }
+
+    fn recordRuntimePerfStats(
+        perf: runtime_perf_log.Context,
+        ai_stats: AiStats,
+        steering_stats: SteeringStats,
+        pathfinding_stats: PathfindingStats,
+        movement_stats: MovementStats,
+        collision_stats: CollisionStats,
+        collision_response_stats: CollisionResponseStats,
+        particle_stats: ParticleUpdateStats,
+        structural_stats: StructuralCommitStats,
+        event_stats: SimulationEventStats,
+    ) void {
+        perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
+        perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
+        perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
+        perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.separation_candidate_checks));
+        perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.separation_neighbor_samples));
+        perf.recordBatch(.ai_separation, ai_stats.separation_batch);
+        perf.recordBatch(.ai_intent, ai_stats.intent_batch);
+
+        perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
+        perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
+        perf.recordMetric(.steering_movement_intents, metric(steering_stats.movement_intent_count));
+        perf.recordMetric(.steering_path_requests, metric(steering_stats.path_request_count));
+        perf.recordMetric(.steering_paths_available, metric(steering_stats.path_available_count));
+        perf.recordMetric(.steering_paths_pending, metric(steering_stats.path_pending_count));
+        perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.path_unavailable_count));
+        perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
+        perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
+        perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
+        perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.agent_neighbor_samples));
+        perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
+        perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
+        perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
+        perf.recordBatch(.steering, steering_stats.batch);
+
+        perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
+        perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
+        perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
+        perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
+        perf.recordMetric(.path_field_requests, metric(pathfinding_stats.field_requests));
+        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
+        perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
+        perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
+        perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
+        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
+        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
+        perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
+        perf.recordMetric(.path_field_cache_hits, metric(pathfinding_stats.field_cache_hits));
+        perf.recordMetric(.path_goal_fields_built, metric(pathfinding_stats.goal_fields_built));
+        perf.recordMetric(.path_goal_fields_reused, metric(pathfinding_stats.goal_fields_reused));
+        perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
+        perf.recordBatch(.path_field_results, pathfinding_stats.field_result_batch);
+        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+
+        perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
+        perf.recordBatch(.movement, movement_stats.batch);
+
+        perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
+        perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
+        perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
+        perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
+        if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
+        perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
+        perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
+
+        perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
+        perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
+        perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+
+        perf.recordMetric(.particle_active_before, metric(particle_stats.active_before));
+        perf.recordMetric(.particle_active_after, metric(particle_stats.active_after));
+        perf.recordMetric(.particle_removed, metric(particle_stats.removed_count));
+        perf.recordBatch(.particles, particle_stats.batch);
+
+        perf.recordMetric(.structural_created, metric(structural_stats.created));
+        perf.recordMetric(.structural_destroyed, metric(structural_stats.destroyed));
+        perf.recordMetric(.structural_components_set, metric(structural_stats.components_set));
+        perf.recordMetric(.structural_stale_skipped, metric(structural_stats.stale_skipped));
+
+        perf.recordMetric(.simulation_events_total, metric(event_stats.total));
+        perf.recordMetric(.simulation_events_dropped, metric(event_stats.dropped));
+        perf.recordMetric(.simulation_events_entity_created, metric(event_stats.entity_created));
+        perf.recordMetric(.simulation_events_entity_destroyed, metric(event_stats.entity_destroyed));
+        perf.recordMetric(.simulation_events_component_changed, metric(event_stats.component_changed));
+        perf.recordMetric(.simulation_events_nav_region_invalidated, metric(event_stats.nav_region_invalidated));
+        perf.recordMetric(.simulation_events_structural_commit_stage, metric(event_stats.structural_commit_stage));
+        perf.recordMetric(.simulation_events_domain_reaction_stage, metric(event_stats.domain_reaction_stage));
+    }
+
+    fn metric(value: usize) u64 {
+        return @intCast(value);
     }
 
     pub fn onPause(self: *GameDemoState) void {
@@ -229,6 +373,74 @@ pub const GameDemoState = struct {
         var movement_slice = self.data.movementBodySlice();
         self.movement.syncPreviousPositions(&movement_slice);
         self.particles.syncPreviousPositions();
+    }
+
+    fn processPostCommitEvents(self: *GameDemoState) !void {
+        var invalidate_navigation = false;
+        for (self.simulation_frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (eventInvalidatesNavigation(event)) {
+                invalidate_navigation = true;
+            }
+        }
+
+        if (!invalidate_navigation) return;
+        try self.simulation_frame.events.ensureCanAppend(1);
+        try self.pathfinding.rebuildStaticNavGrid(&self.data, self.bounds_width, self.bounds_height, 32.0);
+        try self.simulation_frame.events.appendRequired(.{
+            .stage = .domain_reaction,
+            .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
+        });
+    }
+
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState) !StructuralCommitStats {
+        const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
+        const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
+        try self.processPostCommitEvents();
+        return stats;
+    }
+
+    fn reserveRenderQueueForCurrentData(self: *GameDemoState) !void {
+        const visual_count = self.data.primitiveVisualSliceConst().entities.len;
+        const floor_count: usize = 1;
+        const player_marker_count: usize = 1;
+        try self.render_queue.ensureTotalCapacity(floor_count + visual_count + player_marker_count + self.particles.capacity);
+    }
+
+    fn structuralCommandsMayInvalidateNavigation(self: *const GameDemoState) bool {
+        for (self.simulation_frame.structural_commands.mergedItems()) |command| {
+            if (self.structuralCommandMayInvalidateNavigation(command)) return true;
+        }
+        return false;
+    }
+
+    fn structuralCommandMayInvalidateNavigation(self: *const GameDemoState, command: StructuralCommand) bool {
+        return switch (command) {
+            .create_entity => |template| templateCreatesStaticNavigationObstacle(template),
+            .destroy_entity => |entity| self.data.isStaticNavigationObstacle(entity),
+            .set_movement_body => |set| self.data.isAlive(set.entity),
+            .set_collision_bounds => |set| self.data.isAlive(set.entity),
+            .set_collision_response => |set| self.data.isAlive(set.entity),
+            else => false,
+        };
+    }
+
+    fn eventInvalidatesNavigation(event: SimulationEvent) bool {
+        switch (event.payload) {
+            .entity_destroyed => |destroyed| {
+                return destroyed.was_static_navigation_obstacle;
+            },
+            .component_changed => |changed| switch (changed.component) {
+                .movement_body, .collision_bounds => {
+                    return changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle;
+                },
+                .collision_response => {
+                    return changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle;
+                },
+                else => return false,
+            },
+            else => return false,
+        }
     }
 
     fn clampAiSquaresToBounds(self: *GameDemoState, bounds_width: f32, bounds_height: f32) void {
@@ -259,6 +471,7 @@ pub const GameDemoState = struct {
         _ = self.particles.emitBurst(.{
             .count = 2,
             .position = .{ .x = position.x + 16, .y = position.y + 16 },
+            .base_z = render_depth.worldZWithOffset(body.position_z, .obstacle),
             .base_velocity = .{ .x = -24, .y = -36 },
             .velocity_step = .{ .x = 48, .y = -4 },
             .acceleration = .{ .x = 0, .y = 80 },
@@ -268,7 +481,7 @@ pub const GameDemoState = struct {
             .end_size = 1,
             .start_color = .{ .r = 1.0, .g = 0.78, .b = 0.28, .a = 0.85 },
             .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
-            .layer = 0,
+            .depth = .actor,
         });
     }
 
@@ -404,16 +617,27 @@ const CollisionSfxCooldown = struct {
     }
 };
 
+fn sameEntity(lhs: EntityId, rhs: EntityId) bool {
+    return lhs.index == rhs.index and lhs.generation == rhs.generation;
+}
+
+fn templateCreatesStaticNavigationObstacle(template: EntityTemplate) bool {
+    const response = template.collision_response orelse return false;
+    return response.mobility == .static and
+        template.movement_body != null and
+        template.collision_bounds != null;
+}
+
 fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
     const specs = [_]TestSquareSpec{
-        .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 180, .y = 140 }, .velocity = .{ .x = 5, .y = 18 }, .size = .{ .x = 26, .y = 26 }, .color = .{ .r = 0.46, .g = 0.86, .b = 0.38, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 280, .y = 260 }, .velocity = .{ .x = -14, .y = 9 }, .size = .{ .x = 18, .y = 18 }, .color = .{ .r = 0.95, .g = 0.42, .b = 0.59, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 420, .y = 90 }, .velocity = .{ .x = 11, .y = -10 }, .size = .{ .x = 24, .y = 24 }, .color = .{ .r = 0.7, .g = 0.54, .b = 1.0, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 120, .y = 320 }, .velocity = .{ .x = 8, .y = -16 }, .size = .{ .x = 20, .y = 20 }, .color = .{ .r = 0.95, .g = 0.65, .b = 0.25, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 550, .y = 200 }, .velocity = .{ .x = -9, .y = 12 }, .size = .{ .x = 30, .y = 18 }, .color = .{ .r = 0.55, .g = 0.82, .b = 0.92, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 650, .y = 340 }, .velocity = .{ .x = 15, .y = -7 }, .size = .{ .x = 19, .y = 19 }, .color = .{ .r = 0.85, .g = 0.45, .b = 0.78, .a = 1.0 }, .layer = 0 },
-        .{ .position = .{ .x = 300, .y = 70 }, .velocity = .{ .x = -6, .y = 22 }, .size = .{ .x = 25, .y = 25 }, .color = .{ .r = 0.4, .g = 0.95, .b = 0.75, .a = 1.0 }, .layer = 0 },
+        .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 180, .y = 140 }, .velocity = .{ .x = 5, .y = 18 }, .size = .{ .x = 26, .y = 26 }, .color = .{ .r = 0.46, .g = 0.86, .b = 0.38, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 280, .y = 260 }, .velocity = .{ .x = -14, .y = 9 }, .size = .{ .x = 18, .y = 18 }, .color = .{ .r = 0.95, .g = 0.42, .b = 0.59, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 420, .y = 90 }, .velocity = .{ .x = 11, .y = -10 }, .size = .{ .x = 24, .y = 24 }, .color = .{ .r = 0.7, .g = 0.54, .b = 1.0, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 120, .y = 320 }, .velocity = .{ .x = 8, .y = -16 }, .size = .{ .x = 20, .y = 20 }, .color = .{ .r = 0.95, .g = 0.65, .b = 0.25, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 550, .y = 200 }, .velocity = .{ .x = -9, .y = 12 }, .size = .{ .x = 30, .y = 18 }, .color = .{ .r = 0.55, .g = 0.82, .b = 0.92, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 650, .y = 340 }, .velocity = .{ .x = 15, .y = -7 }, .size = .{ .x = 19, .y = 19 }, .color = .{ .r = 0.85, .g = 0.45, .b = 0.78, .a = 1.0 }, .depth = .actor },
+        .{ .position = .{ .x = 300, .y = 70 }, .velocity = .{ .x = -6, .y = 22 }, .size = .{ .x = 25, .y = 25 }, .color = .{ .r = 0.4, .g = 0.95, .b = 0.75, .a = 1.0 }, .depth = .actor },
     };
     var entities: [test_square_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
@@ -431,9 +655,9 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
                     .primitive_visual = .{
                         .size = spec.size,
                         .color = spec.color,
-                        .layer = spec.layer,
+                        .depth = spec.depth,
                         .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                        .marker_layer = spec.layer,
+                        .marker_depth_band = .marker,
                         .marker_length = 0,
                         .marker_depth = 0,
                         .marker_margin = 0,
@@ -462,9 +686,9 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
             try data.setPrimitiveVisual(e, .{
                 .size = spec.size,
                 .color = spec.color,
-                .layer = spec.layer,
+                .depth = spec.depth,
                 .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                .marker_layer = spec.layer,
+                .marker_depth_band = .marker,
                 .marker_length = 0,
                 .marker_depth = 0,
                 .marker_margin = 0,
@@ -536,9 +760,9 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
         try data.setPrimitiveVisual(entity, .{
             .size = spec.size,
             .color = spec.color,
-            .layer = -1,
+            .depth = .obstacle,
             .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-            .marker_layer = -1,
+            .marker_depth_band = .obstacle,
             .marker_length = 0,
             .marker_depth = 0,
             .marker_margin = 0,
@@ -551,43 +775,12 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
     return entities;
 }
 
-fn renderEntity(
-    data: *const DataSystem,
-    entity: EntityId,
-    runtime_assets: *const RuntimeAssets,
-    renderer: *Renderer,
-    interpolation_alpha: f32,
-) !void {
-    const body = data.movementBodyConst(entity) orelse return;
-    const visual = data.primitiveVisualConst(entity) orelse return;
-    const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-    const dest = Rect{
-        .x = render_position.x,
-        .y = render_position.y,
-        .w = visual.size.x,
-        .h = visual.size.y,
-    };
-    if (data.assetReferenceConst(entity)) |asset_ref| {
-        if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
-            try renderer.drawSprite(.{
-                .texture = sprite.texture,
-                .source = sprite.source_rect,
-                .dest = dest,
-                .tint = visual.color,
-                .layer = visual.layer,
-            });
-            return;
-        }
-    }
-    try renderer.drawRect(dest, visual.color, visual.layer);
-}
-
 const TestSquareSpec = struct {
     position: math.Vec2,
     velocity: math.Vec2,
     size: math.Vec2,
     color: config.Color,
-    layer: i32,
+    depth: WorldDepth,
 };
 
 const ObstacleSpec = struct {
@@ -627,6 +820,133 @@ test "demo spawns colored moving test squares" {
         try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
         try std.testing.expectEqual(CollisionResponseMobility.static, demo.data.collisionResponseConst(entity).?.mobility);
     }
+}
+
+test "demo render queue orders mixed world z records after grouped emission" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    demo.render_queue.clearRetainingCapacity();
+    const high_obstacle = demo.data.movementBodyPtr(demo.obstacles[0]).?;
+    high_obstacle.position_z.* = 20;
+    high_obstacle.previous_z.* = 20;
+    const low_actor = demo.data.movementBodyPtr(demo.test_squares[0]).?;
+    low_actor.position_z.* = -20;
+    low_actor.previous_z.* = -20;
+
+    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.obstacles[0], &runtime_assets, 1.0);
+    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.test_squares[0], &runtime_assets, 1.0);
+    demo.render_queue.sortForSubmit();
+
+    try std.testing.expectEqual(@as(usize, 2), demo.render_queue.recordCount());
+    try std.testing.expect(demo.render_queue.recordOrder(0).lessOrEqual(demo.render_queue.recordOrder(1)));
+    try std.testing.expect(demo.render_queue.recordOrder(0).depth < demo.render_queue.recordOrder(1).depth);
+}
+
+test "demo player trail renders behind player body" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    demo.render_queue.clearRetainingCapacity();
+    demo.emitPlayerTrail();
+    try std.testing.expectEqual(@as(usize, 2), demo.particles.activeCount());
+
+    try demo.player.enqueueRender(&demo.data, &runtime_assets, &demo.render_queue, 1.0);
+    try demo.particles.enqueueRender(&demo.render_queue, 1.0);
+    demo.render_queue.sortForSubmit();
+
+    try std.testing.expectEqual(@as(usize, 4), demo.render_queue.recordCount());
+    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(0).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(1).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(2).depth);
+    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(3).depth);
+}
+
+test "demo render queue reserves for structural visual growth before render enqueue" {
+    const created_visual_count = 528;
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var runtime_assets = RuntimeAssets.init();
+
+    var created: usize = 0;
+    while (created < created_visual_count) {
+        const batch_count = @min(created_visual_count - created, 4);
+        demo.simulation_frame.beginStep();
+        try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+        demo.simulation_frame.structural_commands.addCount(0, batch_count);
+        try demo.simulation_frame.structural_commands.prefix();
+        var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+        for (0..batch_count) |batch_index| {
+            const index = created + batch_index;
+            const x: f32 = @floatFromInt(index % 64);
+            const y: f32 = @floatFromInt(index / 64);
+            writer.write(.{ .create_entity = .{
+                .movement_body = .{
+                    .position = .{ .x = x, .y = y },
+                    .previous_position = .{ .x = x, .y = y },
+                },
+                .primitive_visual = .{
+                    .size = .{ .x = 1, .y = 1 },
+                    .color = .{ .r = 0.5, .g = 0.6, .b = 0.7, .a = 1 },
+                    .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+                },
+            } });
+        }
+        writer.finish();
+        demo.simulation_frame.structural_commands.finishWrite();
+
+        const stats = try demo.applyStructuralCommandsAndPostCommitEvents();
+        try std.testing.expectEqual(batch_count, stats.created);
+        created += batch_count;
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, test_square_count + obstacle_count + 1 + created_visual_count),
+        demo.data.primitiveVisualSliceConst().entities.len,
+    );
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .items_per_range = movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
+    defer audio.deinit();
+    var input = InputState{};
+
+    try demo.update(.{
+        .input = &input,
+        .audio = &audio,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+
+    const original_allocator = demo.render_queue.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    demo.render_queue.allocator = failing_allocator.allocator();
+    defer demo.render_queue.allocator = original_allocator;
+
+    while (demo.particles.activeCount() < demo.particles.capacity) {
+        try std.testing.expect(demo.particles.emit(.{
+            .position = .{},
+            .lifetime = 1,
+            .start_size = 1,
+            .end_size = 1,
+            .start_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+            .end_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        }));
+    }
+    try demo.enqueueRenderRecords(&runtime_assets, 1.0);
+
+    try std.testing.expectEqual(
+        1 + demo.data.primitiveVisualSliceConst().entities.len + 1 + demo.particles.capacity,
+        demo.render_queue.recordCount(),
+    );
 }
 
 test "demo owns and completes a simulation frame during update" {
@@ -862,6 +1182,172 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     // vels zeroed on the violated axes (was pushed out)
     try std.testing.expectEqual(@as(f32, 0), after.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), after.velocity.y);
+}
+
+test "demo structural static obstacle change emits one navigation invalidation event" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .create_entity = .{
+        .movement_body = .{
+            .position = .{ .x = 360, .y = 180 },
+            .previous_position = .{ .x = 360, .y = 180 },
+            .velocity = .{},
+            .speed = 0,
+        },
+        .collision_bounds = .{ .size = .{ .x = 32, .y = 32 } },
+        .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+
+    var nav_invalidations: usize = 0;
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => |nav| {
+                nav_invalidations += 1;
+                try std.testing.expectEqual(NavInvalidationReason.static_obstacle_changed, nav.reason);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), nav_invalidations);
+    try std.testing.expectEqual(@as(usize, 1), demo.simulation_frame.events.stats.nav_region_invalidated);
+}
+
+test "demo preflights navigation invalidation event before structural mutation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const entity_count_before = demo.data.movementBodySliceConst().entities.len;
+
+    demo.simulation_frame.beginStep();
+    demo.simulation_frame.events.setCapacityLimit(4);
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .create_entity = .{
+        .movement_body = .{
+            .position = .{ .x = 360, .y = 180 },
+            .previous_position = .{ .x = 360, .y = 180 },
+            .velocity = .{},
+            .speed = 0,
+        },
+        .collision_bounds = .{ .size = .{ .x = 32, .y = 32 } },
+        .collision_response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
+    try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
+}
+
+test "demo preflights same-batch static obstacle promotion before mutation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const entity = try demo.data.createEntity();
+    try demo.data.setMovementBody(entity, .{
+        .position = .{ .x = 360, .y = 180 },
+        .previous_position = .{ .x = 360, .y = 180 },
+        .velocity = .{},
+        .speed = 0,
+    });
+
+    demo.simulation_frame.beginStep();
+    demo.simulation_frame.events.setCapacityLimit(2);
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 2);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_collision_bounds = .{
+        .entity = entity,
+        .bounds = .{ .size = .{ .x = 32, .y = 32 } },
+    } });
+    writer.write(.{ .set_collision_response = .{
+        .entity = entity,
+        .response = .{ .mode = .solid, .mobility = .static, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents());
+    try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
+    try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
+}
+
+test "demo unrelated structural component change does not invalidate navigation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_asset_reference = .{
+        .entity = demo.player.entity,
+        .asset_reference = .{ .sprite = .demo_tile },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => return error.UnexpectedNavInvalidation,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
+}
+
+test "demo dynamic entity structural destruction does not invalidate navigation" {
+    var demo = try GameDemoState.init(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const dynamic = try demo.data.createEntity();
+    try demo.data.setMovementBody(dynamic, .{
+        .position = .{ .x = 360, .y = 180 },
+        .previous_position = .{ .x = 360, .y = 180 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try demo.data.setCollisionBounds(dynamic, .{ .size = .{ .x = 32, .y = 32 } });
+    try demo.data.setCollisionResponse(dynamic, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+
+    demo.simulation_frame.beginStep();
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .destroy_entity = dynamic });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents();
+
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => return error.UnexpectedNavInvalidation,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
 }
 
 test "collision sfx cooldowns harden: cap<=32, full evicts min-remaining, tick compacts for re-add, keyFor pair order" {

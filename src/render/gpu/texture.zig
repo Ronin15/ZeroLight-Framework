@@ -45,7 +45,7 @@ pub fn uploadFromPixels(
 
     var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
     transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = @intCast(pixels.len);
+    transfer_info.size = try checkedTextureBytes(pixels.len);
     const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
@@ -66,13 +66,19 @@ pub fn uploadFromPixels(
         _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
     };
 
+    const pixels_per_row = try checkedPixelsPerRow(pitch);
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
+    var copy_pass_open = true;
+    errdefer if (copy_pass_open) {
+        c.SDL_EndGPUCopyPass(copy_pass);
+    };
+
     var source = c.SDL_GPUTextureTransferInfo{
         .transfer_buffer = transfer,
         .offset = 0,
-        .pixels_per_row = @intCast(pitch / bytes_per_pixel),
+        .pixels_per_row = pixels_per_row,
         .rows_per_layer = height,
     };
     var destination = c.SDL_GPUTextureRegion{
@@ -88,6 +94,7 @@ pub fn uploadFromPixels(
     };
     c.SDL_UploadToGPUTexture(copy_pass, &source, &destination, false);
     c.SDL_EndGPUCopyPass(copy_pass);
+    copy_pass_open = false;
 
     if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
         return sdlError("SDL_SubmitGPUCommandBuffer");
@@ -111,6 +118,15 @@ pub fn validatePixels(pixels: []const u8, width: u32, height: u32, pitch: usize)
     if (pixels.len < required_len) return error.InvalidTexturePixels;
 }
 
+fn checkedTextureBytes(byte_count: usize) error{TextureUploadTooLarge}!u32 {
+    return std.math.cast(u32, byte_count) orelse error.TextureUploadTooLarge;
+}
+
+fn checkedPixelsPerRow(pitch: usize) error{TextureUploadTooLarge}!u32 {
+    const pixels_per_row = pitch / bytes_per_pixel;
+    return std.math.cast(u32, pixels_per_row) orelse error.TextureUploadTooLarge;
+}
+
 fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
 }
@@ -131,4 +147,14 @@ test "texture pixel validation accepts tightly packed and padded rows" {
 
     try validatePixels(tight_pixels[0..], 2, 2, 8);
     try validatePixels(padded_pixels[0..], 2, 2, 12);
+}
+
+test "texture upload sizing rejects SDL u32 overflow" {
+    try std.testing.expectEqual(@as(u32, 4096), try checkedTextureBytes(4096));
+    try std.testing.expectError(error.TextureUploadTooLarge, checkedTextureBytes(@as(usize, std.math.maxInt(u32)) + 1));
+    try std.testing.expectEqual(@as(u32, 8), try checkedPixelsPerRow(8 * bytes_per_pixel));
+    try std.testing.expectError(
+        error.TextureUploadTooLarge,
+        checkedPixelsPerRow((@as(usize, std.math.maxInt(u32)) + 1) * bytes_per_pixel),
+    );
 }

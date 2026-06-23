@@ -9,7 +9,12 @@
 
 const std = @import("std");
 const config = @import("../config.zig");
-const Renderer = @import("../render/renderer.zig").Renderer;
+const renderer_file = @import("../render/renderer.zig");
+const RenderOrder = renderer_file.RenderOrder;
+const Renderer = renderer_file.Renderer;
+const Rect = renderer_file.Rect;
+const UiDepth = renderer_file.UiDepth;
+const UiStackOrder = renderer_file.UiStackOrder;
 const text = @import("../render/text.zig");
 const PreparedText = text.PreparedText;
 
@@ -37,12 +42,13 @@ pub fn renderList(
     overlay_color: config.Color,
     panel_color: config.Color,
     highlight_color: config.Color,
-    overlay_layer: i32,
-    panel_layer: i32,
-    highlight_layer: i32,
-    text_layer: i32,
+    ui_stack_order: UiStackOrder,
+    overlay_depth: UiDepth,
+    panel_depth: UiDepth,
+    highlight_depth: UiDepth,
+    text_depth: UiDepth,
 ) !void {
-    try drawScreenRect(renderer, .{ .x = 0, .y = 0, .w = width, .h = height }, overlay_color, overlay_layer);
+    try drawScreenRect(renderer, .{ .x = 0, .y = 0, .w = width, .h = height }, overlay_color, ui_stack_order, overlay_depth);
 
     const panel_x = (width - panel_width) * 0.5;
     const panel_y = (height - panel_height) * 0.5;
@@ -51,17 +57,10 @@ pub fn renderList(
         .y = panel_y,
         .w = panel_width,
         .h = panel_height,
-    }, panel_color, panel_layer);
-
-    try text.drawPreparedText(renderer, title, .{
-        .x = width * 0.5,
-        .y = title_y,
-        .anchor = .top_center,
-        .layer = text_layer,
-    });
+    }, panel_color, ui_stack_order, panel_depth);
 
     var y = first_item_y;
-    for (items, 0..) |item, i| {
+    for (items, 0..) |_, i| {
         const is_sel = (i == selected);
         if (is_sel) {
             const hx = (width - panel_width) * 0.5 + 10;
@@ -71,22 +70,37 @@ pub fn renderList(
                 .y = y - 4,
                 .w = hw,
                 .h = 28,
-            }, highlight_color, highlight_layer);
+            }, highlight_color, ui_stack_order, highlight_depth);
         }
+        y += item_spacing;
+    }
 
+    try text.drawPreparedText(renderer, title, .{
+        .x = width * 0.5,
+        .y = title_y,
+        .anchor = .top_center,
+        .order = uiOrder(ui_stack_order, text_depth),
+    });
+
+    y = first_item_y;
+    for (items) |item| {
         try text.drawPreparedText(renderer, item, .{
             .x = width * 0.5,
             .y = y,
             .anchor = .top_center,
-            .layer = text_layer,
+            .order = uiOrder(ui_stack_order, text_depth),
         });
 
         y += item_spacing;
     }
 }
 
-fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").Rect, color: config.Color, layer: i32) !void {
-    try renderer.drawRectInSpace(rect, color, layer, .logical);
+fn drawScreenRect(renderer: *Renderer, rect: Rect, color: config.Color, ui_stack_order: UiStackOrder, depth: UiDepth) !void {
+    try renderer.submitOrderedRectInSpace(rect, color, uiOrder(ui_stack_order, depth), .logical);
+}
+
+fn uiOrder(ui_stack_order: UiStackOrder, depth: UiDepth) RenderOrder {
+    return RenderOrder.uiInStack(ui_stack_order, depth);
 }
 
 test "menu_view changeSelection wraps" {

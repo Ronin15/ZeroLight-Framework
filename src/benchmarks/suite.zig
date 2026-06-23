@@ -2,6 +2,11 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! Non-interactive benchmark harness for runtime processors.
+//! Rows are regression signals and scheduler diagnostics, not runtime policy:
+//! production adaptive cases report what the measured tuner selected for this
+//! workload, while fixed cases are controls for comparison.
+
 const std = @import("std");
 const AdaptiveWorkPhase = @import("../app/thread_system.zig").AdaptiveWorkPhase;
 const AdaptiveWorkReport = @import("../app/thread_system.zig").AdaptiveWorkReport;
@@ -37,6 +42,7 @@ pub const Options = struct {
     case_filter: ?[]const u8 = null,
     group_filter: ?[]const u8 = null,
     item_count_filter: ?usize = null,
+    fallback_budget: ?usize = null,
     details: bool = false,
 };
 
@@ -47,6 +53,8 @@ pub const BenchmarkGroup = struct {
 };
 
 pub const BenchmarkCase = struct {
+    // Cases are registered by subsystem modules. The suite owns selection,
+    // warmup/measurement policy, and report formatting around the callback.
     name: []const u8,
     worker_mode: WorkerMode,
     adaptive: bool = false,
@@ -159,12 +167,17 @@ pub const RunStatus = enum {
 };
 
 pub const RunStats = struct {
+    // Plain scalar result surface shared by every benchmark group. Subsystem
+    // counters are optional so the report formatter stays generic.
     status: RunStatus = .measured,
     skip_reason: []const u8 = "",
     item_count: usize = 0,
     candidate_pairs: usize = 0,
     sample_count: usize = 0,
     output_count: usize = 0,
+    deferred_count: usize = 0,
+    fallback_deferred_count: usize = 0,
+    cache_evictions: usize = 0,
     iterations: usize = 0,
     mean_ns: u64 = 0,
     min_ns: u64 = 0,
@@ -174,6 +187,7 @@ pub const RunStats = struct {
     secondary_batch: ?BatchSummary = null,
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
+    render_prep_phases: ?RenderPrepPhaseSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -206,6 +220,8 @@ const CaseResult = struct {
 };
 
 pub const BatchSummary = struct {
+    // Compact copy of ThreadSystem batch telemetry used after a case returns,
+    // keeping report code independent from mutable tuner/batch state.
     item_count: usize = 0,
     range_count: usize = 0,
     items_per_range: usize = 0,
@@ -220,7 +236,16 @@ pub const BatchSummary = struct {
     ran_inline: bool = true,
 };
 
+pub const RenderPrepPhaseSummary = struct {
+    queue_order_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    vertex_emit_ns: u64 = 0,
+    draw_group_ns: u64 = 0,
+};
+
 pub const WorkTuningSummary = struct {
+    // Captures tuner state at the measurement boundary. Unsettled adaptive
+    // results stay visible instead of being treated as final policy.
     phase: AdaptiveWorkPhase = .learning,
     initial_worker_threads: usize = 0,
     initial_range_items: usize = 0,
@@ -243,6 +268,8 @@ pub const WorkTuningSummary = struct {
 };
 
 pub const StatsAccumulator = struct {
+    // Accumulates successful measurement iterations only. Skipped cases keep
+    // their reason in RunStats and never affect timing means.
     item_count: usize,
     iterations: usize = 0,
     total_ns: u128 = 0,
@@ -332,6 +359,8 @@ pub fn workTuningSummary(report: AdaptiveWorkReport, settled_before_measurement:
 }
 
 pub fn adaptiveTunerForCase(case: BenchmarkCase, range_alignment_items: usize) ?AdaptiveWorkTuner {
+    // Fixed-adaptive cases reuse tuner reporting but clamp range probing so they
+    // can act as a stable control against fully adaptive policy.
     if (!case.adaptive) return null;
     return switch (case.adaptive_range_mode) {
         .none, .tuned => null,
@@ -394,6 +423,12 @@ pub fn parseOptions(args: []const []const u8) !Options {
             options.item_count_filter = try parsePositiveUsize(args[index]);
         } else if (stripPrefix(arg, "--items=")) |value| {
             options.item_count_filter = try parsePositiveUsize(value);
+        } else if (std.mem.eql(u8, arg, "--fallback-budget")) {
+            index += 1;
+            if (index >= args.len) return error.MissingArgument;
+            options.fallback_budget = try parsePositiveUsize(args[index]);
+        } else if (stripPrefix(arg, "--fallback-budget=")) |value| {
+            options.fallback_budget = try parsePositiveUsize(value);
         } else if (std.mem.eql(u8, arg, "--details")) {
             options.details = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -409,19 +444,18 @@ pub fn parseOptions(args: []const []const u8) !Options {
 }
 
 pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const BenchmarkGroup, options: Options) !void {
+    // Run order is deterministic and stdout-first. The benchmark is a regression
+    // detector, so reporting favors comparable tables over machine-specific tuning.
     printHeader(options);
     var matched_group = options.group_filter == null;
-    var matched_item_count = options.item_count_filter == null;
     for (groups) |group| {
         if (options.group_filter) |filter| {
             if (!std.mem.eql(u8, filter, group.name)) continue;
             matched_group = true;
         }
-        for (group.defaultItemCounts(options.profile)) |item_count| {
-            if (options.item_count_filter) |filter| {
-                if (filter != item_count) continue;
-                matched_item_count = true;
-            }
+        var explicit_item_count: [1]usize = undefined;
+        const item_counts = itemCountsForOptions(group, options, &explicit_item_count);
+        for (item_counts) |item_count| {
             var results: [default_cases.len]CaseResult = undefined;
             var result_count: usize = 0;
 
@@ -441,10 +475,14 @@ pub fn runAll(allocator: std.mem.Allocator, io: std.Io, groups: []const Benchmar
         std.debug.print("unknown benchmark group: {s}\n", .{options.group_filter.?});
         return error.InvalidArgument;
     }
-    if (!matched_item_count) {
-        std.debug.print("no benchmark workload matched --items={}\n", .{options.item_count_filter.?});
-        return error.InvalidArgument;
+}
+
+fn itemCountsForOptions(group: BenchmarkGroup, options: Options, explicit_item_count: *[1]usize) []const usize {
+    if (options.item_count_filter) |item_count| {
+        explicit_item_count[0] = item_count;
+        return explicit_item_count[0..1];
     }
+    return group.defaultItemCounts(options.profile);
 }
 
 pub fn printUsage() void {
@@ -458,6 +496,7 @@ pub fn printUsage() void {
         \\  --case name
         \\  --group name
         \\  --items N
+        \\  --fallback-budget N
         \\  --details
         \\
         \\Default runs every benchmark case for every registered workload.
@@ -539,9 +578,13 @@ fn printHeader(options: Options) void {
     );
     std.debug.print("worker_threads_available={}\n", .{availableWorkerThreads()});
     std.debug.print("purpose: exercise benchmark flows, prove adaptive behavior, and catch regressions\n", .{});
+    std.debug.print("case roles: serial-direct is baseline; thread-fixed-* rows are forced scheduler controls\n", .{});
+    std.debug.print("case roles: thread-adaptive-* rows reflect production-style measured scheduling policy\n", .{});
 }
 
 fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options: Options) void {
+    // Compact mode keeps the key comparison visible in the terminal; detail mode
+    // exposes the supporting batch/tuner telemetry.
     const baseline = findResult(results, "serial-direct") orelse {
         std.debug.print("\n{s}\n", .{group.name});
         std.debug.print("  no serial baseline was run\n", .{});
@@ -579,8 +622,9 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-unreachable")) return "cached unreachable path requests";
-    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
+    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
+    if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -648,7 +692,7 @@ fn printDetailTable(group_name: []const u8, results: []const CaseResult, baselin
         var worker_ranges_buffer: [24]u8 = undefined;
         var items_per_range_buffer: [24]u8 = undefined;
         var tuning_buffer: [96]u8 = undefined;
-        var workload_buffer: [128]u8 = undefined;
+        var workload_buffer: [256]u8 = undefined;
 
         printCell(result.case.name, 30);
         printCell(formatDurationInto(&min_buffer, result.stats.min_ns), 11);
@@ -670,11 +714,32 @@ fn printValidationSummary(
     adaptive: ?CaseResult,
     results: []const CaseResult,
 ) void {
-    const speedup = speedupBasisPoints(baseline.stats, best.stats);
-    std.debug.print(
-        "summary: best {s} at {f} ({d}.{d:0>2}x serial). ",
-        .{ best.case.name, formatDuration(best.stats.mean_ns), speedup / 100, speedup % 100 },
-    );
+    const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
+    // Keep the summary terse and action-oriented: it should call out unusual
+    // scheduler behavior or workload counters without pretending to choose
+    // runtime tuning policy from one benchmark run.
+    if (is_render_prep) {
+        const focus = adaptive orelse best;
+        const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
+        const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
+        std.debug.print(
+            "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
+            .{ focus_label, focus.case.name, formatDuration(focus.stats.mean_ns), focus_speedup / 100, focus_speedup % 100 },
+        );
+        if (!std.mem.eql(u8, focus.case.name, best.case.name)) {
+            const best_speedup = speedupBasisPoints(baseline.stats, best.stats);
+            std.debug.print(
+                "best_control {s} at {f} ({d}.{d:0>2}x serial). ",
+                .{ best.case.name, formatDuration(best.stats.mean_ns), best_speedup / 100, best_speedup % 100 },
+            );
+        }
+    } else {
+        const speedup = speedupBasisPoints(baseline.stats, best.stats);
+        std.debug.print(
+            "summary: best {s} at {f} ({d}.{d:0>2}x serial). ",
+            .{ best.case.name, formatDuration(best.stats.mean_ns), speedup / 100, speedup % 100 },
+        );
+    }
 
     if (adaptive) |adaptive_result| {
         if (adaptive_result.stats.work_tuning) |summary| {
@@ -702,7 +767,12 @@ fn printValidationSummary(
         std.debug.print("adaptive flow not selected in this run. ", .{});
     }
 
-    if (best.stats.candidate_pairs != 0 or best.stats.output_count != 0) {
+    if (best.stats.candidate_pairs != 0 or
+        best.stats.output_count != 0 or
+        best.stats.deferred_count != 0 or
+        best.stats.fallback_deferred_count != 0 or
+        best.stats.cache_evictions != 0)
+    {
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
                 "workload separation_checks={} intents={}. ",
@@ -718,16 +788,36 @@ fn printValidationSummary(
                 "workload cache_hits={} results={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
-        } else if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
+        } else if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
             std.debug.print(
-                "workload fallback_requests={} results={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
+                "workload fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}. ",
+                .{ best.stats.candidate_pairs, best.stats.fallback_deferred_count, best.stats.deferred_count, best.stats.output_count, best.stats.cache_evictions },
             );
         } else if (std.mem.startsWith(u8, group_name, "collision-response")) {
             std.debug.print(
                 "workload triggers={} intents={}. ",
                 .{ best.stats.candidate_pairs, best.stats.output_count },
             );
+        } else if (std.mem.eql(u8, group_name, "render-prep")) {
+            const render_prep_focus = adaptive orelse best;
+            const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
+            std.debug.print(
+                "{s}={s} workload vertices={} sprites={} skipped={} groups={}. ",
+                .{
+                    focus_label,
+                    render_prep_focus.case.name,
+                    render_prep_focus.stats.candidate_pairs,
+                    render_prep_focus.stats.output_count,
+                    render_prep_focus.stats.deferred_count,
+                    render_prep_focus.stats.sample_count,
+                },
+            );
+            if (render_prep_focus.stats.render_prep_phases) |phases| {
+                std.debug.print(
+                    "phases queue_order={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
+                    .{ formatDuration(phases.queue_order_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
+                );
+            }
         } else {
             std.debug.print(
                 "workload candidates={} outputs={}. ",
@@ -771,6 +861,8 @@ fn printFlowCoverage(results: []const CaseResult) void {
 }
 
 fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_control: ?CaseResult) ?[]const u8 {
+    // Attention messages flag suspicious policy gaps against fixed controls. The
+    // benchmark still exits successfully so timing noise can be reviewed.
     if (adaptive) |adaptive_result| {
         if (fixed_auto) |auto| {
             if (percentDelta(adaptive_result.stats.mean_ns, auto.stats.mean_ns) > 25) {
@@ -790,6 +882,8 @@ fn validationAttention(fixed_auto: ?CaseResult, adaptive: ?CaseResult, threaded_
 }
 
 fn printCell(value: []const u8, width: usize) void {
+    // Table output stays plain text and width-based so diffs remain readable in
+    // terminals and CI logs.
     std.debug.print("{s}", .{value});
     const padding = if (value.len < width) width - value.len else 1;
     for (0..padding + 2) |_| {
@@ -844,6 +938,8 @@ fn formatUsizeInto(buffer: []u8, value: usize) []const u8 {
 }
 
 fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const u8 {
+    // Keep tuner state compact enough for aligned tables; detailed conclusions
+    // belong in validation text, not in every cell.
     const summary = maybe_summary orelse return "-";
     if (!summary.has_threaded_profile) {
         if (summary.candidate_items_per_range) |candidate| {
@@ -876,7 +972,9 @@ fn formatWorkTuningInto(buffer: []u8, maybe_summary: ?WorkTuningSummary) []const
 }
 
 fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []const u8 {
-    if (stats.candidate_pairs == 0 and stats.output_count == 0) return "-";
+    // Workload labels translate shared counters into subsystem language so the
+    // report remains compact without hiding what was measured.
+    if (stats.candidate_pairs == 0 and stats.output_count == 0 and stats.deferred_count == 0 and stats.fallback_deferred_count == 0 and stats.cache_evictions == 0) return "-";
     if (std.mem.eql(u8, group_name, "ai")) {
         if (stats.secondary_batch) |intent| {
             const tuning = stats.secondary_work_tuning;
@@ -909,11 +1007,34 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.startsWith(u8, group_name, "pathfinding-cache")) {
         return std.fmt.bufPrint(buffer, "cache_hits={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
     }
-    if (std.mem.eql(u8, group_name, "pathfinding-hard-fallback")) {
-        return std.fmt.bufPrint(buffer, "fallback_requests={} results={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
+    if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) {
+        return std.fmt.bufPrint(
+            buffer,
+            "fallback_requests={} fallback_deferred={} deferred={} results={} evictions={}",
+            .{ stats.candidate_pairs, stats.fallback_deferred_count, stats.deferred_count, stats.output_count, stats.cache_evictions },
+        ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "render-prep")) {
+        if (stats.render_prep_phases) |phases| {
+            return std.fmt.bufPrint(
+                buffer,
+                "vertices={} sprites={} skipped={} groups={} phases queue_order={f} snapshot={f} vertex={f} groups={f}",
+                .{
+                    stats.candidate_pairs,
+                    stats.output_count,
+                    stats.deferred_count,
+                    stats.sample_count,
+                    formatDuration(phases.queue_order_ns),
+                    formatDuration(phases.snapshot_ns),
+                    formatDuration(phases.vertex_emit_ns),
+                    formatDuration(phases.draw_group_ns),
+                },
+            ) catch "workload";
+        }
+        return std.fmt.bufPrint(buffer, "vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count }) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";
@@ -1056,6 +1177,7 @@ test "benchmark options parse scaling and filtering arguments" {
         "--group=movement",
         "--items",
         "65536",
+        "--fallback-budget=64",
         "--details",
     };
     const options = try parseOptions(&args);
@@ -1065,6 +1187,7 @@ test "benchmark options parse scaling and filtering arguments" {
     try std.testing.expectEqualStrings("thread-fixed-1", options.case_filter.?);
     try std.testing.expectEqualStrings("movement", options.group_filter.?);
     try std.testing.expectEqual(@as(usize, 65_536), options.item_count_filter.?);
+    try std.testing.expectEqual(@as(usize, 64), options.fallback_budget.?);
     try std.testing.expect(options.details);
 }
 
@@ -1123,6 +1246,36 @@ test "event scale profiles cover low through high signal counts" {
     try std.testing.expectEqualSlices(usize, &[_]usize{ 10_000, 25_000, 50_000 }, eventScaleCounts(.stress));
 }
 
+const test_item_counts = [_]usize{ 4, 8 };
+
+fn testItemCounts(_: Profile) []const usize {
+    return &test_item_counts;
+}
+
+fn testRunCase(_: std.mem.Allocator, _: std.Io, _: Options, _: BenchmarkCase, _: usize) anyerror!RunStats {
+    return .{};
+}
+
+test "benchmark items option overrides registered counts" {
+    const group = BenchmarkGroup{
+        .name = "test",
+        .defaultItemCounts = testItemCounts,
+        .runCase = testRunCase,
+    };
+    var explicit_item_count: [1]usize = undefined;
+
+    try std.testing.expectEqualSlices(
+        usize,
+        &test_item_counts,
+        itemCountsForOptions(group, .{}, &explicit_item_count),
+    );
+    try std.testing.expectEqualSlices(
+        usize,
+        &[_]usize{256},
+        itemCountsForOptions(group, .{ .item_count_filter = 256 }, &explicit_item_count),
+    );
+}
+
 test "benchmark table formatters keep compact text" {
     var throughput_buffer: [32]u8 = undefined;
     var speedup_buffer: [16]u8 = undefined;
@@ -1147,6 +1300,16 @@ test "benchmark table formatters keep compact text" {
             .final_items_per_range = 256,
             .settled_before_measurement = true,
             .has_threaded_profile = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "fallback_requests=4 fallback_deferred=2 deferred=2 results=4 evictions=1",
+        formatWorkloadInto(&range_buffer, "pathfinding-hard-fallback-budget", .{
+            .candidate_pairs = 4,
+            .fallback_deferred_count = 2,
+            .deferred_count = 2,
+            .output_count = 4,
+            .cache_evictions = 1,
         }),
     );
 }

@@ -1,0 +1,542 @@
+// Copyright (c) 2026 Hammer Forged Games
+// All rights reserved.
+// Licensed under the MIT License - see LICENSE file for details
+
+const std = @import("std");
+const builtin = @import("builtin");
+const logging = @import("../core/logging.zig");
+const BatchStats = @import("thread_system.zig").BatchStats;
+const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
+
+const log = logging.perf;
+
+pub const enabled = builtin.mode == .Debug and logging.enabled(.debug);
+pub const interval_ns: u64 = 60 * std.time.ns_per_s;
+
+pub const FrameResult = enum {
+    submitted,
+    skipped_no_swapchain,
+    no_render,
+};
+
+pub const Metric = enum {
+    sdl_events,
+    sdl_presentation_events,
+    sdl_window_resize_events,
+    sdl_window_fullscreen_events,
+    sdl_window_display_events,
+    sdl_window_focus_events,
+    sdl_window_visibility_events,
+    sdl_window_move_events,
+    state_updates,
+    state_renders,
+    fixed_updates,
+    update_cap_hits,
+    submitted_frames,
+    skipped_no_swapchain_frames,
+    no_render_frames,
+    sprite_commands,
+    sprite_valid,
+    sprite_skipped_invalid,
+    sprite_vertices,
+    sprite_draw_groups,
+    render_queue_records,
+    ai_entities,
+    ai_intents,
+    ai_navigation_intents,
+    ai_separation_candidate_checks,
+    ai_separation_neighbor_samples,
+    steering_navigation_intents,
+    steering_selected_intents,
+    steering_movement_intents,
+    steering_path_requests,
+    steering_paths_available,
+    steering_paths_pending,
+    steering_paths_unavailable,
+    steering_replan_cooldowns,
+    steering_unavailable_backoffs,
+    steering_stuck_replans,
+    steering_agent_neighbor_samples,
+    steering_obstacle_samples,
+    steering_agent_candidate_checks,
+    steering_obstacle_candidate_checks,
+    path_accepted_requests,
+    path_duplicate_requests,
+    path_pending_requests,
+    path_solved_requests,
+    path_field_requests,
+    path_fallback_requests,
+    path_available_results,
+    path_unavailable_results,
+    path_dropped_requests,
+    path_deferred_requests,
+    path_fallback_deferred_requests,
+    path_cache_hits,
+    path_field_cache_hits,
+    path_goal_fields_built,
+    path_goal_fields_reused,
+    path_cache_evictions,
+    movement_bodies,
+    collision_bodies,
+    collision_candidate_pairs,
+    collision_contacts,
+    collision_broadphase_simd_groups,
+    collision_full_sorts,
+    collision_response_contacts,
+    collision_response_intents,
+    collision_response_triggers,
+    particle_active_before,
+    particle_active_after,
+    particle_removed,
+    structural_created,
+    structural_destroyed,
+    structural_components_set,
+    structural_stale_skipped,
+    simulation_events_total,
+    simulation_events_dropped,
+    simulation_events_entity_created,
+    simulation_events_entity_destroyed,
+    simulation_events_component_changed,
+    simulation_events_nav_region_invalidated,
+    simulation_events_structural_commit_stage,
+    simulation_events_domain_reaction_stage,
+};
+
+pub const Timing = enum {
+    frame_interval,
+    events,
+    frame_controls,
+    update,
+    render_total,
+    render_enqueue,
+    render_overlay,
+    render_end_frame,
+};
+
+pub const BatchStage = enum {
+    ai_separation,
+    ai_intent,
+    steering,
+    path_field_results,
+    path_fallback,
+    movement,
+    collision_broadphase,
+    collision_narrowphase,
+    particles,
+    sprite_prep,
+};
+
+pub const FrameSample = struct {
+    frame_delta_ns: u64 = 0,
+    fixed_updates: u32 = 0,
+    hit_update_cap: bool = false,
+    result: FrameResult = .no_render,
+    sprite_prep: SpritePrepStats = .{},
+};
+
+const metric_count = std.meta.fields(Metric).len;
+const timing_count = std.meta.fields(Timing).len;
+const batch_stage_count = std.meta.fields(BatchStage).len;
+
+pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
+
+pub const Context = if (enabled) struct {
+    logger: ?*RuntimePerfLog = null,
+
+    pub fn bind(logger: *RuntimePerfLog) Context {
+        return .{ .logger = logger };
+    }
+
+    pub fn recordMetric(self: Context, metric: Metric, value: u64) void {
+        if (self.logger) |logger| logger.recordMetric(metric, value);
+    }
+
+    pub fn recordTiming(self: Context, timing: Timing, duration_ns: u64) void {
+        if (self.logger) |logger| logger.recordTiming(timing, duration_ns);
+    }
+
+    pub fn recordBatch(self: Context, stage: BatchStage, stats: BatchStats) void {
+        if (self.logger) |logger| logger.recordBatch(stage, stats);
+    }
+} else struct {
+    pub fn bind(_: *RuntimePerfLog) Context {
+        return .{};
+    }
+
+    pub fn recordMetric(_: Context, _: Metric, _: u64) void {}
+    pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
+    pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
+};
+
+comptime {
+    if (!enabled) {
+        std.debug.assert(@sizeOf(RuntimePerfLog) == 0);
+        std.debug.assert(@sizeOf(Context) == 0);
+    }
+}
+
+const DisabledRuntimePerfLog = struct {
+    pub fn init(_: u64) DisabledRuntimePerfLog {
+        return .{};
+    }
+
+    pub fn recordMetric(_: *DisabledRuntimePerfLog, _: Metric, _: u64) void {}
+    pub fn recordTiming(_: *DisabledRuntimePerfLog, _: Timing, _: u64) void {}
+    pub fn recordBatch(_: *DisabledRuntimePerfLog, _: BatchStage, _: BatchStats) void {}
+    pub fn recordFrame(_: *DisabledRuntimePerfLog, _: u64, _: FrameSample) void {}
+};
+
+const EnabledRuntimePerfLog = struct {
+    interval_start_ns: u64,
+    frames: u64 = 0,
+    metrics: [metric_count]u64 = [_]u64{0} ** metric_count,
+    timings: [timing_count]TimingAggregate = [_]TimingAggregate{.{}} ** timing_count,
+    batches: [batch_stage_count]BatchAggregate = [_]BatchAggregate{.{}} ** batch_stage_count,
+
+    pub fn init(now_ns: u64) EnabledRuntimePerfLog {
+        return .{ .interval_start_ns = now_ns };
+    }
+
+    pub fn recordMetric(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
+        self.metrics[@intFromEnum(metric_id)] += value;
+    }
+
+    pub fn recordTiming(self: *EnabledRuntimePerfLog, timing_id: Timing, duration_ns: u64) void {
+        self.timings[@intFromEnum(timing_id)].record(duration_ns);
+    }
+
+    pub fn recordBatch(self: *EnabledRuntimePerfLog, stage: BatchStage, stats: BatchStats) void {
+        if (stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0) return;
+        self.batches[@intFromEnum(stage)].record(stats);
+    }
+
+    pub fn recordFrame(self: *EnabledRuntimePerfLog, now_ns: u64, sample: FrameSample) void {
+        self.frames += 1;
+        self.recordTiming(.frame_interval, sample.frame_delta_ns);
+        self.recordMetric(.fixed_updates, sample.fixed_updates);
+        if (sample.hit_update_cap) self.recordMetric(.update_cap_hits, 1);
+        switch (sample.result) {
+            .submitted => self.recordMetric(.submitted_frames, 1),
+            .skipped_no_swapchain => self.recordMetric(.skipped_no_swapchain_frames, 1),
+            .no_render => self.recordMetric(.no_render_frames, 1),
+        }
+        self.recordSpritePrep(sample.sprite_prep);
+
+        if (now_ns - self.interval_start_ns >= interval_ns) {
+            self.emit(now_ns - self.interval_start_ns);
+            self.reset(now_ns);
+        }
+    }
+
+    fn recordSpritePrep(self: *EnabledRuntimePerfLog, stats: SpritePrepStats) void {
+        self.recordMetric(.sprite_commands, stats.command_count);
+        self.recordMetric(.sprite_valid, stats.valid_sprite_count);
+        self.recordMetric(.sprite_skipped_invalid, stats.skipped_invalid_count);
+        self.recordMetric(.sprite_vertices, stats.vertex_count);
+        self.recordMetric(.sprite_draw_groups, stats.draw_group_count);
+        self.recordBatch(.sprite_prep, stats.batch);
+    }
+
+    fn reset(self: *EnabledRuntimePerfLog, now_ns: u64) void {
+        self.interval_start_ns = now_ns;
+        self.frames = 0;
+        self.metrics = [_]u64{0} ** metric_count;
+        self.timings = [_]TimingAggregate{.{}} ** timing_count;
+        self.batches = [_]BatchAggregate{.{}} ** batch_stage_count;
+    }
+
+    fn emit(self: *const EnabledRuntimePerfLog, elapsed_ns: u64) void {
+        const frame_interval_timing = self.timingValue(.frame_interval);
+        const events_timing = self.timingValue(.events);
+        const frame_controls_timing = self.timingValue(.frame_controls);
+        const update_timing = self.timingValue(.update);
+        const render_total_timing = self.timingValue(.render_total);
+        const render_enqueue_timing = self.timingValue(.render_enqueue);
+        const render_overlay_timing = self.timingValue(.render_overlay);
+        const render_end_frame_timing = self.timingValue(.render_end_frame);
+        const elapsed_s = seconds(elapsed_ns);
+        const update_count = self.metricValue(.fixed_updates);
+        const rendered_frame_count = self.metricValue(.submitted_frames) +
+            self.metricValue(.skipped_no_swapchain_frames);
+
+        log.debug(
+            "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} events_max_ms={d:.3} controls_avg_ms={d:.3} controls_max_ms={d:.3} update_avg_ms={d:.3} update_max_ms={d:.3} render_total_avg_ms={d:.3} render_total_max_ms={d:.3} event_count={} presentation_events={} resize={} fullscreen={} display={} focus={} visibility={} move={}",
+            .{
+                elapsed_s,
+                self.frames,
+                self.metricValue(.submitted_frames),
+                self.metricValue(.skipped_no_swapchain_frames),
+                self.metricValue(.no_render_frames),
+                self.metricValue(.fixed_updates),
+                self.metricValue(.update_cap_hits),
+                millis(frame_interval_timing.averageNs()),
+                millis(frame_interval_timing.max_ns),
+                millis(events_timing.averageNs()),
+                millis(events_timing.max_ns),
+                millis(frame_controls_timing.averageNs()),
+                millis(frame_controls_timing.max_ns),
+                millis(update_timing.averageNs()),
+                millis(update_timing.max_ns),
+                millis(render_total_timing.averageNs()),
+                millis(render_total_timing.max_ns),
+                self.metricValue(.sdl_events),
+                self.metricValue(.sdl_presentation_events),
+                self.metricValue(.sdl_window_resize_events),
+                self.metricValue(.sdl_window_fullscreen_events),
+                self.metricValue(.sdl_window_display_events),
+                self.metricValue(.sdl_window_focus_events),
+                self.metricValue(.sdl_window_visibility_events),
+                self.metricValue(.sdl_window_move_events),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} render_queue_records={} records_per_frame={d:.1} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
+            .{
+                elapsed_s,
+                self.metricValue(.state_updates),
+                self.metricValue(.state_renders),
+                millis(render_enqueue_timing.averageNs()),
+                millis(render_enqueue_timing.max_ns),
+                millis(render_overlay_timing.averageNs()),
+                millis(render_overlay_timing.max_ns),
+                millis(render_end_frame_timing.averageNs()),
+                millis(render_end_frame_timing.max_ns),
+                self.metricValue(.render_queue_records),
+                averagePer(self.metricValue(.render_queue_records), rendered_frame_count),
+                self.metricValue(.sprite_commands),
+                self.metricValue(.sprite_valid),
+                self.metricValue(.sprite_skipped_invalid),
+                averagePer(self.metricValue(.sprite_commands), rendered_frame_count),
+                self.metricValue(.sprite_vertices),
+                self.metricValue(.sprite_draw_groups),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={} events total={} dropped={} created={} destroyed={} component_changed={} nav_invalidated={} structural_stage={} domain_stage={}",
+            .{
+                elapsed_s,
+                self.metricValue(.ai_entities),
+                averagePer(self.metricValue(.ai_entities), update_count),
+                self.metricValue(.ai_intents),
+                self.metricValue(.ai_navigation_intents),
+                self.metricValue(.steering_selected_intents),
+                self.metricValue(.steering_movement_intents),
+                self.metricValue(.movement_bodies),
+                averagePer(self.metricValue(.movement_bodies), update_count),
+                self.metricValue(.collision_bodies),
+                averagePer(self.metricValue(.collision_bodies), update_count),
+                self.metricValue(.collision_candidate_pairs),
+                self.metricValue(.collision_contacts),
+                self.metricValue(.collision_response_intents),
+                self.metricValue(.collision_response_triggers),
+                self.metricValue(.particle_active_before),
+                averagePer(self.metricValue(.particle_active_before), update_count),
+                self.metricValue(.particle_active_after),
+                self.metricValue(.particle_removed),
+                self.metricValue(.structural_created),
+                self.metricValue(.structural_destroyed),
+                self.metricValue(.structural_components_set),
+                self.metricValue(.structural_stale_skipped),
+                self.metricValue(.simulation_events_total),
+                self.metricValue(.simulation_events_dropped),
+                self.metricValue(.simulation_events_entity_created),
+                self.metricValue(.simulation_events_entity_destroyed),
+                self.metricValue(.simulation_events_component_changed),
+                self.metricValue(.simulation_events_nav_region_invalidated),
+                self.metricValue(.simulation_events_structural_commit_stage),
+                self.metricValue(.simulation_events_domain_reaction_stage),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} field={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} field_cache_hits={} fields_built={} fields_reused={} evictions={} steering path_requests={} available={} pending={} unavailable={} replans={} unavailable_backoff={} stuck={} agent_samples={} obstacle_samples={} agent_checks={} obstacle_checks={} ai_sep_checks={} ai_sep_samples={} collision_simd_groups={} full_sorts={}",
+            .{
+                elapsed_s,
+                self.metricValue(.path_accepted_requests),
+                self.metricValue(.path_duplicate_requests),
+                self.metricValue(.path_pending_requests),
+                self.metricValue(.path_solved_requests),
+                self.metricValue(.path_field_requests),
+                self.metricValue(.path_fallback_requests),
+                self.metricValue(.path_available_results),
+                self.metricValue(.path_unavailable_results),
+                self.metricValue(.path_dropped_requests),
+                self.metricValue(.path_deferred_requests),
+                self.metricValue(.path_fallback_deferred_requests),
+                self.metricValue(.path_cache_hits),
+                self.metricValue(.path_field_cache_hits),
+                self.metricValue(.path_goal_fields_built),
+                self.metricValue(.path_goal_fields_reused),
+                self.metricValue(.path_cache_evictions),
+                self.metricValue(.steering_path_requests),
+                self.metricValue(.steering_paths_available),
+                self.metricValue(.steering_paths_pending),
+                self.metricValue(.steering_paths_unavailable),
+                self.metricValue(.steering_replan_cooldowns),
+                self.metricValue(.steering_unavailable_backoffs),
+                self.metricValue(.steering_stuck_replans),
+                self.metricValue(.steering_agent_neighbor_samples),
+                self.metricValue(.steering_obstacle_samples),
+                self.metricValue(.steering_agent_candidate_checks),
+                self.metricValue(.steering_obstacle_candidate_checks),
+                self.metricValue(.ai_separation_candidate_checks),
+                self.metricValue(.ai_separation_neighbor_samples),
+                self.metricValue(.collision_broadphase_simd_groups),
+                self.metricValue(.collision_full_sorts),
+            },
+        );
+
+        inline for (std.meta.fields(BatchStage)) |field| {
+            const stage: BatchStage = @enumFromInt(field.value);
+            const batch_stats = self.batchValue(stage);
+            if (batch_stats.calls != 0) {
+                log.debug(
+                    "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} worker_util_avg={d:.1}%",
+                    .{
+                        elapsed_s,
+                        field.name,
+                        batch_stats.calls,
+                        batch_stats.items,
+                        batch_stats.ranges,
+                        batch_stats.inline_calls,
+                        batch_stats.threaded_calls,
+                        batch_stats.max_active_worker_threads,
+                        millis(batch_stats.averageNs()),
+                        millis(batch_stats.max_duration_ns),
+                        millis(batch_stats.averageWaitNs()),
+                        batch_stats.averageWorkerUtilization() * 100.0,
+                    },
+                );
+            }
+        }
+    }
+
+    fn metricValue(self: *const EnabledRuntimePerfLog, value: Metric) u64 {
+        return self.metrics[@intFromEnum(value)];
+    }
+
+    fn timingValue(self: *const EnabledRuntimePerfLog, value: Timing) TimingAggregate {
+        return self.timings[@intFromEnum(value)];
+    }
+
+    fn batchValue(self: *const EnabledRuntimePerfLog, value: BatchStage) BatchAggregate {
+        return self.batches[@intFromEnum(value)];
+    }
+};
+
+const TimingAggregate = struct {
+    count: u64 = 0,
+    total_ns: u64 = 0,
+    max_ns: u64 = 0,
+
+    fn record(self: *TimingAggregate, duration_ns: u64) void {
+        self.count += 1;
+        self.total_ns += duration_ns;
+        self.max_ns = @max(self.max_ns, duration_ns);
+    }
+
+    fn averageNs(self: TimingAggregate) u64 {
+        if (self.count == 0) return 0;
+        return self.total_ns / self.count;
+    }
+};
+
+const BatchAggregate = struct {
+    calls: u64 = 0,
+    items: u64 = 0,
+    ranges: u64 = 0,
+    inline_calls: u64 = 0,
+    threaded_calls: u64 = 0,
+    total_duration_ns: u64 = 0,
+    max_duration_ns: u64 = 0,
+    total_wait_ns: u64 = 0,
+    total_worker_utilization: f64 = 0,
+    max_active_worker_threads: usize = 0,
+
+    fn record(self: *BatchAggregate, stats: BatchStats) void {
+        self.calls += 1;
+        self.items += stats.item_count;
+        self.ranges += stats.range_count;
+        if (stats.ran_inline or stats.active_worker_threads == 0) {
+            self.inline_calls += 1;
+        } else {
+            self.threaded_calls += 1;
+        }
+        self.total_duration_ns += stats.batch_duration_ns;
+        self.max_duration_ns = @max(self.max_duration_ns, stats.batch_duration_ns);
+        self.total_wait_ns += stats.main_thread_wait_ns;
+        self.total_worker_utilization += stats.worker_utilization;
+        self.max_active_worker_threads = @max(self.max_active_worker_threads, stats.active_worker_threads);
+    }
+
+    fn averageNs(self: BatchAggregate) u64 {
+        if (self.calls == 0) return 0;
+        return self.total_duration_ns / self.calls;
+    }
+
+    fn averageWaitNs(self: BatchAggregate) u64 {
+        if (self.calls == 0) return 0;
+        return self.total_wait_ns / self.calls;
+    }
+
+    fn averageWorkerUtilization(self: BatchAggregate) f64 {
+        if (self.calls == 0) return 0;
+        return self.total_worker_utilization / @as(f64, @floatFromInt(self.calls));
+    }
+};
+
+fn millis(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms));
+}
+
+fn seconds(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+}
+
+fn averagePer(total: u64, count: u64) f64 {
+    if (count == 0) return 0;
+    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(count));
+}
+
+test "runtime performance log accumulates frame samples until interval" {
+    if (!enabled) return error.SkipZigTest;
+
+    var perf = RuntimePerfLog.init(0);
+    perf.recordFrame(interval_ns / 2, .{
+        .frame_delta_ns = 16 * std.time.ns_per_ms,
+        .fixed_updates = 1,
+        .hit_update_cap = false,
+        .result = .submitted,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), perf.frames);
+    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.submitted_frames));
+    try std.testing.expectEqual(@as(u64, 1), perf.metricValue(.fixed_updates));
+    try std.testing.expectEqual(@as(u64, 16 * std.time.ns_per_ms), perf.timingValue(.frame_interval).max_ns);
+}
+
+test "runtime performance log reset clears accumulators" {
+    if (!enabled) return error.SkipZigTest;
+
+    var perf = RuntimePerfLog.init(0);
+    perf.recordMetric(.sdl_events, 3);
+    perf.recordTiming(.update, 12);
+    perf.recordBatch(.movement, .{
+        .item_count = 16,
+        .range_count = 1,
+        .batch_duration_ns = 100,
+        .ran_inline = true,
+    });
+    perf.recordFrame(interval_ns / 2, .{
+        .frame_delta_ns = 16 * std.time.ns_per_ms,
+        .fixed_updates = 1,
+        .hit_update_cap = true,
+        .result = .submitted,
+    });
+
+    perf.reset(interval_ns);
+
+    try std.testing.expectEqual(@as(u64, 0), perf.frames);
+    try std.testing.expectEqual(@as(u64, 0), perf.metricValue(.sdl_events));
+    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.update).count);
+    try std.testing.expectEqual(@as(u64, 0), perf.batchValue(.movement).calls);
+}

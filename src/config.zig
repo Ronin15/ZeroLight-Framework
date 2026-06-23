@@ -27,6 +27,7 @@ pub const AppConfig = struct {
     audio: AudioConfig = .{},
 
     pub fn validate(self: AppConfig) !void {
+        try validateAssetRoot(self.asset_root);
         try self.resolution_policy.validate();
         try self.audio.validate();
         if (self.frames_in_flight < 1 or self.frames_in_flight > 3) {
@@ -73,6 +74,19 @@ pub const Color = extern struct {
     a: f32,
 };
 
+fn validateAssetRoot(asset_root: []const u8) !void {
+    if (asset_root.len == 0 or std.fs.path.isAbsolute(asset_root)) {
+        return error.InvalidConfig;
+    }
+
+    var components = std.fs.path.componentIterator(asset_root);
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
+            return error.InvalidConfig;
+        }
+    }
+}
+
 test "app config validation accepts defaults" {
     try (AppConfig{
         .app_name = "test",
@@ -101,6 +115,15 @@ test "app config validation rejects invalid frame latency" {
         .window_title = "test",
         .frames_in_flight = 4,
     }).validate());
+}
+
+test "app config validation keeps asset roots relative and traversal-safe" {
+    try (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "content" }).validate();
+    try (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "content/runtime" }).validate();
+    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "" }).validate());
+    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "/tmp/assets" }).validate());
+    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "../content" }).validate());
+    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "./assets" }).validate());
 }
 
 test "audio config validation rejects invalid values" {

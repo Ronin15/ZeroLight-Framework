@@ -2,6 +2,7 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const std = @import("std");
 const TimeLoop = @import("time_loop.zig").TimeLoop;
 const c = @import("../platform/sdl.zig").c;
 
@@ -66,25 +67,20 @@ pub fn paceFallbackFrame(frame_start_ns: u64) void {
 }
 
 test "fallback delay returns full frame when no time elapsed" {
-    const std = @import("std");
     try std.testing.expectEqual(fallback_frame_ns, fallbackDelayNs(100, 100));
 }
 
 test "fallback delay returns remaining frame time" {
-    const std = @import("std");
     const elapsed_ns = fallback_frame_ns / 4;
     try std.testing.expectEqual(fallback_frame_ns - elapsed_ns, fallbackDelayNs(100, 100 + elapsed_ns));
 }
 
 test "fallback delay returns zero when frame is over budget" {
-    const std = @import("std");
     try std.testing.expectEqual(@as(u64, 0), fallbackDelayNs(100, 100 + fallback_frame_ns));
     try std.testing.expectEqual(@as(u64, 0), fallbackDelayNs(100, 100 + fallback_frame_ns + 1));
 }
 
 test "window flags classify renderability separately from background throttling" {
-    const std = @import("std");
-
     try std.testing.expect(flagsCanRender(c.SDL_WINDOW_INPUT_FOCUS));
     try std.testing.expect(flagsCanRender(c.SDL_WINDOW_INPUT_FOCUS | c.SDL_WINDOW_OCCLUDED));
     try std.testing.expect(flagsCanRender(0));
@@ -94,8 +90,6 @@ test "window flags classify renderability separately from background throttling"
 }
 
 test "focused visible windows render without a frame cap" {
-    const std = @import("std");
-
     const policy = flagsFramePolicy(c.SDL_WINDOW_INPUT_FOCUS);
 
     try std.testing.expect(policy.can_render);
@@ -104,8 +98,6 @@ test "focused visible windows render without a frame cap" {
 }
 
 test "occluded windows render with the fallback frame cap" {
-    const std = @import("std");
-
     const policy = flagsFramePolicy(c.SDL_WINDOW_INPUT_FOCUS | c.SDL_WINDOW_OCCLUDED);
 
     try std.testing.expect(policy.can_render);
@@ -114,8 +106,6 @@ test "occluded windows render with the fallback frame cap" {
 }
 
 test "unfocused windows render with the fallback frame cap without forcing pause" {
-    const std = @import("std");
-
     const policy = flagsFramePolicy(0);
 
     try std.testing.expect(policy.can_render);
@@ -124,8 +114,6 @@ test "unfocused windows render with the fallback frame cap without forcing pause
 }
 
 test "hidden and minimized windows skip rendering with the fallback frame cap" {
-    const std = @import("std");
-
     const hidden_policy = flagsFramePolicy(c.SDL_WINDOW_HIDDEN | c.SDL_WINDOW_INPUT_FOCUS);
     const minimized_policy = flagsFramePolicy(c.SDL_WINDOW_MINIMIZED | c.SDL_WINDOW_INPUT_FOCUS);
 
@@ -138,8 +126,6 @@ test "hidden and minimized windows skip rendering with the fallback frame cap" {
 }
 
 test "gameplay blocked policy can keep visible rendering active" {
-    const std = @import("std");
-
     const policy = gameplayBlockedPolicy(.{
         .can_render = true,
         .target_frame_ns = null,
