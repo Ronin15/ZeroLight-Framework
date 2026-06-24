@@ -11,8 +11,6 @@ const std = @import("std");
 const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
-const RenderOrder = @import("../../render/renderer.zig").RenderOrder;
-const RenderQueue = @import("../../render/render_queue.zig").RenderQueue;
 const render_depth = @import("../render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -403,33 +401,6 @@ pub const ParticleSystem = struct {
         };
     }
 
-    pub fn enqueueRender(self: *const ParticleSystem, queue: *RenderQueue, interpolation_alpha: f32) !void {
-        // Particles emit transient draw records; the render queue owns ordering,
-        // while this system keeps only simulation columns.
-        const particles = self.sliceConst();
-        for (0..particles.len()) |index| {
-            const size = particles.size[index];
-            if (size <= 0 or particles.color_a[index] <= 0) continue;
-
-            const position = math.lerpVec2(
-                .{ .x = particles.previous_x[index], .y = particles.previous_y[index] },
-                .{ .x = particles.position_x[index], .y = particles.position_y[index] },
-                interpolation_alpha,
-            );
-            try queue.addRect(.{
-                .x = position.x - size * 0.5,
-                .y = position.y - size * 0.5,
-                .w = size,
-                .h = size,
-            }, .{
-                .r = particles.color_r[index],
-                .g = particles.color_g[index],
-                .b = particles.color_b[index],
-                .a = particles.color_a[index],
-            }, RenderOrder.world(particles.z[index]), .world);
-        }
-    }
-
     pub fn syncPreviousPositions(self: *ParticleSystem) void {
         for (0..self.activeCount()) |index| {
             self.previous_x.items[index] = self.position_x.items[index];
@@ -497,7 +468,8 @@ pub const ParticleSystem = struct {
 
     fn removeExpiredSwap(self: *ParticleSystem) usize {
         // Swap removal is intentionally unordered. Render ordering comes from
-        // RenderQueue depth/order, not particle storage order.
+        // Storage order is stable for emission, while the owning state decides
+        // which render phase submits particles.
         var removed: usize = 0;
         var index: usize = 0;
         while (index < self.activeCount()) {
@@ -812,24 +784,6 @@ test "particle columns remain aligned after expired swap removal" {
     try expectParticleColumnsAligned(&particles);
     const alive = particles.sliceConst();
     try std.testing.expectEqual(@as(f32, 2), alive.velocity_x[0]);
-}
-
-test "particle render records are ordered by render queue instead of storage order" {
-    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 2 });
-    defer particles.deinit();
-    var queue = RenderQueue.init(std.testing.allocator);
-    defer queue.deinit();
-
-    try std.testing.expect(particles.emit(.{ .depth = .marker, .start_size = 4 }));
-    try std.testing.expect(particles.emit(.{ .depth = .effect, .start_size = 4 }));
-
-    try particles.enqueueRender(&queue, 1.0);
-    try std.testing.expectEqual(@as(usize, 2), queue.recordCount());
-    queue.sortForSubmit();
-
-    try std.testing.expect(queue.recordOrder(0).lessOrEqual(queue.recordOrder(1)));
-    try std.testing.expectEqual(render_depth.worldZ(.effect), queue.recordOrder(0).depth);
-    try std.testing.expectEqual(render_depth.worldZ(.marker), queue.recordOrder(1).depth);
 }
 
 test "particle render z is relative to emitter base z" {

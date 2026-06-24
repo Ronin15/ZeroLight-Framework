@@ -264,6 +264,7 @@ pub const Engine = struct {
         const perf_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
         const perf_context = if (comptime runtime_perf_log.enabled) runtime_perf_log.Context.bind(&self.perf_log) else runtime_perf_log.Context{};
         self.audio_commands.beginStep();
+        const perf_state_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
         try self.states.update(UpdateContext{
             .input = &self.input,
             .audio = &self.audio_commands,
@@ -273,10 +274,20 @@ pub const Engine = struct {
             .thread_system = &self.thread_system,
             .perf = perf_context,
         });
+        const perf_transition_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+        if (comptime runtime_perf_log.enabled) {
+            self.perf_log.recordTiming(.state_update, elapsedNs(perf_state_start_ns, perf_transition_start_ns));
+        }
         try self.applyTransitions();
+        const perf_audio_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
+        if (comptime runtime_perf_log.enabled) {
+            self.perf_log.recordTiming(.state_transitions, elapsedNs(perf_transition_start_ns, perf_audio_start_ns));
+        }
         self.audio_service.drain(&self.audio_commands);
         if (comptime runtime_perf_log.enabled) {
-            self.perf_log.recordTiming(.update, elapsedNs(perf_start_ns, self.nowNs()));
+            const perf_end_ns = self.nowNs();
+            self.perf_log.recordTiming(.audio_drain, elapsedNs(perf_audio_start_ns, perf_end_ns));
+            self.perf_log.recordTiming(.app_tick, elapsedNs(perf_start_ns, perf_end_ns));
         }
     }
 

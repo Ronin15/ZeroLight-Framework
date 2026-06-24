@@ -19,6 +19,7 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
+const WorldSystem = @import("../world_system.zig").WorldSystem;
 const PathAgentClass = @import("../simulation.zig").PathAgentClass;
 const PathRequest = @import("../simulation.zig").PathRequest;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
@@ -30,9 +31,11 @@ const default_max_frame_requests: usize = 1024;
 const default_max_pending_requests: usize = 1024;
 const default_max_cached_results: usize = 1024;
 const default_max_goal_fields: usize = 8;
+const default_max_goal_field_cells: usize = 65_536;
 const default_max_worker_scratch_slots: usize = 64;
 const default_max_solved_requests_per_step: usize = 128;
 pub const default_max_fallback_requests_per_step: usize = 128;
+const default_max_fallback_cells: usize = 65_536;
 const no_parent: usize = std.math.maxInt(usize);
 const no_component: u32 = 0;
 const diagonal_cost: u32 = 14;
@@ -77,9 +80,11 @@ pub const PathfindingCapacity = struct {
     max_pending_requests: usize = default_max_pending_requests,
     max_cached_results: usize = default_max_cached_results,
     max_goal_fields: usize = default_max_goal_fields,
+    max_goal_field_cells: usize = default_max_goal_field_cells,
     max_worker_scratch_slots: usize = default_max_worker_scratch_slots,
     max_solved_requests_per_step: usize = default_max_solved_requests_per_step,
     max_fallback_requests_per_step: usize = default_max_fallback_requests_per_step,
+    max_fallback_cells: usize = default_max_fallback_cells,
 };
 
 pub const PathfindingConfig = struct {
@@ -185,8 +190,17 @@ const NavGrid = struct {
         self.* = undefined;
     }
 
-    fn rebuild(self: *NavGrid, allocator: std.mem.Allocator, data: *const DataSystem, bounds_width: f32, bounds_height: f32, cell_size: f32) !void {
-        // Rebuild is the only path that reads static obstacles from DataSystem.
+    fn rebuild(
+        self: *NavGrid,
+        allocator: std.mem.Allocator,
+        data: *const DataSystem,
+        world: ?*const WorldSystem,
+        bounds_width: f32,
+        bounds_height: f32,
+        cell_size: f32,
+    ) !void {
+        // Rebuild is the only path that reads static obstacles from DataSystem
+        // and optional world-tile obstacle views.
         // Once complete, workers query immutable grid arrays and scratch only.
         self.cell_size = cell_size;
         self.width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(bounds_width / cell_size))));
@@ -216,6 +230,9 @@ const NavGrid = struct {
             const max_x = min_x + bounds.size_x[bounds_index];
             const max_y = min_y + bounds.size_y[bounds_index];
             self.markBlockedRectSimd(min_x, min_y, max_x, max_y);
+        }
+        if (world) |world_system| {
+            self.markWorldObstacles(world_system);
         }
 
         self.version +%= 1;
@@ -317,6 +334,25 @@ const NavGrid = struct {
         if (!self.blocked.items[index]) {
             self.blocked.items[index] = true;
             self.blocked_count += 1;
+        }
+    }
+
+    fn markWorldObstacles(self: *NavGrid, world: *const WorldSystem) void {
+        for (0..world.denseLayerCount()) |layer_index| {
+            for (0..world.height) |y_usize| {
+                const y: u16 = @intCast(y_usize);
+                for (0..world.width) |x_usize| {
+                    const x: u16 = @intCast(x_usize);
+                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
+                    const rect = world.cellRect(x, y) orelse continue;
+                    self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+                }
+            }
+        }
+        for (0..world.sparseTileCount()) |index| {
+            if (!world.sparseTileBlocksMovement(index)) continue;
+            const rect = world.sparseTileRect(index) orelse continue;
+            self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
         }
     }
 
@@ -874,13 +910,28 @@ pub const PathfindingSystem = struct {
     }
 
     pub fn rebuildStaticNavGrid(self: *PathfindingSystem, data: *const DataSystem, bounds_width: f32, bounds_height: f32, cell_size: f32) !void {
+        try self.rebuildStaticNavGridWithWorld(data, null, bounds_width, bounds_height, cell_size);
+    }
+
+    pub fn rebuildStaticNavGridWithWorld(
+        self: *PathfindingSystem,
+        data: *const DataSystem,
+        world: ?*const WorldSystem,
+        bounds_width: f32,
+        bounds_height: f32,
+        cell_size: f32,
+    ) !void {
         if (self.goal_fields.items.len == 0 or self.scratch_slots.items.len == 0) {
             try self.reserve(self.capacity);
         }
-        try self.grid.rebuild(self.allocator, data, bounds_width, bounds_height, cell_size);
+        try self.grid.rebuild(self.allocator, data, world, bounds_width, bounds_height, cell_size);
         const cell_count = self.grid.cellCount();
         for (self.goal_fields.items) |*field| {
-            try field.reserve(self.allocator, cell_count);
+            if (self.goalFieldsEnabled()) {
+                try field.reserve(self.allocator, cell_count);
+            } else {
+                field.heap.clearRetainingCapacity();
+            }
             field.occupied = false;
         }
         for (self.scratch_slots.items) |*scratch| {
@@ -1147,6 +1198,7 @@ pub const PathfindingSystem = struct {
     }
 
     fn buildGroupedFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
+        if (!self.goalFieldsEnabled()) return;
         for (self.groups.items) |group| {
             if (group.count < 2) continue;
             _ = self.ensureGoalField(group.key, stats);
@@ -1219,6 +1271,8 @@ pub const PathfindingSystem = struct {
                 // Remaining deferred entries keep pending order and are budgeted.
                 if (fastSolve(&self.grid, self.pending.items[pending_index])) |fast_result| {
                     self.solve_results.items[pending_index] = fast_result;
+                } else if (!self.fallbackSearchEnabled()) {
+                    stats.fallback_deferred_requests += 1;
                 } else if (self.fallback_indices.items.len < fallback_limit) {
                     self.fallback_indices.appendAssumeCapacity(pending_index);
                 } else {
@@ -1303,6 +1357,7 @@ pub const PathfindingSystem = struct {
     // Goal fields are scarce by design. Empty slots are used first; after that,
     // deterministic rotating eviction keeps behavior reproducible.
     fn ensureGoalField(self: *PathfindingSystem, key: GoalKey, stats: *PathfindingStats) ?*GoalField {
+        if (!self.goalFieldsEnabled()) return null;
         for (self.goal_fields.items) |*field| {
             if (field.occupied and goalKeysEqual(field.key, key)) {
                 stats.goal_fields_reused += 1;
@@ -1324,6 +1379,16 @@ pub const PathfindingSystem = struct {
         stats.goal_fields_built += 1;
         stats.cache_evictions += 1;
         return field;
+    }
+
+    fn goalFieldsEnabled(self: *const PathfindingSystem) bool {
+        return self.goal_fields.items.len != 0 and
+            self.grid.valid() and
+            self.grid.cellCount() <= self.capacity.max_goal_field_cells;
+    }
+
+    fn fallbackSearchEnabled(self: *const PathfindingSystem) bool {
+        return self.grid.valid() and self.grid.cellCount() <= self.capacity.max_fallback_cells;
     }
 
     fn findGroupIndex(self: *const PathfindingSystem, key: GoalKey) ?usize {
@@ -1772,6 +1837,29 @@ fn expectTrueFallbackRequest(system: *const PathfindingSystem, request: HardFall
     try std.testing.expect(fastSolve(&system.grid, .{ .entity = request.entity, .key = key }) == null);
 }
 
+test "pathfinding nav grid includes blocking world tiles" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        std.testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 96);
+    defer world.deinit();
+    const water = meta.tileByName("water_1") orelse return error.TestExpectedEqual;
+    _ = try world.setDenseTile(0, 1, 1, water.id);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{});
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 96, 96, 32);
+
+    try std.testing.expect(system.grid.isBlockedCell(.{ .x = 1, .y = 1 }));
+}
+
 test "pathfinding caches unavailable requests without requeueing duplicates" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -2173,6 +2261,75 @@ test "pathfinding goal fields evict by fixed slot order" {
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(system.findGoalField(first) == null);
     try std.testing.expect(system.findGoalField(second) != null);
+}
+
+test "pathfinding skips synchronous goal fields above grid cell cap" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const second = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{
+        .max_frame_requests = 2,
+        .max_pending_requests = 2,
+        .max_cached_results = 4,
+        .max_goal_fields = 1,
+        .max_goal_field_cells = 32,
+        .max_worker_scratch_slots = 1,
+        .max_solved_requests_per_step = 2,
+    });
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+    try std.testing.expect(system.grid.cellCount() > system.capacity.max_goal_field_cells);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(2, 2);
+    try appendPathRequest(&stream, .{ .entity = first, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 488, .y = 488 } });
+    try appendPathRequest(&stream, .{ .entity = second, .start = .{ .x = 40, .y = 8 }, .goal = .{ .x = 488, .y = 488 } });
+
+    const stats = try system.updateSerial(&stream, .{});
+    try std.testing.expectEqual(@as(usize, 0), stats.goal_fields_built);
+    try std.testing.expectEqual(@as(usize, 0), stats.field_requests);
+    try std.testing.expectEqual(@as(usize, 2), stats.available_results);
+}
+
+test "pathfinding defers synchronous fallback search above grid cell cap" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    _ = try addNavBody(&data, .{ .x = 32, .y = 32 }, .{ .x = 32, .y = 32 }, true);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{
+        .max_frame_requests = 1,
+        .max_pending_requests = 1,
+        .max_cached_results = 2,
+        .max_goal_fields = 0,
+        .max_worker_scratch_slots = 1,
+        .max_solved_requests_per_step = 1,
+        .max_fallback_requests_per_step = 1,
+        .max_fallback_cells = 16,
+    });
+    try system.rebuildStaticNavGrid(&data, 160, 160, 32);
+    try std.testing.expect(system.grid.cellCount() > system.capacity.max_fallback_cells);
+
+    const key = system.grid.keyForWorld(.{ .x = 8, .y = 8 }, .{ .x = 128, .y = 128 }, .default).?;
+    try std.testing.expect(directLineResult(&system.grid, key) == null);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(1, 1);
+    try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 128, .y = 128 } });
+
+    const stats = try system.updateSerial(&stream, .{});
+    try std.testing.expectEqual(@as(usize, 0), stats.fallback_requests);
+    try std.testing.expectEqual(@as(usize, 1), stats.fallback_deferred_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
+    try std.testing.expectEqual(PathStatus.pending, system.statusForKey(key).status);
 }
 
 test "pathfinding warmed update does not allocate" {

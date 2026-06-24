@@ -15,6 +15,7 @@ const StateStack = @import("../app/state.zig").StateStack;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const manifest = @import("../assets/manifest.zig");
@@ -113,6 +114,10 @@ pub const LoadingState = struct {
 
     fn loadGameDemo(self: *LoadingState, context: UpdateContext) !void {
         log.debug("loading state building game demo world", .{});
+        const perf_start_ns = if (comptime runtime_perf_log.enabled) c.SDL_GetTicksNS() else 0;
+        defer if (comptime runtime_perf_log.enabled) {
+            context.perf.recordTiming(.loading_build, elapsedNs(perf_start_ns, c.SDL_GetTicksNS()));
+        };
         const game_ptr = try self.allocator.create(GameDemoState);
         var initialized = false;
         var owned_by_transition = false;
@@ -121,9 +126,10 @@ pub const LoadingState = struct {
             self.allocator.destroy(game_ptr);
         };
 
-        game_ptr.* = try GameDemoState.initWithRuntimeAssets(
+        game_ptr.* = try GameDemoState.initProceduralWithRuntimeAssets(
             self.allocator,
             context.runtime_assets,
+            context.thread_system,
             self.width,
             self.height,
         );
@@ -146,6 +152,10 @@ fn statusLabel(phase: LoadingPhase) []const u8 {
         .pending => "Building world",
         .complete => "Starting",
     };
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    return if (end_ns > start_ns) end_ns - start_ns else 0;
 }
 
 test "loading state requires runtime world metadata before building demo" {

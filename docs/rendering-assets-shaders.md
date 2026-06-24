@@ -38,14 +38,15 @@ stale or destroyed IDs are rejected deterministically during batch prep.
 `Renderer` remains the game-facing facade. `src/render/sprite_batch.zig` owns
 sprite command storage, ordered-stream validation, vertex expansion, and draw
 group construction so later UI, tilemap, or effect batchers can be added without
-rewriting SDL_GPU device setup. `src/render/render_queue.zig` owns transient
-draw-record ordering before commands reach the renderer.
+rewriting SDL_GPU device setup. Producers that can interleave depths own an
+explicit ordering phase before commands reach the renderer.
 
-Use `RenderQueue.addSprite` for textured quads emitted by game states:
+Use `Renderer.submitOrderedSprite` for textured quads emitted by ordered
+render-prep phases:
 
 ```zig
 if (context.runtime_assets.sprite(.demo_tile)) |sprite| {
-    try render_queue.addSprite(.{
+    try context.renderer.submitOrderedSprite(.{
         .texture = sprite.texture,
         .source = sprite.source_rect,
         .dest = .{ .x = 100, .y = 120, .w = 32, .h = 32 },
@@ -60,11 +61,12 @@ retires its slot and advances the generation before the slot can be reused, so
 old IDs do not accidentally bind a later texture. The built-in white texture is
 renderer-internal and backs rectangle draw records.
 
-Use `RenderQueue.addRect` for game-state debug or simple primitive rendering.
-Rectangles go through the same sprite batch via a built-in white texture:
+Use `Renderer.submitOrderedRectInSpace` for game-state debug or simple
+primitive rendering from an ordered render-prep phase. Rectangles go through the
+same sprite batch via a built-in white texture:
 
 ```zig
-try render_queue.addRect(.{
+try context.renderer.submitOrderedRectInSpace(.{
     .x = 40,
     .y = 40,
     .w = 64,
@@ -73,9 +75,8 @@ try render_queue.addRect(.{
 ```
 
 Direct `Renderer.submitOrderedSprite` and `submitOrderedRectInSpace` calls are
-for renderer-owned or tightly controlled paths that already submit in
-nondecreasing `RenderOrder`, such as a sorted `RenderQueue`, simple smoke tests,
-or stack-aware UI helpers.
+for paths that already submit in nondecreasing `RenderOrder`, such as world
+z-layer passes, simple smoke tests, or stack-aware UI helpers.
 
 For atlas-backed actors, keep entity data on stable `SpriteAssetId` values plus
 numeric atlas entry IDs. Authoring names stay in source assets and metadata;
@@ -84,10 +85,10 @@ source rectangles. Tilemap batching follows the same stable-ID model rather than
 creating one texture per tile, storing atlas names in hot gameplay data, or
 persisting live renderer handles/source rectangles in `DataSystem`.
 
-Large sprite, tile, or particle scenes should reserve or surface render-queue
-and sprite-batch capacity before relying on allocation-free render frames. The
+Large sprite, tile, or particle scenes should reserve or surface render-prep and
+sprite-batch capacity before relying on allocation-free render frames. The
 warmed path avoids per-frame allocation only inside the currently reserved
-draw-record, command, prepared-command, vertex, and draw-group capacity.
+ordered-command, prepared-command, vertex, and draw-group capacity.
 
 ## Logical Presentation
 
@@ -142,10 +143,16 @@ of leaving partial metadata behind.
 columns, level z columns, and chunk/visibility columns in SoA form. World
 construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
-a primitive rectangle fallback. Demo actors reference stable `.grim_characters`
-atlas-entry IDs through `DataSystem` asset references and keep primitive visual
-rectangles as placeholders when character art is unavailable. Obstacles can
-still use `assets/sprites/demo_tile.png` as a reusable tintable sprite. The
+a primitive rectangle fallback. The runtime loading path builds the procedural
+512x512 tile world through the Engine-owned `ThreadSystem`, then render prep
+limits world tile submission to the camera-visible chunk window, with optional
+configured overscan. World and entity render prep merge visible world z layers
+with dynamic entity and particle z records before submitting ordered commands;
+`SpriteBatch` remains an ordered-stream consumer rather than a fallback tile sorter. Demo actors
+reference stable `.grim_characters` atlas-entry IDs through `DataSystem` asset
+references and keep primitive visual rectangles as placeholders when character
+art is unavailable. Obstacles can still use `assets/sprites/demo_tile.png` as a
+reusable tintable sprite. The
 default text path uses the bundled
 `assets/fonts/NotoSansMono-Regular.ttf` font.
 

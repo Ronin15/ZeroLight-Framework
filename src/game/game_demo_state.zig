@@ -11,6 +11,7 @@ const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
+const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
 const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
@@ -24,6 +25,7 @@ const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
+const SteeringAgent = @import("data_system.zig").SteeringAgent;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
@@ -41,14 +43,16 @@ const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
+const Renderer = @import("../render/renderer.zig").Renderer;
+const Camera2D = @import("../render/camera.zig").Camera2D;
 const TextureId = @import("../render/resources.zig").TextureId;
-const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const render_prep = @import("render_prep.zig");
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
-const WorldSystem = @import("world_system.zig").WorldSystem;
+const world_system = @import("world_system.zig");
+const WorldSystem = world_system.WorldSystem;
 const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 8;
@@ -60,6 +64,12 @@ const demo_music = AudioAssetId.demo_music;
 const collision_sfx = AudioAssetId.collision_sfx;
 const jet_sfx = AudioAssetId.player_jet_sfx;
 const player_jet_loop_id = LoopingSfxId{ .value = 1 };
+const procedural_world_config = world_system.WorldBuildConfig{
+    .width_tiles = 512,
+    .height_tiles = 512,
+    .chunk_size_tiles = 16,
+};
+const world_render_overscan_chunks: u16 = 0;
 
 pub const GameDemoState = struct {
     data: DataSystem,
@@ -68,12 +78,17 @@ pub const GameDemoState = struct {
     world: WorldSystem,
     player: Player,
     particles: ParticleSystem,
-    render_queue: RenderQueue,
+    dynamic_render: DynamicRenderPrep,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
     collision_sfx_cooldown_count: usize = 0,
     music_started: bool = false,
+    jet_loop_active: bool = false,
+    camera_previous: Camera2D = .{},
+    camera_current: Camera2D = .{},
+    viewport_width: f32 = 800,
+    viewport_height: f32 = 450,
     bounds_width: f32 = 800,
     bounds_height: f32 = 450,
 
@@ -92,12 +107,45 @@ pub const GameDemoState = struct {
         bounds_width: f32,
         bounds_height: f32,
     ) !GameDemoState {
-        var state = try initWithWorld(allocator, bounds_width, bounds_height, try WorldSystem.initDemo(
+        var state = try initWithWorld(
             allocator,
-            runtime_assets,
             bounds_width,
             bounds_height,
-        ));
+            bounds_width,
+            bounds_height,
+            try WorldSystem.initDemo(
+                allocator,
+                runtime_assets,
+                bounds_width,
+                bounds_height,
+            ),
+        );
+        errdefer state.deinit();
+        try state.validateAtlasReferences(runtime_assets);
+        return state;
+    }
+
+    pub fn initProceduralWithRuntimeAssets(
+        allocator: std.mem.Allocator,
+        runtime_assets: *const RuntimeAssets,
+        thread_system: *ThreadSystem,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) !GameDemoState {
+        const world = try WorldSystem.initProcedural(
+            allocator,
+            runtime_assets,
+            procedural_world_config,
+            thread_system,
+        );
+        var state = try initWithWorld(
+            allocator,
+            viewport_width,
+            viewport_height,
+            world.worldWidthPixels(),
+            world.worldHeightPixels(),
+            world,
+        );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
         return state;
@@ -105,8 +153,10 @@ pub const GameDemoState = struct {
 
     fn initWithWorld(
         allocator: std.mem.Allocator,
-        bounds_width: f32,
-        bounds_height: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        simulation_bounds_width: f32,
+        simulation_bounds_height: f32,
         world_value: WorldSystem,
     ) !GameDemoState {
         var world = world_value;
@@ -116,18 +166,25 @@ pub const GameDemoState = struct {
         const player = try Player.spawn(&data);
         try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
         try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+        const world_width = simulation_bounds_width;
+        const world_height = simulation_bounds_height;
         const test_squares = try spawnTestSquares(&data);
         const obstacles = try spawnObstacles(&data);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
-        var render_queue = RenderQueue.init(allocator);
-        errdefer render_queue.deinit();
-        try render_queue.ensureTotalCapacity(world.reserveRenderRecords() + obstacle_count + test_square_count + 2 + particles.capacity);
+        var dynamic_render = DynamicRenderPrep.init(allocator);
+        errdefer dynamic_render.deinit();
+        world.setVisibleChunksForWorldRect(.{
+            .x = 0,
+            .y = 0,
+            .w = viewport_width,
+            .h = viewport_height,
+        }, world_render_overscan_chunks);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
         try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, 8);
         try simulation_frame.reservePathRequests(8, test_square_count);
-        var pipeline = try SimulationPipeline.init(allocator, &data, bounds_width, bounds_height, .{
+        var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
             .contact_capacity = demo_contact_capacity,
@@ -140,26 +197,32 @@ pub const GameDemoState = struct {
                 .max_solved_requests_per_step = test_square_count,
                 .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
             },
+            .navigation_world = &world,
         });
         errdefer pipeline.deinit();
 
-        return .{
+        var state = GameDemoState{
             .data = data,
             .simulation_frame = simulation_frame,
             .pipeline = pipeline,
             .world = world,
             .player = player,
             .particles = particles,
-            .render_queue = render_queue,
+            .dynamic_render = dynamic_render,
             .test_squares = test_squares,
             .obstacles = obstacles,
-            .bounds_width = bounds_width,
-            .bounds_height = bounds_height,
+            .viewport_width = viewport_width,
+            .viewport_height = viewport_height,
+            .bounds_width = world_width,
+            .bounds_height = world_height,
         };
+        state.syncCameraToPlayer();
+        try state.ensureDynamicRenderCapacity();
+        return state;
     }
 
     pub fn deinit(self: *GameDemoState) void {
-        self.render_queue.deinit();
+        self.dynamic_render.deinit();
         self.particles.deinit();
         self.world.deinit();
         self.pipeline.deinit();
@@ -191,12 +254,11 @@ pub const GameDemoState = struct {
             .bounds_height = self.bounds_height,
         });
         self.queueCollisionAudio(context.audio, context.delta_seconds);
-        self.emitPlayerTrail();
         const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
+        self.updateCamera();
 
         self.simulation_frame.phase = .merge_outputs;
         const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets);
-        try self.reserveRenderQueueForCurrentData();
         self.simulation_frame.phase = .finished;
 
         if (comptime runtime_perf_log.enabled) {
@@ -212,25 +274,116 @@ pub const GameDemoState = struct {
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
         _ = context.thread_system;
-        try self.enqueueRenderRecords(context.runtime_assets, context.interpolation_alpha);
-        if (comptime runtime_perf_log.enabled) {
-            context.perf.recordMetric(.render_queue_records, self.render_queue.recordCount());
-        }
-        try self.render_queue.submit(context.renderer);
+        const camera = self.interpolatedCamera(context.interpolation_alpha);
+        context.renderer.setCamera(camera);
+        self.world.setVisibleChunksForWorldRect(.{
+            .x = camera.position.x,
+            .y = camera.position.y,
+            .w = self.viewport_width / camera.zoom,
+            .h = self.viewport_height / camera.zoom,
+        }, world_render_overscan_chunks);
+        try context.renderer.reserveSpriteCommands(self.frameSpriteCommandCapacity());
+        try self.collectDynamicRenderRecords();
+        try self.submitLayeredRender(context.renderer, context.runtime_assets, context.interpolation_alpha);
     }
 
-    fn enqueueRenderRecords(self: *GameDemoState, runtime_assets: *const RuntimeAssets, interpolation_alpha: f32) !void {
-        self.render_queue.clearRetainingCapacity();
-        _ = try self.world.enqueueRender(&self.render_queue, runtime_assets);
+    fn submitLayeredRender(
+        self: *GameDemoState,
+        renderer: *Renderer,
+        runtime_assets: *const RuntimeAssets,
+        interpolation_alpha: f32,
+    ) !void {
+        var world_depth = self.world.firstVisibleRenderDepth();
+        var dynamic_range = DynamicDepthRange{ .start = 0, .end = 0 };
+        var dynamic_depth = self.nextDynamicRenderDepth(&dynamic_range);
+        while (world_depth != null or dynamic_depth != null) {
+            if (world_depth) |depth| {
+                if (dynamic_depth == null or depth <= dynamic_depth.?) {
+                    _ = try self.world.submitVisibleRenderDepth(renderer, runtime_assets, depth);
+                    world_depth = self.world.nextVisibleRenderDepthAfter(depth);
+                    continue;
+                }
+            }
 
+            try self.submitDynamicRenderRange(renderer, runtime_assets, interpolation_alpha, dynamic_range);
+            dynamic_range.start = dynamic_range.end;
+            dynamic_depth = self.nextDynamicRenderDepth(&dynamic_range);
+        }
+    }
+
+    fn collectDynamicRenderRecords(self: *GameDemoState) !void {
+        try self.ensureDynamicRenderCapacity();
+        self.dynamic_render.clearRetainingCapacity();
         for (self.data.primitiveVisualSliceConst().entities) |entity| {
+            if (self.dynamicBodyRenderDepth(entity)) |depth| {
+                self.dynamic_render.appendAssumeCapacity(.{
+                    .depth = depth,
+                    .kind = .{ .entity_body = entity },
+                });
+            }
             if (sameEntity(entity, self.player.entity)) {
-                try self.player.enqueueRender(&self.data, runtime_assets, &self.render_queue, interpolation_alpha);
-            } else {
-                try render_prep.enqueueEntity(&self.render_queue, &self.data, entity, runtime_assets, interpolation_alpha);
+                if (self.playerMarkerRenderDepth()) |depth| {
+                    self.dynamic_render.appendAssumeCapacity(.{
+                        .depth = depth,
+                        .kind = .player_marker,
+                    });
+                }
             }
         }
-        try self.particles.enqueueRender(&self.render_queue, interpolation_alpha);
+
+        const particles = self.particles.sliceConst();
+        for (0..particles.len()) |index| {
+            if (!particleRenderable(particles, index)) continue;
+            self.dynamic_render.appendAssumeCapacity(.{
+                .depth = particles.z[index],
+                .kind = .{ .particle = index },
+            });
+        }
+        self.dynamic_render.sort();
+    }
+
+    fn nextDynamicRenderDepth(self: *const GameDemoState, range: *DynamicDepthRange) ?i32 {
+        if (range.start >= self.dynamic_render.records.items.len) return null;
+        const depth = self.dynamic_render.records.items[range.start].depth;
+        range.end = range.start + 1;
+        while (range.end < self.dynamic_render.records.items.len and self.dynamic_render.records.items[range.end].depth == depth) {
+            range.end += 1;
+        }
+        return depth;
+    }
+
+    fn submitDynamicRenderRange(
+        self: *GameDemoState,
+        renderer: *Renderer,
+        runtime_assets: *const RuntimeAssets,
+        interpolation_alpha: f32,
+        range: DynamicDepthRange,
+    ) !void {
+        for (self.dynamic_render.records.items[range.start..range.end]) |record| {
+            switch (record.kind) {
+                .entity_body => |entity| {
+                    if (sameEntity(entity, self.player.entity)) {
+                        try self.player.submitBodyRender(&self.data, runtime_assets, renderer, interpolation_alpha);
+                    } else {
+                        try render_prep.submitEntity(renderer, &self.data, entity, runtime_assets, interpolation_alpha);
+                    }
+                },
+                .player_marker => try self.player.submitMarkerRender(&self.data, renderer, interpolation_alpha),
+                .particle => |particle_index| try self.submitParticleRender(renderer, interpolation_alpha, particle_index),
+            }
+        }
+    }
+
+    fn dynamicBodyRenderDepth(self: *const GameDemoState, entity: EntityId) ?i32 {
+        const body = self.data.movementBodyConst(entity) orelse return null;
+        const visual = self.data.primitiveVisualConst(entity) orelse return null;
+        return render_prep.worldOrder(body.position_z, visual.depth).depth;
+    }
+
+    fn playerMarkerRenderDepth(self: *const GameDemoState) ?i32 {
+        const body = self.data.movementBodyConst(self.player.entity) orelse return null;
+        const visual = self.data.primitiveVisualConst(self.player.entity) orelse return null;
+        return render_prep.worldOrder(body.position_z, visual.marker_depth_band).depth;
     }
 
     fn recordRuntimePerfStats(
@@ -332,6 +485,8 @@ pub const GameDemoState = struct {
         perf.recordMetric(.simulation_events_entity_created, metric(event_stats.entity_created));
         perf.recordMetric(.simulation_events_entity_destroyed, metric(event_stats.entity_destroyed));
         perf.recordMetric(.simulation_events_component_changed, metric(event_stats.component_changed));
+        perf.recordMetric(.simulation_events_world_tile_changed, metric(event_stats.world_tile_changed));
+        perf.recordMetric(.simulation_events_world_obstacle_changed, metric(event_stats.world_obstacle_changed));
         perf.recordMetric(.simulation_events_nav_region_invalidated, metric(event_stats.nav_region_invalidated));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(event_stats.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(event_stats.domain_reaction_stage));
@@ -342,6 +497,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn onPause(self: *GameDemoState) void {
+        self.jet_loop_active = false;
         self.syncInterpolatedState();
     }
 
@@ -352,6 +508,39 @@ pub const GameDemoState = struct {
     fn syncInterpolatedState(self: *GameDemoState) void {
         self.pipeline.syncPreviousPositions(&self.data);
         self.particles.syncPreviousPositions();
+        self.syncCameraToPlayer();
+    }
+
+    fn syncCameraToPlayer(self: *GameDemoState) void {
+        const camera = self.cameraForPlayer();
+        self.camera_previous = camera;
+        self.camera_current = camera;
+    }
+
+    fn updateCamera(self: *GameDemoState) void {
+        self.camera_previous = self.camera_current;
+        self.camera_current = self.cameraForPlayer();
+    }
+
+    fn interpolatedCamera(self: *const GameDemoState, interpolation_alpha: f32) Camera2D {
+        return .{
+            .position = math.lerpVec2(self.camera_previous.position, self.camera_current.position, interpolation_alpha),
+            .zoom = self.camera_current.zoom,
+        };
+    }
+
+    fn cameraForPlayer(self: *const GameDemoState) Camera2D {
+        const body = self.data.movementBodyConst(self.player.entity) orelse return self.camera_current;
+        const visual = self.data.primitiveVisualConst(self.player.entity) orelse return self.camera_current;
+        const target_x = body.position.x + visual.size.x * 0.5 - self.viewport_width * 0.5;
+        const target_y = body.position.y + visual.size.y * 0.5 - self.viewport_height * 0.5;
+        return .{
+            .position = .{
+                .x = math.clamp(target_x, 0, @max(self.bounds_width - self.viewport_width, 0)),
+                .y = math.clamp(target_y, 0, @max(self.bounds_height - self.viewport_height, 0)),
+            },
+            .zoom = 1.0,
+        };
     }
 
     fn processPostCommitEvents(self: *GameDemoState) !void {
@@ -365,7 +554,7 @@ pub const GameDemoState = struct {
 
         if (!invalidate_navigation) return;
         try self.simulation_frame.events.ensureCanAppend(1);
-        try self.pipeline.rebuildStaticNavigation(&self.data, self.bounds_width, self.bounds_height);
+        try self.pipeline.rebuildStaticNavigationWithWorld(&self.data, &self.world, self.bounds_width, self.bounds_height);
         try self.simulation_frame.events.appendRequired(.{
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
@@ -377,13 +566,46 @@ pub const GameDemoState = struct {
         const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         try self.processPostCommitEvents();
+        try self.ensureDynamicRenderCapacity();
         return stats;
     }
 
-    fn reserveRenderQueueForCurrentData(self: *GameDemoState) !void {
+    fn frameSpriteCommandCapacity(self: *const GameDemoState) usize {
         const visual_count = self.data.primitiveVisualSliceConst().entities.len;
         const player_marker_count: usize = 1;
-        try self.render_queue.ensureTotalCapacity(self.world.reserveRenderRecords() + visual_count + player_marker_count + self.particles.capacity);
+        return self.world.reserveRenderRecords() + visual_count + player_marker_count + self.particles.activeCount();
+    }
+
+    fn dynamicRenderRecordCapacity(self: *const GameDemoState) usize {
+        const visual_count = self.data.primitiveVisualSliceConst().entities.len;
+        const player_marker_count: usize = 1;
+        return visual_count + player_marker_count + self.particles.capacity;
+    }
+
+    fn ensureDynamicRenderCapacity(self: *GameDemoState) !void {
+        try self.dynamic_render.ensureTotalCapacity(self.dynamicRenderRecordCapacity());
+    }
+
+    fn submitParticleRender(self: *GameDemoState, renderer: *Renderer, interpolation_alpha: f32, index: usize) !void {
+        const particles = self.particles.sliceConst();
+        if (index >= particles.len() or !particleRenderable(particles, index)) return;
+        const size = particles.size[index];
+        const position = math.lerpVec2(
+            .{ .x = particles.previous_x[index], .y = particles.previous_y[index] },
+            .{ .x = particles.position_x[index], .y = particles.position_y[index] },
+            interpolation_alpha,
+        );
+        try renderer.submitOrderedRectInSpace(.{
+            .x = position.x - size * 0.5,
+            .y = position.y - size * 0.5,
+            .w = size,
+            .h = size,
+        }, .{
+            .r = particles.color_r[index],
+            .g = particles.color_g[index],
+            .b = particles.color_b[index],
+            .a = particles.color_a[index],
+        }, RenderOrder.world(particles.z[index]), .world);
     }
 
     fn validateAtlasReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
@@ -436,28 +658,12 @@ pub const GameDemoState = struct {
                 },
                 else => return false,
             },
+            .world_tile_changed => |changed| {
+                return changed.old_blocks_movement != changed.new_blocks_movement;
+            },
+            .world_obstacle_changed => return true,
             else => return false,
         }
-    }
-
-    fn emitPlayerTrail(self: *GameDemoState) void {
-        const body = self.data.movementBodyConst(self.player.entity) orelse return;
-        const position = body.position;
-        _ = self.particles.emitBurst(.{
-            .count = 2,
-            .position = .{ .x = position.x + 16, .y = position.y + 16 },
-            .base_z = render_depth.worldZWithOffset(body.position_z, .obstacle),
-            .base_velocity = .{ .x = -24, .y = -36 },
-            .velocity_step = .{ .x = 48, .y = -4 },
-            .acceleration = .{ .x = 0, .y = 80 },
-            .lifetime = 0.55,
-            .lifetime_step = 0.04,
-            .start_size = 7,
-            .end_size = 1,
-            .start_color = .{ .r = 1.0, .g = 0.78, .b = 0.28, .a = 0.85 },
-            .end_color = .{ .r = 0.95, .g = 0.24, .b = 0.18, .a = 0.0 },
-            .depth = .actor,
-        });
     }
 
     fn queueAmbientAudio(self: *GameDemoState, audio: *AudioCommandBuffer, input: *const InputState) void {
@@ -473,7 +679,8 @@ pub const GameDemoState = struct {
 
         if (self.data.movementBodyConst(self.player.entity)) |body| {
             audio.setListener(.{ .x = body.position.x + 16, .y = body.position.y + 16 }) catch {};
-            if (input.movementVector().x != 0 or input.movementVector().y != 0) {
+            const player_moving = input.movementVector().x != 0 or input.movementVector().y != 0;
+            if (player_moving and !self.jet_loop_active) {
                 audio.startLoopingSfx(player_jet_loop_id, .{
                     .asset = jet_sfx,
                     .gain = 0.34,
@@ -481,8 +688,10 @@ pub const GameDemoState = struct {
                     .frequency_ratio = 1.0,
                     .position = .{ .x = body.position.x + 16, .y = body.position.y + 16 },
                 }) catch {};
-            } else {
+                self.jet_loop_active = true;
+            } else if (!player_moving and self.jet_loop_active) {
                 audio.stopLoopingSfx(player_jet_loop_id) catch {};
+                self.jet_loop_active = false;
             }
         }
     }
@@ -591,6 +800,67 @@ const CollisionSfxCooldown = struct {
         return (@as(u64, entity.generation) << 32) | entity.index;
     }
 };
+
+const DynamicRenderKind = union(enum) {
+    entity_body: EntityId,
+    player_marker,
+    particle: usize,
+};
+
+const DynamicRenderRecord = struct {
+    depth: i32,
+    sequence: usize = 0,
+    kind: DynamicRenderKind,
+};
+
+const DynamicDepthRange = struct {
+    start: usize,
+    end: usize,
+};
+
+const DynamicRenderPrep = struct {
+    allocator: std.mem.Allocator,
+    records: std.ArrayList(DynamicRenderRecord) = .empty,
+    next_sequence: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) DynamicRenderPrep {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *DynamicRenderPrep) void {
+        self.records.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn ensureTotalCapacity(self: *DynamicRenderPrep, capacity: usize) !void {
+        try self.records.ensureTotalCapacity(self.allocator, capacity);
+    }
+
+    fn clearRetainingCapacity(self: *DynamicRenderPrep) void {
+        self.records.clearRetainingCapacity();
+        self.next_sequence = 0;
+    }
+
+    fn appendAssumeCapacity(self: *DynamicRenderPrep, record: DynamicRenderRecord) void {
+        var sequenced = record;
+        sequenced.sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.records.appendAssumeCapacity(sequenced);
+    }
+
+    fn sort(self: *DynamicRenderPrep) void {
+        std.mem.sort(DynamicRenderRecord, self.records.items, {}, lessDynamicRenderRecord);
+    }
+};
+
+fn lessDynamicRenderRecord(_: void, lhs: DynamicRenderRecord, rhs: DynamicRenderRecord) bool {
+    return lhs.depth < rhs.depth or
+        (lhs.depth == rhs.depth and lhs.sequence < rhs.sequence);
+}
+
+fn particleRenderable(particles: @import("systems/particle.zig").ConstParticleSlice, index: usize) bool {
+    return particles.size[index] > 0 and particles.color_a[index] > 0;
+}
 
 fn sameEntity(lhs: EntityId, rhs: EntityId) bool {
     return lhs.index == rhs.index and lhs.generation == rhs.generation;
@@ -709,7 +979,7 @@ fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
     return entities;
 }
 
-fn demoSteeringAgent(size: math.Vec2) @import("data_system.zig").SteeringAgent {
+fn demoSteeringAgent(size: math.Vec2) SteeringAgent {
     return .{
         .agent_radius = @max(size.x, size.y) * 0.5,
         .waypoint_tolerance = 10,
@@ -785,7 +1055,7 @@ const ObstacleSpec = struct {
 fn initDemoForTest(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     const world = try WorldSystem.initDemoFromAssetStore(allocator, asset_store, bounds_width, bounds_height);
-    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, world);
+    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world);
 }
 
 fn runtimeAssetsWithWorldTexture() !RuntimeAssets {
@@ -799,7 +1069,7 @@ fn runtimeAssetsWithWorldMetadataForTest() !RuntimeAssets {
     runtime_assets.allocator = std.testing.allocator;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     runtime_assets.atlas_meta[manifest.spriteIndex(.world_tileset)] = .{
-        .world_tileset = try @import("../assets/world_tileset_meta.zig").load(
+        .world_tileset = try world_tileset_meta.load(
             std.testing.allocator,
             asset_store,
             manifest.spriteSpec(.world_tileset).metadata_path.?,
@@ -836,7 +1106,7 @@ fn deinitRuntimeAssetMetadataForTest(runtime_assets: *RuntimeAssets) void {
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: SpriteAssetId, texture: TextureId) void {
-    runtime_assets.sprite_slots[@import("../assets/manifest.zig").spriteIndex(id)] = .{
+    runtime_assets.sprite_slots[manifest.spriteIndex(id)] = .{
         .status = .available,
         .lease = .{ .id = texture },
     };
@@ -889,7 +1159,7 @@ test "demo actor atlas entries resolve in installed character metadata" {
     );
     defer meta.deinit();
 
-    const player_asset = @import("data_system.zig").AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
+    const player_asset = AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
     try std.testing.expect(meta.sourceRectForId(player_asset.atlas_entry_id) != null);
     for (0..test_square_count) |index| {
         const asset_ref = demoCharacterAssetReference(index);
@@ -906,6 +1176,35 @@ test "demo init validates atlas-backed references at loading boundary" {
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+}
+
+test "procedural demo uses large world bounds and interpolated follow camera" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+
+    var demo = try GameDemoState.initProceduralWithRuntimeAssets(std.testing.allocator, &runtime_assets, &threads, 800, 450);
+    defer demo.deinit();
+
+    try std.testing.expectEqual(@as(f32, 800), demo.viewport_width);
+    try std.testing.expectEqual(@as(f32, 450), demo.viewport_height);
+    try std.testing.expect(demo.bounds_width > demo.viewport_width);
+    try std.testing.expect(demo.bounds_height > demo.viewport_height);
+
+    const body = demo.data.movementBodyPtr(demo.player.entity).?;
+    body.position_x.* = 4096.5;
+    body.position_y.* = 2048.25;
+    body.previous_x.* = 4090.5;
+    body.previous_y.* = 2040.25;
+    demo.updateCamera();
+
+    const camera = demo.interpolatedCamera(0.5);
+    try std.testing.expect(camera.position.x > 0);
+    try std.testing.expect(camera.position.y > 0);
+    try std.testing.expect(camera.position.x != @floor(camera.position.x));
 }
 
 test "demo init rejects missing character atlas metadata" {
@@ -961,12 +1260,36 @@ test "demo structural asset reference validation rejects invalid atlas entry bef
     try std.testing.expectEqual(previous.atlas_entry_id, current.atlas_entry_id);
 }
 
-test "demo render queue orders mixed world z records after grouped emission" {
+test "demo world tile event invalidates navigation after commit reaction" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
-    demo.render_queue.clearRetainingCapacity();
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const water = (meta.tileByName("water_1") orelse return error.TestExpectedEqual).id;
+    const changed = (try demo.world.setDenseTile(0, 1, 1, water)) orelse return error.TestExpectedEqual;
+    try demo.simulation_frame.events.appendRequired(.{
+        .stage = .structural_commit,
+        .payload = .{ .world_tile_changed = changed },
+    });
+
+    try demo.processPostCommitEvents();
+
+    var nav_invalidated = false;
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => nav_invalidated = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(nav_invalidated);
+}
+
+test "demo dynamic render prep preserves mixed world z order" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
     const high_obstacle = demo.data.movementBodyPtr(demo.obstacles[0]).?;
     high_obstacle.position_z.* = 20;
     high_obstacle.previous_z.* = 20;
@@ -974,36 +1297,60 @@ test "demo render queue orders mixed world z records after grouped emission" {
     low_actor.position_z.* = -20;
     low_actor.previous_z.* = -20;
 
-    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.obstacles[0], &runtime_assets, 1.0);
-    try render_prep.enqueueEntity(&demo.render_queue, &demo.data, demo.test_squares[0], &runtime_assets, 1.0);
-    demo.render_queue.sortForSubmit();
+    const low_actor_order = render_prep.worldOrder(-20, .actor);
+    const high_obstacle_order = render_prep.worldOrder(20, .obstacle);
+    try demo.collectDynamicRenderRecords();
+    var low_actor_seen = false;
+    var high_obstacle_seen = false;
+    var low_actor_index: usize = 0;
+    var high_obstacle_index: usize = 0;
+    for (demo.dynamic_render.records.items, 0..) |record, record_index| {
+        if (record.depth == low_actor_order.depth and !low_actor_seen) {
+            low_actor_seen = true;
+            low_actor_index = record_index;
+        }
+        if (record.depth == high_obstacle_order.depth and !high_obstacle_seen) {
+            high_obstacle_seen = true;
+            high_obstacle_index = record_index;
+        }
+    }
 
-    try std.testing.expectEqual(@as(usize, 2), demo.render_queue.recordCount());
-    try std.testing.expect(demo.render_queue.recordOrder(0).lessOrEqual(demo.render_queue.recordOrder(1)));
-    try std.testing.expect(demo.render_queue.recordOrder(0).depth < demo.render_queue.recordOrder(1).depth);
+    try std.testing.expect(low_actor_order.depth < high_obstacle_order.depth);
+    try std.testing.expect(low_actor_seen);
+    try std.testing.expect(high_obstacle_seen);
+    try std.testing.expect(low_actor_index < high_obstacle_index);
 }
 
-test "demo player trail renders behind player body" {
+test "demo dynamic render prep includes particles in z order" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
-    demo.render_queue.clearRetainingCapacity();
-    demo.emitPlayerTrail();
-    try std.testing.expectEqual(@as(usize, 2), demo.particles.activeCount());
+    try std.testing.expect(demo.particles.emit(.{
+        .base_z = 50,
+        .depth = .effect,
+        .start_size = 4,
+    }));
+    try std.testing.expect(demo.particles.emit(.{
+        .base_z = -50,
+        .depth = .effect,
+        .start_size = 4,
+    }));
 
-    try demo.player.enqueueRender(&demo.data, &runtime_assets, &demo.render_queue, 1.0);
-    try demo.particles.enqueueRender(&demo.render_queue, 1.0);
-    demo.render_queue.sortForSubmit();
-
-    try std.testing.expectEqual(@as(usize, 4), demo.render_queue.recordCount());
-    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(0).depth);
-    try std.testing.expectEqual(render_depth.worldZ(.obstacle), demo.render_queue.recordOrder(1).depth);
-    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(2).depth);
-    try std.testing.expectEqual(render_depth.worldZ(.actor), demo.render_queue.recordOrder(3).depth);
+    try demo.collectDynamicRenderRecords();
+    var previous_depth: i32 = std.math.minInt(i32);
+    var particle_count: usize = 0;
+    for (demo.dynamic_render.records.items) |record| {
+        try std.testing.expect(previous_depth <= record.depth);
+        previous_depth = record.depth;
+        switch (record.kind) {
+            .particle => particle_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), particle_count);
 }
 
-test "demo render queue reserves for structural visual growth before render enqueue" {
+test "demo frame sprite capacity tracks structural visual growth" {
     const created_visual_count = 528;
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
@@ -1067,26 +1414,9 @@ test "demo render queue reserves for structural visual growth before render enqu
         .thread_system = &threads,
     });
 
-    const original_allocator = demo.render_queue.allocator;
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    demo.render_queue.allocator = failing_allocator.allocator();
-    defer demo.render_queue.allocator = original_allocator;
-
-    while (demo.particles.activeCount() < demo.particles.capacity) {
-        try std.testing.expect(demo.particles.emit(.{
-            .position = .{},
-            .lifetime = 1,
-            .start_size = 1,
-            .end_size = 1,
-            .start_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-            .end_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        }));
-    }
-    try demo.enqueueRenderRecords(&runtime_assets, 1.0);
-
     try std.testing.expectEqual(
-        demo.world.reserveRenderRecords() + demo.data.primitiveVisualSliceConst().entities.len + 1 + demo.particles.capacity,
-        demo.render_queue.recordCount(),
+        demo.world.reserveRenderRecords() + demo.data.primitiveVisualSliceConst().entities.len + 1,
+        demo.frameSpriteCommandCapacity(),
     );
 }
 
@@ -1134,11 +1464,64 @@ test "demo owns and completes a simulation frame during update" {
             any_square_moved = true;
         }
     }
-    // At least some square activity (non-ai squares move from spawn vel; ai-driven ones via intent+consumption covered by dedicated "demo ai processor drives..." test).
     try std.testing.expect(any_square_moved);
-    try std.testing.expect(demo.particles.activeCount() > 0);
     try std.testing.expect(demo.music_started);
     try std.testing.expect(audio.len() >= 2);
+}
+
+test "demo queues jet loop audio only on movement edges" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 0,
+        .items_per_range = movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
+    defer audio.deinit();
+    var runtime_assets = RuntimeAssets.init();
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+
+    try demo.update(.{
+        .input = &input,
+        .audio = &audio,
+        .runtime_assets = &runtime_assets,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+    try std.testing.expect(demo.jet_loop_active);
+    try std.testing.expect(audio.len() >= 3);
+
+    audio.beginStep();
+    try demo.update(.{
+        .input = &input,
+        .audio = &audio,
+        .runtime_assets = &runtime_assets,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+    try std.testing.expect(demo.jet_loop_active);
+    try std.testing.expectEqual(@as(usize, 1), audio.len());
+
+    input.setHeld(.moveRight, false);
+    audio.beginStep();
+    try demo.update(.{
+        .input = &input,
+        .audio = &audio,
+        .runtime_assets = &runtime_assets,
+        .delta_seconds = 0.016,
+        .transitions = &transitions,
+        .thread_system = &threads,
+    });
+    try std.testing.expect(!demo.jet_loop_active);
+    try std.testing.expectEqual(@as(usize, 2), audio.len());
 }
 
 test "demo collision response blocks player against obstacles" {

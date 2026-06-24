@@ -3,12 +3,16 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const Color = @import("../config.zig").Color;
 const math = @import("../core/math.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const AssetReference = @import("data_system.zig").AssetReference;
 const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
-const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
+const Renderer = @import("../render/renderer.zig").Renderer;
+const Sprite = @import("../render/renderer.zig").Sprite;
+const TextureId = @import("../render/resources.zig").TextureId;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
@@ -16,15 +20,39 @@ const manifest = @import("../assets/manifest.zig");
 const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 
-pub fn enqueueEntity(
-    queue: *RenderQueue,
+pub const PreparedDraw = union(enum) {
+    sprite: Sprite,
+    rect: RectDraw,
+};
+
+pub const RectDraw = struct {
+    rect: Rect,
+    color: Color,
+    order: RenderOrder,
+};
+
+pub fn submitEntity(
+    renderer: *Renderer,
     data: *const DataSystem,
     entity: EntityId,
     runtime_assets: *const RuntimeAssets,
     interpolation_alpha: f32,
 ) !void {
-    const body = data.movementBodyConst(entity) orelse return;
-    const visual = data.primitiveVisualConst(entity) orelse return;
+    const draw = prepareEntity(data, entity, runtime_assets, interpolation_alpha) orelse return;
+    switch (draw) {
+        .sprite => |sprite| try renderer.submitOrderedSprite(sprite),
+        .rect => |rect| try renderer.submitOrderedRectInSpace(rect.rect, rect.color, rect.order, .world),
+    }
+}
+
+pub fn prepareEntity(
+    data: *const DataSystem,
+    entity: EntityId,
+    runtime_assets: *const RuntimeAssets,
+    interpolation_alpha: f32,
+) ?PreparedDraw {
+    const body = data.movementBodyConst(entity) orelse return null;
+    const visual = data.primitiveVisualConst(entity) orelse return null;
     const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
     const dest = Rect{
         .x = render_position.x,
@@ -41,24 +69,23 @@ pub fn enqueueEntity(
             else
                 sprite.source_rect;
             if (!asset_ref.hasAtlasEntry() or source != null) {
-                try queue.addSprite(.{
+                return .{ .sprite = .{
                     .texture = sprite.texture,
                     .source = source,
                     .dest = dest,
                     .tint = visual.color,
                     .order = order,
-                });
-                return;
+                } };
             }
         }
     }
 
-    try queue.addRect(dest, visual.color, order, .world);
+    return .{ .rect = .{ .rect = dest, .color = visual.color, .order = order } };
 }
 
 pub fn sourceRectForAsset(
     runtime_assets: *const RuntimeAssets,
-    asset_ref: @import("data_system.zig").AssetReference,
+    asset_ref: AssetReference,
     sprite_source: ?Rect,
 ) ?Rect {
     if (!asset_ref.hasAtlasEntry()) return sprite_source;
@@ -92,15 +119,13 @@ test "atlas-backed entity falls back to primitive rect without metadata" {
     });
     try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
     var runtime_assets = RuntimeAssets.init();
-    setSpriteAvailableForTest(&runtime_assets, .grim_characters, try @import("../render/resources.zig").TextureId.init(1, 1));
-    var queue = RenderQueue.init(std.testing.allocator);
-    defer queue.deinit();
+    setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
 
-    try enqueueEntity(&queue, &data, entity, &runtime_assets, 1.0);
-    queue.sortForSubmit();
-
-    try std.testing.expectEqual(@as(usize, 1), queue.recordCount());
-    try std.testing.expect(queue.sortedSprite(0) == null);
+    const draw = prepareEntity(&data, entity, &runtime_assets, 1.0) orelse return error.TestExpectedEqual;
+    switch (draw) {
+        .rect => {},
+        .sprite => return error.TestExpectedEqual,
+    }
 }
 
 test "atlas-backed entity uses metadata source rect when available" {
@@ -116,16 +141,15 @@ test "atlas-backed entity uses metadata source rect when available" {
     try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
     var runtime_assets = RuntimeAssets.init();
     runtime_assets.allocator = std.testing.allocator;
-    setSpriteAvailableForTest(&runtime_assets, .grim_characters, try @import("../render/resources.zig").TextureId.init(1, 1));
+    setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
     try setSpriteAtlasMetadataForTest(&runtime_assets, .grim_characters);
     defer deinitAtlasMetadataForTest(&runtime_assets, .grim_characters);
-    var queue = RenderQueue.init(std.testing.allocator);
-    defer queue.deinit();
 
-    try enqueueEntity(&queue, &data, entity, &runtime_assets, 1.0);
-    queue.sortForSubmit();
-
-    const sprite = queue.sortedSprite(0) orelse return error.TestExpectedEqual;
+    const draw = prepareEntity(&data, entity, &runtime_assets, 1.0) orelse return error.TestExpectedEqual;
+    const sprite = switch (draw) {
+        .sprite => |sprite| sprite,
+        .rect => return error.TestExpectedEqual,
+    };
     const source = sprite.source orelse return error.TestExpectedEqual;
     const expected = runtime_assets.spriteAtlasMeta(.grim_characters).?.sourceRectForId(0) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected.x, source.x);
@@ -134,7 +158,7 @@ test "atlas-backed entity uses metadata source rect when available" {
     try std.testing.expectEqual(expected.h, source.h);
 }
 
-fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: @import("../render/resources.zig").TextureId) void {
+fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
     runtime_assets.sprite_slots[manifest.spriteIndex(id)] = .{
         .status = .available,
         .lease = .{ .id = texture },

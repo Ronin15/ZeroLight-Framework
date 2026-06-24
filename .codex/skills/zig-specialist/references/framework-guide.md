@@ -20,7 +20,7 @@ performance, comment, test, and generated-output standards.
 - `src/core/` owns small shared helpers such as math primitives.
 - `src/root.zig` should stay limited to math aliases and compile coverage; feature code should live under the matching `src/` area.
 
-Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and transition application. Game states should emit transient draw records through `RenderQueue` by default. Use `Renderer.submitOrdered*` only for renderer-owned or tightly controlled paths that already submit in nondecreasing `RenderOrder`; game states should never call SDL_GPU directly.
+Keep `src/main.zig` timing-centric. Let app/state code own state lifetimes and transition application. Game states should submit render commands only through explicit render-prep phases that already walk nondecreasing `RenderOrder`; world/entity rendering should merge z layers before calling `Renderer.submitOrdered*`. Game states should never call SDL_GPU directly.
 
 ## Slice Completion
 
@@ -52,7 +52,7 @@ Default optimize mode is `Debug`. Use explicit release modes only for release ca
 
 ## Rendering And Timing Rules
 
-The app uses SDL_GPU directly and does not call Vulkan APIs itself. Game code should draw through `RenderQueue` unless it is a tightly controlled already ordered path. `RenderQueue` is the intentional ordering phase for world/effect/UI/debug records; `SpriteBatch` is a strict ordered-stream consumer, not a compatibility sorter. Shader sources live in `assets/shaders/*.glsl` and build into installed runtime shader files.
+The app uses SDL_GPU directly and does not call Vulkan APIs itself. Game code should draw through renderer-facing APIs from explicit ordered render-prep phases. World/entity rendering walks z layers and submits nondecreasing `RenderOrder`; `SpriteBatch` is a strict ordered-stream consumer, not a compatibility sorter. Shader sources live in `assets/shaders/*.glsl` and build into installed runtime shader files.
 
 Keep CPU render prep outside the acquired swapchain window where practical. Snapshot, draw-record ordering, and worker vertex expansion should happen before `SDL_WaitAndAcquireGPUSwapchainTexture`; the acquired section should stay focused on upload, render-pass encoding, and submit.
 

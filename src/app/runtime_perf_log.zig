@@ -40,7 +40,6 @@ pub const Metric = enum {
     sprite_skipped_invalid,
     sprite_vertices,
     sprite_draw_groups,
-    render_queue_records,
     ai_entities,
     ai_intents,
     ai_navigation_intents,
@@ -107,6 +106,8 @@ pub const Metric = enum {
     simulation_events_entity_created,
     simulation_events_entity_destroyed,
     simulation_events_component_changed,
+    simulation_events_world_tile_changed,
+    simulation_events_world_obstacle_changed,
     simulation_events_nav_region_invalidated,
     simulation_events_structural_commit_stage,
     simulation_events_domain_reaction_stage,
@@ -116,7 +117,12 @@ pub const Timing = enum {
     frame_interval,
     events,
     frame_controls,
-    update,
+    app_tick,
+    state_update,
+    gameplay_update,
+    state_transitions,
+    audio_drain,
+    loading_build,
     render_total,
     render_enqueue,
     render_overlay,
@@ -259,7 +265,12 @@ const EnabledRuntimePerfLog = struct {
         const frame_interval_timing = self.timingValue(.frame_interval);
         const events_timing = self.timingValue(.events);
         const frame_controls_timing = self.timingValue(.frame_controls);
-        const update_timing = self.timingValue(.update);
+        const app_tick_timing = self.timingValue(.app_tick);
+        const state_update_timing = self.timingValue(.state_update);
+        const gameplay_update_timing = self.timingValue(.gameplay_update);
+        const transition_timing = self.timingValue(.state_transitions);
+        const audio_drain_timing = self.timingValue(.audio_drain);
+        const loading_build_timing = self.timingValue(.loading_build);
         const render_total_timing = self.timingValue(.render_total);
         const render_enqueue_timing = self.timingValue(.render_enqueue);
         const render_overlay_timing = self.timingValue(.render_overlay);
@@ -270,7 +281,7 @@ const EnabledRuntimePerfLog = struct {
             self.metricValue(.skipped_no_swapchain_frames);
 
         log.debug(
-            "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} events_max_ms={d:.3} controls_avg_ms={d:.3} controls_max_ms={d:.3} update_avg_ms={d:.3} update_max_ms={d:.3} render_total_avg_ms={d:.3} render_total_max_ms={d:.3} event_count={} presentation_events={} resize={} fullscreen={} display={} focus={} visibility={} move={}",
+            "perf {d:.1}s frames={} submitted={} no_swapchain={} no_render={} updates={} cap_hits={} frame_interval_avg_ms={d:.3} frame_interval_max_ms={d:.3} events_avg_ms={d:.3} events_max_ms={d:.3} controls_avg_ms={d:.3} controls_max_ms={d:.3} app_tick_avg_ms={d:.3} app_tick_max_ms={d:.3} render_total_avg_ms={d:.3} render_total_max_ms={d:.3} event_count={} presentation_events={} resize={} fullscreen={} display={} focus={} visibility={} move={}",
             .{
                 elapsed_s,
                 self.frames,
@@ -285,8 +296,8 @@ const EnabledRuntimePerfLog = struct {
                 millis(events_timing.max_ns),
                 millis(frame_controls_timing.averageNs()),
                 millis(frame_controls_timing.max_ns),
-                millis(update_timing.averageNs()),
-                millis(update_timing.max_ns),
+                millis(app_tick_timing.averageNs()),
+                millis(app_tick_timing.max_ns),
                 millis(render_total_timing.averageNs()),
                 millis(render_total_timing.max_ns),
                 self.metricValue(.sdl_events),
@@ -300,7 +311,23 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} render_queue_records={} records_per_frame={d:.1} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
+            "perf {d:.1}s update state_avg_ms={d:.3} state_max_ms={d:.3} gameplay_avg_ms={d:.3} gameplay_max_ms={d:.3} transitions_avg_ms={d:.3} transitions_max_ms={d:.3} audio_drain_avg_ms={d:.3} audio_drain_max_ms={d:.3} loading_build_avg_ms={d:.3} loading_build_max_ms={d:.3}",
+            .{
+                elapsed_s,
+                millis(state_update_timing.averageNs()),
+                millis(state_update_timing.max_ns),
+                millis(gameplay_update_timing.averageNs()),
+                millis(gameplay_update_timing.max_ns),
+                millis(transition_timing.averageNs()),
+                millis(transition_timing.max_ns),
+                millis(audio_drain_timing.averageNs()),
+                millis(audio_drain_timing.max_ns),
+                millis(loading_build_timing.averageNs()),
+                millis(loading_build_timing.max_ns),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s dispatch state_updates={} state_renders={} render_enqueue_avg_ms={d:.3} render_enqueue_max_ms={d:.3} overlay_avg_ms={d:.3} overlay_max_ms={d:.3} end_frame_avg_ms={d:.3} end_frame_max_ms={d:.3} sprites commands={} valid={} skipped={} sprites_per_frame={d:.1} vertices={} groups={}",
             .{
                 elapsed_s,
                 self.metricValue(.state_updates),
@@ -311,8 +338,6 @@ const EnabledRuntimePerfLog = struct {
                 millis(render_overlay_timing.max_ns),
                 millis(render_end_frame_timing.averageNs()),
                 millis(render_end_frame_timing.max_ns),
-                self.metricValue(.render_queue_records),
-                averagePer(self.metricValue(.render_queue_records), rendered_frame_count),
                 self.metricValue(.sprite_commands),
                 self.metricValue(.sprite_valid),
                 self.metricValue(.sprite_skipped_invalid),
@@ -545,7 +570,8 @@ test "runtime performance log reset clears accumulators" {
 
     var perf = RuntimePerfLog.init(0);
     perf.recordMetric(.sdl_events, 3);
-    perf.recordTiming(.update, 12);
+    perf.recordTiming(.app_tick, 12);
+    perf.recordTiming(.gameplay_update, 8);
     perf.recordBatch(.movement, .{
         .item_count = 16,
         .range_count = 1,
@@ -563,6 +589,7 @@ test "runtime performance log reset clears accumulators" {
 
     try std.testing.expectEqual(@as(u64, 0), perf.frames);
     try std.testing.expectEqual(@as(u64, 0), perf.metricValue(.sdl_events));
-    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.update).count);
+    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.app_tick).count);
+    try std.testing.expectEqual(@as(u64, 0), perf.timingValue(.gameplay_update).count);
     try std.testing.expectEqual(@as(u64, 0), perf.batchValue(.movement).calls);
 }

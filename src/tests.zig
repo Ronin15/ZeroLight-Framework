@@ -63,7 +63,6 @@ comptime {
     _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");
-    _ = @import("render/render_queue.zig");
     _ = @import("render/resources.zig");
     _ = @import("render/sprite_batch.zig");
     _ = @import("render/text.zig");

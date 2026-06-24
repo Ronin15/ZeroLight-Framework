@@ -8,7 +8,6 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const resources = @import("../render/resources.zig");
-const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
 const sprite_batch = @import("../render/sprite_batch.zig");
 const suite = @import("suite.zig");
 
@@ -70,9 +69,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var batch = sprite_batch.SpriteBatch.init(allocator);
     defer batch.deinit();
     try batch.reserveStorage(item_count, item_count * 6, item_count);
-    var queue = RenderQueue.init(allocator);
-    defer queue.deinit();
-    try queue.ensureTotalCapacity(item_count);
 
     var threads: ?ThreadSystem = null;
     if (case.usesThreadSystem()) {
@@ -88,14 +84,14 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
 
     for (0..options.warmup_iterations) |_| {
-        try queueToBatchOnce(&queue, &batch, item_count);
+        try submitOrderedCommandsOnce(&batch, item_count);
         _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            try queueToBatchOnce(&queue, &batch, item_count);
+            try submitOrderedCommandsOnce(&batch, item_count);
             _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
         }
     }
@@ -106,7 +102,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_prep = sprite_batch.SpritePrepStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const measured = try runMeasuredOnce(&queue, item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
+        const measured = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), measured.stats.batch);
         phase_accumulator.record(measured.phases);
@@ -154,13 +150,13 @@ const MeasuredPrep = struct {
 };
 
 const PhaseAccumulator = struct {
-    queue_order_ns: u128 = 0,
+    ordered_submit_ns: u128 = 0,
     snapshot_ns: u128 = 0,
     vertex_emit_ns: u128 = 0,
     draw_group_ns: u128 = 0,
 
     fn record(self: *PhaseAccumulator, phases: suite.RenderPrepPhaseSummary) void {
-        self.queue_order_ns += phases.queue_order_ns;
+        self.ordered_submit_ns += phases.ordered_submit_ns;
         self.snapshot_ns += phases.snapshot_ns;
         self.vertex_emit_ns += phases.vertex_emit_ns;
         self.draw_group_ns += phases.draw_group_ns;
@@ -170,7 +166,7 @@ const PhaseAccumulator = struct {
         if (iterations == 0) return .{};
         const count: u128 = iterations;
         return .{
-            .queue_order_ns = u128ToU64Saturated(self.queue_order_ns / count),
+            .ordered_submit_ns = u128ToU64Saturated(self.ordered_submit_ns / count),
             .snapshot_ns = u128ToU64Saturated(self.snapshot_ns / count),
             .vertex_emit_ns = u128ToU64Saturated(self.vertex_emit_ns / count),
             .draw_group_ns = u128ToU64Saturated(self.draw_group_ns / count),
@@ -179,7 +175,6 @@ const PhaseAccumulator = struct {
 };
 
 fn runMeasuredOnce(
-    queue: *RenderQueue,
     item_count: usize,
     batch: *sprite_batch.SpriteBatch,
     resolver: sprite_batch.TextureResolver,
@@ -187,9 +182,9 @@ fn runMeasuredOnce(
     case: suite.BenchmarkCase,
     io: std.Io,
 ) !MeasuredPrep {
-    const queue_start_ns = suite.nowNs(io);
-    try queueToBatchOnce(queue, batch, item_count);
-    const queue_end_ns = suite.nowNs(io);
+    const submit_start_ns = suite.nowNs(io);
+    try submitOrderedCommandsOnce(batch, item_count);
+    const submit_end_ns = suite.nowNs(io);
 
     const snapshot_start_ns = suite.nowNs(io);
     _ = batch.snapshotCommandsAssumeCapacity(resolver);
@@ -207,7 +202,7 @@ fn runMeasuredOnce(
     return .{
         .stats = stats,
         .phases = .{
-            .queue_order_ns = suite.elapsedNs(queue_start_ns, queue_end_ns),
+            .ordered_submit_ns = suite.elapsedNs(submit_start_ns, submit_end_ns),
             .snapshot_ns = suite.elapsedNs(snapshot_start_ns, snapshot_end_ns),
             .vertex_emit_ns = suite.elapsedNs(vertex_start_ns, vertex_end_ns),
             .draw_group_ns = suite.elapsedNs(group_start_ns, group_end_ns),
@@ -261,18 +256,11 @@ fn fillCommands(batch: *sprite_batch.SpriteBatch, count: usize) !void {
     }
 }
 
-fn queueToBatchOnce(queue: *RenderQueue, batch: *sprite_batch.SpriteBatch, count: usize) !void {
-    queue.clearRetainingCapacity();
+fn submitOrderedCommandsOnce(batch: *sprite_batch.SpriteBatch, count: usize) !void {
     batch.commands.clearRetainingCapacity();
     batch.last_order = null;
     for (0..count) |index| {
-        try queue.addSprite(benchmarkSprite(index, queueBenchmarkOrder(index, count)));
-    }
-    queue.sortForSubmit();
-    for (0..queue.recordCount()) |index| {
-        if (queue.sortedSprite(index)) |sprite| {
-            try batch.drawSprite(sprite);
-        }
+        try batch.drawSprite(benchmarkSprite(index, orderedBenchmarkOrder(index, count)));
     }
 }
 
@@ -306,11 +294,6 @@ fn benchmarkSprite(index: usize, order: sprite_batch.RenderOrder) sprite_batch.S
             else => .drawable,
         },
     };
-}
-
-fn queueBenchmarkOrder(index: usize, count: usize) sprite_batch.RenderOrder {
-    if (count == 0) return orderedBenchmarkOrder(index, count);
-    return orderedBenchmarkOrder(count - 1 - index, count);
 }
 
 fn orderedBenchmarkOrder(index: usize, count: usize) sprite_batch.RenderOrder {
@@ -361,15 +344,12 @@ test "render prep benchmark tiny serial case runs without display" {
     try std.testing.expect(stats.render_prep_phases != null);
 }
 
-test "render prep benchmark feeds sorted queue stream into sprite batch" {
-    var queue = RenderQueue.init(std.testing.allocator);
-    defer queue.deinit();
-    try queue.ensureTotalCapacity(128);
+test "render prep benchmark feeds ordered stream into sprite batch" {
     var batch = sprite_batch.SpriteBatch.init(std.testing.allocator);
     defer batch.deinit();
     try batch.reserveStorage(128, 128 * 6, 128);
 
-    try queueToBatchOnce(&queue, &batch, 128);
+    try submitOrderedCommandsOnce(&batch, 128);
 
     try std.testing.expectEqual(@as(usize, 128), batch.commands.items.len);
     for (batch.commands.items[1..], 1..) |command, index| {

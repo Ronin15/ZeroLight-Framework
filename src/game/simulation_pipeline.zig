@@ -29,6 +29,7 @@ const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
+const WorldSystem = @import("world_system.zig").WorldSystem;
 
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
@@ -38,6 +39,7 @@ pub const SimulationPipelineConfig = struct {
     contact_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
+    navigation_world: ?*const WorldSystem = null,
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -94,7 +96,7 @@ pub const SimulationPipeline = struct {
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
-        try pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, config.nav_cell_size);
+        try pathfinding.rebuildStaticNavGridWithWorld(data, config.navigation_world, bounds_width, bounds_height, config.nav_cell_size);
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
@@ -132,6 +134,16 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
     ) !void {
         try self.pathfinding.rebuildStaticNavGrid(data, bounds_width, bounds_height, self.nav_cell_size);
+    }
+
+    pub fn rebuildStaticNavigationWithWorld(
+        self: *SimulationPipeline,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+        bounds_width: f32,
+        bounds_height: f32,
+    ) !void {
+        try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size);
     }
 
     /// Synchronizes interpolation history for pipeline-owned movement state.

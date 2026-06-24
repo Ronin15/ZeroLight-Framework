@@ -22,13 +22,13 @@ adding broad abstraction.
 
 ## Next Priority Tracks
 
-- Use the completed Slice 7 render-prep benchmark to guard the current
-  `RenderQueue` -> `SpriteBatch` CPU prep path. Future tile rendering, richer
-  UI, particles, lighting sprites, and debug records should feed typed
-  `RenderOrder` records through `RenderQueue` first, then add specialized
-  batchers only after measurement shows the sprite/rect batcher is the wrong
-  representation. Keep SDL_GPU command-buffer, swapchain, upload, render-pass,
-  and submit ownership on the render thread.
+- Use the completed Slice 7 render-prep benchmark to guard the current ordered
+  command -> `SpriteBatch` CPU prep path. Future tile rendering, richer UI,
+  particles, lighting sprites, and debug records should feed typed `RenderOrder`
+  commands through an explicit ordered render-prep phase first, then add
+  specialized batchers only after measurement shows the sprite/rect batcher is
+  the wrong representation. Keep SDL_GPU command-buffer, swapchain, upload,
+  render-pass, and submit ownership on the render thread.
 - Track collision-response merge/apply, SpriteBatch high-water/capacity policy,
   text-cache lifetime policy, shader/material registry guardrails, and remaining
   manual registry guardrails as hardening follow-ups.
@@ -259,14 +259,13 @@ Render-data boundary:
   references plus source intent such as tint, typed render-depth intent, and
   coordinate-space intent, not live renderer handles or raw layer numbers.
 - State-owned render-prep code reads immutable `DataSystem` slices, resolves
-  stable IDs through `RuntimeAssets`, emits transient draw records into
-  `RenderQueue`, and submits the queue's ordered stream to `Renderer`. The
-  renderer should not look up gameplay entities, world data, asset paths, or
-  texture assignments.
+  stable IDs through `RuntimeAssets`, and submits commands to `Renderer` only
+  after an explicit ordered render-prep phase. The renderer should not look up
+  gameplay entities, world data, asset paths, or texture assignments.
 - Atlas and tile work should build on the same boundary: assets decode source
   images, atlas code packs CPU pixels, render uploads the final atlas texture,
   entities or tile cells reference atlas regions, and render prep converts those
-  IDs into queue records with explicit `RenderOrder`.
+  IDs into ordered commands with explicit `RenderOrder`.
 
 Checklist:
 
@@ -325,7 +324,7 @@ Implemented foundation:
 
 - `Renderer` owns frame coordination, public draw APIs, texture IDs, swapchain
   acquisition, render-pass encoding, and command submission.
-- `RenderQueue` owns transient draw-record ordering across world, UI, effect,
+- Explicit render-prep phases own transient ordering across world, UI, effect,
   and debug producers.
 - `SpriteBatch` owns strict ordered-stream validation, vertex expansion, and
   draw-group construction.
@@ -339,8 +338,8 @@ Architecture notes:
   `renderer.zig`, so texture ownership does not migrate across several files at
   the same time as the handle model changes.
 - The first split uses `src/render/gpu/` for SDL_GPU device/window setup,
-  shader/pipeline creation, buffers, and texture upload, with draw-record
-  ordering in `render_queue.zig` and vertex expansion in `sprite_batch.zig`.
+  shader/pipeline creation, buffers, and texture upload, with ordered-stream
+  validation and vertex expansion in `sprite_batch.zig`.
 - Keep `Renderer` as the game-facing facade and frame coordinator; the split
   should hide GPU details behind narrower render-owned modules, not expose more
   SDL_GPU surface area to game states.
@@ -354,7 +353,8 @@ Checklist:
 - [x] Introduce static material/pipeline records for the current sprite pipeline.
 - [x] Keep draw record ordering stable by `RenderOrder` and submission order.
 - [x] Preserve explicit `Renderer.submitOrdered*` calls for already ordered
-      renderer-owned paths and route unordered producers through `RenderQueue`.
+      renderer-owned paths and route unordered producers through explicit
+      render-prep ordering.
 - [x] Add tests for batch grouping, invalid texture skipping, and ordering.
 - [x] Re-run `gpu-smoke` when display access is available.
 
@@ -451,9 +451,9 @@ Parallel render-prep design:
 - [x] Keep SDL_GPU command-buffer acquisition, swapchain acquisition, GPU
       upload, render-pass encoding, and submit on the main/render thread for
       the first implementation.
-- [x] Split CPU render prep into explicit phases: `RenderQueue` owns intentional
-      transient draw-record ordering, then `SpriteBatch` consumes the ordered
-      stream for texture validation, sprite-to-vertex expansion, and draw-group
+- [x] Split CPU render prep into explicit phases: producers own intentional
+      transient ordering, then `SpriteBatch` consumes the ordered stream for
+      texture validation, sprite-to-vertex expansion, and draw-group
       construction. The renderer does not keep compatibility fallback sorting
       that hides producer-order bugs.
 - [x] Keep the render prep tuner and stats owned by `SpriteBatch`/`Renderer`
@@ -500,12 +500,12 @@ Slice 7 is complete for the current sprite/rect renderer path. It has a
 pre-spawned app-owned `ThreadSystem`, explicit update/render contexts,
 synchronous `parallelFor`, adaptive per-batch worker-thread participation,
 per-worker scratch slot indexing, and render-owned parallel CPU sprite prep.
-`RenderQueue` owns draw-record ordering by `RenderOrder`, including world z,
-stack-aware UI depth, effects, and debug records. `SpriteBatch` consumes only an
-already ordered stream, snapshots texture metadata on the main thread, expands
-prepared sprites into disjoint vertex spans through the thread system, builds
-draw groups deterministically on the main thread, and leaves SDL_GPU
-command-buffer work on the render thread. Future tile rendering, UI widgets,
+State-owned render prep owns draw-record ordering by `RenderOrder`, including
+world z, stack-aware UI depth, effects, and debug records. `SpriteBatch`
+consumes only an already ordered stream, snapshots texture metadata on the main
+thread, expands prepared sprites into disjoint vertex spans through the thread
+system, builds draw groups deterministically on the main thread, and leaves
+SDL_GPU command-buffer work on the render thread. Future tile rendering, UI widgets,
 material registries, lighting/fire effects, or threaded GPU command buffers
 remain separate slices that must preserve this queue-first ordering contract
 unless they replace it with an explicitly measured render-owned ordering phase.
@@ -531,7 +531,7 @@ Architecture notes:
   stable asset/material IDs plus typed render order until render prep resolves
   them into queue records or a render-owned batcher stream.
 - New batchers may be added for tile spans, light volumes, or effect particles,
-  but they should consume sorted `RenderQueue` records or a documented
+  but they should consume an explicitly ordered stream or a documented
   render-owned phase with the same ordering guarantees. Do not add renderer
   fallback sorting to hide unordered producers.
 - Build-time shader manifests and runtime pipeline registries should converge so
@@ -1471,10 +1471,10 @@ Architecture notes:
   variants with focused emit/read tests; do not add placeholder systems for
   domains that do not exist yet.
 - Keep existing high-volume streams specialized. Collision contacts, movement
-  intents, navigation intents, path requests, and render-prep queue records
+  intents, navigation intents, path requests, and render-prep command streams
   should not be collapsed into one generic simulation-event stream just for
   uniformity. Events may invalidate or wake a render producer, but render prep
-  still emits explicit `RenderQueue` records with typed `RenderOrder`.
+  still emits explicit ordered commands with typed `RenderOrder`.
 - Threaded producers must use the same count/prefix/write/range-index merge
   model as other `SimulationFrame` streams. Output order must come from stable
   phase, input, range, and per-range sequence order, not worker timing.
@@ -1525,7 +1525,7 @@ Checklist:
       applicable, and stage/controller attribution for benchmarks or debug UI.
 - [x] Document which cross-system communication should use simulation/domain
       events and which should remain a specialized stream such as contacts,
-      movement intents, navigation intents, path requests, render-queue records,
+      movement intents, navigation intents, path requests, render-prep commands,
       or structural commands.
 - [x] Document the architecture mapping for event producers and consumers:
       pipeline phase, controller owner, persistent data owner, transient event
@@ -1583,11 +1583,11 @@ Current foundation:
 - `SimulationPipeline` owns reusable fixed-step simulation systems and today's
   ordered processor dispatch for one gameplay state instance.
 - `GameDemoState.update` applies main-thread input/audio, delegates processor
-  dispatch to `SimulationPipeline`, applies structural commits, and reserves
-  the render queue for the current primitive-visual rows before render enqueue.
-- `GameDemoState.render` emits transient draw records by iterating current
-  primitive visual rows through render prep, with the player marker and
-  particles handled as explicit render producers outside fixed-step simulation.
+  dispatch to `SimulationPipeline`, applies structural commits, and keeps
+  dynamic render-prep scratch reserved for current primitive-visual rows.
+- `GameDemoState.render` collects dynamic render records once, sorts them by
+  world z, then merges them with visible world z layers. The player marker and
+  particles are explicit render producers outside fixed-step simulation.
 - Processors gather dense `DataSystem` slices and support threaded serial
   parity paths with benchmarks into the 50k stress scale.
 - Architecture docs describe `SimulationPipeline` as the long-term owner of
@@ -1615,7 +1615,7 @@ Architecture notes:
   simulation data is ready. The pipeline can determine which entities are in
   active scope, visible scope, or dirty regions, but it should hand immutable
   slices and scope lists to render prep rather than calling `Renderer` or
-  owning `RenderQueue`.
+  owning render-prep ordering.
 
 Implementation context to preserve:
 
@@ -1632,7 +1632,7 @@ Implementation context to preserve:
   AI navigation intent production, steering/path status consumption,
   pathfinding, sparse movement-intent application, movement integration,
   player bounds clamp, collision detection, collision response, particle/domain
-  reactions, structural commit, and post-commit render-queue reservation.
+  reactions, structural commit, and post-commit render-prep reservation.
 - Scoped runtime behavior remains required after world rendering provides real
   tile/chunk/visibility data. The initial full-active-set pipeline and tier
   scaffolding are architectural stepping stones; they must not be documented as
@@ -1718,8 +1718,8 @@ Current foundation:
   `.grim_characters`, and `.grim_items`.
 - `world_tileset_meta.zig` validates tile JSON and exposes tile lookup by name,
   id, category, animation, and source rect.
-- `RenderQueue` owns transient draw-record ordering and `Renderer` owns SDL_GPU
-  submission.
+- Explicit render-prep phases own transient draw-record ordering and `Renderer`
+  owns SDL_GPU submission.
 
 Architecture notes:
 
@@ -1728,8 +1728,14 @@ Architecture notes:
 - `GameDemoState` is constructed from Engine-owned `RuntimeAssets` through a
   loading state; world construction requires `.world_tileset` metadata and
   world rendering requires the `.world_tileset` texture.
+- The runtime loading path now uses the Engine-owned `ThreadSystem` for
+  deterministic procedural chunk generation; it does not create a separate
+  worker pool.
 - Persistent world storage is SoA: stable tile IDs, atlas source-rect columns,
   level z metadata, dense/sparse tile columns, and chunk/visibility columns.
+- Gameplay viewport size is separate from world size. The first large runtime
+  world is a finite 512x512 tile segment with camera-visible chunk rendering,
+  intended as a foundation for later larger-map streaming.
 - The first world renderer exposes enough chunk/visibility shape for the later
   scoped tier slice, but it does not enable simulation tier filtering by itself.
 - Demo actors can use character atlas entries with primitive-visual rectangle
@@ -1740,10 +1746,13 @@ Checklist:
 - [x] Add a small world/tile data owner with tile IDs, world coordinates, and
       chunk/visibility metadata suitable for later `ActiveRegion` construction.
 - [x] Render at least one world/tile layer from `.world_tileset` atlas metadata
-      through render prep and `RenderQueue`.
+      through ordered render prep.
 - [x] Keep tile draw ordering explicit by `RenderOrder` and stable source rects.
 - [x] Add tests for tile lookup, strict missing atlas texture behavior,
       actor primitive fallback, and deterministic queue record order.
+- [x] Add tests for ThreadSystem-driven procedural chunk generation,
+      camera-follow world bounds, visible chunk culling, and world-tile
+      pathfinding blockers.
 - [x] Update rendering/assets docs and roadmap cross-links after runtime wiring
       lands.
 
@@ -1761,10 +1770,14 @@ Slice 23 adds `WorldSystem` as `GameDemoState`-owned SoA world storage and
 render prep. `LoadingState` now bridges menu activation to runtime-asset-backed
 gameplay construction, fixing the old direct demo-state constructor boundary.
 The demo renders a dense atlas-backed floor layer plus sparse world decoration
-through `RenderQueue`, carries level/chunk/visibility columns for future scoped
-simulation, and keeps `SimulationPipeline` focused on fixed-step entity
+through ordered render prep, carries level/chunk/visibility columns for future
+scoped simulation, and keeps `SimulationPipeline` focused on fixed-step entity
 processors. Demo actors now reference `.grim_characters` atlas entries while
 retaining primitive visuals as missing-character placeholders.
+The runtime loading path now builds a 512x512 procedural segment with
+`ThreadSystem` chunk batches, follows the player with an interpolated sub-pixel
+camera, and renders only camera-visible chunks. World blocking tiles are folded
+into the pathfinding nav-grid rebuild alongside static entity obstacles.
 
 ## Slice 24: Scoped Simulation Tiers And Chunk Policy
 
@@ -1841,8 +1854,8 @@ Resource ownership, text/UI, renderer composition, threading, SIMD,
 startup runtime assets, frame-delayed pathfinding, steering/local avoidance, and
 navigation hardening now form the source-of-truth foundation for future slices.
 Render ordering is also part of that foundation: game/world/UI/effect producers
-emit typed draw records through `RenderQueue`, persistent data stores stable IDs
-and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
+emit typed ordered commands through explicit render-prep phases, persistent data
+stores stable IDs and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
 benchmark-owned render-prep timing stays out of the production path.
 Slice 21 typed simulation/domain events, Slice 22 `SimulationPipeline`
 extraction, and Slice 23 atlas-backed world rendering are in place for the

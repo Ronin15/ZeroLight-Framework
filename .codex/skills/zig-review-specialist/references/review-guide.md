@@ -33,9 +33,9 @@ Use concrete severity judgment:
 - Lower states receive update/input/render only according to policy.
 - Game code draws through renderer-facing APIs rather than owning raw SDL_GPU resources.
 - When multiple game/effect/UI producers can interleave render depths, game code
-  should emit transient records into `RenderQueue` or another explicit render-prep
-  ordering phase. Flag ad hoc demo-local ordering lists and renderer-side
-  fallback sorting that hides producer-order bugs.
+  should use an explicit render-prep ordering phase owned by the relevant
+  system. For world/entity rendering, flag ad hoc record lists, renderer-side
+  fallback sorting, and any path that does not walk z layers deterministically.
 - Shared gameplay orchestration stays state-owned: `StateStack` dispatches,
   gameplay states own `DataSystem`/`SimulationFrame`/pipeline instances, and
   pipelines own controller order.
@@ -79,7 +79,7 @@ Use concrete severity judgment:
   reason. Flag `SDL_WaitAndAcquireGPUSwapchainTexture` before substantial CPU
   prep as latency and swapchain-pressure risk.
 - Per-frame draw submission does not add avoidable allocation, string lookup, or hash-map lookup.
-- Sprite ordering remains stable when render queue ordering or batching changes.
+- Sprite ordering remains stable when render ordering or batching changes.
   `SpriteBatch` should consume ordered streams; it should not be the compatibility
   fallback sorter for unordered producers.
 - Upload validation rejects bad dimensions, pitch, and buffer lengths before GPU work.

@@ -237,7 +237,7 @@ pub const BatchSummary = struct {
 };
 
 pub const RenderPrepPhaseSummary = struct {
-    queue_order_ns: u64 = 0,
+    ordered_submit_ns: u64 = 0,
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
     draw_group_ns: u64 = 0,
@@ -814,8 +814,8 @@ fn printValidationSummary(
             );
             if (render_prep_focus.stats.render_prep_phases) |phases| {
                 std.debug.print(
-                    "phases queue_order={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
-                    .{ formatDuration(phases.queue_order_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
+                    "phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
+                    .{ formatDuration(phases.ordered_submit_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
                 );
             }
         } else {
@@ -1021,13 +1021,13 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         if (stats.render_prep_phases) |phases| {
             return std.fmt.bufPrint(
                 buffer,
-                "vertices={} sprites={} skipped={} groups={} phases queue_order={f} snapshot={f} vertex={f} groups={f}",
+                "vertices={} sprites={} skipped={} groups={} phases ordered_submit={f} snapshot={f} vertex={f} groups={f}",
                 .{
                     stats.candidate_pairs,
                     stats.output_count,
                     stats.deferred_count,
                     stats.sample_count,
-                    formatDuration(phases.queue_order_ns),
+                    formatDuration(phases.ordered_submit_ns),
                     formatDuration(phases.snapshot_ns),
                     formatDuration(phases.vertex_emit_ns),
                     formatDuration(phases.draw_group_ns),

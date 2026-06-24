@@ -157,6 +157,12 @@ pub const Renderer = struct {
         try self.batch.drawSprite(sprite);
     }
 
+    pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
+        const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
+        try self.reserveBatchStorage(command_capacity, vertex_capacity, command_capacity);
+        try self.ensureBatchCapacity(vertex_capacity);
+    }
+
     pub fn submitOrderedRectInSpace(self: *Renderer, rect: Rect, color: config.Color, order: RenderOrder, coordinate_space: CoordinateSpace) !void {
         try self.submitOrderedSprite(.{
             .texture = self.white_texture,

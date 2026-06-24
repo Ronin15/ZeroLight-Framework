@@ -124,10 +124,11 @@ gameplay state or persistent gameplay data.
 
 ## Coordination Boundaries
 
-Game states emit transient draw records through `RenderQueue` when multiple
-world/effect/UI producers need ordering. Direct `Renderer.submitOrdered*` calls
-are reserved for renderer-owned or tightly controlled paths that already submit
-in nondecreasing `RenderOrder`; game states should not call SDL_GPU directly.
+Game states submit through `Renderer.submitOrdered*` only from explicit
+render-prep phases that already walk nondecreasing `RenderOrder`. World render
+submission is layer-owned: z/depth discovery happens in `WorldSystem` and
+state-owned dynamic render prep, then both streams are merged by world z before
+commands reach `SpriteBatch`. Game states should not call SDL_GPU directly.
 Window, GPU device, swapchain, shader, texture, text, and frame submission code
 stays under `src/render/` and `src/app/`.
 SDL, SDL_ttf, SDL_mixer, and SDL_GPU resources should pair creation and cleanup
@@ -296,8 +297,13 @@ Large world surfaces belong to state-owned world storage rather than
 source-rect columns, level base-z columns, dense/sparse tile columns, and
 chunk/visibility columns. `WorldSystem` prepares world draw records during
 render, using explicit world-depth bands from `src/game/render_depth.zig`.
-Future scoped simulation slices may consume its chunk/visibility view, but
-`SimulationPipeline` should not own tile storage or runtime atlas metadata.
+Runtime gameplay construction uses the Engine-owned `ThreadSystem` to build the
+procedural 512x512 tile world in deterministic chunk ranges. The gameplay state
+keeps viewport size separate from world bounds, follows the player with an
+interpolated sub-pixel camera, and asks `WorldSystem` to expose only
+camera-visible chunks to render prep. Future scoped simulation slices may
+consume its chunk/visibility view, but `SimulationPipeline` should not own tile
+storage, runtime atlas metadata, or camera policy.
 
 The current gameplay fixed-step pipeline is:
 
@@ -309,8 +315,9 @@ The current gameplay fixed-step pipeline is:
 6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
 7. Queue contact audio, emit/update transient particles, and merge outputs.
 8. Commit deferred structural commands to `DataSystem`.
-9. Render current `WorldSystem`, `DataSystem`, and particle state with
-   interpolation.
+9. Update the state-owned follow camera and visible world chunks.
+10. Render current `WorldSystem`, `DataSystem`, and particle state with
+    interpolation.
 
 `SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
 stage order, scope stats, budgets, and processor handoff for one gameplay state
@@ -455,13 +462,14 @@ explicit reaction points consume immutable event slices. Consumers may emit
 specialized outputs, later-phase events, or deferred structural commands, but
 they do not recursively redispatch events or mutate `DataSystem` structurally
 outside the commit boundary. The current event payloads cover structural
-entity/component changes and navigation-region invalidation. Event records carry
-only stable entity IDs, component enums, reason enums, and small scalar payloads;
+entity/component changes, world tile/obstacle changes, and navigation-region
+invalidation. Event records carry only stable entity IDs, component enums,
+reason enums, compact coordinates, and small scalar payloads;
 they do not carry pointers, app/render/audio handles, asset paths, allocators,
 or service references.
 
 High-volume streams stay specialized. Collision contacts, collision triggers,
-navigation intents, movement intents, path requests, render-queue records, and
+navigation intents, movement intents, path requests, render-prep commands, and
 structural commands are not collapsed into the generic event stream. The event
 hub exists for cross-system change signals and diagnostics. Event producers own
 their range writes and range-local stats; the stream merges per-type and

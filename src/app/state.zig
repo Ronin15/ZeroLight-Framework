@@ -466,9 +466,13 @@ pub const StateStack = struct {
         }
 
         for (self.states.items[first_updated..]) |entry| {
+            const perf_start_ns = if (comptime runtime_perf_log.enabled) c.SDL_GetTicksNS() else 0;
             try entry.state.update(context);
             if (comptime runtime_perf_log.enabled) {
                 context.perf.recordMetric(.state_updates, 1);
+                if (entry.policy.gameplay) {
+                    context.perf.recordTiming(.gameplay_update, elapsedNs(perf_start_ns, c.SDL_GetTicksNS()));
+                }
             }
         }
     }
@@ -606,6 +610,10 @@ fn policyLabel(policy: StatePolicy) []const u8 {
     if (policy.update_below and policy.events_below and policy.render_below) return "pass_through_overlay";
     if (!policy.update_below and !policy.events_below and policy.render_below) return "modal_overlay";
     return "custom";
+}
+
+fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
+    return if (end_ns > start_ns) end_ns - start_ns else 0;
 }
 
 fn initTestThreadSystem() !ThreadSystem {

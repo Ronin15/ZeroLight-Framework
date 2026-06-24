@@ -55,7 +55,7 @@ and before the next `beginStep()`.
 
 The concrete processor order is pipeline-owned for one gameplay state instance.
 `GameDemoState` currently keeps main-thread input, audio, particles, structural
-commit/domain reactions, and render-queue reservation at the state boundary.
+commit/domain reactions, and render-prep reservation at the state boundary.
 `SimulationPipeline` owns AI navigation-intent production, steering/path status,
 pathfinding, sparse movement-intent application, movement, bounds clamp,
 collision detection, and collision response.
@@ -91,8 +91,8 @@ part of the contract: count and write phases must stay consistent.
 - `structural_commands`: deferred entity/component changes.
 
 High-volume data should stay in its specialized stream. Do not collapse
-contacts, movement intents, navigation intents, path requests, render-queue
-records, or structural commands into generic events just for uniformity.
+contacts, movement intents, navigation intents, path requests, render-prep
+commands, or structural commands into generic events just for uniformity.
 
 Use `reserveStreams`, `reservePathRequests`, and
 `reserveNavigationIntents` during state/system initialization or warmup so
@@ -109,6 +109,8 @@ Current event payloads are:
 - `entity_created`
 - `entity_destroyed`
 - `component_changed`
+- `world_tile_changed`
+- `world_obstacle_changed`
 - `nav_region_invalidated`
 
 Current event stages are:
@@ -119,6 +121,11 @@ Current event stages are:
 Events carry stable IDs, enum tags, and small value payloads only. They must not
 carry pointers, app/render/audio handles, asset paths, allocators, loaded
 resources, or service references.
+
+World tile and obstacle events carry compact level/cell regions plus old/new
+tile and obstacle flags. They wake explicit reaction points such as pathfinding
+or future world-collision refreshes; they are not immediate callbacks from
+`WorldSystem`.
 
 `appendRequired` fails if the configured event capacity cannot hold the event.
 `appendDiagnostic` drops on capacity failure and increments dropped stats. Use
@@ -153,15 +160,15 @@ capacity fails.
 - starts each fixed step with `beginStep()`;
 - writes player input and audio commands at the main-thread boundary;
 - delegates reusable fixed-step systems and stage order to `SimulationPipeline`;
-- consumes structural/domain events to rebuild navigation when static
+- consumes structural/domain/world events to rebuild navigation when static
   obstacle-affecting changes require it;
 - applies structural commands at the fixed-step commit boundary;
-- reserves render-queue capacity after structural commits and before render
-  enqueue.
+- reserves renderer command capacity after structural commits and before render
+  submission.
 
 Render prep is outside `simulation.zig`. Persistent render intent stays in
 `DataSystem`; render code resolves stable asset IDs through `RuntimeAssets` and
-emits transient draw records through `RenderQueue`.
+submits ordered renderer commands from explicit world/entity z-layer passes.
 
 ## Non-Goals
 

@@ -47,6 +47,24 @@ pub const NavRegionInvalidatedEvent = struct {
     reason: NavInvalidationReason,
 };
 
+pub const WorldTileChangedEvent = struct {
+    level: u16,
+    x: u16,
+    y: u16,
+    old_tile_id: u16,
+    new_tile_id: u16,
+    old_blocks_movement: bool = false,
+    new_blocks_movement: bool = false,
+};
+
+pub const WorldObstacleChangedEvent = struct {
+    level: u16,
+    min_x: u16,
+    min_y: u16,
+    max_x_exclusive: u16,
+    max_y_exclusive: u16,
+};
+
 pub const ComponentChangedEvent = struct {
     entity: EntityId,
     component: Component,
@@ -64,6 +82,8 @@ pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
     entity_destroyed: EntityDestroyedEvent,
     component_changed: ComponentChangedEvent,
+    world_tile_changed: WorldTileChangedEvent,
+    world_obstacle_changed: WorldObstacleChangedEvent,
     nav_region_invalidated: NavRegionInvalidatedEvent,
 };
 
@@ -78,6 +98,8 @@ pub const SimulationEventStats = struct {
     entity_created: usize = 0,
     entity_destroyed: usize = 0,
     component_changed: usize = 0,
+    world_tile_changed: usize = 0,
+    world_obstacle_changed: usize = 0,
     nav_region_invalidated: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
@@ -92,6 +114,8 @@ pub const SimulationEventStats = struct {
             .entity_created => self.entity_created += 1,
             .entity_destroyed => self.entity_destroyed += 1,
             .component_changed => self.component_changed += 1,
+            .world_tile_changed => self.world_tile_changed += 1,
+            .world_obstacle_changed => self.world_obstacle_changed += 1,
             .nav_region_invalidated => self.nav_region_invalidated += 1,
         }
     }
@@ -101,6 +125,8 @@ pub const SimulationEventStats = struct {
         self.entity_created += produced.entity_created;
         self.entity_destroyed += produced.entity_destroyed;
         self.component_changed += produced.component_changed;
+        self.world_tile_changed += produced.world_tile_changed;
+        self.world_obstacle_changed += produced.world_obstacle_changed;
         self.nav_region_invalidated += produced.nav_region_invalidated;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;

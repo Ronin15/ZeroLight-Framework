@@ -212,11 +212,13 @@ Render-prep output reports draw commands, valid sprites, skipped invalid
 resources, generated vertices, draw groups, worker usage, range size, and the
 render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
 does not open a window or submit SDL_GPU command buffers. Each measured
-iteration builds and sorts the `RenderQueue`, appends its sorted sprites into
-the same `SpriteBatch` command stream, then snapshots, emits vertices, and
-builds draw groups. The benchmark owns its phase timers around that shared path
-and reports queue-order, snapshot, vertex-emission, and draw-group timings; the
-production renderer does not run those benchmark timers.
+iteration submits an already ordered sprite stream into the same `SpriteBatch`
+command storage, then snapshots, emits vertices, and builds draw groups.
+Current production world rendering submits already ordered commands from
+explicit z-layer passes instead of a separate general ordering queue. The
+benchmark owns its phase timers around that shared path and reports ordered
+submission, snapshot, vertex-emission, and draw-group timings; the production
+renderer does not run those benchmark timers.
 For runtime performance judgment, read the adaptive rows as the production-style
 scheduling signal: they start from measured inline work and only use workers
 when the adaptive tuner finds a batch large enough and a threaded profile that

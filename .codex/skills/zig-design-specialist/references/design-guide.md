@@ -16,10 +16,10 @@ repo. Keep the final design compact, but make the decisions below explicit.
   overlay policies can let lower states receive events, updates, or rendering.
 - New designs should keep gameplay behavior in states or processors, not in
   `main.zig` or broad `Engine` conditionals.
-- Rendering designs should treat `RenderQueue` as the transient ordering phase
-  for records from world, effects, UI, and debug producers. `Renderer` and
-  `SpriteBatch` consume already ordered commands; do not design fallback sorting
-  inside the renderer to hide producer-order bugs.
+- Rendering designs should define an explicit owner for render ordering.
+  World/entity rendering should walk z layers and submit already ordered
+  commands through `Renderer`; `SpriteBatch` consumes ordered commands and
+  should not fallback-sort to hide producer-order bugs.
 
 ## Simulation Pipeline And Controllers
 
@@ -79,9 +79,10 @@ define immutable inputs plus deterministic owned outputs.
 - Runtime gameplay and render-prep data should carry stable asset IDs such as
   `SpriteAssetId` and `AudioAssetId`; path validation, PNG decode, GPU upload,
   audio load/predecode, and string lookup belong in asset/app services.
-- Transient render queues may carry renderer-facing handles after `RuntimeAssets`
-  resolution, but persistent gameplay storage should keep stable asset IDs and
-  enum render-depth intent instead of live renderer handles or raw layer numbers.
+- Transient ordered render-prep outputs may carry renderer-facing handles after
+  `RuntimeAssets` resolution, but persistent gameplay storage should keep stable
+  asset IDs and enum render-depth intent instead of live renderer handles or raw
+  layer numbers.
 
 ## Processor Contracts
 

@@ -12,7 +12,7 @@ const Facing = @import("data_system.zig").Facing;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Rect = @import("../render/renderer.zig").Rect;
-const RenderQueue = @import("../render/render_queue.zig").RenderQueue;
+const Renderer = @import("../render/renderer.zig").Renderer;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const render_depth = @import("render_depth.zig");
 const render_prep = @import("render_prep.zig");
@@ -84,9 +84,8 @@ pub const Player = struct {
         );
     }
 
-    pub fn enqueueRender(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, queue: *RenderQueue, interpolation_alpha: f32) !void {
+    pub fn submitBodyRender(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, renderer: *Renderer, interpolation_alpha: f32) !void {
         const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
-        const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
         const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
         const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
         const body_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.depth));
@@ -101,7 +100,7 @@ pub const Player = struct {
             if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
                 const source = render_prep.sourceRectForAsset(runtime_assets, asset_ref, sprite.source_rect);
                 if (!asset_ref.hasAtlasEntry() or source != null) {
-                    try queue.addSprite(.{
+                    try renderer.submitOrderedSprite(.{
                         .texture = sprite.texture,
                         .source = source,
                         .dest = dest,
@@ -109,16 +108,23 @@ pub const Player = struct {
                         .order = body_order,
                     });
                 } else {
-                    try queue.addRect(dest, visual.color, body_order, .world);
+                    try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
                 }
             } else {
-                try queue.addRect(dest, visual.color, body_order, .world);
+                try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
             }
         } else {
-            try queue.addRect(dest, visual.color, body_order, .world);
+            try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
         }
+    }
+
+    pub fn submitMarkerRender(self: Player, data: *const DataSystem, renderer: *Renderer, interpolation_alpha: f32) !void {
+        const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
+        const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
+        const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
+        const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
         const marker_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.marker_depth_band));
-        try queue.addRect(
+        try renderer.submitOrderedRectInSpace(
             markerRect(render_position, facing.direction, visual),
             visual.marker_color,
             marker_order,
