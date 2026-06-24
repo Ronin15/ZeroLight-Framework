@@ -213,18 +213,17 @@ pub const GameDemoState = struct {
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
             .contact_capacity = demo_contact_capacity,
-            // The procedural world spans 512x512 tiles (16384px/side). At the
-            // default 32px nav cell that is 262_144 grid cells, which exceeds the
-            // pathfinding goal-field/fallback gates (65_536 cells) and silently
-            // disables both solvers. A 128px nav cell keeps the grid at
-            // 128x128 = 16_384 cells, well under the gate, so navigation actually
-            // solves instead of falling back to direct seek.
-            .nav_cell_size = 128,
+            // The procedural world spans 512x512 tiles (16384px/side). At a 32px
+            // nav cell that is 262_144 grid cells. Slice 25B sizes A* scratch to a
+            // bounded explored-node budget (not the whole grid) and the demo's
+            // shared player-seek goal is serviced by a small bounded group-field
+            // registry, so 32px cells fit and navigation runs full resolution.
+            .nav_cell_size = 32,
             .pathfinding = .{
                 .max_frame_requests = test_square_count,
                 .max_pending_requests = test_square_count,
                 .max_cached_results = test_square_count * 4,
-                .max_goal_fields = 4,
+                .max_group_fields = 4,
                 .max_worker_scratch_slots = 64,
                 .max_solved_requests_per_step = test_square_count,
                 .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
@@ -490,7 +489,6 @@ pub const GameDemoState = struct {
         perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
         perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
         perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
-        perf.recordMetric(.path_field_requests, metric(pathfinding_stats.field_requests));
         perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
         perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
         perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
@@ -498,11 +496,13 @@ pub const GameDemoState = struct {
         perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
         perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
         perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
-        perf.recordMetric(.path_field_cache_hits, metric(pathfinding_stats.field_cache_hits));
-        perf.recordMetric(.path_goal_fields_built, metric(pathfinding_stats.goal_fields_built));
-        perf.recordMetric(.path_goal_fields_reused, metric(pathfinding_stats.goal_fields_reused));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
-        perf.recordBatch(.path_field_results, pathfinding_stats.field_result_batch);
+        perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
+        perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
+        perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
+        perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
+        perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
+        perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
         perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));

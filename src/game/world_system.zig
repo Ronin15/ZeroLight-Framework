@@ -79,7 +79,7 @@ pub const LevelLinkKind = enum {
 // Persistent inter-level connectivity fact. Holds only stable level indices and
 // tile-cell coordinates plus a traversal cost — never live nav node indices,
 // renderer/SDL handles, or prepared draw records. Pathfinding converts these to
-// nav-graph edges at build/query time (Slice 25C); this slice only stores them.
+// nav-graph edges at build/query time.
 pub const LevelLink = struct {
     kind: LevelLinkKind,
     level_a: u16,
@@ -560,6 +560,27 @@ pub const WorldSystem = struct {
         if (layer_index >= self.dense_level_indices.items.len) return true;
         if (x >= self.width or y >= self.height) return true;
         return self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement;
+    }
+
+    /// Level a dense band belongs to. Lets navigation iterate the dense bands of a
+    /// single level directly instead of polling per cell across all levels.
+    pub fn denseLayerLevel(self: *const WorldSystem, layer_index: usize) u16 {
+        return self.dense_level_indices.items[layer_index];
+    }
+
+    /// Level a sparse tile belongs to. Pairs with `sparseTileCellCoord` so a
+    /// per-level sparse-cell set can be built in O(sparse), not O(cells x sparse).
+    pub fn sparseTileLevel(self: *const WorldSystem, index: usize) u16 {
+        return self.sparse_level_indices.items[index];
+    }
+
+    /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index.
+    pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
+        const cell = self.sparse_cell_indices.items[index];
+        return .{
+            .x = @intCast(cell % self.width),
+            .y = @intCast((cell / self.width) % self.height),
+        };
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {

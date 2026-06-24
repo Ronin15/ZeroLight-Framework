@@ -416,23 +416,47 @@ with stable stream order as the tie-breaker.
 Player movement remains direct input with no steering component, while collision
 response still resolves after movement.
 
-`PathfindingSystem` is a frame-delayed grid pathfinding processor under
-`src/game/systems/`. It owns the static versioned nav grid, pending request
-queue, duplicate suppression, completed result cache, unavailable-path cache,
-warmed A* scratch, per-stage adaptive tuner state, and benchmark stats.
+`PathfindingSystem` is a frame-delayed, Z-aware grid pathfinding processor under
+`src/game/systems/` (Slice 25A-25C). It runs two coordinated solver modes selected
+per request kind: budget-bounded goal-keyed heap A* for individual goals, and a
+demand-driven managed shared-goal reverse-Dijkstra flow field for declared `group`
+requests. Long-range and cross-level individual queries route through a per-level
+chunk-portal abstract graph plus inter-level `LevelLink` edges: abstract A* picks a
+corridor, then the system STITCHES a full obstacle-aware (level,cell) path by running
+per-segment local A* between consecutive corridor portals (a discrete jump only
+across a link edge) and caches it whole. The per-agent query walks that path on its
+current level cell by cell, exactly like a single-level A* path, so every heading is a
+traversable neighbor — never a straight-line cut across a wall — and multi-hop and
+cross-floor routes converge. Abstract seeding scans only the start level's portals
+(per-level portal index); abstract scratch saturation or a per-segment node-budget
+spill returns `pending` (retry) rather than a hard negative. It owns the static versioned
+nav grid (one per level), the chunk-portal/link graph,
+pending request queue, duplicate suppression, the goal-keyed completed path
+cache, unavailable-path cache, per-worker budgeted A* scratch, a fixed group-field
+registry, per-stage adaptive tuner state, and benchmark stats.
 `SimulationFrame.path_requests` carries transient requests from steering or
 future rule systems; path queues, scratch, thread state, and live path caches
 stay out of `DataSystem`. Request key preparation and static grid marking use
 `src/core/simd.zig` lane batches where the work is regular; branch-heavy A*
 frontier expansion remains scalar inside threaded request ranges. Path results
 are consumed on later fixed steps so missing or unreachable paths do not stall
-same-step movement, and unavailable keys are cached by
-`nav_version + agent_class + start_cell + goal_cell` to avoid repeated request
-spam. True fallback A* work has its own per-step request budget; overflow stays
-pending in stable order and is retried on later fixed steps. Completed-result,
-entity-result, unavailable-key, and goal-field caches are fixed-capacity runtime
-structures with explicit eviction or saturation behavior rather than unbounded
-growth.
+same-step movement. Cache and pending keys are goal-keyed
+(`nav_version + agent_class + goal_level + goal_cell`) so a moving agent reuses one
+shared result and derives its per-step waypoint from its current cell against the
+stored path/corridor; agents that share a goal share one pending entry. A* scratch
+is sized to a configured `max_explored_nodes` (not the whole grid) via a cell->slot
+hash with generation stamps; hitting the local node budget or saturating the
+abstract scratch returns `pending` and increments `path_budget_exhausted`. A blocked
+goal projects to the nearest open cell on the goal level
+(`path_goal_projected`); `unavailable` is reserved for definitive negatives
+(disconnected component, no open cell near the goal, or no corridor across levels). Oversized worlds fail
+loud at `NavGrid.rebuild` with `error.NavWorldTooLarge` rather than degrading at
+query time. The managed flow field is built only on declared group requests
+(zero cost otherwise), rebuilt only when the goal crosses a nav cell and at most
+once per `group_field_rebuild_min_steps`, and budgeted across frames by
+`group_field_build_budget`. Completed-path, unavailable-key, and group-field
+registries are fixed-capacity runtime structures with explicit eviction or
+saturation behavior rather than unbounded growth.
 
 The demo player is intentionally a special-case facade for player input and
 facing rules, backed by `DataSystem` data. Enemies and other world objects

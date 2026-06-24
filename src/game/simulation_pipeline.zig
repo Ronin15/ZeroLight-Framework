@@ -178,6 +178,10 @@ pub const SimulationPipeline = struct {
         const ai_stats = try self.ai.update(ai_slice, move_slice, data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
+            // Every demo agent seeks the moving player: the canonical shared goal.
+            // Declaring group mode routes them through one managed flow field
+            // toward the player's nav cell instead of N individual A* solves.
+            .nav_request_kind = .group,
             .navigation_intents = &frame.navigation_intents,
         });
         ai_timer.stop(context.perf, .pipeline_ai);
@@ -298,7 +302,7 @@ test "pipeline updates full active player-only state through serial path" {
             .max_frame_requests = 2,
             .max_pending_requests = 2,
             .max_cached_results = 4,
-            .max_goal_fields = 1,
+            .max_group_fields = 1,
             .max_worker_scratch_slots = 4,
             .max_solved_requests_per_step = 2,
             .max_fallback_requests_per_step = 2,

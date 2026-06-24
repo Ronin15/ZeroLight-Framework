@@ -62,7 +62,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
         .max_frame_requests = count,
         .max_pending_requests = count,
         .max_cached_results = count * 2,
-        .max_goal_fields = 4,
+        .max_group_fields = 4,
         .max_worker_scratch_slots = 1,
         .max_solved_requests_per_step = count,
     });

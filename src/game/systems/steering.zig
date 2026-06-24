@@ -495,6 +495,10 @@ pub const SteeringSystem = struct {
     }
 
     fn writePathRequests(self: *SteeringSystem, frame: *SimulationFrame, request_count: usize) !void {
+        // Agents have no per-entity level column yet, so the start level is the
+        // single-level default; a per-entity lookup replaces this when multi-level
+        // placement exists.
+        const agent_start_level: u16 = 0;
         const request_range_base = try frame.path_requests.appendRangeCounts(1);
         frame.path_requests.addCount(request_range_base, request_count);
         try frame.path_requests.prefixAppendedRanges(request_range_base);
@@ -506,6 +510,12 @@ pub const SteeringSystem = struct {
             request_writer.write(PathRequest{
                 .entity = selected.entity,
                 .agent_class = selected.intent.agent_class,
+                .kind = selected.intent.kind,
+                // No per-entity level store exists yet, so the agent's start level
+                // is the single-level default (0). When real multi-level placement
+                // lands, source this from a per-entity level column.
+                .start_level = agent_start_level,
+                .goal_level = selected.intent.goal_level,
                 .start = .{ .x = self.start_x.items[index], .y = self.start_y.items[index] },
                 .goal = selected.intent.goal,
             });
@@ -570,7 +580,8 @@ pub const SteeringSystem = struct {
         _ = self;
         // Missing paths request work, pending paths hold direction, unavailable
         // paths enter backoff, and available paths steer toward the next waypoint.
-        const view = pathfinding.statusForEntityWorld(selected.entity, start, selected.intent.goal, selected.intent.agent_class);
+        // Single-level default start level (0).
+        const view = pathfinding.statusForEntityWorld(selected.entity, 0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class);
         switch (view.status) {
             .available => {
                 stats.path_available_count += 1;
@@ -1180,7 +1191,7 @@ test "steering requests missing paths then follows available path results" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 2, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1215,7 +1226,7 @@ test "steering missing path requests respect replan cooldown" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 2, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1247,7 +1258,7 @@ test "steering unavailable paths enter backoff without request spam" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1278,7 +1289,7 @@ test "steering keeps highest priority navigation intent with stable tie order" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1312,7 +1323,7 @@ test "steering capped selection keeps highest priority entity intent" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1344,7 +1355,7 @@ test "steering prunes runtime rows for removed steering entities" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1375,7 +1386,7 @@ test "steering applies local agent and static obstacle avoidance" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1420,7 +1431,7 @@ test "steering serial and real threaded workers produce identical movement inten
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_goal_fields = 4, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 128 });
     try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 32);
 
     var serial_frame = SimulationFrame.init(std.testing.allocator);
@@ -1476,7 +1487,7 @@ test "steering update is allocation-free after reserves and warmup" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1523,7 +1534,7 @@ test "steering obstacle scratch reserve is independent from agent reserve" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1568,7 +1579,7 @@ test "steering prunes runtime rows for destroyed entities" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1612,7 +1623,7 @@ test "steering bounds dense crowd candidate checks" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -1641,7 +1652,7 @@ test "steering bounds dense obstacle candidate checks" {
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
-    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_goal_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .max_worker_scratch_slots = 1, .max_solved_requests_per_step = 4 });
     try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
 
     var frame = SimulationFrame.init(std.testing.allocator);

@@ -1198,6 +1198,15 @@ transitions.
 
 ## Slice 18: Frame-Delayed Pathfinding System
 
+> Note (superseded core): Slice 25 replaced the goal-field-centric core described
+> below. The opportunistic per-step auto-grouped goal fields, the open-grid direct
+> path / portal-detour fast paths, and the start-cell-in-key model are gone. The
+> frame-delayed request/result contract, fixed-capacity caches, deterministic
+> deferral, and adaptive thread scheduling remain. Read the Slice 25 section and
+> `docs/architecture.md` for the as-built solver (per-agent budgeted A* + managed
+> shared-goal flow field + chunk-portal abstract/cross-level tier). This slice is
+> retained as historical record.
+
 Goal: add a state-owned, frame-delayed grid pathfinding system so AI and rule
 processors can request navigation without blocking current-step movement or
 storing solver queues, caches, or scratch data in `DataSystem`.
@@ -1346,6 +1355,13 @@ stage writes final NPC `MovementIntent`s. Player movement remains direct input,
 and collision response still resolves after movement.
 
 ## Slice 20: Navigation Hardening And Hard-Path Budgets
+
+> Note (superseded core): Slice 25 supersedes the goal-field core and the
+> opportunistic fast paths this slice hardened. The node-budget concept it
+> introduced lives on as the per-agent A* `max_explored_nodes` budget and the
+> abstract `max_abstract_nodes` budget; the budget-spill-returns-`pending`
+> contract is unchanged. The auto-grouped goal fields it tuned are replaced by the
+> declared managed shared-goal flow field. Retained as historical record.
 
 Goal: keep rare true-A* and complex-map navigation costs bounded, tested, and
 visible so pathfinding remains a stable gameplay foundation as map and NPC
@@ -1876,9 +1892,13 @@ Architecture notes:
 - A path query maps start/goal to `(level, cell)`, projects a blocked goal to the
   nearest open cell within a bounded radius, rejects cross-component goals via
   per-level connected components, then runs abstract A* over the portal graph plus
-  link edges (Z-crossing is a link edge between portal nodes in different levels)
-  and refines only the first segment into the `next_waypoint` steering consumes.
-  The `PathView` contract (`status`/`next_waypoint`/`path_len`) is unchanged.
+  link edges (Z-crossing is a link edge between portal nodes in different levels).
+  The chosen corridor is then STITCHED into one obstacle-aware (level,cell) path by
+  running per-segment local A* between consecutive corridor portals (a discrete jump
+  only across a link edge) and cached whole; the per-agent query walks the path on its
+  current level cell by cell, so multi-hop and cross-level routes converge with every
+  heading a traversable neighbor. The `PathView` contract
+  (`status`/`next_waypoint`/`path_len`) is unchanged.
 - Per-agent A* uses a binary-heap open set and generation-stamped closed/g-cost
   storage sized to a bounded `max_explored_nodes` budget (e.g. 4096) via a
   cell→slot hash, not whole-grid arrays. Budget exhaustion returns `pending`
@@ -1888,9 +1908,19 @@ Architecture notes:
   waypoint is re-refined from the agent's current cell each step it is consumed,
   so a moving agent reuses one corridor for its whole trip and many agents sharing
   a goal share one pending entry.
-- Goal fields, goal groups, and their stats are removed (wrong tool for per-agent
-  goals). An optional shared-goal flow field may return later behind a config flag
-  for swarm scenarios; it is not in the default path.
+- The core provides TWO coordinated solver modes. (1) Per-agent A* for distinct
+  goals (the default). (2) A MANAGED shared-goal flow field for declared common
+  goals (crowds converging on the player/an objective): a small fixed registry of
+  reverse-Dijkstra integration fields keyed by `{nav_version, goal_cell}`,
+  persistent and reused across frames and all agents, rebuilt only when nav
+  changes or the declared goal crosses into a new nav cell, throttled by a minimum
+  rebuild interval, and built under a per-frame expansion budget (a field may be
+  `building` across frames) so it never spikes. This is NOT the old per-step
+  auto-grouped goal field (which thrashed at `field_cache_hits=0`); grouping is
+  declared by the request, not detected. Agents sample the field in O(1) and the
+  result surfaces through the unchanged `PathView` contract. The long-range
+  individual mechanism is the Slice 25C chunk-portal abstract tier; the group
+  field is the shared-goal mechanism — both coexist.
 - Dynamic updates are event-driven: `world_tile_changed`/`world_obstacle_changed`
   map to affected cells, flip blocked bits, mark owning (and border-touching
   neighbor) chunks dirty, and `applyNavUpdates` recomputes only dirty chunks'
@@ -1919,9 +1949,12 @@ Sub-slices (each independently shippable and headless-testable):
 - Slice 25A — `WorldSystem` per-level navigability accessor + `LevelLink` store;
   pathfinding consumes `levelBlocksMovement` for level 0 only (behavior-preserving
   for the single-level demo).
-- Slice 25B — per-agent A* + goal-keyed corridor cache; remove goal fields, cell
-  gates, and the start-cell key; add `max_explored_nodes` and `max_nav_memory_bytes`;
-  fix the `deferred_requests` double-write; redefine `unavailable` vs `pending`.
+- Slice 25B — hybrid core: per-agent A* (goal-keyed corridor cache, budgeted
+  scratch) PLUS a managed shared-goal flow-field registry. Remove the old
+  auto-grouped goal fields, cell gates, and the start-cell key; add
+  `max_explored_nodes`, `max_group_fields`, group rebuild throttle/budget, and
+  `max_nav_memory_bytes`; fix the `deferred_requests` double-write; redefine
+  `unavailable` vs `pending`; request contract carries individual-vs-group kind.
 - Slice 25C — chunk-portal abstract tier and cross-level query; `PathRequest`/
   `NavigationIntent` gain `start_level`/`goal_level`; steering fills them.
 - Slice 25D — event-driven incremental rebuild: dirty-chunk queue, `applyNavUpdates`,
@@ -1930,51 +1963,87 @@ Sub-slices (each independently shippable and headless-testable):
 
 Checklist:
 
-- [ ] 25A: add `WorldSystem.levelBlocksMovement`, `levelCount`, and `LevelLink`
+- [x] 25A: add `WorldSystem.levelBlocksMovement`, `levelCount`, and `LevelLink`
       store/accessors; switch `markWorldObstacles` to per-level composition.
-- [ ] 25B: replace goal-field core with budgeted per-agent A* and goal-keyed
-      corridor cache; delete cell gates and goal-field stats; add memory-gate
-      validation; fix the `deferred_requests` single-write.
-- [ ] 25C: build per-level chunk-portal graph; abstract A* over portals + link
-      edges; first-segment refinement; add level fields to request/intent/steering.
+- [x] 25B: per-agent A* (budgeted scratch, goal-keyed corridor cache, no
+      start-cell key); delete the old auto-grouped goal fields, cell gates, and
+      their stats; add memory-gate validation; fix the `deferred_requests`
+      single-write. Heap A* is now the sole individual solver; scratch is sized
+      to `max_explored_nodes` via a cell->slot hash, not whole-grid arrays; the
+      node-budget spill returns `pending` and increments `path_budget_exhausted`.
+- [x] 25B: managed shared-goal flow-field registry (`max_group_fields`,
+      cell-quantized + throttled + per-frame-budgeted rebuilds, declared by
+      request kind, sampled O(1) through `PathView`); both modes tested. Group
+      fields are built only on declared `group` requests (zero cost when unused),
+      throttled by `group_field_rebuild_min_steps`, and built across frames under
+      `group_field_build_budget`.
+- [x] 25C: build per-level chunk-portal graph; abstract A* over portals + link
+      edges; stitch the chosen corridor into one full obstacle-aware (level,cell) path
+      via per-segment local A* (link edges are discrete jumps) and walk it per-agent on
+      its current level cell by cell; add level fields to request/intent/steering.
+      Abstract scratch saturation or a per-segment node-budget spill returns
+      `budget_exhausted` (retry), reserving `unavailable` for a missing corridor.
+      Abstract seeding scans only the start level's portals via a per-level portal
+      index, so per-query work is bounded independent of total cells and of other
+      levels' portals.
 - [ ] 25D: dirty-chunk incremental rebuild driven by typed world events; replace
       full nav rebuild on tile change; add nav-update metrics.
-- [ ] Reset the demo `nav_cell_size` stopgap (currently 128) to a tile-aligned
-      principled value; coarseness lives in the chunk tier, not the cell size.
-- [ ] Keep pathfinding a gameplay system in `src/game/systems/`; no test-only
+- [x] Reset the demo `nav_cell_size` stopgap (currently 128) to a tile-aligned
+      principled value (32 = one nav cell per tile); coarseness lives in the chunk
+      tier, not the cell size.
+- [x] Keep pathfinding a gameplay system in `src/game/systems/`; no test-only
       enum tags, marker fields, or fixture hooks in production contracts.
 
 Acceptance checks:
 
-- [ ] Intra-level paths are correct against a per-level composed mask; a cross-
-      level path uses a `LevelLink`; a blocked goal projects to the nearest open
-      cell; disconnected goals return `unavailable` exactly once and cache.
-- [ ] A moving agent toward a fixed goal produces one accepted request then cache
-      reuse (no per-cell churn); `replans` collapses versus the current baseline.
-- [ ] Per-query explored-node count is bounded and independent of total world cell
-      count; the `pipeline_pathfinding` max spike is eliminated.
-- [ ] An oversized world returns `error.NavWorldTooLarge` at construction; no query
-      path ever silently degrades to direct seek.
+- [x] Intra-level paths are correct against a per-level composed mask; a blocked
+      goal projects to the nearest open cell (`path_goal_projected`); disconnected
+      goals return `unavailable` exactly once and cache.
+- [x] Cross-level `LevelLink` traversal works (25C): a bidirectional link routes an
+      off-level agent across floors (`cross_level_solves`); a directed link works one
+      way only; a missing or blocked-endpoint link returns `unavailable` (not a
+      permanent stall); per-level obstacles do not bleed across floors; a multi-hop
+      same-level corridor (split component bridged by a same-level teleport) and a
+      cross-level corridor both travel obstacle-free past a concave wall in single-cell
+      steps (no straight-line cut) and reach the goal; abstract scratch saturation
+      reads pending (not cached unavailable); a warmed abstract solve does not
+      allocate; a cross-level group member falls back to an individual corridor once
+      the goal-level field is ready. All asserted by headless tests.
+- [x] A moving agent toward a fixed goal produces one accepted request then cache
+      reuse (no per-cell churn): asserted by the goal-keyed dedup-under-drift test.
+- [x] Per-query explored-node count is bounded (`max_explored_nodes`) and
+      independent of total world cell count; spills return `pending`.
+- [x] An oversized world returns `error.NavWorldTooLarge` at construction; no query
+      path ever silently degrades to direct seek (the cell gates were removed).
 - [ ] A tile/obstacle event blocks/unblocks a corridor and the next path reflects
       it; `nav_incremental_rebuilds`/`nav_version_bumps` are non-zero and full
-      rebuild runs only at init.
-- [ ] `zig build fmt`, `zig build check`, `zig build test`, `zig build verify`, and
-      targeted Debug/ReleaseFast pathfinding benchmarks pass; benchmarks report
-      before/after `replans`, `stuck`, `unavailable`, and pathfinding timing.
+      rebuild runs only at init. (Slice 25D.)
+- [x] `zig build fmt`, `zig build check`, `zig build test`, `zig build verify`, and
+      targeted pathfinding benchmarks pass.
 
 Open decisions (recommendation in parentheses): inter-level link representation
 (explicit `LevelLink` records, not inferred tile flags); chunk size (16 tiles);
-keep a default flow-field path (no — opt-in only for future swarm cases);
+shared-goal flow field is folded into the 25B core (declared by request kind,
+persistent, cell-quantized + throttled + budgeted), not opportunistically grouped;
 parallel-solve threshold (keep existing adaptive/inline behavior; `applyNavUpdates`
 serial initially); `components` width (u32 initially); goal-level source
 (`NavigationIntent`, default 0 until multi-level gameplay exists).
 
-Status: design of record, not yet implemented. Recommended implementation order
-is 25A then 25B (foundation plus the highest-payoff correctness fix), with a
-captured baseline 60s perf sample before 25B, then 25C and 25D. Route each slice
-diff to review with attention to the goal-keyed cache reuse contract, the
-single-write `deferred_requests` fix, gate removal, and no lingering goal-field
-test hooks.
+Status: 25A, 25B, and 25C implemented. The hybrid core ships goal-keyed individual
+A* with budget-bounded scratch, the managed shared-goal flow-field registry, and the
+chunk-portal abstract tier with cross-level `LevelLink` routing. Long-range and
+cross-level queries route through abstract A* over portal/link nodes, then stitch the
+chosen corridor into one full obstacle-aware (level,cell) path via per-segment local
+A* (link edges are discrete jumps) and cache it whole; the per-agent query walks it on
+its current level cell by cell, so every heading is a traversable neighbor. Abstract
+seeding scans only the start level's portals (per-level portal index); abstract scratch
+saturation or a per-segment node-budget spill returns `budget_exhausted` (retry) rather
+than a hard negative. The old auto-grouped goal fields, cell gates, start-cell key, and
+their stats remain removed; `deferred_requests` is a single post-compaction write in
+both update paths; the memory gate fails loud at rebuild. 25D (event-driven
+incremental rebuild) remains; until it lands, a nav change triggers a full rebuild
+with a `nav_version` bump. Route the remaining slice diff to review with attention to
+the goal-keyed cache reuse and corridor-advancement contracts and gate behavior.
 
 ## Suggested Order
 

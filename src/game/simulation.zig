@@ -323,9 +323,23 @@ pub const PathAgentClass = enum {
     default,
 };
 
+/// Solver mode selected per navigation request.
+/// `individual` runs goal-keyed budget-bounded A*; `group` declares a shared
+/// goal serviced by a managed reverse-Dijkstra flow field. Grouping is always
+/// declared by the requester, never detected.
+pub const PathRequestKind = enum {
+    individual,
+    group,
+};
+
 pub const PathRequest = struct {
     entity: EntityId,
     agent_class: PathAgentClass = .default,
+    kind: PathRequestKind = .individual,
+    // Z-level floors for start/goal. Both default to 0 for the single-level
+    // demo; cross-level queries route through `LevelLink` edges.
+    start_level: u16 = 0,
+    goal_level: u16 = 0,
     start: math.Vec2,
     goal: math.Vec2,
 };
@@ -333,6 +347,10 @@ pub const PathRequest = struct {
 pub const NavigationIntent = struct {
     entity: EntityId,
     agent_class: PathAgentClass = .default,
+    kind: PathRequestKind = .individual,
+    // Target Z-level floor. Defaults to 0 until multi-level gameplay placement
+    // exists; the start level is supplied by the producing system.
+    goal_level: u16 = 0,
     goal: math.Vec2,
     direct_direction_x: f32 = 0,
     direct_direction_y: f32 = 0,

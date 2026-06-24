@@ -31,6 +31,7 @@ const AiAgent = @import("../data_system.zig").AiAgent;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const NavigationIntent = @import("../simulation.zig").NavigationIntent;
+const PathRequestKind = @import("../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 
@@ -58,6 +59,10 @@ pub const AiConfig = struct {
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
     seek_target: ?math.Vec2 = null,
+    /// Solver mode stamped on emitted navigation intents. The shared-player-seek
+    /// demo declares `group` so all seekers share one managed flow field; tests
+    /// and other callers keep the default `individual`.
+    nav_request_kind: PathRequestKind = .individual,
     navigation_intents: ?*RangeOutputStream(NavigationIntent) = null,
 };
 
@@ -189,6 +194,7 @@ pub const AiSystem = struct {
             .target_x = target_x,
             .target_y = target_y,
             .seed = system_config.intent_seed,
+            .nav_request_kind = system_config.nav_request_kind,
             .range_base = range_base,
         };
 
@@ -264,6 +270,7 @@ pub const AiSystem = struct {
 
             writer.write(.{
                 .entity = self.entities.items[i],
+                .kind = system_config.nav_request_kind,
                 .goal = .{ .x = tx, .y = ty },
                 .direct_direction_x = dir.x,
                 .direct_direction_y = dir.y,
@@ -387,6 +394,7 @@ const NormalizedAiConfig = struct {
     intent_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_seed: u64,
     seek_target: ?math.Vec2,
+    nav_request_kind: PathRequestKind,
     navigation_intents: ?*RangeOutputStream(NavigationIntent),
 };
 
@@ -407,6 +415,7 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
             null,
         .intent_seed = config.intent_seed,
         .seek_target = config.seek_target,
+        .nav_request_kind = config.nav_request_kind,
         .navigation_intents = config.navigation_intents,
     };
 }
@@ -707,6 +716,7 @@ const AiJobContext = struct {
     target_x: f32,
     target_y: f32,
     seed: u64,
+    nav_request_kind: PathRequestKind,
     range_base: usize,
 };
 
@@ -731,6 +741,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
 
         writer.write(.{
             .entity = job.entities[i],
+            .kind = job.nav_request_kind,
             .goal = .{ .x = job.target_x, .y = job.target_y },
             .direct_direction_x = dir.x,
             .direct_direction_y = dir.y,

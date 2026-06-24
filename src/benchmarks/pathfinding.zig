@@ -150,7 +150,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var system = PathfindingSystem.init(allocator);
     defer system.deinit();
     if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
-        system.field_tuner = tuner;
+        system.fallback_tuner = tuner;
     }
 
     const grid_side = fixtureGridSide(item_count, .common_goal);
@@ -159,7 +159,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         .max_frame_requests = item_count,
         .max_pending_requests = item_count,
         .max_cached_results = item_count * 2,
-        .max_goal_fields = 8,
+        .max_group_fields = 8,
         .max_worker_scratch_slots = 64,
         .max_solved_requests_per_step = item_count,
         .max_fallback_requests_per_step = item_count,
@@ -184,12 +184,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
-        while (!system.field_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
+        while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearTransientRequestsRetainingFields();
             _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count);
         }
     }
-    const solve_settled_before_measurement = if (case.adaptive) system.field_tuner.isSettled() else false;
+    const solve_settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
@@ -202,10 +202,14 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
 
     var stats = accumulator.finish();
-    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    stats.candidate_pairs = last_stats.field_requests;
+    // Goal-keyed dedup resolves a shared goal once; same-goal duplicates and
+    // warm cache hits are also resolved agents. Count all so output_count still
+    // reflects every requesting agent.
+    stats.output_count = last_stats.available_results + last_stats.unavailable_results +
+        last_stats.duplicate_requests + last_stats.cache_hits;
+    stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
     if (case.adaptive) {
-        stats.work_tuning = suite.workTuningSummary(system.field_tuner.report(), solve_settled_before_measurement);
+        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), solve_settled_before_measurement);
     }
     return stats;
 }
@@ -252,7 +256,7 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
         .max_frame_requests = item_count,
         .max_pending_requests = item_count,
         .max_cached_results = item_count * 2,
-        .max_goal_fields = 8,
+        .max_group_fields = 8,
         .max_worker_scratch_slots = 64,
         .max_solved_requests_per_step = solve_budget,
         .max_fallback_requests_per_step = fallback_budget,
