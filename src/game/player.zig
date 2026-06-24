@@ -22,7 +22,7 @@ pub const Player = struct {
 
     const initial_position = math.Vec2{ .x = 400, .y = 225 };
     const size = math.Vec2{ .x = 32, .y = 32 };
-    const speed: f32 = 240;
+    const speed: f32 = 120;
     const marker_length: f32 = 12;
     const marker_depth: f32 = 6;
     const marker_margin: f32 = 4;
