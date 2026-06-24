@@ -488,8 +488,8 @@ fn selectStageWork(
 
 fn cellForPosition(x: f32, y: f32) GridCell {
     return .{
-        .x = @intFromFloat(@floor(x / grid_cell_size)),
-        .y = @intFromFloat(@floor(y / grid_cell_size)),
+        .x = math.floorToI32(x / grid_cell_size),
+        .y = math.floorToI32(y / grid_cell_size),
     };
 }
 

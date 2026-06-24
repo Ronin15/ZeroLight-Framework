@@ -565,13 +565,13 @@ fn rendererRenderText(context: *anyopaque, font: *c.TTF_Font, request: TextReque
     const color = ColorKey.fromColor(request.style.color).toSdl();
     c.TTF_SetFontWrapAlignment(font, sdlAlignment(request.layout.alignment));
 
-    const surface = if (request.layout.wrap)
+    const surface = (if (request.layout.wrap)
         c.TTF_RenderText_Blended_Wrapped(font, request.text.ptr, request.text.len, color, @intCast(request.layout.max_width.?))
     else
-        c.TTF_RenderText_Blended(font, request.text.ptr, request.text.len, color) orelse {
-            log.err("TTF text render failed: {s}", .{c.SDL_GetError()});
-            return error.SdlError;
-        };
+        c.TTF_RenderText_Blended(font, request.text.ptr, request.text.len, color)) orelse {
+        log.err("TTF text render failed: {s}", .{c.SDL_GetError()});
+        return error.SdlError;
+    };
     defer c.SDL_DestroySurface(surface);
 
     const texture = try createTextureFromTextSurface(renderer, surface);

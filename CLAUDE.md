@@ -32,6 +32,8 @@ boundaries just to make a local change easier.
 
 - `src/main.zig` — thin entry/timing: builds `AppConfig`, inits `Engine`, runs
   the fixed-step loop. Keep it thin.
+- `src/config.zig` — shared `AppConfig`, presentation options, clear color, and
+  thread-system defaults consumed by build options and runtime startup.
 - `src/app/` — app coordination: `engine.zig`, state stack, `input.zig` +
   `input_router.zig`, `time_loop.zig` (60Hz), `frame_pacer.zig`, `audio.zig`,
   `thread_system.zig`, `resolution.zig`.

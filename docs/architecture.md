@@ -19,8 +19,10 @@ game-specific behavior under `src/game/`.
 - `src/app/time_loop.zig` keeps simulation fixed at 60Hz.
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
+- `src/app/pause_controller.zig` owns the pause policy: pushes the modal `PauseState` over gameplay and resets timing on resume.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
+- `src/app/runtime_perf_log.zig` records fixed-step runtime perf metrics consumed by states and the debug overlay.
 - `src/assets/assets.zig` resolves safe runtime asset paths,
   `src/assets/image.zig` decodes PNGs into transient CPU image data,
   `src/assets/cache.zig` caches renderer-backed runtime assets,

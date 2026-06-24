@@ -217,12 +217,22 @@ const SourceRectTable = struct {
     rects: []manifest.SourceRect,
 };
 
+// Dense lookup table keyed by sprite id, so its size follows the largest id
+// rather than the sprite count. Sprite ids are validated u16s (< grid cell
+// count, never maxInt(u16)) before this runs, so the table is already bounded
+// to <= max_source_rect_entries; the explicit cap documents that bound and
+// guards against a sparse, high-id sidecar forcing a wasteful allocation.
+const max_source_rect_entries: usize = std.math.maxInt(u16);
+
 fn buildSourceRectTable(allocator: std.mem.Allocator, sprites: []const JsonSpriteEntry) !SourceRectTable {
     var max_id: usize = 0;
     for (sprites) |sprite| {
         max_id = @max(max_id, sprite.id);
     }
     const count = if (sprites.len == 0) 0 else max_id + 1;
+    if (count > max_source_rect_entries) {
+        return atlas_meta_common.LayoutMismatch.AtlasLayoutMismatch;
+    }
     const valid = try allocator.alloc(bool, count);
     errdefer allocator.free(valid);
     const rects = try allocator.alloc(manifest.SourceRect, count);

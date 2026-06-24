@@ -85,6 +85,10 @@ pub const GameDemoState = struct {
     collision_sfx_cooldown_count: usize = 0,
     music_started: bool = false,
     jet_loop_active: bool = false,
+    // Set when a pause interrupts an active jet loop: onPause has no audio
+    // command buffer, so the stale engine-side loop is stopped on the first
+    // update after resume before the movement edge can re-trigger it.
+    jet_loop_stop_pending: bool = false,
     camera_previous: Camera2D = .{},
     camera_current: Camera2D = .{},
     viewport_width: f32 = 800,
@@ -497,6 +501,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn onPause(self: *GameDemoState) void {
+        if (self.jet_loop_active) self.jet_loop_stop_pending = true;
         self.jet_loop_active = false;
         self.syncInterpolatedState();
     }
@@ -675,6 +680,11 @@ pub const GameDemoState = struct {
                 .fade_in_ms = 750,
             }) catch return;
             self.music_started = true;
+        }
+
+        if (self.jet_loop_stop_pending) {
+            audio.stopLoopingSfx(player_jet_loop_id) catch {};
+            self.jet_loop_stop_pending = false;
         }
 
         if (self.data.movementBodyConst(self.player.entity)) |body| {
@@ -1456,7 +1466,8 @@ test "demo owns and completes a simulation frame during update" {
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.structural_commands.mergedItems().len);
     const player_after = demo.data.movementBodyConst(demo.player.entity).?;
     try std.testing.expect(player_after.position.x > player_before.position.x);
-    try std.testing.expectEqual(@as(f32, 240), player_after.velocity.x);
+    // moveRight (direction.x = 1) * Player.speed (120) = 120.
+    try std.testing.expectEqual(@as(f32, 120), player_after.velocity.x);
     var any_square_moved = false;
     for (demo.test_squares, 0..) |entity, index| {
         const body = demo.data.movementBodyConst(entity).?;

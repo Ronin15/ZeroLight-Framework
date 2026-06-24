@@ -1129,7 +1129,7 @@ fn spatialCellSize(steering: ConstSteeringAgentSlice) f32 {
 }
 
 fn spatialCell(value: f32, cell_size: f32) i32 {
-    return @intFromFloat(@floor(value / @max(cell_size, min_spatial_cell_size)));
+    return math.floorToI32(value / @max(cell_size, min_spatial_cell_size));
 }
 
 fn normalizeOrZero(dx: f32, dy: f32) math.Vec2 {

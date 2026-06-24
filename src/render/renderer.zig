@@ -606,6 +606,11 @@ pub const Renderer = struct {
             new_capacity *= 2;
         }
 
+        // Growth requires a full GPU idle below, stalling the pipeline. Large
+        // scenes should reserve vertex capacity up front; warn so an unreserved
+        // runtime grow-and-stall is visible rather than silent.
+        log.warn("growing vertex batch capacity {} -> {} vertices (GPU stall); reserve capacity to avoid this", .{ self.batch_capacity_vertices, new_capacity });
+
         const new_vertex_buffer = try gpu_buffer.createVertexBuffer(self.device, new_capacity);
         errdefer c.SDL_ReleaseGPUBuffer(self.device, new_vertex_buffer);
 

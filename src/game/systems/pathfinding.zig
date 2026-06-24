@@ -265,8 +265,8 @@ const NavGrid = struct {
     fn worldToCellClamped(self: *const NavGrid, value: math.Vec2) GridCell {
         const max_x: i32 = @intCast(self.width - 1);
         const max_y: i32 = @intCast(self.height - 1);
-        const raw_x: i32 = @intFromFloat(@floor(value.x / self.cell_size));
-        const raw_y: i32 = @intFromFloat(@floor(value.y / self.cell_size));
+        const raw_x: i32 = math.floorToI32(value.x / self.cell_size);
+        const raw_y: i32 = math.floorToI32(value.y / self.cell_size);
         return .{
             .x = std.math.clamp(raw_x, 0, max_x),
             .y = std.math.clamp(raw_y, 0, max_y),

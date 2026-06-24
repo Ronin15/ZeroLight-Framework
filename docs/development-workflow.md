@@ -131,8 +131,11 @@ zig build --release=safe -Dlog-level=err
 ## Atlas Packing
 
 Loose source sprites under `source_assets/` pack into runtime atlases under
-`assets/sprites/`. See `docs/atlas-asset-workflow.md` for the full filename-driven
-workflow, order manifests, and art-swap steps.
+`assets/sprites/`. `source_assets/` is optional and only needs to exist once you
+add raw art to pack; until then the runtime ships the registered sidecars in
+`assets/sprites/` and atlas lint runs in sidecar-only mode. See
+`docs/atlas-asset-workflow.md` for the full filename-driven workflow, order
+manifests, and art-swap steps.
 
 Atlas packing, source-art export, and placeholder generation require Python 3
 and Pillow (`pip install pillow`). Runtime atlas lint reads registered PNG/JSON

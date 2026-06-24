@@ -369,6 +369,9 @@ pub const SimulationFrame = struct {
     collision_triggers: RangeOutputStream(CollisionTriggerEvent),
     structural_commands: RangeOutputStream(StructuralCommand),
     structural_plan_scratch: StructuralPlanScratch,
+    // Reused across commits so a structural-mutating frame stays allocation-free
+    // after warmup; cleared (capacity retained) at the start of each commit.
+    structural_changes_scratch: std.ArrayList(StructuralChange) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
@@ -385,6 +388,7 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
+        self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.structural_commands.deinit();
         self.collision_triggers.deinit();
@@ -410,6 +414,7 @@ pub const SimulationFrame = struct {
         self.collision_triggers.clearRetainingCapacity();
         self.structural_commands.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
+        self.structural_changes_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -449,14 +454,14 @@ pub const SimulationFrame = struct {
     ) !StructuralCommitStats {
         self.phase = .commit_structural;
         const commands = self.structural_commands.mergedItems();
-        var changes = std.ArrayList(StructuralChange).empty;
-        defer changes.deinit(self.events.stream.allocator);
+        const changes = &self.structural_changes_scratch;
+        changes.clearRetainingCapacity();
         var preparer = StructuralCommitPreparer{
             .frame = self,
-            .changes = &changes,
+            .changes = changes,
             .extra_required_events = extra_required_events,
         };
-        var sink = StructuralChangeSink{ .changes = &changes };
+        var sink = StructuralChangeSink{ .changes = changes };
         const stats = try data.applyStructuralCommandsPrepared(commands, &self.structural_plan_scratch, &preparer, &sink);
         std.debug.assert(changes.items.len <= preparer.structural_event_count);
         try self.publishStructuralChanges(changes.items);
