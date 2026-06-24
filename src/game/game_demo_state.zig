@@ -71,6 +71,27 @@ const procedural_world_config = world_system.WorldBuildConfig{
 };
 const world_render_overscan_chunks: u16 = 0;
 
+/// Comptime-gated wall-clock timer for one gameplay-tick stage. Zero-cost no-op
+/// when perf logging is disabled; samples the SDL nanosecond clock otherwise.
+const StageTimer = if (runtime_perf_log.enabled) struct {
+    start_ns: u64,
+
+    fn start() StageTimer {
+        return .{ .start_ns = c.SDL_GetTicksNS() };
+    }
+
+    fn stop(self: StageTimer, perf: runtime_perf_log.Context, timing: runtime_perf_log.Timing) void {
+        const end_ns = c.SDL_GetTicksNS();
+        perf.recordTiming(timing, if (end_ns > self.start_ns) end_ns - self.start_ns else 0);
+    }
+} else struct {
+    fn start() StageTimer {
+        return .{};
+    }
+
+    fn stop(_: StageTimer, _: runtime_perf_log.Context, _: runtime_perf_log.Timing) void {}
+};
+
 pub const GameDemoState = struct {
     data: DataSystem,
     simulation_frame: SimulationFrame,
@@ -192,6 +213,13 @@ pub const GameDemoState = struct {
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
             .contact_capacity = demo_contact_capacity,
+            // The procedural world spans 512x512 tiles (16384px/side). At the
+            // default 32px nav cell that is 262_144 grid cells, which exceeds the
+            // pathfinding goal-field/fallback gates (65_536 cells) and silently
+            // disables both solvers. A 128px nav cell keeps the grid at
+            // 128x128 = 16_384 cells, well under the gate, so navigation actually
+            // solves instead of falling back to direct seek.
+            .nav_cell_size = 128,
             .pathfinding = .{
                 .max_frame_requests = test_square_count,
                 .max_pending_requests = test_square_count,
@@ -245,8 +273,13 @@ pub const GameDemoState = struct {
         _ = context.transitions;
         self.simulation_frame.beginStep();
         self.simulation_frame.phase = .main_thread_inputs;
+        var input_timer = StageTimer.start();
         try self.player.applyInput(&self.data, context.input);
+        input_timer.stop(context.perf, .gameplay_input);
+
+        var ambient_audio_timer = StageTimer.start();
         self.queueAmbientAudio(context.audio, context.input);
+        ambient_audio_timer.stop(context.perf, .gameplay_audio);
 
         const pipeline_stats = try self.pipeline.update(.{
             .data = &self.data,
@@ -256,13 +289,25 @@ pub const GameDemoState = struct {
             .delta_seconds = context.delta_seconds,
             .bounds_width = self.bounds_width,
             .bounds_height = self.bounds_height,
+            .perf = context.perf,
         });
+
+        var collision_audio_timer = StageTimer.start();
         self.queueCollisionAudio(context.audio, context.delta_seconds);
+        collision_audio_timer.stop(context.perf, .gameplay_audio);
+
+        var particle_timer = StageTimer.start();
         const particle_stats = self.particles.update(context.thread_system, context.delta_seconds, .{});
+        particle_timer.stop(context.perf, .gameplay_particles);
+
+        var camera_timer = StageTimer.start();
         self.updateCamera();
+        camera_timer.stop(context.perf, .gameplay_camera);
 
         self.simulation_frame.phase = .merge_outputs;
+        var structural_timer = StageTimer.start();
         const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets);
+        structural_timer.stop(context.perf, .gameplay_structural);
         self.simulation_frame.phase = .finished;
 
         if (comptime runtime_perf_log.enabled) {

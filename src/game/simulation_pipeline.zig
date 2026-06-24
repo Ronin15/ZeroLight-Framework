@@ -9,6 +9,8 @@
 
 const std = @import("std");
 const math = @import("../core/math.zig");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
+const c = @import("../platform/sdl.zig").c;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
@@ -53,6 +55,9 @@ pub const SimulationPipelineUpdateContext = struct {
     delta_seconds: f32,
     bounds_width: f32,
     bounds_height: f32,
+    /// Borrowed runtime perf sink. Stage timers are zero-cost when perf
+    /// logging is disabled at comptime, so the hot path stays clean.
+    perf: runtime_perf_log.Context = .{},
 };
 
 /// Aggregated outputs from one pipeline step. Runtime perf and tests consume
@@ -169,22 +174,43 @@ pub const SimulationPipeline = struct {
         else
             math.Vec2{ .x = 400, .y = 225 };
 
+        var ai_timer = StageTimer.start();
         const ai_stats = try self.ai.update(ai_slice, move_slice, data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .seek_target = player_target,
             .navigation_intents = &frame.navigation_intents,
         });
+        ai_timer.stop(context.perf, .pipeline_ai);
+
+        var steering_timer = StageTimer.start();
         const steering_stats = try self.steering.update(data, frame, context.thread_system, &self.pathfinding, .{});
+        steering_timer.stop(context.perf, .pipeline_steering);
+
+        var pathfinding_timer = StageTimer.start();
         const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, context.thread_system, .{});
+        pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
+
+        var apply_intents_timer = StageTimer.start();
         applyAiMovementIntents(data, frame);
+        apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
 
         var movement_slice = data.movementBodySlice();
+        var movement_timer = StageTimer.start();
         const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        movement_timer.stop(context.perf, .pipeline_movement);
 
+        var clamp_timer = StageTimer.start();
         clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
         try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
+        clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
+
+        var collision_timer = StageTimer.start();
         const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{});
+        collision_timer.stop(context.perf, .pipeline_collision);
+
+        var collision_response_timer = StageTimer.start();
         const collision_response_stats = try self.collision_response.update(data, frame);
+        collision_response_timer.stop(context.perf, .pipeline_collision_response);
 
         return .{
             .scope = scope,
@@ -196,6 +222,28 @@ pub const SimulationPipeline = struct {
             .collision_response = collision_response_stats,
         };
     }
+};
+
+/// Comptime-gated wall-clock timer for one pipeline stage. When perf logging
+/// is disabled it is a zero-field, zero-cost no-op; when enabled it samples the
+/// SDL nanosecond clock and forwards the duration to the bound perf context.
+const StageTimer = if (runtime_perf_log.enabled) struct {
+    start_ns: u64,
+
+    fn start() StageTimer {
+        return .{ .start_ns = c.SDL_GetTicksNS() };
+    }
+
+    fn stop(self: StageTimer, perf: runtime_perf_log.Context, timing: runtime_perf_log.Timing) void {
+        const end_ns = c.SDL_GetTicksNS();
+        perf.recordTiming(timing, if (end_ns > self.start_ns) end_ns - self.start_ns else 0);
+    }
+} else struct {
+    fn start() StageTimer {
+        return .{};
+    }
+
+    fn stop(_: StageTimer, _: runtime_perf_log.Context, _: runtime_perf_log.Timing) void {}
 };
 
 fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {

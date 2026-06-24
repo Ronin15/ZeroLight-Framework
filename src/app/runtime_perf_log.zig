@@ -120,6 +120,24 @@ pub const Timing = enum {
     app_tick,
     state_update,
     gameplay_update,
+    // Fine-grained gameplay-tick stages. Each pipeline_* timer covers one
+    // system's whole call (its serial prep plus its threaded dispatch and
+    // join), so comparing it against the matching batch_* avg_ms isolates the
+    // serial/dispatch overhead that the batch counters never see. The
+    // gameplay_* timers cover state-owned glue outside the pipeline.
+    pipeline_ai,
+    pipeline_steering,
+    pipeline_pathfinding,
+    pipeline_apply_intents,
+    pipeline_movement,
+    pipeline_clamp_bounds,
+    pipeline_collision,
+    pipeline_collision_response,
+    gameplay_input,
+    gameplay_audio,
+    gameplay_particles,
+    gameplay_camera,
+    gameplay_structural,
     state_transitions,
     audio_drain,
     loading_build,
@@ -324,6 +342,57 @@ const EnabledRuntimePerfLog = struct {
                 millis(audio_drain_timing.max_ns),
                 millis(loading_build_timing.averageNs()),
                 millis(loading_build_timing.max_ns),
+            },
+        );
+        const pipeline_ai_timing = self.timingValue(.pipeline_ai);
+        const pipeline_steering_timing = self.timingValue(.pipeline_steering);
+        const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
+        const pipeline_apply_intents_timing = self.timingValue(.pipeline_apply_intents);
+        const pipeline_movement_timing = self.timingValue(.pipeline_movement);
+        const pipeline_clamp_timing = self.timingValue(.pipeline_clamp_bounds);
+        const pipeline_collision_timing = self.timingValue(.pipeline_collision);
+        const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
+        log.debug(
+            "perf {d:.1}s pipeline ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            .{
+                elapsed_s,
+                millis(pipeline_ai_timing.averageNs()),
+                millis(pipeline_ai_timing.max_ns),
+                millis(pipeline_steering_timing.averageNs()),
+                millis(pipeline_steering_timing.max_ns),
+                millis(pipeline_pathfinding_timing.averageNs()),
+                millis(pipeline_pathfinding_timing.max_ns),
+                millis(pipeline_apply_intents_timing.averageNs()),
+                millis(pipeline_apply_intents_timing.max_ns),
+                millis(pipeline_movement_timing.averageNs()),
+                millis(pipeline_movement_timing.max_ns),
+                millis(pipeline_clamp_timing.averageNs()),
+                millis(pipeline_clamp_timing.max_ns),
+                millis(pipeline_collision_timing.averageNs()),
+                millis(pipeline_collision_timing.max_ns),
+                millis(pipeline_collision_response_timing.averageNs()),
+                millis(pipeline_collision_response_timing.max_ns),
+            },
+        );
+        const gameplay_input_timing = self.timingValue(.gameplay_input);
+        const gameplay_audio_timing = self.timingValue(.gameplay_audio);
+        const gameplay_particles_timing = self.timingValue(.gameplay_particles);
+        const gameplay_camera_timing = self.timingValue(.gameplay_camera);
+        const gameplay_structural_timing = self.timingValue(.gameplay_structural);
+        log.debug(
+            "perf {d:.1}s gameplay_stage input_avg_ms={d:.3} input_max_ms={d:.3} audio_avg_ms={d:.3} audio_max_ms={d:.3} particles_avg_ms={d:.3} particles_max_ms={d:.3} camera_avg_ms={d:.3} camera_max_ms={d:.3} structural_avg_ms={d:.3} structural_max_ms={d:.3}",
+            .{
+                elapsed_s,
+                millis(gameplay_input_timing.averageNs()),
+                millis(gameplay_input_timing.max_ns),
+                millis(gameplay_audio_timing.averageNs()),
+                millis(gameplay_audio_timing.max_ns),
+                millis(gameplay_particles_timing.averageNs()),
+                millis(gameplay_particles_timing.max_ns),
+                millis(gameplay_camera_timing.averageNs()),
+                millis(gameplay_camera_timing.max_ns),
+                millis(gameplay_structural_timing.averageNs()),
+                millis(gameplay_structural_timing.max_ns),
             },
         );
         log.debug(
