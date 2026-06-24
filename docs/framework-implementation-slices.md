@@ -1819,6 +1819,163 @@ Acceptance checks:
 - [ ] Benchmarks or debug stats report active scope counts so typical runs stay
       far below 50k stress scales by policy rather than by accident.
 
+## Slice 25: Z-Aware Scalable Navigation Redesign
+
+Goal: make the pathfinder correct, scalable, and functional for multi-Z-level,
+fixed-but-variable-size worlds with event-driven dynamic tile changes and
+mostly per-agent distinct goals. This supersedes the single-flat-grid,
+goal-field-centric core from Slices 18/20 while keeping the frame-delayed
+request/result contract and steering integration from Slices 18/19 intact.
+
+Current foundation:
+
+- Slice 18 frame-delayed pathfinding, Slice 19 steering/local avoidance, and
+  Slice 20 bounded hard-path budgets define the request/result contract,
+  deterministic deferral, and fixed-capacity caches this redesign keeps.
+- Slice 21 typed events (`world_tile_changed`, `world_obstacle_changed`,
+  `nav_region_invalidated`) are the dynamic-update signal source.
+- Slice 23 world rendering provides `WorldSystem` levels (`addLevel`/
+  `level_base_z`), dense render bands (`addDenseLayer`/`denseLayerCount`), sparse
+  obstacles, `cellRect`, and tile size (32).
+- Slice 22 `SimulationPipeline` owns the per-tick `pathfinding.update` call site
+  and the one-time nav build; the per-stage `pipeline_pathfinding` timer exists.
+
+Problem (observed defects this slice fixes):
+
+- A Z-level is a `WorldSystem` level (floor), not a render band. `NavGrid`
+  collapses every dense band of every level into one flat blocked mask
+  (`pathfinding.zig` `markWorldObstacles`), which is wrong across bands and
+  across floors. There is no inter-level connectivity.
+- Whole-grid scratch sizing is the real scalability wall: goal fields and
+  per-worker scratch are sized to total cell count, costing ~293 MB at 512²/32px
+  before the demo coarsened to 128px nav cells. The 65,536-cell `goalFieldsEnabled`
+  / `fallbackSearchEnabled` gates then silently degrade navigation to direct seek
+  with no error — a correctness landmine.
+- `PathQueryKey` includes the agent start cell, so a drifting agent mints a new
+  key every cell, pending entries never dedup, and agents replan-storm (observed
+  `replans=17256` in a 60s sample).
+- Goal fields only build for ≥2 same-goal requests in the same step, so with
+  per-agent distinct goals they never cache-hit (`field_cache_hits=0`,
+  `fields_built=51`, `evictions=277`) — pure thrash and the source of the
+  `pipeline_pathfinding_max≈31ms` dropped-frame spike.
+- `update()` writes `deferred_requests` twice (`pathfinding.zig` ~1008 then
+  ~1041); budget exhaustion can read as `unavailable` instead of `pending`.
+- Coarse 128px cells push waypoints away from walls, raising `stuck`/`unavailable`.
+
+Architecture notes:
+
+- Navigable unit is the level (Z-floor). A level's per-cell blocked mask is the
+  OR of that level's dense bands plus its sparse obstacles, exposed by a new
+  `WorldSystem.levelBlocksMovement(level, x, y)` accessor so pathfinding stops
+  iterating render bands directly.
+- Two-tier (HPA*-style) structure per level: a fine per-level blocked bitset
+  (cell = one 32px tile) plus a coarse chunk-portal graph (default 16-tile
+  chunks). Inter-level travel uses explicit `LevelLink` records (ramp/stair/
+  teleport) owned by `WorldSystem` as persistent world facts carrying only stable
+  cell coordinates and level indices — never live nav indices or handles.
+- A path query maps start/goal to `(level, cell)`, projects a blocked goal to the
+  nearest open cell within a bounded radius, rejects cross-component goals via
+  per-level connected components, then runs abstract A* over the portal graph plus
+  link edges (Z-crossing is a link edge between portal nodes in different levels)
+  and refines only the first segment into the `next_waypoint` steering consumes.
+  The `PathView` contract (`status`/`next_waypoint`/`path_len`) is unchanged.
+- Per-agent A* uses a binary-heap open set and generation-stamped closed/g-cost
+  storage sized to a bounded `max_explored_nodes` budget (e.g. 4096) via a
+  cell→slot hash, not whole-grid arrays. Budget exhaustion returns `pending`
+  (loud `path_budget_exhausted` counter), never silent `unavailable`.
+- Cache/pending key is `{ nav_version, agent_class, goal_level, goal_cell }` —
+  start is dropped. A cached result stores the abstract corridor; the per-entity
+  waypoint is re-refined from the agent's current cell each step it is consumed,
+  so a moving agent reuses one corridor for its whole trip and many agents sharing
+  a goal share one pending entry.
+- Goal fields, goal groups, and their stats are removed (wrong tool for per-agent
+  goals). An optional shared-goal flow field may return later behind a config flag
+  for swarm scenarios; it is not in the default path.
+- Dynamic updates are event-driven: `world_tile_changed`/`world_obstacle_changed`
+  map to affected cells, flip blocked bits, mark owning (and border-touching
+  neighbor) chunks dirty, and `applyNavUpdates` recomputes only dirty chunks'
+  cells/portals/adjacency plus dirty-driven component relabel (full relabel only
+  past a threshold, loud counter). One `nav_version` bump per batch invalidates
+  goal-keyed cache/pending entries. The whole-world build runs only at init.
+- The cell gates are deleted. Oversized worlds fail loud at construction via a
+  configured `max_nav_memory_bytes` (`error.NavWorldTooLarge` with a diagnostic),
+  not at query time. Per-query work is bounded by the abstract graph plus the node
+  budget, independent of total world cell count.
+- Threading: per-request abstract+local A* runs on workers with worker-indexed
+  scratch and deterministic per-`pending_index` output (existing fallback
+  dispatch shape); small batches stay inline via the adaptive tuner.
+  `applyNavUpdates` runs single-threaded at the event reaction point before the
+  next step's solves; chunk recompute is parallelizable later if needed.
+
+Capacity/memory model (per level: W·H nav cells = C, L levels, K-cell chunks):
+nav ≈ `L·(C/8 bitset + 4·C components) + links·16`; A* scratch ≈
+`slots · max_explored_nodes · ~28 B`, independent of C. 512²/32px/1 level drops
+from ~293 MB to ~1.1 MB; 512²/32px/4 levels ≈ 4.3 MB; 2048²/64px/4 levels
+≈ 17 MB. `components` width (u32→u16 or abstract-graph-only reachability) is a
+future memory lever for very large worlds.
+
+Sub-slices (each independently shippable and headless-testable):
+
+- Slice 25A — `WorldSystem` per-level navigability accessor + `LevelLink` store;
+  pathfinding consumes `levelBlocksMovement` for level 0 only (behavior-preserving
+  for the single-level demo).
+- Slice 25B — per-agent A* + goal-keyed corridor cache; remove goal fields, cell
+  gates, and the start-cell key; add `max_explored_nodes` and `max_nav_memory_bytes`;
+  fix the `deferred_requests` double-write; redefine `unavailable` vs `pending`.
+- Slice 25C — chunk-portal abstract tier and cross-level query; `PathRequest`/
+  `NavigationIntent` gain `start_level`/`goal_level`; steering fills them.
+- Slice 25D — event-driven incremental rebuild: dirty-chunk queue, `applyNavUpdates`,
+  `nav_version` bump, incremental relabel; wire world-tile/obstacle events from the
+  post-commit reaction point into the pipeline instead of full rebuilds.
+
+Checklist:
+
+- [ ] 25A: add `WorldSystem.levelBlocksMovement`, `levelCount`, and `LevelLink`
+      store/accessors; switch `markWorldObstacles` to per-level composition.
+- [ ] 25B: replace goal-field core with budgeted per-agent A* and goal-keyed
+      corridor cache; delete cell gates and goal-field stats; add memory-gate
+      validation; fix the `deferred_requests` single-write.
+- [ ] 25C: build per-level chunk-portal graph; abstract A* over portals + link
+      edges; first-segment refinement; add level fields to request/intent/steering.
+- [ ] 25D: dirty-chunk incremental rebuild driven by typed world events; replace
+      full nav rebuild on tile change; add nav-update metrics.
+- [ ] Reset the demo `nav_cell_size` stopgap (currently 128) to a tile-aligned
+      principled value; coarseness lives in the chunk tier, not the cell size.
+- [ ] Keep pathfinding a gameplay system in `src/game/systems/`; no test-only
+      enum tags, marker fields, or fixture hooks in production contracts.
+
+Acceptance checks:
+
+- [ ] Intra-level paths are correct against a per-level composed mask; a cross-
+      level path uses a `LevelLink`; a blocked goal projects to the nearest open
+      cell; disconnected goals return `unavailable` exactly once and cache.
+- [ ] A moving agent toward a fixed goal produces one accepted request then cache
+      reuse (no per-cell churn); `replans` collapses versus the current baseline.
+- [ ] Per-query explored-node count is bounded and independent of total world cell
+      count; the `pipeline_pathfinding` max spike is eliminated.
+- [ ] An oversized world returns `error.NavWorldTooLarge` at construction; no query
+      path ever silently degrades to direct seek.
+- [ ] A tile/obstacle event blocks/unblocks a corridor and the next path reflects
+      it; `nav_incremental_rebuilds`/`nav_version_bumps` are non-zero and full
+      rebuild runs only at init.
+- [ ] `zig build fmt`, `zig build check`, `zig build test`, `zig build verify`, and
+      targeted Debug/ReleaseFast pathfinding benchmarks pass; benchmarks report
+      before/after `replans`, `stuck`, `unavailable`, and pathfinding timing.
+
+Open decisions (recommendation in parentheses): inter-level link representation
+(explicit `LevelLink` records, not inferred tile flags); chunk size (16 tiles);
+keep a default flow-field path (no — opt-in only for future swarm cases);
+parallel-solve threshold (keep existing adaptive/inline behavior; `applyNavUpdates`
+serial initially); `components` width (u32 initially); goal-level source
+(`NavigationIntent`, default 0 until multi-level gameplay exists).
+
+Status: design of record, not yet implemented. Recommended implementation order
+is 25A then 25B (foundation plus the highest-payoff correctness fix), with a
+captured baseline 60s perf sample before 25B, then 25C and 25D. Route each slice
+diff to review with attention to the goal-keyed cache reuse contract, the
+single-write `deferred_requests` fix, gate removal, and no lingering goal-field
+test hooks.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1846,6 +2003,7 @@ Acceptance checks:
 22. Simulation pipeline and tier/scope scaffolding.
 23. Atlas-backed world rendering addition.
 24. Scoped simulation tiers and chunk policy.
+25. Z-aware scalable navigation redesign.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
