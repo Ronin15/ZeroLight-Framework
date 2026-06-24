@@ -101,7 +101,7 @@ build options, formatting, shader commands, and GPU smoke details.
 - `src/assets/` contains runtime path resolution, installed-file loading, the typed asset manifest, atlas metadata loaders, runtime asset catalog, and cache-backed texture ownership.
 - `src/core/` contains small shared helpers.
 - `assets/` contains runtime atlases, audio, bundled fonts, and shader sources.
-- `tools/` contains atlas packing, export, lint, and art-generation helpers.
+- `tools/` contains atlas packing, export, lint, art-generation, and benchmark helpers (see [tools/README.md](tools/README.md)).
 
 Generated build output goes under `zig-out/` and should not be committed.
 

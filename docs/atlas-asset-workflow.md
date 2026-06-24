@@ -4,8 +4,9 @@ This project packs loose source sprites into runtime atlas PNGs plus JSON sideca
 manifests. Filenames are authoring/setup identifiers; runtime gameplay stores
 stable `SpriteAssetId` values plus numeric tile or atlas entry IDs.
 
-Build tools live under `tools/`. Runtime atlases install to `assets/sprites/` and
-are registered in `src/assets/manifest.zig`.
+Build tools live under `tools/` (see [`tools/README.md`](../tools/README.md) for
+the script index). Runtime atlases install to `assets/sprites/` and are
+registered in `src/assets/manifest.zig`.
 
 ## Goals
 
