@@ -63,6 +63,33 @@ pub const WorldBuildConfig = struct {
     seed: u64 = 0x51d1_ea5e_2026_0624,
 };
 
+// Stable tile-cell coordinate used by persistent world facts (e.g. LevelLink).
+// Carries only grid indices, never world-space or live nav/render handles.
+pub const CellCoord = struct {
+    x: u16,
+    y: u16,
+};
+
+pub const LevelLinkKind = enum {
+    ramp,
+    stair,
+    teleport,
+};
+
+// Persistent inter-level connectivity fact. Holds only stable level indices and
+// tile-cell coordinates plus a traversal cost — never live nav node indices,
+// renderer/SDL handles, or prepared draw records. Pathfinding converts these to
+// nav-graph edges at build/query time (Slice 25C); this slice only stores them.
+pub const LevelLink = struct {
+    kind: LevelLinkKind,
+    level_a: u16,
+    cell_a: CellCoord,
+    level_b: u16,
+    cell_b: CellCoord,
+    traversal_cost: u32,
+    bidirectional: bool,
+};
+
 const ProceduralTiles = struct {
     grass: TileId,
     grass_patchy: TileId,
@@ -171,6 +198,7 @@ pub const WorldSystem = struct {
     catalog_flags: std.ArrayList(TileFlags) = .empty,
 
     level_base_z: std.ArrayList(i32) = .empty,
+    level_links: std.ArrayList(LevelLink) = .empty,
 
     dense_level_indices: std.ArrayList(u16) = .empty,
     dense_base_z: std.ArrayList(i32) = .empty,
@@ -366,6 +394,7 @@ pub const WorldSystem = struct {
         self.dense_base_z.deinit(self.allocator);
         self.dense_level_indices.deinit(self.allocator);
 
+        self.level_links.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
 
         self.catalog_flags.deinit(self.allocator);
@@ -531,6 +560,47 @@ pub const WorldSystem = struct {
         if (layer_index >= self.dense_level_indices.items.len) return true;
         if (x >= self.width or y >= self.height) return true;
         return self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement;
+    }
+
+    pub fn levelCount(self: *const WorldSystem) usize {
+        return self.level_base_z.items.len;
+    }
+
+    // Per-level composed navigability: a level's blocked mask is the OR of every
+    // dense band assigned to that level plus every sparse obstacle on that level.
+    // Out-of-range x/y returns blocked, matching denseTileBlocksMovement; an
+    // invalid level also returns blocked (fail-closed) so a bad index can never
+    // expose phantom open cells to the pathfinder. Allocation-free: iterates the
+    // dense band columns and sparse SoA columns directly with no joins.
+    pub fn levelBlocksMovement(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
+        if (@as(usize, level_index) >= self.level_base_z.items.len) return true;
+        if (x >= self.width or y >= self.height) return true;
+        for (self.dense_level_indices.items, 0..) |dense_level, layer_index| {
+            if (dense_level != level_index) continue;
+            if (self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement) return true;
+        }
+        const cell = self.cellIndex(x, y);
+        for (self.sparse_level_indices.items, 0..) |sparse_level, sparse_index| {
+            if (sparse_level != level_index) continue;
+            if (self.sparse_cell_indices.items[sparse_index] != cell) continue;
+            if (self.sparse_flags.items[sparse_index].blocks_movement) return true;
+        }
+        return false;
+    }
+
+    // Appends a persistent inter-level link. Validates both level indices and
+    // that both cells lie inside the tile grid before storing. Explicit error
+    // set; allocation is bounded to the single append.
+    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
+        try self.validateLevelIndex(link.level_a);
+        try self.validateLevelIndex(link.level_b);
+        if (link.cell_a.x >= self.width or link.cell_a.y >= self.height) return error.InvalidWorldCell;
+        if (link.cell_b.x >= self.width or link.cell_b.y >= self.height) return error.InvalidWorldCell;
+        try self.level_links.append(self.allocator, link);
+    }
+
+    pub fn levelLinks(self: *const WorldSystem) []const LevelLink {
+        return self.level_links.items;
     }
 
     pub fn sparseTileCount(self: *const WorldSystem) usize {
@@ -1439,4 +1509,136 @@ test "visible tile count crops inside visible chunks" {
 
     world.setVisibleChunksForWorldRect(.{ .x = 512, .y = 512, .w = 64, .h = 64 }, 0);
     try std.testing.expectEqual(@as(usize, 4), world.visibleTileCount());
+}
+
+test "level blocks movement is the OR of dense bands and sparse obstacles" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Two dense bands, both grass-filled (non-blocking), then a blocker placed in
+    // a different cell of each band so neither cell is covered by both bands.
+    const band_a = try world.addDenseLayer(level, 0, .floor, grass);
+    const band_b = try world.addDenseLayer(level, 0, .obstacle, grass);
+    _ = try world.setDenseTile(band_a, 1, 1, tree);
+    _ = try world.setDenseTile(band_b, 5, 3, tree);
+    // A sparse obstacle on the same level contributes to the composed mask.
+    _ = try world.addSparseTile(level, 6, 6, deco, 0, .obstacle);
+
+    // Each blocker is reported by the composed level query.
+    try std.testing.expect(world.levelBlocksMovement(level, 1, 1));
+    try std.testing.expect(world.levelBlocksMovement(level, 5, 3));
+    try std.testing.expect(world.levelBlocksMovement(level, 6, 6));
+    // An untouched open cell stays open.
+    try std.testing.expect(!world.levelBlocksMovement(level, 0, 0));
+    try std.testing.expect(!world.levelBlocksMovement(level, 4, 4));
+    // Out-of-range cells are blocked, matching denseTileBlocksMovement.
+    try std.testing.expect(world.levelBlocksMovement(level, world.width, 0));
+    try std.testing.expect(world.levelBlocksMovement(level, 0, world.height));
+    // An invalid level fails closed.
+    try std.testing.expect(world.levelBlocksMovement(7, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), world.levelCount());
+}
+
+test "level navigability does not collapse across levels" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+
+    const band0 = try world.addDenseLayer(level0, 0, .floor, grass);
+    const band1 = try world.addDenseLayer(level1, 0, .floor, grass);
+    _ = band0;
+    // Block cell (2,2) on level 1 only.
+    _ = try world.setDenseTile(band1, 2, 2, tree);
+
+    try std.testing.expectEqual(@as(usize, 2), world.levelCount());
+    try std.testing.expect(world.levelBlocksMovement(level1, 2, 2));
+    // The same cell on level 0 must stay open: levels do not collapse.
+    try std.testing.expect(!world.levelBlocksMovement(level0, 2, 2));
+}
+
+test "level link store round-trips and validates inputs" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(10);
+    try std.testing.expectEqual(@as(usize, 0), world.levelLinks().len);
+
+    const link = LevelLink{
+        .kind = .stair,
+        .level_a = 0,
+        .cell_a = .{ .x = 1, .y = 2 },
+        .level_b = 1,
+        .cell_b = .{ .x = 3, .y = 4 },
+        .traversal_cost = 5,
+        .bidirectional = true,
+    };
+    try world.addLevelLink(link);
+
+    const links = world.levelLinks();
+    try std.testing.expectEqual(@as(usize, 1), links.len);
+    try std.testing.expectEqual(LevelLinkKind.stair, links[0].kind);
+    try std.testing.expectEqual(@as(u16, 1), links[0].level_b);
+    try std.testing.expectEqual(@as(u16, 3), links[0].cell_b.x);
+    try std.testing.expectEqual(@as(u32, 5), links[0].traversal_cost);
+    try std.testing.expect(links[0].bidirectional);
+
+    // Invalid level index is rejected.
+    try std.testing.expectError(error.InvalidWorldLevel, world.addLevelLink(.{
+        .kind = .ramp,
+        .level_a = 0,
+        .cell_a = .{ .x = 0, .y = 0 },
+        .level_b = 2,
+        .cell_b = .{ .x = 0, .y = 0 },
+        .traversal_cost = 1,
+        .bidirectional = false,
+    }));
+    // Out-of-bounds cell is rejected.
+    try std.testing.expectError(error.InvalidWorldCell, world.addLevelLink(.{
+        .kind = .teleport,
+        .level_a = 0,
+        .cell_a = .{ .x = 0, .y = 0 },
+        .level_b = 1,
+        .cell_b = .{ .x = world.width, .y = 0 },
+        .traversal_cost = 1,
+        .bidirectional = false,
+    }));
+    // No partial append from rejected links.
+    try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
 }

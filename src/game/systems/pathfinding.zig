@@ -338,21 +338,20 @@ const NavGrid = struct {
     }
 
     fn markWorldObstacles(self: *NavGrid, world: *const WorldSystem) void {
-        for (0..world.denseLayerCount()) |layer_index| {
-            for (0..world.height) |y_usize| {
-                const y: u16 = @intCast(y_usize);
-                for (0..world.width) |x_usize| {
-                    const x: u16 = @intCast(x_usize);
-                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
-                    const rect = world.cellRect(x, y) orelse continue;
-                    self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
-                }
+        // Slice 25A: consume the per-level composed mask for level 0 only. With a
+        // single level (the demo) this is the OR of every level-0 dense band plus
+        // every level-0 sparse obstacle, identical to the prior global band+sparse
+        // scan. Multi-level grids and LevelLink traversal arrive in Slice 25C.
+        const level: u16 = 0;
+        if (@as(usize, level) >= world.levelCount()) return;
+        for (0..world.height) |y_usize| {
+            const y: u16 = @intCast(y_usize);
+            for (0..world.width) |x_usize| {
+                const x: u16 = @intCast(x_usize);
+                if (!world.levelBlocksMovement(level, x, y)) continue;
+                const rect = world.cellRect(x, y) orelse continue;
+                self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
             }
-        }
-        for (0..world.sparseTileCount()) |index| {
-            if (!world.sparseTileBlocksMovement(index)) continue;
-            const rect = world.sparseTileRect(index) orelse continue;
-            self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
         }
     }
 
@@ -1858,6 +1857,55 @@ test "pathfinding nav grid includes blocking world tiles" {
     try system.rebuildStaticNavGridWithWorld(&data, &world, 96, 96, 32);
 
     try std.testing.expect(system.grid.isBlockedCell(.{ .x = 1, .y = 1 }));
+}
+
+test "pathfinding nav grid blocked set matches per-level composed mask" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        std.testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    // Real single-level demo world (one ground band plus sparse deco obstacles),
+    // then a second dense band carrying its own blocker. This is the single-level,
+    // multi-band configuration markWorldObstacles handled before Slice 25A; the
+    // composed level-0 mask must reproduce the same blocked set the global
+    // band+sparse scan would have, validating the switch to levelBlocksMovement.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const extra_band = try world.addDenseLayer(0, 0, .obstacle, grass);
+    _ = try world.setDenseTile(extra_band, 5, 6, tree);
+    _ = try world.setDenseTile(extra_band, 2, 1, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{});
+    // cell_size == tile_size so each world tile maps to exactly one nav cell.
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+
+    var expected_blocked: usize = 0;
+    for (0..world.height) |y_usize| {
+        const y: u16 = @intCast(y_usize);
+        for (0..world.width) |x_usize| {
+            const x: u16 = @intCast(x_usize);
+            const expect_blocked = world.levelBlocksMovement(0, x, y);
+            if (expect_blocked) expected_blocked += 1;
+            try std.testing.expectEqual(expect_blocked, system.grid.isBlockedCell(.{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            }));
+        }
+    }
+    // The world contributes real blockers (sparse deco + the extra band trees), so
+    // the grid's blocked set is non-empty and exactly matches the composed mask.
+    try std.testing.expect(expected_blocked > 0);
+    try std.testing.expectEqual(expected_blocked, system.grid.blocked_count);
 }
 
 test "pathfinding caches unavailable requests without requeueing duplicates" {
