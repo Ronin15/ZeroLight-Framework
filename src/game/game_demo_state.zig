@@ -297,6 +297,7 @@ pub const GameDemoState = struct {
         runtime_assets: *const RuntimeAssets,
         interpolation_alpha: f32,
     ) !void {
+        try self.world.ensureRenderDepthIndex();
         var world_depth = self.world.firstVisibleRenderDepth();
         var dynamic_range = DynamicDepthRange{ .start = 0, .end = 0 };
         var dynamic_depth = self.nextDynamicRenderDepth(&dynamic_range);

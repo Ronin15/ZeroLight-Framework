@@ -92,6 +92,15 @@ const VisibleTileBounds = struct {
     max_y_exclusive: u16,
 };
 
+// One contiguous run of sparse tiles that share a render depth, expressed as a
+// window into `sparse_render_order`. Lets sparse submission touch only the
+// tiles at a given depth instead of rescanning every sparse tile per depth.
+const SparseDepthRange = struct {
+    depth: i32,
+    start: u32,
+    count: u32,
+};
+
 const ChunkColumns = struct {
     level_indices: std.ArrayList(u16) = .empty,
     x: std.ArrayList(i32) = .empty,
@@ -174,6 +183,16 @@ pub const WorldSystem = struct {
     sparse_tile_ids: std.ArrayList(TileId) = .empty,
     sparse_depth_values: std.ArrayList(i32) = .empty,
     sparse_flags: std.ArrayList(TileFlags) = .empty,
+
+    // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
+    // set changes (tracked by render_index_dirty), never per frame. render_depths
+    // is the sorted distinct set of dense+sparse depths; sparse_render_order holds
+    // sparse indices grouped by depth (ascending depth, then original index), with
+    // sparse_depth_ranges giving the per-depth window into it.
+    render_depths: std.ArrayList(i32) = .empty,
+    sparse_render_order: std.ArrayList(u32) = .empty,
+    sparse_depth_ranges: std.ArrayList(SparseDepthRange) = .empty,
+    render_index_dirty: bool = true,
 
     chunk_level_indices: std.ArrayList(u16) = .empty,
     chunk_x: std.ArrayList(i32) = .empty,
@@ -331,6 +350,10 @@ pub const WorldSystem = struct {
         self.chunk_x.deinit(self.allocator);
         self.chunk_level_indices.deinit(self.allocator);
 
+        self.sparse_depth_ranges.deinit(self.allocator);
+        self.sparse_render_order.deinit(self.allocator);
+        self.render_depths.deinit(self.allocator);
+
         self.sparse_flags.deinit(self.allocator);
         self.sparse_depth_values.deinit(self.allocator);
         self.sparse_tile_ids.deinit(self.allocator);
@@ -411,10 +434,11 @@ pub const WorldSystem = struct {
     }
 
     pub fn submitOrderedRender(
-        self: *const WorldSystem,
+        self: *WorldSystem,
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
     ) !WorldRenderStats {
+        try self.ensureRenderDepthIndex();
         var total = WorldRenderStats{};
         var previous_depth: ?i32 = null;
         while (self.nextVisibleRenderDepthAfter(previous_depth)) |depth| {
@@ -428,25 +452,22 @@ pub const WorldSystem = struct {
         return self.nextVisibleRenderDepthAfter(null);
     }
 
+    /// Returns the next render depth strictly greater than `previous_depth`
+    /// (or the first depth for null). Walks the precomputed `render_depths`
+    /// instead of rescanning every tile, so discovery is independent of tile
+    /// count. Per-tile visibility is applied later at submission, so a depth
+    /// with no currently-visible tiles simply submits nothing — draw order and
+    /// the `@max`/sum-reduced render stats are unchanged. Callers must keep the
+    /// index current via `ensureRenderDepthIndex` before walking.
     pub fn nextVisibleRenderDepthAfter(self: *const WorldSystem, previous_depth: ?i32) ?i32 {
-        const bounds = self.visibleTileBounds();
-        var next_depth: ?i32 = null;
-        for (0..self.dense_level_indices.items.len) |layer_index| {
-            if (!self.denseLayerHasVisibleTiles(layer_index, bounds)) continue;
-            const depth = self.denseLayerOrder(layer_index).depth;
-            if (previous_depth) |previous| {
-                if (depth <= previous) continue;
+        const depths = self.render_depths.items;
+        if (previous_depth) |previous| {
+            for (depths) |depth| {
+                if (depth > previous) return depth;
             }
-            if (next_depth == null or depth < next_depth.?) next_depth = depth;
+            return null;
         }
-        for (self.sparse_depth_values.items, self.sparse_chunk_indices.items, self.sparse_cell_indices.items) |depth, chunk_index, cell| {
-            if (!self.isSparseChunkVisible(chunk_index) or !self.cellInVisibleBounds(cell, bounds)) continue;
-            if (previous_depth) |previous| {
-                if (depth <= previous) continue;
-            }
-            if (next_depth == null or depth < next_depth.?) next_depth = depth;
-        }
-        return next_depth;
+        return if (depths.len == 0) null else depths[0];
     }
 
     pub fn submitVisibleRenderDepth(
@@ -570,6 +591,7 @@ pub const WorldSystem = struct {
         for (0..self.cellCount()) |_| {
             self.dense_tile_ids.appendAssumeCapacity(fill_tile);
         }
+        self.render_index_dirty = true;
         return layer_index;
     }
 
@@ -601,6 +623,7 @@ pub const WorldSystem = struct {
         self.sparse_tile_ids.appendAssumeCapacity(tile_id);
         self.sparse_depth_values.appendAssumeCapacity(world_z);
         self.sparse_flags.appendAssumeCapacity(flags);
+        self.render_index_dirty = true;
         if (!flags.blocks_movement) return null;
         return .{
             .level = level_index,
@@ -646,11 +669,12 @@ pub const WorldSystem = struct {
         depth: i32,
         stats: *WorldRenderStats,
     ) !void {
-        for (self.sparse_tile_ids.items, 0..) |tile_id, index| {
-            if (self.sparse_depth_values.items[index] != depth) continue;
+        const range = self.sparseDepthRange(depth) orelse return;
+        for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
             if (!self.isSparseChunkVisible(self.sparse_chunk_indices.items[index])) continue;
             const cell = self.sparse_cell_indices.items[index];
             if (!self.cellInVisibleBounds(cell, bounds)) continue;
+            const tile_id = self.sparse_tile_ids.items[index];
             const x: u16 = @intCast(cell % self.width);
             const y: u16 = @intCast((cell / self.width) % self.height);
             try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth), stats);
@@ -769,6 +793,74 @@ pub const WorldSystem = struct {
         self.chunk_visible = next.visible;
         next = .{};
         old.deinit(self.allocator);
+
+        try self.rebuildRenderDepthIndex();
+    }
+
+    /// Rebuilds the derived render-walk index if a structural change marked it
+    /// dirty. Cheap no-op on a clean world, so it is safe to call every frame at
+    /// the render entry point; the const render readers assume it is current.
+    pub fn ensureRenderDepthIndex(self: *WorldSystem) !void {
+        if (!self.render_index_dirty) return;
+        try self.rebuildRenderDepthIndex();
+    }
+
+    fn rebuildRenderDepthIndex(self: *WorldSystem) !void {
+        const sparse_count = self.sparse_tile_ids.items.len;
+        const depth_values = self.sparse_depth_values.items;
+
+        // Sparse indices grouped by (depth, original index) — a total order, so
+        // the per-depth windows below preserve the original submission order.
+        self.sparse_render_order.clearRetainingCapacity();
+        try self.sparse_render_order.ensureTotalCapacity(self.allocator, sparse_count);
+        for (0..sparse_count) |i| self.sparse_render_order.appendAssumeCapacity(@intCast(i));
+        std.mem.sort(u32, self.sparse_render_order.items, depth_values, sparseRenderOrderLessThan);
+
+        self.sparse_depth_ranges.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < sparse_count) {
+            const depth = depth_values[self.sparse_render_order.items[i]];
+            const start = i;
+            while (i < sparse_count and depth_values[self.sparse_render_order.items[i]] == depth) : (i += 1) {}
+            try self.sparse_depth_ranges.append(self.allocator, .{
+                .depth = depth,
+                .start = @intCast(start),
+                .count = @intCast(i - start),
+            });
+        }
+
+        // Distinct, ascending union of dense-layer and sparse depths.
+        self.render_depths.clearRetainingCapacity();
+        for (0..self.dense_level_indices.items.len) |layer_index| {
+            try self.appendRenderDepth(self.denseLayerOrder(layer_index).depth);
+        }
+        for (self.sparse_depth_ranges.items) |range| {
+            try self.appendRenderDepth(range.depth);
+        }
+        std.mem.sort(i32, self.render_depths.items, {}, std.sort.asc(i32));
+
+        self.render_index_dirty = false;
+    }
+
+    fn appendRenderDepth(self: *WorldSystem, depth: i32) !void {
+        for (self.render_depths.items) |existing| {
+            if (existing == depth) return;
+        }
+        try self.render_depths.append(self.allocator, depth);
+    }
+
+    fn sparseRenderOrderLessThan(depth_values: []const i32, lhs: u32, rhs: u32) bool {
+        const lhs_depth = depth_values[lhs];
+        const rhs_depth = depth_values[rhs];
+        if (lhs_depth != rhs_depth) return lhs_depth < rhs_depth;
+        return lhs < rhs;
+    }
+
+    fn sparseDepthRange(self: *const WorldSystem, depth: i32) ?SparseDepthRange {
+        for (self.sparse_depth_ranges.items) |range| {
+            if (range.depth == depth) return range;
+        }
+        return null;
     }
 
     fn sourceRect(self: *const WorldSystem, tile_id: TileId) ?Rect {
@@ -876,14 +968,6 @@ pub const WorldSystem = struct {
             self.dense_base_z.items[layer_index],
             self.dense_depth_bands.items[layer_index],
         ));
-    }
-
-    fn denseLayerHasVisibleTiles(self: *const WorldSystem, layer_index: usize, bounds: VisibleTileBounds) bool {
-        for (0..self.chunk_visible.items.len) |chunk_index| {
-            if (!self.chunk_visible.items[chunk_index] or !self.chunkMatchesLayer(chunk_index, layer_index)) continue;
-            if (self.visibleChunkCellCount(chunk_index, bounds) != 0) return true;
-        }
-        return false;
     }
 
     fn chunkMatchesLayer(self: *const WorldSystem, chunk_index: usize, layer_index: usize) bool {
@@ -1043,6 +1127,103 @@ fn hash2(seed: u64, x: anytype, y: anytype) u64 {
 fn testWorldMeta() !WorldTilesetMeta {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     return try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+}
+
+fn containsDepth(depths: []const i32, value: i32) bool {
+    for (depths) |depth| {
+        if (depth == value) return true;
+    }
+    return false;
+}
+
+fn sparseDepthIndexLessForTest(values: []const i32, a: u32, b: u32) bool {
+    if (values[a] != values[b]) return values[a] < values[b];
+    return a < b;
+}
+
+test "world render depth index orders sparse tiles by depth then insertion" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 16,
+        .height = 16,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const deco = try world.requireTileByName(&meta, "deco_0");
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+
+    // Insertion order is deliberately not depth order, with repeated depths.
+    const bands = [_]WorldDepth{ .obstacle, .floor, .effect, .floor, .obstacle, .effect };
+    for (bands, 0..) |band, i| {
+        const x: u16 = @intCast(i + 1);
+        _ = try world.addSparseTile(level, x, 1, if (i % 2 == 0) tree else deco, 0, band);
+    }
+    try world.rebuildChunks();
+
+    // render_depths is strictly ascending and covers every dense and sparse depth.
+    const depths = world.render_depths.items;
+    try std.testing.expect(depths.len > 0);
+    for (depths[1..], 1..) |depth, idx| {
+        try std.testing.expect(depths[idx - 1] < depth);
+    }
+    for (0..world.dense_level_indices.items.len) |layer| {
+        try std.testing.expect(containsDepth(depths, world.denseLayerOrder(layer).depth));
+    }
+    for (world.sparse_depth_values.items) |depth| {
+        try std.testing.expect(containsDepth(depths, depth));
+    }
+
+    // Reference order: original indices sorted by (depth, insertion index) — the
+    // exact order the old scan-per-depth path visited matching sparse tiles in.
+    var reference: [bands.len]u32 = undefined;
+    for (0..bands.len) |i| reference[i] = @intCast(i);
+    std.mem.sort(u32, &reference, world.sparse_depth_values.items, sparseDepthIndexLessForTest);
+
+    // Actual order produced by walking render_depths through the range index.
+    var actual: [bands.len]u32 = undefined;
+    var count: usize = 0;
+    for (depths) |depth| {
+        const range = world.sparseDepthRange(depth) orelse continue;
+        for (world.sparse_render_order.items[range.start..][0..range.count]) |index| {
+            try std.testing.expectEqual(depth, world.sparse_depth_values.items[index]);
+            actual[count] = index;
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(bands.len, count);
+    try std.testing.expectEqualSlices(u32, &reference, actual[0..count]);
+}
+
+test "world render depth index refreshes after runtime sparse insert" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    defer world.deinit();
+
+    // Construction leaves the index current.
+    try std.testing.expect(!world.render_index_dirty);
+    try world.ensureRenderDepthIndex();
+
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const new_depth = world.worldZForLevel(0, 0, .effect);
+    try std.testing.expect(!containsDepth(world.render_depths.items, new_depth));
+
+    _ = try world.addSparseTile(0, 2, 1, tree, 0, .effect);
+    try std.testing.expect(world.render_index_dirty);
+
+    try world.ensureRenderDepthIndex();
+    try std.testing.expect(!world.render_index_dirty);
+    try std.testing.expect(containsDepth(world.render_depths.items, new_depth));
+    // Every sparse tile is represented exactly once in the render order.
+    try std.testing.expectEqual(world.sparse_tile_ids.items.len, world.sparse_render_order.items.len);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
