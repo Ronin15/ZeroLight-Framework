@@ -41,6 +41,7 @@ pub const SpritePrepStats = sprite_batch.SpritePrepStats;
 // Re-exported so world/render-prep code can build retained static vertices
 // without importing the render/gpu boundary.
 pub const Vertex = sprite_batch.Vertex;
+pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
 const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
 const CoordinatePresentation = sprite_batch.CoordinatePresentation;
@@ -834,6 +835,9 @@ fn mergeDrawList(
     try out.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
     out.appendSliceAssumeCapacity(static_groups);
     out.appendSliceAssumeCapacity(dynamic_groups);
+    // Stability is load-bearing: static groups are appended first so that at equal
+    // order they draw before dynamic (world/dense under sparse/entities). Do not
+    // swap to an unstable sort without restoring that tie-break another way.
     std.mem.sort(DrawGroup, out.items, {}, drawGroupOrderLessThan);
     out.items.len = coalesceDrawList(out.items);
 }

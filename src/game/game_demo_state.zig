@@ -345,7 +345,6 @@ pub const GameDemoState = struct {
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
-        _ = context.thread_system;
         const camera = self.interpolatedCamera(context.interpolation_alpha);
         context.renderer.setCamera(camera);
         self.world.setVisibleChunksForWorldRect(.{
@@ -356,24 +355,28 @@ pub const GameDemoState = struct {
         }, world_render_overscan_chunks);
         try context.renderer.reserveSpriteCommands(self.frameSpriteCommandCapacity());
         try self.collectDynamicRenderRecords();
-        try self.submitLayeredRender(context.renderer, context.runtime_assets, context.interpolation_alpha);
+        try self.submitLayeredRender(context);
     }
 
-    fn submitLayeredRender(
-        self: *GameDemoState,
-        renderer: *Renderer,
-        runtime_assets: *const RuntimeAssets,
-        interpolation_alpha: f32,
-    ) !void {
+    fn submitLayeredRender(self: *GameDemoState, context: RenderContext) !void {
+        const renderer = context.renderer;
+        const runtime_assets = context.runtime_assets;
+        const interpolation_alpha = context.interpolation_alpha;
         try self.world.ensureRenderDepthIndex();
-        var world_depth = self.world.firstVisibleRenderDepth();
+
+        // Dense world geometry is retained on the GPU; only re-gathered/re-uploaded
+        // on a pan or dig. Sparse tiles and dynamic entities stream through the
+        // ordered batch and the renderer merges all three by render order.
+        try self.world.submitStaticDenseGeometry(renderer, runtime_assets, context.thread_system);
+
+        var sparse_depth = self.world.firstVisibleSparseDepth();
         var dynamic_range = DynamicDepthRange{ .start = 0, .end = 0 };
         var dynamic_depth = self.nextDynamicRenderDepth(&dynamic_range);
-        while (world_depth != null or dynamic_depth != null) {
-            if (world_depth) |depth| {
+        while (sparse_depth != null or dynamic_depth != null) {
+            if (sparse_depth) |depth| {
                 if (dynamic_depth == null or depth <= dynamic_depth.?) {
-                    _ = try self.world.submitVisibleRenderDepth(renderer, runtime_assets, depth);
-                    world_depth = self.world.nextVisibleRenderDepthAfter(depth);
+                    try self.world.submitVisibleSparseAtDepth(renderer, runtime_assets, depth);
+                    sparse_depth = self.world.nextVisibleSparseDepthAfter(depth);
                     continue;
                 }
             }
