@@ -337,7 +337,7 @@ pub const Renderer = struct {
                 const texture = self.resolveTextureSlot(group.texture) orelse continue;
 
                 if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
-                    applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation);
+                    applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation, self.batch.camera);
                 }
                 var sampler_binding = c.SDL_GPUTextureSamplerBinding{
                     .texture = texture.texture.?,
@@ -687,10 +687,12 @@ fn applyGroupPresentation(
     command_buffer: *c.SDL_GPUCommandBuffer,
     presentation: resolution.Presentation,
     coordinate_presentation: sprite_batch.CoordinatePresentation,
+    camera: Camera2D,
 ) void {
-    pushFrameUniform(command_buffer, presentation, coordinate_presentation);
+    pushFrameUniform(command_buffer, presentation, coordinate_presentation, camera);
     switch (coordinate_presentation) {
-        .logical => {
+        // World and logical geometry both clip to the logical viewport.
+        .world, .logical => {
             var scissor = scissorForViewport(presentation.viewport, presentation.drawable_size);
             c.SDL_SetGPUScissor(render_pass, &scissor);
         },
@@ -710,21 +712,36 @@ fn pushFrameUniform(
     command_buffer: *c.SDL_GPUCommandBuffer,
     presentation: resolution.Presentation,
     coordinate_presentation: sprite_batch.CoordinatePresentation,
+    camera: Camera2D,
 ) void {
-    var frame_uniform = frameUniformForPresentation(presentation, coordinate_presentation);
+    var frame_uniform = frameUniformForPresentation(presentation, coordinate_presentation, camera);
     c.SDL_PushGPUVertexUniformData(command_buffer, 0, &frame_uniform, @sizeOf(FrameUniform));
 }
 
 fn frameUniformForPresentation(
     presentation: resolution.Presentation,
     coordinate_presentation: sprite_batch.CoordinatePresentation,
+    camera: Camera2D,
 ) FrameUniform {
+    const viewport_scale_x = presentation.viewport.scale_x;
+    const viewport_scale_y = presentation.viewport.scale_y;
+    const viewport_offset_x: f32 = @floatFromInt(presentation.viewport.x);
+    const viewport_offset_y: f32 = @floatFromInt(presentation.viewport.y);
     const transform: [4]f32 = switch (coordinate_presentation) {
+        // World geometry arrives in world space; fold the camera into the
+        // logical viewport affine so `drawable = world*scale + offset` exactly
+        // reproduces the former CPU `worldToScreen` path.
+        .world => .{
+            camera.zoom * viewport_scale_x,
+            camera.zoom * viewport_scale_y,
+            viewport_offset_x - camera.position.x * camera.zoom * viewport_scale_x,
+            viewport_offset_y - camera.position.y * camera.zoom * viewport_scale_y,
+        },
         .logical => .{
-            presentation.viewport.scale_x,
-            presentation.viewport.scale_y,
-            @as(f32, @floatFromInt(presentation.viewport.x)),
-            @as(f32, @floatFromInt(presentation.viewport.y)),
+            viewport_scale_x,
+            viewport_scale_y,
+            viewport_offset_x,
+            viewport_offset_y,
         },
         .drawable => .{ 1, 1, 0, 0 },
     };
@@ -926,7 +943,7 @@ test "frame uniforms transform logical coordinates after acquisition" {
         .{ .width = 3600, .height = 2260 },
     );
 
-    const logical = frameUniformForPresentation(presentation, .logical);
+    const logical = frameUniformForPresentation(presentation, .logical, .{});
     try std.testing.expectEqual(@as(f32, 3600), logical.drawable_size[0]);
     try std.testing.expectEqual(@as(f32, 2260), logical.drawable_size[1]);
     try std.testing.expectApproxEqAbs(presentation.viewport.scale_x, logical.position_transform[0], 0.001);
@@ -934,11 +951,28 @@ test "frame uniforms transform logical coordinates after acquisition" {
     try std.testing.expectEqual(@as(f32, @floatFromInt(presentation.viewport.x)), logical.position_transform[2]);
     try std.testing.expectEqual(@as(f32, @floatFromInt(presentation.viewport.y)), logical.position_transform[3]);
 
-    const drawable = frameUniformForPresentation(presentation, .drawable);
+    const drawable = frameUniformForPresentation(presentation, .drawable, .{});
     try std.testing.expectEqual(@as(f32, 1), drawable.position_transform[0]);
     try std.testing.expectEqual(@as(f32, 1), drawable.position_transform[1]);
     try std.testing.expectEqual(@as(f32, 0), drawable.position_transform[2]);
     try std.testing.expectEqual(@as(f32, 0), drawable.position_transform[3]);
+
+    // World geometry bakes the camera into the logical viewport affine so the
+    // GPU reproduces the former CPU `worldToScreen` then logical-presentation path.
+    const camera = Camera2D{ .position = .{ .x = 40, .y = 25 }, .zoom = 2 };
+    const world = frameUniformForPresentation(presentation, .world, camera);
+    try std.testing.expectApproxEqAbs(camera.zoom * presentation.viewport.scale_x, world.position_transform[0], 0.001);
+    try std.testing.expectApproxEqAbs(camera.zoom * presentation.viewport.scale_y, world.position_transform[1], 0.001);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, @floatFromInt(presentation.viewport.x)) - camera.position.x * camera.zoom * presentation.viewport.scale_x,
+        world.position_transform[2],
+        0.001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, @floatFromInt(presentation.viewport.y)) - camera.position.y * camera.zoom * presentation.viewport.scale_y,
+        world.position_transform[3],
+        0.001,
+    );
 }
 
 test "presentation state applies first group and changes only" {

@@ -107,6 +107,10 @@ pub const Sprite = struct {
 };
 
 pub const CoordinatePresentation = enum {
+    // World geometry is emitted in world space; the renderer bakes the camera
+    // into the vertex uniform at draw time. Logical/drawable keep their prior
+    // viewport-relative meaning.
+    world,
     logical,
     drawable,
 };
@@ -117,9 +121,19 @@ pub const Vertex = extern struct {
     color: [4]f32,
 };
 
+// Which renderer-owned vertex buffer a draw group indexes. Dynamic groups index
+// the per-frame streamed buffer; static groups index the renderer's retained
+// slab. The renderer merges both into one order-sorted draw list.
+pub const DrawSource = enum {
+    dynamic,
+    static,
+};
+
 pub const DrawGroup = struct {
+    source: DrawSource = .dynamic,
     texture: TextureId,
     presentation: CoordinatePresentation,
+    order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
 };
@@ -292,7 +306,6 @@ pub const SpriteBatch = struct {
                 var context = SpritePrepJobContext{
                     .commands = self.prepared_commands.items,
                     .vertices = self.vertices.items,
-                    .camera = self.camera,
                 };
                 batch = threads.parallelForWithOptions(valid_count, &context, writePreparedSpritesJob, .{
                     .items_per_range = system_config.items_per_range,
@@ -304,7 +317,7 @@ pub const SpriteBatch = struct {
                 fillPreparedRange(self.prepared_commands.items, self.vertices.items, .{
                     .start = 0,
                     .end = valid_count,
-                }, self.camera);
+                });
                 batch = .{
                     .item_count = valid_count,
                     .range_count = 1,
@@ -342,6 +355,7 @@ pub const SpriteBatch = struct {
 
         var active_texture: ?TextureId = null;
         var active_presentation: CoordinatePresentation = .logical;
+        var active_order: RenderOrder = .{};
         var active_first_vertex: u32 = 0;
         var active_vertex_count: u32 = 0;
 
@@ -352,14 +366,19 @@ pub const SpriteBatch = struct {
             if (active_texture == null or !textureIdsEqual(active_texture.?, command.sprite.texture) or active_presentation != group_presentation) {
                 if (active_texture) |texture| {
                     self.draw_groups.appendAssumeCapacity(.{
+                        .source = .dynamic,
                         .texture = texture,
                         .presentation = active_presentation,
+                        .order = active_order,
                         .first_vertex = active_first_vertex,
                         .vertex_count = active_vertex_count,
                     });
                 }
                 active_texture = command.sprite.texture;
                 active_presentation = group_presentation;
+                // Submission is nondecreasing, so the first command's order is the
+                // group's min order — the correct key for merging with static spans.
+                active_order = command.sprite.order;
                 active_first_vertex = first_vertex;
                 active_vertex_count = 6;
             } else {
@@ -369,8 +388,10 @@ pub const SpriteBatch = struct {
 
         if (active_texture) |texture| {
             self.draw_groups.appendAssumeCapacity(.{
+                .source = .dynamic,
                 .texture = texture,
                 .presentation = active_presentation,
+                .order = active_order,
                 .first_vertex = active_first_vertex,
                 .vertex_count = active_vertex_count,
             });
@@ -390,19 +411,17 @@ const PreparedSpriteCommand = struct {
 const SpritePrepJobContext = struct {
     commands: []const PreparedSpriteCommand,
     vertices: []Vertex,
-    camera: Camera2D,
 };
 
 fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpritePrepJobContext = @ptrCast(@alignCast(context));
-    fillPreparedRange(job.commands, job.vertices, range, job.camera);
+    fillPreparedRange(job.commands, job.vertices, range);
 }
 
 fn fillPreparedRange(
     commands: []const PreparedSpriteCommand,
     vertices: []Vertex,
     range: ParallelRange,
-    camera: Camera2D,
 ) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= commands.len);
@@ -410,19 +429,56 @@ fn fillPreparedRange(
         writePreparedSpriteVertices(
             commands[index],
             vertices[index * 6 ..][0..6],
-            camera,
         );
     }
 }
 
+// Affine map applied to each emitted world-space corner: `p * scale + offset`.
+// World geometry is emitted in world space and the renderer bakes the camera
+// into the draw-time vertex uniform, so CPU emission always uses identity.
+const PositionTransform = struct {
+    scale: math.Vec2 = .{ .x = 1, .y = 1 },
+    offset: math.Vec2 = .{ .x = 0, .y = 0 },
+
+    const identity = PositionTransform{};
+
+    fn apply(self: PositionTransform, point: math.Vec2) math.Vec2 {
+        return .{
+            .x = point.x * self.scale.x + self.offset.x,
+            .y = point.y * self.scale.y + self.offset.y,
+        };
+    }
+};
+
 fn writePreparedSpriteVertices(
     prepared: PreparedSpriteCommand,
     out: []Vertex,
-    camera: Camera2D,
 ) void {
-    const sprite = prepared.sprite;
+    // All spaces emit world/identity-space geometry; the renderer applies the
+    // camera via its vertex uniform, never on the CPU.
+    writeSpriteQuad(prepared.sprite, prepared.texture_desc, .identity, out);
+}
+
+/// Writes one world-space sprite quad with identity transform. The world builds
+/// static tile vertices through this so they are byte-identical to dynamic
+/// sprite vertices, without importing gpu/* or the internal PositionTransform.
+pub fn writeWorldSpriteQuad(
+    sprite: Sprite,
+    texture: resources.TextureDesc,
+    out: []Vertex,
+) void {
+    writeSpriteQuad(sprite, texture, .identity, out);
+}
+
+// Pure six-vertex quad emission shared by dynamic sprite prep and static tile
+// vertex builds, keeping their vertex layout byte-identical.
+fn writeSpriteQuad(
+    sprite: Sprite,
+    texture: resources.TextureDesc,
+    transform: PositionTransform,
+    out: []Vertex,
+) void {
     std.debug.assert(out.len == 6);
-    const texture = prepared.texture_desc;
     const source = sprite.source orelse Rect{
         .x = 0,
         .y = 0,
@@ -462,11 +518,7 @@ fn writePreparedSpriteVertices(
             .x = sprite.dest.x + sprite.origin.x + rotated.x,
             .y = sprite.dest.y + sprite.origin.y + rotated.y,
         };
-        const screen = switch (sprite.coordinate_space) {
-            .world => camera.worldToScreen(world),
-            .logical, .drawable => world,
-        };
-        positions[index] = screen;
+        positions[index] = transform.apply(world);
     }
 
     for (indices, 0..) |source_index, out_index| {
@@ -487,7 +539,8 @@ fn setVertexCountAssumeCapacity(vertices: *std.ArrayList(Vertex), count: usize) 
 
 pub fn presentationForCoordinateSpace(coordinate_space: CoordinateSpace) CoordinatePresentation {
     return switch (coordinate_space) {
-        .world, .logical => .logical,
+        .world => .world,
+        .logical => .logical,
         .drawable => .drawable,
     };
 }
@@ -567,7 +620,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
     try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
     try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].texture.index);
-    try std.testing.expectEqual(CoordinatePresentation.logical, batch.draw_groups.items[0].presentation);
+    try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
     try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].first_vertex);
     try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[0].vertex_count);
 }
@@ -600,16 +653,19 @@ test "batch builder groups by texture and coordinate presentation" {
     batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 18), batch.vertices.items.len);
-    try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
-    try std.testing.expectEqual(CoordinatePresentation.logical, batch.draw_groups.items[0].presentation);
+    try std.testing.expectEqual(@as(usize, 3), batch.draw_groups.items.len);
+    try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
     try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].first_vertex);
-    try std.testing.expectEqual(@as(u32, 12), batch.draw_groups.items[0].vertex_count);
-    try std.testing.expectEqual(CoordinatePresentation.drawable, batch.draw_groups.items[1].presentation);
-    try std.testing.expectEqual(@as(u32, 12), batch.draw_groups.items[1].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[0].vertex_count);
+    try std.testing.expectEqual(CoordinatePresentation.logical, batch.draw_groups.items[1].presentation);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[1].first_vertex);
     try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[1].vertex_count);
+    try std.testing.expectEqual(CoordinatePresentation.drawable, batch.draw_groups.items[2].presentation);
+    try std.testing.expectEqual(@as(u32, 12), batch.draw_groups.items[2].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[2].vertex_count);
 }
 
-test "world sprites apply camera while logical and drawable sprites ignore camera" {
+test "world vertices ignore camera now that the transform is baked on the GPU" {
     const allocator = std.testing.allocator;
     const slots = [_]TestTextureSlot{
         .{ .id = testTextureId(0, 1), .desc = .{ .width = 8, .height = 8 } },
@@ -632,21 +688,17 @@ test "world sprites apply camera while logical and drawable sprites ignore camer
         .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
         .coordinate_space = .logical,
     });
-    try batch.drawSprite(.{
-        .texture = testTextureId(0, 1),
-        .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
-        .coordinate_space = .drawable,
-    });
 
     batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[0]);
-    try std.testing.expectEqual(@as(f32, 40), batch.vertices.items[0].position[1]);
+    // All spaces emit world/identity-space geometry; the camera is applied by
+    // the renderer's vertex uniform, never on the CPU.
+    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[0].position[0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[1]);
     try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[6].position[1]);
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[12].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[1]);
-    try std.testing.expectEqual(CoordinatePresentation.drawable, batch.draw_groups.items[1].presentation);
+    try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
+    try std.testing.expectEqual(CoordinatePresentation.logical, batch.draw_groups.items[1].presentation);
 }
 
 test "batch builder preserves ordered submission stream" {
@@ -718,31 +770,6 @@ test "world and logical vertices stay independent of drawable presentation" {
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[6].position[1]);
     try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[12].position[0]);
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[1]);
-}
-
-test "world vertices include camera without presentation offset" {
-    const allocator = std.testing.allocator;
-    const slots = [_]TestTextureSlot{
-        .{ .id = testTextureId(0, 1), .desc = .{ .width = 8, .height = 8 } },
-    };
-    const table = TestTextureTable{ .slots = &slots };
-    var batch = try initBatchTest(allocator, &table);
-    defer batch.deinit();
-    batch.setCamera(.{
-        .position = .{ .x = 5, .y = 10 },
-        .zoom = 2,
-    });
-
-    try batch.drawSprite(.{
-        .texture = testTextureId(0, 1),
-        .dest = .{ .x = 20, .y = 30, .w = 1, .h = 1 },
-        .coordinate_space = .world,
-    });
-
-    batch.buildSerial(table.resolver());
-
-    try std.testing.expectApproxEqAbs(@as(f32, 30), batch.vertices.items[0].position[0], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 40), batch.vertices.items[0].position[1], 0.001);
 }
 
 test "safe sprite batch build reserves missing frame storage" {
