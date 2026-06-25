@@ -205,7 +205,10 @@ pub const SimulationPipeline = struct {
         steering_timer.stop(context.perf, .pipeline_steering);
 
         var pathfinding_timer = StageTimer.start();
-        const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, context.thread_system, .{});
+        // Drive elastic pathfinding capacity off the live steering-agent crowd (the
+        // entities that consume paths), so pools grow for battles and shrink after.
+        const path_agent_count = data.steeringAgentSliceConst().entities.len;
+        const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, path_agent_count, context.thread_system, .{});
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
 
         var apply_intents_timer = StageTimer.start();

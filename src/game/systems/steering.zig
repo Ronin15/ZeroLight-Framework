@@ -1209,7 +1209,7 @@ test "steering requests missing paths then follows available path results" {
     try std.testing.expectEqual(@as(usize, 1), frame.path_requests.mergedItems().len);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 
-    _ = try pathfinding.updateSerial(&frame.path_requests, .{});
+    _ = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 0, .direct_direction_y = 1 });
@@ -1272,7 +1272,7 @@ test "steering unavailable paths enter backoff without request spam" {
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 128, .y = 0 }, .direct_direction_x = 1 });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
-    const solve = try pathfinding.updateSerial(&frame.path_requests, .{});
+    const solve = try pathfinding.updateSerial(&frame.path_requests, 1, .{});
     try std.testing.expectEqual(@as(usize, 1), solve.unavailable_results);
 
     frame.beginStep();

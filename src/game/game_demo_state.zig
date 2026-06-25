@@ -30,7 +30,6 @@ const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
-const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
 const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const CollisionContact = @import("simulation.zig").CollisionContact;
@@ -230,14 +229,14 @@ pub const GameDemoState = struct {
             // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
             // resolution.
             .nav_cell_size = 32,
+            // Elastic pathfinding capacity tracks the live steering-agent crowd:
+            // the per-step request/cache caps and the group-field threshold derive
+            // from the agent count automatically. Only the hard ceiling is fixed, so
+            // a battle grows and quiets shrinks without bumping knobs. At this demo's
+            // small scale capacity settles low and the group path stays dormant.
             .pathfinding = .{
-                .max_frame_requests = test_square_count,
-                .max_pending_requests = test_square_count,
-                .max_cached_results = test_square_count * 4,
                 .max_group_fields = 4,
-                .max_worker_scratch_slots = 64,
-                .max_solved_requests_per_step = test_square_count,
-                .max_fallback_requests_per_step = default_max_fallback_requests_per_step,
+                .max_agent_budget = 4096,
             },
             .navigation_world = &world,
         });
