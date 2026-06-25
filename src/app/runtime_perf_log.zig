@@ -144,6 +144,13 @@ pub const Timing = enum {
     gameplay_particles,
     gameplay_camera,
     gameplay_structural,
+    // Pathfinding sub-stages: a breakdown of pipeline_pathfinding into request
+    // accept/dedup, group-field service/build, individual+abstract solve+stitch,
+    // and result publish/compact, so the dominant phase is visible.
+    pathfinding_accept,
+    pathfinding_group_service,
+    pathfinding_solve,
+    pathfinding_publish,
     state_transitions,
     audio_drain,
     loading_build,
@@ -398,6 +405,24 @@ const EnabledRuntimePerfLog = struct {
                 millis(gameplay_camera_timing.max_ns),
                 millis(gameplay_structural_timing.averageNs()),
                 millis(gameplay_structural_timing.max_ns),
+            },
+        );
+        const pathfinding_accept_timing = self.timingValue(.pathfinding_accept);
+        const pathfinding_group_timing = self.timingValue(.pathfinding_group_service);
+        const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
+        const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
+        log.debug(
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3}",
+            .{
+                elapsed_s,
+                millis(pathfinding_accept_timing.averageNs()),
+                millis(pathfinding_accept_timing.max_ns),
+                millis(pathfinding_group_timing.averageNs()),
+                millis(pathfinding_group_timing.max_ns),
+                millis(pathfinding_solve_timing.averageNs()),
+                millis(pathfinding_solve_timing.max_ns),
+                millis(pathfinding_publish_timing.averageNs()),
+                millis(pathfinding_publish_timing.max_ns),
             },
         );
         log.debug(

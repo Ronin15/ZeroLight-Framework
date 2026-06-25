@@ -226,11 +226,8 @@ pub const GameDemoState = struct {
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
             .contact_capacity = demo_contact_capacity,
-            // The procedural world spans 512x512 tiles (16384px/side). At a 32px
-            // nav cell that is 262_144 grid cells. Slice 25B sizes A* scratch to a
-            // bounded explored-node budget (not the whole grid) and the demo's
-            // shared player-seek goal is serviced by a small bounded group-field
-            // registry, so 32px cells fit and navigation runs full resolution.
+            // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
+            // resolution.
             .nav_cell_size = 32,
             .pathfinding = .{
                 .max_frame_requests = test_square_count,
@@ -524,6 +521,10 @@ pub const GameDemoState = struct {
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
         perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+        perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
+        perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
+        perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
+        perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);

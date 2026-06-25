@@ -428,7 +428,9 @@ across a link edge) and caches it whole. The per-agent query walks that path on 
 current level cell by cell, exactly like a single-level A* path, so every heading is a
 traversable neighbor — never a straight-line cut across a wall — and multi-hop and
 cross-floor routes converge. Abstract seeding scans only the start level's portals
-(per-level portal index); abstract scratch saturation or a per-segment node-budget
+that share the start cell's connected component, via a per-(level,component) portal
+index, so seeding scales with the reachable subset rather than the level's full
+border; abstract scratch saturation or a per-segment node-budget
 spill returns `pending` (retry) rather than a hard negative. It owns the static versioned
 nav grid (one per level), the chunk-portal/link graph,
 pending request queue, duplicate suppression, the goal-keyed completed path
@@ -443,10 +445,14 @@ are consumed on later fixed steps so missing or unreachable paths do not stall
 same-step movement. Cache and pending keys are goal-keyed
 (`nav_version + agent_class + goal_level + goal_cell`) so a moving agent reuses one
 shared result and derives its per-step waypoint from its current cell against the
-stored path/corridor; agents that share a goal share one pending entry. A* scratch
-is sized to a configured `max_explored_nodes` (not the whole grid) via a cell->slot
-hash with generation stamps; hitting the local node budget or saturating the
-abstract scratch returns `pending` and increments `path_budget_exhausted`. A blocked
+stored path/corridor; agents that share a goal share one pending entry. The local A*
+node state (g-cost/parent/closed) lives in generation-stamped DIRECT per-cell arrays
+indexed by cell index — O(1) access with no hash probes or collisions, in exchange
+for per-worker scratch that is O(cells) (the grid is world-bounded, so this is a fixed
+cost the build-time memory gate counts). `max_explored_nodes` stays the node BUDGET:
+an explicit per-solve expansion counter caps how many distinct cells one solve may
+stamp. Hitting that local node budget or saturating the abstract scratch returns
+`pending` and increments `path_budget_exhausted`. A blocked
 goal projects to the nearest open cell on the goal level
 (`path_goal_projected`); `unavailable` is reserved for definitive negatives
 (disconnected component, no open cell near the goal, or no corridor across levels). Oversized worlds fail

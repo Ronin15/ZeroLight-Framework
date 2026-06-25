@@ -1938,10 +1938,15 @@ Architecture notes:
   next step's solves; chunk recompute is parallelizable later if needed.
 
 Capacity/memory model (per level: W·H nav cells = C, L levels, K-cell chunks):
-nav ≈ `L·(C/8 bitset + 4·C components) + links·16`; A* scratch ≈
-`slots · max_explored_nodes · ~28 B`, independent of C. 512²/32px/1 level drops
-from ~293 MB to ~1.1 MB; 512²/32px/4 levels ≈ 4.3 MB; 2048²/64px/4 levels
-≈ 17 MB. `components` width (u32→u16 or abstract-graph-only reachability) is a
+nav ≈ `L·(C/8 bitset + 4·C components) + links·16`. The per-worker local A* scratch
+is now generation-stamped DIRECT per-cell arrays (g-cost + parent + stamp + closed
+≈ 13 B/cell), so A* scratch ≈ `slots · C · 13 B` — O(cells) instead of
+O(`max_explored_nodes`). This is a deliberate speed-for-bounded-memory trade (O(1)
+node access, no hash probes); the build-time `max_nav_memory_bytes` gate counts it,
+so an over-provisioned `max_worker_scratch_slots` on a large world fails loud at the
+gate. `max_explored_nodes` remains the per-solve node BUDGET (a spill cap), enforced
+by an explicit expansion counter rather than a hash-table-full condition.
+`components` width (u32→u16 or abstract-graph-only reachability) is a
 future memory lever for very large worlds.
 
 Sub-slices (each independently shippable and headless-testable):
@@ -1993,7 +1998,9 @@ Checklist:
       `budget_exhausted` (retry), reserving `unavailable` for a missing corridor.
       Abstract seeding scans only the start level's portals via a per-level portal
       index, so per-query work is bounded independent of total cells and of other
-      levels' portals.
+      levels' portals. (Performance, post-25: the per-level index is further grouped
+      by connected component — a per-(level,component) CSR — so seeding scans only the
+      START component's portals, not the level's full border; architecture unchanged.)
 - [x] 25D: incremental nav rebuild driven by typed world events. `applyNavUpdates`
       flips the affected level's blocked bits, recomputes only affected levels'
       masks/components, rebuilds the chunk-portal abstract graph once, and bumps
@@ -2084,6 +2091,25 @@ portal/CSR surgery is deferred pending a per-chunk-addressable portal store. Rou
 slice diff to review with attention to the goal-keyed cache reuse and
 corridor-advancement contracts, the per-affected-level update scope, and the
 allocation-free steady-path claim.
+
+Post-25 performance pass (architecture unchanged — same A* results, deterministic,
+allocation-free on the warmed path; all layers retained): (1) the per-worker local A*
+scratch is generation-stamped DIRECT per-cell arrays indexed by cell index, giving
+O(1) node access with no hash probes/collisions in place of the prior open-addressed
+cell→slot hash. Per-worker scratch is now O(cells); the build-time memory gate
+(`NavMemoryBudget.requiredBytes`) counts `slots · cells · 13 B`, and `max_explored_nodes`
+remains the per-solve node budget enforced by an explicit expansion counter.
+(2) Abstract seeding is component-scoped: the per-level portal index is grouped by
+connected component (a per-(level,component) CSR), so seeding scans only the start
+component's portals rather than the level's full border. (3) `localAStar` derives each
+neighbor's (x,y) incrementally from the current cell plus the direction offset and feeds
+those coordinates straight to the octile heuristic, removing per-neighbor `index%width`/
+`index/width` div/mod. A node-access design that would make a same-component
+budget-spill escalate to the abstract corridor (the considered "WIN C") was NOT adopted:
+with component-scoped seeding the abstract corridor for a same-component goal collapses
+to a single portal, so escalation cannot subdivide the long segment and would only add
+per-frame work — making it effective would require start-chunk-scoped seeding (a global
+corridor-shape change), a design decision left for a future slice.
 
 ## Suggested Order
 

@@ -2,26 +2,16 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
-//! Hybrid frame-delayed grid pathfinding: per-level (Z-aware) and scalable.
-//! Two coordinated solver modes selected per request:
-//!   * Mode 1 (individual): budget-bounded heap A* keyed by goal cell. One solve
-//!     per shared goal; per-entity waypoints derive from the agent's current cell
-//!     against the cached result each step. Long-range/cross-level queries route
-//!     through an abstract chunk-portal + link graph to pick a corridor, then STITCH
-//!     a full obstacle-aware (level,cell) path from per-segment local A* runs between
-//!     consecutive corridor portals (a discrete jump only across an inter-level
-//!     link). The query walks that path per-agent on its current level cell by cell,
-//!     so every heading is a traversable neighbor — never a straight-line cut across
-//!     a wall. Per-solve work is bounded by the abstract node budget plus the local
-//!     budget; a segment node-budget spill retries next frame. Abstract seeding scans
-//!     only the start level's portals via a per-level portal index, bounded
-//!     independent of total cells and of other levels' portals.
-//!   * Mode 2 (group): demand-driven reverse-Dijkstra flow field toward a shared
-//!     declared goal on the goal's level, lazily built, throttled on goal-cell
-//!     change, and budgeted across frames. Zero cost when no group requests arrive.
+//! Frame-delayed, Z-aware grid pathfinding with two coordinated solver modes per
+//! request kind:
+//!   * individual: goal-keyed budget-bounded local A*; long-range/cross-level queries
+//!     route through an abstract chunk-portal + link graph and stitch a full
+//!     obstacle-aware (level,cell) path the per-agent query walks cell by cell.
+//!   * group: demand-driven reverse-Dijkstra flow field toward a shared declared goal,
+//!     lazily built and budgeted across frames (zero cost when unused).
 //! Owns transient request queues, result caches, per-level nav-grid state, the
-//! abstract chunk-portal/link graph, fixed scratch, and stage tuners. Fixed-step
-//! update is allocation-free after reserve/rebuild.
+//! abstract chunk-portal/link graph, and per-worker scratch. The fixed-step update is
+//! allocation-free after reserve/rebuild.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,6 +22,8 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
+const sdl = @import("../../platform/sdl.zig").c;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const WorldSystem = @import("../world_system.zig").WorldSystem;
@@ -59,6 +51,10 @@ const default_max_stored_path_cells: usize = 512;
 const default_max_group_fields: usize = 4;
 const default_group_field_rebuild_min_steps: u32 = 30;
 const default_group_field_build_budget: usize = 8192;
+// Minimum agents sharing a goal in one step before a flow field is built; below
+// this they use individual A*. High because a shared goal already dedups to ~one
+// cached solve, so the field only earns its O(cells) build for large crowds.
+const default_min_group_field_agents: usize = 1024;
 // Generous default nav-memory ceiling. The build-time gate fails loud well before
 // real allocation pressure; tests use a tiny ceiling to exercise the gate.
 const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
@@ -179,6 +175,7 @@ pub const PathfindingCapacity = struct {
     max_group_fields: usize = default_max_group_fields,
     group_field_rebuild_min_steps: u32 = default_group_field_rebuild_min_steps,
     group_field_build_budget: usize = default_group_field_build_budget,
+    min_group_field_agents: usize = default_min_group_field_agents,
 };
 
 pub const PathfindingConfig = struct {
@@ -188,6 +185,27 @@ pub const PathfindingConfig = struct {
     fallback_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     max_solved_requests_per_step: ?usize = null,
     max_fallback_requests_per_step: ?usize = null,
+};
+
+// Comptime-gated monotonic phase timer for the fixed-step pathfinding update.
+// Zero-cost no-op when perf logging is disabled; uses the SDL monotonic clock
+// (gated, perf-only) like the other fixed-step stage timers.
+const PhaseTimer = if (runtime_perf_log.enabled) struct {
+    start_ns: u64,
+    fn begin() PhaseTimer {
+        return .{ .start_ns = sdl.SDL_GetTicksNS() };
+    }
+    fn lap(self: *PhaseTimer) u64 {
+        const now = sdl.SDL_GetTicksNS();
+        return if (now > self.start_ns) now - self.start_ns else 0;
+    }
+} else struct {
+    fn begin() PhaseTimer {
+        return .{};
+    }
+    fn lap(_: *PhaseTimer) u64 {
+        return 0;
+    }
 };
 
 pub const PathfindingStats = struct {
@@ -203,7 +221,7 @@ pub const PathfindingStats = struct {
     fallback_deferred_requests: usize = 0,
     cache_hits: usize = 0,
     cache_evictions: usize = 0,
-    // New Slice 25B counters.
+    // Solver and flow-field counters.
     budget_exhausted: usize = 0,
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
@@ -214,10 +232,23 @@ pub const PathfindingStats = struct {
     abstract_solves: usize = 0,
     cross_level_solves: usize = 0,
     fallback_batch: BatchStats = .{},
+    // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
+    // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
+    accept_ns: u64 = 0,
+    group_service_ns: u64 = 0,
+    solve_ns: u64 = 0,
+    publish_ns: u64 = 0,
 
     pub fn solveBatch(self: PathfindingStats) BatchStats {
         return self.fallback_batch;
     }
+};
+
+// A distinct group goal and how many agents declared it this step; the count
+// gates flow-field building.
+const GroupRequestTally = struct {
+    key: PathQueryKey,
+    count: usize,
 };
 
 const PreparedRequest = struct {
@@ -292,6 +323,10 @@ const NavGrid = struct {
     height: usize = 0,
     version: u32 = 1,
     blocked_count: usize = 0,
+    // Highest component label assigned by buildComponents (labels are dense 1..N on
+    // a world-bounded grid). Used to size the per-(level,component) portal index so
+    // abstract seeding scans only the start component's portals.
+    component_count: u32 = 0,
     blocked: std.ArrayList(bool) = .empty,
     components: std.ArrayList(u32) = .empty,
     component_queue: std.ArrayList(usize) = .empty,
@@ -486,6 +521,8 @@ const NavGrid = struct {
             next_component +%= 1;
             if (next_component == no_component) next_component = 1;
         }
+        // next_component is one past the last label assigned (labels are 1..N).
+        self.component_count = next_component -% 1;
     }
 
     fn floodComponent(self: *NavGrid, start_index: usize, component: u32) void {
@@ -580,10 +617,21 @@ const NavGraph = struct {
     portal_offsets: std.ArrayList(u32) = .empty,
     portal_edges: std.ArrayList(AbstractEdge) = .empty,
     // Per-level index into a level-sorted portal-node ordering. A level's portal
-    // nodes occupy level_portal_order[level_portal_offsets[level]..[level+1]], so
-    // abstract seeding scans only the start level's portals, not every portal.
+    // nodes occupy level_portal_order[level_portal_offsets[level]..[level+1]]. Within
+    // a level the run is further grouped by connected component, so a level's
+    // component-C portals occupy a contiguous sub-run, and abstract seeding scans only
+    // the START component's portals rather than every portal on the level.
     level_portal_order: std.ArrayList(u32) = .empty,
     level_portal_offsets: std.ArrayList(u32) = .empty,
+    // CSR over (level, component): component_portal_offsets is a flat
+    // [level_component_base[level] + component_count[level] + 1] array of begin/end
+    // boundaries into level_portal_order. level_component_base[level] is the start of
+    // a level's block (one entry per component plus a trailing terminator), so the
+    // portals of component C on a level are level_portal_order over
+    // [component_portal_offsets[base+C-1] .. component_portal_offsets[base+C]].
+    // Components are 1..N per level (dense), so the index by C is direct.
+    component_portal_offsets: std.ArrayList(u32) = .empty,
+    level_component_base: std.ArrayList(u32) = .empty,
     // Scratch used only during rebuild to discover edges before CSR compaction.
     edge_scratch: std.ArrayList(EdgeScratch) = .empty,
     // Per-level fast lookup from cell index to portal node index (no_cell when the
@@ -604,6 +652,8 @@ const NavGraph = struct {
         self.build_u32_scratch.deinit(self.allocator);
         self.cell_to_portal.deinit(self.allocator);
         self.edge_scratch.deinit(self.allocator);
+        self.level_component_base.deinit(self.allocator);
+        self.component_portal_offsets.deinit(self.allocator);
         self.level_portal_offsets.deinit(self.allocator);
         self.level_portal_order.deinit(self.allocator);
         self.portal_edges.deinit(self.allocator);
@@ -840,9 +890,11 @@ const NavGraph = struct {
         return self.build_u32_scratch.items;
     }
 
-    // Builds the per-level portal index so abstract seeding scans only one level's
-    // portals (O(start-level portals)) instead of every portal across all levels.
-    // Runs after all portals (including late link endpoints) are appended.
+    // Builds the per-level portal index (level_portal_order grouped by level, then by
+    // connected component within each level) plus the (level, component) CSR so
+    // abstract seeding scans only the START component's portals on the start level,
+    // not every portal on the level or across all levels. Runs after all
+    // portals (including late link endpoints) are appended.
     fn indexPortalsByLevel(self: *NavGraph) !void {
         const level_count = self.levels.items.len;
         try self.level_portal_offsets.ensureTotalCapacity(self.allocator, level_count + 1);
@@ -863,6 +915,54 @@ const NavGraph = struct {
             self.level_portal_order.items[cursor[level]] = @intCast(node_index);
             cursor[level] += 1;
         }
+
+        // Per-level base into the flat component CSR: each level contributes
+        // (component_count[level] + 1) offset entries (one begin boundary per
+        // component 1..N plus a trailing terminator). Component 0 (no_component) never
+        // holds a seedable portal, so component C indexes [base + C - 1 .. base + C].
+        try self.level_component_base.ensureTotalCapacity(self.allocator, level_count + 1);
+        self.level_component_base.items.len = level_count + 1;
+        self.level_component_base.items[0] = 0;
+        for (self.levels.items, 0..) |*level_grid, i| {
+            self.level_component_base.items[i + 1] =
+                self.level_component_base.items[i] + level_grid.component_count + 1;
+        }
+        const total_offsets = self.level_component_base.items[level_count];
+        try self.component_portal_offsets.ensureTotalCapacity(self.allocator, total_offsets);
+        self.component_portal_offsets.items.len = total_offsets;
+
+        // For each level, order its portal sub-run by component (an in-place sort over
+        // the level's slice of level_portal_order) and record each component's
+        // [begin, end). The sort keeps seeding's per-component scan contiguous; it is
+        // bounded by the level's portal count (chunk-border count), not by cells.
+        for (self.levels.items, 0..) |*level_grid, level_index| {
+            const level: u16 = @intCast(level_index);
+            const begin = self.level_portal_offsets.items[level];
+            const end = self.level_portal_offsets.items[@as(usize, level) + 1];
+            const base = self.level_component_base.items[level];
+            const slots = level_grid.component_count + 1; // entries this level owns
+            const offsets = self.component_portal_offsets.items[base .. base + slots];
+            const run = self.level_portal_order.items[begin..end];
+            const sort_ctx = PortalComponentSort{ .portals = self.portals.items, .components = level_grid.components.items };
+            std.sort.pdq(u32, run, sort_ctx, PortalComponentSort.lessThan);
+            // After the stable-ordered sort, fill each component's begin boundary by a
+            // single pass: offsets[c-1] is where component c starts (relative to the
+            // global level_portal_order). Components with no portal get an empty range
+            // (begin == end), which the seeding scan skips.
+            var cursor_pos: u32 = begin;
+            var component: u32 = 1;
+            // offsets are indexed 0..slots-1; offsets[c-1] = begin of component c,
+            // offsets[c] = end of component c (= begin of c+1).
+            while (component <= level_grid.component_count) : (component += 1) {
+                offsets[component - 1] = cursor_pos;
+                while (cursor_pos < end and
+                    level_grid.components.items[self.portals.items[run[cursor_pos - begin]].cell_index] == component)
+                {
+                    cursor_pos += 1;
+                }
+            }
+            offsets[slots - 1] = cursor_pos; // trailing terminator (== end for present components)
+        }
     }
 
     // Returns the portal node indices on `level` (membership in level_portal_order).
@@ -870,6 +970,20 @@ const NavGraph = struct {
         if (@as(usize, level) + 1 >= self.level_portal_offsets.items.len) return &.{};
         const begin = self.level_portal_offsets.items[level];
         const end = self.level_portal_offsets.items[@as(usize, level) + 1];
+        return self.level_portal_order.items[begin..end];
+    }
+
+    // Returns the portal node indices on `level` that belong to connected `component`
+    // (a contiguous sub-run of levelPortals), so abstract seeding scans only the start
+    // component's portals. An out-of-range component yields an empty slice.
+    fn levelComponentPortals(self: *const NavGraph, level: u16, component: u32) []const u32 {
+        if (component == no_component) return &.{};
+        if (@as(usize, level) + 1 >= self.level_component_base.items.len) return &.{};
+        const level_grid = &self.levels.items[level];
+        if (component > level_grid.component_count) return &.{};
+        const base = self.level_component_base.items[level];
+        const begin = self.component_portal_offsets.items[base + component - 1];
+        const end = self.component_portal_offsets.items[base + component];
         return self.level_portal_order.items[begin..end];
     }
 
@@ -1066,6 +1180,23 @@ fn portalChunkLessThan(portals: []const PortalNode, lhs: u32, rhs: u32) bool {
     return a.cell_index < b.cell_index;
 }
 
+// Orders a level's portal node indices by connected component (then cell index for a
+// deterministic build) so each component's portals form a contiguous sub-run that
+// abstract seeding can scan in isolation.
+const PortalComponentSort = struct {
+    portals: []const PortalNode,
+    components: []const u32,
+
+    fn lessThan(self: PortalComponentSort, lhs: u32, rhs: u32) bool {
+        const a_cell = self.portals[lhs].cell_index;
+        const b_cell = self.portals[rhs].cell_index;
+        const a_comp = self.components[a_cell];
+        const b_comp = self.components[b_cell];
+        if (a_comp != b_comp) return a_comp < b_comp;
+        return a_cell < b_cell;
+    }
+};
+
 // Octile distance between two cell indices, in the same cardinal/diagonal cost
 // units used by the local A*, so abstract and refined costs are comparable.
 fn octileCells(width: usize, a: u32, b: u32) u32 {
@@ -1106,9 +1237,10 @@ const NavMemoryBudget = struct {
     // without the pathological per-chunk pairwise (O(cells)) term.
     const abstract_degree: usize = 8;
 
-    // Per SearchScratch slot table entry: slot_cell/slot_g/slot_parent/slot_stamp
-    // (4 x u32) plus slot_closed (bool).
-    const scratch_slot_bytes: usize = 4 * @sizeOf(u32) + 1;
+    // Per SearchScratch direct per-cell entry: slot_g/slot_parent/slot_stamp
+    // (3 x u32) plus slot_closed (bool). The direct array is indexed by cell_index,
+    // so there is no separate slot_cell column.
+    const scratch_slot_bytes: usize = 3 * @sizeOf(u32) + 1;
     // edge_scratch entry (EdgeScratch: u32 from + AbstractEdge{u32,u32,bool}) and the
     // compacted CSR edge entry (AbstractEdge). Both buffers are reserved to the edge
     // worst case.
@@ -1128,9 +1260,10 @@ const NavMemoryBudget = struct {
         const static_bytes = per_level_bytes *| levels;
         // Group-field registry: max_group_fields x cells x per-cell field bytes.
         const group_registry_bytes = self.max_group_fields *| cell_count *| self.group_field_bytes_per_cell;
-        // Per-worker budget-bounded A* scratch tables (independent of cell count).
-        const scratch_bytes = self.max_worker_scratch_slots *|
-            (self.max_explored_nodes *| 2 *| scratch_slot_bytes);
+        // Per-worker A* scratch is direct per-cell arrays, so each slot is O(cells),
+        // not O(node budget). The gate counts it so an over-provisioned slot count on a
+        // large world fails loud here rather than degrading at query time.
+        const scratch_bytes = self.max_worker_scratch_slots *| cell_count *| scratch_slot_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.
@@ -1173,7 +1306,12 @@ const NavMemoryBudget = struct {
         // scratch (u32).
         const portal_buffers = portals *| (portal_node_bytes +| 3 *| @sizeOf(u32));
         const edge_buffers = edges *| (edge_scratch_bytes +| portal_edge_bytes);
-        return cell_to_portal_bytes +| portal_buffers +| edge_buffers;
+        // (level, component) seeding CSR: component_portal_offsets has at most
+        // one entry per portal plus per-level terminators; level_component_base has one
+        // entry per level. Bounded by portals + levels, never by cells.
+        const component_index_bytes = (portals +| levels) *| @sizeOf(u32) +|
+            (levels +| 1) *| @sizeOf(u32);
+        return cell_to_portal_bytes +| portal_buffers +| edge_buffers +| component_index_bytes;
     }
 
     // Pure validation helper: returns the error and stays log-free. A lifecycle
@@ -1483,26 +1621,41 @@ const GroupFieldState = enum {
     ready,
 };
 
+// Bucket count for the integration's monotone bucket queue (Dial's algorithm). Step
+// costs are octile {cardinal_cost, diagonal_cost}, so a (current_distance % B) bucket
+// holds only cells at exactly current_distance when B > max step cost.
+const group_field_buckets: u32 = diagonal_cost + 1;
+
 const GroupField = struct {
     state: GroupFieldState = .empty,
     key: PathQueryKey = emptyKey(0),
     goal_index: usize = 0,
     generation: u32 = 1,
     last_build_step: u32 = 0,
-    // Set when (re)built this step so reuse is not double-counted in the same
-    // step; cleared at the start of group-field servicing.
+    // Monotone distance cursor for the bucket queue; resumed across budgeted frames.
+    current_distance: u32 = 0,
+    // Set when (re)built this step so reuse is not double-counted in the same step.
     fresh_this_step: bool = false,
-    // Integration cost-to-goal and per-cell flow direction (index into
-    // neighbor_dirs, or 0xff for none). Generation stamps avoid full clears.
+    // Integration cost-to-goal and per-cell flow direction (index into neighbor_dirs,
+    // or no_flow). stamps gate costs/flow_dir to the current build without a clear.
     costs: std.ArrayList(u32) = .empty,
     flow_dir: std.ArrayList(u8) = .empty,
     stamps: std.ArrayList(u32) = .empty,
-    heap: std.ArrayList(OpenNode) = .empty,
+    // Dial's bucket queue: `buckets` holds per-bucket head cell indices; `bucket_next`/
+    // `bucket_prev` are intrusive per-cell links so a decrease-key unlinks in O(1). A
+    // cell is in at most one bucket; `queued_stamp == generation` marks it queued.
+    buckets: std.ArrayList(u32) = .empty,
+    bucket_next: std.ArrayList(u32) = .empty,
+    bucket_prev: std.ArrayList(u32) = .empty,
+    queued_stamp: std.ArrayList(u32) = .empty,
 
     const no_flow: u8 = 0xff;
 
     fn deinit(self: *GroupField, allocator: std.mem.Allocator) void {
-        self.heap.deinit(allocator);
+        self.queued_stamp.deinit(allocator);
+        self.bucket_prev.deinit(allocator);
+        self.bucket_next.deinit(allocator);
+        self.buckets.deinit(allocator);
         self.stamps.deinit(allocator);
         self.flow_dir.deinit(allocator);
         self.costs.deinit(allocator);
@@ -1513,14 +1666,22 @@ const GroupField = struct {
         try self.costs.ensureTotalCapacity(allocator, cell_count);
         try self.flow_dir.ensureTotalCapacity(allocator, cell_count);
         try self.stamps.ensureTotalCapacity(allocator, cell_count);
-        try self.heap.ensureTotalCapacity(allocator, cell_count);
+        try self.buckets.ensureTotalCapacity(allocator, group_field_buckets);
+        try self.bucket_next.ensureTotalCapacity(allocator, cell_count);
+        try self.bucket_prev.ensureTotalCapacity(allocator, cell_count);
+        try self.queued_stamp.ensureTotalCapacity(allocator, cell_count);
         self.costs.items.len = cell_count;
         self.flow_dir.items.len = cell_count;
         self.stamps.items.len = cell_count;
+        self.buckets.items.len = group_field_buckets;
+        self.bucket_next.items.len = cell_count;
+        self.bucket_prev.items.len = cell_count;
+        self.queued_stamp.items.len = cell_count;
         @memset(self.costs.items, unreachable_cost);
         @memset(self.flow_dir.items, no_flow);
         @memset(self.stamps.items, 0);
-        self.heap.clearRetainingCapacity();
+        @memset(self.buckets.items, no_cell);
+        @memset(self.queued_stamp.items, 0);
         self.state = .empty;
     }
 
@@ -1538,8 +1699,32 @@ const GroupField = struct {
         self.generation +%= 1;
         if (self.generation == 0) {
             @memset(self.stamps.items, 0);
+            @memset(self.queued_stamp.items, 0);
             self.generation = 1;
         }
+    }
+
+    // Links `index` (already costed) into its distance bucket at the head.
+    fn bucketPush(self: *GroupField, index: usize, distance: u32) void {
+        const b = distance % group_field_buckets;
+        const head = self.buckets.items[b];
+        self.bucket_next.items[index] = head;
+        self.bucket_prev.items[index] = no_cell;
+        if (head != no_cell) self.bucket_prev.items[head] = @intCast(index);
+        self.buckets.items[b] = @intCast(index);
+        self.queued_stamp.items[index] = self.generation;
+    }
+
+    // Unlinks `index` from its current distance bucket in O(1).
+    fn bucketUnlink(self: *GroupField, index: usize, distance: u32) void {
+        const prev = self.bucket_prev.items[index];
+        const next = self.bucket_next.items[index];
+        if (prev != no_cell) {
+            self.bucket_next.items[prev] = next;
+        } else {
+            self.buckets.items[distance % group_field_buckets] = next;
+        }
+        if (next != no_cell) self.bucket_prev.items[next] = prev;
     }
 
     fn beginBuild(self: *GroupField, grid: *const NavGrid, key: PathQueryKey, goal_index: usize, step: u32) bool {
@@ -1547,61 +1732,99 @@ const GroupField = struct {
         self.goal_index = goal_index;
         self.last_build_step = step;
         self.nextGeneration();
-        self.heap.clearRetainingCapacity();
+        @memset(self.buckets.items, no_cell);
+        self.current_distance = 0;
         if (grid.isBlockedIndex(goal_index)) {
             self.state = .empty;
             return false;
         }
         self.setCost(goal_index, 0, no_flow);
-        self.heap.appendAssumeCapacity(.{ .index = goal_index, .f = 0, .h = 0 });
+        self.bucketPush(goal_index, 0);
         self.state = .building;
         return true;
     }
 
-    // Expands at most `budget` cells. Returns true when the field finished.
+    // Expands at most `budget` cells of the integration via Dial's monotone bucket
+    // queue. Returns true when the field finished. The distance cursor advances only
+    // forward, so the build resumes correctly across budgeted frames.
     fn expand(self: *GroupField, grid: *const NavGrid, budget: usize) bool {
         var expansions: usize = 0;
-        while (self.heap.items.len != 0) {
+        while (true) {
             if (expansions >= budget) return false;
-            const current = self.heapPop();
-            if (self.cost(current.index) != current.f) continue;
+            const current_index = self.popNext() orelse {
+                self.state = .ready;
+                return true;
+            };
             expansions += 1;
-            const current_x: i32 = @intCast(current.index % grid.width);
-            const current_y: i32 = @intCast(current.index / grid.width);
+            const current_cost = self.costs.items[current_index];
+            const current_x: i32 = @intCast(current_index % grid.width);
+            const current_y: i32 = @intCast(current_index / grid.width);
             for (neighbor_dirs, 0..) |dir, dir_index| {
-                const next_cell = GridCell{ .x = current_x + dir.x, .y = current_y + dir.y };
-                const next_index = grid.indexForCell(next_cell) orelse continue;
+                const nx = current_x + dir.x;
+                const ny = current_y + dir.y;
+                const next_index = grid.indexForCell(.{ .x = nx, .y = ny }) orelse continue;
                 if (grid.isBlockedIndex(next_index)) continue;
-                if (dir.diagonal and (grid.isBlockedCell(.{ .x = current_x + dir.x, .y = current_y }) or grid.isBlockedCell(.{ .x = current_x, .y = current_y + dir.y }))) {
+                if (dir.diagonal and (grid.isBlockedCell(.{ .x = nx, .y = current_y }) or grid.isBlockedCell(.{ .x = current_x, .y = ny }))) {
                     continue;
                 }
                 const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
-                const candidate = current.f + step_cost;
-                if (candidate >= self.cost(next_index)) continue;
-                // Flow points from next_index back toward current via the
-                // opposite direction.
-                self.setCost(next_index, candidate, oppositeDirIndex(dir_index));
-                if (self.heap.items.len >= self.heap.capacity) {
-                    // Heap capacity equals cell count, so this is unreachable in
-                    // a correct build; treat as completion to stay safe.
-                    self.state = .ready;
-                    return true;
+                const candidate = current_cost + step_cost;
+                const existing = self.cost(next_index);
+                if (candidate < existing) {
+                    if (existing != unreachable_cost and self.queued_stamp.items[next_index] == self.generation) {
+                        self.bucketUnlink(next_index, existing);
+                    }
+                    self.setCost(next_index, candidate, oppositeDirIndex(dir_index));
+                    self.bucketPush(next_index, candidate);
+                } else if (candidate == existing) {
+                    // Equal-cost tie: a priority-queue Dijkstra pops predecessors in
+                    // (cost, index) order and the FIRST to relax a child sets its flow
+                    // direction (strict-improvement rejects later equal relaxations). So
+                    // the winning predecessor is the one with the smaller (cost, index).
+                    // Replicate that here so the field is byte-identical regardless of
+                    // the bucket queue's intra-distance pop order: overwrite only when
+                    // the existing recorded predecessor has the SAME cost as `current`
+                    // but a strictly higher index (a lower-cost predecessor already won
+                    // and a higher-cost one cannot have been processed yet).
+                    const existing_parent = self.flowParentIndex(grid, next_index);
+                    if (self.cost(existing_parent) == current_cost and existing_parent > @as(usize, current_index)) {
+                        self.flow_dir.items[next_index] = oppositeDirIndex(dir_index);
+                    }
                 }
-                self.heap.appendAssumeCapacity(.{ .index = next_index, .f = candidate, .h = 0 });
-                siftUp(self.heap.items, self.heap.items.len - 1);
             }
         }
-        self.state = .ready;
-        return true;
     }
 
-    fn heapPop(self: *GroupField) OpenNode {
-        const result = self.heap.items[0];
-        const last = self.heap.items.len - 1;
-        self.heap.items[0] = self.heap.items[last];
-        self.heap.items.len = last;
-        if (self.heap.items.len != 0) siftDown(self.heap.items, 0);
-        return result;
+    // Pops the next-lowest-distance queued cell, advancing the monotone distance cursor
+    // over empty buckets. Returns null when the queue is empty.
+    fn popNext(self: *GroupField) ?usize {
+        var scanned: u32 = 0;
+        while (scanned <= group_field_buckets) : (scanned += 1) {
+            const b = self.current_distance % group_field_buckets;
+            const head = self.buckets.items[b];
+            if (head != no_cell) {
+                const next = self.bucket_next.items[head];
+                self.buckets.items[b] = next;
+                if (next != no_cell) self.bucket_prev.items[next] = no_cell;
+                self.queued_stamp.items[head] = 0;
+                return head;
+            }
+            // Empty bucket: advance to the next distance. A full wrap with every bucket
+            // empty means the queue is drained.
+            self.current_distance += 1;
+        }
+        return null;
+    }
+
+    // The cell index of next_index's recorded flow parent (the cell its flow_dir points
+    // to), used only for the equal-cost predecessor tie-break.
+    fn flowParentIndex(self: *const GroupField, grid: *const NavGrid, next_index: usize) usize {
+        const dir = self.flow_dir.items[next_index];
+        if (dir == no_flow) return next_index;
+        const neighbor = neighbor_dirs[dir];
+        const x: i32 = @intCast(next_index % grid.width);
+        const y: i32 = @intCast(next_index / grid.width);
+        return grid.indexForCell(.{ .x = x + neighbor.x, .y = y + neighbor.y }) orelse next_index;
     }
 
     // Samples the flow direction at `cell_index`, returning the stepped waypoint.
@@ -1709,14 +1932,26 @@ const AbstractScratch = struct {
 };
 
 const SearchScratch = struct {
-    // One scratch slot per ThreadSystem participant. Budget-bounded: closed/g-cost
-    // use a cell->slot open-addressed hash with generation stamps rather than
-    // whole-grid arrays, so memory is O(max_explored_nodes), not O(cells).
+    // One scratch slot per ThreadSystem participant. The local A* node state
+    // (g-cost/parent/closed) lives in GENERATION-STAMPED DIRECT per-cell arrays
+    // indexed by cell_index: O(1) access with zero hash collisions/probes and good
+    // cache locality, in exchange for per-worker storage that is O(cells) (the
+    // intended speed-for-bounded-memory trade — the grid is world-bounded). A
+    // "reset" bumps the generation rather than clearing the arrays, only @memset-ing
+    // the stamps on the rare generation wraparound. `max_explored_nodes` remains the
+    // node BUDGET: an explicit expansion counter caps how many distinct cells one
+    // solve may stamp, spilling the request to a later frame when exceeded (storage
+    // is per-cell but the budget is unchanged).
     generation: u32 = 1,
-    slot_capacity: usize = 0,
+    cell_count: usize = 0,
+    // Per-solve count of distinct cells stamped this generation, bounded by the
+    // node budget so a long-range solve spills instead of fully exploring the grid.
+    explored: usize = 0,
+    explored_budget: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
-    // Parallel slot arrays, indexed by the cell hash slot.
-    slot_cell: std.ArrayList(u32) = .empty,
+    // Direct per-cell arrays, indexed by cell_index (NOT a hash slot). slot_g/parent/
+    // closed carry the A* state; slot_stamp marks which generation last touched the
+    // cell so stale values from a prior solve read as "untouched".
     slot_g: std.ArrayList(u32) = .empty,
     slot_parent: std.ArrayList(u32) = .empty,
     slot_closed: std.ArrayList(bool) = .empty,
@@ -1738,31 +1973,29 @@ const SearchScratch = struct {
         self.slot_closed.deinit(allocator);
         self.slot_parent.deinit(allocator);
         self.slot_g.deinit(allocator);
-        self.slot_cell.deinit(allocator);
         self.open.deinit(allocator);
         self.* = undefined;
     }
 
-    fn reserve(self: *SearchScratch, allocator: std.mem.Allocator, max_explored_nodes: usize, max_stored_path_cells: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize) !void {
+    fn reserve(self: *SearchScratch, allocator: std.mem.Allocator, max_explored_nodes: usize, max_stored_path_cells: usize, max_abstract_nodes: usize, max_stitched_path_cells: usize, cell_count: usize) !void {
         try self.abstract.reserve(allocator, max_abstract_nodes);
-        // Use a power-of-two-ish open table sized larger than the node budget to
-        // keep linear probing cheap.
-        const slot_capacity = @max(@as(usize, 16), max_explored_nodes * 2);
-        self.slot_capacity = slot_capacity;
+        // Direct per-cell arrays sized to the grid cell count; cell_index is the
+        // array index, so there is no probe and no collision. The node budget stays
+        // independent of this storage and is enforced by the expansion counter.
+        self.cell_count = cell_count;
+        self.explored_budget = max_explored_nodes;
         try self.open.ensureTotalCapacity(allocator, max_explored_nodes);
-        try self.slot_cell.ensureTotalCapacity(allocator, slot_capacity);
-        try self.slot_g.ensureTotalCapacity(allocator, slot_capacity);
-        try self.slot_parent.ensureTotalCapacity(allocator, slot_capacity);
-        try self.slot_closed.ensureTotalCapacity(allocator, slot_capacity);
-        try self.slot_stamp.ensureTotalCapacity(allocator, slot_capacity);
+        try self.slot_g.ensureTotalCapacity(allocator, cell_count);
+        try self.slot_parent.ensureTotalCapacity(allocator, cell_count);
+        try self.slot_closed.ensureTotalCapacity(allocator, cell_count);
+        try self.slot_stamp.ensureTotalCapacity(allocator, cell_count);
         try self.path_scratch.ensureTotalCapacity(allocator, @max(max_explored_nodes, max_stored_path_cells));
         // One extra slot lets a segment overflow be detected before truncation.
         try self.stitched_scratch.ensureTotalCapacity(allocator, max_stitched_path_cells + 1);
-        self.slot_cell.items.len = slot_capacity;
-        self.slot_g.items.len = slot_capacity;
-        self.slot_parent.items.len = slot_capacity;
-        self.slot_closed.items.len = slot_capacity;
-        self.slot_stamp.items.len = slot_capacity;
+        self.slot_g.items.len = cell_count;
+        self.slot_parent.items.len = cell_count;
+        self.slot_closed.items.len = cell_count;
+        self.slot_stamp.items.len = cell_count;
         @memset(self.slot_stamp.items, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
@@ -1770,6 +2003,7 @@ const SearchScratch = struct {
 
     fn reset(self: *SearchScratch) void {
         self.open.clearRetainingCapacity();
+        self.explored = 0;
         self.generation +%= 1;
         if (self.generation == 0) {
             @memset(self.slot_stamp.items, 0);
@@ -1777,27 +2011,20 @@ const SearchScratch = struct {
         }
     }
 
-    // Returns the slot index for `cell`, allocating it on first touch. Returns
-    // null when the table is full (node budget exhausted).
+    // Returns the direct cell slot, freshening it on first touch this generation.
+    // Returns null only when freshening a NEW cell would exceed the node budget
+    // (the spill cap) — already-touched cells always resolve, so reopening a cell
+    // never spills. cell_index must be < cell_count (a valid grid cell).
     fn slotFor(self: *SearchScratch, cell: usize) ?usize {
-        const capacity = self.slot_capacity;
-        if (capacity == 0) return null;
-        const start = hashUsize(cell) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            if (self.slot_stamp.items[index] == self.generation) {
-                if (self.slot_cell.items[index] == @as(u32, @intCast(cell))) return index;
-                continue;
-            }
-            // Fresh slot for this generation.
-            self.slot_stamp.items[index] = self.generation;
-            self.slot_cell.items[index] = @intCast(cell);
-            self.slot_g.items[index] = unreachable_cost;
-            self.slot_parent.items[index] = no_cell;
-            self.slot_closed.items[index] = false;
-            return index;
-        }
-        return null;
+        if (cell >= self.cell_count) return null;
+        if (self.slot_stamp.items[cell] == self.generation) return cell;
+        if (self.explored >= self.explored_budget) return null;
+        self.explored += 1;
+        self.slot_stamp.items[cell] = self.generation;
+        self.slot_g.items[cell] = unreachable_cost;
+        self.slot_parent.items[cell] = no_cell;
+        self.slot_closed.items[cell] = false;
+        return cell;
     }
 };
 
@@ -1815,7 +2042,7 @@ pub const PathfindingSystem = struct {
     pending_keys: KeySet = .{},
     group_fields: std.ArrayList(GroupField) = .empty,
     // Requested group goal keys this step (declared, never detected).
-    group_requests: std.ArrayList(PathQueryKey) = .empty,
+    group_requests: std.ArrayList(GroupRequestTally) = .empty,
     scratch_slots: std.ArrayList(SearchScratch) = .empty,
     // Per-worker reconstructed paths, written into completed by the main thread
     // after the worker batch finishes.
@@ -1934,8 +2161,9 @@ pub const PathfindingSystem = struct {
         const budget = NavMemoryBudget{
             .max_bytes = self.capacity.max_nav_memory_bytes,
             .level_count = level_count,
-            // group field per-cell: u32 cost + u8 flow + u32 stamp.
-            .group_field_bytes_per_cell = @sizeOf(u32) + 1 + @sizeOf(u32),
+            // group field per-cell: cost(u32) + flow(u8) + stamp(u32) + the Dial's
+            // bucket-queue links bucket_next/bucket_prev(u32) + queued_stamp(u32).
+            .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
             .max_group_fields = self.capacity.max_group_fields,
             .max_explored_nodes = self.capacity.max_explored_nodes,
             .max_stored_path_cells = self.capacity.max_stored_path_cells,
@@ -1958,7 +2186,7 @@ pub const PathfindingSystem = struct {
             try field.reserve(self.allocator, cell_count);
         }
         for (self.scratch_slots.items) |*scratch| {
-            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells);
+            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
         }
         // Pre-reserve the per-level affected-flag scratch so a steady-path
         // applyNavUpdates allocates nothing per edit.
@@ -2106,14 +2334,19 @@ pub const PathfindingSystem = struct {
 
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         self.step_counter +%= 1;
+        var accept_timer = PhaseTimer.begin();
         var stats = self.acceptRequests(requests.mergedItems());
+        stats.accept_ns = accept_timer.lap();
+        var group_timer = PhaseTimer.begin();
         self.serviceGroupFields(&stats);
+        stats.group_service_ns = group_timer.lap();
         const solve_count = self.effectiveSolveLimit(config);
         if (solve_count == 0) {
             stats.pending_requests = self.pending.items.len;
             stats.deferred_requests = self.pending.items.len;
             return stats;
         }
+        var solve_timer = PhaseTimer.begin();
         var system_config = config;
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(system_config), &stats);
@@ -2134,9 +2367,12 @@ pub const PathfindingSystem = struct {
                 .adaptive_tuner = system_config.fallback_adaptive_tuner,
             });
         }
+        stats.solve_ns = solve_timer.lap();
 
+        var publish_timer = PhaseTimer.begin();
         self.publishSolvedResults(solve_count, &stats);
         self.compactPendingAfterSolve(solve_count);
+        stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.items.len;
         stats.deferred_requests = self.pending.items.len;
         return stats;
@@ -2144,14 +2380,19 @@ pub const PathfindingSystem = struct {
 
     pub fn updateSerial(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), config: PathfindingConfig) !PathfindingStats {
         self.step_counter +%= 1;
+        var accept_timer = PhaseTimer.begin();
         var stats = self.acceptRequests(requests.mergedItems());
+        stats.accept_ns = accept_timer.lap();
+        var group_timer = PhaseTimer.begin();
         self.serviceGroupFields(&stats);
+        stats.group_service_ns = group_timer.lap();
         const solve_count = self.effectiveSolveLimit(config);
         if (solve_count == 0) {
             stats.pending_requests = self.pending.items.len;
             stats.deferred_requests = self.pending.items.len;
             return stats;
         }
+        var solve_timer = PhaseTimer.begin();
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(config), &stats);
         if (self.fallback_indices.items.len != 0) {
@@ -2170,8 +2411,11 @@ pub const PathfindingSystem = struct {
             .main_thread_ranges = if (self.fallback_indices.items.len == 0) 0 else 1,
             .ran_inline = true,
         };
+        stats.solve_ns = solve_timer.lap();
+        var publish_timer = PhaseTimer.begin();
         self.publishSolvedResults(solve_count, &stats);
         self.compactPendingAfterSolve(solve_count);
+        stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.items.len;
         stats.deferred_requests = self.pending.items.len;
         return stats;
@@ -2262,11 +2506,14 @@ pub const PathfindingSystem = struct {
     }
 
     fn recordGroupRequest(self: *PathfindingSystem, key: PathQueryKey) void {
-        for (self.group_requests.items) |existing| {
-            if (keysEqual(existing, key)) return;
+        for (self.group_requests.items) |*existing| {
+            if (keysEqual(existing.key, key)) {
+                existing.count += 1;
+                return;
+            }
         }
         if (self.group_requests.items.len < self.group_requests.capacity) {
-            self.group_requests.appendAssumeCapacity(key);
+            self.group_requests.appendAssumeCapacity(.{ .key = key, .count = 1 });
         }
     }
 
@@ -2283,8 +2530,14 @@ pub const PathfindingSystem = struct {
                 }
             }
         }
-        for (self.group_requests.items) |key| {
-            self.ensureGroupField(key, stats);
+        for (self.group_requests.items) |tally| {
+            // Only build/maintain a shared flow field once enough agents declare the
+            // same goal to amortize its O(cells) build. Smaller groups already took
+            // an individual A* solve during acceptance, so a handful of agents never
+            // pay the flow-field cost — pathfinding stays cheap at low agent counts
+            // and the field engages only at crowd scale.
+            if (tally.count < self.capacity.min_group_field_agents) continue;
+            self.ensureGroupField(tally.key, stats);
         }
     }
 
@@ -2714,15 +2967,15 @@ fn abstractCorridor(
     const abstract = &scratch.abstract;
     abstract.reset();
 
-    // Seed the open set with the start level's portals reachable (same component)
-    // from the start cell, costed by octile distance from the start. Iterating the
-    // per-level portal index keeps seeding O(start-level portals).
+    // Seed the open set with the start cell's component portals on the start level,
+    // costed by octile distance from the start. The (level, component) portal index
+    // yields only that component's portals, so seeding never scans unreachable
+    // components.
     const start_component = start_grid.components.items[start_index];
     if (start_component == no_component) return .none;
     var seeded: usize = 0;
-    for (graph.levelPortals(start_level)) |node_index| {
+    for (graph.levelComponentPortals(start_level, start_component)) |node_index| {
         const portal = graph.portals.items[node_index];
-        if (start_grid.components.items[portal.cell_index] != start_component) continue;
         const slot = abstract.slotFor(node_index) orelse return .saturated;
         const g = octileCells(graph.width, @intCast(start_index), portal.cell_index);
         abstract.slot_g.items[slot] = g;
@@ -2833,10 +3086,13 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
         return .found;
     }
     scratch.reset();
+    const width: i32 = @intCast(grid.width);
+    const goal_x: i32 = @intCast(goal_index % grid.width);
+    const goal_y: i32 = @intCast(goal_index / grid.width);
     const start_slot = scratch.slotFor(start_index) orelse return .budget_exhausted;
     scratch.slot_g.items[start_slot] = 0;
     scratch.slot_parent.items[start_slot] = @intCast(start_index);
-    const h0 = heuristic(grid, start_index, goal_index);
+    const h0 = octileXY(@intCast(start_index % grid.width), @intCast(start_index / grid.width), goal_x, goal_y);
     scratch.open.appendAssumeCapacity(.{ .index = start_index, .f = h0, .h = h0 });
 
     while (scratch.open.items.len != 0) {
@@ -2848,14 +3104,19 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
             reconstructLocalPath(scratch, start_index, goal_index);
             return .found;
         }
+        // Derive current (x,y) once and step neighbors by the direction offset; the
+        // neighbor coordinates feed the heuristic directly, so the inner loop has no
+        // per-neighbor div/mod.
         const current_x: i32 = @intCast(current.index % grid.width);
         const current_y: i32 = @intCast(current.index / grid.width);
         const current_g = scratch.slot_g.items[current_slot];
         for (neighbor_dirs) |dir| {
-            const next_cell = GridCell{ .x = current_x + dir.x, .y = current_y + dir.y };
-            const next_index = grid.indexForCell(next_cell) orelse continue;
+            const nx = current_x + dir.x;
+            const ny = current_y + dir.y;
+            if (nx < 0 or ny < 0 or nx >= width or ny >= @as(i32, @intCast(grid.height))) continue;
+            const next_index: usize = @intCast(ny * width + nx);
             if (grid.isBlockedIndex(next_index)) continue;
-            if (dir.diagonal and (grid.isBlockedCell(.{ .x = current_x + dir.x, .y = current_y }) or grid.isBlockedCell(.{ .x = current_x, .y = current_y + dir.y }))) {
+            if (dir.diagonal and (grid.isBlockedCell(.{ .x = nx, .y = current_y }) or grid.isBlockedCell(.{ .x = current_x, .y = ny }))) {
                 continue;
             }
             const next_slot = scratch.slotFor(next_index) orelse return .budget_exhausted;
@@ -2865,7 +3126,7 @@ fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize,
             if (candidate_g >= scratch.slot_g.items[next_slot]) continue;
             scratch.slot_g.items[next_slot] = candidate_g;
             scratch.slot_parent.items[next_slot] = @intCast(current.index);
-            const h = heuristic(grid, next_index, goal_index);
+            const h = octileXY(nx, ny, goal_x, goal_y);
             if (scratch.open.items.len >= scratch.open.capacity) return .budget_exhausted;
             scratch.open.appendAssumeCapacity(.{ .index = next_index, .f = candidate_g + h, .h = h });
             siftUp(scratch.open.items, scratch.open.items.len - 1);
@@ -2976,11 +3237,9 @@ fn oppositeDirIndex(dir_index: usize) u8 {
     return GroupField.no_flow;
 }
 
-fn heuristic(grid: *const NavGrid, from_index: usize, to_index: usize) u32 {
-    const from_x: i32 = @intCast(from_index % grid.width);
-    const from_y: i32 = @intCast(from_index / grid.width);
-    const to_x: i32 = @intCast(to_index % grid.width);
-    const to_y: i32 = @intCast(to_index / grid.width);
+// Octile heuristic over explicit cell coordinates; callers pass coordinates they
+// already hold so the hot loop avoids re-deriving them via div/mod.
+fn octileXY(from_x: i32, from_y: i32, to_x: i32, to_y: i32) u32 {
     const dx: u32 = @intCast(@abs(to_x - from_x));
     const dy: u32 = @intCast(@abs(to_y - from_y));
     const diagonal = @min(dx, dy);
@@ -3088,6 +3347,10 @@ fn baselineCapacity() PathfindingCapacity {
         .max_worker_scratch_slots = 1,
         .max_solved_requests_per_step = 8,
         .max_fallback_requests_per_step = 8,
+        // Group tests exercise the flow field with a handful of agents; keep the
+        // old "build on any group request" behavior. The demo uses the higher
+        // default so small crowds skip the field.
+        .min_group_field_agents = 1,
     };
 }
 
@@ -3217,7 +3480,7 @@ test "pathfinding spills to pending when node budget is exhausted" {
     defer system.deinit();
     var capacity = baselineCapacity();
     // A tiny node budget cannot explore the open grid to the far goal.
-    capacity.max_explored_nodes = 8;
+    capacity.max_explored_nodes = 20;
     try system.reserve(capacity);
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
@@ -3365,6 +3628,46 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
     try std.testing.expectEqual(PathStatus.available, view.status);
 }
 
+test "pathfinding skips the group flow field below the agent threshold" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const c = try addNavBody(&data, .{ .x = 64, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    // Require three same-goal agents before a shared field is built.
+    var capacity = baselineCapacity();
+    capacity.min_group_field_agents = 3;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    const goal = math.Vec2{ .x = 200, .y = 200 };
+
+    // Two agents (< threshold): no field builds; the shared goal still resolves via
+    // one individual A* solve, so a small group never pays the flow-field cost.
+    var below = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer below.deinit();
+    try below.reserve(3, 3);
+    try appendPathRequest(&below, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+    try appendPathRequest(&below, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+    const below_stats = try system.updateSerial(&below, .{});
+    try std.testing.expectEqual(@as(usize, 0), below_stats.group_fields_built);
+    try std.testing.expectEqual(@as(usize, 1), below_stats.accepted_requests);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default).status);
+
+    // Three agents (== threshold): the shared field now builds.
+    var at = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer at.deinit();
+    try at.reserve(3, 3);
+    try appendPathRequest(&at, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+    try appendPathRequest(&at, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+    try appendPathRequest(&at, .{ .entity = c, .kind = .group, .start = .{ .x = 72, .y = 8 }, .goal = goal });
+    const at_stats = try system.updateSerial(&at, .{});
+    try std.testing.expectEqual(@as(usize, 1), at_stats.group_fields_built);
+}
+
 test "pathfinding builds no group field when no group requests arrive" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3479,6 +3782,76 @@ test "pathfinding group field reports building across frames under tiny budget" 
     }
     try std.testing.expect(guard > 0);
     try std.testing.expectEqual(GroupFieldState.ready, system.findGroupField(key).?.state);
+}
+
+// Reference reverse-Dijkstra integration field over a NavGrid using a binary heap with
+// the same octile step costs, strict-improvement relaxation, and (cost, index) tie
+// order as a priority-queue Dijkstra. The production GroupField's Dial's bucket queue
+// must reproduce this field byte-for-byte (costs AND flow directions).
+fn referenceFlowField(allocator: std.mem.Allocator, grid: *const NavGrid, goal_index: usize, out_cost: []u32, out_dir: []u8) !void {
+    @memset(out_cost, unreachable_cost);
+    @memset(out_dir, GroupField.no_flow);
+    var heap = std.ArrayList(OpenNode).empty;
+    defer heap.deinit(allocator);
+    out_cost[goal_index] = 0;
+    try heap.append(allocator, .{ .index = goal_index, .f = 0, .h = 0 });
+    while (heap.items.len != 0) {
+        const current = popHeap(&heap);
+        if (out_cost[current.index] != current.f) continue;
+        const cx: i32 = @intCast(current.index % grid.width);
+        const cy: i32 = @intCast(current.index / grid.width);
+        for (neighbor_dirs, 0..) |dir, dir_index| {
+            const next_index = grid.indexForCell(.{ .x = cx + dir.x, .y = cy + dir.y }) orelse continue;
+            if (grid.isBlockedIndex(next_index)) continue;
+            if (dir.diagonal and (grid.isBlockedCell(.{ .x = cx + dir.x, .y = cy }) or grid.isBlockedCell(.{ .x = cx, .y = cy + dir.y }))) continue;
+            const candidate = current.f + (if (dir.diagonal) diagonal_cost else cardinal_cost);
+            if (candidate >= out_cost[next_index]) continue;
+            out_cost[next_index] = candidate;
+            out_dir[next_index] = oppositeDirIndex(dir_index);
+            try heap.append(allocator, .{ .index = next_index, .f = candidate, .h = 0 });
+            siftUp(heap.items, heap.items.len - 1);
+        }
+    }
+}
+
+test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra field" {
+    const allocator = std.testing.allocator;
+    var grid = NavGrid{};
+    defer grid.deinit(allocator);
+    try grid.prepare(allocator, 0, 20, 20, default_cell_size, 1);
+    // A diagonal-ish obstacle pattern so the field has equal-cost cells reachable from
+    // multiple predecessors (the case where pop order could change flow directions).
+    const blocked_cells = [_][2]usize{ .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 6, 5 }, .{ 7, 5 }, .{ 10, 10 }, .{ 11, 10 }, .{ 12, 10 }, .{ 3, 12 }, .{ 4, 12 }, .{ 14, 6 }, .{ 14, 7 } };
+    for (blocked_cells) |bc| grid.markBlockedIndex(bc[1] * grid.width + bc[0]);
+    grid.buildComponents();
+
+    const cell_count = grid.cellCount();
+    const ref_cost = try allocator.alloc(u32, cell_count);
+    defer allocator.free(ref_cost);
+    const ref_dir = try allocator.alloc(u8, cell_count);
+    defer allocator.free(ref_dir);
+    const goal_index = 9 * grid.width + 9;
+    try referenceFlowField(allocator, &grid, goal_index, ref_cost, ref_dir);
+
+    var field = GroupField{};
+    defer field.deinit(allocator);
+    try field.reserve(allocator, cell_count);
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1));
+    // Build in tiny budgeted chunks so the cross-frame resume path is exercised too.
+    var guard: usize = 0;
+    while (field.state == .building and guard < cell_count + 8) : (guard += 1) {
+        _ = field.expand(&grid, 7);
+    }
+    try std.testing.expectEqual(GroupFieldState.ready, field.state);
+
+    // Every cell's integration cost and flow direction matches the reference exactly.
+    for (0..cell_count) |i| {
+        const dial_cost = field.cost(i);
+        try std.testing.expectEqual(ref_cost[i], dial_cost);
+        if (ref_cost[i] != unreachable_cost) {
+            try std.testing.expectEqual(ref_dir[i], field.flow_dir.items[i]);
+        }
+    }
 }
 
 test "pathfinding threaded solve matches serial solve" {
@@ -3636,7 +4009,7 @@ test "pathfinding result cache evicts deterministically and stores paths" {
 }
 
 // ----------------------------------------------------------------------------
-// Abstract-tier and cross-level (Slice 25C) test fixtures and tests
+// Abstract-tier and cross-level test fixtures and tests
 // ----------------------------------------------------------------------------
 
 // Loads the world tileset metadata used by the demo. Cross-level/abstract tests
@@ -3667,6 +4040,7 @@ fn abstractCapacity() PathfindingCapacity {
         .max_fallback_requests_per_step = 8,
         .nav_chunk_tiles = 4,
         .max_stitched_path_cells = 256,
+        .min_group_field_agents = 1,
     };
 }
 
@@ -3970,7 +4344,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     // Build a single-level and a multi-level world of the SAME size and identical
     // level-0 topology. Seeding scans only the start level's portals, so level 0's
     // seeded portal count must be IDENTICAL regardless of how many other levels and
-    // how many total portals exist. This proves seeding is per-level-bounded (M2).
+    // how many total portals exist. This proves seeding is per-level-bounded.
     var one_data = DataSystem.init(std.testing.allocator);
     defer one_data.deinit();
     var one_world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
@@ -4296,6 +4670,60 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     try std.testing.expectEqual(PathStatus.pending, view.status);
 }
 
+test "pathfinding component-scoped portal seeding only scans the start component" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    // A 12x12-cell world split into TWO disconnected open regions by a SOLID vertical
+    // tree wall at column 5 (no gaps). Left (cols 0..4) and right (cols 6..11) are
+    // different connected components on level 0, each spanning several 4-tile chunks
+    // so each has its own border portals.
+    const built = try buildCorridorWorld(&meta, &.{});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const grid = system.graph.grid(0).?;
+    const left_cell = grid.indexForCell(.{ .x = 1, .y = 5 }).?;
+    const right_cell = grid.indexForCell(.{ .x = 9, .y = 5 }).?;
+    const left_component = grid.componentOf(left_cell);
+    const right_component = grid.componentOf(right_cell);
+    // The wall genuinely splits the world into two components.
+    try std.testing.expect(left_component != no_component);
+    try std.testing.expect(right_component != no_component);
+    try std.testing.expect(left_component != right_component);
+
+    // The (level, component) index partitions the level's portals: every portal in a
+    // component's slice belongs to that component, the two slices are disjoint, and
+    // together they cover all of the level's portals. Seeding therefore scans ONLY the
+    // start component's portals instead of the level's full border.
+    const left_portals = system.graph.levelComponentPortals(0, left_component);
+    const right_portals = system.graph.levelComponentPortals(0, right_component);
+    try std.testing.expect(left_portals.len > 0);
+    try std.testing.expect(right_portals.len > 0);
+    for (left_portals) |node| {
+        try std.testing.expectEqual(left_component, grid.componentOf(system.graph.portals.items[node].cell_index));
+    }
+    for (right_portals) |node| {
+        try std.testing.expectEqual(right_component, grid.componentOf(system.graph.portals.items[node].cell_index));
+    }
+    try std.testing.expectEqual(system.graph.levelPortals(0).len, left_portals.len + right_portals.len);
+
+    // Correctness preserved: a cross-component goal (no link) is unavailable, and a
+    // same-component goal stays reachable.
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const cross = try solveStep(&system, requester, tileCenter(1, 5), tileCenter(9, 5));
+    try std.testing.expectEqual(@as(usize, 1), cross.unavailable_results);
+    const same = try solveStep(&system, requester, tileCenter(1, 1), tileCenter(1, 10));
+    try std.testing.expectEqual(@as(usize, 1), same.available_results);
+}
+
 test "pathfinding warmed cross-level abstract solve does not allocate" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -4347,7 +4775,7 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
 }
 
 // ----------------------------------------------------------------------------
-// Slice 25D: incremental nav update tests
+// Incremental nav update tests
 // ----------------------------------------------------------------------------
 
 // World center (px) of tile cell (cx, cy) at the demo 32px tile size, used to seed
