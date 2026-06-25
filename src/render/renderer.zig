@@ -38,6 +38,12 @@ pub const UiStackOrder = sprite_batch.UiStackOrder;
 pub const DebugDepth = sprite_batch.DebugDepth;
 pub const Sprite = sprite_batch.Sprite;
 pub const SpritePrepStats = sprite_batch.SpritePrepStats;
+// Re-exported so world/render-prep code can build retained static vertices
+// without importing the render/gpu boundary.
+pub const Vertex = sprite_batch.Vertex;
+const DrawGroup = sprite_batch.DrawGroup;
+const DrawSource = sprite_batch.DrawSource;
+const CoordinatePresentation = sprite_batch.CoordinatePresentation;
 
 pub const FrameResult = enum {
     submitted,
@@ -64,6 +70,21 @@ pub const Renderer = struct {
     viewport_width: u32 = 0,
     viewport_height: u32 = 0,
     window_claimed: bool = true,
+    // Retained static world geometry: world-space vertices uploaded once and
+    // re-uploaded only when `static_dirty` (visible set change, dig/build). The
+    // GPU buffer persists across frames; the per-frame draw list interleaves
+    // these spans with the dynamic batch by render order.
+    static_vertex_buffer: ?*c.SDL_GPUBuffer = null,
+    static_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
+    static_capacity_vertices: usize = 0,
+    static_vertices: std.ArrayListUnmanaged(Vertex) = .empty,
+    static_groups: std.ArrayListUnmanaged(DrawGroup) = .empty,
+    static_dirty: bool = false,
+    draw_list: std.ArrayListUnmanaged(DrawGroup) = .empty,
+    // Reserved upper bounds feeding the merged draw list. `draw_list` is sized to
+    // their sum so the per-frame merge stays allocation-free.
+    reserved_dynamic_groups: usize = 0,
+    reserved_static_spans: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -132,6 +153,11 @@ pub const Renderer = struct {
         }
         self.texture_slots.deinit(self.allocator);
         self.deinitBatchStorage();
+        self.static_vertices.deinit(self.allocator);
+        self.static_groups.deinit(self.allocator);
+        self.draw_list.deinit(self.allocator);
+        if (self.static_transfer_buffer) |transfer| c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+        if (self.static_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(self.device, buffer);
 
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
         c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
@@ -164,6 +190,8 @@ pub const Renderer = struct {
         const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
         try self.reserveBatchStorage(command_capacity, vertex_capacity, command_capacity);
         try self.ensureBatchCapacity(vertex_capacity);
+        self.reserved_dynamic_groups = command_capacity;
+        try self.ensureDrawListReservation();
     }
 
     pub fn submitOrderedRectInSpace(self: *Renderer, rect: Rect, color: config.Color, order: RenderOrder, coordinate_space: CoordinateSpace) !void {
@@ -178,6 +206,53 @@ pub const Renderer = struct {
 
     pub fn setCamera(self: *Renderer, camera: Camera2D) void {
         self.batch.setCamera(camera);
+    }
+
+    /// Begins replacing the retained static geometry for this and following
+    /// frames. Producers call this only when the static set changes (visible set
+    /// change, dig/build), then append spans; the buffer re-uploads once. When
+    /// not called, the existing static geometry persists and is reused.
+    pub fn beginStaticGeometry(self: *Renderer) void {
+        self.static_vertices.clearRetainingCapacity();
+        self.static_groups.clearRetainingCapacity();
+        self.static_dirty = true;
+    }
+
+    /// Reserves retained static storage. Setup/grow-only; call before relying on
+    /// allocation-free static rebuilds.
+    pub fn reserveStaticGeometry(self: *Renderer, vertex_capacity: usize, span_capacity: usize) !void {
+        try self.static_vertices.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.static_groups.ensureTotalCapacity(self.allocator, span_capacity);
+        self.reserved_static_spans = span_capacity;
+        try self.ensureDrawListReservation();
+    }
+
+    // Sizes the merged draw list to the combined dynamic + static span budget so
+    // the per-frame `mergeDrawList` never reallocates.
+    fn ensureDrawListReservation(self: *Renderer) !void {
+        const total = try std.math.add(usize, self.reserved_dynamic_groups, self.reserved_static_spans);
+        try self.draw_list.ensureTotalCapacity(self.allocator, total);
+    }
+
+    /// Appends one retained world-space span (e.g. a chunk-layer) with its draw
+    /// order. `vertices` are world space; the camera is applied by the vertex
+    /// uniform at draw time. Must be called between `beginStaticGeometry` and the
+    /// next `endFrame`.
+    pub fn appendStaticSpan(self: *Renderer, texture: TextureId, order: RenderOrder, vertices: []const Vertex) !void {
+        if (vertices.len == 0) return;
+        const end = try std.math.add(usize, self.static_vertices.items.len, vertices.len);
+        const first_vertex = std.math.cast(u32, self.static_vertices.items.len) orelse return error.StaticGeometryTooLarge;
+        _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
+        try self.static_vertices.appendSlice(self.allocator, vertices);
+        try self.static_groups.append(self.allocator, .{
+            .source = .static,
+            .texture = texture,
+            .presentation = .world,
+            .order = order,
+            .first_vertex = first_vertex,
+            .vertex_count = @intCast(vertices.len),
+        });
+        self.static_dirty = true;
     }
 
     pub fn drawablePixelScale(self: *const Renderer) f32 {
@@ -285,12 +360,21 @@ pub const Renderer = struct {
         // Sorting, texture metadata snapshots, and optional worker vertex prep
         // happen before acquiring the swapchain to keep the acquired window short.
         try self.prepareFrameCommands(thread_system);
+        // Unified draw list: retained static spans + dynamic groups, ordered and
+        // coalesced. Rebuilt every frame because the dynamic groups change; the
+        // static buffer itself only re-uploads when `static_dirty`.
+        try mergeDrawList(&self.draw_list, self.allocator, self.static_groups.items, self.batch.draw_groups.items);
+        const upload_static = self.static_dirty and self.static_vertices.items.len > 0;
         // Staging before swapchain acquisition is safe across frames in flight
         // only because the transfer buffer is mapped with cycle=true (see
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
-        // overwriting bytes a prior frame's copy pass may still reference.
+        // overwriting bytes a prior frame's copy pass may still reference. The
+        // static buffer uses the same cycle=true upload, only when dirty.
         if (self.batch.vertices.items.len > 0) {
             try self.stageVertices();
+        }
+        if (upload_static) {
+            try self.stageStaticVertices();
         }
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
@@ -306,6 +390,14 @@ pub const Renderer = struct {
                 return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
             };
         }
+        if (upload_static) {
+            self.recordStaticVertexUpload(command_buffer) catch {
+                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
+            };
+        }
+        // The static buffer now holds current data on the GPU; reuse it until the
+        // next change marks it dirty again.
+        self.static_dirty = false;
 
         var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
         color_target.texture = acquired_swapchain_texture;
@@ -323,18 +415,28 @@ pub const Renderer = struct {
         };
         c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
 
-        if (self.batch.vertices.items.len > 0) {
+        if (self.draw_list.items.len > 0) {
             applyDrawableViewport(render_pass, presentation);
 
-            var vertex_binding = c.SDL_GPUBufferBinding{
-                .buffer = self.vertex_buffer,
-                .offset = 0,
-            };
-            c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
-
-            var active_presentation: ?sprite_batch.CoordinatePresentation = null;
-            for (self.batch.draw_groups.items) |group| {
+            // Bind the source buffer on source change, push the presentation
+            // uniform on presentation change, draw each group in order.
+            var active_source: ?DrawSource = null;
+            var active_presentation: ?CoordinatePresentation = null;
+            for (self.draw_list.items) |group| {
                 const texture = self.resolveTextureSlot(group.texture) orelse continue;
+                const source_buffer = switch (group.source) {
+                    .dynamic => self.vertex_buffer,
+                    .static => self.static_vertex_buffer orelse continue,
+                };
+
+                if (active_source == null or active_source.? != group.source) {
+                    var vertex_binding = c.SDL_GPUBufferBinding{
+                        .buffer = source_buffer,
+                        .offset = 0,
+                    };
+                    c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
+                    active_source = group.source;
+                }
 
                 if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
                     applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation, self.batch.camera);
@@ -637,6 +739,48 @@ pub const Renderer = struct {
         try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_transfer_buffer, self.vertex_buffer, self.batch.vertices.items);
     }
 
+    // Grows the retained static buffer to hold `needed_vertices`. Grow-only; the
+    // static buffer is created lazily on first non-empty upload. Like the dynamic
+    // grow path this stalls on GPU idle, but static rebuilds are infrequent.
+    fn ensureStaticCapacity(self: *Renderer, needed_vertices: usize) !void {
+        if (self.static_vertex_buffer != null and needed_vertices <= self.static_capacity_vertices) return;
+
+        var new_capacity = if (self.static_capacity_vertices == 0) needed_vertices else self.static_capacity_vertices;
+        while (new_capacity < needed_vertices) {
+            new_capacity *= 2;
+        }
+
+        if (self.static_vertex_buffer != null) {
+            // Growing an existing static buffer stalls on GPU idle below. Reserve
+            // static capacity up front so this is not hit at runtime.
+            log.warn("growing static vertex capacity {} -> {} vertices (GPU stall); reserve capacity to avoid this", .{ self.static_capacity_vertices, new_capacity });
+        }
+
+        const new_buffer = try gpu_buffer.createVertexBuffer(self.device, new_capacity);
+        errdefer c.SDL_ReleaseGPUBuffer(self.device, new_buffer);
+        const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, new_capacity);
+        errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
+
+        if (self.static_vertex_buffer != null) {
+            _ = c.SDL_WaitForGPUIdle(self.device);
+            if (self.static_transfer_buffer) |transfer| c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+            if (self.static_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        }
+
+        self.static_vertex_buffer = new_buffer;
+        self.static_transfer_buffer = new_transfer;
+        self.static_capacity_vertices = new_capacity;
+    }
+
+    fn stageStaticVertices(self: *Renderer) !void {
+        try self.ensureStaticCapacity(self.static_vertices.items.len);
+        try gpu_buffer.stageVertices(self.device, self.static_transfer_buffer.?, self.static_vertices.items);
+    }
+
+    fn recordStaticVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
+        try gpu_buffer.recordVertexUpload(command_buffer, self.static_transfer_buffer.?, self.static_vertex_buffer.?, self.static_vertices.items);
+    }
+
     pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {
         return self.batch.lastPrepStats();
     }
@@ -645,6 +789,54 @@ pub const Renderer = struct {
         _ = self.batch.buildAssumeCapacity(self.textureResolver(), thread_system, .{});
     }
 };
+
+// Stable comparator for the unified draw list: by render order only, so equal
+// orders keep append order (static spans are appended before dynamic groups,
+// preserving the prior world-before-dynamic tie-break at the same depth).
+fn drawGroupOrderLessThan(_: void, a: DrawGroup, b: DrawGroup) bool {
+    const a_domain = @intFromEnum(a.order.domain);
+    const b_domain = @intFromEnum(b.order.domain);
+    if (a_domain != b_domain) return a_domain < b_domain;
+    return a.order.depth < b.order.depth;
+}
+
+// Coalesces adjacent draw groups sharing source, texture, and presentation that
+// are contiguous in their buffer. Compacts in place; returns the new length.
+fn coalesceDrawList(items: []DrawGroup) usize {
+    if (items.len == 0) return 0;
+    var write: usize = 0;
+    for (items[1..]) |group| {
+        const cur = &items[write];
+        if (cur.source == group.source and
+            cur.presentation == group.presentation and
+            cur.texture.index == group.texture.index and
+            cur.texture.generation == group.texture.generation and
+            cur.first_vertex + cur.vertex_count == group.first_vertex)
+        {
+            cur.vertex_count += group.vertex_count;
+        } else {
+            write += 1;
+            items[write] = group;
+        }
+    }
+    return write + 1;
+}
+
+// Builds the per-frame unified draw list from retained static spans and dynamic
+// groups: append (static first), stable-sort by order, then coalesce.
+fn mergeDrawList(
+    out: *std.ArrayListUnmanaged(DrawGroup),
+    allocator: std.mem.Allocator,
+    static_groups: []const DrawGroup,
+    dynamic_groups: []const DrawGroup,
+) !void {
+    out.clearRetainingCapacity();
+    try out.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
+    out.appendSliceAssumeCapacity(static_groups);
+    out.appendSliceAssumeCapacity(dynamic_groups);
+    std.mem.sort(DrawGroup, out.items, {}, drawGroupOrderLessThan);
+    out.items.len = coalesceDrawList(out.items);
+}
 
 const UploadedTexture = gpu_texture.UploadedTexture;
 
@@ -985,6 +1177,124 @@ test "presentation state applies first group and changes only" {
     try std.testing.expectEqual(sprite_batch.CoordinatePresentation.drawable, active_presentation.?);
     try std.testing.expect(!shouldApplyPresentationState(&active_presentation, .drawable));
     try std.testing.expect(shouldApplyPresentationState(&active_presentation, .logical));
+}
+
+fn testDrawGroup(
+    source: DrawSource,
+    texture_index: u32,
+    presentation: CoordinatePresentation,
+    order: RenderOrder,
+    first_vertex: u32,
+    vertex_count: u32,
+) DrawGroup {
+    return .{
+        .source = source,
+        .texture = TextureId.init(texture_index, 1) catch unreachable,
+        .presentation = presentation,
+        .order = order,
+        .first_vertex = first_vertex,
+        .vertex_count = vertex_count,
+    };
+}
+
+test "draw list interleaves static and dynamic by render order across z" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // Static floor (-2) and effect (+1) tiles; a dynamic actor (0) between them.
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6),
+        testDrawGroup(.static, 0, .world, RenderOrder.world(1), 6, 6),
+    };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(0), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(DrawSource.static, list.items[0].source);
+    try std.testing.expectEqual(@as(i32, -2), list.items[0].order.depth);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[1].source);
+    try std.testing.expectEqual(@as(i32, 0), list.items[1].order.depth);
+    try std.testing.expectEqual(DrawSource.static, list.items[2].source);
+    try std.testing.expectEqual(@as(i32, 1), list.items[2].order.depth);
+}
+
+test "draw list coalesces contiguous same-source same-texture spans" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6),
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 6, 12),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &.{});
+
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(@as(u32, 0), list.items[0].first_vertex);
+    try std.testing.expectEqual(@as(u32, 18), list.items[0].vertex_count);
+}
+
+test "draw list keeps non-contiguous spans separate" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6),
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 12, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &.{});
+
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "merge draw list stays allocation-free when reserved to combined size" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // Reserve to dynamic + static budget (2 + 2), as the renderer reservation does.
+    try list.ensureTotalCapacity(allocator, 4);
+    const capacity_before = list.capacity;
+
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6),
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-1), 6, 6),
+    };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(0), 0, 6),
+        testDrawGroup(.dynamic, 1, .logical, RenderOrder.ui(.panel), 6, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(capacity_before, list.capacity);
+}
+
+test "draw list does not merge across source and keeps static before dynamic at equal order" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(0), 0, 6),
+    };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 0, .world, RenderOrder.world(0), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqual(DrawSource.static, list.items[0].source);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[1].source);
 }
 
 test "renderer drawable pixel scale follows current presentation" {
