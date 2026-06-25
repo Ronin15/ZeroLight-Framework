@@ -910,6 +910,8 @@ pub const GameDemoState = struct {
 
     /// Truncates a non-negative magnitude to integer hash bits, guarding
     /// `@intFromFloat` against non-finite contact normals (illegal behavior).
+    /// The `@min` ceiling is purely an `@intFromFloat` domain guard, not a
+    /// hashing concern: the bounded callers never approach it.
     fn hashBitsFromFloat(value: f32) u64 {
         if (!std.math.isFinite(value) or value <= 0) return 0;
         return @intFromFloat(@min(value, 16_777_216.0));

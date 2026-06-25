@@ -218,9 +218,11 @@ pub const Renderer = struct {
     /// Acquires a command buffer and swapchain texture, handling the
     /// no-swapchain and zero-size cases internally (canceling, or submitting an
     /// empty frame). Returns null when the frame should be skipped; on success
-    /// the caller owns `command_buffer` and records into it — post-acquisition
-    /// error paths are explicit (`finishAcquiredCommandBufferAfterError`), so no
-    /// errdefer crosses back to the caller. `recovery` only tunes the log text.
+    /// the caller owns `command_buffer` and records into it. The helper's own
+    /// pre-acquisition errdefer is fully resolved before any return, so the
+    /// returned command buffer carries no pending cleanup — post-acquisition
+    /// error paths are explicit (`finishAcquiredCommandBufferAfterError`).
+    /// `recovery` only tunes the log text.
     fn acquireSwapchainFrame(self: *Renderer, recovery: bool) !?AcquiredFrame {
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
             return sdlError("SDL_AcquireGPUCommandBuffer");

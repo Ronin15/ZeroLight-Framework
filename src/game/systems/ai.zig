@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -657,33 +658,114 @@ const SeparationResult = struct {
     candidate_count: u16 = 0,
 };
 
+// Window thresholds shared by the SIMD body and the scalar tail so both paths
+// use identical epsilon/radius constants.
+const separation_min_dist2: f32 = 0.1;
+
+// Pass 1 (gather) walks the separation cells and packs every cap-passing
+// candidate's dx/dy into stack-local SoA scratch sized by the candidate cap. The
+// distance window is applied vectorized in pass 2, not here. Pass 1 ends on the
+// candidate cap, or early once max_separation_neighbors in-window neighbors have
+// been found: the cheap scalar window below is just the early-out that bounds the
+// gather in dense crowds, where most candidates accept.
+//
+// Pass 2 vectorizes everything: it builds the window mask from the two
+// comparisons, computes dist2 / reciprocal-sqrt / accumulate 4 lanes at a time,
+// and tallies accepted neighbors. The neighbor cap bounds the contributing set to
+// the first N in-window neighbors in grid order; the 4-lane block that crosses the
+// cap is handled scalar lane-by-lane so that boundary is exact; all earlier full
+// blocks are pure SIMD.
 fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
     const own_cell = cellForPosition(job.pos_x[index], job.pos_y[index]);
     var result = SeparationResult{};
+
+    var s_dx: [max_separation_candidate_checks]f32 = undefined;
+    var s_dy: [max_separation_candidate_checks]f32 = undefined;
+    var scratch_len: usize = 0;
+    var accepted_tally: u8 = 0;
+
     var cell_y = own_cell.y - separation_cell_radius;
-    while (cell_y <= own_cell.y + separation_cell_radius) : (cell_y += 1) {
+    pass1: while (cell_y <= own_cell.y + separation_cell_radius) : (cell_y += 1) {
         var cell_x = own_cell.x - separation_cell_radius;
         while (cell_x <= own_cell.x + separation_cell_radius) : (cell_x += 1) {
             const range = findCellRange(job.cell_ranges, .{ .x = cell_x, .y = cell_y }) orelse continue;
             for (job.cell_entries[range.start..range.end]) |entry| {
                 if (entry.index == index) continue;
-                if (result.candidate_count >= max_separation_candidate_checks) return result;
+                if (result.candidate_count >= max_separation_candidate_checks) break :pass1;
                 result.candidate_count += 1;
 
                 const dx = job.pos_x[index] - job.pos_x[entry.index];
                 const dy = job.pos_y[index] - job.pos_y[entry.index];
+                s_dx[scratch_len] = dx;
+                s_dy[scratch_len] = dy;
+                scratch_len += 1;
+
+                // Cheap scalar early-out: once max_separation_neighbors in-window
+                // neighbors are found the scan stops, bounding gather work in
+                // dense crowds. neighbor_count and the accumulation itself are
+                // computed vectorized in pass 2.
                 const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.1 and dist2 < separation_radius2) {
-                    const invd = 1.0 / @sqrt(dist2);
-                    result.x += dx * invd;
-                    result.y += dy * invd;
-                    result.neighbor_count += 1;
-                    if (result.neighbor_count >= max_separation_neighbors) return result;
+                if (dist2 > separation_min_dist2 and dist2 < separation_radius2) {
+                    accepted_tally += 1;
+                    if (accepted_tally >= max_separation_neighbors) break :pass1;
                 }
             }
         }
     }
+
+    accumulateSeparation(s_dx[0..scratch_len], s_dy[0..scratch_len], &result);
     return result;
+}
+
+// Pass 2: vectorized window + reciprocal-sqrt + accumulate over the gathered
+// scratch. The divisor is floored before the reciprocal so masked/short lanes
+// never produce inf/NaN, and rejected lanes are zeroed before the horizontal
+// fold. The neighbor cap bounds the contributing set to the first N in-window
+// neighbors in grid order; the block that crosses the cap drops to scalar so that
+// boundary lands on the exact neighbor.
+fn accumulateSeparation(dxs: []const f32, dys: []const f32, result: *SeparationResult) void {
+    const dist_floor = simd.splatFloat4(std.math.floatMin(f32));
+    const min4 = simd.splatFloat4(separation_min_dist2);
+    const max4 = simd.splatFloat4(separation_radius2);
+    const zero4 = simd.splatFloat4(0);
+
+    const body_end = simd.vectorizedEnd(dxs.len);
+    var offset: usize = 0;
+    while (offset < body_end) : (offset += simd.lane_count) {
+        const dx = simd.loadFloat4(dxs[offset..]);
+        const dy = simd.loadFloat4(dys[offset..]);
+        const dist2 = simd.lengthSquared2Float4(dx, dy);
+        const mask = simd.greaterThanFloat4(dist2, min4) & simd.lessThanFloat4(dist2, max4);
+
+        const accepted_here: u8 = @intCast(simd.maskTrueCount(mask));
+        if (result.neighbor_count + accepted_here > max_separation_neighbors) {
+            accumulateSeparationTail(dxs[offset..][0..simd.lane_count], dys[offset..][0..simd.lane_count], result);
+            return;
+        }
+
+        const inv_len = simd.reciprocalSqrtFloat4(simd.maxFloat4(dist2, dist_floor));
+        result.x += simd.horizontalSumFloat4(simd.selectFloat4(mask, dx * inv_len, zero4));
+        result.y += simd.horizontalSumFloat4(simd.selectFloat4(mask, dy * inv_len, zero4));
+        result.neighbor_count += accepted_here;
+    }
+
+    accumulateSeparationTail(dxs[body_end..], dys[body_end..], result);
+}
+
+// Scalar lane-by-lane accumulate sharing the SIMD body's window/accumulate
+// expressions, used for the `<4` tail and the cap-crossing block so the neighbor
+// cap stops on the exact neighbor reached in grid order.
+fn accumulateSeparationTail(dxs: []const f32, dys: []const f32, result: *SeparationResult) void {
+    for (dxs, dys) |dx, dy| {
+        if (result.neighbor_count >= max_separation_neighbors) return;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 > separation_min_dist2 and dist2 < separation_radius2) {
+            const invd = 1.0 / @sqrt(dist2);
+            result.x += dx * invd;
+            result.y += dy * invd;
+            result.neighbor_count += 1;
+        }
+    }
 }
 
 const AiJobContext = struct {
@@ -1208,4 +1290,76 @@ test "ai spatial separation handles negative grid coordinates" {
     try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 2), stats.separation_candidate_checks);
     try std.testing.expectEqual(@as(usize, 2), stats.separation_neighbor_samples);
+}
+
+// Pre-refactor scalar separation accumulate, reproduced exactly as the parity
+// oracle: window over each candidate, 1/sqrt accumulate, neighbor cap by count.
+fn referenceSeparation(dxs: []const f32, dys: []const f32) SeparationResult {
+    var result = SeparationResult{};
+    for (dxs, dys) |dx, dy| {
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 > separation_min_dist2 and dist2 < separation_radius2) {
+            const invd = 1.0 / @sqrt(dist2);
+            result.x += dx * invd;
+            result.y += dy * invd;
+            result.neighbor_count += 1;
+            if (result.neighbor_count >= max_separation_neighbors) return result;
+        }
+    }
+    return result;
+}
+
+test "ai separation SIMD accumulate matches scalar oracle across block and tail sizes" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_a1);
+    const random = prng.random();
+
+    // 0 (empty), 1, 3 (tail only), 4 (one block), 7 (block + tail), plus a
+    // straddle case mixing inside, just-outside, and far candidates.
+    const counts = [_]usize{ 0, 1, 3, 4, 7 };
+    for (counts) |count| {
+        var dxs: [max_separation_candidate_checks]f32 = undefined;
+        var dys: [max_separation_candidate_checks]f32 = undefined;
+        for (0..count) |i| {
+            dxs[i] = (random.float(f32) - 0.5) * 90.0;
+            dys[i] = (random.float(f32) - 0.5) * 90.0;
+        }
+        var simd_result = SeparationResult{};
+        accumulateSeparation(dxs[0..count], dys[0..count], &simd_result);
+        const reference = referenceSeparation(dxs[0..count], dys[0..count]);
+
+        try std.testing.expectEqual(reference.neighbor_count, simd_result.neighbor_count);
+        try std.testing.expectApproxEqAbs(reference.x, simd_result.x, @max(@abs(reference.x), 1.0) * 1.0e-4);
+        try std.testing.expectApproxEqAbs(reference.y, simd_result.y, @max(@abs(reference.y), 1.0) * 1.0e-4);
+    }
+
+    // Window straddle: below min_dist2 (rejected), inside radius (accepted),
+    // exactly at radius (rejected, dist2 == separation_radius2), beyond (rejected).
+    const sx = [_]f32{ 0.2, 10.0, separation_radius, 80.0 };
+    const sy = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    var straddle = SeparationResult{};
+    accumulateSeparation(sx[0..], sy[0..], &straddle);
+    const straddle_ref = referenceSeparation(sx[0..], sy[0..]);
+    try std.testing.expectEqual(straddle_ref.neighbor_count, straddle.neighbor_count);
+    try std.testing.expectEqual(@as(u8, 1), straddle.neighbor_count);
+    try std.testing.expectApproxEqAbs(straddle_ref.x, straddle.x, 1.0e-4);
+}
+
+test "ai separation SIMD accumulate stops on neighbor cap in scratch order" {
+    // More accepted candidates than the neighbor cap: dense in-window deltas so
+    // every entry passes the window and the cap-crossing block falls to scalar.
+    const total = max_separation_candidate_checks;
+    var dxs: [max_separation_candidate_checks]f32 = undefined;
+    var dys: [max_separation_candidate_checks]f32 = undefined;
+    for (0..total) |i| {
+        dxs[i] = 5.0 + @as(f32, @floatFromInt(i % 7));
+        dys[i] = 3.0 + @as(f32, @floatFromInt(i % 5));
+    }
+    var simd_result = SeparationResult{};
+    accumulateSeparation(dxs[0..total], dys[0..total], &simd_result);
+    const reference = referenceSeparation(dxs[0..total], dys[0..total]);
+
+    try std.testing.expectEqual(@as(u8, max_separation_neighbors), reference.neighbor_count);
+    try std.testing.expectEqual(reference.neighbor_count, simd_result.neighbor_count);
+    try std.testing.expectApproxEqAbs(reference.x, simd_result.x, @abs(reference.x) * 1.0e-4);
+    try std.testing.expectApproxEqAbs(reference.y, simd_result.y, @abs(reference.y) * 1.0e-4);
 }

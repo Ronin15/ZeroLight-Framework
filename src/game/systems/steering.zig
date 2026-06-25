@@ -17,6 +17,7 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
 const ConstCollisionBoundsSlice = @import("../data_system.zig").ConstCollisionBoundsSlice;
 const ConstCollisionResponseSlice = @import("../data_system.zig").ConstCollisionResponseSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
@@ -887,6 +888,9 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResul
     };
 }
 
+// Obstacle avoidance stays scalar intentionally: the inside/outside-box branch
+// with center-fallback is an irreducible per-element branch, so vectorizing it is
+// deferred. Only the agent-avoidance loop is restructured to full SIMD.
 fn accumulateObstacleSample(
     job: *const SteeringJobContext,
     obstacle_index: usize,
@@ -922,6 +926,24 @@ fn accumulateObstacleSample(
     }
 }
 
+// Distance-window floor shared by the SIMD body and scalar tail of agent avoidance.
+const agent_min_dist2: f32 = 0.0001;
+
+// Pass 1 (gather) walks the agent-avoidance cells and packs each cap-passing,
+// non-self neighbor's dx/dy/combined_radius into stack-local SoA scratch sized by
+// the candidate cap. The distance window is applied vectorized in pass 2, not
+// here. Pass 1 ends on the candidate cap, or early once the sample cap's worth of
+// in-window neighbors have been found: the cheap scalar window below is just the
+// early-out that bounds the gather in dense crowds.
+//
+// Pass 2 vectorizes everything: window mask, dist2, reciprocal-sqrt, the
+// (1 - dist/combined_radius)*weight strength, and accumulation, 4 lanes at a
+// time. The sample cap bounds the contributing set to the first N in-window
+// neighbors in grid order; the block that crosses the cap is handled scalar
+// lane-by-lane so that boundary is exact; all earlier full blocks are pure SIMD.
+//
+// Scratch is sized by the candidate cap because the gathered count can never
+// exceed candidate_count, which is bounded by max_agent_candidate_checks.
 fn accumulateAgentAvoidanceBounded(
     job: *const SteeringJobContext,
     index: usize,
@@ -944,43 +966,145 @@ fn accumulateAgentAvoidanceBounded(
     const min_cell_y = spatialCell(start_y - query_radius, job.spatial_cell_size);
     const max_cell_y = spatialCell(start_y + query_radius, job.spatial_cell_size);
 
+    var s_dx: [max_agent_candidate_checks]f32 = undefined;
+    var s_dy: [max_agent_candidate_checks]f32 = undefined;
+    var s_combined_radius: [max_agent_candidate_checks]f32 = undefined;
+    var scratch_len: usize = 0;
+    var accepted_tally: u16 = 0;
+
     var cell_y = min_cell_y;
-    while (cell_y <= max_cell_y and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_y += 1) {
+    pass1: while (cell_y <= max_cell_y and accepted_tally < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_y += 1) {
         var cell_x = min_cell_x;
-        while (cell_x <= max_cell_x and sample_count.* < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_x += 1) {
+        while (cell_x <= max_cell_x and accepted_tally < max_samples and candidate_count.* < max_agent_candidate_checks) : (cell_x += 1) {
             const range = findCellRange(job.agent_cell_ranges, cell_x, cell_y) orelse continue;
             for (job.agent_cell_entries[range.start..range.end]) |entry| {
-                if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
+                if (accepted_tally >= max_samples or candidate_count.* >= max_agent_candidate_checks) break :pass1;
                 candidate_count.* += 1;
                 const other_index = entry.index;
                 if (entityIdsEqual(job.all_agent_entities[other_index], self_entity)) continue;
                 const dx = start_x - job.all_agent_x[other_index];
                 const dy = start_y - job.all_agent_y[other_index];
                 const combined_radius = avoidance_radius + job.all_agent_radii[other_index];
+                s_dx[scratch_len] = dx;
+                s_dy[scratch_len] = dy;
+                s_combined_radius[scratch_len] = combined_radius;
+                scratch_len += 1;
+
+                // Cheap scalar early-out: once the sample cap's worth of in-window
+                // neighbors are found the scan stops, bounding gather work in dense
+                // crowds. sample_count and the accumulation are computed vectorized
+                // in pass 2.
                 const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.0001 and dist2 < combined_radius * combined_radius) {
-                    accumulateAgentSample(dx, dy, dist2, combined_radius, weight, ax, ay, sample_count);
+                if (dist2 > agent_min_dist2 and dist2 < combined_radius * combined_radius) {
+                    accepted_tally += 1;
                 }
             }
         }
     }
+
+    accumulateAgentAvoidance(
+        s_dx[0..scratch_len],
+        s_dy[0..scratch_len],
+        s_combined_radius[0..scratch_len],
+        weight,
+        max_samples,
+        ax,
+        ay,
+        sample_count,
+    );
 }
 
-fn accumulateAgentSample(
-    dx: f32,
-    dy: f32,
-    dist2: f32,
-    combined_radius: f32,
+// Pass 2: vectorized window + reciprocal-sqrt + strength + accumulate over the
+// gathered scratch. The divisor is floored before the reciprocal so masked/short
+// lanes never produce inf/NaN, rejected lanes are zeroed before the horizontal
+// fold, and sample_count tracks accepted neighbors. The sample cap bounds the
+// contributing set to the first N in-window neighbors in grid order; the block
+// that crosses the cap drops to scalar so that boundary is exact.
+fn accumulateAgentAvoidance(
+    dxs: []const f32,
+    dys: []const f32,
+    radii: []const f32,
     weight: f32,
+    max_samples: u16,
     ax: *f32,
     ay: *f32,
     sample_count: *u16,
 ) void {
-    const dist = @sqrt(dist2);
-    const strength = (1.0 - dist / combined_radius) * weight;
-    ax.* += (dx / dist) * strength;
-    ay.* += (dy / dist) * strength;
-    sample_count.* += 1;
+    const dist_floor = simd.splatFloat4(std.math.floatMin(f32));
+    const weight4 = simd.splatFloat4(weight);
+    const one4 = simd.splatFloat4(1.0);
+    const min4 = simd.splatFloat4(agent_min_dist2);
+    const zero4 = simd.splatFloat4(0);
+
+    const body_end = simd.vectorizedEnd(dxs.len);
+    var offset: usize = 0;
+    while (offset < body_end) : (offset += simd.lane_count) {
+        const dx = simd.loadFloat4(dxs[offset..]);
+        const dy = simd.loadFloat4(dys[offset..]);
+        const combined_radius = simd.loadFloat4(radii[offset..]);
+        const radius2 = combined_radius * combined_radius;
+        const dist2 = simd.lengthSquared2Float4(dx, dy);
+        const mask = simd.greaterThanFloat4(dist2, min4) & simd.lessThanFloat4(dist2, radius2);
+
+        const accepted_here: u16 = @intCast(simd.maskTrueCount(mask));
+        if (sample_count.* + accepted_here > max_samples) {
+            accumulateAgentAvoidanceTail(
+                dxs[offset..][0..simd.lane_count],
+                dys[offset..][0..simd.lane_count],
+                radii[offset..][0..simd.lane_count],
+                weight,
+                max_samples,
+                ax,
+                ay,
+                sample_count,
+            );
+            return;
+        }
+
+        const inv_len = simd.reciprocalSqrtFloat4(simd.maxFloat4(dist2, dist_floor));
+        const dist = dist2 * inv_len; // sqrt(dist2) without a second sqrt
+        const strength = (one4 - dist / combined_radius) * weight4;
+        ax.* += simd.horizontalSumFloat4(simd.selectFloat4(mask, dx * inv_len * strength, zero4));
+        ay.* += simd.horizontalSumFloat4(simd.selectFloat4(mask, dy * inv_len * strength, zero4));
+        sample_count.* += accepted_here;
+    }
+
+    accumulateAgentAvoidanceTail(
+        dxs[body_end..],
+        dys[body_end..],
+        radii[body_end..],
+        weight,
+        max_samples,
+        ax,
+        ay,
+        sample_count,
+    );
+}
+
+// Scalar lane-by-lane accumulate sharing the SIMD body's window/strength
+// expressions, used for the `<4` tail and the cap-crossing block so the sample
+// cap stops on the exact neighbor reached in grid order.
+fn accumulateAgentAvoidanceTail(
+    dxs: []const f32,
+    dys: []const f32,
+    radii: []const f32,
+    weight: f32,
+    max_samples: u16,
+    ax: *f32,
+    ay: *f32,
+    sample_count: *u16,
+) void {
+    for (dxs, dys, radii) |dx, dy, combined_radius| {
+        if (sample_count.* >= max_samples) return;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 > agent_min_dist2 and dist2 < combined_radius * combined_radius) {
+            const dist = @sqrt(dist2);
+            const strength = (1.0 - dist / combined_radius) * weight;
+            ax.* += (dx / dist) * strength;
+            ay.* += (dy / dist) * strength;
+            sample_count.* += 1;
+        }
+    }
 }
 
 fn selectSteeringWork(
@@ -1703,4 +1827,105 @@ fn appendNavigationIntents(frame: *SimulationFrame, intents: []const NavigationI
     for (intents) |intent| writer.write(intent);
     writer.finish();
     frame.navigation_intents.finishWrite();
+}
+
+const AgentAvoidanceRef = struct {
+    ax: f32 = 0,
+    ay: f32 = 0,
+    sample_count: u16 = 0,
+};
+
+// Pre-refactor scalar agent-avoidance accumulate, reproduced exactly as the
+// parity oracle: window per candidate, (1 - dist/combined_radius)*weight push,
+// sample cap by count.
+fn referenceAgentAvoidance(
+    dxs: []const f32,
+    dys: []const f32,
+    radii: []const f32,
+    weight: f32,
+    max_samples: u16,
+) AgentAvoidanceRef {
+    var ref = AgentAvoidanceRef{};
+    for (dxs, dys, radii) |dx, dy, combined_radius| {
+        if (ref.sample_count >= max_samples) break;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 > agent_min_dist2 and dist2 < combined_radius * combined_radius) {
+            const dist = @sqrt(dist2);
+            const strength = (1.0 - dist / combined_radius) * weight;
+            ref.ax += (dx / dist) * strength;
+            ref.ay += (dy / dist) * strength;
+            ref.sample_count += 1;
+        }
+    }
+    return ref;
+}
+
+test "steering agent avoidance SIMD accumulate matches scalar oracle across block and tail sizes" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_b2);
+    const random = prng.random();
+    const weight: f32 = 0.8;
+    const max_samples: u16 = 256;
+
+    const counts = [_]usize{ 0, 1, 3, 4, 7 };
+    for (counts) |count| {
+        var dxs: [max_agent_candidate_checks]f32 = undefined;
+        var dys: [max_agent_candidate_checks]f32 = undefined;
+        var radii: [max_agent_candidate_checks]f32 = undefined;
+        for (0..count) |i| {
+            radii[i] = 8.0 + random.float(f32) * 8.0;
+            // Mix inside-window and outside-window candidates.
+            const scale = radii[i] * (0.2 + random.float(f32) * 1.4);
+            const angle = random.float(f32) * 6.2831853;
+            dxs[i] = @cos(angle) * scale;
+            dys[i] = @sin(angle) * scale;
+        }
+        var ax: f32 = 0;
+        var ay: f32 = 0;
+        var sample_count: u16 = 0;
+        accumulateAgentAvoidance(dxs[0..count], dys[0..count], radii[0..count], weight, max_samples, &ax, &ay, &sample_count);
+        const reference = referenceAgentAvoidance(dxs[0..count], dys[0..count], radii[0..count], weight, max_samples);
+
+        try std.testing.expectEqual(reference.sample_count, sample_count);
+        try std.testing.expectApproxEqAbs(reference.ax, ax, @max(@abs(reference.ax), 1.0) * 1.0e-4);
+        try std.testing.expectApproxEqAbs(reference.ay, ay, @max(@abs(reference.ay), 1.0) * 1.0e-4);
+    }
+
+    // Window straddle: below min_dist2, inside, exactly at combined_radius
+    // (rejected), beyond. combined_radius == 10 for all.
+    const sx = [_]f32{ 0.005, 4.0, 10.0, 20.0 };
+    const sy = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const sr = [_]f32{ 10.0, 10.0, 10.0, 10.0 };
+    var ax: f32 = 0;
+    var ay: f32 = 0;
+    var sample_count: u16 = 0;
+    accumulateAgentAvoidance(sx[0..], sy[0..], sr[0..], 1.0, 256, &ax, &ay, &sample_count);
+    const ref = referenceAgentAvoidance(sx[0..], sy[0..], sr[0..], 1.0, 256);
+    try std.testing.expectEqual(@as(u16, 1), sample_count);
+    try std.testing.expectEqual(ref.sample_count, sample_count);
+    try std.testing.expectApproxEqAbs(ref.ax, ax, 1.0e-4);
+}
+
+test "steering agent avoidance SIMD accumulate stops on sample cap in scratch order" {
+    const weight: f32 = 0.6;
+    const max_samples: u16 = 5; // below a block boundary to force a scalar crossing block
+    const total = max_agent_candidate_checks;
+    var dxs: [max_agent_candidate_checks]f32 = undefined;
+    var dys: [max_agent_candidate_checks]f32 = undefined;
+    var radii: [max_agent_candidate_checks]f32 = undefined;
+    for (0..total) |i| {
+        radii[i] = 12.0;
+        // All inside the window so every candidate would accept without the cap.
+        dxs[i] = 2.0 + @as(f32, @floatFromInt(i % 3));
+        dys[i] = 1.0 + @as(f32, @floatFromInt(i % 4));
+    }
+    var ax: f32 = 0;
+    var ay: f32 = 0;
+    var sample_count: u16 = 0;
+    accumulateAgentAvoidance(dxs[0..total], dys[0..total], radii[0..total], weight, max_samples, &ax, &ay, &sample_count);
+    const reference = referenceAgentAvoidance(dxs[0..total], dys[0..total], radii[0..total], weight, max_samples);
+
+    try std.testing.expectEqual(max_samples, sample_count);
+    try std.testing.expectEqual(reference.sample_count, sample_count);
+    try std.testing.expectApproxEqAbs(reference.ax, ax, @max(@abs(reference.ax), 1.0) * 1.0e-4);
+    try std.testing.expectApproxEqAbs(reference.ay, ay, @max(@abs(reference.ay), 1.0) * 1.0e-4);
 }
