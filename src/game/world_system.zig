@@ -17,12 +17,12 @@ const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TileDataId = @import("../render/renderer.zig").TileDataId;
+const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const Vertex = @import("../render/renderer.zig").Vertex;
 const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
 const TextureId = @import("../render/resources.zig").TextureId;
 const TextureDesc = @import("../render/resources.zig").TextureDesc;
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
@@ -193,7 +193,7 @@ pub const WorldSystem = struct {
     // One renderer-owned tile-data storage buffer per dense layer, built from
     // dense_tile_ids at load. World holds only the opaque handles; the renderer
     // owns and releases the GPU buffers. The tilemap shader reads these directly
-    // (Phase C), so per-tile vertex geometry is no longer built for dense layers.
+    // so no per-tile vertex geometry is built for dense layers.
     dense_layer_tile_buffers: std.ArrayList(TileDataId) = .empty,
 
     sparse_level_indices: std.ArrayList(u16) = .empty,
@@ -226,34 +226,18 @@ pub const WorldSystem = struct {
     visible_max_tile_x_exclusive: u16 = 0,
     visible_max_tile_y_exclusive: u16 = 0,
 
-    // Retained per-chunk-layer static tile geometry. Camera-independent world-space
-    // vertices (the GPU shader applies the camera) built once via writeWorldSpriteQuad
-    // and rebuilt per chunk-layer only when its tiles change (dig/build). The
-    // per-frame submit is a memcpy gather of visible spans, never a recompute, which
-    // is what removes the render-rate worker churn. Each chunk-layer always emits a
-    // fixed 6-verts-per-cell span, so layout is stable and dig rewrites in place.
-    // Indexed by packed (dense_layer_index * chunksPerLevel + local_chunk).
-    // UVs bake the world-tileset dimensions at build time; a runtime atlas swap to
-    // different dimensions would need an explicit cache invalidation (not supported
-    // — world atlas dimensions are fixed for the world's lifetime).
-    chunk_layer_vertex_start: std.ArrayList(u32) = .empty,
-    chunk_layer_vertex_count: std.ArrayList(u32) = .empty,
-    chunk_layer_dirty: std.ArrayList(bool) = .empty,
-    chunk_layer_vertices: std.ArrayList(Vertex) = .empty,
-    // World atlas dimensions captured at init, the single source of truth for static
-    // tile UVs. Lets the cache pre-warm at load (off the first render frame) without
-    // a renderer handle; submit asserts the runtime texture matches in safe builds.
+    // World atlas dimensions captured at init: source of truth for the tilemap
+    // atlas params and the safe-build runtime-texture-match assert.
     atlas_texture: TextureDesc = .{ .width = 0, .height = 0 },
-    static_dirty_scratch: std.ArrayList(u32) = .empty,
-    // Dedicated tuner so the static-cache build's threading decisions don't share
-    // timing with the per-frame sprite-prep or simulation stages (engine pattern).
-    static_cache_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // Some chunk-layer's cached vertices need rebuilding (structural change or dig).
-    static_cache_dirty: bool = true,
-    // The renderer's static buffer needs re-submission (cache rebuilt or visible
-    // chunk set changed by a pan). Cleared after a submit; while false the renderer
-    // reuses last frame's static geometry and skips the upload.
-    static_submit_dirty: bool = true,
+    // World-constant grid + atlas geometry for the tilemap fragment shader. Built
+    // once at init; every dense layer's quad reuses it (only the tile-data buffer
+    // differs per layer). See [[dense_layer_tile_buffers]] above.
+    tilemap_params: TilemapParams = .{ .grid = .{ 0, 0, 0, 0 }, .atlas = .{ 0, 0, 0, 0 } },
+    // The dense-layer tilemap quads need (re)submitting into the renderer's static
+    // buffer: true at init and on a structural change (new dense layer). Unlike the
+    // old vertex cache this never flips on a pan — the quads are full-world and the
+    // camera lives in the shader, so panning uploads nothing.
+    dense_quads_dirty: bool = true,
 
     pub fn initDemo(
         allocator: std.mem.Allocator,
@@ -324,9 +308,7 @@ pub const WorldSystem = struct {
 
         try world.addProceduralSparseTiles(level, ids, config.seed);
         try world.rebuildChunks();
-        // Pre-warm the static tile cache at load so the full-world vertex build runs
-        // here (threaded), not as a hitch on the first render frame.
-        try world.ensureStaticCache(world.atlas_texture, thread_system);
+        world.tilemap_params = tilemapParamsFor(meta, world.width, world.height, world.tile_size);
         return world;
     }
 
@@ -379,8 +361,7 @@ pub const WorldSystem = struct {
         _ = try world.addSparseTile(level, (width * 3) / 4, (height * 2) / 3, deco, 0, .obstacle);
 
         try world.rebuildChunks();
-        // Small demo world: pre-warm inline so first-frame render just gathers spans.
-        try world.ensureStaticCache(world.atlas_texture, null);
+        world.tilemap_params = tilemapParamsFor(meta, world.width, world.height, world.tile_size);
         return world;
     }
 
@@ -396,12 +377,6 @@ pub const WorldSystem = struct {
     }
 
     pub fn deinit(self: *WorldSystem) void {
-        self.static_dirty_scratch.deinit(self.allocator);
-        self.chunk_layer_vertices.deinit(self.allocator);
-        self.chunk_layer_dirty.deinit(self.allocator);
-        self.chunk_layer_vertex_count.deinit(self.allocator);
-        self.chunk_layer_vertex_start.deinit(self.allocator);
-
         self.chunk_visible.deinit(self.allocator);
         self.chunk_cell_max_y_exclusive.deinit(self.allocator);
         self.chunk_cell_max_x_exclusive.deinit(self.allocator);
@@ -499,9 +474,9 @@ pub const WorldSystem = struct {
             const chunk_y: u16 = @intCast(self.chunk_y.items[index]);
             const visible = chunk_x >= min_chunk_x and chunk_x <= max_chunk_x and
                 chunk_y >= min_chunk_y and chunk_y <= max_chunk_y;
-            // A changed visible set changes which static spans are submitted, so the
-            // retained static buffer must be re-gathered and re-uploaded next frame.
-            if (visible != self.chunk_visible.items[index]) self.static_submit_dirty = true;
+            // Chunk visibility still crops sparse tiles, but no longer drives dense
+            // rendering: each dense layer is one full-world tilemap quad, so a pan
+            // uploads nothing.
             self.chunk_visible.items[index] = visible;
         }
     }
@@ -514,50 +489,53 @@ pub const WorldSystem = struct {
         return @as(f32, @floatFromInt(self.height)) * self.tile_size;
     }
 
-    /// Submits the visible dense world geometry as retained static spans. Rebuilds
-    /// any dirty chunk-layer vertex caches first (threaded via `thread_system` when
-    /// the work is large, inline for a single dig), then — only when the static set
-    /// changed (pan or rebuild) — re-gathers the visible spans into the renderer's
-    /// static buffer. When nothing changed this is a cheap early-out and the
-    /// renderer reuses last frame's static geometry. Camera-independent: the spans
-    /// carry world-space vertices and the GPU shader applies the camera.
+    /// Submits each dense layer as one retained world-space tilemap quad: the
+    /// fragment shader reads tile ids from the layer's storage buffer and samples
+    /// the atlas, so a whole layer is one draw independent of world size. Builds the
+    /// per-layer storage buffers on first call. Re-submits only on a structural
+    /// change (`dense_quads_dirty`), never on a pan — the quads are full-world and
+    /// the camera lives in the vertex shader, so panning uploads nothing.
     pub fn submitStaticDenseGeometry(
         self: *WorldSystem,
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
-        thread_system: ?*ThreadSystem,
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
-        try self.ensureStaticCache(self.atlas_texture, thread_system);
-        if (!self.static_submit_dirty) return;
+        try self.uploadDenseLayerBuffers(renderer);
+        if (!self.dense_quads_dirty) return;
 
-        // UVs are baked from the world atlas dimensions captured at init; the bound
-        // runtime texture must match. Checked only on a re-submit (pan/dig), not on
-        // still frames, and compiles out of release builds.
+        // The tilemap atlas params are baked from the world atlas dimensions at init;
+        // the bound runtime texture must match. Safe-build only, and only on a
+        // re-submit (structural change), not still frames.
         if (std.debug.runtime_safety) {
             if (renderer.textureDesc(prepared.texture)) |desc| {
                 std.debug.assert(desc.width == self.atlas_texture.width and desc.height == self.atlas_texture.height);
             }
         }
 
-        const counts = self.visibleStaticCounts();
-        try renderer.reserveStaticGeometry(counts.vertices, counts.spans);
+        const layer_count = self.denseLayerCount();
+        try renderer.reserveStaticGeometry(layer_count * 6, layer_count);
         renderer.beginStaticGeometry();
-        const chunks_per_level = self.chunkCountPerLevel();
-        for (0..self.dense_level_indices.items.len) |layer_index| {
-            const level_index = self.dense_level_indices.items[layer_index];
-            const order = self.denseLayerOrder(layer_index);
-            for (0..chunks_per_level) |local_chunk| {
-                const global_chunk = @as(usize, level_index) * chunks_per_level + local_chunk;
-                if (!self.chunk_visible.items[global_chunk]) continue;
-                const packed_index = layer_index * chunks_per_level + local_chunk;
-                const start = self.chunk_layer_vertex_start.items[packed_index];
-                const count = self.chunk_layer_vertex_count.items[packed_index];
-                if (count == 0) continue;
-                try renderer.appendStaticSpan(prepared.texture, order, self.chunk_layer_vertices.items[start..][0..count]);
-            }
+        const world_w = self.worldWidthPixels();
+        const world_h = self.worldHeightPixels();
+        for (0..layer_count) |layer_index| {
+            // Only the world-space corners (position) are consumed by the tilemap
+            // shader; the source/uv are ignored, so the source rect is a placeholder.
+            var quad: [6]Vertex = undefined;
+            writeWorldSpriteQuad(.{
+                .texture = TextureId.invalid,
+                .source = .{ .x = 0, .y = 0, .w = self.tile_size, .h = self.tile_size },
+                .dest = .{ .x = 0, .y = 0, .w = world_w, .h = world_h },
+            }, self.atlas_texture, &quad);
+            try renderer.appendStaticTilemapSpan(
+                prepared.texture,
+                self.denseLayerOrder(layer_index),
+                &quad,
+                self.denseLayerTileBuffer(layer_index),
+                self.tilemap_params,
+            );
         }
-        self.static_submit_dirty = false;
+        self.dense_quads_dirty = false;
     }
 
     /// Submits the visible sparse tiles at `depth` through the dynamic ordered
@@ -608,7 +586,8 @@ pub const WorldSystem = struct {
         const old_blocks_movement = self.flagsFor(old_tile_id).blocks_movement;
         const new_blocks_movement = self.flagsFor(tile_id).blocks_movement;
         self.dense_tile_ids.items[tile_index] = tile_id;
-        self.markChunkLayerDirty(layer_index, x, y);
+        // The CPU tile field is the source of truth (collision/gameplay read it);
+        // the layer's GPU tile-data buffer is updated separately by the dig hook.
         return .{
             .level = self.dense_level_indices.items[layer_index],
             .x = x,
@@ -788,7 +767,9 @@ pub const WorldSystem = struct {
             self.dense_tile_ids.appendAssumeCapacity(fill_tile);
         }
         self.render_index_dirty = true;
-        try self.rebuildStaticCacheLayout();
+        // A new dense layer needs its own tilemap quad submitted; its storage buffer
+        // is built lazily on the next submit (uploadDenseLayerBuffers resumes).
+        self.dense_quads_dirty = true;
         return layer_index;
     }
 
@@ -829,154 +810,6 @@ pub const WorldSystem = struct {
             .max_x_exclusive = @min(self.width, x +| 1),
             .max_y_exclusive = @min(self.height, y +| 1),
         };
-    }
-
-    // Resizes the per-chunk-layer span table to the current dense-layer and chunk
-    // geometry and sizes the vertex backing store. Each chunk-layer reserves a
-    // fixed 6-verts-per-cell span; the vertices themselves are (re)built lazily by
-    // ensureStaticCache. Marks the whole cache dirty so it rebuilds before use.
-    fn rebuildStaticCacheLayout(self: *WorldSystem) !void {
-        const chunks_per_level = self.chunkCountPerLevel();
-        const layer_count = self.dense_level_indices.items.len;
-        const entry_count = layer_count * chunks_per_level;
-
-        self.chunk_layer_vertex_start.clearRetainingCapacity();
-        self.chunk_layer_vertex_count.clearRetainingCapacity();
-        self.chunk_layer_dirty.clearRetainingCapacity();
-        try self.chunk_layer_vertex_start.ensureTotalCapacity(self.allocator, entry_count);
-        try self.chunk_layer_vertex_count.ensureTotalCapacity(self.allocator, entry_count);
-        try self.chunk_layer_dirty.ensureTotalCapacity(self.allocator, entry_count);
-
-        var offset: usize = 0;
-        for (0..layer_count) |layer_index| {
-            const level_index = self.dense_level_indices.items[layer_index];
-            for (0..chunks_per_level) |local_chunk| {
-                const global_chunk = @as(usize, level_index) * chunks_per_level + local_chunk;
-                const count = self.chunkCellCount(global_chunk) * 6;
-                const start = std.math.cast(u32, offset) orelse return error.StaticGeometryTooLarge;
-                _ = std.math.cast(u32, count) orelse return error.StaticGeometryTooLarge;
-                self.chunk_layer_vertex_start.appendAssumeCapacity(start);
-                self.chunk_layer_vertex_count.appendAssumeCapacity(@intCast(count));
-                self.chunk_layer_dirty.appendAssumeCapacity(true);
-                offset += count;
-            }
-        }
-        try self.chunk_layer_vertices.resize(self.allocator, offset);
-        self.static_cache_dirty = true;
-        self.static_submit_dirty = true;
-    }
-
-    // Marks the chunk-layer owning cell (x, y) in `layer_index` for a vertex
-    // rebuild. The dig/build hook: a tile change invalidates only its chunk-layer,
-    // not the whole world. A no-op before the cache layout exists (initial fill
-    // marks everything via rebuildStaticCacheLayout).
-    fn markChunkLayerDirty(self: *WorldSystem, layer_index: usize, x: u16, y: u16) void {
-        const chunks_per_level = self.chunkCountPerLevel();
-        const local_chunk = @as(usize, y / self.chunk_size_tiles) * @as(usize, self.chunksX()) +
-            @as(usize, x / self.chunk_size_tiles);
-        const packed_index = layer_index * chunks_per_level + local_chunk;
-        if (packed_index >= self.chunk_layer_dirty.items.len) return;
-        self.chunk_layer_dirty.items[packed_index] = true;
-        self.static_cache_dirty = true;
-    }
-
-    // Rebuilds any dirty chunk-layer vertex caches. Large rebuilds (initial build,
-    // mass reveal) thread across the supplied ThreadSystem; the adaptive tuner gates
-    // a single dig to run inline. A clean cache is a no-op. On any rebuild the
-    // static set must be re-gathered, so static_submit_dirty is raised.
-    fn ensureStaticCache(self: *WorldSystem, texture: TextureDesc, thread_system: ?*ThreadSystem) !void {
-        if (!self.static_cache_dirty) return;
-
-        self.static_dirty_scratch.clearRetainingCapacity();
-        for (self.chunk_layer_dirty.items, 0..) |dirty, packed_index| {
-            if (dirty) try self.static_dirty_scratch.append(self.allocator, @intCast(packed_index));
-        }
-
-        if (self.static_dirty_scratch.items.len > 0) {
-            var context = StaticCacheBuildContext{
-                .world = self,
-                .vertices = self.chunk_layer_vertices.items,
-                .texture = texture,
-                .dirty = self.static_dirty_scratch.items,
-            };
-            if (thread_system) |threads| {
-                _ = threads.parallelForWithOptions(self.static_dirty_scratch.items.len, &context, buildStaticCacheJob, .{
-                    .range_alignment_items = 1,
-                    .adaptive_tuner = &self.static_cache_tuner,
-                });
-            } else {
-                for (self.static_dirty_scratch.items) |packed_index| {
-                    self.writeChunkLayerVertices(packed_index, self.chunk_layer_vertices.items, texture);
-                }
-            }
-            @memset(self.chunk_layer_dirty.items, false);
-        }
-
-        self.static_cache_dirty = false;
-        self.static_submit_dirty = true;
-    }
-
-    // Builds one chunk-layer's world-space tile vertices into its fixed span of
-    // `vertices`. Pure per-span work writing a disjoint range, so it is safe to run
-    // concurrently across chunk-layers. Uses writeWorldSpriteQuad so static tile
-    // vertices stay byte-identical to dynamic sprite vertices.
-    fn writeChunkLayerVertices(self: *const WorldSystem, packed_index: usize, vertices: []Vertex, texture: TextureDesc) void {
-        const chunks_per_level = self.chunkCountPerLevel();
-        const layer_index = packed_index / chunks_per_level;
-        const local_chunk = packed_index % chunks_per_level;
-        const level_index = self.dense_level_indices.items[layer_index];
-        const global_chunk = @as(usize, level_index) * chunks_per_level + local_chunk;
-
-        const min_x = self.chunk_cell_min_x.items[global_chunk];
-        const min_y = self.chunk_cell_min_y.items[global_chunk];
-        const max_x = self.chunk_cell_max_x_exclusive.items[global_chunk];
-        const max_y = self.chunk_cell_max_y_exclusive.items[global_chunk];
-
-        var slot: usize = self.chunk_layer_vertex_start.items[packed_index];
-        var y = min_y;
-        while (y < max_y) : (y += 1) {
-            var x = min_x;
-            while (x < max_x) : (x += 1) {
-                const tile_id = self.denseTile(layer_index, x, y);
-                // Dense tiles are catalog-validated at set time, so this fallback is
-                // unreachable; the degenerate (zero-area) quad keeps the threaded
-                // build infallible rather than surfacing a per-cell error.
-                const source = self.sourceRect(tile_id) orelse Rect{ .x = 0, .y = 0, .w = 0, .h = 0 };
-                writeWorldSpriteQuad(.{
-                    .texture = TextureId.invalid,
-                    .source = source,
-                    .dest = .{
-                        .x = @as(f32, @floatFromInt(x)) * self.tile_size,
-                        .y = @as(f32, @floatFromInt(y)) * self.tile_size,
-                        .w = self.tile_size,
-                        .h = self.tile_size,
-                    },
-                }, texture, vertices[slot..][0..6]);
-                slot += 6;
-            }
-        }
-    }
-
-    const VisibleStaticCounts = struct { vertices: usize, spans: usize };
-
-    // Sums the visible chunk-layer spans the next static submit will gather, so the
-    // renderer can reserve grow-only before the gather. Only runs on a re-submit
-    // (pan/dig), not on still frames.
-    fn visibleStaticCounts(self: *const WorldSystem) VisibleStaticCounts {
-        const chunks_per_level = self.chunkCountPerLevel();
-        var counts = VisibleStaticCounts{ .vertices = 0, .spans = 0 };
-        for (0..self.dense_level_indices.items.len) |layer_index| {
-            const level_index = self.dense_level_indices.items[layer_index];
-            for (0..chunks_per_level) |local_chunk| {
-                const global_chunk = @as(usize, level_index) * chunks_per_level + local_chunk;
-                if (!self.chunk_visible.items[global_chunk]) continue;
-                const count = self.chunk_layer_vertex_count.items[layer_index * chunks_per_level + local_chunk];
-                if (count == 0) continue;
-                counts.vertices += count;
-                counts.spans += 1;
-            }
-        }
-        return counts;
     }
 
     fn submitVisibleSparseRange(
@@ -1106,7 +939,7 @@ pub const WorldSystem = struct {
         old.deinit(self.allocator);
 
         try self.rebuildRenderDepthIndex();
-        try self.rebuildStaticCacheLayout();
+        self.dense_quads_dirty = true;
     }
 
     /// Rebuilds the derived render-walk index if a structural change marked it
@@ -1210,12 +1043,6 @@ pub const WorldSystem = struct {
 
     fn denseLayerOffset(self: *const WorldSystem, layer_index: usize) usize {
         return layer_index * self.cellCount();
-    }
-
-    fn chunkCellCount(self: *const WorldSystem, chunk_index: usize) usize {
-        const width = self.chunk_cell_max_x_exclusive.items[chunk_index] - self.chunk_cell_min_x.items[chunk_index];
-        const height = self.chunk_cell_max_y_exclusive.items[chunk_index] - self.chunk_cell_min_y.items[chunk_index];
-        return @as(usize, width) * @as(usize, height);
     }
 
     fn visibleTileBounds(self: *const WorldSystem) VisibleTileBounds {
@@ -1350,20 +1177,6 @@ pub const WorldSystem = struct {
     }
 };
 
-const StaticCacheBuildContext = struct {
-    world: *WorldSystem,
-    vertices: []Vertex,
-    texture: TextureDesc,
-    dirty: []const u32,
-};
-
-fn buildStaticCacheJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const build: *StaticCacheBuildContext = @ptrCast(@alignCast(context));
-    for (build.dirty[range.start..range.end]) |packed_index| {
-        build.world.writeChunkLayerVertices(packed_index, build.vertices, build.texture);
-    }
-}
-
 fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const build: *ProceduralBuildContext = @ptrCast(@alignCast(context));
     const chunks_x = ceilDiv(build.width, build.chunk_size_tiles);
@@ -1406,6 +1219,29 @@ fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
 fn atlasTextureDesc(meta: *const WorldTilesetMeta) TextureDesc {
     const atlas = meta.atlas();
     return .{ .width = atlas.width, .height = atlas.height };
+}
+
+// World-constant tilemap shader params. The fragment shader derives the atlas cell
+// straight from the tile id as a tight grid (col = id % columns, row = id / columns),
+// with tile_size as both the world cell size and the atlas tile pixel size. That
+// layout is enforced for every tile at meta load by validateGridEntry, so the shader
+// needs no per-tile source rect.
+fn tilemapParamsFor(meta: *const WorldTilesetMeta, width: u16, height: u16, tile_size: f32) TilemapParams {
+    const atlas = meta.atlas();
+    return .{
+        .grid = .{
+            tile_size,
+            @floatFromInt(width),
+            @floatFromInt(height),
+            @floatFromInt(invalid_tile_id),
+        },
+        .atlas = .{
+            @floatFromInt(meta.columns()),
+            @floatFromInt(atlas.width),
+            @floatFromInt(atlas.height),
+            tile_size,
+        },
+    };
 }
 
 fn catalogCapacity(meta: *const WorldTilesetMeta) usize {
@@ -1931,166 +1767,7 @@ test "level link store round-trips and validates inputs" {
     try std.testing.expectEqual(@as(usize, 1), world.levelLinks().len);
 }
 
-const static_cache_test_texture = TextureDesc{ .width = 256, .height = 256 };
-
-fn expectChunkLayerVerticesMatchTiles(world: *const WorldSystem, layer_index: usize) !void {
-    const chunks_per_level = world.chunkCountPerLevel();
-    const level_index = world.dense_level_indices.items[layer_index];
-    for (0..chunks_per_level) |local_chunk| {
-        const global_chunk = @as(usize, level_index) * chunks_per_level + local_chunk;
-        const packed_index = layer_index * chunks_per_level + local_chunk;
-        var slot: usize = world.chunk_layer_vertex_start.items[packed_index];
-        var y = world.chunk_cell_min_y.items[global_chunk];
-        while (y < world.chunk_cell_max_y_exclusive.items[global_chunk]) : (y += 1) {
-            var x = world.chunk_cell_min_x.items[global_chunk];
-            while (x < world.chunk_cell_max_x_exclusive.items[global_chunk]) : (x += 1) {
-                var expected: [6]Vertex = undefined;
-                const source = world.sourceRect(world.denseTile(layer_index, x, y)).?;
-                writeWorldSpriteQuad(.{
-                    .texture = TextureId.invalid,
-                    .source = source,
-                    .dest = .{
-                        .x = @as(f32, @floatFromInt(x)) * world.tile_size,
-                        .y = @as(f32, @floatFromInt(y)) * world.tile_size,
-                        .w = world.tile_size,
-                        .h = world.tile_size,
-                    },
-                }, static_cache_test_texture, expected[0..]);
-                for (0..6) |i| {
-                    try std.testing.expectEqual(expected[i], world.chunk_layer_vertices.items[slot + i]);
-                }
-                slot += 6;
-            }
-        }
-    }
-}
-
-test "static cache builds fixed 6-verts-per-cell spans matching writeWorldSpriteQuad" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 2,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-
-    const level = try world.addLevel(0);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const dirt = try world.requireTileByName(&meta, "dirt");
-    const stone = try world.requireTileByName(&meta, "stone_floor");
-    const layer = try world.addDenseLayer(level, 0, .floor, grass);
-    _ = try world.setDenseTile(layer, 0, 0, dirt);
-    _ = try world.setDenseTile(layer, 3, 3, stone);
-    try world.rebuildChunks();
-
-    try world.ensureStaticCache(static_cache_test_texture, null);
-
-    // Every dense cell contributes exactly six vertices; nothing is dropped.
-    try std.testing.expectEqual(@as(usize, world.cellCount() * 6), world.chunk_layer_vertices.items.len);
-    // A clean rebuild leaves no chunk-layer dirty but flags a re-submit.
-    try std.testing.expect(!world.static_cache_dirty);
-    try std.testing.expect(world.static_submit_dirty);
-    try expectChunkLayerVerticesMatchTiles(&world, layer);
-}
-
-test "setDenseTile marks only the owning chunk-layer dirty" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 4,
-        .height = 4,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 2,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-
-    const level = try world.addLevel(0);
-    const grass = try world.requireTileByName(&meta, "grass");
-    const water = try world.requireTileByName(&meta, "water_1");
-    const layer = try world.addDenseLayer(level, 0, .floor, grass);
-    try world.rebuildChunks();
-    try world.ensureStaticCache(static_cache_test_texture, null);
-
-    // Clean baseline: building cleared every per-chunk-layer dirty flag.
-    for (world.chunk_layer_dirty.items) |dirty| try std.testing.expect(!dirty);
-    try std.testing.expect(!world.static_cache_dirty);
-
-    // Cell (3,3) lives in chunk (1,1) => local chunk 3 of a 2x2 chunk grid.
-    _ = try world.setDenseTile(layer, 3, 3, water);
-    try std.testing.expect(world.static_cache_dirty);
-    const chunks_per_level = world.chunkCountPerLevel();
-    for (world.chunk_layer_dirty.items, 0..) |dirty, packed_index| {
-        const expected_dirty = packed_index == layer * chunks_per_level + 3;
-        try std.testing.expectEqual(expected_dirty, dirty);
-    }
-
-    // Rebuilding refreshes only the dug chunk-layer and re-arms the re-submit.
-    try world.ensureStaticCache(static_cache_test_texture, null);
-    try std.testing.expect(world.static_submit_dirty);
-    try expectChunkLayerVerticesMatchTiles(&world, layer);
-}
-
-test "visible-set change drives static re-submit, a still frame does not" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 64,
-        .height = 64,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 16,
-    };
-    defer world.deinit();
-    try world.buildCatalog(&meta);
-
-    const level = try world.addLevel(0);
-    const grass = try world.requireTileByName(&meta, "grass");
-    _ = try world.addDenseLayer(level, 0, .floor, grass);
-    try world.rebuildChunks();
-
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0);
-    world.static_submit_dirty = false;
-
-    // Re-applying the same window leaves the visible set unchanged: no re-submit.
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0);
-    try std.testing.expect(!world.static_submit_dirty);
-
-    // Panning to a different window changes visibility and arms a re-submit.
-    world.setVisibleChunksForWorldRect(.{ .x = 1024, .y = 1024, .w = 128, .h = 128 }, 0);
-    try std.testing.expect(world.static_submit_dirty);
-}
-
-test "threaded and inline static cache builds are byte-identical" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
-
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3 });
-    defer threads.deinit();
-
-    const config = WorldBuildConfig{ .width_tiles = 64, .height_tiles = 64, .chunk_size_tiles = 8, .seed = 42 };
-    var threaded = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
-    defer threaded.deinit();
-    var serial = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
-    defer serial.deinit();
-
-    // Force a fresh rebuild of both (init already pre-warmed the cache), one
-    // threaded and one inline: the worker range-split must produce exactly the
-    // inline result. Guards the disjoint-span write math.
-    try threaded.rebuildStaticCacheLayout();
-    try serial.rebuildStaticCacheLayout();
-    try threaded.ensureStaticCache(static_cache_test_texture, &threads);
-    try serial.ensureStaticCache(static_cache_test_texture, null);
-    try std.testing.expectEqualSlices(Vertex, serial.chunk_layer_vertices.items, threaded.chunk_layer_vertices.items);
-}
-
-test "static cache layout spans every dense layer across z levels" {
+test "dense layers order by z level and quads re-submit only on structural change" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -2106,17 +1783,26 @@ test "static cache layout spans every dense layer across z levels" {
     const lower_level = try world.addLevel(0);
     const upper_level = try world.addLevel(10);
     const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
     const lower_layer = try world.addDenseLayer(lower_level, 0, .floor, grass);
     const upper_layer = try world.addDenseLayer(upper_level, 0, .floor, grass);
     try world.rebuildChunks();
-    try world.ensureStaticCache(static_cache_test_texture, null);
 
-    const chunks_per_level = world.chunkCountPerLevel();
-    // One cache entry per (dense layer, chunk-of-its-level) pair.
-    try std.testing.expectEqual(@as(usize, 2 * chunks_per_level), world.chunk_layer_vertex_count.items.len);
-    // A higher base-z level carries a strictly higher order and renders above the
-    // lower one — the order-merge interleaves z levels with no manual depth merge.
+    // A higher base-z level carries a strictly higher order; the ordered draw list
+    // interleaves each dense tilemap quad with dynamic entities by this depth.
     try std.testing.expect(world.denseLayerOrder(lower_layer).depth < world.denseLayerOrder(upper_layer).depth);
-    try expectChunkLayerVerticesMatchTiles(&world, lower_layer);
-    try expectChunkLayerVerticesMatchTiles(&world, upper_layer);
+
+    // A structural change (new layer / chunk rebuild) arms a quad re-submit.
+    try std.testing.expect(world.dense_quads_dirty);
+    world.dense_quads_dirty = false;
+
+    // A dig changes tile-data, not quad geometry, so it does not re-arm a re-submit
+    // (the GPU buffer is updated directly by the dig hook).
+    _ = try world.setDenseTile(lower_layer, 3, 3, water);
+    try std.testing.expect(!world.dense_quads_dirty);
+
+    // A pan changes chunk visibility (crops sparse tiles) but not the full-world
+    // dense quads, so it does not re-arm a re-submit either.
+    world.setVisibleChunksForWorldRect(.{ .x = 1024, .y = 1024, .w = 128, .h = 128 }, 0);
+    try std.testing.expect(!world.dense_quads_dirty);
 }

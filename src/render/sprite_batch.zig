@@ -129,13 +129,39 @@ pub const DrawSource = enum {
     static,
 };
 
+// Which pipeline draws a group. `sprite` samples a texture per vertex UV (the
+// default path). `tilemap` draws one world-space quad per dense layer and the
+// fragment shader reads tile ids from a storage buffer, so a whole layer is one
+// draw independent of world size.
+pub const Material = enum {
+    sprite,
+    tilemap,
+};
+
+/// Fragment uniform (set 3) for a tilemap draw — world-constant grid + atlas
+/// geometry. extern for a stable GPU layout matching `tilemap.frag.glsl`.
+pub const TilemapParams = extern struct {
+    // x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
+    grid: [4]f32,
+    // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
+    atlas: [4]f32,
+};
+
+/// Per-group tilemap binding data, meaningful only when `material == .tilemap`.
+pub const TilemapDrawData = struct {
+    tile_data: resources.TileDataId = .invalid,
+    params: TilemapParams = .{ .grid = .{ 0, 0, 0, 0 }, .atlas = .{ 0, 0, 0, 0 } },
+};
+
 pub const DrawGroup = struct {
     source: DrawSource = .dynamic,
+    material: Material = .sprite,
     texture: TextureId,
     presentation: CoordinatePresentation,
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
+    tilemap: TilemapDrawData = .{},
 };
 
 pub const TextureResolver = struct {

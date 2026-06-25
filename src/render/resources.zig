@@ -28,6 +28,14 @@ pub const TextureId = struct {
     }
 };
 
+/// Opaque handle to a renderer-owned tilemap tile-data storage buffer. World and
+/// game code hold these per dense layer; the renderer owns the GPU resource. The
+/// enum's value is the buffer's index in the renderer registry.
+pub const TileDataId = enum(u32) {
+    invalid = std.math.maxInt(u32),
+    _,
+};
+
 pub const TextureFormat = enum {
     rgba8_unorm,
 };

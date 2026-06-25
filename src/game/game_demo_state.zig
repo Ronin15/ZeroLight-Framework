@@ -364,10 +364,10 @@ pub const GameDemoState = struct {
         const interpolation_alpha = context.interpolation_alpha;
         try self.world.ensureRenderDepthIndex();
 
-        // Dense world geometry is retained on the GPU; only re-gathered/re-uploaded
-        // on a pan or dig. Sparse tiles and dynamic entities stream through the
+        // Each dense layer is one retained GPU tilemap quad, uploaded once and
+        // unchanged on a pan. Sparse tiles and dynamic entities stream through the
         // ordered batch and the renderer merges all three by render order.
-        try self.world.submitStaticDenseGeometry(renderer, runtime_assets, context.thread_system);
+        try self.world.submitStaticDenseGeometry(renderer, runtime_assets);
 
         var sparse_depth = self.world.firstVisibleSparseDepth();
         var dynamic_range = DynamicDepthRange{ .start = 0, .end = 0 };

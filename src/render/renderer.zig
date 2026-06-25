@@ -45,6 +45,8 @@ pub const Vertex = sprite_batch.Vertex;
 pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
 const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
+const Material = sprite_batch.Material;
+pub const TilemapParams = sprite_batch.TilemapParams;
 const CoordinatePresentation = sprite_batch.CoordinatePresentation;
 
 pub const FrameResult = enum {
@@ -52,12 +54,7 @@ pub const FrameResult = enum {
     skipped_no_swapchain,
 };
 
-/// Opaque handle to a renderer-owned tilemap tile-data storage buffer. World and
-/// game code hold these per dense layer; the renderer owns the GPU resource.
-pub const TileDataId = enum(u32) {
-    invalid = std.math.maxInt(u32),
-    _,
-};
+pub const TileDataId = resources.TileDataId;
 
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
@@ -263,11 +260,18 @@ pub const Renderer = struct {
         try self.draw_list.ensureTotalCapacity(self.allocator, total);
     }
 
-    /// Appends one retained world-space span (e.g. a chunk-layer) with its draw
-    /// order. `vertices` are world space; the camera is applied by the vertex
-    /// uniform at draw time. Must be called between `beginStaticGeometry` and the
-    /// next `endFrame`.
-    pub fn appendStaticSpan(self: *Renderer, texture: TextureId, order: RenderOrder, vertices: []const Vertex) !void {
+    /// Appends one retained world-space quad that draws a whole dense layer via
+    /// the tilemap pipeline: the fragment shader reads `tile_data` per pixel and
+    /// samples `atlas_texture`. `vertices` are the quad's world-space corners (6).
+    /// Must be called between `beginStaticGeometry` and the next `endFrame`.
+    pub fn appendStaticTilemapSpan(
+        self: *Renderer,
+        atlas_texture: TextureId,
+        order: RenderOrder,
+        vertices: []const Vertex,
+        tile_data: TileDataId,
+        params: TilemapParams,
+    ) !void {
         if (vertices.len == 0) return;
         const end = try std.math.add(usize, self.static_vertices.items.len, vertices.len);
         const first_vertex = std.math.cast(u32, self.static_vertices.items.len) orelse return error.StaticGeometryTooLarge;
@@ -275,11 +279,13 @@ pub const Renderer = struct {
         try self.static_vertices.appendSlice(self.allocator, vertices);
         try self.static_groups.append(self.allocator, .{
             .source = .static,
-            .texture = texture,
+            .material = .tilemap,
+            .texture = atlas_texture,
             .presentation = .world,
             .order = order,
             .first_vertex = first_vertex,
             .vertex_count = @intCast(vertices.len),
+            .tilemap = .{ .tile_data = tile_data, .params = params },
         });
         self.static_dirty = true;
     }
@@ -442,21 +448,35 @@ pub const Renderer = struct {
         const render_pass = c.SDL_BeginGPURenderPass(command_buffer, &color_target, 1, null) orelse {
             return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPURenderPass");
         };
-        c.SDL_BindGPUGraphicsPipeline(render_pass, self.pipeline);
-
         if (self.draw_list.items.len > 0) {
             applyDrawableViewport(render_pass, presentation);
 
-            // Bind the source buffer on source change, push the presentation
-            // uniform on presentation change, draw each group in order.
+            // Bind the pipeline on material change, the source buffer on source
+            // change, push the presentation uniform on presentation change, then
+            // draw each group in order. Vertex-buffer bindings and pushed uniforms
+            // persist across pipeline binds, so both materials share the camera
+            // vertex uniform pushed by applyGroupPresentation.
             var active_source: ?DrawSource = null;
             var active_presentation: ?CoordinatePresentation = null;
+            var active_material: ?Material = null;
             for (self.draw_list.items) |group| {
                 const texture = self.resolveTextureSlot(group.texture) orelse continue;
                 const source_buffer = switch (group.source) {
                     .dynamic => self.vertex_buffer,
                     .static => self.static_vertex_buffer orelse continue,
                 };
+                const tile_buffer: ?*c.SDL_GPUBuffer = switch (group.material) {
+                    .sprite => null,
+                    .tilemap => self.tileDataBuffer(group.tilemap.tile_data) orelse continue,
+                };
+
+                if (active_material == null or active_material.? != group.material) {
+                    c.SDL_BindGPUGraphicsPipeline(render_pass, switch (group.material) {
+                        .sprite => self.pipeline,
+                        .tilemap => self.tilemap_pipeline,
+                    });
+                    active_material = group.material;
+                }
 
                 if (active_source == null or active_source.? != group.source) {
                     var vertex_binding = c.SDL_GPUBufferBinding{
@@ -475,6 +495,17 @@ pub const Renderer = struct {
                     .sampler = self.sampler,
                 };
                 c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+
+                if (group.material == .tilemap) {
+                    // Rebind the storage buffer for every tilemap group: on Metal the
+                    // storage-buffer slot shifts when the bound pipeline's UBO count
+                    // differs, and an unconditional rebind is correct on every backend.
+                    var storage = tile_buffer.?;
+                    c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
+                    var params = group.tilemap.params;
+                    c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
+                }
+
                 c.SDL_DrawGPUPrimitives(render_pass, group.vertex_count, 1, group.first_vertex, 0);
             }
         }
@@ -618,6 +649,7 @@ pub const Renderer = struct {
         const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
         if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
         try self.tile_data_buffers.append(self.allocator, buffer);
+        log.debug("created tilemap tile-data buffer {d}: {d} cells", .{ index, tiles.len });
         return @enumFromInt(index);
     }
 
@@ -861,7 +893,10 @@ fn coalesceDrawList(items: []DrawGroup) usize {
     var write: usize = 0;
     for (items[1..]) |group| {
         const cur = &items[write];
-        if (cur.source == group.source and
+        // Only sprite groups coalesce; each tilemap group binds its own storage
+        // buffer + uniform, so it must stay a distinct draw.
+        if (cur.material == .sprite and group.material == .sprite and
+            cur.source == group.source and
             cur.presentation == group.presentation and
             cur.texture.index == group.texture.index and
             cur.texture.generation == group.texture.generation and
@@ -1310,6 +1345,48 @@ test "draw list keeps non-contiguous spans separate" {
 
     try mergeDrawList(&list, allocator, &static_groups, &.{});
 
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "tilemap layer quads interleave with dynamic groups by render order" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // Two dense tilemap layers (floor -2, roof +1) with a dynamic actor (0) between.
+    var floor = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6);
+    floor.material = .tilemap;
+    var roof = testDrawGroup(.static, 0, .world, RenderOrder.world(1), 6, 6);
+    roof.material = .tilemap;
+    const static_groups = [_]DrawGroup{ floor, roof };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(0), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(Material.tilemap, list.items[0].material);
+    try std.testing.expectEqual(@as(i32, -2), list.items[0].order.depth);
+    try std.testing.expectEqual(Material.sprite, list.items[1].material);
+    try std.testing.expectEqual(Material.tilemap, list.items[2].material);
+    try std.testing.expectEqual(@as(i32, 1), list.items[2].order.depth);
+}
+
+test "contiguous tilemap groups never coalesce" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // Same texture/order and contiguous verts — a sprite pair would coalesce, but
+    // each tilemap group binds its own storage buffer, so they stay separate draws.
+    var first = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6);
+    first.material = .tilemap;
+    var second = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 6, 6);
+    second.material = .tilemap;
+    const static_groups = [_]DrawGroup{ first, second };
+
+    try mergeDrawList(&list, allocator, &static_groups, &.{});
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
 }
 

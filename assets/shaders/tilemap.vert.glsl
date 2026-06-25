@@ -11,7 +11,7 @@ layout(location = 2) in vec4 in_color;
 
 layout(location = 0) out vec2 out_world_pos;
 
-// Shared with the sprite vertex shader: the camera/viewport affine (Phase 1).
+// Shared with the sprite vertex shader: the camera/viewport affine.
 layout(set = 1, binding = 0) uniform FrameUniform {
     vec4 drawable_size;
     vec4 position_transform;
