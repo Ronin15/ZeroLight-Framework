@@ -36,13 +36,14 @@ submits by texture and coordinate-presentation groups. Texture ownership is
 tracked with generational `TextureId` values so stale or destroyed IDs are
 rejected deterministically during batch prep.
 
-The renderer owns a second, **static** vertex buffer for retained world geometry
-(see Retained Static World Geometry). Each frame it builds one order-merged draw
-list from the dynamic draw groups plus the static spans, stable-sorted by
-`RenderOrder` (static appended first, so world/dense geometry draws under
-sparse/dynamic at equal order), and binds the dynamic or static buffer per draw
-group. The static buffer re-uploads only when its contents change, so a still or
-panning frame issues no dense-tile vertex work.
+The renderer owns a second, **static** vertex buffer for retained world geometry —
+now just one quad per dense layer (see GPU-Driven Tilemap). Each frame it builds one
+order-merged draw list from the dynamic draw groups plus the static spans,
+stable-sorted by `RenderOrder` (static appended first, so world/dense geometry draws
+under sparse/dynamic at equal order). It binds the dynamic or static vertex buffer
+per source and the **sprite** or **tilemap** pipeline per `DrawGroup.material`. The
+static buffer re-uploads only on a structural change, so a still or panning frame
+issues no dense vertex work.
 
 `Renderer` remains the game-facing facade. `src/render/sprite_batch.zig` owns
 sprite command storage, ordered-stream validation, vertex expansion, and draw
@@ -99,40 +100,40 @@ sprite-batch capacity before relying on allocation-free render frames. The
 warmed path avoids per-frame allocation only inside the currently reserved
 ordered-command, prepared-command, vertex, and draw-group capacity.
 
-## Retained Static World Geometry
+## GPU-Driven Tilemap
 
-Dense world tiles are static and camera-independent (the shader applies the
-camera), so they are not re-emitted per frame. `WorldSystem` holds a per-chunk-
-layer CPU vertex cache keyed by `(dense_layer_index, chunk_index)`, built once via
-`writeWorldSpriteQuad` so its vertices are byte-identical to dynamic sprite
-vertices. The renderer owns the matching retained static GPU vertex buffer; the
-world submits the visible chunk-layers' cached spans through
-`Renderer.beginStaticGeometry` / `appendStaticSpan`.
+Dense world tiles are not emitted as per-tile vertices. Each dense layer's tile ids
+are uploaded once to a GPU **storage buffer** (`GRAPHICS_STORAGE_READ`, one `u32`
+per cell, row-major — a direct copy of `WorldSystem.dense_tile_ids` via
+`Renderer.createTileDataBuffer`). The world draws **one world-space quad per dense
+layer** through the retained static vertex buffer (`Renderer.beginStaticGeometry` /
+`appendStaticTilemapSpan`) at `denseLayerOrder(layer)`, tagged
+`DrawGroup.material = .tilemap`. The tilemap fragment shader maps each screen pixel
+to a world cell, reads the tile id from the storage buffer, derives the atlas cell
+from the tight grid (`col = id % columns`, `row = id / columns`; that layout is
+enforced for every tile at meta load by `validateGridEntry`), and samples the
+atlas. Cost scales with the **screen**, not the world: ~0.5 MB/layer of tile data
+and a handful of draw calls regardless of world size.
 
-The static buffer re-uploads (cycle-on-dirty, in the pre-render copy pass, like
-the dynamic buffer) only when the static set actually changes: a camera pan
-(different visible chunk-layers) re-gathers cached spans with no vertex recompute,
-and a tile edit (`setDenseTile`, the dig/build hook) rebuilds only the one
-affected chunk-layer. A still frame re-uploads nothing and reuses last frame's
-geometry. Rebuilds of many chunk-layers (initial build, mass reveal) thread across
-the `ThreadSystem` under a dedicated tuner; a single dig stays inline.
+The camera lives in the vertex shader (Sprite Rendering's `position_transform`), so
+a **pan uploads nothing** — the full-world quads are unchanged. The quads re-submit
+only on a structural change (`dense_quads_dirty`: a new dense layer or chunk
+rebuild), never per frame or per pan.
 
-Multi-z is native: deeper levels are additional chunk-layers at a lower
-`RenderOrder`, and the order-merged draw list interleaves them with dynamic
-entities, so an actor in a dug pit renders between the floor below and walls above.
+A **dig/build** (`setDenseTile`) writes the CPU tile field — the source of truth for
+collision and gameplay — and queues a single-cell GPU edit. `flushDenseTileEdits`
+applies all of a frame's queued edits in one batched copy pass
+(`Renderer.uploadTileDataEdits`) at the render boundary: a dig is one storage-buffer
+element write, no full re-upload and no vertex work.
 
-Tradeoffs to know:
-
-- The cache holds the **whole world's** tile vertices resident (≈50 MB for a
-  512×512 single dense layer at 32 bytes/vertex, six vertices/cell), independent of
-  the GPU buffer, which only holds the visible spans. Cost scales with world cells
-  times dense layers; revisit (e.g. per-chunk GPU buffers, or a windowed cache)
-  before world or layer counts grow large.
-- The cache is **pre-warmed at world load** (`initProcedural*` / `initDemo*`), so
-  the one-time full-world build runs behind the loading path (threaded), not as a
-  hitch on the first render frame.
-- Tile UVs bake the world-atlas dimensions captured at init; a runtime atlas swap
-  to different dimensions is not supported without an explicit cache invalidation.
+Two pipelines share the ordered draw list. The renderer binds the **sprite** or
+**tilemap** pipeline on a `DrawGroup.material` change; tilemap groups additionally
+bind the layer storage buffer (rebound per group, covering a Metal storage-slot
+shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — each
+tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
+layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
+with dynamic entities, so an actor in a dug pit renders between the floor below and
+walls above.
 
 ## Logical Presentation
 
@@ -147,8 +148,8 @@ size. CPU prep emits world vertices in **world coordinates** and logical/drawabl
 vertices in their own space; the vertex shader applies the per-presentation
 uniform, which for `.world` folds the camera (pan/zoom) and the acquired-size
 presentation into one affine transform. Keeping the camera in the shader makes
-world geometry camera-independent on the CPU, which is what lets static world
-tiles be built once and reused (see Retained Static World Geometry). SDL_GPU
+world geometry camera-independent on the CPU, which is what lets the dense tilemap
+quads be uploaded once and reused across pans (see GPU-Driven Tilemap). SDL_GPU
 viewport stays in drawable space and scissor clips logical content to the
 computed viewport.
 
@@ -193,13 +194,13 @@ columns, level z columns, and chunk/visibility columns in SoA form. World
 construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
 a primitive rectangle fallback. The runtime loading path builds the procedural
-512x512 tile world through the Engine-owned `ThreadSystem`, then render prep
-limits world tile submission to the camera-visible chunk window, with optional
-configured overscan. Dense world tiles submit as retained static chunk-layer
-spans (see Retained Static World Geometry) while sparse tiles, entities, and
-particles stream through the ordered dynamic batch; the renderer's order-merged
-draw list interleaves all of them by `RenderOrder`, so there is no hand-written
-world/entity depth merge and `SpriteBatch` stays an ordered-stream consumer
+512x512 tile world through the Engine-owned `ThreadSystem`. Dense world tiles draw
+as one GPU-driven tilemap quad per layer (see GPU-Driven Tilemap) while sparse
+tiles, entities, and particles stream through the ordered dynamic batch — the
+camera-visible chunk window still crops sparse-tile submission, with optional
+configured overscan. The renderer's order-merged draw list interleaves all of them
+by `RenderOrder`, so there is no hand-written world/entity depth merge and
+`SpriteBatch` stays an ordered-stream consumer
 rather than a fallback tile sorter. Demo actors
 reference stable `.grim_characters` atlas-entry IDs through `DataSystem` asset
 references and keep primitive visual rectangles as placeholders when character
@@ -274,13 +275,16 @@ part of the normal runtime path.
 Add GLSL source under `assets/shaders/`, then add an entry to the
 `shader_programs` table in `build.zig` so the build emits the platform shader
 files. Load the resulting installed shader files from the render-owned GPU
-pipeline module, such as `src/render/gpu/sprite_pipeline.zig`, while keeping
-`Renderer` as the game-facing facade.
+pipeline module, such as `src/render/gpu/sprite_pipeline.zig` (or
+`tilemap_pipeline.zig` for the storage-buffer example), while keeping `Renderer`
+as the game-facing facade.
 
 Keep shader resource bindings aligned with SDL_GPU's layout rules:
 
 - vertex uniform buffers: set 1
-- fragment sampled textures/samplers: set 2
+- fragment sampled textures/samplers: set 2, then fragment storage buffers in the
+  same set after the samplers (so one sampler + one storage buffer are bindings 0
+  and 1, bound via separate `SDL_BindGPUFragmentSamplers` / `…StorageBuffers` slots)
 - fragment uniform buffers: set 3
 
 The build converts those SPIR-V bindings to SDL-compatible MSL resource bindings

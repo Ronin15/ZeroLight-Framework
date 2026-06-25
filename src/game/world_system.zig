@@ -18,6 +18,7 @@ const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
+const TileDataEdit = @import("../render/renderer.zig").TileDataEdit;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const Vertex = @import("../render/renderer.zig").Vertex;
 const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
@@ -195,6 +196,12 @@ pub const WorldSystem = struct {
     // owns and releases the GPU buffers. The tilemap shader reads these directly
     // so no per-tile vertex geometry is built for dense layers.
     dense_layer_tile_buffers: std.ArrayList(TileDataId) = .empty,
+    // Per-cell tile-data edits queued by setDenseTile once a layer's storage buffer
+    // exists, flushed in one batched copy pass at the render boundary. Empty (and
+    // allocation-free) on frames with no tile changes. Invariant: drained every frame
+    // gameplay advances — the pause policy blocks gameplay updates whenever render is
+    // skipped, so the queue stays bounded without an explicit cap.
+    dense_tile_edits: std.ArrayList(TileDataEdit) = .empty,
 
     sparse_level_indices: std.ArrayList(u16) = .empty,
     sparse_chunk_indices: std.ArrayList(u32) = .empty,
@@ -397,6 +404,7 @@ pub const WorldSystem = struct {
         self.sparse_chunk_indices.deinit(self.allocator);
         self.sparse_level_indices.deinit(self.allocator);
 
+        self.dense_tile_edits.deinit(self.allocator);
         self.dense_layer_tile_buffers.deinit(self.allocator);
         self.dense_tile_ids.deinit(self.allocator);
         self.dense_depth_bands.deinit(self.allocator);
@@ -538,6 +546,15 @@ pub const WorldSystem = struct {
         self.dense_quads_dirty = false;
     }
 
+    /// Flushes queued per-cell tile edits (digs/builds) to the GPU in one batched
+    /// copy pass, then clears the queue. A no-op on frames with no tile changes.
+    /// Call once per frame at the render boundary, after the layer buffers exist.
+    pub fn flushDenseTileEdits(self: *WorldSystem, renderer: *Renderer) !void {
+        if (self.dense_tile_edits.items.len == 0) return;
+        try renderer.uploadTileDataEdits(self.dense_tile_edits.items);
+        self.dense_tile_edits.clearRetainingCapacity();
+    }
+
     /// Submits the visible sparse tiles at `depth` through the dynamic ordered
     /// stream. Sparse tiles stay dynamic (they are sparse and change independently
     /// of the dense static field); the renderer merges them with dynamic entities
@@ -586,8 +603,16 @@ pub const WorldSystem = struct {
         const old_blocks_movement = self.flagsFor(old_tile_id).blocks_movement;
         const new_blocks_movement = self.flagsFor(tile_id).blocks_movement;
         self.dense_tile_ids.items[tile_index] = tile_id;
-        // The CPU tile field is the source of truth (collision/gameplay read it);
-        // the layer's GPU tile-data buffer is updated separately by the dig hook.
+        // Queue the GPU cell update once the layer buffer exists. Before it is built,
+        // the initial full upload captures the tile, so no edit is needed.
+        const buffer = self.denseLayerTileBuffer(layer_index);
+        if (buffer != .invalid) {
+            try self.dense_tile_edits.append(self.allocator, .{
+                .buffer = buffer,
+                .element_index = self.cellIndex(x, y),
+                .value = tile_id,
+            });
+        }
         return .{
             .level = self.dense_level_indices.items[layer_index],
             .x = x,
@@ -1442,6 +1467,36 @@ test "dense layer tile-data staging matches denseTile by row-major cell index" {
             );
         }
     }
+}
+
+test "setDenseTile queues a GPU cell edit only once the layer buffer exists" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    defer world.deinit();
+
+    const water = try world.requireTileByName(&meta, "water_1");
+    const grass = try world.requireTileByName(&meta, "grass");
+
+    // Before the storage buffer is built, a dig records no edit: the initial full
+    // upload will capture the tile.
+    _ = try world.setDenseTile(0, 2, 1, water);
+    try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
+
+    // Simulate the layer's storage buffer having been built (uploadDenseLayerBuffers
+    // needs a renderer, unavailable headless).
+    try world.dense_layer_tile_buffers.append(std.testing.allocator, @enumFromInt(0));
+
+    _ = try world.setDenseTile(0, 1, 0, grass);
+    try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
+    const edit = world.dense_tile_edits.items[0];
+    try std.testing.expectEqual(@as(usize, world.cellIndex(1, 0)), edit.element_index);
+    try std.testing.expectEqual(@as(u32, grass), edit.value);
+
+    // A flushed queue is cleared; an unchanged tile records nothing.
+    world.dense_tile_edits.clearRetainingCapacity();
+    try std.testing.expect((try world.setDenseTile(0, 1, 0, grass)) == null);
+    try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
 }
 
 test "world rejects invalid tile ids before render" {

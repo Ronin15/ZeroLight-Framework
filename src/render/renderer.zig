@@ -56,6 +56,15 @@ pub const FrameResult = enum {
 
 pub const TileDataId = resources.TileDataId;
 
+/// One queued tile-data cell edit: write `value` at `element_index` of the layer
+/// buffer `buffer`. Game code accumulates these on tile changes and flushes them
+/// to the GPU once per frame at the render boundary.
+pub const TileDataEdit = struct {
+    buffer: TileDataId,
+    element_index: usize,
+    value: u32,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
@@ -71,6 +80,9 @@ pub const Renderer = struct {
     // layer (a row-major copy of the world's dense_tile_ids). Renderer-owned so
     // world keeps only opaque handles and never crosses the render/gpu boundary.
     tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
+    // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
+    // for one batched dig upload per frame.
+    tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -177,6 +189,7 @@ pub const Renderer = struct {
             c.SDL_ReleaseGPUBuffer(self.device, buffer);
         }
         self.tile_data_buffers.deinit(self.allocator);
+        self.tile_edit_scratch.deinit(self.allocator);
         self.deinitBatchStorage();
         self.static_vertices.deinit(self.allocator);
         self.static_groups.deinit(self.allocator);
@@ -653,10 +666,22 @@ pub const Renderer = struct {
         return @enumFromInt(index);
     }
 
-    /// Uploads a single tile (one cell) into a tile-data buffer — the dig path.
-    pub fn uploadTileDataElement(self: *Renderer, id: TileDataId, element_index: usize, value: u32) !void {
-        const buffer = self.tileDataBuffer(id) orelse return error.InvalidTileDataBuffer;
-        try gpu_buffer.uploadStorageElement(self.device, buffer, element_index, value);
+    /// Uploads a batch of single-cell tile edits (the dig path) in one GPU copy
+    /// pass. Edits whose handle no longer resolves are skipped. The scratch list
+    /// resolves handles to buffers and is grow-only across frames.
+    pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
+        if (edits.len == 0) return;
+        self.tile_edit_scratch.clearRetainingCapacity();
+        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, edits.len);
+        for (edits) |edit| {
+            const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
+            self.tile_edit_scratch.appendAssumeCapacity(.{
+                .buffer = buffer,
+                .element_index = edit.element_index,
+                .value = edit.value,
+            });
+        }
+        try gpu_buffer.uploadStorageRegions(self.device, self.tile_edit_scratch.items);
     }
 
     fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
@@ -825,21 +850,16 @@ pub const Renderer = struct {
         try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_transfer_buffer, self.vertex_buffer, self.batch.vertices.items);
     }
 
-    // Grows the retained static buffer to hold `needed_vertices`. Grow-only; the
-    // static buffer is created lazily on first non-empty upload. Like the dynamic
-    // grow path this stalls on GPU idle, but static rebuilds are infrequent.
+    // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
+    // tilemap quads, 6 per layer). Grow-only and created lazily on first upload; it
+    // grows only when a dense layer is added, so the GPU-idle stall below is a rare,
+    // few-vertex structural event rather than a per-frame cost.
     fn ensureStaticCapacity(self: *Renderer, needed_vertices: usize) !void {
         if (self.static_vertex_buffer != null and needed_vertices <= self.static_capacity_vertices) return;
 
         var new_capacity = if (self.static_capacity_vertices == 0) needed_vertices else self.static_capacity_vertices;
         while (new_capacity < needed_vertices) {
             new_capacity *= 2;
-        }
-
-        if (self.static_vertex_buffer != null) {
-            // Growing an existing static buffer stalls on GPU idle below. Reserve
-            // static capacity up front so this is not hit at runtime.
-            log.warn("growing static vertex capacity {} -> {} vertices (GPU stall); reserve capacity to avoid this", .{ self.static_capacity_vertices, new_capacity });
         }
 
         const new_buffer = try gpu_buffer.createVertexBuffer(self.device, new_capacity);

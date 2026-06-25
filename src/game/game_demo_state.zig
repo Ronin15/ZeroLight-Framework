@@ -368,6 +368,8 @@ pub const GameDemoState = struct {
         // unchanged on a pan. Sparse tiles and dynamic entities stream through the
         // ordered batch and the renderer merges all three by render order.
         try self.world.submitStaticDenseGeometry(renderer, runtime_assets);
+        // Apply any tile edits (digs/builds) to the layer storage buffers.
+        try self.world.flushDenseTileEdits(renderer);
 
         var sparse_depth = self.world.firstVisibleSparseDepth();
         var dynamic_range = DynamicDepthRange{ .start = 0, .end = 0 };

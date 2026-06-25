@@ -124,21 +124,28 @@ pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement)
     return buffer;
 }
 
-/// Uploads a single storage element (one cell) at `element_index` — the dig
-/// path. One 4-byte transfer + region copy; no full-buffer re-upload.
-pub fn uploadStorageElement(
-    device: *c.SDL_GPUDevice,
+/// One storage-buffer cell edit: write `value` at `element_index` of `buffer`.
+pub const StorageRegion = struct {
     buffer: *c.SDL_GPUBuffer,
     element_index: usize,
     value: StorageElement,
-) !void {
+};
+
+/// Uploads a batch of single-cell edits (the dig path) in one transfer buffer +
+/// one copy pass + one submit, so a multi-cell edit is a single GPU round-trip
+/// rather than one per cell. Edits may target different buffers. `cycle = false`
+/// is mandatory for partial-region writes: `cycle = true` would rotate the whole
+/// buffer to fresh memory and leave every un-written cell garbage. The tradeoff is
+/// a write may race a prior in-flight frame's read of the same cell (self-correcting
+/// next frame), the same in-place pattern as the initial full upload.
+pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegion) !void {
+    if (edits.len == 0) return;
     const element_size: u32 = @sizeOf(StorageElement);
-    const byte_offset = std.math.mul(usize, element_index, element_size) catch return error.GpuBufferTooLarge;
-    const offset = try checkedGpuBytes(byte_offset);
+    const total_bytes = try storageByteSize(edits.len);
 
     var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
     transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = element_size;
+    transfer_info.size = total_bytes;
     const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
@@ -147,7 +154,8 @@ pub fn uploadStorageElement(
     const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
-    @as(*StorageElement, @ptrCast(@alignCast(mapped))).* = value;
+    const values = @as([*]StorageElement, @ptrCast(@alignCast(mapped)))[0..edits.len];
+    for (edits, values) |edit, *slot| slot.* = edit.value;
     c.SDL_UnmapGPUTransferBuffer(device, transfer);
 
     const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
@@ -161,9 +169,19 @@ pub fn uploadStorageElement(
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
-    var source = c.SDL_GPUTransferBufferLocation{ .transfer_buffer = transfer, .offset = 0 };
-    var destination = c.SDL_GPUBufferRegion{ .buffer = buffer, .offset = offset, .size = element_size };
-    c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
+    for (edits, 0..) |edit, i| {
+        const dst_byte_offset = std.math.mul(usize, edit.element_index, element_size) catch return error.GpuBufferTooLarge;
+        var source = c.SDL_GPUTransferBufferLocation{
+            .transfer_buffer = transfer,
+            .offset = @intCast(i * element_size),
+        };
+        var destination = c.SDL_GPUBufferRegion{
+            .buffer = edit.buffer,
+            .offset = try checkedGpuBytes(dst_byte_offset),
+            .size = element_size,
+        };
+        c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
+    }
     c.SDL_EndGPUCopyPass(copy_pass);
 
     if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
