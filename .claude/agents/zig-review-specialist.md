@@ -80,6 +80,41 @@ atomics for high-volume outputs, hidden hot-path allocation, direct worker mutat
 `DataSystem`, and unbatched structural commits. Multi-stage processors need explicit per-stage
 ownership, deterministic merge points, and visible timing/tuning stats.
 
+**All vector and named-math operations go through `core` (`src/core/simd.zig`,
+`src/core/math.zig`)** — these modules are the canonical, tested home for vector types/ops and
+reusable scalar/vector math, so the math is verified once and SIMD use stays consistent (one
+lane width, no divergent copies). This is unconditional: a system being domain-specific is not a
+license to hand-roll math. The separate question of *where a kernel lives* is about promotion,
+not about whether to use `core` — a one-system composition (e.g. AABB contact resolution) may
+stay in its system, but it is still assembled from `core` primitives, never raw intrinsics.
+Flag, regardless of how specific the surrounding logic is:
+- Raw `@Vector` (or an ad hoc lane width) declared in a system instead of the shared `simd`
+  vector types and helpers.
+- A named/general math operation hand-rolled inline — whether or not a matching helper exists
+  yet. If one exists in `core`, point to it; if not, the fix is to add it to `core` and consume
+  it. (Recurring categories: gather/scatter, reciprocal/inverse sqrt, length/normalize, trig,
+  interpolation, clamp/saturating conversions — illustrative, not exhaustive.)
+- Scalar and SIMD forms of the same operation drifting apart in different files instead of
+  being paired in `core`, which lets layouts disagree.
+- A general-purpose kernel duplicated across systems — recommend promoting it to
+  `simd.zig`/`math.zig` with scalar-vs-SIMD parity tests, then consuming it.
+
+Plain operator arithmetic (`+ - * /`, including on the `simd` vector types, which overload the
+operators) is fine inline — the rule targets raw `@Vector` and hand-rolled named primitives, not
+basic arithmetic. Do not raise noise asking to wrap every operator in a helper.
+
+**SIMD applicability (per `docs/coding-standards.md`)** — judge vectorization at target scale
+(heavy scenes/battles/late-game), not demo counts. A new dense, uniform, branch-light float
+loop over contiguous aligned SoA columns should be vectorized through the shared helpers with a
+scalar tail; flag one left scalar without reason. For gather-bound or per-element-branchy hot
+loops (AI separation/decision, steering avoidance, perception), the expected pattern is
+gather-once-into-packed-SoA-scratch then vectorized masked math — flag accepting the scalar form
+as final when scale will make it dominant, but do NOT push SIMD onto genuinely irreducible
+loops (frontier traversal/BFS/A* expansion, swap-remove compaction, rare branch-heavy setup);
+those stay scalar with a stated reason. Every newly vectorized/restructured path needs
+scalar-vs-SIMD and serial-vs-threaded parity tests and scratch buffers that are allocation-free
+after warmup.
+
 **Cache-line behavior** — check hot SoA column alignment, worker range splitting, and
 false-sharing risk; 64-byte padding belongs only on concurrently written thread-shared
 records, not cold entity slot metadata.

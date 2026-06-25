@@ -97,6 +97,23 @@ item-count floors. Do not turn the main thread into a dumping ground for scalabl
 payloads, or service shortcuts to production contracts. Tests use private helpers, local
 fixtures, mocks, or real payloads.
 
+**All vector and named-math operations go through `core`.** Use `src/core/simd.zig` (vector
+types and ops) and `src/core/math.zig` (reusable scalar/vector math) for every vector operation
+and every named math operation, so the math is tested once and SIMD use stays consistent. This
+is unconditional — a processor being domain-specific is not a reason to hand-roll: do not declare
+raw `@Vector` in a system, and do not hand-roll a named primitive inline (gather/scatter,
+reciprocal/inverse sqrt, length/normalize, trig, interpolation, clamp/saturating conversions, and
+the like). If a needed primitive is missing, add it to `core` with scalar-vs-SIMD parity tests
+and consume it; keep scalar and SIMD forms of the same operation paired so layouts agree. A
+one-system composite kernel (e.g. contact resolution) may stay in its system, but assemble it
+from `core` primitives, not raw intrinsics; if a kernel is reused across systems, promote it to
+`core`. Plain operator arithmetic (`+ - * /`, including on `simd` vector types) is fine inline —
+the rule is about raw `@Vector` and named primitives, not basic arithmetic. Vectorize dense
+uniform branch-light float loops over aligned SoA columns (with a scalar tail) through these
+helpers, judged at target battle scale per `docs/coding-standards.md`; for gather-bound or
+per-element-branchy loops use gather-into-packed-SoA-scratch then masked vector math; leave only
+irreducible loops (e.g. frontier traversal, swap-remove) scalar with a stated reason.
+
 ## Slices & Scaffolding
 
 Treat a roadmap slice as a full feature — runtime behavior, diagnostics, docs, tests, and

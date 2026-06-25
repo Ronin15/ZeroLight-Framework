@@ -59,8 +59,21 @@ masks are for membership/query decisions, not a replacement for direct slice
 iteration in hot processors. Worker ranges should write disjoint rows and avoid
 sharing writable cache lines in hot SoA columns.
 
-Apply SIMD with scale in mind. Use the `src/core/simd.zig` helpers (never raw
-`@Vector` in systems) for dense, uniform, branch-light float math over contiguous
+All vector operations and named math operations go through `core`:
+`src/core/simd.zig` for vector types/ops and `src/core/math.zig` for reusable
+scalar/vector math. This is unconditional and independent of how domain-specific
+the calling system is — it keeps the math tested once and SIMD use consistent
+(one lane width, no divergent copies). Do not declare raw `@Vector` in a system
+or hand-roll a named primitive inline (gather/scatter, reciprocal/inverse sqrt,
+length/normalize, trig, interpolation, clamp/saturating conversions, and the
+like); if one is missing, add it to `core` with scalar-vs-SIMD parity tests and
+keep the scalar and SIMD forms paired. A one-system composite kernel may stay in
+its system, but assemble it from `core` primitives. Plain operator arithmetic
+(`+ - * /`, including on the `simd` vector types) is fine inline — the rule
+targets raw `@Vector` and named primitives, not basic arithmetic.
+
+Apply SIMD with scale in mind. Use the `src/core/simd.zig` helpers for dense,
+uniform, branch-light float math over contiguous
 aligned SoA columns, always with a scalar tail — this is the pattern in movement,
 collision broadphase/narrowphase, collision response, particle integration, and
 the pathfinding flow field. This framework is built to scale to heavy scenes,
