@@ -17,6 +17,7 @@ const log = logging.render;
 const gpu_buffer = @import("gpu/buffer.zig");
 const gpu_device = @import("gpu/device.zig");
 const gpu_pipeline = @import("gpu/sprite_pipeline.zig");
+const gpu_tilemap = @import("gpu/tilemap_pipeline.zig");
 const gpu_texture = @import("gpu/texture.zig");
 const resources = @import("resources.zig");
 const resolution = @import("../app/resolution.zig");
@@ -56,6 +57,7 @@ pub const Renderer = struct {
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
     pipeline: *c.SDL_GPUGraphicsPipeline,
+    tilemap_pipeline: *c.SDL_GPUGraphicsPipeline,
     sampler: *c.SDL_GPUSampler,
     vertex_buffer: *c.SDL_GPUBuffer,
     vertex_transfer_buffer: *c.SDL_GPUTransferBuffer,
@@ -124,11 +126,21 @@ pub const Renderer = struct {
         const pipeline = try gpu_pipeline.createSpritePipeline(allocator, device, assets, target_format, shader_set);
         errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
 
+        const tilemap_pipeline = try gpu_tilemap.createTilemapPipeline(
+            allocator,
+            device,
+            assets,
+            target_format,
+            gpu_tilemap.shaderSetForFormat(shader_set.format),
+        );
+        errdefer c.SDL_ReleaseGPUGraphicsPipeline(device, tilemap_pipeline);
+
         var renderer = Renderer{
             .allocator = allocator,
             .device = device,
             .window = window,
             .pipeline = pipeline,
+            .tilemap_pipeline = tilemap_pipeline,
             .sampler = sampler,
             .vertex_buffer = vertex_buffer,
             .vertex_transfer_buffer = vertex_transfer_buffer,
@@ -163,6 +175,7 @@ pub const Renderer = struct {
         c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
         c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
         c.SDL_ReleaseGPUSampler(self.device, self.sampler);
+        c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.tilemap_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
         if (self.window_claimed) {
             c.SDL_ReleaseWindowFromGPUDevice(self.device, self.window);
@@ -1044,6 +1057,7 @@ test "texture slots reuse retired slots with fresh generations" {
         .device = undefined,
         .window = undefined,
         .pipeline = undefined,
+        .tilemap_pipeline = undefined,
         .sampler = undefined,
         .vertex_buffer = undefined,
         .vertex_transfer_buffer = undefined,
@@ -1081,6 +1095,7 @@ test "internal texture slots cannot be destroyed or replaced through public APIs
         .device = undefined,
         .window = undefined,
         .pipeline = undefined,
+        .tilemap_pipeline = undefined,
         .sampler = undefined,
         .vertex_buffer = undefined,
         .vertex_transfer_buffer = undefined,
@@ -1308,6 +1323,7 @@ test "renderer drawable pixel scale follows current presentation" {
         .device = undefined,
         .window = undefined,
         .pipeline = undefined,
+        .tilemap_pipeline = undefined,
         .sampler = undefined,
         .vertex_buffer = undefined,
         .vertex_transfer_buffer = undefined,

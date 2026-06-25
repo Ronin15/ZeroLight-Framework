@@ -196,7 +196,7 @@ pub fn shaderFormatName(format: c.SDL_GPUShaderFormat) []const u8 {
     return "unknown";
 }
 
-fn createShader(
+pub fn createShader(
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     assets: AssetStore,

@@ -51,6 +51,21 @@ const shader_programs = [_]ShaderProgram{
             },
         },
     },
+    .{
+        .name = "tilemap",
+        .stages = .{
+            .{
+                .stage = .vertex,
+                .source_path = "assets/shaders/tilemap.vert.glsl",
+                .output_stem = "tilemap.vert",
+            },
+            .{
+                .stage = .fragment,
+                .source_path = "assets/shaders/tilemap.frag.glsl",
+                .output_stem = "tilemap.frag",
+            },
+        },
+    },
 };
 
 pub fn build(b: *std.Build) void {
