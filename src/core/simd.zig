@@ -151,21 +151,6 @@ pub fn clampFloat4(values: Float4, minimum: Float4, maximum: Float4) Float4 {
     return minFloat4(maxFloat4(values, minimum), maximum);
 }
 
-/// Horizontal sum of the four lanes, left-folded so vectorized reductions stay
-/// consistent with the scalar accumulation order of their tails.
-pub fn horizontalSumFloat4(vector: Float4) f32 {
-    return vector[0] + vector[1] + vector[2] + vector[3];
-}
-
-/// Number of true lanes in `mask` (0..lane_count).
-pub fn maskTrueCount(mask: Mask4) usize {
-    var count: usize = 0;
-    inline for (0..lane_count) |lane| {
-        if (mask[lane]) count += 1;
-    }
-    return count;
-}
-
 pub fn clampInt4(values: Int4, minimum: Int4, maximum: Int4) Int4 {
     return minInt4(maxInt4(values, minimum), maximum);
 }
@@ -421,18 +406,6 @@ test "normalize or zero matches scalar and zeroes short lanes" {
             try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
         }
     }
-}
-
-test "horizontalSumFloat4 left-folds the lanes" {
-    try std.testing.expectEqual(@as(f32, 10), horizontalSumFloat4(float4(1, 2, 3, 4)));
-    try std.testing.expectEqual(@as(f32, 0), horizontalSumFloat4(splatFloat4(0)));
-}
-
-test "maskTrueCount counts true lanes" {
-    try std.testing.expectEqual(@as(usize, 0), maskTrueCount(@splat(false)));
-    try std.testing.expectEqual(@as(usize, lane_count), maskTrueCount(@splat(true)));
-    const mixed: Mask4 = .{ true, false, true, false };
-    try std.testing.expectEqual(@as(usize, 2), maskTrueCount(mixed));
 }
 
 test "sin and cos match scalar builtins per lane" {
