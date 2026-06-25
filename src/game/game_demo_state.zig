@@ -62,9 +62,10 @@ const obstacle_count = 2;
 const collision_sfx_cooldown_capacity = 32;
 const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_contact_capacity = 64;
-// Upper bound on nav-invalidating world events the post-commit reaction maps into
-// dirty nav cell edits in one step. Matches the simulation event capacity reserved
-// in `initWithWorld`.
+// Soft cap on dirty nav cells buffered per step. A single obstacle rect expands to
+// (w*h) cell edits and can exceed this; overflow is dropped on purpose because
+// applyNavUpdates remasks the whole affected level, so the buffer only needs to flag
+// which levels/chunks changed, not enumerate every cell.
 const nav_dirty_edit_capacity = 16;
 const demo_music = AudioAssetId.demo_music;
 const collision_sfx = AudioAssetId.collision_sfx;
@@ -259,9 +260,8 @@ pub const GameDemoState = struct {
         };
         state.syncCameraToPlayer();
         try state.ensureDynamicRenderCapacity();
-        // Reserve the dirty-edit scratch to the event capacity (the upper bound on
-        // nav-invalidating world events the post-commit reaction can observe in one
-        // step), keeping incremental nav updates allocation-free on the steady path.
+        // Reserve the dirty-cell scratch once so buffering stays allocation-free on
+        // the steady path; see nav_dirty_edit_capacity for the soft-cap/overflow rule.
         try state.nav_dirty_edits.ensureTotalCapacity(allocator, nav_dirty_edit_capacity);
         return state;
     }

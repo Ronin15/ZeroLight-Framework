@@ -579,7 +579,7 @@ pub const WorldSystem = struct {
         const cell = self.sparse_cell_indices.items[index];
         return .{
             .x = @intCast(cell % self.width),
-            .y = @intCast((cell / self.width) % self.height),
+            .y = @intCast(cell / self.width),
         };
     }
 
@@ -637,7 +637,7 @@ pub const WorldSystem = struct {
         if (index >= self.sparse_cell_indices.items.len) return null;
         const cell = self.sparse_cell_indices.items[index];
         const x: u16 = @intCast(cell % self.width);
-        const y: u16 = @intCast((cell / self.width) % self.height);
+        const y: u16 = @intCast(cell / self.width);
         return self.cellRect(x, y);
     }
 
@@ -767,7 +767,7 @@ pub const WorldSystem = struct {
             if (!self.cellInVisibleBounds(cell, bounds)) continue;
             const tile_id = self.sparse_tile_ids.items[index];
             const x: u16 = @intCast(cell % self.width);
-            const y: u16 = @intCast((cell / self.width) % self.height);
+            const y: u16 = @intCast(cell / self.width);
             try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth), stats);
         }
     }
@@ -1027,7 +1027,7 @@ pub const WorldSystem = struct {
 
     fn cellInVisibleBounds(self: *const WorldSystem, cell: u32, bounds: VisibleTileBounds) bool {
         const x: u16 = @intCast(cell % self.width);
-        const y: u16 = @intCast((cell / self.width) % self.height);
+        const y: u16 = @intCast(cell / self.width);
         return x >= bounds.min_x and x < bounds.max_x_exclusive and
             y >= bounds.min_y and y < bounds.max_y_exclusive;
     }

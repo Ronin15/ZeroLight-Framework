@@ -694,10 +694,15 @@ const NavGraph = struct {
         chunk_tiles: u16,
         memory_budget: NavMemoryBudget,
     ) !void {
-        self.cell_size = cell_size;
+        // A 0/negative/non-finite cell_size or bound would make @intFromFloat see
+        // inf/NaN (illegal behavior); degenerate config collapses to a 1x1 grid.
+        const safe_cell_size = if (std.math.isFinite(cell_size) and cell_size > 0) cell_size else 1.0;
+        const safe_w: f32 = if (std.math.isFinite(bounds_width) and bounds_width > 0) bounds_width else 0;
+        const safe_h: f32 = if (std.math.isFinite(bounds_height) and bounds_height > 0) bounds_height else 0;
+        self.cell_size = safe_cell_size;
         self.chunk_tiles = @max(@as(u16, 1), chunk_tiles);
-        self.width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(bounds_width / cell_size))));
-        self.height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(bounds_height / cell_size))));
+        self.width = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_w / safe_cell_size))));
+        self.height = @max(@as(usize, 1), @as(usize, @intFromFloat(@ceil(safe_h / safe_cell_size))));
 
         // Fail loud at build instead of degrading at query time.
         try memory_budget.check(self.width, self.height);
@@ -719,7 +724,7 @@ const NavGraph = struct {
 
         for (self.levels.items, 0..) |*level_grid, level_index| {
             const level: u16 = @intCast(level_index);
-            try level_grid.prepare(self.allocator, level, self.width, self.height, cell_size, self.version);
+            try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.version);
             // Only level 0 sources DataSystem collision bodies; the demo's
             // entities live on the ground floor. World mask drives every level.
             if (level == 0) level_grid.markStaticBodies(data);
@@ -860,6 +865,9 @@ const NavGraph = struct {
 
         const cell_count = self.cellCount();
         const total = cell_count * self.levels.items.len;
+        // Cell indices are stored as u32 with no_cell as the sentinel; the
+        // NavMemoryBudget gate enforces this long before the cap is reachable.
+        std.debug.assert(total < no_cell);
         try self.cell_to_portal.ensureTotalCapacity(self.allocator, total);
         self.cell_to_portal.items.len = total;
         @memset(self.cell_to_portal.items, no_cell);
@@ -1262,7 +1270,9 @@ const NavMemoryBudget = struct {
         const group_registry_bytes = self.max_group_fields *| cell_count *| self.group_field_bytes_per_cell;
         // Per-worker A* scratch is direct per-cell arrays, so each slot is O(cells),
         // not O(node budget). The gate counts it so an over-provisioned slot count on a
-        // large world fails loud here rather than degrading at query time.
+        // large world fails loud here rather than degrading at query time. Kept
+        // conservative (slot cap, not participant count) so the gate never under-budgets;
+        // actual resident scratch is now bounded by participant count (ensureWorkerScratch).
         const scratch_bytes = self.max_worker_scratch_slots *| cell_count *| scratch_slot_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
@@ -2044,6 +2054,10 @@ pub const PathfindingSystem = struct {
     // Requested group goal keys this step (declared, never detected).
     group_requests: std.ArrayList(GroupRequestTally) = .empty,
     scratch_slots: std.ArrayList(SearchScratch) = .empty,
+    // Grid cell count the per-cell scratch arrays are sized against. Only slots that
+    // will actually be indexed get O(cells) arrays (sized lazily by participant count
+    // in the threaded path); the rest stay empty until used.
+    scratch_cell_count: usize = 0,
     // Per-worker reconstructed paths, written into completed by the main thread
     // after the worker batch finishes.
     solved_paths: std.ArrayList(SolvedPath) = .empty,
@@ -2185,8 +2199,14 @@ pub const PathfindingSystem = struct {
         for (self.group_fields.items) |*field| {
             try field.reserve(self.allocator, cell_count);
         }
-        for (self.scratch_slots.items) |*scratch| {
-            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
+        // Per-cell A* scratch is O(cells) per slot, but only participant-count slots
+        // (~workers+1) are ever indexed. Size slot 0 here (the serial updateSerial
+        // path) and defer the rest to ensureWorkerScratch, called from the threaded
+        // update once the participant count is known — so resident scratch is bounded
+        // by participants, not the slot cap.
+        self.scratch_cell_count = cell_count;
+        if (self.scratch_slots.items.len != 0) {
+            try self.scratch_slots.items[0].reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
         }
         // Pre-reserve the per-level affected-flag scratch so a steady-path
         // applyNavUpdates allocates nothing per edit.
@@ -2332,6 +2352,21 @@ pub const PathfindingSystem = struct {
         return .{ .status = .missing };
     }
 
+    // Lazily sizes the per-cell A* scratch arrays for slots [0, slot_count) to the
+    // current grid cell count. Idempotent: a slot already sized for this cell count is
+    // skipped, so this is a no-op after the first post-rebuild frame, preserving the
+    // allocation-free-after-warmup contract. Called from the single-threaded point in
+    // the threaded update before dispatch (allocation is safe there).
+    fn ensureWorkerScratch(self: *PathfindingSystem, slot_count: usize) !void {
+        const limit = @min(slot_count, self.scratch_slots.items.len);
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            const scratch = &self.scratch_slots.items[i];
+            if (scratch.cell_count == self.scratch_cell_count) continue;
+            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, self.scratch_cell_count);
+        }
+    }
+
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         self.step_counter +%= 1;
         var accept_timer = PhaseTimer.begin();
@@ -2357,6 +2392,9 @@ pub const PathfindingSystem = struct {
             }
             const participants = thread_system.participantSlotCount();
             if (participants > self.scratch_slots.items.len) return error.PathfindingScratchCapacityExceeded;
+            // Single-threaded point: size per-cell scratch for the slots this batch
+            // will actually index (no-op after the first post-rebuild frame).
+            try self.ensureWorkerScratch(participants);
             self.resetSolvedPaths();
             var context = SolveJobContext{ .system = self };
             stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
@@ -2433,8 +2471,14 @@ pub const PathfindingSystem = struct {
     // can be (re)built lazily; they still get a per-agent fallback while building.
     fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest) PathfindingStats {
         var stats = PathfindingStats{};
+        // Cross-step decaying accumulation: halve every carried tally before this
+        // step's requests fold in, so a SUSTAINED shared goal accumulates toward the
+        // threshold (~2x per-step intake at equilibrium) while a transient burst
+        // decays back to zero. Runs every step (even with no requests) so a crowd
+        // that stops requesting decays away. Zero-count tallies are compacted after
+        // threshold-service in serviceGroupFields.
+        for (self.group_requests.items) |*tally| tally.count /= 2;
         if (requests.len == 0 or !self.graph.valid()) return stats;
-        self.group_requests.clearRetainingCapacity();
         self.prepareRequestKeys(requests, &stats);
         for (self.prepared_requests.items) |prepared| {
             if (prepared.kind == .group) {
@@ -2519,6 +2563,12 @@ pub const PathfindingSystem = struct {
 
     // Builds/advances managed shared-goal flow fields for declared group goals.
     // Lazy on first request, throttled on goal-cell change, budgeted per frame.
+    // The min_group_field_agents threshold is checked against the cross-step
+    // accumulator (acceptRequests), so it reflects SUSTAINED shared-goal demand
+    // (~2x per-step intake at equilibrium), not a single-step burst. Raising
+    // min_group_field_agents for scale also requires raising the per-step request
+    // budget (max_frame_requests / max_solved_requests_per_step) so the accumulator
+    // can actually reach the threshold.
     fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
         if (!self.graph.valid()) return;
         // Advance any field still building, on its own goal level.
@@ -2531,13 +2581,23 @@ pub const PathfindingSystem = struct {
             }
         }
         for (self.group_requests.items) |tally| {
-            // Only build/maintain a shared flow field once enough agents declare the
-            // same goal to amortize its O(cells) build. Smaller groups already took
-            // an individual A* solve during acceptance, so a handful of agents never
-            // pay the flow-field cost — pathfinding stays cheap at low agent counts
-            // and the field engages only at crowd scale.
+            // Only build/maintain a shared flow field once sustained demand for the
+            // same goal amortizes its O(cells) build. Smaller groups already took an
+            // individual A* solve during acceptance, so a handful of agents never pay
+            // the flow-field cost — pathfinding stays cheap at low agent counts and
+            // the field engages only at crowd scale.
             if (tally.count < self.capacity.min_group_field_agents) continue;
             self.ensureGroupField(tally.key, stats);
+        }
+        // Compact out tallies that decayed to zero this step (they received no new
+        // request to keep them alive), so a transient crowd releases its slot.
+        var i: usize = 0;
+        while (i < self.group_requests.items.len) {
+            if (self.group_requests.items[i].count == 0) {
+                _ = self.group_requests.swapRemove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -3717,6 +3777,96 @@ test "pathfinding group field reuses within a nav cell and throttles cross-cell 
     // throttle bounds rebuilds well below the step count.
     try std.testing.expect(rebuild_count >= 1);
     try std.testing.expect(rebuild_count <= steps / capacity.group_field_rebuild_min_steps + 2);
+}
+
+test "pathfinding group field latches via cross-step accumulation when intake is staggered" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    // Threshold of 3, but only 2 same-goal requests arrive per step (below the
+    // threshold per step). The decaying accumulator equilibrates near ~2x intake,
+    // so sustained demand crosses the threshold within a couple of steps.
+    var capacity = baselineCapacity();
+    capacity.min_group_field_agents = 3;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    const goal = math.Vec2{ .x = 200, .y = 200 };
+    var built: usize = 0;
+    for (0..4) |_| {
+        var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.reserve(2, 2);
+        try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+        try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+        const stats = try system.updateSerial(&stream, .{});
+        built += stats.group_fields_built;
+    }
+    // No single step ever delivered the threshold count, yet accumulation latched.
+    try std.testing.expect(built >= 1);
+    var ready: usize = 0;
+    for (system.group_fields.items) |field| {
+        if (field.state == .ready) ready += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ready);
+}
+
+test "pathfinding sub-threshold transient crowd decays back to no group field" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    // Threshold of 4: a single 2-agent burst never reaches it and then stops, so
+    // the accumulator decays back to zero and the tally is compacted out.
+    var capacity = baselineCapacity();
+    capacity.min_group_field_agents = 4;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    const goal = math.Vec2{ .x = 200, .y = 200 };
+    var burst = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer burst.deinit();
+    try burst.reserve(2, 2);
+    try appendPathRequest(&burst, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+    try appendPathRequest(&burst, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+    const burst_stats = try system.updateSerial(&burst, .{});
+    try std.testing.expectEqual(@as(usize, 0), burst_stats.group_fields_built);
+
+    // No further group requests: the carried tally halves to zero and compacts away,
+    // and no field is ever built.
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    for (0..3) |_| {
+        const stats = try system.updateSerial(&empty, .{});
+        try std.testing.expectEqual(@as(usize, 0), stats.group_fields_built);
+    }
+    try std.testing.expectEqual(@as(usize, 0), system.group_requests.items.len);
+    for (system.group_fields.items) |field| {
+        try std.testing.expectEqual(GroupFieldState.empty, field.state);
+    }
+}
+
+test "pathfinding nav grid survives degenerate cell size and bounds" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, true);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+
+    // cell_size 0 and a non-finite bound would feed inf/NaN into @intFromFloat;
+    // the guard collapses to at least a 1x1 grid instead of crashing.
+    try system.rebuildStaticNavGrid(&data, std.math.inf(f32), 256, 0);
+    try std.testing.expect(system.graph.width >= 1);
+    try std.testing.expect(system.graph.height >= 1);
 }
 
 test "pathfinding group field within the same nav cell reuses without rebuilding" {
