@@ -476,7 +476,7 @@ pub const SteeringSystem = struct {
             const runtime = try self.runtimeRowForSelected(selected);
             const goal_distance = distance(start, selected.intent.goal);
             const path_dir = self.directionFromPathStatus(pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
-            const direct_dir = normalizeOrZero(selected.intent.direct_direction_x, selected.intent.direct_direction_y);
+            const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
             const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
 
             self.updateProgress(selected, runtime, goal_distance, steering_agent, path_dir.status_allows_replan, stats, &request_count);
@@ -589,10 +589,10 @@ pub const SteeringSystem = struct {
                     .x = view.next_waypoint.x - start.x,
                     .y = view.next_waypoint.y - start.y,
                 };
-                if (lengthSquared(to_waypoint) <= steering_agent.waypoint_tolerance * steering_agent.waypoint_tolerance) {
-                    return .{ .has_direction = true, .direction = normalizeOrZero(selected.intent.goal.x - start.x, selected.intent.goal.y - start.y), .status_allows_replan = true };
+                if (math.lengthSquared(to_waypoint) <= steering_agent.waypoint_tolerance * steering_agent.waypoint_tolerance) {
+                    return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(selected.intent.goal.x - start.x, selected.intent.goal.y - start.y, 0.0001), .status_allows_replan = true };
                 }
-                return .{ .has_direction = true, .direction = normalizeOrZero(to_waypoint.x, to_waypoint.y), .status_allows_replan = true };
+                return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(to_waypoint.x, to_waypoint.y, 0.0001), .status_allows_replan = true };
             },
             .missing => {
                 if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
@@ -879,7 +879,7 @@ fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResul
     }
 
     return .{
-        .direction = normalizeOrZero(ax, ay),
+        .direction = math.normalizeOrZeroFinite(ax, ay, 0.0001),
         .agent_samples = sample_count,
         .obstacle_samples = obstacle_count,
         .agent_candidate_checks = agent_candidate_count,
@@ -904,8 +904,8 @@ fn accumulateObstacleSample(
     const min_y = job.obstacle_min_y[obstacle_index];
     const max_x = job.obstacle_max_x[obstacle_index];
     const max_y = job.obstacle_max_y[obstacle_index];
-    const closest_x = clamp(start_x, min_x, max_x);
-    const closest_y = clamp(start_y, min_y, max_y);
+    const closest_x = math.clampMinMax(start_x, min_x, max_x);
+    const closest_y = math.clampMinMax(start_y, min_y, max_y);
     var dx = start_x - closest_x;
     var dy = start_y - closest_y;
     if (dx == 0 and dy == 0) {
@@ -1143,24 +1143,8 @@ fn spatialCell(value: f32, cell_size: f32) i32 {
     return math.floorToI32(value / @max(cell_size, min_spatial_cell_size));
 }
 
-fn normalizeOrZero(dx: f32, dy: f32) math.Vec2 {
-    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{};
-    const len2 = dx * dx + dy * dy;
-    if (!std.math.isFinite(len2) or len2 <= 0.0001) return .{};
-    const inv_len = 1.0 / @sqrt(len2);
-    return .{ .x = dx * inv_len, .y = dy * inv_len };
-}
-
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
     return @sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
-}
-
-fn lengthSquared(v: math.Vec2) f32 {
-    return v.x * v.x + v.y * v.y;
-}
-
-fn clamp(value: f32, min_value: f32, max_value: f32) f32 {
-    return @min(@max(value, min_value), max_value);
 }
 
 fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {

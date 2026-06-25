@@ -50,6 +50,38 @@ pub fn normalizeOrZero(v: Vec2, epsilon: f32) Vec2 {
     return .{ .x = v.x * inv, .y = v.y * inv };
 }
 
+/// Two-scalar normalize-or-zero with full non-finite guards: returns a zero
+/// vector when either input, the squared length, or the result is non-finite,
+/// or when the squared length is at or below `epsilon`. Used by gameplay
+/// processors whose inputs can overflow to non-finite intermediates.
+pub fn normalizeOrZeroFinite(dx: f32, dy: f32, epsilon: f32) Vec2 {
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{};
+    const len2 = dx * dx + dy * dy;
+    if (!std.math.isFinite(len2) or len2 <= epsilon) return .{};
+    const inv = 1.0 / @sqrt(len2);
+    return .{ .x = dx * inv, .y = dy * inv };
+}
+
+/// Like `normalizeOrZeroFinite` but returns `default` on any degenerate or
+/// non-finite case, including a post-normalize finite recheck of the result.
+pub fn normalizeOrDefaultFinite(dx: f32, dy: f32, epsilon: f32, default: Vec2) Vec2 {
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return default;
+    const len2 = dx * dx + dy * dy;
+    if (!std.math.isFinite(len2) or len2 <= epsilon) return default;
+    const inv = 1.0 / @sqrt(len2);
+    const nx = dx * inv;
+    const ny = dy * inv;
+    if (!std.math.isFinite(nx) or !std.math.isFinite(ny)) return default;
+    return .{ .x = nx, .y = ny };
+}
+
+/// Clamp using `@min(@max(...))`. Differs from `clamp` only in NaN handling: a
+/// NaN `value` yields a bound rather than propagating NaN. Scalar counterpart
+/// of `simd.clampFloat4`.
+pub fn clampMinMax(value: f32, min: f32, max: f32) f32 {
+    return @min(@max(value, min), max);
+}
+
 test "clamp keeps values inside bounds" {
     try std.testing.expectEqual(@as(f32, 0), clamp(-4, 0, 10));
     try std.testing.expectEqual(@as(f32, 5), clamp(5, 0, 10));
@@ -86,4 +118,49 @@ test "normalizeOrZero normalizes and zeroes short vectors" {
     const zeroed = normalizeOrZero(.{ .x = 0, .y = 0 }, 1.0e-12);
     try std.testing.expectEqual(@as(f32, 0), zeroed.x);
     try std.testing.expectEqual(@as(f32, 0), zeroed.y);
+}
+
+test "normalizeOrZeroFinite matches SIMD normalize lane-for-lane on finite vectors" {
+    const simd = @import("simd.zig");
+    const epsilon: f32 = 1.0e-3;
+    const cases = [_][2]f32{ .{ 3, 4 }, .{ -5, 12 }, .{ 0.001, 0 }, .{ 0, 0 } };
+    for (cases) |case| {
+        const scalar = normalizeOrZeroFinite(case[0], case[1], epsilon);
+        const vector = simd.normalizeOrZero2Float4(simd.splatFloat4(case[0]), simd.splatFloat4(case[1]), epsilon);
+        try std.testing.expectApproxEqAbs(scalar.x, vector.x[0], 1.0e-6);
+        try std.testing.expectApproxEqAbs(scalar.y, vector.y[0], 1.0e-6);
+    }
+}
+
+test "normalizeOrZeroFinite zeroes non-finite inputs" {
+    const overflow = normalizeOrZeroFinite(std.math.floatMax(f32), std.math.floatMax(f32), 1.0e-4);
+    try std.testing.expectEqual(@as(f32, 0), overflow.x);
+    try std.testing.expectEqual(@as(f32, 0), overflow.y);
+
+    const infinite = normalizeOrZeroFinite(std.math.inf(f32), 1, 1.0e-4);
+    try std.testing.expectEqual(@as(f32, 0), infinite.x);
+    try std.testing.expectEqual(@as(f32, 0), infinite.y);
+}
+
+test "normalizeOrDefaultFinite falls back on degenerate inputs" {
+    const default = Vec2{ .x = 1, .y = 0 };
+    const normalized = normalizeOrDefaultFinite(3, 4, 1.0e-4, default);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), normalized.x, 1.0e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), normalized.y, 1.0e-4);
+
+    try std.testing.expectEqual(default, normalizeOrDefaultFinite(0, 0, 1.0e-4, default));
+    try std.testing.expectEqual(default, normalizeOrDefaultFinite(std.math.inf(f32), 0, 1.0e-4, default));
+    try std.testing.expectEqual(default, normalizeOrDefaultFinite(std.math.floatMax(f32), std.math.floatMax(f32), 1.0e-4, default));
+}
+
+test "clampMinMax matches SIMD clamp and tolerates NaN" {
+    const simd = @import("simd.zig");
+    try std.testing.expectEqual(@as(f32, 0), clampMinMax(-4, 0, 10));
+    try std.testing.expectEqual(@as(f32, 10), clampMinMax(20, 0, 10));
+
+    const scalar = clampMinMax(7, 0, 10);
+    const vector = simd.clampFloat4(simd.splatFloat4(7), simd.splatFloat4(0), simd.splatFloat4(10));
+    try std.testing.expectEqual(scalar, vector[0]);
+
+    try std.testing.expect(!std.math.isNan(clampMinMax(std.math.nan(f32), 0, 10)));
 }

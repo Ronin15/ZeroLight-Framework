@@ -666,9 +666,9 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
         const b_center_x = (b_min_x + b_max_x) * simd.splatFloat4(0.5);
         const a_center_y = (a_min_y + a_max_y) * simd.splatFloat4(0.5);
         const b_center_y = (b_min_y + b_max_y) * simd.splatFloat4(0.5);
-        const normal_x = @select(f32, use_x_axis, @select(f32, a_center_x <= b_center_x, negative_one, one), zero);
-        const normal_y = @select(f32, use_x_axis, zero, @select(f32, a_center_y <= b_center_y, negative_one, one));
-        const penetration = @select(f32, use_x_axis, overlap_x, overlap_y);
+        const normal_x = simd.selectFloat4(use_x_axis, simd.selectFloat4(a_center_x <= b_center_x, negative_one, one), zero);
+        const normal_y = simd.selectFloat4(use_x_axis, zero, simd.selectFloat4(a_center_y <= b_center_y, negative_one, one));
+        const penetration = simd.selectFloat4(use_x_axis, overlap_x, overlap_y);
 
         inline for (0..simd.lane_count) |lane| {
             if (valid[lane]) {

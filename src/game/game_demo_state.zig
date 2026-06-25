@@ -901,11 +901,18 @@ pub const GameDemoState = struct {
 
     fn collisionSfxFrequencyRatio(contact: CollisionContact) f32 {
         var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
-        hash ^= @as(u64, @intFromFloat(@abs(contact.normal_x) * 31.0));
-        hash ^= @as(u64, @intFromFloat(@abs(contact.normal_y) * 47.0)) << 8;
-        hash ^= @as(u64, @intFromFloat(std.math.clamp(contact.penetration, 0, 64) * 16.0)) << 16;
+        hash ^= hashBitsFromFloat(@abs(contact.normal_x) * 31.0);
+        hash ^= hashBitsFromFloat(@abs(contact.normal_y) * 47.0) << 8;
+        hash ^= hashBitsFromFloat(std.math.clamp(contact.penetration, 0, 64) * 16.0) << 16;
         const bucket: f32 = @floatFromInt(hash % 9);
         return 0.92 + bucket * 0.02;
+    }
+
+    /// Truncates a non-negative magnitude to integer hash bits, guarding
+    /// `@intFromFloat` against non-finite contact normals (illegal behavior).
+    fn hashBitsFromFloat(value: f32) u64 {
+        if (!std.math.isFinite(value) or value <= 0) return 0;
+        return @intFromFloat(@min(value, 16_777_216.0));
     }
 };
 

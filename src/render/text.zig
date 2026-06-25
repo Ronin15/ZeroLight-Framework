@@ -11,11 +11,10 @@ const std = @import("std");
 const assets = @import("../assets/assets.zig");
 const config = @import("../config.zig");
 const log = @import("../core/logging.zig").render;
-const renderer_file = @import("renderer.zig");
-const CoordinateSpace = renderer_file.CoordinateSpace;
-const RenderOrder = renderer_file.RenderOrder;
-const Rect = renderer_file.Rect;
-const Renderer = renderer_file.Renderer;
+const CoordinateSpace = @import("renderer.zig").CoordinateSpace;
+const RenderOrder = @import("renderer.zig").RenderOrder;
+const Rect = @import("renderer.zig").Rect;
+const Renderer = @import("renderer.zig").Renderer;
 const TextureId = @import("resources.zig").TextureId;
 const c = @import("../platform/sdl.zig").c;
 

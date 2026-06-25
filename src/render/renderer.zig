@@ -157,6 +157,9 @@ pub const Renderer = struct {
         try self.batch.drawSprite(sprite);
     }
 
+    /// Grows batch storage to hold `command_capacity` ordered sprite commands.
+    /// Setup-time and grow-only (never shrinks); call before relying on
+    /// allocation-free render frames.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
         const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
         try self.reserveBatchStorage(command_capacity, vertex_capacity, command_capacity);
@@ -205,29 +208,27 @@ pub const Renderer = struct {
         };
     }
 
-    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
-        try self.ensureFrameBatchCapacity();
-        const window_size = try self.currentWindowSize();
-        const pre_acquire_drawable_size = self.currentDrawableSize() catch |err| switch (err) {
-            error.InvalidDrawableSize => return .skipped_no_swapchain,
-            else => return err,
-        };
-        _ = self.updatePresentation(window_size, pre_acquire_drawable_size);
-        // Sorting, texture metadata snapshots, and optional worker vertex prep
-        // happen before acquiring the swapchain to keep the acquired window short.
-        try self.prepareFrameCommands(thread_system);
-        if (self.batch.vertices.items.len > 0) {
-            try self.stageVertices();
-        }
+    const AcquiredFrame = struct {
+        command_buffer: *c.SDL_GPUCommandBuffer,
+        swapchain_texture: *c.SDL_GPUTexture,
+        width: u32,
+        height: u32,
+    };
 
+    /// Acquires a command buffer and swapchain texture, handling the
+    /// no-swapchain and zero-size cases internally (canceling, or submitting an
+    /// empty frame). Returns null when the frame should be skipped; on success
+    /// the caller owns `command_buffer` and records into it — post-acquisition
+    /// error paths are explicit (`finishAcquiredCommandBufferAfterError`), so no
+    /// errdefer crosses back to the caller. `recovery` only tunes the log text.
+    fn acquireSwapchainFrame(self: *Renderer, recovery: bool) !?AcquiredFrame {
         const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
             return sdlError("SDL_AcquireGPUCommandBuffer");
         };
         var command_buffer_finished = false;
         var swapchain_acquired = false;
         // Before a swapchain texture is acquired, canceling the command buffer is
-        // enough cleanup. After acquisition, error paths submit or cancel through
-        // helpers that release the acquired texture correctly.
+        // enough cleanup.
         errdefer if (!command_buffer_finished and !swapchain_acquired) {
             _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
         };
@@ -242,28 +243,61 @@ pub const Renderer = struct {
         if (swapchainUnavailable(swapchain_texture)) {
             _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
             command_buffer_finished = true;
-            return .skipped_no_swapchain;
+            return null;
         }
         const acquired_swapchain_texture = swapchain_texture.?;
         swapchain_acquired = true;
 
         if (width == 0 or height == 0) {
-            log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
+            if (recovery) {
+                log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{} during recovery; submitting empty frame", .{ width, height });
+            } else {
+                log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{}; submitting empty frame", .{ width, height });
+            }
             if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
                 command_buffer_finished = true;
                 return sdlError("SDL_SubmitGPUCommandBuffer");
             }
             command_buffer_finished = true;
-            return .skipped_no_swapchain;
+            return null;
         }
 
         self.viewport_width = width;
         self.viewport_height = height;
-        const acquired_drawable_size = resolution.DrawableSize{
+        return AcquiredFrame{
+            .command_buffer = command_buffer,
+            .swapchain_texture = acquired_swapchain_texture,
             .width = width,
             .height = height,
         };
-        const presentation = self.updatePresentation(window_size, acquired_drawable_size);
+    }
+
+    pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
+        try self.ensureFrameBatchCapacity();
+        const window_size = try self.currentWindowSize();
+        const pre_acquire_drawable_size = self.currentDrawableSize() catch |err| switch (err) {
+            error.InvalidDrawableSize => return .skipped_no_swapchain,
+            else => return err,
+        };
+        _ = self.updatePresentation(window_size, pre_acquire_drawable_size);
+        // Sorting, texture metadata snapshots, and optional worker vertex prep
+        // happen before acquiring the swapchain to keep the acquired window short.
+        try self.prepareFrameCommands(thread_system);
+        // Staging before swapchain acquisition is safe across frames in flight
+        // only because the transfer buffer is mapped with cycle=true (see
+        // gpu/buffer.zig): the map rotates to fresh backing storage rather than
+        // overwriting bytes a prior frame's copy pass may still reference.
+        if (self.batch.vertices.items.len > 0) {
+            try self.stageVertices();
+        }
+
+        const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
+        const command_buffer = frame.command_buffer;
+        const acquired_swapchain_texture = frame.swapchain_texture;
+        const presentation = self.updatePresentation(window_size, .{
+            .width = frame.width,
+            .height = frame.height,
+        });
 
         if (self.batch.vertices.items.len > 0) {
             self.recordVertexUpload(command_buffer) catch {
@@ -315,59 +349,23 @@ pub const Renderer = struct {
         c.SDL_EndGPURenderPass(render_pass);
 
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
-            command_buffer_finished = true;
             return sdlError("SDL_SubmitGPUCommandBuffer");
         }
-        command_buffer_finished = true;
         return .submitted;
     }
 
     pub fn submitSwapchainRecoveryFrame(self: *Renderer, clear_color: config.Color) !FrameResult {
         self.clear_color = clear_color;
         const window_size = try self.currentWindowSize();
-        const command_buffer = c.SDL_AcquireGPUCommandBuffer(self.device) orelse {
-            return sdlError("SDL_AcquireGPUCommandBuffer");
-        };
-        var command_buffer_finished = false;
-        var swapchain_acquired = false;
-        errdefer if (!command_buffer_finished and !swapchain_acquired) {
-            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-        };
-
-        var swapchain_texture: ?*c.SDL_GPUTexture = null;
-        var width: u32 = 0;
-        var height: u32 = 0;
-        if (!c.SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, self.window, &swapchain_texture, &width, &height)) {
-            return sdlError("SDL_WaitAndAcquireGPUSwapchainTexture");
-        }
-
-        if (swapchainUnavailable(swapchain_texture)) {
-            _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-            command_buffer_finished = true;
-            return .skipped_no_swapchain;
-        }
-        const acquired_swapchain_texture = swapchain_texture.?;
-        swapchain_acquired = true;
-
-        if (width == 0 or height == 0) {
-            log.warn("acquired SDL_GPU swapchain texture with invalid size {}x{} during recovery; submitting empty frame", .{ width, height });
-            if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
-                command_buffer_finished = true;
-                return sdlError("SDL_SubmitGPUCommandBuffer");
-            }
-            command_buffer_finished = true;
-            return .skipped_no_swapchain;
-        }
-
-        self.viewport_width = width;
-        self.viewport_height = height;
+        const frame = try self.acquireSwapchainFrame(true) orelse return .skipped_no_swapchain;
+        const command_buffer = frame.command_buffer;
         _ = self.updatePresentation(window_size, .{
-            .width = width,
-            .height = height,
+            .width = frame.width,
+            .height = frame.height,
         });
 
         var color_target = std.mem.zeroes(c.SDL_GPUColorTargetInfo);
-        color_target.texture = acquired_swapchain_texture;
+        color_target.texture = frame.swapchain_texture;
         color_target.clear_color = .{
             .r = clear_color.r,
             .g = clear_color.g,
@@ -383,10 +381,8 @@ pub const Renderer = struct {
         c.SDL_EndGPURenderPass(render_pass);
 
         if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
-            command_buffer_finished = true;
             return sdlError("SDL_SubmitGPUCommandBuffer");
         }
-        command_buffer_finished = true;
         return .submitted;
     }
 
@@ -423,6 +419,11 @@ pub const Renderer = struct {
         window_size: resolution.WindowSize,
         drawable_size: resolution.DrawableSize,
     ) resolution.Presentation {
+        // computePresentation only fails on a zero window, drawable, or logical
+        // size. All three are validated non-zero before reaching here: window and
+        // drawable sizes by the callers (currentWindowSize/currentDrawableSize and
+        // the post-acquire zero check), and resolution_policy.logical_size at
+        // startup via AppConfig.validate. The failure path is unreachable.
         const presentation = resolution.computePresentation(
             self.resolution_policy,
             window_size,

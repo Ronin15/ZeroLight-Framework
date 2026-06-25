@@ -87,7 +87,9 @@ pub fn divFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs / rhs;
 }
 
-/// Integer division uses Zig's trunc-toward-zero semantics.
+/// Integer division uses Zig's trunc-toward-zero semantics. Lowered lane-by-lane
+/// because Zig has no portable vector signed trunc-divide; do not fold into a
+/// single vector `/` (that would be illegal behavior on signed operands).
 pub fn divInt4(lhs: Int4, rhs: Int4) Int4 {
     return .{
         @divTrunc(lhs[0], rhs[0]),
@@ -205,6 +207,11 @@ pub fn gatherInt4(values: []const i32, indices: [lane_count]usize) Int4 {
 /// Scatters lane values back to `values` at the given indices. Indices must be
 /// distinct; overlapping targets make the result order-dependent.
 pub fn scatterFloat4(values: []f32, indices: [lane_count]usize, vector: Float4) void {
+    inline for (0..lane_count) |i| {
+        inline for (i + 1..lane_count) |j| {
+            std.debug.assert(indices[i] != indices[j]);
+        }
+    }
     inline for (0..lane_count) |lane| {
         values[indices[lane]] = vector[lane];
     }

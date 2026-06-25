@@ -462,7 +462,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={} events total={} dropped={} created={} destroyed={} component_changed={} nav_invalidated={} structural_stage={} domain_stage={}",
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
                 self.metricValue(.ai_entities),
@@ -487,11 +487,19 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.structural_destroyed),
                 self.metricValue(.structural_components_set),
                 self.metricValue(.structural_stale_skipped),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} structural_stage={} domain_stage={}",
+            .{
+                elapsed_s,
                 self.metricValue(.simulation_events_total),
                 self.metricValue(.simulation_events_dropped),
                 self.metricValue(.simulation_events_entity_created),
                 self.metricValue(.simulation_events_entity_destroyed),
                 self.metricValue(.simulation_events_component_changed),
+                self.metricValue(.simulation_events_world_tile_changed),
+                self.metricValue(.simulation_events_world_obstacle_changed),
                 self.metricValue(.simulation_events_nav_region_invalidated),
                 self.metricValue(.simulation_events_structural_commit_stage),
                 self.metricValue(.simulation_events_domain_reaction_stage),

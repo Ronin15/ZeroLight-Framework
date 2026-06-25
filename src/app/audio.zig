@@ -420,7 +420,7 @@ pub const AudioService = struct {
         }
 
         const audio = try self.audioHandle(request.asset, .sfx) orelse return;
-        const slot_index = try self.selectLoopingSfxTrack(request.priority) orelse return;
+        const slot_index = try self.selectSfxTrack(request.priority) orelse return;
         const slot = &self.sfx_tracks.items[slot_index];
         try self.backend.stop_track(self.backend_context, slot.handle, 0);
         try self.backend.set_track_audio(self.backend_context, slot.handle, audio);
@@ -499,24 +499,9 @@ pub const AudioService = struct {
         return self.active_music_gain * self.music_gain * pause_gain;
     }
 
+    /// Picks a free non-looping SFX slot, or the lowest-priority stealable one
+    /// when `priority` outranks it. Shared by one-shot and looping playback.
     fn selectSfxTrack(self: *AudioService, priority: u8) !?usize {
-        var steal_index: ?usize = null;
-        for (self.sfx_tracks.items, 0..) |*slot, index| {
-            if (slot.looping_id != null) continue;
-            if (!try self.backend.track_playing(self.backend_context, slot.handle)) {
-                slot.priority = 0;
-                return index;
-            }
-            if (steal_index == null or lowerPriority(slot.*, self.sfx_tracks.items[steal_index.?])) {
-                steal_index = index;
-            }
-        }
-        const index = steal_index orelse return null;
-        if (priority < self.sfx_tracks.items[index].priority) return null;
-        return index;
-    }
-
-    fn selectLoopingSfxTrack(self: *AudioService, priority: u8) !?usize {
         var steal_index: ?usize = null;
         for (self.sfx_tracks.items, 0..) |*slot, index| {
             if (slot.looping_id != null) continue;

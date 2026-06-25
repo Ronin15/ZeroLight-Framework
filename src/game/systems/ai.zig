@@ -590,7 +590,8 @@ fn decideDir(
         dx += w.x * wander_strength;
         dy += w.y * wander_strength;
     }
-    return normalizeOrDefault(dx, dy);
+    const normalized = math.normalizeOrDefaultFinite(dx, dy, 0.0001, .{ .x = 1, .y = 0 });
+    return .{ .x = normalized.x, .y = normalized.y };
 }
 
 /// Shared post-decide blend + normalize for separation contribution (precomputed on main).
@@ -604,7 +605,8 @@ fn applySeparationAndNormalize(base: AiDir, sx: f32, sy: f32) AiDir {
         dx = dx * 0.55 + sx * sep_strength * 0.45;
         dy = dy * 0.55 + sy * sep_strength * 0.45;
     }
-    return normalizeOrDefault(dx, dy);
+    const normalized = math.normalizeOrDefaultFinite(dx, dy, 0.0001, .{ .x = 1, .y = 0 });
+    return .{ .x = normalized.x, .y = normalized.y };
 }
 
 fn priorityForBehavior(behavior: AiBehavior) i16 {
@@ -612,25 +614,6 @@ fn priorityForBehavior(behavior: AiBehavior) i16 {
         .seek => 10,
         .wander => 0,
     };
-}
-
-fn normalizeOrDefault(dx: f32, dy: f32) AiDir {
-    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{ .x = 1, .y = 0 };
-    const len2 = dx * dx + dy * dy;
-    if (!std.math.isFinite(len2) or len2 <= 0.0001) return .{ .x = 1, .y = 0 };
-    const inv_len = 1.0 / @sqrt(len2);
-    const nx = dx * inv_len;
-    const ny = dy * inv_len;
-    if (!std.math.isFinite(nx) or !std.math.isFinite(ny)) return .{ .x = 1, .y = 0 };
-    return .{ .x = nx, .y = ny };
-}
-
-fn normalizeOrZero(dx: f32, dy: f32) AiDir {
-    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{ .x = 0, .y = 0 };
-    const len2 = dx * dx + dy * dy;
-    if (!std.math.isFinite(len2) or len2 <= 0.0001) return .{ .x = 0, .y = 0 };
-    const inv_len = 1.0 / @sqrt(len2);
-    return .{ .x = dx * inv_len, .y = dy * inv_len };
 }
 
 fn deterministicUnitDir(seed: u64, key: u32) AiDir {
