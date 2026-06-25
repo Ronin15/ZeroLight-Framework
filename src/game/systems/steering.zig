@@ -474,12 +474,11 @@ pub const SteeringSystem = struct {
                 .y = movement.previous_y[selected.movement_index],
             };
             const runtime = try self.runtimeRowForSelected(selected);
-            const goal_distance = distance(start, selected.intent.goal);
             const path_dir = self.directionFromPathStatus(pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
             const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
             const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
 
-            self.updateProgress(selected, runtime, goal_distance, steering_agent, path_dir.status_allows_replan, stats, &request_count);
+            self.updateProgress(selected, runtime, path_dir.progress_distance, steering_agent, path_dir.status_allows_replan, stats, &request_count);
             self.start_x.appendAssumeCapacity(start.x);
             self.start_y.appendAssumeCapacity(start.y);
             self.base_dir_x.appendAssumeCapacity(base_dir.x);
@@ -581,6 +580,7 @@ pub const SteeringSystem = struct {
         // Missing paths request work, pending paths hold direction, unavailable
         // paths enter backoff, and available paths steer toward the next waypoint.
         // Single-level default start level (0).
+        const goal_distance = distance(start, selected.intent.goal);
         const view = pathfinding.statusForEntityWorld(selected.entity, 0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class);
         switch (view.status) {
             .available => {
@@ -590,9 +590,12 @@ pub const SteeringSystem = struct {
                     .y = view.next_waypoint.y - start.y,
                 };
                 if (math.lengthSquared(to_waypoint) <= steering_agent.waypoint_tolerance * steering_agent.waypoint_tolerance) {
-                    return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(selected.intent.goal.x - start.x, selected.intent.goal.y - start.y, 0.0001), .status_allows_replan = true };
+                    // At the waypoint: steer straight to the goal, so progress is goal distance.
+                    return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(selected.intent.goal.x - start.x, selected.intent.goal.y - start.y, 0.0001), .status_allows_replan = true, .progress_distance = goal_distance };
                 }
-                return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(to_waypoint.x, to_waypoint.y, 0.0001), .status_allows_replan = true };
+                // Following the path: progress is closing on the next waypoint, which a
+                // detour reduces even while straight-line goal distance grows.
+                return .{ .has_direction = true, .direction = math.normalizeOrZeroFinite(to_waypoint.x, to_waypoint.y, 0.0001), .status_allows_replan = true, .progress_distance = math.length(to_waypoint) };
             },
             .missing => {
                 if (runtime.replan_cooldown == 0 and runtime.unavailable_backoff == 0) {
@@ -602,11 +605,11 @@ pub const SteeringSystem = struct {
                 } else {
                     stats.replan_cooldown_count += 1;
                 }
-                return .{ .status_allows_replan = true };
+                return .{ .status_allows_replan = true, .progress_distance = goal_distance };
             },
             .pending => {
                 stats.path_pending_count += 1;
-                return .{};
+                return .{ .progress_distance = goal_distance };
             },
             .unavailable => {
                 stats.path_unavailable_count += 1;
@@ -615,7 +618,7 @@ pub const SteeringSystem = struct {
                 } else {
                     stats.unavailable_backoff_count += 1;
                 }
-                return .{};
+                return .{ .progress_distance = goal_distance };
             },
         }
     }
@@ -624,22 +627,24 @@ pub const SteeringSystem = struct {
         self: *SteeringSystem,
         selected: *SelectedIntent,
         runtime: *RuntimeRow,
-        goal_distance: f32,
+        progress_distance: f32,
         steering_agent: SteeringAgentView,
         status_allows_replan: bool,
         stats: *SteeringStats,
         request_count: *usize,
     ) void {
         _ = self;
-        // Stuck detection watches goal distance, not instantaneous velocity, so
-        // local avoidance jitter does not immediately trigger replans.
+        // Stuck detection watches distance to the active steering target (next
+        // waypoint, or goal when direct), not instantaneous velocity, so local
+        // avoidance jitter does not immediately trigger replans and an agent walking
+        // a detour around an obstacle is not mistaken for stuck.
         const progress_epsilon: f32 = 0.25;
-        if (runtime.has_previous_distance and goal_distance + progress_epsilon >= runtime.previous_goal_distance) {
+        if (runtime.has_previous_distance and progress_distance + progress_epsilon >= runtime.previous_progress_distance) {
             if (runtime.stuck_steps < std.math.maxInt(u16)) runtime.stuck_steps += 1;
         } else {
             runtime.stuck_steps = 0;
         }
-        runtime.previous_goal_distance = goal_distance;
+        runtime.previous_progress_distance = progress_distance;
         runtime.has_previous_distance = true;
 
         if (status_allows_replan and steering_agent.stuck_step_threshold > 0 and
@@ -730,7 +735,7 @@ const RuntimeRow = struct {
     // Runtime state is intentionally separate from SteeringAgent component data;
     // it is simulation-local and safe to discard when the component is removed.
     entity: EntityId,
-    previous_goal_distance: f32 = 0,
+    previous_progress_distance: f32 = 0,
     has_previous_distance: bool = false,
     stuck_steps: u16 = 0,
     replan_cooldown: u16 = 0,
@@ -752,6 +757,11 @@ const PathDirection = struct {
     has_direction: bool = false,
     direction: math.Vec2 = .{},
     status_allows_replan: bool = false,
+    // Distance from the agent to the point it is actually steering toward this step
+    // (the next path waypoint, or the goal when steering direct). Stuck detection
+    // measures progress against this, not the straight-line goal distance, so an
+    // agent correctly walking a detour around an obstacle is not flagged stuck.
+    progress_distance: f32 = 0,
 };
 
 const SteeringWorkSelection = struct {
