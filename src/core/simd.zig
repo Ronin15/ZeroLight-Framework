@@ -169,6 +169,91 @@ pub fn hasTail(item_count: usize) bool {
     return tailLen(item_count) != 0;
 }
 
+/// Per-lane pair of 2D components (one `Float4` per axis).
+pub const Vec2x4 = struct {
+    x: Float4,
+    y: Float4,
+};
+
+/// Per-lane sine and cosine results.
+pub const SinCos4 = struct {
+    sin: Float4,
+    cos: Float4,
+};
+
+/// Gathers four `f32` values from `values` at the given indices into lane order.
+/// Use to pack sparse SoA rows into contiguous lanes before vector math.
+pub fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
+    return .{
+        values[indices[0]],
+        values[indices[1]],
+        values[indices[2]],
+        values[indices[3]],
+    };
+}
+
+/// Gathers four `i32` values from `values` at the given indices into lane order.
+pub fn gatherInt4(values: []const i32, indices: [lane_count]usize) Int4 {
+    return .{
+        values[indices[0]],
+        values[indices[1]],
+        values[indices[2]],
+        values[indices[3]],
+    };
+}
+
+/// Scatters lane values back to `values` at the given indices. Indices must be
+/// distinct; overlapping targets make the result order-dependent.
+pub fn scatterFloat4(values: []f32, indices: [lane_count]usize, vector: Float4) void {
+    inline for (0..lane_count) |lane| {
+        values[indices[lane]] = vector[lane];
+    }
+}
+
+/// Per-lane reciprocal square root, `1 / sqrt(values)`. Lanes that are zero or
+/// negative produce inf/NaN; guard the input when that is possible.
+pub fn reciprocalSqrtFloat4(values: Float4) Float4 {
+    return splatFloat4(1) / @sqrt(values);
+}
+
+/// Per-lane squared length of 2D vectors.
+pub fn lengthSquared2Float4(x: Float4, y: Float4) Float4 {
+    return x * x + y * y;
+}
+
+/// Normalizes per-lane 2D vectors, returning zero for lanes whose squared
+/// length is at or below `epsilon`. Matches scalar normalize-or-zero semantics
+/// and never produces inf/NaN: the divisor is floored before the reciprocal,
+/// and short lanes are masked to zero afterward.
+pub fn normalizeOrZero2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
+    const len2 = lengthSquared2Float4(x, y);
+    const positive = greaterThanFloat4(len2, splatFloat4(epsilon));
+    const safe_len2 = maxFloat4(len2, splatFloat4(std.math.floatMin(f32)));
+    const inv_len = reciprocalSqrtFloat4(safe_len2);
+    const zero = splatFloat4(0);
+    return .{
+        .x = selectFloat4(positive, x * inv_len, zero),
+        .y = selectFloat4(positive, y * inv_len, zero),
+    };
+}
+
+/// Per-lane sine. Uses the compiler builtin element-wise over the vector; the
+/// single call site lets a vectorized polynomial replace this later without
+/// touching callers.
+pub fn sinFloat4(values: Float4) Float4 {
+    return @sin(values);
+}
+
+/// Per-lane cosine. See `sinFloat4` for the implementation note.
+pub fn cosFloat4(values: Float4) Float4 {
+    return @cos(values);
+}
+
+/// Per-lane sine and cosine together, for rotation and field-of-view math.
+pub fn sinCosFloat4(values: Float4) SinCos4 {
+    return .{ .sin = @sin(values), .cos = @cos(values) };
+}
+
 fn expectFloatArrayApprox(actual: [lane_count]f32, expected: [lane_count]f32) !void {
     for (actual, expected) |actual_value, expected_value| {
         try std.testing.expectApproxEqAbs(expected_value, actual_value, 0.001);
@@ -270,4 +355,62 @@ test "tail helpers cover empty partial exact and multi lane counts" {
     try std.testing.expectEqual(@as(usize, 8), vectorizedEnd(11));
     try std.testing.expectEqual(@as(usize, 3), tailLen(11));
     try std.testing.expect(hasTail(11));
+}
+
+test "gather and scatter move lanes through sparse indices" {
+    const source = [_]f32{ 10, 11, 12, 13, 14, 15 };
+    const gathered = gatherFloat4(&source, .{ 5, 0, 3, 1 });
+    try expectFloatArrayApprox(toFloatArray(gathered), .{ 15, 10, 13, 11 });
+
+    const int_source = [_]i32{ 0, -1, -2, -3, -4 };
+    try std.testing.expectEqual(
+        [_]i32{ -4, 0, -2, -1 },
+        toIntArray(gatherInt4(&int_source, .{ 4, 0, 2, 1 })),
+    );
+
+    var dest = [_]f32{ 0, 0, 0, 0, 0, 0 };
+    scatterFloat4(&dest, .{ 5, 0, 3, 1 }, float4(15, 10, 13, 11));
+    try std.testing.expectEqual([_]f32{ 10, 11, 0, 13, 0, 15 }, dest);
+}
+
+test "reciprocal sqrt matches scalar reference" {
+    const values = float4(1, 4, 16, 0.25);
+    const result = toFloatArray(reciprocalSqrtFloat4(values));
+    try expectFloatArrayApprox(result, .{ 1, 0.5, 0.25, 2 });
+}
+
+test "normalize or zero matches scalar and zeroes short lanes" {
+    const epsilon: f32 = 1.0e-12;
+    const xs = float4(3, 0, -5, 0);
+    const ys = float4(4, 0, 0, -2);
+    const normalized = normalizeOrZero2Float4(xs, ys, epsilon);
+
+    const x_out = toFloatArray(normalized.x);
+    const y_out = toFloatArray(normalized.y);
+    inline for (0..lane_count) |lane| {
+        const len2 = xs[lane] * xs[lane] + ys[lane] * ys[lane];
+        if (len2 <= epsilon) {
+            try std.testing.expectEqual(@as(f32, 0), x_out[lane]);
+            try std.testing.expectEqual(@as(f32, 0), y_out[lane]);
+        } else {
+            const inv = 1.0 / @sqrt(len2);
+            try std.testing.expectApproxEqAbs(xs[lane] * inv, x_out[lane], 0.001);
+            try std.testing.expectApproxEqAbs(ys[lane] * inv, y_out[lane], 0.001);
+            try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
+        }
+    }
+}
+
+test "sin and cos match scalar builtins per lane" {
+    const angles = float4(0, std.math.pi / 6.0, std.math.pi / 2.0, std.math.pi);
+    const sines = toFloatArray(sinFloat4(angles));
+    const cosines = toFloatArray(cosFloat4(angles));
+    const both = sinCosFloat4(angles);
+
+    inline for (0..lane_count) |lane| {
+        try std.testing.expectApproxEqAbs(@sin(angles[lane]), sines[lane], 0.0001);
+        try std.testing.expectApproxEqAbs(@cos(angles[lane]), cosines[lane], 0.0001);
+        try std.testing.expectApproxEqAbs(sines[lane], both.sin[lane], 0.0001);
+        try std.testing.expectApproxEqAbs(cosines[lane], both.cos[lane], 0.0001);
+    }
 }

@@ -33,6 +33,23 @@ pub fn lerpVec2(start: Vec2, end: Vec2, amount: f32) Vec2 {
     };
 }
 
+pub fn lengthSquared(v: Vec2) f32 {
+    return v.x * v.x + v.y * v.y;
+}
+
+pub fn length(v: Vec2) f32 {
+    return @sqrt(lengthSquared(v));
+}
+
+/// Normalizes `v`, returning a zero vector when its squared length is at or
+/// below `epsilon`. Scalar counterpart of `simd.normalizeOrZero2Float4`.
+pub fn normalizeOrZero(v: Vec2, epsilon: f32) Vec2 {
+    const len2 = lengthSquared(v);
+    if (len2 <= epsilon) return .{};
+    const inv = 1.0 / @sqrt(len2);
+    return .{ .x = v.x * inv, .y = v.y * inv };
+}
+
 test "clamp keeps values inside bounds" {
     try std.testing.expectEqual(@as(f32, 0), clamp(-4, 0, 10));
     try std.testing.expectEqual(@as(f32, 5), clamp(5, 0, 10));
@@ -53,4 +70,20 @@ test "lerpVec2 interpolates between points" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 4), result.x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 8), result.y, 0.001);
+}
+
+test "length helpers measure 3-4-5 vector" {
+    const v = Vec2{ .x = 3, .y = 4 };
+    try std.testing.expectApproxEqAbs(@as(f32, 25), lengthSquared(v), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), length(v), 0.001);
+}
+
+test "normalizeOrZero normalizes and zeroes short vectors" {
+    const normalized = normalizeOrZero(.{ .x = 3, .y = 4 }, 1.0e-12);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), normalized.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), normalized.y, 0.001);
+
+    const zeroed = normalizeOrZero(.{ .x = 0, .y = 0 }, 1.0e-12);
+    try std.testing.expectEqual(@as(f32, 0), zeroed.x);
+    try std.testing.expectEqual(@as(f32, 0), zeroed.y);
 }

@@ -494,27 +494,12 @@ pub const CollisionSystem = struct {
                 inline for (0..simd.lane_count) |lane| {
                     candidate_indices[lane] = self.order.items[candidate_sorted_index + lane];
                 }
-                const candidate_min_x = simd.float4(
-                    self.min_x.items[candidate_indices[0]],
-                    self.min_x.items[candidate_indices[1]],
-                    self.min_x.items[candidate_indices[2]],
-                    self.min_x.items[candidate_indices[3]],
-                );
+                const candidate_min_x = simd.gatherFloat4(self.min_x.items, candidate_indices);
                 const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
                 if (!x_active[0]) break;
 
-                const candidate_min_y = simd.float4(
-                    self.min_y.items[candidate_indices[0]],
-                    self.min_y.items[candidate_indices[1]],
-                    self.min_y.items[candidate_indices[2]],
-                    self.min_y.items[candidate_indices[3]],
-                );
-                const candidate_max_y = simd.float4(
-                    self.max_y.items[candidate_indices[0]],
-                    self.max_y.items[candidate_indices[1]],
-                    self.max_y.items[candidate_indices[2]],
-                    self.max_y.items[candidate_indices[3]],
-                );
+                const candidate_min_y = simd.gatherFloat4(self.min_y.items, candidate_indices);
+                const candidate_max_y = simd.gatherFloat4(self.max_y.items, candidate_indices);
                 const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
                 inline for (0..simd.lane_count) |lane| {
                     if (overlaps[lane]) {
@@ -608,27 +593,12 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
             inline for (0..simd.lane_count) |lane| {
                 candidate_indices[lane] = system.order.items[candidate_sorted_index + lane];
             }
-            const candidate_min_x = simd.float4(
-                system.min_x.items[candidate_indices[0]],
-                system.min_x.items[candidate_indices[1]],
-                system.min_x.items[candidate_indices[2]],
-                system.min_x.items[candidate_indices[3]],
-            );
+            const candidate_min_x = simd.gatherFloat4(system.min_x.items, candidate_indices);
             const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
             if (!x_active[0]) break;
 
-            const candidate_min_y = simd.float4(
-                system.min_y.items[candidate_indices[0]],
-                system.min_y.items[candidate_indices[1]],
-                system.min_y.items[candidate_indices[2]],
-                system.min_y.items[candidate_indices[3]],
-            );
-            const candidate_max_y = simd.float4(
-                system.max_y.items[candidate_indices[0]],
-                system.max_y.items[candidate_indices[1]],
-                system.max_y.items[candidate_indices[2]],
-                system.max_y.items[candidate_indices[3]],
-            );
+            const candidate_min_y = simd.gatherFloat4(system.min_y.items, candidate_indices);
+            const candidate_max_y = simd.gatherFloat4(system.max_y.items, candidate_indices);
             const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
             inline for (0..simd.lane_count) |lane| {
                 if (overlaps[lane]) {
@@ -675,14 +645,14 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
             b_indices[lane] = pair.b;
         }
 
-        const a_min_x = gather4(system.min_x.items, a_indices);
-        const a_max_x = gather4(system.max_x.items, a_indices);
-        const a_min_y = gather4(system.min_y.items, a_indices);
-        const a_max_y = gather4(system.max_y.items, a_indices);
-        const b_min_x = gather4(system.min_x.items, b_indices);
-        const b_max_x = gather4(system.max_x.items, b_indices);
-        const b_min_y = gather4(system.min_y.items, b_indices);
-        const b_max_y = gather4(system.max_y.items, b_indices);
+        const a_min_x = simd.gatherFloat4(system.min_x.items, a_indices);
+        const a_max_x = simd.gatherFloat4(system.max_x.items, a_indices);
+        const a_min_y = simd.gatherFloat4(system.min_y.items, a_indices);
+        const a_max_y = simd.gatherFloat4(system.max_y.items, a_indices);
+        const b_min_x = simd.gatherFloat4(system.min_x.items, b_indices);
+        const b_max_x = simd.gatherFloat4(system.max_x.items, b_indices);
+        const b_min_y = simd.gatherFloat4(system.min_y.items, b_indices);
+        const b_max_y = simd.gatherFloat4(system.max_y.items, b_indices);
 
         const overlap_left = a_max_x - b_min_x;
         const overlap_right = b_max_x - a_min_x;
@@ -722,15 +692,6 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
             buffer.appendContactAssumeCapacity(contact);
         }
     }
-}
-
-fn gather4(values: []const f32, indices: [simd.lane_count]usize) simd.Float4 {
-    return simd.float4(
-        values[indices[0]],
-        values[indices[1]],
-        values[indices[2]],
-        values[indices[3]],
-    );
 }
 
 fn overlapsY(system: *const CollisionSystem, a: usize, b: usize) bool {
