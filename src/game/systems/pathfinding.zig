@@ -68,6 +68,11 @@ const default_goal_projection_radius: i32 = 16;
 // Side length (in nav cells) of one abstract chunk. The chunk-portal graph is the
 // structure that bounds per-query work independent of total cell count.
 const default_nav_chunk_tiles: u16 = 16;
+// When an incremental nav update touches more than this many distinct levels, the
+// per-affected-level relabel degenerates into a full relabel of every level. It
+// increments a loud `nav_full_relabel` counter so a runaway batch is visible. The
+// demo's worlds have very few levels, so a real edit stays well under this.
+const default_nav_full_relabel_level_threshold: usize = 8;
 // Fixed abstract-cost penalty added when an abstract A* edge crosses a LevelLink.
 // Kept above any single octile step so the search prefers staying on one level.
 const inter_level_penalty: u32 = cardinal_cost * 4;
@@ -104,6 +109,34 @@ pub const PathView = struct {
     path_len: usize = 0,
 };
 
+// One static-obstacle edit for incremental nav rebuild: a world tile flip on
+// `level` at tile `(x, y)`. Carries only compact coordinates (no world handle), so
+// the caller maps a `world_tile_changed`/`world_obstacle_changed` event into this
+// before feeding `applyNavUpdates`. The world reference is passed alongside the edit
+// batch so the affected level's blocked mask is re-derived from authoritative state.
+pub const NavCellEdit = struct {
+    level: u16,
+    x: u16,
+    y: u16,
+};
+
+// Diagnostics for one incremental `applyNavUpdates` batch. Recorded by the caller
+// into runtime perf metrics. A batch that finds no real obstacle change does no
+// work and leaves every counter zero.
+pub const NavUpdateStats = struct {
+    // Distinct abstract chunks touched by the dirty cells (membership-counted, not
+    // double-counted) across affected levels.
+    dirty_chunks: usize = 0,
+    // 1 when this batch recomputed affected-level masks/components and the abstract
+    // graph (an incremental rebuild that did NOT touch the whole world); else 0.
+    incremental_rebuilds: usize = 0,
+    // 1 when the affected-level count exceeded the configured full-relabel
+    // threshold and every level was relabeled (a loud bounded fallback); else 0.
+    full_relabel: usize = 0,
+    // 1 when this batch bumped `nav_version` (invalidating goal-keyed caches); else 0.
+    version_bumps: usize = 0,
+};
+
 pub const GridCell = struct {
     x: i32,
     y: i32,
@@ -136,6 +169,10 @@ pub const PathfindingCapacity = struct {
     nav_chunk_tiles: u16 = default_nav_chunk_tiles,
     max_abstract_nodes: usize = default_max_abstract_nodes,
     max_stitched_path_cells: usize = default_max_stitched_path_cells,
+    // Incremental nav update: when an `applyNavUpdates` batch touches more than this
+    // many levels, it relabels every level (a loud, counted fallback) rather than
+    // only the affected ones.
+    nav_full_relabel_level_threshold: usize = default_nav_full_relabel_level_threshold,
     // Build-time nav memory ceiling. Exceeding it fails the rebuild loudly.
     max_nav_memory_bytes: usize = default_max_nav_memory_bytes,
     // Managed shared-goal flow fields.
@@ -424,6 +461,20 @@ const NavGrid = struct {
         self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
     }
 
+    // Re-derives this single level's blocked mask in place from authoritative static
+    // sources (level-0 collision bodies plus the world mask). Used by the incremental
+    // nav update: a single dirty world cell may overlap several nav cells via its
+    // rect, and a nav cell may be kept blocked by an unrelated overlapping rect, so a
+    // correct unblock requires recomposing this level's mask rather than clearing the
+    // edited cell alone. Bounded by ONE level's cells plus its bodies/sparse columns;
+    // never touches another level. Dimensions/version are retained.
+    fn remarkStaticMask(self: *NavGrid, data: *const DataSystem, world: ?*const WorldSystem) void {
+        @memset(self.blocked.items, false);
+        self.blocked_count = 0;
+        if (self.level == 0) self.markStaticBodies(data);
+        if (world) |world_system| self.markWorldObstacles(world_system);
+    }
+
     fn buildComponents(self: *NavGrid) void {
         @memset(self.components.items, no_component);
         self.component_queue.clearRetainingCapacity();
@@ -538,6 +589,11 @@ const NavGraph = struct {
     // Per-level fast lookup from cell index to portal node index (no_cell when the
     // cell is not a portal). Sized levels x cell_count and rebuilt each build.
     cell_to_portal: std.ArrayList(u32) = .empty,
+    // Persistent u32 scratch reused (non-overlapping) by the abstract-graph build
+    // helpers for the portal sort order and the CSR/level cursors. Persisting it (vs
+    // a per-build allocator.alloc) keeps both the init build and the incremental
+    // `applyNavUpdates` rebuild allocation-free once the graph has been built once.
+    build_u32_scratch: std.ArrayList(u32) = .empty,
 
     const EdgeScratch = struct {
         from: u32,
@@ -545,6 +601,7 @@ const NavGraph = struct {
     };
 
     fn deinit(self: *NavGraph) void {
+        self.build_u32_scratch.deinit(self.allocator);
         self.cell_to_portal.deinit(self.allocator);
         self.edge_scratch.deinit(self.allocator);
         self.level_portal_offsets.deinit(self.allocator);
@@ -623,6 +680,111 @@ const NavGraph = struct {
         try self.buildAbstractGraph(world);
     }
 
+    // Incrementally folds a batch of static-obstacle edits into the existing graph
+    // WITHOUT a whole-world rebuild. Re-derives the blocked mask + components of only
+    // the affected levels (the bounded per-affected-level fallback: true per-chunk
+    // portal/CSR surgery would require a per-chunk-addressable portal store, a larger
+    // redesign), rebuilds the abstract graph once (bounded by chunk borders), and
+    // bumps `version` once so every goal-keyed cache/pending entry keyed on the old
+    // version re-solves. Unaffected levels keep their masks and components untouched.
+    // `affected_levels` is caller-owned pre-reserved scratch (sized to level count).
+    // Allocation contract: this call is allocation-free at steady state — the abstract
+    // buffers are reused at the init build's high-water capacity. A genuine topology
+    // expansion past that high-water mark (an edit that opens more portals/edges than
+    // any prior build) does ONE bounded amortized growth. That is acceptable per
+    // coding-standards.md allocation exceptions: this is a cold, event-triggered
+    // main-thread path (fires only on nav-changing tile/obstacle events, never per
+    // frame), with NavGraph as the explicit owner, and the cost cannot move to init
+    // because the new topology is only known when the edit arrives. Returns the batch
+    // diagnostics.
+    fn applyNavUpdates(
+        self: *NavGraph,
+        data: *const DataSystem,
+        world: ?*const WorldSystem,
+        edits: []const NavCellEdit,
+        affected_levels: *std.ArrayList(bool),
+        full_relabel_level_threshold: usize,
+    ) !NavUpdateStats {
+        var stats = NavUpdateStats{};
+        if (edits.len == 0 or !self.valid()) return stats;
+
+        const level_count = self.levels.items.len;
+        // Capacity is pre-reserved to the level count at rebuild, so this is a no-op
+        // on the steady path; the ensure guards against a future level-count change
+        // OOB-writing the affected-flag scratch.
+        try affected_levels.ensureTotalCapacity(self.allocator, level_count);
+        affected_levels.items.len = level_count;
+        @memset(affected_levels.items, false);
+
+        // Membership-count distinct dirty chunks and flag affected levels. A tile
+        // edit maps to the abstract chunk owning the nav cell at the tile origin;
+        // counting is for diagnostics, the per-level remask covers the full rects.
+        var affected_level_count: usize = 0;
+        for (edits) |edit| {
+            if (@as(usize, edit.level) >= level_count) continue;
+            if (!affected_levels.items[edit.level]) {
+                affected_levels.items[edit.level] = true;
+                affected_level_count += 1;
+            }
+        }
+        if (affected_level_count == 0) return stats;
+        stats.dirty_chunks = self.countDirtyChunks(world, edits);
+
+        // Past the threshold the per-level relabel degenerates to relabeling every
+        // level; flag it loudly rather than silently doing whole-world work.
+        const full_relabel = affected_level_count > full_relabel_level_threshold;
+        for (self.levels.items, 0..) |*level_grid, level_index| {
+            if (!full_relabel and !affected_levels.items[level_index]) continue;
+            level_grid.remarkStaticMask(data, world);
+            level_grid.buildComponents();
+        }
+
+        // The abstract graph is shared global structure (portals/CSR span all levels)
+        // and is bounded by chunk borders, not cells, so rebuilding it once after the
+        // affected-level masks change is the bounded incremental step.
+        try self.buildAbstractGraph(world);
+
+        self.version +%= 1;
+        if (self.version == 0) self.version = 1;
+        for (self.levels.items) |*level_grid| level_grid.version = self.version;
+
+        stats.incremental_rebuilds = 1;
+        stats.version_bumps = 1;
+        if (full_relabel) stats.full_relabel = 1;
+        return stats;
+    }
+
+    // Counts distinct abstract chunks (per level) touched by the dirty edits, using
+    // the nav cell at each edited tile's origin. Quadratic in the edit count, which
+    // is bounded by the per-step world-event budget; purely diagnostic.
+    fn countDirtyChunks(self: *const NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
+        const world_system = world orelse return 0;
+        var count: usize = 0;
+        for (edits, 0..) |edit, i| {
+            const cell_index = self.navCellIndexForTile(world_system, edit) orelse continue;
+            const chunk = self.chunkOf(cell_index);
+            var seen = false;
+            for (edits[0..i]) |prior| {
+                if (prior.level != edit.level) continue;
+                const prior_index = self.navCellIndexForTile(world_system, prior) orelse continue;
+                if (self.chunkOf(prior_index) == chunk) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) count += 1;
+        }
+        return count;
+    }
+
+    // Nav cell index of the nav cell containing a world tile's origin corner.
+    fn navCellIndexForTile(self: *const NavGraph, world: *const WorldSystem, edit: NavCellEdit) ?usize {
+        const level_grid = self.grid(edit.level) orelse return null;
+        const rect = world.cellRect(edit.x, edit.y) orelse return null;
+        const cell = level_grid.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
+        return level_grid.indexForCell(cell);
+    }
+
     fn chunksX(self: *const NavGraph) usize {
         return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
     }
@@ -669,6 +831,15 @@ const NavGraph = struct {
         try self.indexPortalsByLevel();
     }
 
+    // Returns a persistent u32 scratch slice of `len`, growing the backing buffer only
+    // when a build needs more than any prior build. The three abstract-graph build
+    // helpers use this sequentially (never overlapping), so one buffer serves all.
+    fn buildScratch(self: *NavGraph, len: usize) ![]u32 {
+        try self.build_u32_scratch.ensureTotalCapacity(self.allocator, len);
+        self.build_u32_scratch.items.len = len;
+        return self.build_u32_scratch.items;
+    }
+
     // Builds the per-level portal index so abstract seeding scans only one level's
     // portals (O(start-level portals)) instead of every portal across all levels.
     // Runs after all portals (including late link endpoints) are appended.
@@ -685,8 +856,7 @@ const NavGraph = struct {
         }
         try self.level_portal_order.ensureTotalCapacity(self.allocator, self.portals.items.len);
         self.level_portal_order.items.len = self.portals.items.len;
-        var cursor = try self.allocator.alloc(u32, level_count);
-        defer self.allocator.free(cursor);
+        const cursor = try self.buildScratch(level_count);
         for (0..level_count) |i| cursor[i] = self.level_portal_offsets.items[i];
         for (self.portals.items, 0..) |portal, node_index| {
             const level: usize = portal.level;
@@ -769,8 +939,7 @@ const NavGraph = struct {
     fn buildIntraLevelEdges(self: *NavGraph) !void {
         // Order portal indices by (level, chunk) so each chunk's portals form a
         // contiguous run we can connect pairwise without a global quadratic scan.
-        var order = try self.allocator.alloc(u32, self.portals.items.len);
-        defer self.allocator.free(order);
+        const order = try self.buildScratch(self.portals.items.len);
         for (0..self.portals.items.len) |i| order[i] = @intCast(i);
         std.sort.pdq(u32, order, self.portals.items, portalChunkLessThan);
 
@@ -859,8 +1028,7 @@ const NavGraph = struct {
         const edge_count = self.edge_scratch.items.len;
         try self.portal_edges.ensureTotalCapacity(self.allocator, edge_count);
         self.portal_edges.items.len = edge_count;
-        var cursor = try self.allocator.alloc(u32, node_count);
-        defer self.allocator.free(cursor);
+        const cursor = try self.buildScratch(node_count);
         for (0..node_count) |i| cursor[i] = self.portal_offsets.items[i];
         for (self.edge_scratch.items) |scratch| {
             const slot = cursor[scratch.from];
@@ -926,10 +1094,28 @@ const NavMemoryBudget = struct {
     max_cached_results: usize,
     max_solved_requests_per_step: usize,
     max_stitched_path_cells: usize,
+    // Abstract chunk-portal graph sizing. The portal/edge buffers grow to their real
+    // (obstacle-dependent) size at the init build and are not pre-reserved to a
+    // worst case; the gate uses a realistic estimate (portals <= internal-border
+    // cells, edges <= portals * a small abstract degree) so large SPARSE worlds pass
+    // while a world whose real nav structures exceed the budget still fails loud.
+    chunk_tiles: usize,
+    link_count: usize,
+    // Realistic upper bound on the abstract degree of a portal node (intra-chunk
+    // peers + cross-border + link edges). Used to estimate the CSR edge buffers
+    // without the pathological per-chunk pairwise (O(cells)) term.
+    const abstract_degree: usize = 8;
 
     // Per SearchScratch slot table entry: slot_cell/slot_g/slot_parent/slot_stamp
     // (4 x u32) plus slot_closed (bool).
     const scratch_slot_bytes: usize = 4 * @sizeOf(u32) + 1;
+    // edge_scratch entry (EdgeScratch: u32 from + AbstractEdge{u32,u32,bool}) and the
+    // compacted CSR edge entry (AbstractEdge). Both buffers are reserved to the edge
+    // worst case.
+    const edge_scratch_bytes: usize = @sizeOf(u32) + 2 * @sizeOf(u32) + 1;
+    const portal_edge_bytes: usize = 2 * @sizeOf(u32) + 1;
+    // PortalNode (u16 level + u32 cell_index + u32 chunk), padded.
+    const portal_node_bytes: usize = @sizeOf(u16) + 2 * @sizeOf(u32);
 
     // Saturating estimate of total nav memory. An overflowing term clamps to
     // maxInt so the gate rejects rather than wrapping to a small value.
@@ -953,8 +1139,41 @@ const NavMemoryBudget = struct {
         // (config-scaled, independent of cell count).
         const stitched_bytes = (self.max_cached_results +| self.max_solved_requests_per_step) *|
             self.max_stitched_path_cells *| @sizeOf(StitchedCell);
+        // Realistic abstract chunk-portal graph buffers (cell_to_portal is exact;
+        // portals/edges are estimated from border structure, not a per-cell worst case).
+        const abstract_bytes = self.abstractGraphBytes(width, height, levels);
         return static_bytes +| group_registry_bytes +|
-            scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes;
+            scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
+            abstract_bytes;
+    }
+
+    // Realistic bytes for the abstract-graph buffers. The cell_to_portal lookup is
+    // genuinely sized to levels * cell_count every build (O(cells), unavoidable). The
+    // portal/edge buffers are estimated from structure rather than a pathological
+    // worst case: portals <= internal-border cells (NOT all cells), and CSR edges <=
+    // portals * abstract_degree (NOT the per-chunk pairwise (4*ct)^2 term that made
+    // the estimate ~16*cells and rejected large sparse worlds). This keeps the gate
+    // honest for genuinely oversized worlds while letting big sparse worlds build.
+    fn abstractGraphBytes(self: NavMemoryBudget, width: usize, height: usize, levels: usize) usize {
+        const cell_count = width *| height;
+        const ct = @max(@as(usize, 1), self.chunk_tiles);
+        const cx = (width + ct - 1) / ct;
+        const cy = (height + ct - 1) / ct;
+        const internal_vertical = if (cx > 0) cx - 1 else 0;
+        const internal_horizontal = if (cy > 0) cy - 1 else 0;
+        // Portals live on internal chunk borders (both sides): a structural cap well
+        // below cell_count for any non-degenerate chunk size.
+        const border_cells_per_level = 2 *| internal_vertical *| height +|
+            2 *| internal_horizontal *| width;
+        const portals = levels *| border_cells_per_level +| 2 *| self.link_count;
+        // CSR edges scale with portals times a small abstract degree, not with cells.
+        const edges = portals *| abstract_degree;
+        const cell_to_portal_bytes = levels *| cell_count *| @sizeOf(u32);
+        // portals buffer + level_portal_order (u32) + portal_offsets (u32) + build
+        // scratch (u32).
+        const portal_buffers = portals *| (portal_node_bytes +| 3 *| @sizeOf(u32));
+        const edge_buffers = edges *| (edge_scratch_bytes +| portal_edge_bytes);
+        return cell_to_portal_bytes +| portal_buffers +| edge_buffers;
     }
 
     // Pure validation helper: returns the error and stays log-free. A lifecycle
@@ -1609,6 +1828,10 @@ pub const PathfindingSystem = struct {
     // batch. Plain local solves leave their stripe unused (stitched_len 0).
     worker_stitched_pool: std.ArrayList(StitchedCell) = .empty,
     next_group_evict: usize = 0,
+    // Pre-reserved per-level affected-flag scratch for incremental nav updates. Sized
+    // to the level count at rebuild so `applyNavUpdates` allocates nothing per edit on
+    // the steady path; it is the main-thread post-commit reaction, never a worker.
+    affected_levels: std.ArrayList(bool) = .empty,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -1640,6 +1863,7 @@ pub const PathfindingSystem = struct {
     pub fn deinit(self: *PathfindingSystem) void {
         for (self.scratch_slots.items) |*scratch| scratch.deinit(self.allocator);
         for (self.group_fields.items) |*field| field.deinit(self.allocator);
+        self.affected_levels.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
         self.solved_paths.deinit(self.allocator);
@@ -1706,6 +1930,7 @@ pub const PathfindingSystem = struct {
             try self.reserve(self.capacity);
         }
         const level_count: usize = if (world) |world_system| @max(@as(usize, 1), world_system.levelCount()) else 1;
+        const link_count: usize = if (world) |world_system| world_system.levelLinks().len else 0;
         const budget = NavMemoryBudget{
             .max_bytes = self.capacity.max_nav_memory_bytes,
             .level_count = level_count,
@@ -1718,8 +1943,16 @@ pub const PathfindingSystem = struct {
             .max_cached_results = self.capacity.max_cached_results,
             .max_solved_requests_per_step = self.capacity.max_solved_requests_per_step,
             .max_stitched_path_cells = self.capacity.max_stitched_path_cells,
+            .chunk_tiles = @max(@as(usize, 1), self.capacity.nav_chunk_tiles),
+            .link_count = link_count,
         };
         try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget);
+        // The init buildAbstractGraph (inside rebuild) grows the portal/edge buffers to
+        // their real size; clearRetainingCapacity keeps that high-water mark. A later
+        // incremental applyNavUpdates within the high-water mark allocates nothing; a
+        // genuine topology expansion past it does one bounded amortized growth (a cold,
+        // event-triggered main-thread path — see applyNavUpdates). No O(cells)
+        // pre-reserve, so large SPARSE worlds (few portals) stay cheap and pass the gate.
         const cell_count = self.graph.cellCount();
         for (self.group_fields.items) |*field| {
             try field.reserve(self.allocator, cell_count);
@@ -1727,9 +1960,43 @@ pub const PathfindingSystem = struct {
         for (self.scratch_slots.items) |*scratch| {
             try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells);
         }
+        // Pre-reserve the per-level affected-flag scratch so a steady-path
+        // applyNavUpdates allocates nothing per edit.
+        try self.affected_levels.ensureTotalCapacity(self.allocator, self.graph.levelCount());
+        self.affected_levels.items.len = self.graph.levelCount();
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
+    }
+
+    // Incrementally folds a batch of static-obstacle edits into the existing nav
+    // graph at the main-thread post-commit reaction point (never on a worker). Only
+    // affected levels' masks/components are recomputed; the abstract graph is rebuilt
+    // once; `nav_version` bumps once so goal-keyed caches/pending entries re-solve.
+    // Runtime request/result state is cleared (caches invalidate on the version bump),
+    // while group fields are dropped to .empty so a stale field is never sampled. No
+    // whole-world rebuild and no scratch reallocation occur on the steady path.
+    pub fn applyNavUpdates(
+        self: *PathfindingSystem,
+        data: *const DataSystem,
+        world: ?*const WorldSystem,
+        edits: []const NavCellEdit,
+    ) !NavUpdateStats {
+        const stats = try self.graph.applyNavUpdates(
+            data,
+            world,
+            edits,
+            &self.affected_levels,
+            self.capacity.nav_full_relabel_level_threshold,
+        );
+        if (stats.version_bumps != 0) {
+            // The version bump invalidated every goal-keyed key; drop stale work and
+            // group fields so the next request re-solves against the new mask.
+            self.clearTransientRequestsRetainingFields();
+            for (self.group_fields.items) |*field| field.state = .empty;
+            self.next_group_evict = 0;
+        }
+        return stats;
     }
 
     pub fn clearRuntimeState(self: *PathfindingSystem) void {
@@ -4077,4 +4344,423 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
     try std.testing.expectEqual(@as(usize, 1), stats.abstract_solves);
     try std.testing.expectEqual(@as(usize, 1), stats.cross_level_solves);
+}
+
+// ----------------------------------------------------------------------------
+// Slice 25D: incremental nav update tests
+// ----------------------------------------------------------------------------
+
+// World center (px) of tile cell (cx, cy) at the demo 32px tile size, used to seed
+// requests/queries at a known nav cell.
+fn tileCenter(cx: u16, cy: u16) math.Vec2 {
+    return .{ .x = @as(f32, @floatFromInt(cx)) * 32 + 16, .y = @as(f32, @floatFromInt(cy)) * 32 + 16 };
+}
+
+// Builds a 12x12-tile single-level world with a vertical tree wall at column 5 that
+// leaves open gaps at the given rows. The base floor is open grass, so the only way
+// across the wall is through a gap. Returns the world plus the obstacle layer index
+// so a test can flip the gap cells.
+fn buildCorridorWorld(meta: *const @import("../../assets/world_tileset_meta.zig").WorldTilesetMeta, open_rows: []const u16) !struct { world: WorldSystem, wall_layer: usize } {
+    const grass = try requireTestTile(meta, "grass");
+    const tree = try requireTestTile(meta, "tree_0");
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, meta, 384, 384);
+    errdefer world.deinit();
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    var y: u16 = 0;
+    while (y < 12) : (y += 1) {
+        var open = false;
+        for (open_rows) |row| {
+            if (row == y) open = true;
+        }
+        if (open) continue;
+        _ = try world.setDenseTile(wall_layer, 5, y, tree);
+    }
+    return .{ .world = world, .wall_layer = wall_layer };
+}
+
+fn solveStep(system: *PathfindingSystem, requester: EntityId, start: math.Vec2, goal: math.Vec2) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
+    return system.updateSerial(&stream, .{});
+}
+
+test "pathfinding incremental update reroutes when a corridor gap is flipped to blocking" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // Two gaps in the wall: the nearer (row 3) is used first; closing it forces a
+    // reroute through the far gap (row 9).
+    const built = try buildCorridorWorld(&meta, &.{ 3, 9 });
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    const start = tileCenter(1, 5);
+    const goal = tileCenter(9, 5);
+    const before = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(@as(usize, 1), before.available_results);
+    const view_before = system.statusForWorld(0, start, 0, goal, .default);
+    try std.testing.expectEqual(PathStatus.available, view_before.status);
+
+    // The cached path must cross the wall through the near gap (row 3): some stored
+    // path cell sits on the wall column at row 3.
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 9));
+
+    const version_before = system.graph.version;
+
+    // Flip the near gap (5,3) to a tree (now blocking) via the world tile API.
+    const changed = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement != changed.new_blocks_movement);
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
+    try std.testing.expect(system.graph.version != version_before);
+    // The previously cached completed entry was keyed on the old nav_version: it must
+    // no longer answer this goal until re-solved.
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default).status);
+
+    // Next solve produces a DIFFERENT path that avoids the now-blocked near gap and
+    // routes through the far gap (row 9).
+    const after = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(@as(usize, 1), after.available_results);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
+}
+
+// Returns whether the cached completed (or stitched) path for the goal includes the
+// nav cell at tile (cx, cy). Walks the stored cells directly; used to assert a route
+// crosses a specific corridor gap.
+fn cachedPathTouchesCell(system: *const PathfindingSystem, start: math.Vec2, goal: math.Vec2, cx: u16, cy: u16) bool {
+    const key = system.graph.keyForWorld(0, goal, .default) orelse return false;
+    _ = start;
+    const slot = system.completed.slotIndex(key) orelse return false;
+    const result = system.completed.slots.items[slot].result;
+    const grid = system.graph.grid(0) orelse return false;
+    const target = grid.indexForCell(.{ .x = @intCast(cx), .y = @intCast(cy) }) orelse return false;
+    if (result.stitched_len != 0) {
+        for (system.completed.stitchedSlice(slot, result.stitched_len)) |sc| {
+            if (sc.level == 0 and sc.cell == target) return true;
+        }
+        return false;
+    }
+    for (system.completed.pathSlice(slot, result.path_len)) |cell| {
+        if (cell == target) return true;
+    }
+    return false;
+}
+
+test "pathfinding incremental update disconnects a goal when the last gap is closed" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // A single gap at row 3 is the only crossing.
+    const built = try buildCorridorWorld(&meta, &.{3});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    const start = tileCenter(1, 5);
+    const goal = tileCenter(9, 5);
+    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+
+    const changed = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
+
+    // The wall is now solid: the goal is truly disconnected, so the re-solve is a
+    // definitive unavailable rather than a stale cached available.
+    const after = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(@as(usize, 1), after.unavailable_results);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default).status);
+}
+
+test "pathfinding incremental update opens a shorter path when a tile is unblocked" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+
+    // Start with only the far gap (row 9) open; the near gap (row 3) is a tree.
+    const built = try buildCorridorWorld(&meta, &.{9});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    const start = tileCenter(1, 5);
+    const goal = tileCenter(9, 5);
+    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    // Path crosses only at row 9 (the near gap is closed).
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
+
+    // Open the near gap (5,3) back to grass.
+    const changed = (try world.setDenseTile(built.wall_layer, 5, 3, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+
+    // The now-shorter route uses the near gap.
+    try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
+}
+
+test "pathfinding incremental update leaves an unaffected second level untouched" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    const level1_layer = try world.addDenseLayer(1, 0, .floor, grass);
+    // A distinctive obstacle on level 1 cell (7,7) so we can confirm level 1 is
+    // unchanged by an edit on level 0.
+    _ = try world.setDenseTile(level1_layer, 7, 7, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    // Snapshot level 1's blocked count and component label of its obstacle cell.
+    const level1_blocked_before = system.graph.grid(1).?.blocked_count;
+    const level1_cell77 = system.graph.grid(1).?.indexForCell(.{ .x = 7, .y = 7 }).?;
+    try std.testing.expect(system.graph.grid(1).?.isBlockedIndex(level1_cell77));
+
+    // Edit a tile on LEVEL 0 only.
+    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    const changed = (try world.setDenseTile(obstacle_layer, 2, 2, tree)) orelse return error.TestExpectedEqual;
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), nav_stats.full_relabel);
+    // Level 1's mask is byte-for-byte what it was: the incremental update never
+    // re-marked it. Its obstacle cell and blocked count are intact.
+    try std.testing.expectEqual(level1_blocked_before, system.graph.grid(1).?.blocked_count);
+    try std.testing.expect(system.graph.grid(1).?.isBlockedIndex(level1_cell77));
+    // Level 0 gained the new obstacle.
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
+}
+
+test "pathfinding incremental update with no real change does no work" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const version_before = system.graph.version;
+
+    // An empty edit batch is a no-op: no version bump, no counters.
+    const stats = try system.applyNavUpdates(&data, &world, &.{});
+    try std.testing.expectEqual(@as(usize, 0), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
+    try std.testing.expectEqual(version_before, system.graph.version);
+}
+
+test "pathfinding incremental update is allocation-free at steady state (within init high-water mark)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    // The corridor world opens its gaps at the INIT build, so the abstract buffers
+    // reach their high-water capacity during rebuild. Blocking an existing open gap
+    // (removes portals) and reopening it (re-adds <= the init count) both stay WITHIN
+    // that high-water mark — the real steady-state contract.
+    const built = try buildCorridorWorld(&meta, &.{ 3, 9 });
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const high_water = system.graph.portals.items.len;
+    try std.testing.expect(high_water > 0);
+
+    // The failing allocator must cover BOTH the system AND the nav graph (which holds
+    // its own captured allocator copy): every graph-rebuild buffer (portals/edges/
+    // cell_to_portal/build scratch) flows through graph.allocator, so swapping only
+    // system.allocator would let a graph allocation slip through undetected.
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    // Block an existing open gap: removes portals, stays within high-water.
+    const blocked = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
+    const block_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = blocked.level, .x = blocked.x, .y = blocked.y }});
+    try std.testing.expectEqual(@as(usize, 1), block_stats.incremental_rebuilds);
+
+    // Reopen the same gap: re-adds portals back to <= the init high-water count, so it
+    // reuses retained capacity and allocates nothing.
+    const opened = (try world.setDenseTile(built.wall_layer, 5, 3, grass)) orelse return error.TestExpectedEqual;
+    const open_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
+    try std.testing.expectEqual(@as(usize, 1), open_stats.incremental_rebuilds);
+    try std.testing.expect(system.graph.portals.items.len <= high_water);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
+test "pathfinding incremental update expands beyond init high-water mark with bounded growth" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    // Start fully walled so the init build has zero portals (minimal high-water).
+    // Opening a block later expands the abstract graph past it. This is the documented
+    // amortized-growth exception (a cold, event-triggered path), NOT the alloc-free
+    // contract: it must SUCCEED and produce the new topology, using the real allocator.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
+    var y: u16 = 0;
+    while (y < 12) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 12) : (x += 1) {
+            _ = try world.setDenseTile(wall_layer, x, y, tree);
+        }
+    }
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try std.testing.expectEqual(@as(usize, 0), system.graph.portals.items.len);
+
+    // Open a 6x6 block spanning chunk borders, creating new portals past the (zero)
+    // init high-water mark. The growth is allowed and the build completes correctly.
+    var edits = std.ArrayList(NavCellEdit).empty;
+    defer edits.deinit(std.testing.allocator);
+    y = 2;
+    while (y < 8) : (y += 1) {
+        var x: u16 = 2;
+        while (x < 8) : (x += 1) {
+            const opened = (try world.setDenseTile(wall_layer, x, y, grass)) orelse continue;
+            try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
+        }
+    }
+    const stats = try system.applyNavUpdates(&data, &world, edits.items);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), stats.version_bumps);
+    // The expansion produced new portals (the abstract graph grew past init).
+    try std.testing.expect(system.graph.portals.items.len > 0);
+
+    // A subsequent edit within the NEW high-water mark is allocation-free again.
+    const closed = (try world.setDenseTile(wall_layer, 4, 4, tree)) orelse return error.TestExpectedEqual;
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    const close_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = closed.level, .x = closed.x, .y = closed.y }});
+    system.graph.allocator = original;
+    system.allocator = original;
+    try std.testing.expectEqual(@as(usize, 1), close_stats.incremental_rebuilds);
+}
+
+test "pathfinding incremental update flips cross-level link liveness when the endpoint cell changes" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    const level1_floor = try world.addDenseLayer(1, 0, .floor, grass);
+    // Obstacle layer on level 1 so the link endpoint cell (2,2) can be flipped via the
+    // dense tile API (which emits a WorldTileChangedEvent that drives applyNavUpdates).
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = level1_floor;
+    _ = try world.setDenseTile(level1_obstacle, 2, 2, tree); // endpoint blocked
+    try world.addLevelLink(.{
+        .kind = .stair,
+        .level_a = 0,
+        .cell_a = .{ .x = 10, .y = 10 },
+        .level_b = 1,
+        .cell_b = .{ .x = 2, .y = 2 },
+        .traversal_cost = 5,
+        .bidirectional = true,
+    });
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    // Blocked endpoint: the link is not live, so the cross-level goal is unavailable.
+    var blocked_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer blocked_stream.deinit();
+    try appendPathRequest(&blocked_stream, .{
+        .entity = requester,
+        .start_level = 0,
+        .goal_level = 1,
+        .start = .{ .x = 16, .y = 16 },
+        .goal = .{ .x = 304, .y = 304 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), (try system.updateSerial(&blocked_stream, .{})).unavailable_results);
+
+    // Open the endpoint cell (2,2) on level 1 via the world tile API + incremental
+    // update. buildLinkEdges re-derives link liveness against the current masks, so
+    // the link becomes live and the same cross-level goal is now reachable.
+    const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
+
+    var open_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer open_stream.deinit();
+    try appendPathRequest(&open_stream, .{
+        .entity = requester,
+        .start_level = 0,
+        .goal_level = 1,
+        .start = .{ .x = 16, .y = 16 },
+        .goal = .{ .x = 304, .y = 304 },
+    });
+    const open_stats = try system.updateSerial(&open_stream, .{});
+    try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
+    try std.testing.expectEqual(@as(usize, 1), open_stats.cross_level_solves);
 }

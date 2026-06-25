@@ -505,10 +505,33 @@ producers: required events fail before structural mutation or domain reaction
 side effects, while diagnostic events are dropped and counted. Reaction work has
 explicit ownership rather than a generic main-thread fallback: light
 orchestration may run inline, and expensive consumers should split over
-immutable event slices and write range-owned outputs. `GameDemoState` currently
-consumes structural events after the commit point and rebuilds the state-owned
-pathfinding nav grid once when static obstacle-affecting changes occur, then
-emits a `nav_region_invalidated` event.
+immutable event slices and write range-owned outputs. `GameDemoState` consumes
+structural events after the commit point and, on static obstacle-affecting
+changes, folds them into the state-owned pathfinding nav graph INCREMENTALLY
+rather than rebuilding the whole world. Blocking `world_tile_changed` /
+`world_obstacle_changed` edits (only when `old_blocks_movement !=
+new_blocks_movement`) plus entity-driven obstacle changes are collected into a
+pre-reserved dirty nav-cell set and fed to `pipeline.applyNavUpdates`, which
+recomputes only the affected levels' blocked masks and components, rebuilds the
+chunk-portal abstract graph once (bounded by chunk borders, not cells), and bumps
+`nav_version` exactly once per batch so every goal-keyed cache/pending entry and
+group field keyed on the old version re-solves. Unaffected levels are never
+touched, and the whole-world build runs only at init. The reaction is recorded
+through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
+`nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
+counted full relabel only past a configured level threshold), and a
+`nav_region_invalidated` event is still emitted whenever the graph actually
+changed. The update runs single-threaded at the main-thread post-commit reaction
+point and is allocation-free on the steady path: the abstract chunk-portal
+buffers grow to their real size at the init rebuild and retain that high-water
+capacity, so an incremental rebuild whose topology stays within the high-water
+mark grows no buffer. A genuine topology expansion past it (an unblock opening
+more portals than any prior build) does one bounded amortized growth, which is
+acceptable on this cold, event-triggered path. The `max_nav_memory_bytes` gate
+estimates nav memory from realistic structure (portals bounded by chunk-border
+cells, CSR edges by portal count times a small abstract degree), not a per-chunk
+pairwise worst case, so large sparse worlds build instead of being falsely
+rejected.
 
 The cross-cutting ownership rules apply here too: event reactions may have
 main-thread commit points, but scalable reaction work still needs a named owner,

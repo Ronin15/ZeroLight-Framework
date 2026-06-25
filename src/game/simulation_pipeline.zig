@@ -27,6 +27,8 @@ const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
+const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
+const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -149,6 +151,18 @@ pub const SimulationPipeline = struct {
         bounds_height: f32,
     ) !void {
         try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size);
+    }
+
+    /// Folds a batch of static-obstacle edits into the existing nav graph
+    /// incrementally (affected levels only, single `nav_version` bump) rather than
+    /// rebuilding the whole world. The whole-world build path stays init-only.
+    pub fn applyNavUpdates(
+        self: *SimulationPipeline,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+        edits: []const NavCellEdit,
+    ) !NavUpdateStats {
+        return self.pathfinding.applyNavUpdates(data, world, edits);
     }
 
     /// Synchronizes interpolation history for pipeline-owned movement state.

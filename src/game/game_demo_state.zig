@@ -31,6 +31,8 @@ const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const default_max_fallback_requests_per_step = @import("systems/pathfinding.zig").default_max_fallback_requests_per_step;
+const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
+const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
@@ -60,6 +62,10 @@ const obstacle_count = 2;
 const collision_sfx_cooldown_capacity = 32;
 const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_contact_capacity = 64;
+// Upper bound on nav-invalidating world events the post-commit reaction maps into
+// dirty nav cell edits in one step. Matches the simulation event capacity reserved
+// in `initWithWorld`.
+const nav_dirty_edit_capacity = 16;
 const demo_music = AudioAssetId.demo_music;
 const collision_sfx = AudioAssetId.collision_sfx;
 const jet_sfx = AudioAssetId.player_jet_sfx;
@@ -102,6 +108,13 @@ pub const GameDemoState = struct {
     dynamic_render: DynamicRenderPrep,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
+    // Pre-reserved dirty-edit scratch for incremental nav updates. The post-commit
+    // reaction maps blocking world-tile/obstacle events into nav cell edits here, then
+    // feeds them to `pipeline.applyNavUpdates`. Reserved to the event capacity so the
+    // reaction allocates nothing per edit on the steady path.
+    nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
+    // Last incremental nav-update batch diagnostics, recorded into perf metrics.
+    last_nav_update_stats: NavUpdateStats = .{},
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
     collision_sfx_cooldown_count: usize = 0,
     music_started: bool = false,
@@ -249,10 +262,15 @@ pub const GameDemoState = struct {
         };
         state.syncCameraToPlayer();
         try state.ensureDynamicRenderCapacity();
+        // Reserve the dirty-edit scratch to the event capacity (the upper bound on
+        // nav-invalidating world events the post-commit reaction can observe in one
+        // step), keeping incremental nav updates allocation-free on the steady path.
+        try state.nav_dirty_edits.ensureTotalCapacity(allocator, nav_dirty_edit_capacity);
         return state;
     }
 
     pub fn deinit(self: *GameDemoState) void {
+        self.nav_dirty_edits.deinit(self.data.allocator);
         self.dynamic_render.deinit();
         self.particles.deinit();
         self.world.deinit();
@@ -316,6 +334,7 @@ pub const GameDemoState = struct {
                 particle_stats,
                 structural_stats,
                 self.simulation_frame.events.stats,
+                self.last_nav_update_stats,
             );
         }
     }
@@ -441,6 +460,7 @@ pub const GameDemoState = struct {
         particle_stats: ParticleUpdateStats,
         structural_stats: StructuralCommitStats,
         event_stats: SimulationEventStats,
+        nav_update_stats: NavUpdateStats,
     ) void {
         const scope_stats = pipeline_stats.scope.stats;
         const ai_stats = pipeline_stats.ai;
@@ -540,6 +560,11 @@ pub const GameDemoState = struct {
         perf.recordMetric(.simulation_events_nav_region_invalidated, metric(event_stats.nav_region_invalidated));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(event_stats.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(event_stats.domain_reaction_stage));
+
+        perf.recordMetric(.nav_dirty_chunks, metric(nav_update_stats.dirty_chunks));
+        perf.recordMetric(.nav_incremental_rebuilds, metric(nav_update_stats.incremental_rebuilds));
+        perf.recordMetric(.nav_full_relabel, metric(nav_update_stats.full_relabel));
+        perf.recordMetric(.nav_version_bumps, metric(nav_update_stats.version_bumps));
     }
 
     fn metric(value: usize) u64 {
@@ -594,22 +619,57 @@ pub const GameDemoState = struct {
         };
     }
 
+    // Reacts to committed structural events by folding nav-invalidating world changes
+    // into the existing nav graph INCREMENTALLY (per docs/architecture.md): only
+    // affected levels are recomputed and `nav_version` bumps once, instead of a
+    // whole-world rebuild. The whole-world build stays init-only. Blocking world-tile
+    // and obstacle edits are mapped into dirty nav cell edits; entity-driven static
+    // obstacle changes do not carry a cell, so the whole affected level is recomputed
+    // via an edit on each touched level. A `nav_region_invalidated` event is still
+    // emitted when the graph actually changed.
     fn processPostCommitEvents(self: *GameDemoState) !void {
-        var invalidate_navigation = false;
+        self.last_nav_update_stats = .{};
+        self.nav_dirty_edits.clearRetainingCapacity();
+        var entity_obstacle_change = false;
         for (self.simulation_frame.events.mergedItems()) |event| {
             if (event.stage != .structural_commit) continue;
-            if (eventInvalidatesNavigation(event)) {
-                invalidate_navigation = true;
+            if (!eventInvalidatesNavigation(event)) continue;
+            switch (event.payload) {
+                .world_tile_changed => |changed| self.recordNavDirtyCell(changed.level, changed.x, changed.y),
+                .world_obstacle_changed => |changed| {
+                    var y = changed.min_y;
+                    while (y < changed.max_y_exclusive) : (y += 1) {
+                        var x = changed.min_x;
+                        while (x < changed.max_x_exclusive) : (x += 1) {
+                            self.recordNavDirtyCell(changed.level, x, y);
+                        }
+                    }
+                },
+                // Entity-component nav changes do not carry a world cell. Mark level 0
+                // (the only level sourcing collision bodies) dirty with a sentinel cell
+                // so its mask/components are recomputed without a whole-world rebuild.
+                else => entity_obstacle_change = true,
             }
         }
+        if (entity_obstacle_change) self.recordNavDirtyCell(0, 0, 0);
 
-        if (!invalidate_navigation) return;
+        if (self.nav_dirty_edits.items.len == 0) return;
         try self.simulation_frame.events.ensureCanAppend(1);
-        try self.pipeline.rebuildStaticNavigationWithWorld(&self.data, &self.world, self.bounds_width, self.bounds_height);
+        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world, self.nav_dirty_edits.items);
+        // Only signal invalidation when the batch actually changed the graph (e.g. a
+        // tile flip whose blocking state truly differed and reached a real level).
+        if (self.last_nav_update_stats.version_bumps == 0) return;
         try self.simulation_frame.events.appendRequired(.{
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
         });
+    }
+
+    // Appends one dirty nav cell edit, dropping silently if the bounded scratch is
+    // full (the version bump still invalidates caches for the cells that fit).
+    fn recordNavDirtyCell(self: *GameDemoState, level: u16, x: u16, y: u16) void {
+        if (self.nav_dirty_edits.items.len >= self.nav_dirty_edits.capacity) return;
+        self.nav_dirty_edits.appendAssumeCapacity(.{ .level = level, .x = x, .y = y });
     }
 
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets) !StructuralCommitStats {
@@ -1331,6 +1391,68 @@ test "demo world tile event invalidates navigation after commit reaction" {
     });
 
     try demo.processPostCommitEvents();
+
+    var nav_invalidated = false;
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => nav_invalidated = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(nav_invalidated);
+}
+
+test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+
+    // Block a rect whose cell count (5x5 = 25) exceeds nav_dirty_edit_capacity (16) so
+    // the rect-expansion loop overflows the dirty-edit scratch. The level-wide remask
+    // must still leave EVERY covered cell blocked (the dirty set only flags affected
+    // levels/chunks; remask reads the level's full current mask).
+    const obstacle_layer = try demo.world.addDenseLayer(0, 0, .obstacle, grass);
+    const min_x: u16 = 2;
+    const min_y: u16 = 2;
+    const max_x_exclusive: u16 = 7;
+    const max_y_exclusive: u16 = 7;
+    var yy: u16 = min_y;
+    while (yy < max_y_exclusive) : (yy += 1) {
+        var xx: u16 = min_x;
+        while (xx < max_x_exclusive) : (xx += 1) {
+            _ = try demo.world.setDenseTile(obstacle_layer, xx, yy, tree);
+        }
+    }
+    try demo.simulation_frame.events.appendRequired(.{
+        .stage = .structural_commit,
+        .payload = .{ .world_obstacle_changed = .{
+            .level = 0,
+            .min_x = min_x,
+            .min_y = min_y,
+            .max_x_exclusive = max_x_exclusive,
+            .max_y_exclusive = max_y_exclusive,
+        } },
+    });
+
+    try demo.processPostCommitEvents();
+
+    // The incremental update ran and bumped the version exactly once.
+    try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.version_bumps);
+
+    // Every covered cell is blocked even though the rect overflowed the dirty scratch.
+    yy = min_y;
+    while (yy < max_y_exclusive) : (yy += 1) {
+        var xx: u16 = min_x;
+        while (xx < max_x_exclusive) : (xx += 1) {
+            try std.testing.expect(demo.world.levelBlocksMovement(0, xx, yy));
+        }
+    }
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {

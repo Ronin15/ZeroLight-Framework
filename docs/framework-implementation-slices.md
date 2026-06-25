@@ -1957,9 +1957,17 @@ Sub-slices (each independently shippable and headless-testable):
   `unavailable` vs `pending`; request contract carries individual-vs-group kind.
 - Slice 25C — chunk-portal abstract tier and cross-level query; `PathRequest`/
   `NavigationIntent` gain `start_level`/`goal_level`; steering fills them.
-- Slice 25D — event-driven incremental rebuild: dirty-chunk queue, `applyNavUpdates`,
-  `nav_version` bump, incremental relabel; wire world-tile/obstacle events from the
-  post-commit reaction point into the pipeline instead of full rebuilds.
+- Slice 25D — event-driven incremental rebuild: dirty nav-cell set, `applyNavUpdates`,
+  per-affected-level mask/component recompute, single `nav_version` bump, nav-update
+  metrics; wire world-tile/obstacle events from the post-commit reaction point into the
+  pipeline instead of full rebuilds. Granularity: per-AFFECTED-LEVEL recompute (the
+  bounded fallback the brief permits) — only affected levels' masks/components are
+  re-derived and the shared chunk-portal abstract graph is rebuilt once (bounded by
+  chunk borders, not cells); true per-chunk portal/CSR surgery would require a
+  per-chunk-addressable portal store (a larger redesign) and is deferred. A relabel of
+  every level happens only past a configured affected-level threshold and increments a
+  loud `nav_full_relabel` counter; unaffected levels are never touched and the
+  whole-world build stays init-only.
 
 Checklist:
 
@@ -1986,8 +1994,27 @@ Checklist:
       Abstract seeding scans only the start level's portals via a per-level portal
       index, so per-query work is bounded independent of total cells and of other
       levels' portals.
-- [ ] 25D: dirty-chunk incremental rebuild driven by typed world events; replace
-      full nav rebuild on tile change; add nav-update metrics.
+- [x] 25D: incremental nav rebuild driven by typed world events. `applyNavUpdates`
+      flips the affected level's blocked bits, recomputes only affected levels'
+      masks/components, rebuilds the chunk-portal abstract graph once, and bumps
+      `nav_version` once per batch so goal-keyed cache/pending/group entries re-solve.
+      `GameDemoState` collects blocking `world_tile_changed`/`world_obstacle_changed`
+      (and entity-driven obstacle) changes into a pre-reserved dirty nav-cell set and
+      feeds `pipeline.applyNavUpdates`; the whole-world build path is init-only. Added
+      `nav_dirty_chunks`, `nav_incremental_rebuilds`, `nav_full_relabel`,
+      `nav_version_bumps` metrics; the per-affected-level relabel degenerates to a
+      counted full relabel only past `nav_full_relabel_level_threshold`. The build
+      helpers were moved off per-call `allocator.alloc` onto persistent scratch, and
+      the abstract-graph buffers grow to their real size at the init rebuild and
+      retain that high-water capacity, so an incremental rebuild within the
+      high-water mark allocates nothing (a failing-allocator test drives both the
+      system and graph allocators across a block-then-reopen). A genuine topology
+      expansion past the high-water mark does one bounded amortized growth — a cold,
+      event-triggered path covered by a separate test. The `max_nav_memory_bytes`
+      gate estimates nav memory from realistic structure (portals bounded by
+      chunk-border cells, CSR edges by portal count times a small abstract degree),
+      not a per-chunk pairwise worst case, so large sparse worlds build. `PathView`
+      and request contracts are unchanged.
 - [x] Reset the demo `nav_cell_size` stopgap (currently 128) to a tile-aligned
       principled value (32 = one nav cell per tile); coarseness lives in the chunk
       tier, not the cell size.
@@ -2015,9 +2042,15 @@ Acceptance checks:
       independent of total world cell count; spills return `pending`.
 - [x] An oversized world returns `error.NavWorldTooLarge` at construction; no query
       path ever silently degrades to direct seek (the cell gates were removed).
-- [ ] A tile/obstacle event blocks/unblocks a corridor and the next path reflects
+- [x] A tile/obstacle event blocks/unblocks a corridor and the next path reflects
       it; `nav_incremental_rebuilds`/`nav_version_bumps` are non-zero and full
-      rebuild runs only at init. (Slice 25D.)
+      rebuild runs only at init. (Slice 25D.) Headless tests cover: flipping a
+      corridor gap to blocking reroutes the next solve through a different gap (and
+      stale cached path invalidates because its `nav_version` key no longer matches);
+      closing the last gap returns `unavailable`; unblocking a tile opens a shorter
+      path; an edit on level 0 leaves a second level's mask/components byte-for-byte
+      untouched (work scales with the dirty set, not world size); an empty batch is a
+      no-op; and the steady-path update is allocation-free under a failing allocator.
 - [x] `zig build fmt`, `zig build check`, `zig build test`, `zig build verify`, and
       targeted pathfinding benchmarks pass.
 
@@ -2029,7 +2062,7 @@ parallel-solve threshold (keep existing adaptive/inline behavior; `applyNavUpdat
 serial initially); `components` width (u32 initially); goal-level source
 (`NavigationIntent`, default 0 until multi-level gameplay exists).
 
-Status: 25A, 25B, and 25C implemented. The hybrid core ships goal-keyed individual
+Status: 25A, 25B, 25C, and 25D implemented. The hybrid core ships goal-keyed individual
 A* with budget-bounded scratch, the managed shared-goal flow-field registry, and the
 chunk-portal abstract tier with cross-level `LevelLink` routing. Long-range and
 cross-level queries route through abstract A* over portal/link nodes, then stitch the
@@ -2040,10 +2073,17 @@ seeding scans only the start level's portals (per-level portal index); abstract 
 saturation or a per-segment node-budget spill returns `budget_exhausted` (retry) rather
 than a hard negative. The old auto-grouped goal fields, cell gates, start-cell key, and
 their stats remain removed; `deferred_requests` is a single post-compaction write in
-both update paths; the memory gate fails loud at rebuild. 25D (event-driven
-incremental rebuild) remains; until it lands, a nav change triggers a full rebuild
-with a `nav_version` bump. Route the remaining slice diff to review with attention to
-the goal-keyed cache reuse and corridor-advancement contracts and gate behavior.
+both update paths; the memory gate fails loud at rebuild. 25D (event-driven incremental
+rebuild) is implemented: `applyNavUpdates` folds a dirty nav-cell set from
+world-tile/obstacle (and entity-driven obstacle) events into the existing graph by
+recomputing only affected levels' masks/components, rebuilding the chunk-portal abstract
+graph once, and bumping `nav_version` once per batch so goal-keyed work re-solves; the
+whole-world build runs only at init. Granularity is per-affected-level (the bounded
+fallback) with a counted `nav_full_relabel` past a level threshold; true per-chunk
+portal/CSR surgery is deferred pending a per-chunk-addressable portal store. Route the
+slice diff to review with attention to the goal-keyed cache reuse and
+corridor-advancement contracts, the per-affected-level update scope, and the
+allocation-free steady-path claim.
 
 ## Suggested Order
 

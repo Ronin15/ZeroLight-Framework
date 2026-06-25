@@ -77,6 +77,10 @@ pub const Metric = enum {
     path_group_field_reuses,
     path_group_field_rebuild_throttled,
     path_group_field_samples,
+    nav_dirty_chunks,
+    nav_incremental_rebuilds,
+    nav_full_relabel,
+    nav_version_bumps,
     movement_bodies,
     collision_bodies,
     collision_candidate_pairs,
@@ -490,6 +494,17 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_group_field_reuses),
                 self.metricValue(.path_group_field_rebuild_throttled),
                 self.metricValue(.path_group_field_samples),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} region_invalidated={}",
+            .{
+                elapsed_s,
+                self.metricValue(.nav_dirty_chunks),
+                self.metricValue(.nav_incremental_rebuilds),
+                self.metricValue(.nav_full_relabel),
+                self.metricValue(.nav_version_bumps),
+                self.metricValue(.simulation_events_nav_region_invalidated),
             },
         );
         log.debug(
