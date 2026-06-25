@@ -540,7 +540,6 @@ pub const WorldSystem = struct {
                 self.denseLayerOrder(layer_index),
                 &quad,
                 self.denseLayerTileBuffer(layer_index),
-                self.tilemap_params,
             );
         }
         self.dense_quads_dirty = false;
@@ -653,7 +652,7 @@ pub const WorldSystem = struct {
         try self.dense_layer_tile_buffers.ensureTotalCapacity(self.allocator, layer_count);
         for (self.dense_layer_tile_buffers.items.len..layer_count) |layer_index| {
             self.writeDenseLayerTileData(layer_index, scratch);
-            const id = try renderer.createTileDataBuffer(scratch);
+            const id = try renderer.createTileDataBuffer(scratch, self.tilemap_params);
             self.dense_layer_tile_buffers.appendAssumeCapacity(id);
         }
     }

@@ -139,18 +139,14 @@ pub const Material = enum {
 };
 
 /// Fragment uniform (set 3) for a tilemap draw — world-constant grid + atlas
-/// geometry. extern for a stable GPU layout matching `tilemap.frag.glsl`.
+/// geometry. extern for a stable GPU layout matching `tilemap.frag.glsl`. Kept off
+/// `DrawGroup` (looked up in the renderer by `tile_data`) so the per-frame draw-group
+/// sort/coalesce/merge does not drag this payload through every sprite group.
 pub const TilemapParams = extern struct {
     // x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
     grid: [4]f32,
     // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     atlas: [4]f32,
-};
-
-/// Per-group tilemap binding data, meaningful only when `material == .tilemap`.
-pub const TilemapDrawData = struct {
-    tile_data: resources.TileDataId = .invalid,
-    params: TilemapParams = .{ .grid = .{ 0, 0, 0, 0 }, .atlas = .{ 0, 0, 0, 0 } },
 };
 
 pub const DrawGroup = struct {
@@ -161,7 +157,9 @@ pub const DrawGroup = struct {
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
-    tilemap: TilemapDrawData = .{},
+    // Tilemap-material groups only: the layer's storage-buffer handle. The grid/atlas
+    // uniform lives in the renderer keyed by this id.
+    tile_data: resources.TileDataId = .invalid,
 };
 
 pub const TextureResolver = struct {

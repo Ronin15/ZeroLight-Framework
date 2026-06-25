@@ -80,6 +80,10 @@ pub const Renderer = struct {
     // layer (a row-major copy of the world's dense_tile_ids). Renderer-owned so
     // world keeps only opaque handles and never crosses the render/gpu boundary.
     tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
+    // World-constant grid/atlas uniform per tile-data buffer (parallel to
+    // tile_data_buffers). Kept here rather than on each DrawGroup so the per-frame
+    // draw-group sort/coalesce/merge stays small.
+    tile_data_params: std.ArrayList(TilemapParams) = .empty,
     // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
     // for one batched dig upload per frame.
     tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
@@ -189,6 +193,7 @@ pub const Renderer = struct {
             c.SDL_ReleaseGPUBuffer(self.device, buffer);
         }
         self.tile_data_buffers.deinit(self.allocator);
+        self.tile_data_params.deinit(self.allocator);
         self.tile_edit_scratch.deinit(self.allocator);
         self.deinitBatchStorage();
         self.static_vertices.deinit(self.allocator);
@@ -283,7 +288,6 @@ pub const Renderer = struct {
         order: RenderOrder,
         vertices: []const Vertex,
         tile_data: TileDataId,
-        params: TilemapParams,
     ) !void {
         if (vertices.len == 0) return;
         const end = try std.math.add(usize, self.static_vertices.items.len, vertices.len);
@@ -298,7 +302,7 @@ pub const Renderer = struct {
             .order = order,
             .first_vertex = first_vertex,
             .vertex_count = @intCast(vertices.len),
-            .tilemap = .{ .tile_data = tile_data, .params = params },
+            .tile_data = tile_data,
         });
         self.static_dirty = true;
     }
@@ -472,6 +476,7 @@ pub const Renderer = struct {
             var active_source: ?DrawSource = null;
             var active_presentation: ?CoordinatePresentation = null;
             var active_material: ?Material = null;
+            var active_texture: ?TextureId = null;
             for (self.draw_list.items) |group| {
                 const texture = self.resolveTextureSlot(group.texture) orelse continue;
                 const source_buffer = switch (group.source) {
@@ -480,7 +485,7 @@ pub const Renderer = struct {
                 };
                 const tile_buffer: ?*c.SDL_GPUBuffer = switch (group.material) {
                     .sprite => null,
-                    .tilemap => self.tileDataBuffer(group.tilemap.tile_data) orelse continue,
+                    .tilemap => self.tileDataBuffer(group.tile_data) orelse continue,
                 };
 
                 if (active_material == null or active_material.? != group.material) {
@@ -503,11 +508,20 @@ pub const Renderer = struct {
                 if (shouldApplyPresentationState(&active_presentation, group.presentation)) {
                     applyGroupPresentation(render_pass, command_buffer, presentation, group.presentation, self.batch.camera);
                 }
-                var sampler_binding = c.SDL_GPUTextureSamplerBinding{
-                    .texture = texture.texture.?,
-                    .sampler = self.sampler,
-                };
-                c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+                // Bind the texture/sampler only on a real texture change; SDL_GPU
+                // keeps the binding across pipeline switches, so consecutive groups
+                // sharing a texture skip a redundant bind (matters at many groups).
+                if (active_texture == null or
+                    active_texture.?.index != group.texture.index or
+                    active_texture.?.generation != group.texture.generation)
+                {
+                    var sampler_binding = c.SDL_GPUTextureSamplerBinding{
+                        .texture = texture.texture.?,
+                        .sampler = self.sampler,
+                    };
+                    c.SDL_BindGPUFragmentSamplers(render_pass, 0, &sampler_binding, 1);
+                    active_texture = group.texture;
+                }
 
                 if (group.material == .tilemap) {
                     // Rebind the storage buffer for every tilemap group: on Metal the
@@ -515,7 +529,7 @@ pub const Renderer = struct {
                     // differs, and an unconditional rebind is correct on every backend.
                     var storage = tile_buffer.?;
                     c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
-                    var params = group.tilemap.params;
+                    var params = self.tileDataParams(group.tile_data);
                     c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
                 }
 
@@ -654,14 +668,17 @@ pub const Renderer = struct {
     }
 
     /// Creates a renderer-owned tile-data storage buffer from a row-major tile
-    /// array (one `u32` per cell) and returns its handle. Built once per dense
-    /// layer at world load; the tilemap fragment shader reads it directly.
-    pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32) !TileDataId {
+    /// array (one `u32` per cell) and returns its handle. `params` is the layer's
+    /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
+    /// the handle. Built once per dense layer at world load.
+    pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32, params: TilemapParams) !TileDataId {
         const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
         errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
         const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
         if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
         try self.tile_data_buffers.append(self.allocator, buffer);
+        errdefer _ = self.tile_data_buffers.pop();
+        try self.tile_data_params.append(self.allocator, params);
         log.debug("created tilemap tile-data buffer {d}: {d} cells", .{ index, tiles.len });
         return @enumFromInt(index);
     }
@@ -689,6 +706,12 @@ pub const Renderer = struct {
         const index = @intFromEnum(id);
         if (index >= self.tile_data_buffers.items.len) return null;
         return self.tile_data_buffers.items[index];
+    }
+
+    // Direct load: only called for a tilemap group whose `tile_data` already
+    // resolved to a buffer this frame, so the parallel params entry is present.
+    fn tileDataParams(self: *const Renderer, id: TileDataId) TilemapParams {
+        return self.tile_data_params.items[@intFromEnum(id)];
     }
 
     fn createInternalTextureFromPixels(
