@@ -59,6 +59,30 @@ masks are for membership/query decisions, not a replacement for direct slice
 iteration in hot processors. Worker ranges should write disjoint rows and avoid
 sharing writable cache lines in hot SoA columns.
 
+Apply SIMD with scale in mind. Use the `src/core/simd.zig` helpers (never raw
+`@Vector` in systems) for dense, uniform, branch-light float math over contiguous
+aligned SoA columns, always with a scalar tail — this is the pattern in movement,
+collision broadphase/narrowphase, collision response, particle integration, and
+the pathfinding flow field. This framework is built to scale to heavy scenes,
+large battles, and late-game worlds, where per-agent and per-neighbor work
+(AI decision, separation, steering avoidance) becomes the dominant cost. Do not
+dismiss those loops as "low count" — assess them at their target scale, not their
+current demo scale.
+
+Vectorizability is a property of data layout, not an inherent property of a
+system. A loop that is hard to vectorize today because it gathers from sparse
+indices or branches per element is usually a candidate to *restructure* so it
+becomes vectorizable: gather neighbor/contact data once into a packed local SoA
+scratch buffer, then run the distance / inverse-sqrt / normalize / accumulate
+math vectorized across lanes, and convert per-element branches into masked
+`select`. At high element counts the one-time gather is amortized and the lane
+gain dominates. Treat such restructuring as the default plan for hot per-agent
+math before accepting a scalar loop. Genuinely irreducible scalar cases remain
+(data-dependent frontier traversal such as BFS/A* expansion, swap-remove
+compaction, rare branch-heavy setup); leave those scalar and say why. When a hot
+float loop is added or restructured, vectorize it through the shared helpers and
+prove scalar/SIMD and serial/threaded parity in tests.
+
 Use 64-byte padding only for concurrently written thread-shared records where
 false sharing is a real risk. Do not pad cold entity slot metadata by default.
 

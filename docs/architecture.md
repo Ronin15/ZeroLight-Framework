@@ -345,6 +345,19 @@ requests. Scope then decides which loaded worlds, chunks, chunk halos, or
 staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
 
+Emergent NPC behavior layers on the cognition tier. Perception, memory, and
+affect (emotion) are durable per-entity concepts that live as SoA components in
+`DataSystem` and are advanced by cognition-gated processor stages in
+`src/game/systems/`, alongside AI, steering, and pathfinding. They follow the
+same rules as every other processor: allocation-free hot paths, deterministic
+serial/threaded and scalar/SIMD parity, range-disjoint output, and explicit
+barriers. Dense per-step sensing/affect data stays in component columns or
+transient range streams; only notable transitions become low-volume domain
+events. Cross-entity classification (faction/stance), a deterministic per-entity
+RNG facility in `src/core`, and a shared per-frame spatial index are shared
+substrate these stages consume. Because they run only for in-scope cognition
+entities, their cost scales with active scope, not total entity count.
+
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
 domains. Controllers own feature orchestration: small queues, budgets,

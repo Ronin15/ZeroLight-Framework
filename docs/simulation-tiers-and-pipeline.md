@@ -132,6 +132,15 @@ or future world-collision refreshes; they are not immediate callbacks from
 required events for data needed to keep downstream state correct; use
 diagnostic events only for optional observability.
 
+Events are for low-volume notable changes and transitions, not high-volume
+per-frame per-entity data. Dense per-step results — for example AI separation,
+or future perception, memory, and affect state — belong in component columns or
+transient range streams; only state transitions (such as acquiring or losing a
+target, or a drive crossing a threshold) become events. This keeps the event
+stream bounded and the per-frame data path allocation-free. New signal payloads
+must still follow the scalar-only rule above and emit through the per-range
+writers so merge order stays deterministic.
+
 ## Structural Commands
 
 Structural mutation is deferred. Worker ranges and hot processors write

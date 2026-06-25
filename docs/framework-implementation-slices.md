@@ -57,6 +57,15 @@ adding broad abstraction.
   deterministic merge, and deferred structural-change contracts.
 - Treat CPU benchmark 50k scales as throughput ceilings, not per-frame targets;
   tiers and active scope keep typical fixed steps far below those stress counts.
+- Land Slice 24 scoped cognition gating before the emergent-AI track
+  (Slices 26–33). Per-entity perception, memory, and affect are only affordable
+  at scale when the cognition tier shrinks which entities run them each step;
+  building emergent AI on the full-active pipeline would bake in a scale problem.
+  The track first adds the framework pieces it requires — entity faction
+  classification, a deterministic per-entity RNG facility, and a shared spatial
+  index — then layers perception → memory → affect → behavior arbitration as
+  cognition-gated processor stages, keeping per-frame sensing columnar and routing
+  only notable transitions through scalar-only `domain_reaction` events.
 
 ## Long-Term Gameplay Direction
 
@@ -1800,27 +1809,50 @@ into the pathfinding nav-grid rebuild alongside static entity obstacles.
 Goal: turn the Slice 22 scaffolding into real scoped simulation behavior after
 Slice 23 provides world/chunk/visibility inputs.
 
-Current foundation:
+Readiness: the foundation for this slice is fully present (Slices 22/23/21);
+what remains is wiring. The six checklist items below are the concrete gaps
+between the current full-active pipeline and real scoped behavior.
 
-- `SimulationPipeline`, `SimulationScope`, `SimulationTier`, `ActiveRegion`,
-  cold tier/chunk metadata, and full-active scope stats exist from Slice 22.
-- World rendering provides concrete tile/chunk/visibility data from Slice 23.
-- Slice 21 events provide typed signals for future wake/promotion/demotion
-  policy.
+Current foundation (present — do not rebuild):
 
-Checklist:
+- `SimulationTier` enum with capability predicates `allowsMovement`,
+  `allowsCollision`, `allowsCognition` (`simulation_scope.zig`).
+- Per-entity cold metadata `EntitySimulationMetadata { tier, chunk }` on
+  `EntitySlot.simulation`, with `simulationMetadata`/`setSimulationMetadata`
+  accessors and a `simulationScopeStatsFullActive()` tally (`data_system.zig`).
+- `ActiveRegion` half-open chunk rectangle with `containsChunk()`, and
+  `SimulationScope { active_region: ?ActiveRegion, stats }` plus per-tier and
+  per-stage `SimulationScopeStats` (`simulation_scope.zig`).
+- `WorldSystem` maintains `chunk_visible[]`, chunk coordinate columns, and
+  `setVisibleChunksForWorldRect` / `chunkCoordForCell` (`world_system.zig`).
+- The pipeline still runs full-active: `SimulationPipeline.update` builds
+  `SimulationScope.fullActive(...)` and dispatches every stage over the full
+  component slices — scoped filtering is intentionally deferred to this slice
+  (`simulation_pipeline.zig`).
 
+Checklist (the remaining wiring):
+
+- [ ] Expose a public `WorldSystem` query that returns visible chunks as an
+      `ActiveRegion` (e.g. `visibleChunkRegion()` / `isChunkVisible(ChunkCoord)`)
+      over the existing `chunk_visible[]` — today the data is maintained but not
+      readable by scope.
+- [ ] Add a main-thread pass (post-movement, pre-commit) that recomputes each
+      scoped entity's cold `chunk` metadata from its position via
+      `chunkCoordForCell`, writing off the hot worker ranges. This is the missing
+      bridge between entity positions and chunk scope.
 - [ ] Add scoped gather entry points for movement, collision, AI, and steering
-      without changing hot processor math or merge rules.
-- [ ] Wire `ActiveRegion` from world/chunk/visibility data.
-- [ ] Keep the existing processor stage order identical while scope shrinks
-      participation.
-- [ ] Add stagger and reduced-cadence policy for cognition without adding a
-      second pipeline.
-- [ ] Wire tier changes through deferred structural commands or explicit
-      main-thread commits; processors must not mutate tier metadata in ranges.
+      that filter by `(tier predicate AND active_region)`. Processors keep their
+      current hot loops and merge rules and receive scoped slices/index lists
+      instead of full slices.
+- [ ] Add stagger and reduced-cadence policy for cognition (per-entity phase
+      counter in cold metadata, 1-in-N cadence) without adding a second pipeline;
+      count skips in scope stats.
+- [ ] Wire tier promotions/demotions (wake/sleep) through the existing deferred
+      structural-command commit or an explicit main-thread commit point;
+      processors must not mutate tier metadata inside worker ranges.
 - [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
-      stagger skips, and wake promotions.
+      stagger skips, and wake promotions, surfaced in the debug overlay and a
+      bench profile.
 
 Acceptance checks:
 
@@ -1828,6 +1860,8 @@ Acceptance checks:
       entity subset in tests.
 - [ ] Tier/chunk filtering changes which entities enter each stage without
       changing stage order or `SimulationFrame` stream contracts.
+- [ ] Entity chunk metadata stays consistent with position after movement, and
+      scope counts match the entities actually processed per stage.
 - [ ] Tier changes do not mutate `DataSystem` structurally except through the
       existing deferred command commit point.
 - [ ] `zig build test` covers scope build, tier gates, stagger skips, and
@@ -2111,6 +2145,463 @@ to a single portal, so escalation cannot subdivide the long segment and would on
 per-frame work — making it effective would require start-chunk-scoped seeding (a global
 corridor-shape change), a design decision left for a future slice.
 
+## Emergent AI Track Overview (Slices 26–33)
+
+Goal: layer emergent NPC behavior — perception, memory, emotion, and richer
+behavior arbitration — on top of the navigation substrate, while staying
+allocation-free on hot paths, deterministic (serial == threaded, scalar ==
+SIMD), and affordable at scale by running only under the cognition tier gated by
+Slice 24.
+
+Sequencing rationale:
+
+- Slices 26–28 are framework foundations the AI work requires and the framework
+  does not have yet (entity classification, deterministic RNG, a shared spatial
+  index). They are blockers or strong enablers for perception.
+- Slices 29–32 are the composing AI stack: perception → memory → affect →
+  behavior arbitration. Each reads the prior layer's columnar state.
+- Slice 33 is authoring/tuning infrastructure (data-driven archetypes + debug
+  introspection) that makes the stack usable and verifiable.
+
+Shared design contracts for the whole track:
+
+- Each new per-entity concept follows the existing component-store pattern in
+  `data_system.zig`: `Component` enum tag, component mask, `EntityTemplate`
+  field, `StructuralCommand` variant, `StructuralCapacityNeeds` capacity, an SoA
+  `*Store` (modeled on `AiAgentStore`), a `Const*Slice`, an `EntitySlot` index,
+  and public set/get/slice + validation helpers.
+- Each new per-step computation is a parallel processor stage modeled on
+  `ai.zig` (main-thread gather → grid/precompute → parallel range jobs → emit),
+  preserving serial/threaded parity and writing range-disjoint output.
+- Stages are designed SIMD-first because they run per cognition-agent and must
+  hold up in heavy scenes and large battles. Gather neighbor/perception data once
+  into packed local SoA scratch, then vectorize the float math (distance, FOV,
+  normalize, drive appraisal, weight blend) through `src/core/simd.zig` with
+  masked branches and a scalar tail, per the SIMD policy in
+  `docs/coding-standards.md` and Slice 34. Scale assessment uses target battle
+  counts, not demo counts.
+- Events follow the Slice 21 contract: scalar-only payloads (`EntityId`, enums,
+  scalars — no pointers/slices/handles), added as a `SimulationEventPayload`
+  union variant with a matching `SimulationEventStats` counter, `record()` switch
+  arm, and `addProduced()` line; emitted at the `domain_reaction` stage through
+  the per-range `SimulationEvents.RangeWriter`; capacity pre-reserved.
+- High-volume per-frame data (e.g. "who each agent sees this frame") lives in
+  component columns / transient frame buffers, never in the event stream. Only
+  state *transitions* (acquired/lost target, drive threshold crossed) become
+  events. This keeps the event stream low-volume and the design scalable.
+
+## Slice 26: Entity Faction And Classification Model
+
+Goal: give entities a classification so perception and behavior can distinguish
+threat / ally / neutral. No team or faction concept exists anywhere today; it is
+a hard prerequisite for perception (Slice 29) and behavior arbitration
+(Slice 32).
+
+Current foundation:
+
+- Entities are dense SoA with stable `EntityId` handles and component masks
+  (`data_system.zig`); the component-store pattern is established (e.g.
+  `AiAgentStore`).
+- No faction, team, allegiance, or relationship data exists.
+
+Checklist:
+
+- [ ] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
+      faction id per entity, following the full component-store pattern.
+- [ ] Add a fixed faction-relationship matrix (enum × enum → stance:
+      hostile / neutral / friendly), const-evaluated, scalar/enum only, no
+      per-frame allocation and no hash lookup on hot paths.
+- [ ] Expose a stance query usable from processor hot paths (`stance(a, b)`)
+      that compiles to a table index, not a map lookup.
+- [ ] Add to `EntityTemplate` and demo spawns so actors can be tagged.
+
+Acceptance checks:
+
+- [ ] Stance lookups are allocation-free and branch-light on hot paths.
+- [ ] Faction assignment round-trips through structural commands and survives
+      entity destruction/reuse with generational correctness.
+- [ ] `zig build test` covers stance symmetry/asymmetry and template wiring.
+
+## Slice 27: Deterministic Per-Entity RNG Facility
+
+Goal: provide reproducible randomness for AI (wander jitter, appraisal noise,
+investigate targets) that does not break the determinism contract
+(serial == threaded, replayable, range-order-independent).
+
+Current foundation:
+
+- `src/core` owns shared math/SIMD/logging helpers but has no deterministic RNG
+  facility; existing wander randomness is ad hoc.
+- The fixed-step loop provides a stable per-step index usable as an RNG input.
+
+Architecture notes:
+
+- A counter-based / hash-based stream (e.g. `hash(entity_index, step, salt)`) is
+  required rather than a stateful PRNG, so a worker can derive an entity's noise
+  independent of range partitioning or execution order.
+
+Checklist:
+
+- [ ] Add a stateless, seeded, splittable RNG in `src/core` keyed by
+      `(entity_index, step, salt)` returning uniform f32 / bounded ints.
+- [ ] Document the determinism guarantee: same inputs → same outputs regardless
+      of thread count or range order.
+- [ ] Migrate existing AI wander randomness onto it as the first consumer.
+
+Acceptance checks:
+
+- [ ] Identical RNG outputs across serial and threaded runs for the same step.
+- [ ] No per-call allocation; no shared mutable RNG state across workers.
+- [ ] `zig build test` covers reproducibility and distribution bounds.
+
+## Slice 28: Shared Spatial Index Service
+
+Goal: build one frame-level spatial index consumed by AI separation, perception,
+and collision broadphase instead of each system building its own grid.
+
+Current foundation:
+
+- AI separation builds a deterministic 32-unit grid each step
+  (`systems/ai.zig`), and collision broadphase maintains its own candidate
+  structure (`systems/collision.zig`). Perception (Slice 29) would add a third.
+
+Architecture notes:
+
+- Build once on the main thread (or a dedicated pre-stage); workers read it
+  immutably. Must preserve each current consumer's results exactly so it lands as
+  a parity-tested refactor, not a behavior change.
+
+Checklist:
+
+- [ ] Add a frame-built spatial hash/grid owned at the pipeline boundary, sized
+      from reserved capacity, rebuilt per step, read-only to workers.
+- [ ] Port AI separation and collision broadphase to consume it; remove the
+      duplicate grid builds.
+- [ ] Expose a bounded neighbor-query API (max samples / radius) reusable by
+      perception.
+
+Acceptance checks:
+
+- [ ] Separation and collision outputs are identical to the pre-refactor results
+      (parity tests).
+- [ ] Index build and queries are allocation-free after warmup and deterministic.
+- [ ] `zig build bench` shows no regression (ideally a win) from removing
+      redundant grid builds.
+
+## Slice 29: AI Perception Substrate
+
+Goal: let agents sense other entities (and later sounds) within vision/hearing
+limits, writing per-frame sensed state to columns and emitting only acquisition/
+loss transitions as events.
+
+Current foundation:
+
+- AI today perceives only an aggregate seek target and separation neighbors
+  (`systems/ai.zig`); there is no range/FOV/line-of-sight sensing and no notion
+  of distinct sensed entities.
+- Slice 26 supplies faction stance; Slice 28 supplies a shared spatial index;
+  Slice 21 supplies the event contract.
+
+Architecture notes:
+
+- Runs as a parallel processor stage before AI decision. High-volume per-frame
+  sense results are columnar; only transitions are events.
+- Hearing depends on a world stimulus/sound-emission buffer; ship vision-first
+  and gate hearing behind that buffer (tracked in this slice's checklist).
+
+Checklist:
+
+- [ ] Add an `AiPerception` component: cold tunables (vision range, FOV
+      half-angle, hearing range) plus hot output columns (`target_visible`,
+      `last_seen_x/y`, `nearest_threat: EntityId`, `nearest_threat_dist`).
+- [ ] Add a `PerceptionSystem` parallel stage that queries the shared spatial
+      index for candidates, then applies bounded range/FOV/line-of-sight checks
+      (LOS against world blocking tiles via `world_system` walkability), writing
+      results to perception columns.
+- [ ] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
+      target acquisition/loss transitions, emitted at `domain_reaction` via the
+      per-range writer with pre-reserved capacity.
+- [ ] Add a transient per-step world stimulus/sound buffer (position +
+      intensity + type, scalar-only) and consume it for hearing; keep it separate
+      from the audio playback service.
+
+Acceptance checks:
+
+- [ ] Per-frame sense results live in columns, not events; only transitions emit
+      events, bounded by a per-step cap with drops surfaced via event stats.
+- [ ] Serial and threaded perception produce identical columns and event order.
+- [ ] Sensing is allocation-free after warmup and runs only for cognition-tier
+      entities in scope.
+- [ ] `zig build test` covers range/FOV/LOS gating, transition events, and
+      serial/threaded parity.
+
+## Slice 30: AI Memory And Scope-Aware AI State Policy
+
+Goal: give agents short-term memory of recent contacts and last-known positions
+with decay, and define what happens to AI state when an entity leaves the
+cognition tier.
+
+Current foundation:
+
+- No per-entity memory exists; AI reacts only to current-frame inputs.
+- Slice 24 introduces tier promotion/demotion; this slice defines the state
+  policy across those transitions.
+
+Checklist:
+
+- [ ] Add an `AiMemory` component with fixed-size scalar columns: last-known
+      target position + staleness timer, a small fixed-capacity recent-contact
+      ring (entity id + last-seen pos + age), and a spatial familiarity scalar —
+      no per-entity `ArrayList` on the hot path.
+- [ ] Refresh memory from perception transitions and decay it each step
+      (staleness++, familiarity toward baseline); vectorizable column math.
+- [ ] Feed memory to AI when perception is cold (e.g. pursue last-known
+      position).
+- [ ] Implement the scope ↔ AI-state policy: freeze memory/affect decay on
+      demotion out of cognition, resync on promotion, routed through the Slice 24
+      deferred-commit path; no background per-frame work for out-of-scope agents.
+- [ ] Optional `memory_expired` event (scalar-only, `domain_reaction`) if a
+      reaction needs it; otherwise memory stays purely columnar.
+
+Acceptance checks:
+
+- [ ] Memory updates and decay are deterministic and allocation-free; fixed-size
+      storage never grows per frame.
+- [ ] Demoted entities preserve state with decay paused and resume correctly on
+      promotion.
+- [ ] `zig build test` covers refresh-from-perception, decay, ring eviction, and
+      demotion/promotion state continuity.
+
+## Slice 31: AI Affect And Emotion Drives
+
+Goal: add an appraisal-driven scalar emotion model whose drives modulate behavior
+weights, decaying toward per-entity baselines.
+
+Current foundation:
+
+- No affective/emotional state exists. `data_system.zig` already provides
+  SIMD-aligned hot f32 column support reusable for drive columns.
+- Perception (29) and memory (30) provide the appraisal inputs.
+
+Architecture notes:
+
+- Drives are a small fixed set (`fear`, `curiosity`, `aggression`, `fatigue`) as
+  hot SIMD-aligned f32 columns; the update is pure column math that vectorizes
+  like movement integration (`systems/movement.zig`).
+
+Checklist:
+
+- [ ] Add an `AiAffect` component with fixed scalar drive columns plus per-entity
+      baselines, SIMD-aligned.
+- [ ] Add an `AffectSystem` parallel/SIMD stage that appraises perception +
+      memory into drive deltas, applies them, and decays each drive toward its
+      baseline; bounded, allocation-free, deterministic.
+- [ ] Expose drives to behavior arbitration (Slice 32) as weight modulators
+      (fear → flee weight + speed, curiosity → investigate weight, fatigue → max
+      speed).
+- [ ] Add scalar-only `affect_threshold_crossed { entity, drive, rising }` events
+      for threshold crossings (panic onset/calm) at `domain_reaction`.
+
+Acceptance checks:
+
+- [ ] Scalar and SIMD affect updates produce identical results (parity test).
+- [ ] Drives stay bounded and decay to baseline with no inputs; updates are
+      allocation-free.
+- [ ] Threshold events are low-volume by construction and capacity-bounded.
+- [ ] `zig build test` covers appraisal, decay-to-baseline, and threshold events.
+
+## Slice 32: AI Behavior Arbitration
+
+Goal: select among composed behaviors (flee, pursue, investigate, group/cohere)
+by weighted arbitration over drives, memory, and perception, producing the
+existing `NavigationIntent` so downstream steering/pathfinding/movement are
+unchanged.
+
+Current foundation:
+
+- `AiBehavior` is `wander`/`seek` and `decideDir()` blends wander + seek +
+  separation (`systems/ai.zig`); AI emits `NavigationIntent` consumed by steering
+  (`simulation.zig`).
+- Slices 29–31 supply perception, memory, and affect inputs.
+
+Architecture notes:
+
+- Arbitration is a weighted blend (data-oriented), not an FSM, so it stays
+  vectorizable and emergent. Emergence comes from richer intent inputs, not new
+  pipeline plumbing — the intent → steering → pathfinding → movement contract is
+  untouched.
+
+Checklist:
+
+- [ ] Extend `AiBehavior` and `decideDir()` with `flee`, `pursue`, `investigate`,
+      and `group/cohere`.
+- [ ] Compute behavior selection as a weighted arbitration over affect drives
+      (31), memory (30), and perception (29), emitting `NavigationIntent` +
+      priority through the existing path.
+- [ ] Keep steering/pathfinding/movement and their merge contracts unchanged.
+
+Acceptance checks:
+
+- [ ] Behavior selection is deterministic and allocation-free; serial == threaded.
+- [ ] Downstream steering/pathfinding/movement contracts are unchanged (no new
+      pipeline stages downstream of AI).
+- [ ] `zig build test` covers each behavior's intent output and arbitration
+      blending.
+
+## Slice 33: Data-Driven AI Archetypes And Debug Introspection
+
+Goal: make the emergent-AI stack authorable without recompiling and observable
+for tuning.
+
+Current foundation:
+
+- Demo spawn specs are hardcoded in `game_demo_state.zig`; tuning drives or
+  behaviors means editing source.
+- A debug overlay exists in the render layer but has no AI introspection.
+- The atlas-metadata workflow is an established JSON-sidecar pattern to mirror.
+
+Checklist:
+
+- [ ] Add JSON-sidecar AI archetype definitions (faction, perception, memory,
+      affect, behavior tunables) resolved to component bundles at load, mirroring
+      the atlas-metadata workflow; validate strictly.
+- [ ] Migrate demo spawns to named archetypes (e.g. timid / curious /
+      aggressive) exercising emergent flee / pursue / investigate / cohere.
+- [ ] Extend the debug overlay to draw vision cones, drive bars, last-known
+      memory markers, current behavior, and Slice 24 scope/tier counts.
+
+Acceptance checks:
+
+- [ ] Archetypes load from data with strict validation and persist via stable
+      asset IDs / enum tunables, not paths or live handles.
+- [ ] Debug overlay visualizes perception, affect, memory, behavior, and scope
+      without affecting simulation determinism.
+- [ ] `zig build verify` passes; demo shows emergent interplay (timid agents
+      flee, curious investigate, threats pursue, crowds cohere).
+
+## Slice 34: Core SIMD Primitive Layer Expansion And Dense-Path Wins
+
+Goal: extend `src/core/simd.zig` with the vector primitives the SIMD-first
+gameplay/AI stages will need, and land the layout-independent dense-path
+vectorization wins that are measurable today. This is foundational and should
+land before the SIMD-first emergent-AI stages (Slices 29–32) so they build on
+shared primitives instead of each hand-rolling gather/rsqrt/normalize. The
+applicability policy itself already lives in `docs/coding-standards.md`.
+
+Why now: the primitive layer is foundation — its absence forces every new stage
+to reinvent gather and normalize and risks drift. The dense-path wins
+(sprite_batch, batched lerp) are low-risk and benchmarkable now via the existing
+render-prep profile. Restructuring the existing AI/steering hot loops is NOT in
+this slice — that is optimization that must be validated at battle scale and is
+deferred to Slice 35.
+
+Current foundation (already vectorized through `src/core/simd.zig`, with scalar
+tails, no raw `@Vector` in systems):
+
+- `systems/movement.zig` — position/velocity integration over SoA columns.
+- `systems/collision.zig` — broadphase AABB sweep and narrowphase contact math
+  (a locally hand-rolled `gather4` + masked select).
+- `systems/collision_response.zig` — normal/penetration/velocity correction math.
+- `systems/particle.zig` — particle integration and color/size lerp.
+- `systems/pathfinding.zig` — flow-field octile heuristic and nav-grid marking;
+  `pathfinding_range_alignment_items = simd.lane_count`.
+- The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp, and
+  tail helpers, with a single `lane_count` source of width.
+
+Gaps the SIMD-first stages need (the missing primitives):
+
+- No shared gather/scatter helper — collision hand-rolls `gather4`; AI/steering
+  and perception will all need the same.
+- No reciprocal/inverse sqrt and no vectorized 2D normalize (with a masked
+  zero-length guard) — required by every separation/avoidance/perception kernel.
+- No vector sin/cos approximation — Zig `@cos`/`@sin` do not auto-vectorize, and
+  rotation (sprites) and FOV (perception) math need it.
+- No documented packed-SoA-scratch idiom (gather sparse indices into contiguous
+  lanes) — the standard tool for making gather-bound loops vectorizable.
+
+Checklist:
+
+- [ ] Add gather/scatter helpers to `core/simd.zig`, generalizing collision's
+      local `gather4`; port collision to the shared helper.
+- [ ] Add reciprocal-sqrt / inverse-length and a vectorized 2D normalize with a
+      masked zero-guard (matching the scalar `normalizeOrZero` semantics).
+- [ ] Add a vector sin/cos (or sincos) approximation with a documented error
+      bound and a scalar fallback path.
+- [ ] Document the packed-SoA-scratch idiom in `core/simd.zig` (or a sibling
+      helper) so later stages reuse one gather-into-lanes pattern.
+- [ ] Vectorize the sprite vertex transform in `render/sprite_batch.zig`
+      (`writePreparedSpriteVertices` / `fillPreparedRange`): pack the 4-corner
+      rotation + translation + camera transform through the helpers over the
+      contiguous prepared-command array, mask the `coordinate_space` branch, keep
+      a scalar tail (~1.3–1.5x on large batches).
+- [ ] Replace the AI separation-grid zero-fill (`systems/ai.zig`) with `@memset`
+      or a vector fill.
+- [ ] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
+      when the interpolation pass iterates many entities over contiguous columns.
+
+Acceptance checks:
+
+- [ ] New primitives have unit tests and scalar-vs-SIMD parity tests; numeric
+      approximations (rsqrt, sin/cos) document error bounds and keep a scalar
+      fallback.
+- [ ] Collision narrowphase produces identical contacts after porting to the
+      shared gather helper (parity test).
+- [ ] `zig build bench` shows a render-prep vertex-emit win at 10k–50k sprites
+      with no regression at low counts.
+- [ ] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
+- [ ] `zig build verify` passes.
+
+## Slice 35: AI And Steering Hot-Loop SIMD Restructure
+
+Goal: restructure the existing scalar per-agent / per-neighbor loops in AI and
+steering into packed-SoA-scratch vectorized kernels, so they hold up in heavy
+scenes, large battles, and late-game worlds where they become the dominant cost.
+
+Why deferred (not part of Slice 34): this is optimization, not foundation, and
+its acceptance is defined at target scale. It needs the Slice 34 primitive layer,
+Slice 24 scoping (which determines how many entities actually reach these loops
+per step), and a way to spawn representative agent counts (Slice 33 archetypes or
+a stress spawner) so wins and regressions can be measured at battle scale rather
+than demo scale. Doing it before that is optimizing against guessed load, and the
+emergent-AI slices (29–32) will reshape these systems anyway — new stages are
+built SIMD-first per the track contract, so this slice targets the pre-existing
+loops.
+
+Current foundation:
+
+- AI separation accumulation and decision math (`systems/ai.zig`) and steering
+  neighbor/obstacle avoidance (`systems/steering.zig`) are scalar today because of
+  sparse-index gather and per-element early exits — a data-layout limitation, not
+  an inherent one.
+- Slice 34 supplies gather/rsqrt/normalize/sincos and the packed-SoA-scratch idiom.
+
+Checklist:
+
+- [ ] Restructure AI separation accumulation: gather each agent's in-range
+      neighbors once into packed SoA scratch, vectorize the
+      `dx, dy, dist2, inv_sqrt, accumulate` math, and replace the per-neighbor
+      early exit with a bounded mask.
+- [ ] Vectorize AI decision math (`decideDir`, wander/seek blend, normalize)
+      across agents using `select`-masked branches instead of per-agent control
+      flow.
+- [ ] Restructure steering neighbor/obstacle avoidance: pack sampled neighbors and
+      obstacle boxes into local SoA scratch, vectorize the
+      distance/push/normalize/blend force math, and keep the dynamic sampling
+      bound as a batched mask.
+
+Acceptance checks:
+
+- [ ] Each restructured path has scalar-vs-SIMD and serial-vs-threaded parity
+      tests (bit-stable across layouts).
+- [ ] `zig build bench` shows wins at high neighbor/agent counts measured at
+      target battle scale, with no regression at low counts.
+- [ ] Gather-into-SoA-scratch buffers are allocation-free after warmup and
+      reserved up front.
+- [ ] Only irreducibly scalar loops (pathfinding frontier traversal/portal
+      linking, particle swap-remove) remain scalar, each documented with the
+      reason per the coding-standards policy.
+- [ ] `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -2139,6 +2630,16 @@ corridor-shape change), a design decision left for a future slice.
 23. Atlas-backed world rendering addition.
 24. Scoped simulation tiers and chunk policy.
 25. Z-aware scalable navigation redesign.
+26. Entity faction and classification model.
+27. Deterministic per-entity RNG facility.
+28. Shared spatial index service.
+34. Core SIMD primitive layer expansion and dense-path wins.
+29. AI perception substrate.
+30. AI memory and scope-aware AI state policy.
+31. AI affect and emotion drives.
+32. AI behavior arbitration.
+33. Data-driven AI archetypes and debug introspection.
+35. AI and steering hot-loop SIMD restructure.
 
 This order records the dependency path used to build the current project
 foundation. Current work should be chosen from Next Priority Tracks above.
@@ -2156,3 +2657,12 @@ current structural, navigation, and world/chunk visibility foundation. Slice 24
 scoped simulation tiers should consume those world/chunk views next. Scoped
 tiers, chunk policy, and tier transitions should use those event signals through
 pipeline-owned controllers instead of adding parallel orchestration paths.
+The emergent-AI track (Slices 26–33) builds on that foundation: it lands the
+framework additions the AI work requires (faction classification, deterministic
+RNG, shared spatial index), then layers perception, memory, affect, and behavior
+arbitration as cognition-tier-gated processor stages, with data-driven archetypes
+and debug introspection for authoring and tuning. The whole track stays
+allocation-free on hot paths, deterministic (serial == threaded, scalar == SIMD),
+routes notable signals through scalar-only `domain_reaction` events while keeping
+per-frame sensing columnar, and reuses the existing intent → steering →
+pathfinding → movement contract instead of adding new downstream plumbing.
