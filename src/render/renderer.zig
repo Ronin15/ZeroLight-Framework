@@ -52,6 +52,13 @@ pub const FrameResult = enum {
     skipped_no_swapchain,
 };
 
+/// Opaque handle to a renderer-owned tilemap tile-data storage buffer. World and
+/// game code hold these per dense layer; the renderer owns the GPU resource.
+pub const TileDataId = enum(u32) {
+    invalid = std.math.maxInt(u32),
+    _,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
@@ -63,6 +70,10 @@ pub const Renderer = struct {
     vertex_transfer_buffer: *c.SDL_GPUTransferBuffer,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
+    // GPU-driven tilemap tile-data: one graphics-storage-read buffer per dense
+    // layer (a row-major copy of the world's dense_tile_ids). Renderer-owned so
+    // world keeps only opaque handles and never crosses the render/gpu boundary.
+    tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -165,6 +176,10 @@ pub const Renderer = struct {
             }
         }
         self.texture_slots.deinit(self.allocator);
+        for (self.tile_data_buffers.items) |buffer| {
+            c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        }
+        self.tile_data_buffers.deinit(self.allocator);
         self.deinitBatchStorage();
         self.static_vertices.deinit(self.allocator);
         self.static_groups.deinit(self.allocator);
@@ -592,6 +607,31 @@ pub const Renderer = struct {
         pitch: usize,
     ) !TextureId {
         return try self.createTextureFromPixelsInternal(pixels, width, height, pitch, false);
+    }
+
+    /// Creates a renderer-owned tile-data storage buffer from a row-major tile
+    /// array (one `u32` per cell) and returns its handle. Built once per dense
+    /// layer at world load; the tilemap fragment shader reads it directly.
+    pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32) !TileDataId {
+        const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
+        errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
+        if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
+        try self.tile_data_buffers.append(self.allocator, buffer);
+        return @enumFromInt(index);
+    }
+
+    /// Uploads a single tile (one cell) into a tile-data buffer — the dig path.
+    pub fn uploadTileDataElement(self: *Renderer, id: TileDataId, element_index: usize, value: u32) !void {
+        const buffer = self.tileDataBuffer(id) orelse return error.InvalidTileDataBuffer;
+        try gpu_buffer.uploadStorageElement(self.device, buffer, element_index, value);
+    }
+
+    fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
+        if (id == .invalid) return null;
+        const index = @intFromEnum(id);
+        if (index >= self.tile_data_buffers.items.len) return null;
+        return self.tile_data_buffers.items[index];
     }
 
     fn createInternalTextureFromPixels(

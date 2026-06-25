@@ -16,6 +16,7 @@ const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
+const TileDataId = @import("../render/renderer.zig").TileDataId;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const Vertex = @import("../render/renderer.zig").Vertex;
 const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
@@ -189,6 +190,11 @@ pub const WorldSystem = struct {
     dense_base_z: std.ArrayList(i32) = .empty,
     dense_depth_bands: std.ArrayList(WorldDepth) = .empty,
     dense_tile_ids: std.ArrayList(TileId) = .empty,
+    // One renderer-owned tile-data storage buffer per dense layer, built from
+    // dense_tile_ids at load. World holds only the opaque handles; the renderer
+    // owns and releases the GPU buffers. The tilemap shader reads these directly
+    // (Phase C), so per-tile vertex geometry is no longer built for dense layers.
+    dense_layer_tile_buffers: std.ArrayList(TileDataId) = .empty,
 
     sparse_level_indices: std.ArrayList(u16) = .empty,
     sparse_chunk_indices: std.ArrayList(u32) = .empty,
@@ -416,6 +422,7 @@ pub const WorldSystem = struct {
         self.sparse_chunk_indices.deinit(self.allocator);
         self.sparse_level_indices.deinit(self.allocator);
 
+        self.dense_layer_tile_buffers.deinit(self.allocator);
         self.dense_tile_ids.deinit(self.allocator);
         self.dense_depth_bands.deinit(self.allocator);
         self.dense_base_z.deinit(self.allocator);
@@ -615,6 +622,43 @@ pub const WorldSystem = struct {
 
     pub fn denseLayerCount(self: *const WorldSystem) usize {
         return self.dense_level_indices.items.len;
+    }
+
+    /// Widens a dense layer's row-major tile ids into `out` (one `u32` per cell)
+    /// for storage-buffer upload. `out.len` must equal `cellCount()`. The row-major
+    /// order here is exactly the tilemap shader's `cell.y * width + cell.x` read,
+    /// so the GPU lookup matches `cellIndex`. Load-time only (not a frame path).
+    fn writeDenseLayerTileData(self: *const WorldSystem, layer_index: usize, out: []u32) void {
+        const cells = self.cellCount();
+        std.debug.assert(out.len == cells);
+        const src = self.dense_tile_ids.items[self.denseLayerOffset(layer_index)..][0..cells];
+        for (src, out) |tile, *dst| dst.* = tile;
+    }
+
+    /// Builds one renderer-owned tile-data storage buffer per dense layer from
+    /// `dense_tile_ids`. Idempotent: a no-op once the buffers exist. Call once at
+    /// world load, before the tilemap layers are submitted for drawing.
+    pub fn uploadDenseLayerBuffers(self: *WorldSystem, renderer: *Renderer) !void {
+        const layer_count = self.denseLayerCount();
+        // Resume from the first not-yet-built layer, so a mid-loop failure can be
+        // retried to completion and a fully-built world is a no-op.
+        if (self.dense_layer_tile_buffers.items.len == layer_count) return;
+
+        const scratch = try self.allocator.alloc(u32, self.cellCount());
+        defer self.allocator.free(scratch);
+        try self.dense_layer_tile_buffers.ensureTotalCapacity(self.allocator, layer_count);
+        for (self.dense_layer_tile_buffers.items.len..layer_count) |layer_index| {
+            self.writeDenseLayerTileData(layer_index, scratch);
+            const id = try renderer.createTileDataBuffer(scratch);
+            self.dense_layer_tile_buffers.appendAssumeCapacity(id);
+        }
+    }
+
+    /// The tile-data storage buffer handle for a dense layer (`.invalid` until
+    /// `uploadDenseLayerBuffers` has run).
+    pub fn denseLayerTileBuffer(self: *const WorldSystem, layer_index: usize) TileDataId {
+        if (layer_index >= self.dense_layer_tile_buffers.items.len) return .invalid;
+        return self.dense_layer_tile_buffers.items[layer_index];
     }
 
     pub fn denseTileBlocksMovement(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) bool {
@@ -1535,6 +1579,33 @@ test "world dense layer uses row-major indexing" {
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.setDenseTile(0, 2, 1, grass);
     try std.testing.expectEqual(grass, world.denseTile(0, 2, 1));
+}
+
+test "dense layer tile-data staging matches denseTile by row-major cell index" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    defer world.deinit();
+
+    const grass = try world.requireTileByName(&meta, "grass");
+    _ = try world.setDenseTile(0, 2, 1, grass);
+
+    const staging = try std.testing.allocator.alloc(u32, world.cellCount());
+    defer std.testing.allocator.free(staging);
+    world.writeDenseLayerTileData(0, staging);
+
+    for (0..world.height) |y| {
+        for (0..world.width) |x| {
+            const xi: u16 = @intCast(x);
+            const yi: u16 = @intCast(y);
+            // The shader reads tile_ids[cell.y*width + cell.x]; cellIndex is that
+            // same index, so staging[cellIndex] must equal the logical tile.
+            try std.testing.expectEqual(
+                @as(u32, world.denseTile(0, xi, yi)),
+                staging[world.cellIndex(xi, yi)],
+            );
+        }
+    }
 }
 
 test "world rejects invalid tile ids before render" {

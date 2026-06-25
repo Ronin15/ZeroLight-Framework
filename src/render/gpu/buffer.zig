@@ -65,6 +65,120 @@ pub fn recordVertexUpload(
     copy_pass_open = false;
 }
 
+/// One tile-data storage element. `u32` (not the world's `u16`) keeps the
+/// storage layout portable — no 16-bit storage extension — and leaves room to
+/// pack variant/light/AO bits later without changing the buffer type.
+pub const StorageElement = u32;
+
+/// Creates a graphics-storage-read buffer holding `data` (one element per cell,
+/// row-major) and uploads it once via a transient command buffer. The returned
+/// buffer is read by the tilemap fragment shader; the caller owns its release.
+pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement) !*c.SDL_GPUBuffer {
+    if (data.len == 0) return error.EmptyStorageBuffer;
+    const bytes = std.mem.sliceAsBytes(data);
+    const upload_size = try checkedGpuBytes(bytes.len);
+
+    var buffer_info = std.mem.zeroes(c.SDL_GPUBufferCreateInfo);
+    buffer_info.usage = c.SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ;
+    buffer_info.size = upload_size;
+    const buffer = c.SDL_CreateGPUBuffer(device, &buffer_info) orelse {
+        return sdlError("SDL_CreateGPUBuffer");
+    };
+    errdefer c.SDL_ReleaseGPUBuffer(device, buffer);
+
+    var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
+    transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    transfer_info.size = upload_size;
+    const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
+        return sdlError("SDL_CreateGPUTransferBuffer");
+    };
+    defer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+        return sdlError("SDL_MapGPUTransferBuffer");
+    };
+    const mapped_bytes = @as([*]u8, @ptrCast(mapped))[0..bytes.len];
+    @memcpy(mapped_bytes, bytes);
+    c.SDL_UnmapGPUTransferBuffer(device, transfer);
+
+    const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
+        return sdlError("SDL_AcquireGPUCommandBuffer");
+    };
+    var command_buffer_finished = false;
+    errdefer if (!command_buffer_finished) {
+        _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+    };
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
+        return sdlError("SDL_BeginGPUCopyPass");
+    };
+    var source = c.SDL_GPUTransferBufferLocation{ .transfer_buffer = transfer, .offset = 0 };
+    var destination = c.SDL_GPUBufferRegion{ .buffer = buffer, .offset = 0, .size = upload_size };
+    c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
+    c.SDL_EndGPUCopyPass(copy_pass);
+
+    if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
+        return sdlError("SDL_SubmitGPUCommandBuffer");
+    }
+    command_buffer_finished = true;
+    return buffer;
+}
+
+/// Uploads a single storage element (one cell) at `element_index` — the dig
+/// path. One 4-byte transfer + region copy; no full-buffer re-upload.
+pub fn uploadStorageElement(
+    device: *c.SDL_GPUDevice,
+    buffer: *c.SDL_GPUBuffer,
+    element_index: usize,
+    value: StorageElement,
+) !void {
+    const element_size: u32 = @sizeOf(StorageElement);
+    const byte_offset = std.math.mul(usize, element_index, element_size) catch return error.GpuBufferTooLarge;
+    const offset = try checkedGpuBytes(byte_offset);
+
+    var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
+    transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    transfer_info.size = element_size;
+    const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
+        return sdlError("SDL_CreateGPUTransferBuffer");
+    };
+    defer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+        return sdlError("SDL_MapGPUTransferBuffer");
+    };
+    @as(*StorageElement, @ptrCast(@alignCast(mapped))).* = value;
+    c.SDL_UnmapGPUTransferBuffer(device, transfer);
+
+    const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
+        return sdlError("SDL_AcquireGPUCommandBuffer");
+    };
+    var command_buffer_finished = false;
+    errdefer if (!command_buffer_finished) {
+        _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+    };
+
+    const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
+        return sdlError("SDL_BeginGPUCopyPass");
+    };
+    var source = c.SDL_GPUTransferBufferLocation{ .transfer_buffer = transfer, .offset = 0 };
+    var destination = c.SDL_GPUBufferRegion{ .buffer = buffer, .offset = offset, .size = element_size };
+    c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
+    c.SDL_EndGPUCopyPass(copy_pass);
+
+    if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
+        return sdlError("SDL_SubmitGPUCommandBuffer");
+    }
+    command_buffer_finished = true;
+}
+
+/// Byte size of a `count`-element storage buffer, rejecting overflow of the
+/// SDL `u32` size field.
+pub fn storageByteSize(element_count: usize) error{GpuBufferTooLarge}!u32 {
+    const bytes = std.math.mul(usize, element_count, @sizeOf(StorageElement)) catch return error.GpuBufferTooLarge;
+    return checkedGpuBytes(bytes);
+}
+
 fn vertexByteSize(vertex_capacity: usize) error{GpuBufferTooLarge}!u32 {
     const bytes = std.math.mul(usize, vertex_capacity, @sizeOf(sprite_batch.Vertex)) catch return error.GpuBufferTooLarge;
     return checkedGpuBytes(bytes);
@@ -87,6 +201,15 @@ test "vertex buffer byte sizing rejects overflow and SDL u32 overflow" {
     try std.testing.expectError(
         error.GpuBufferTooLarge,
         vertexByteSize(@as(usize, std.math.maxInt(u32)) / @sizeOf(sprite_batch.Vertex) + 1),
+    );
+}
+
+test "storage byte sizing is 4 bytes per element and rejects overflow" {
+    try std.testing.expectEqual(@as(u32, 16), try storageByteSize(4));
+    try std.testing.expectError(error.GpuBufferTooLarge, storageByteSize(std.math.maxInt(usize)));
+    try std.testing.expectError(
+        error.GpuBufferTooLarge,
+        storageByteSize(@as(usize, std.math.maxInt(u32)) / @sizeOf(StorageElement) + 1),
     );
 }
 
