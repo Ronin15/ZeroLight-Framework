@@ -157,6 +157,8 @@ pub const GameDemoState = struct {
                 bounds_width,
                 bounds_height,
             ),
+            // No thread system on this path (tests): serial, slot 0 only.
+            1,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -183,6 +185,9 @@ pub const GameDemoState = struct {
             world.worldWidthPixels(),
             world.worldHeightPixels(),
             world,
+            // The configured threaded participant count is fixed at this point; the
+            // pathfinding A* scratch is sized for it during the nav build.
+            thread_system.participantSlotCount(),
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -196,6 +201,7 @@ pub const GameDemoState = struct {
         simulation_bounds_width: f32,
         simulation_bounds_height: f32,
         world_value: WorldSystem,
+        worker_participant_count: usize,
     ) !GameDemoState {
         var world = world_value;
         errdefer world.deinit();
@@ -237,6 +243,9 @@ pub const GameDemoState = struct {
             .pathfinding = .{
                 .max_group_fields = 4,
                 .max_agent_budget = 4096,
+                // Configured threaded participant count; A* scratch is sized for it in
+                // the nav build so the first threaded solve does no lazy allocation.
+                .worker_participant_count = worker_participant_count,
             },
             .navigation_world = &world,
         });
@@ -1171,7 +1180,9 @@ const ObstacleSpec = struct {
 fn initDemoForTest(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     const world = try WorldSystem.initDemoFromAssetStore(allocator, asset_store, bounds_width, bounds_height);
-    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world);
+    // The helper-based demo tests dispatch with a 0-worker thread system
+    // (participantSlotCount = 1), so one scratch slot suffices.
+    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world, 1);
 }
 
 fn runtimeAssetsWithWorldTexture() !RuntimeAssets {

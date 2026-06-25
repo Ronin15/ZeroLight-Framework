@@ -63,7 +63,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
         .max_pending_requests = count,
         .max_cached_results = count * 2,
         .max_group_fields = 4,
-        .max_worker_scratch_slots = 1,
+        .worker_participant_count = 1,
         .max_solved_requests_per_step = count,
     });
     var agents = std.ArrayList(EntityId).empty;

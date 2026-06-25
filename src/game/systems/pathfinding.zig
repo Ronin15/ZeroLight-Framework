@@ -38,7 +38,11 @@ const default_cell_size: f32 = 32.0;
 const default_max_frame_requests: usize = 1024;
 const default_max_pending_requests: usize = 1024;
 const default_max_cached_results: usize = 1024;
-const default_max_worker_scratch_slots: usize = 64;
+// Threaded participant slots (workers + main thread). A FIXED property of the
+// configured thread system, not a per-frame discovery: exactly this many per-cell A*
+// scratch slots get O(cells) arrays, sized once during the nav build. Default 1 is
+// the serial path (slot 0 only); the pipeline plumbs the real participant count.
+const default_worker_participant_count: usize = 1;
 const default_max_solved_requests_per_step: usize = 128;
 pub const default_max_fallback_requests_per_step: usize = 128;
 // Budget-bounded A* scratch is sized to this many explored nodes rather than the
@@ -51,14 +55,14 @@ const default_max_stored_path_cells: usize = 512;
 const default_max_group_fields: usize = 4;
 const default_group_field_rebuild_min_steps: u32 = 30;
 const default_group_field_build_budget: usize = 8192;
-// Floor for the group-field agent threshold. The operating threshold is derived
-// each step as a RATIO of the live capacity (see group_field_agent_ratio), so the
-// field engages with ~a quarter of the crowd at any scale. This is only a hard
-// minimum so a tiny crowd never builds a field for one or two agents.
-const default_min_group_field_agents: usize = 2;
-// Fraction of the live capacity that must share a goal before a flow field is
-// built. At 4096-agent scale this is ~1024; at tiny scale the min floor dominates.
-const default_group_field_agent_ratio: f32 = 0.25;
+// Group-field threshold: a flow-field build is O(cells), so the shared field earns
+// its build only at grid-scale crowds, not a population fraction. Threshold =
+// clamp(cellCount / cells_per_group_agent, floor, budget); auto-scales with world
+// size. The divisor and floor are tuning knobs (256 lands the 512x512 demo on ~1024),
+// not measured constants. A non-zero min_group_field_agents pins it instead (tests); 0 derives.
+const default_min_group_field_agents: usize = 0;
+const default_cells_per_group_agent: usize = 256;
+const group_field_threshold_floor: usize = 64;
 // Hard ceiling on the elastically-derived per-step/memory capacity. The only fixed
 // capacity number; requests beyond it follow the existing dropped_requests path.
 // Caps worst-case resident memory so a safe-point resize can never OOM.
@@ -180,7 +184,9 @@ pub const PathfindingCapacity = struct {
     max_frame_requests: usize = default_max_frame_requests,
     max_pending_requests: usize = default_max_pending_requests,
     max_cached_results: usize = default_max_cached_results,
-    max_worker_scratch_slots: usize = default_max_worker_scratch_slots,
+    // Threaded participant slots (workers + 1). Set from the configured thread system
+    // by the pipeline; each gets an O(cells) A* scratch slot sized during the build.
+    worker_participant_count: usize = default_worker_participant_count,
     max_solved_requests_per_step: usize = default_max_solved_requests_per_step,
     max_fallback_requests_per_step: usize = default_max_fallback_requests_per_step,
     // Budget-bounded A* sizing.
@@ -201,11 +207,9 @@ pub const PathfindingCapacity = struct {
     max_group_fields: usize = default_max_group_fields,
     group_field_rebuild_min_steps: u32 = default_group_field_rebuild_min_steps,
     group_field_build_budget: usize = default_group_field_build_budget,
-    // Hard floor for the group-field threshold. The operating threshold is derived
-    // each step from group_field_agent_ratio x live capacity, clamped up to this.
+    // Pins the group-field threshold when non-zero; 0 derives it from grid size (see
+    // groupFieldThreshold). Non-zero is for tests exercising field mechanics.
     min_group_field_agents: usize = default_min_group_field_agents,
-    // Fraction of the live capacity sharing a goal before a flow field builds.
-    group_field_agent_ratio: f32 = default_group_field_agent_ratio,
     // Elastic capacity ceiling (the only fixed capacity number). Live capacity
     // tracks the agent count up to this, then requests follow dropped_requests.
     max_agent_budget: usize = default_max_agent_budget,
@@ -1264,7 +1268,7 @@ const NavMemoryBudget = struct {
     // than cell count.
     max_explored_nodes: usize,
     max_stored_path_cells: usize,
-    max_worker_scratch_slots: usize,
+    worker_participant_count: usize,
     max_cached_results: usize,
     max_solved_requests_per_step: usize,
     max_stitched_path_cells: usize,
@@ -1303,12 +1307,11 @@ const NavMemoryBudget = struct {
         const static_bytes = per_level_bytes *| levels;
         // Group-field registry: max_group_fields x cells x per-cell field bytes.
         const group_registry_bytes = self.max_group_fields *| cell_count *| self.group_field_bytes_per_cell;
-        // Per-worker A* scratch is direct per-cell arrays, so each slot is O(cells),
-        // not O(node budget). The gate counts it so an over-provisioned slot count on a
-        // large world fails loud here rather than degrading at query time. Kept
-        // conservative (slot cap, not participant count) so the gate never under-budgets;
-        // actual resident scratch is now bounded by participant count (ensureWorkerScratch).
-        const scratch_bytes = self.max_worker_scratch_slots *| cell_count *| scratch_slot_bytes;
+        // Per-participant A* scratch is direct per-cell arrays, so each slot is
+        // O(cells). The gate counts exactly the participant slots that are sized during
+        // the build (the real resident scratch), so a large world fails loud here
+        // rather than degrading at query time.
+        const scratch_bytes = self.worker_participant_count *| cell_count *| scratch_slot_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.
@@ -2097,11 +2100,9 @@ pub const PathfindingSystem = struct {
     group_fields: std.ArrayList(GroupField) = .empty,
     // Requested group goal keys this step (declared, never detected).
     group_requests: std.ArrayList(GroupRequestTally) = .empty,
+    // One per-cell A* scratch slot per configured threaded participant (workers + 1);
+    // all O(cells) arrays are sized during the nav build, not lazily on first solve.
     scratch_slots: std.ArrayList(SearchScratch) = .empty,
-    // Grid cell count the per-cell scratch arrays are sized against. Only slots that
-    // will actually be indexed get O(cells) arrays (sized lazily by participant count
-    // in the threaded path); the rest stay empty until used.
-    scratch_cell_count: usize = 0,
     // Per-worker reconstructed paths, written into completed by the main thread
     // after the worker batch finishes.
     solved_paths: std.ArrayList(SolvedPath) = .empty,
@@ -2202,13 +2203,15 @@ pub const PathfindingSystem = struct {
         return cap;
     }
 
-    // Effective group-field threshold for the current live capacity: ratio x the
-    // in-flight request capacity, clamped up to the configured floor. Scales the
-    // group path with the crowd (a few agents at tiny scale, ~1024 near the ceiling)
-    // without a knob to bump.
+    // See default_cells_per_group_agent for the model. Capped by max_agent_budget (the
+    // hard ceiling), NOT live max_pending_requests, or the small live crowd would pull
+    // the threshold to demo scale. A sub-floor budget can cap below the floor; cellCount
+    // 0 (no graph yet) yields the floor.
     fn groupFieldThreshold(self: *const PathfindingSystem) usize {
-        const ratio_term: usize = @intFromFloat(@floor(self.capacity.group_field_agent_ratio * @as(f32, @floatFromInt(self.capacity.max_pending_requests))));
-        return @max(self.capacity.min_group_field_agents, ratio_term);
+        if (self.capacity.min_group_field_agents != 0) return self.capacity.min_group_field_agents;
+        const derived = self.graph.cellCount() / default_cells_per_group_agent;
+        const ceiling = @max(min_capacity_floor, self.capacity.max_agent_budget);
+        return @min(@max(derived, group_field_threshold_floor), ceiling);
     }
 
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) !void {
@@ -2240,7 +2243,10 @@ pub const PathfindingSystem = struct {
             self.group_fields.appendAssumeCapacity(.{});
         }
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
-        const scratch_slots = @max(@as(usize, 1), capacity.max_worker_scratch_slots);
+        // One scratch slot per threaded participant (workers + main). The configured
+        // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
+        // lazily on first solve.
+        const scratch_slots = @max(@as(usize, 1), capacity.worker_participant_count);
         try self.scratch_slots.ensureTotalCapacity(self.allocator, scratch_slots);
         while (self.scratch_slots.items.len < scratch_slots) {
             self.scratch_slots.appendAssumeCapacity(.{});
@@ -2268,8 +2274,9 @@ pub const PathfindingSystem = struct {
     // pending/pending_keys/group_requests/completed/unavailable hold cross-step state;
     // resize wipes the reconstructable caches and round-trips the non-reconstructable
     // pending deferred work + group tally through reusable snapshots, then rebuilds
-    // pending_keys from the restored pending. scratch_slots are participant-derived
-    // (ensureWorkerScratch) and not touched here. No worker is running.
+    // pending_keys from the restored pending. The scratch_slots count is the fixed
+    // configured participant count (unchanged by an elastic resize) and its per-cell
+    // arrays were sized at the nav build, so this never touches them. No worker runs.
     fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize) !void {
         if (self.effective_agent_capacity == 0) return; // not reserved yet
         const target = deriveCapacity(self.capacity, agent_count).max_pending_requests;
@@ -2346,7 +2353,7 @@ pub const PathfindingSystem = struct {
             .max_group_fields = self.capacity.max_group_fields,
             .max_explored_nodes = self.capacity.max_explored_nodes,
             .max_stored_path_cells = self.capacity.max_stored_path_cells,
-            .max_worker_scratch_slots = @max(@as(usize, 1), self.capacity.max_worker_scratch_slots),
+            .worker_participant_count = @max(@as(usize, 1), self.capacity.worker_participant_count),
             .max_cached_results = self.capacity.max_cached_results,
             .max_solved_requests_per_step = self.capacity.max_solved_requests_per_step,
             .max_stitched_path_cells = self.capacity.max_stitched_path_cells,
@@ -2364,14 +2371,13 @@ pub const PathfindingSystem = struct {
         for (self.group_fields.items) |*field| {
             try field.reserve(self.allocator, cell_count);
         }
-        // Per-cell A* scratch is O(cells) per slot, but only participant-count slots
-        // (~workers+1) are ever indexed. Size slot 0 here (the serial updateSerial
-        // path) and defer the rest to ensureWorkerScratch, called from the threaded
-        // update once the participant count is known — so resident scratch is bounded
-        // by participants, not the slot cap.
-        self.scratch_cell_count = cell_count;
-        if (self.scratch_slots.items.len != 0) {
-            try self.scratch_slots.items[0].reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
+        // Per-cell A* scratch is O(cells) per slot. The participant count is a fixed
+        // configured property, so size EVERY participant slot here as part of the build
+        // (the O(cells) memset hides in this one-time build cost) — no lazy per-frame
+        // sizing. Resident scratch is bounded by participant count, not any slot cap.
+        // A nav rebuild with a new cell_count re-sizes all slots the same way.
+        for (self.scratch_slots.items) |*scratch| {
+            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, cell_count);
         }
         // Pre-reserve the per-level affected-flag scratch so a steady-path
         // applyNavUpdates allocates nothing per edit.
@@ -2517,21 +2523,6 @@ pub const PathfindingSystem = struct {
         return .{ .status = .missing };
     }
 
-    // Lazily sizes the per-cell A* scratch arrays for slots [0, slot_count) to the
-    // current grid cell count. Idempotent: a slot already sized for this cell count is
-    // skipped, so this is a no-op after the first post-rebuild frame, preserving the
-    // allocation-free-after-warmup contract. Called from the single-threaded point in
-    // the threaded update before dispatch (allocation is safe there).
-    fn ensureWorkerScratch(self: *PathfindingSystem, slot_count: usize) !void {
-        const limit = @min(slot_count, self.scratch_slots.items.len);
-        var i: usize = 0;
-        while (i < limit) : (i += 1) {
-            const scratch = &self.scratch_slots.items[i];
-            if (scratch.cell_count == self.scratch_cell_count) continue;
-            try scratch.reserve(self.allocator, self.capacity.max_explored_nodes, self.capacity.max_stored_path_cells, self.capacity.max_abstract_nodes, self.capacity.max_stitched_path_cells, self.scratch_cell_count);
-        }
-    }
-
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         self.step_counter +%= 1;
         // Safe-point elastic resize: single-threaded, after last frame's publish and
@@ -2558,11 +2549,11 @@ pub const PathfindingSystem = struct {
             if (system_config.adaptive and system_config.fallback_adaptive_tuner == null and system_config.items_per_range == null) {
                 system_config.fallback_adaptive_tuner = &self.fallback_tuner;
             }
+            // The configured participant count sized the per-cell scratch at the nav
+            // build; this is the safety assertion that the live thread system never
+            // exceeds it. No allocation here — the solve loop is allocation-free.
             const participants = thread_system.participantSlotCount();
             if (participants > self.scratch_slots.items.len) return error.PathfindingScratchCapacityExceeded;
-            // Single-threaded point: size per-cell scratch for the slots this batch
-            // will actually index (no-op after the first post-rebuild frame).
-            try self.ensureWorkerScratch(participants);
             self.resetSolvedPaths();
             var context = SolveJobContext{ .system = self };
             stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
@@ -2733,16 +2724,11 @@ pub const PathfindingSystem = struct {
 
     // Builds/advances managed shared-goal flow fields for declared group goals.
     // Lazy on first request, throttled on goal-cell change, budgeted per frame.
-    // The min_group_field_agents threshold is checked against the cross-step
-    // accumulator (acceptRequests), so it reflects SUSTAINED shared-goal demand
-    // (~2x per-step intake at equilibrium), not a single-step burst. Raising
-    // min_group_field_agents for scale also requires raising the per-step request
-    // budget (max_frame_requests / max_solved_requests_per_step) so the accumulator
-    // can actually reach the threshold.
+    // The threshold is checked against the cross-step accumulator (acceptRequests),
+    // so it reflects SUSTAINED shared-goal demand (~2x per-step intake at
+    // equilibrium), not a single-step burst.
     fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
         if (!self.graph.valid()) return;
-        // Threshold scales with the live capacity (ratio x in-flight request cap,
-        // floored), so the group path engages at a fixed crowd fraction at any scale.
         const threshold = self.groupFieldThreshold();
         // Advance any field still building, on its own goal level.
         for (self.group_fields.items) |*field| {
@@ -3595,13 +3581,12 @@ fn appendPathRequest(stream: *RangeOutputStream(PathRequest), request: PathReque
 fn baselineCapacity() PathfindingCapacity {
     // Per-step request/cache caps are derived elastically from the agent count
     // (floored at min_capacity_floor = 8), so only the non-derived knobs are set
-    // here. The ratio is zeroed so min_group_field_agents is the sole operating
-    // group-field threshold: these tests exercise the field mechanics with a handful
-    // of agents at an explicit threshold, independent of capacity scale.
+    // here. An explicit min_group_field_agents pins the group-field threshold so
+    // these tests exercise the field mechanics with a handful of agents, bypassing
+    // the grid-derived threshold (which would otherwise require hundreds of sharers).
     return .{
         .max_group_fields = 2,
-        .max_worker_scratch_slots = 1,
-        .group_field_agent_ratio = 0,
+        .worker_participant_count = 1,
         .min_group_field_agents = 1,
     };
 }
@@ -3818,7 +3803,7 @@ test "pathfinding deferred_requests equals pending in threaded update path" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     var capacity = baselineCapacity();
-    capacity.max_worker_scratch_slots = 4;
+    capacity.worker_participant_count = 4;
     try system.reserve(capacity);
     try system.rebuildStaticNavGrid(&data, 256, 256, 32);
 
@@ -4209,7 +4194,7 @@ test "pathfinding threaded solve matches serial solve" {
     var threaded_system = PathfindingSystem.init(std.testing.allocator);
     defer threaded_system.deinit();
     var threaded_capacity = baselineCapacity();
-    threaded_capacity.max_worker_scratch_slots = 3;
+    threaded_capacity.worker_participant_count = 3;
     try threaded_system.reserve(threaded_capacity);
     try threaded_system.rebuildStaticNavGrid(&data, 160, 160, 32);
 
@@ -4253,7 +4238,7 @@ test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
     var threaded_system = PathfindingSystem.init(std.testing.allocator);
     defer threaded_system.deinit();
     var threaded_cap = serial_cap;
-    threaded_cap.max_worker_scratch_slots = 4;
+    threaded_cap.worker_participant_count = 4;
     try threaded_system.reserve(threaded_cap);
     try threaded_system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
@@ -4375,7 +4360,7 @@ fn abstractCapacity() PathfindingCapacity {
         .max_pending_requests = 8,
         .max_cached_results = 16,
         .max_group_fields = 2,
-        .max_worker_scratch_slots = 1,
+        .worker_participant_count = 1,
         .max_solved_requests_per_step = 8,
         .max_fallback_requests_per_step = 8,
         .nav_chunk_tiles = 4,
@@ -5667,7 +5652,7 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     }
 }
 
-test "pathfinding group-field threshold scales with the live capacity ratio" {
+test "pathfinding group-field threshold derives from grid size, not population" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
@@ -5675,19 +5660,22 @@ test "pathfinding group-field threshold scales with the live capacity ratio" {
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    // Real default ratio (0.25), tiny budget so the floor governs at small scale.
-    try system.reserve(.{ .max_group_fields = 2, .max_worker_scratch_slots = 1, .max_agent_budget = 64 });
-    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+    // No explicit min_group_field_agents (derive from grid). Budget large enough that
+    // the grid-derived threshold, not the population cap, governs on the demo grid.
+    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
+    // 512x512 px / 32 px cell = 16x16 = 256 cells... use the demo's nav resolution:
+    // a 512x512-cell grid (512x512 world at 1px cells) gives 262144 cells.
+    try system.rebuildStaticNavGrid(&data, 16384, 16384, 32);
+    try std.testing.expectEqual(@as(usize, 512 * 512), system.graph.cellCount());
 
-    // At the floor capacity (8), the threshold is ratio x cap = floor(0.25 x 8) = 2:
-    // a tiny crowd engages the field with few agents, with no knob to bump.
-    try std.testing.expectEqual(@as(usize, 2), system.groupFieldThreshold());
+    // 262144 / 256 = 1024 same-goal sharers required before the field builds.
+    try std.testing.expectEqual(@as(usize, 1024), system.groupFieldThreshold());
 
+    // A small same-goal group at this grid size never reaches the threshold, so no
+    // O(cells) flow field is built (the demo's 8 agents stay on individual A*).
     const goal = math.Vec2{ .x = 400, .y = 400 };
     var built: usize = 0;
-    // Two same-goal group agents per step reach the scaled threshold via the decaying
-    // accumulator (equilibrium ~2x intake), so the field engages at small scale.
-    for (0..4) |_| {
+    for (0..8) |_| {
         var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer stream.deinit();
         try stream.reserve(2, 2);
@@ -5696,5 +5684,28 @@ test "pathfinding group-field threshold scales with the live capacity ratio" {
         const stats = try system.updateSerial(&stream, 2, .{});
         built += stats.group_fields_built;
     }
-    try std.testing.expect(built >= 1);
+    try std.testing.expectEqual(@as(usize, 0), built);
+}
+
+test "pathfinding group-field threshold floors on a tiny grid and caps by population" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
+    // A 32x32-cell grid (1024 cells) would derive 1024/256 = 4, below the floor (64),
+    // so the floor governs.
+    try system.rebuildStaticNavGrid(&data, 1024, 1024, 32);
+    try std.testing.expectEqual(@as(usize, 32 * 32), system.graph.cellCount());
+    try std.testing.expectEqual(group_field_threshold_floor, system.groupFieldThreshold());
+
+    // With a tiny budget (max possible population 8) below the floor, the budget cap
+    // wins so the threshold never demands more sharers than can ever exist.
+    var capped = PathfindingSystem.init(std.testing.allocator);
+    defer capped.deinit();
+    try capped.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
+    try capped.rebuildStaticNavGrid(&data, 1024, 1024, 32);
+    try std.testing.expectEqual(@as(usize, 8), capped.groupFieldThreshold());
 }

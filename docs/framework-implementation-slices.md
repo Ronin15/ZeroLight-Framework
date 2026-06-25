@@ -1942,9 +1942,9 @@ nav ≈ `L·(C/8 bitset + 4·C components) + links·16`. The per-worker local A*
 is now generation-stamped DIRECT per-cell arrays (g-cost + parent + stamp + closed
 ≈ 13 B/cell), so A* scratch ≈ `slots · C · 13 B` — O(cells) instead of
 O(`max_explored_nodes`). This is a deliberate speed-for-bounded-memory trade (O(1)
-node access, no hash probes); the build-time `max_nav_memory_bytes` gate counts it,
-so an over-provisioned `max_worker_scratch_slots` on a large world fails loud at the
-gate. `max_explored_nodes` remains the per-solve node BUDGET (a spill cap), enforced
+node access, no hash probes); slots = `worker_participant_count` (workers+1, sized at
+the build), and the build-time `max_nav_memory_bytes` gate counts exactly that
+resident scratch, so a large world that exceeds the budget fails loud at the gate. `max_explored_nodes` remains the per-solve node BUDGET (a spill cap), enforced
 by an explicit expansion counter rather than a hash-table-full condition.
 `components` width (u32→u16 or abstract-graph-only reachability) is a
 future memory lever for very large worlds.

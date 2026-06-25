@@ -155,15 +155,9 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
     const grid_side = fixtureGridSide(item_count, .common_goal);
     const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .max_worker_scratch_slots = 64,
-        // Let elastic capacity grow to the full benchmark item count (some profiles
-        // exceed the default ceiling); agent_count drives the per-step caps.
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
+    // Build the thread system first so the pathfinding system is sized for its real
+    // participant count (workers + 1); each participant gets one O(cells) A* slot.
     var threads: ?ThreadSystem = null;
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
@@ -172,6 +166,16 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         });
     }
     defer if (threads) |*thread_system| thread_system.deinit();
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = 8,
+        .worker_participant_count = participant_count,
+        // Let elastic capacity grow to the full benchmark item count (some profiles
+        // exceed the default ceiling); agent_count drives the per-step caps.
+        .max_agent_budget = @max(item_count, 1),
+    });
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
     system.clearRuntimeState();
     _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
@@ -250,15 +254,9 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
 
     const grid_side = fixtureGridSide(item_count, workload);
     const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
-    try system.reserve(PathfindingCapacity{
-        .max_group_fields = 8,
-        .max_worker_scratch_slots = 64,
-        // Elastic capacity grows to the benchmark item count; the per-step solve and
-        // fallback budgets are still applied via the config each runColdOnce.
-        .max_agent_budget = @max(item_count, 1),
-    });
-    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
+    // Build the thread system first so the pathfinding A* scratch is sized for the
+    // real participant count (workers + 1) during the nav build, not lazily.
     var threads: ?ThreadSystem = null;
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
@@ -267,6 +265,16 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
         });
     }
     defer if (threads) |*thread_system| thread_system.deinit();
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = 8,
+        .worker_participant_count = participant_count,
+        // Elastic capacity grows to the benchmark item count; the per-step solve and
+        // fallback budgets are still applied via the config each runColdOnce.
+        .max_agent_budget = @max(item_count, 1),
+    });
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
     system.clearRuntimeState();
     _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);

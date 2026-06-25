@@ -320,7 +320,7 @@ test "pipeline updates full active player-only state through serial path" {
             .max_pending_requests = 2,
             .max_cached_results = 4,
             .max_group_fields = 1,
-            .max_worker_scratch_slots = 4,
+            .worker_participant_count = 1,
             .max_solved_requests_per_step = 2,
             .max_fallback_requests_per_step = 2,
         },
