@@ -41,26 +41,6 @@ pub const TileFlags = packed struct(u8) {
     reserved: u5 = 0,
 };
 
-pub const WorldRenderStats = struct {
-    levels: usize = 0,
-    chunks: usize = 0,
-    visible_chunks: usize = 0,
-    total_tiles: usize = 0,
-    visible_tiles: usize = 0,
-    emitted_sprite_tiles: usize = 0,
-    missing_source_rects: usize = 0,
-
-    pub fn add(self: *WorldRenderStats, other: WorldRenderStats) void {
-        self.levels = @max(self.levels, other.levels);
-        self.chunks = @max(self.chunks, other.chunks);
-        self.visible_chunks = @max(self.visible_chunks, other.visible_chunks);
-        self.total_tiles = @max(self.total_tiles, other.total_tiles);
-        self.visible_tiles += other.visible_tiles;
-        self.emitted_sprite_tiles += other.emitted_sprite_tiles;
-        self.missing_source_rects += other.missing_source_rects;
-    }
-};
-
 pub const WorldBuildConfig = struct {
     width_tiles: u16 = 512,
     height_tiles: u16 = 512,
@@ -254,6 +234,10 @@ pub const WorldSystem = struct {
     chunk_layer_vertex_count: std.ArrayList(u32) = .empty,
     chunk_layer_dirty: std.ArrayList(bool) = .empty,
     chunk_layer_vertices: std.ArrayList(Vertex) = .empty,
+    // World atlas dimensions captured at init, the single source of truth for static
+    // tile UVs. Lets the cache pre-warm at load (off the first render frame) without
+    // a renderer handle; submit asserts the runtime texture matches in safe builds.
+    atlas_texture: TextureDesc = .{ .width = 0, .height = 0 },
     static_dirty_scratch: std.ArrayList(u32) = .empty,
     // Dedicated tuner so the static-cache build's threading decisions don't share
     // timing with the per-frame sprite-prep or simulation stages (engine pattern).
@@ -297,6 +281,7 @@ pub const WorldSystem = struct {
             .height = @max(config.height_tiles, 1),
             .tile_size = meta.tileSize(),
             .chunk_size_tiles = @max(config.chunk_size_tiles, 1),
+            .atlas_texture = atlasTextureDesc(meta),
         };
         errdefer world.deinit();
 
@@ -333,6 +318,9 @@ pub const WorldSystem = struct {
 
         try world.addProceduralSparseTiles(level, ids, config.seed);
         try world.rebuildChunks();
+        // Pre-warm the static tile cache at load so the full-world vertex build runs
+        // here (threaded), not as a hitch on the first render frame.
+        try world.ensureStaticCache(world.atlas_texture, thread_system);
         return world;
     }
 
@@ -351,6 +339,7 @@ pub const WorldSystem = struct {
             .height = height,
             .tile_size = tile_size,
             .chunk_size_tiles = default_chunk_size_tiles,
+            .atlas_texture = atlasTextureDesc(meta),
         };
         errdefer world.deinit();
 
@@ -384,6 +373,8 @@ pub const WorldSystem = struct {
         _ = try world.addSparseTile(level, (width * 3) / 4, (height * 2) / 3, deco, 0, .obstacle);
 
         try world.rebuildChunks();
+        // Small demo world: pre-warm inline so first-frame render just gathers spans.
+        try world.ensureStaticCache(world.atlas_texture, null);
         return world;
     }
 
@@ -530,9 +521,17 @@ pub const WorldSystem = struct {
         thread_system: ?*ThreadSystem,
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
-        const texture = renderer.textureDesc(prepared.texture) orelse return error.WorldTilesetTextureUnavailable;
-        try self.ensureStaticCache(texture, thread_system);
+        try self.ensureStaticCache(self.atlas_texture, thread_system);
         if (!self.static_submit_dirty) return;
+
+        // UVs are baked from the world atlas dimensions captured at init; the bound
+        // runtime texture must match. Checked only on a re-submit (pan/dig), not on
+        // still frames, and compiles out of release builds.
+        if (std.debug.runtime_safety) {
+            if (renderer.textureDesc(prepared.texture)) |desc| {
+                std.debug.assert(desc.width == self.atlas_texture.width and desc.height == self.atlas_texture.height);
+            }
+        }
 
         const counts = self.visibleStaticCounts();
         try renderer.reserveStaticGeometry(counts.vertices, counts.spans);
@@ -566,8 +565,7 @@ pub const WorldSystem = struct {
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
         const bounds = self.visibleTileBounds();
-        var stats = WorldRenderStats{};
-        try self.submitVisibleSparseRange(renderer, prepared, bounds, depth, &stats);
+        try self.submitVisibleSparseRange(renderer, prepared, bounds, depth);
     }
 
     pub fn firstVisibleSparseDepth(self: *const WorldSystem) ?i32 {
@@ -943,7 +941,6 @@ pub const WorldSystem = struct {
         prepared: PreparedSprite,
         bounds: VisibleTileBounds,
         depth: i32,
-        stats: *WorldRenderStats,
     ) !void {
         const range = self.sparseDepthRange(depth) orelse return;
         for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
@@ -953,7 +950,7 @@ pub const WorldSystem = struct {
             const tile_id = self.sparse_tile_ids.items[index];
             const x: u16 = @intCast(cell % self.width);
             const y: u16 = @intCast(cell / self.width);
-            try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth), stats);
+            try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth));
         }
     }
 
@@ -965,13 +962,8 @@ pub const WorldSystem = struct {
         x: u16,
         y: u16,
         order: RenderOrder,
-        stats: *WorldRenderStats,
     ) !void {
-        stats.visible_tiles += 1;
-        const source = self.sourceRect(tile_id) orelse {
-            stats.missing_source_rects += 1;
-            return error.MissingTileSourceRect;
-        };
+        const source = self.sourceRect(tile_id) orelse return error.MissingTileSourceRect;
         try renderer.submitOrderedSprite(.{
             .texture = prepared.texture,
             .source = source,
@@ -983,7 +975,6 @@ pub const WorldSystem = struct {
             },
             .order = order,
         });
-        stats.emitted_sprite_tiles += 1;
     }
 
     fn buildCatalog(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
@@ -1366,6 +1357,11 @@ fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
     if ((h & 15) == 0) return build.ids.dirt;
     if ((h & 7) == 0) return build.ids.grass_patchy;
     return build.ids.grass;
+}
+
+fn atlasTextureDesc(meta: *const WorldTilesetMeta) TextureDesc {
+    const atlas = meta.atlas();
+    return .{ .width = atlas.width, .height = atlas.height };
 }
 
 fn catalogCapacity(meta: *const WorldTilesetMeta) usize {
@@ -2013,8 +2009,11 @@ test "threaded and inline static cache builds are byte-identical" {
     var serial = try WorldSystem.initProceduralFromMeta(std.testing.allocator, &meta, config, &threads);
     defer serial.deinit();
 
-    // Same deterministic world built two ways: the worker range-split must produce
-    // exactly the inline result. Guards the disjoint-span write math.
+    // Force a fresh rebuild of both (init already pre-warmed the cache), one
+    // threaded and one inline: the worker range-split must produce exactly the
+    // inline result. Guards the disjoint-span write math.
+    try threaded.rebuildStaticCacheLayout();
+    try serial.rebuildStaticCacheLayout();
     try threaded.ensureStaticCache(static_cache_test_texture, &threads);
     try serial.ensureStaticCache(static_cache_test_texture, null);
     try std.testing.expectEqualSlices(Vertex, serial.chunk_layer_vertices.items, threaded.chunk_layer_vertices.items);
