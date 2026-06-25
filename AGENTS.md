@@ -35,7 +35,9 @@ content changes.
 - Add new code under the owning module described by `docs/architecture.md`.
   Do not move ownership boundaries just to make a local change easier.
 - Follow `docs/coding-standards.md` for Zig style, imports, performance,
-  comments, tests, generated-output rules, and production-contract boundaries.
+  comments, logging, tests, generated-output rules, and production-contract
+  boundaries. Log via `src/core/logging.zig` scoped loggers, never raw
+  `std.log`/`std.debug.print`; hot paths stay log-free in release.
 - Keep `src/main.zig` timing-centric, app/state flow under `src/app/`, rendering
   and GPU resource work under `src/render/`, runtime asset catalog/path work
   under `src/assets/`, and gameplay/data/systems under `src/game/`.

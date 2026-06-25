@@ -131,9 +131,13 @@ test-only paths in production code — prefer private helpers, local fixtures, m
 payloads. When tests are weak, name the untested contract and give a narrow scenario that
 would expose the bug.
 
-**Diagnostics** — new features/slices include scoped `std.log` for lifecycle/config/fallback/
-failure context; avoid routine per-frame/per-event/per-draw formatting; `warn`/`err` stay
-rare and actionable; pure helpers/validation stay log-free.
+**Diagnostics** — audit logger usage (`docs/coding-standards.md` Logging). Flag: any raw
+`std.log`/`std.log.scoped(...)` or `std.debug.print` for engine/gameplay logging (`std.debug.print`
+is `src/benchmarks/` CLI stdout only); any hot/frame-adjacent log call not comptime-gated out of
+release (release must have zero per-frame/update/draw/entity log calls — compiled out to a
+zero-sized no-op, not runtime-skipped, per `runtime_perf_log.zig`); non-trivial formatting not
+behind `logging.enabled(level)`. `warn`/`err` stay rare and actionable; pure helpers/validation
+stay log-free.
 
 ## Output Format
 

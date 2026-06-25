@@ -82,7 +82,8 @@ the game layer needs. Game states never call SDL_GPU directly.
   and without adding test-only enum tags, marker payloads, fake stages, fixture hooks, or
   service shortcuts to production APIs. Tests use private helpers, local fixtures, mocks, or
   real payloads.
-- **Diagnostics**: scoped `std.log` for lifecycle/config/fallback/failure context.
+- **Diagnostics**: route through the central logger `src/core/logging.zig` scoped loggers
+  (never raw `std.log`/`std.debug.print`) for lifecycle/config/fallback/failure context.
 
 ## Emergent Gameplay
 

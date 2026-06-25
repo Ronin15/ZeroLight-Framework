@@ -49,10 +49,10 @@ supporting evidence. Report display/GPU/sandbox limitations separately from code
 3. Run the narrowest relevant command before any wider validation.
 4. Inspect the owner file and adjacent tests or build steps.
 5. Form one concrete hypothesis and test it.
-6. When fixing a runtime/integration boundary, add or preserve scoped `std.log` diagnostics
-   that would make the same class of failure diagnosable next time (`debug` for low-frequency
-   lifecycle/config/fallback context, `warn` only for recovered degraded behavior, `err`
-   only for real failures; keep hot paths quiet and pure helpers log-free).
+6. When fixing a runtime/integration boundary, add or preserve diagnostics via `src/core/logging.zig`
+   scoped loggers (never raw `std.log`/`std.debug.print`) that make the same failure class
+   diagnosable next time (`debug` for low-frequency lifecycle/config/fallback, `warn` for recovered
+   degradation, `err` for real failures; hot paths stay log-free in release, pure helpers log-free).
 7. Fix only the confirmed issue, then re-run the failing command.
 8. Escalate to broader validation only after the targeted failure resolves.
 

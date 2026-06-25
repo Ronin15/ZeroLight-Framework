@@ -108,6 +108,26 @@ Production worker participation should be driven by measured batch timing and
 structural constraints. Do not add static item-count floors for worker
 participation as a substitute for stage-owned tuning.
 
+## Logging
+
+Route all runtime diagnostics through the central logger `src/core/logging.zig`
+scoped loggers (`app`, `assets`, `audio`, `core`, `game`, `render`, `platform`,
+`debug_overlay`, `perf`): `const log = @import("../core/logging.zig").render;`.
+Never call `std.log`/`std.log.scoped(...)` directly or use `std.debug.print` for
+engine/gameplay diagnostics (`std.debug.print` is for `src/benchmarks/` CLI
+stdout only). `info`/`debug` for lifecycle/config/fallback, `warn` for recovered
+degradation, `err` for real failures; keep pure helpers/validation log-free.
+
+Hot and frame-adjacent paths carry no logging in release — a release binary has
+zero per-frame/update/event/draw/entity/iteration log calls. Such instrumentation
+must be comptime-gated so it compiles out to a zero-sized no-op, not skipped at
+runtime; `src/app/runtime_perf_log.zig` is the reference (`enabled` folds
+`builtin.mode == .Debug and logging.enabled(.debug)`, the type and its `Context`
+go zero-sized when disabled, per-frame work is counter increments, and the
+formatted emit runs once per interval in Debug only). `logging.enabled(level)` is
+comptime, so gate any non-trivially-formatted diagnostic behind it — call and
+formatting both drop when the level is off.
+
 ## Comments
 
 Use comments to preserve contracts and non-obvious intent, not to narrate

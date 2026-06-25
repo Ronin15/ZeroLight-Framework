@@ -73,9 +73,11 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
    not string paths, live renderer/SDL/audio handles, or prepared draw records. Convert
    stable IDs to renderer texture IDs at the render-prep/queue boundary, not in `DataSystem`.
    Keep asset paths relative and traversal-safe.
-10. Add scoped `std.log` diagnostics for lifecycle/config/fallback/failure context. Keep
-    hot-path debug logging minimal and deliberate; `warn` for recovered degraded behavior,
-    `err` for real failures; keep pure helpers/validation log-free.
+10. Log only through `src/core/logging.zig` scoped loggers, never raw `std.log`/`std.debug.print`;
+    `warn` for recovered degradation, `err` for real failures; pure helpers/validation stay
+    log-free. Hot/frame-adjacent paths carry no logging in release — any per-frame/update/draw/
+    entity instrumentation must be comptime-gated out to a zero-sized no-op (`runtime_perf_log.zig`
+    pattern), not runtime-skipped. See `docs/coding-standards.md` Logging.
 11. Add behavior-focused Zig tests when logic can be tested without opening a window.
 
 ## ECS / Hot-Path Rules
