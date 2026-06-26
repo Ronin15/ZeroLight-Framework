@@ -752,8 +752,8 @@
       "properties": {
         "layer": "ground",
         "terrain": "dirt",
-        "walkable": true,
-        "blocks_movement": false,
+        "walkable": false,
+        "blocks_movement": true,
         "blocks_vision": false
       }
     },
@@ -770,8 +770,8 @@
       "properties": {
         "layer": "ground",
         "terrain": "dirt",
-        "walkable": true,
-        "blocks_movement": false,
+        "walkable": false,
+        "blocks_movement": true,
         "blocks_vision": false
       }
     },

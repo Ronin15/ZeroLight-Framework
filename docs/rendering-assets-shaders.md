@@ -133,7 +133,19 @@ shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — 
 tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
 layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
 with dynamic entities, so an actor in a dug pit renders between the floor below and
-walls above.
+walls above. `submitStaticDenseGeometry` takes the player's active level and skips
+the floors above it (re-submitting only when the plane changes), so descending
+reveals the plane the player stands on instead of leaving it buried under the
+surface.
+
+Digging authors two kinds of tile edit. A *hole* clears the cell to
+`invalid_tile_id`, which the tilemap fragment shader discards (see-through to the
+plane below) and `flagsFor` treats as non-blocking — the player falls through it. A
+*carve* writes a visible walkable floor tile. The three dig actions compose these:
+digging forward on the surface opens a hole (fall); digging forward underground
+carves a walkable tunnel tile so the player mines horizontally through the solid
+dirt; digging down opens a hole on any plane to drop one level. A fall always carves
+its landing cell so the player never lands embedded in rock.
 
 ## Logical Presentation
 

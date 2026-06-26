@@ -4,10 +4,16 @@
 
 //! Pipeline-owned domain controller for player digging on a multi-Z-level world.
 //! Consumes the per-step `dig_intent` captured in the input phase, resolves the
-//! cell the player faces on their current plane, and either punches a see-through
-//! hole (`clearDenseTile`) to fall through, or carves a walkable ramp tile plus a
-//! `LevelLink` to climb between planes. Emits the resulting `world_tile_changed`
-//! event for the post-commit nav re-mask.
+//! cell the player faces on their current plane, and authors a world-tile edit:
+//!   - dig hole on the surface (level 0): punches a see-through hole
+//!     (`clearDenseTile`) to fall to the plane below.
+//!   - dig hole underground (level >= 1): carves a walkable tunnel floor through
+//!     the solid dirt of the current plane so the player can mine forward.
+//!   - dig down: punches a see-through hole in the faced cell on any plane to drop
+//!     to the level below (no-op on the bottom plane).
+//!   - dig ramp: carves a walkable ramp tile plus a bidirectional `LevelLink` to
+//!     climb between planes.
+//! Emits the resulting `world_tile_changed` event for the post-commit nav re-mask.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -20,18 +26,21 @@ const CellCoord = @import("world_system.zig").CellCoord;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 
-/// The walkable ramp tile the dig carves, resolved by the gameplay state from the
-/// tileset meta and passed in at pipeline init, so the controller stays free of
-/// asset loading.
+/// Walkable tiles the dig carves, resolved by the gameplay state from the tileset
+/// meta and passed in at pipeline init, so the controller stays free of asset
+/// loading. `ramp_tile` climbs between planes; `tunnel_tile` is the walkable floor
+/// left when mining forward through solid underground dirt.
 pub const DigConfig = struct {
     ramp_tile: TileId = 0,
+    tunnel_tile: TileId = 0,
 };
 
 pub const DigController = struct {
     ramp_tile: TileId,
+    tunnel_tile: TileId,
 
     pub fn init(config: DigConfig) DigController {
-        return .{ .ramp_tile = config.ramp_tile };
+        return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
     }
 
     /// Applies this step's dig intent to the cell the player faces on their current
@@ -60,7 +69,18 @@ pub const DigController = struct {
 
         const floor_layer = world.denseFloorLayerForLevel(player.current_level) orelse return;
         const changed = switch (intent) {
-            .hole => try world.clearDenseTile(floor_layer, cell.x, cell.y),
+            // Surface: punch a see-through hole to fall through. Underground: mine a
+            // walkable tunnel floor through the solid dirt of this plane.
+            .hole => if (player.current_level == 0)
+                try world.clearDenseTile(floor_layer, cell.x, cell.y)
+            else
+                try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile),
+            // Dig down: punch a see-through hole in the faced cell on any plane to
+            // drop to the level below. No-op on the bottom plane (nothing below).
+            .down => if (@as(usize, player.current_level) + 1 < world.levelCount())
+                try world.clearDenseTile(floor_layer, cell.x, cell.y)
+            else
+                null,
             .ramp => try self.digRamp(world, player.current_level, floor_layer, cell),
             .none => unreachable,
         } orelse return;
@@ -109,6 +129,7 @@ const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
 fn testDigController(meta: anytype) !DigController {
     return DigController.init(.{
         .ramp_tile = (meta.tileByName("cobblestone") orelse return error.TestUnexpectedResult).id,
+        .tunnel_tile = (meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id,
     });
 }
 
@@ -175,6 +196,70 @@ test "dig controller punches a see-through hole in the faced cell" {
     try std.testing.expectEqual(@as(u16, 3), changed.y);
     try std.testing.expectEqual(invalid_tile_id, changed.new_tile_id);
     try std.testing.expect(!changed.new_blocks_movement);
+}
+
+test "dig controller mines a walkable tunnel floor underground instead of a hole" {
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    // The faced underground cell starts as solid dirt.
+    try std.testing.expect(tw.world.denseTileBlocksMovement(floor, 4, 3));
+
+    var frame = try runDig(&tw, dig, .hole);
+    defer frame.deinit();
+
+    // Mining carves the walkable tunnel tile (not a see-through hole).
+    try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expect(!tw.world.denseTileBlocksMovement(floor, 4, 3));
+
+    const events = frame.events.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    const changed = switch (events[0].payload) {
+        .world_tile_changed => |ch| ch,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u16, 1), changed.level);
+    try std.testing.expect(changed.old_blocks_movement);
+    try std.testing.expect(!changed.new_blocks_movement);
+}
+
+test "dig controller down punches a drop hole through the faced cell underground" {
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+
+    var frame = try runDig(&tw, dig, .down);
+    defer frame.deinit();
+
+    // The faced underground cell becomes a see-through, non-blocking hole to fall
+    // through to the plane below (distinct from a walkable tunnel carve).
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expectEqual(invalid_tile_id, tw.world.denseTile(floor, 4, 3));
+
+    const events = frame.events.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    const changed = switch (events[0].payload) {
+        .world_tile_changed => |ch| ch,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(changed.old_blocks_movement);
+    try std.testing.expect(!changed.new_blocks_movement);
+}
+
+test "dig controller down is a no-op on the bottom plane" {
+    var tw = try TestWorld.init(.right, 2);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+
+    var frame = try runDig(&tw, dig, .down);
+    defer frame.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    // The bottom floor cell stays solid: there is nothing below to fall into.
+    const floor = tw.world.denseFloorLayerForLevel(2).?;
+    try std.testing.expect(tw.world.denseTileBlocksMovement(floor, 4, 3));
 }
 
 test "dig controller carves a ramp tile and one bidirectional link below the surface" {

@@ -375,9 +375,12 @@ pub const CollisionContact = struct {
 
 /// Per-step player dig request captured in the `main_thread_inputs` phase and
 /// consumed by the pipeline-owned dig controller in `processors`. Single value:
-/// the player digs at most one faced cell per fixed step. `hole` punches a
-/// see-through hole to fall through; `ramp` carves a walkable cross-plane link.
-pub const DigIntent = enum { none, hole, ramp };
+/// the player digs at most one faced cell per fixed step. `hole` digs the faced
+/// cell on the current plane (a see-through hole to fall through on the surface, a
+/// walkable tunnel when mining through solid underground dirt); `down` always
+/// punches a see-through hole to drop one plane; `ramp` carves a walkable
+/// cross-plane link to climb up.
+pub const DigIntent = enum { none, hole, ramp, down };
 
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,

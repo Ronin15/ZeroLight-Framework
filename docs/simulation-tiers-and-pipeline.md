@@ -58,7 +58,17 @@ The concrete processor order is pipeline-owned for one gameplay state instance.
 commit/domain reactions, and render-prep reservation at the state boundary.
 `SimulationPipeline` owns AI navigation-intent production, steering/path status,
 pathfinding, sparse movement-intent application, movement, bounds clamp,
-collision detection, and collision response.
+player-vs-world-tile gating, collision detection, and collision response.
+
+The player-vs-tile gate runs right after the bounds clamp and before entity
+collision, so every downstream stage and the camera see the gated position. It
+stops the player from moving into movement-blocking tiles on their current plane
+(the mining mechanic: underground dirt is solid until dug) by resolving X then Y
+against the pre-move position, which yields wall-sliding. It is player-only by
+design: AI agents have no per-entity plane and stay on the fully-walkable surface
+(level 0), where the gate is a no-op, so they cannot enter the solid underground.
+Autonomous NPC descent — a per-entity plane column plus an all-bodies traversal
+and gate — is a deliberately separate, deferred slice.
 
 ## Range Output Streams
 

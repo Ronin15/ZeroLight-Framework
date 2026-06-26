@@ -84,7 +84,6 @@ pub const LevelLink = struct {
 const ProceduralTiles = struct {
     grass: TileId,
     grass_patchy: TileId,
-    dirt: TileId,
     path: TileId,
     stone: TileId,
     water: TileId,
@@ -306,7 +305,6 @@ pub const WorldSystem = struct {
         const ids = ProceduralTiles{
             .grass = try world.requireTileByName(meta, "grass"),
             .grass_patchy = try world.requireTileByName(meta, "grass_patchy"),
-            .dirt = try world.requireTileByName(meta, "dirt"),
             .path = try world.requireTileByName(meta, "path_0"),
             .stone = try world.requireTileByName(meta, "stone_floor"),
             .water = try world.requireTileByName(meta, "water_1"),
@@ -361,7 +359,10 @@ pub const WorldSystem = struct {
         const level = try world.addLevel(0);
 
         const grass = try world.requireTileByName(meta, "grass");
-        const dirt = try world.requireTileByName(meta, "dirt");
+        // Surface accent: grass_patchy stands in for the old `dirt` accent now that
+        // `dirt` is a solid underground material (blocks_movement), keeping level 0
+        // fully walkable and coherent with the player tile-collision gate.
+        const grass_patchy = try world.requireTileByName(meta, "grass_patchy");
         const path = try world.requireTileByName(meta, "path_0");
         const stone = try world.requireTileByName(meta, "stone_floor");
         const deco = try world.requireTileByName(meta, "deco_0");
@@ -374,7 +375,7 @@ pub const WorldSystem = struct {
                 const tile: TileId = if (x == mid_x or y == mid_y)
                     path
                 else if ((x + y) % 11 == 0)
-                    dirt
+                    grass_patchy
                 else if ((x * 3 + y) % 17 == 0)
                     stone
                 else
@@ -1357,7 +1358,7 @@ fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
 
     const h = hash2(build.seed, x, y);
     if ((h & 31) == 0) return build.ids.stone;
-    if ((h & 15) == 0) return build.ids.dirt;
+    // `dirt` is a solid underground material now; the surface accent is grass_patchy.
     if ((h & 7) == 0) return build.ids.grass_patchy;
     return build.ids.grass;
 }
@@ -1881,6 +1882,28 @@ test "level navigability does not collapse across levels" {
     try std.testing.expect(world.levelBlocksMovement(level1, 2, 2));
     // The same cell on level 0 must stay open: levels do not collapse.
     try std.testing.expect(!world.levelBlocksMovement(level0, 2, 2));
+}
+
+test "underground demo levels are solid dirt until a cell is dug walkable" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    try std.testing.expectEqual(@as(usize, 3), world.levelCount());
+
+    // The two underground floors block movement by default (mining: solid until dug).
+    try std.testing.expect(world.levelBlocksMovement(1, 2, 2));
+    try std.testing.expect(world.levelBlocksMovement(2, 2, 2));
+    // The surface plane stays open at the same cell — levels do not collapse.
+    try std.testing.expect(!world.levelBlocksMovement(0, 2, 2));
+
+    // Carving a level-1 cell to the walkable tunnel tile opens it.
+    const cave_0 = try world.requireTileByName(&meta, "cave_0");
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    _ = try world.setDenseTile(floor1, 2, 2, cave_0);
+    try std.testing.expect(!world.levelBlocksMovement(1, 2, 2));
 }
 
 test "level link store round-trips and validates inputs" {

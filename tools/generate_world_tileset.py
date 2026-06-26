@@ -172,7 +172,13 @@ def tile_properties(category: str, name: str) -> dict:
             terrain = "void"
         elif name in {"grass", "grass_patchy", "grass_bones", "grass_rocky"}:
             terrain = "grass"
-        elif name in {"dirt", "dirt_dark", "mud"}:
+        elif name in {"dirt", "dirt_dark"}:
+            # Solid underground material: the player mines through it (dug to a
+            # walkable tunnel tile) rather than walking over it.
+            walkable = False
+            blocks_movement = True
+            terrain = "dirt"
+        elif name == "mud":
             terrain = "dirt"
         elif "stone" in name or name == "cobblestone":
             terrain = "stone"

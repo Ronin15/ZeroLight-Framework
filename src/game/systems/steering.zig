@@ -495,8 +495,10 @@ pub const SteeringSystem = struct {
 
     fn writePathRequests(self: *SteeringSystem, frame: *SimulationFrame, request_count: usize) !void {
         // Agents have no per-entity level column yet, so the start level is the
-        // single-level default; a per-entity lookup replaces this when multi-level
-        // placement exists.
+        // single-level default. This is load-bearing: NPCs are confined to the
+        // fully-walkable surface (level 0), which is why they can never enter the
+        // solid-dirt underground and need no tile-collision gating. A per-entity
+        // lookup replaces this only when autonomous NPC descent lands.
         const agent_start_level: u16 = 0;
         const request_range_base = try frame.path_requests.appendRangeCounts(1);
         frame.path_requests.addCount(request_range_base, request_count);
@@ -1210,6 +1212,38 @@ test "steering requests missing paths then follows available path results" {
     try std.testing.expectEqual(@as(usize, 1), available_stats.path_available_count);
     try std.testing.expectEqual(@as(usize, 0), available_stats.path_request_count);
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
+}
+
+test "steering pins NPC path requests to the surface plane" {
+    // Load-bearing confinement: NPCs have no per-entity plane, so every path request
+    // they emit must stay on level 0 (the fully-walkable surface). This guards against
+    // a future accidental wire of the player's plane into the goal level, which would
+    // make NPCs request underground paths they cannot walk and pile at the ramp mouth.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+
+    const requests = frame.path_requests.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), requests.len);
+    try std.testing.expectEqual(@as(u16, 0), requests[0].start_level);
+    try std.testing.expectEqual(@as(u16, 0), requests[0].goal_level);
 }
 
 test "steering missing path requests respect replan cooldown" {

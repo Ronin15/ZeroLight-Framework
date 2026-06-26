@@ -124,9 +124,13 @@ pub const GameDemoState = struct {
     // frame. Input is main-thread state, so the latch lives on the state.
     dig_hole_held_last: bool = false,
     dig_ramp_held_last: bool = false,
+    dig_down_held_last: bool = false,
     // Last grid cell the player occupied, so plane traversal (fall/ramp) fires
     // only on cell entry — anti-oscillation and the one-level-per-fall guard.
     player_last_cell: ?world_system.CellCoord = null,
+    // Walkable tile a fall carves into the landing cell so the player never lands
+    // embedded in the solid dirt below (matches the dig controller's tunnel tile).
+    tunnel_tile: world_system.TileId = 0,
     music_started: bool = false,
     jet_loop_active: bool = false,
     // Set when a pause interrupts an active jet loop: onPause has no audio
@@ -206,8 +210,8 @@ pub const GameDemoState = struct {
         return state;
     }
 
-    /// Resolves the dig controller's tile config (the walkable ramp tile) from the
-    /// runtime tileset metadata.
+    /// Resolves the dig controller's tile config (the walkable ramp and tunnel
+    /// tiles) from the runtime tileset metadata.
     fn digConfigFromRuntimeAssets(runtime_assets: *const RuntimeAssets) !DigConfig {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
         return digConfigFromMeta(meta);
@@ -216,6 +220,7 @@ pub const GameDemoState = struct {
     fn digConfigFromMeta(meta: *const WorldTilesetMeta) !DigConfig {
         return .{
             .ramp_tile = (meta.tileByName("cobblestone") orelse return error.WorldTilesetMissingDigTile).id,
+            .tunnel_tile = (meta.tileByName("cave_0") orelse return error.WorldTilesetMissingDigTile).id,
         };
     }
 
@@ -292,6 +297,7 @@ pub const GameDemoState = struct {
             .dynamic_render = dynamic_render,
             .test_squares = test_squares,
             .obstacles = obstacles,
+            .tunnel_tile = dig_config.tunnel_tile,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .bounds_width = world_width,
@@ -349,7 +355,7 @@ pub const GameDemoState = struct {
 
         // After movement: drop the player a plane on entering a hole, or follow a
         // ramp link. State-owned because the pipeline only gets the player by value.
-        self.applyPlaneTraversal();
+        try self.applyPlaneTraversal();
 
         var collision_audio_timer = StageTimer.start();
         self.queueCollisionAudio(context.audio, context.delta_seconds);
@@ -382,25 +388,32 @@ pub const GameDemoState = struct {
     }
 
     /// Translates the held dig actions into this step's `dig_intent`, firing on
-    /// the rising edge so one press digs one cell. Hole wins if both fire the
-    /// same frame. The pipeline-owned dig controller consumes the intent.
+    /// the rising edge so one press digs one cell. If more than one fires the same
+    /// frame, hole (forward) wins, then down, then ramp. The pipeline-owned dig
+    /// controller consumes the intent.
     fn captureDigIntent(self: *GameDemoState, input: *const InputState) void {
         const hole_held = input.isHeld(.digHole);
+        const down_held = input.isHeld(.digDown);
         const ramp_held = input.isHeld(.digRamp);
         if (hole_held and !self.dig_hole_held_last) {
             self.simulation_frame.dig_intent = .hole;
+        } else if (down_held and !self.dig_down_held_last) {
+            self.simulation_frame.dig_intent = .down;
         } else if (ramp_held and !self.dig_ramp_held_last) {
             self.simulation_frame.dig_intent = .ramp;
         }
         self.dig_hole_held_last = hole_held;
+        self.dig_down_held_last = down_held;
         self.dig_ramp_held_last = ramp_held;
     }
 
     /// Updates the player's plane after movement. On entering a new cell: follow a
     /// ramp link to its other plane, else fall one level if standing over a hole
     /// with a level below. The cell-entry guard prevents ramp oscillation and caps
-    /// a hole to a single one-level drop.
-    fn applyPlaneTraversal(self: *GameDemoState) void {
+    /// a hole to a single one-level drop. Player-only by design: NPCs have no
+    /// per-entity plane and stay on the surface, so they never fall or take ramps
+    /// (autonomous NPC descent is a separate, deferred slice).
+    fn applyPlaneTraversal(self: *GameDemoState) !void {
         const body = self.data.movementBodyConst(self.player.entity) orelse return;
         const visual = self.data.primitiveVisualConst(self.player.entity) orelse return;
         const center_x = body.position.x + visual.size.x * 0.5;
@@ -414,25 +427,53 @@ pub const GameDemoState = struct {
         self.player_last_cell = cell;
 
         if (self.world.rampLinkOtherLevel(self.player.current_level, cell)) |other| {
-            self.setPlayerLevel(other);
+            self.setPlayerLevel(other, cell);
             return;
         }
         const below: usize = @as(usize, self.player.current_level) + 1;
         if (below < self.world.levelCount() and
             self.world.denseFloorIsEmpty(self.player.current_level, cell.x, cell.y))
         {
-            self.setPlayerLevel(@intCast(below));
+            const below_level: u16 = @intCast(below);
+            // The plane below is solid dirt; carve the landing cell walkable so the
+            // player never lands embedded in rock (else the tile gate would shove
+            // them straight back out). Carve before the snap so the cell is open.
+            try self.carveLandingCell(below_level, cell);
+            self.setPlayerLevel(below_level, cell);
         }
     }
 
+    /// Carves a fall's landing cell to the walkable tunnel tile and queues the tile
+    /// change for the post-commit nav re-mask. No-op when the level has no floor
+    /// layer or the cell was already walkable.
+    fn carveLandingCell(self: *GameDemoState, level: u16, cell: world_system.CellCoord) !void {
+        const floor_layer = self.world.denseFloorLayerForLevel(level) orelse return;
+        const changed = (try self.world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile)) orelse return;
+        try self.simulation_frame.events.appendRequired(.{
+            .stage = .structural_commit,
+            .payload = .{ .world_tile_changed = changed },
+        });
+    }
+
     /// Moves the player onto a plane: tracks the level and snaps the body's render
-    /// z (and its previous, since z is not interpolated) to that plane's base.
-    fn setPlayerLevel(self: *GameDemoState, level: u16) void {
+    /// z (and its previous, since z is not interpolated) to that plane's base. When
+    /// descending into a solid lower plane, also snaps x/y flush onto `cell` so the
+    /// one-tile-sized body sits inside the carved pocket rather than straddling the
+    /// solid neighbors the tile gate would otherwise shove it out of. Level 0 is
+    /// fully open, so no x/y snap there.
+    fn setPlayerLevel(self: *GameDemoState, level: u16, cell: world_system.CellCoord) void {
         self.player.current_level = level;
         const body = self.data.movementBodyPtr(self.player.entity) orelse return;
         const z = self.world.levelBaseZ(level);
         body.position_z.* = z;
         body.previous_z.* = z;
+        if (level == 0) return;
+        const snap_x = @as(f32, @floatFromInt(cell.x)) * self.world.tile_size;
+        const snap_y = @as(f32, @floatFromInt(cell.y)) * self.world.tile_size;
+        body.position_x.* = snap_x;
+        body.position_y.* = snap_y;
+        body.previous_x.* = snap_x;
+        body.previous_y.* = snap_y;
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -1581,7 +1622,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    demo.applyPlaneTraversal(); // seed player_last_cell = (3,3)
+    try demo.applyPlaneTraversal(); // seed player_last_cell = (3,3)
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
@@ -1591,21 +1632,56 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     // Walk into the hole -> fall exactly one level onto the dirt plane.
     placePlayerInCell(&demo, 4, 3);
-    demo.applyPlaneTraversal();
+    try demo.applyPlaneTraversal();
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(1), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
+    // The solid-dirt landing cell is carved walkable so the fall does not bury
+    // the player in rock.
+    const floor1 = demo.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(!demo.world.denseTileBlocksMovement(floor1, 4, 3));
+
     // Standing put: no second fall.
-    demo.applyPlaneTraversal();
+    try demo.applyPlaneTraversal();
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
-    demo.applyPlaneTraversal();
+    try demo.applyPlaneTraversal();
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
+}
+
+test "demo dig down drops the player through the dirt plane to the void plane" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
+    try demo.applyPlaneTraversal(); // seed player_last_cell = (3,3)
+
+    // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
+    try digFacedForTest(&demo, .hole);
+    placePlayerInCell(&demo, 4, 3);
+    try demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
+
+    // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
+    try digFacedForTest(&demo, .down);
+    const floor1 = demo.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor1, 5, 3));
+
+    // Walk into it -> fall one more level onto the void plane (level 2).
+    placePlayerInCell(&demo, 5, 3);
+    try demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 2), demo.player.current_level);
+    try std.testing.expectEqual(demo.world.levelBaseZ(2), demo.data.movementBodyConst(demo.player.entity).?.position_z);
+
+    // The void-plane landing cell is carved walkable so the player is not buried.
+    const floor2 = demo.world.denseFloorLayerForLevel(2).?;
+    try std.testing.expect(!demo.world.denseTileBlocksMovement(floor2, 5, 3));
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {

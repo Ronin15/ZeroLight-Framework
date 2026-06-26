@@ -195,6 +195,11 @@ pub const SimulationPipeline = struct {
 
         const ai_slice = data.aiAgentSliceConst();
         const move_slice = data.movementBodySliceConst();
+        // The player's plane is deliberately NOT propagated into the AI goal level:
+        // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
+        // Seeding the player's underground plane here would make them request
+        // cross-level paths they cannot walk (start_level is pinned to 0), piling
+        // them at the ramp mouth. They simply seek the (x,y) above the player.
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
             pbody.previous_position
         else
@@ -235,6 +240,12 @@ pub const SimulationPipeline = struct {
         var clamp_timer = StageTimer.start();
         clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
         try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
+        // Gate the player against solid world tiles on their current plane (mining:
+        // underground dirt is solid until dug). Runs after the bounds clamp and
+        // before entity collision so downstream stages see the gated position. AI
+        // entities stay on the surface (level 0, fully walkable) this slice, so the
+        // gate is player-only by design — see docs/simulation-tiers-and-pipeline.md.
+        gatePlayerToWalkableTiles(context.world, data, context.player);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
 
         var collision_timer = StageTimer.start();
@@ -291,6 +302,50 @@ fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void
             body.velocity_y.* = movement_intent.direction_y * speed;
         }
     }
+}
+
+/// Stops the player from moving into solid world tiles on their current plane.
+/// No-op on level 0 (the surface is fully walkable and pre-existing decos/water are
+/// intentionally pass-through there). Resolves X then Y independently against the
+/// pre-move position so a diagonal push into a wall slides along it. The body is one
+/// tile wide; sampling the four AABB corners (with an epsilon so a flush right/bottom
+/// edge stays in the covered cell) is exact for the sub-tile motion this produces.
+/// Allocation-free, single entity, scalar.
+fn gatePlayerToWalkableTiles(world: *const WorldSystem, data: *DataSystem, player: Player) void {
+    if (player.current_level == 0) return;
+    const body = data.movementBodyPtr(player.entity) orelse return;
+    const visual = data.primitiveVisualConst(player.entity) orelse return;
+    const w = visual.size.x;
+    const h = visual.size.y;
+    const pre_x = body.previous_x.*;
+    const pre_y = body.previous_y.*;
+    const post_x = body.position_x.*;
+    const post_y = body.position_y.*;
+
+    var resolved_x = post_x;
+    if (rectOverlapsSolidTile(world, player.current_level, post_x, pre_y, w, h)) resolved_x = pre_x;
+    var resolved_y = post_y;
+    if (rectOverlapsSolidTile(world, player.current_level, resolved_x, post_y, w, h)) resolved_y = pre_y;
+
+    if (resolved_x != post_x) body.velocity_x.* = 0;
+    if (resolved_y != post_y) body.velocity_y.* = 0;
+    body.position_x.* = resolved_x;
+    body.position_y.* = resolved_y;
+}
+
+/// Whether an axis-aligned body rect overlaps any movement-blocking tile on `level`.
+/// Off-world corners read as blocked (fail-closed), matching `levelBlocksMovement`.
+fn rectOverlapsSolidTile(world: *const WorldSystem, level: u16, x: f32, y: f32, w: f32, h: f32) bool {
+    const edge_epsilon: f32 = 0.5;
+    const sample_xs = [_]f32{ x, x + w - edge_epsilon };
+    const sample_ys = [_]f32{ y, y + h - edge_epsilon };
+    for (sample_ys) |sy| {
+        for (sample_xs) |sx| {
+            const cell = world.cellContaining(sx, sy) orelse return true;
+            if (world.levelBlocksMovement(level, cell.x, cell.y)) return true;
+        }
+    }
+    return false;
 }
 
 fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: f32) void {
@@ -384,4 +439,70 @@ test "pipeline syncs movement previous positions" {
     const synced = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(synced.position.x, synced.previous_position.x);
     try std.testing.expectEqual(synced.position.y, synced.previous_position.y);
+}
+
+const AssetStore = @import("../assets/assets.zig").AssetStore;
+const manifest = @import("../assets/manifest.zig");
+const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+
+// Builds a 3-level demo world and carves the two given level-1 cells walkable so a
+// player body can sit in one and try to move into solid dirt around it.
+fn gateTestWorld(meta: *const world_tileset_meta.WorldTilesetMeta, carve: []const [2]u16) !WorldSystem {
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, meta, 320, 320);
+    errdefer world.deinit();
+    try world.addUndergroundLevels(meta);
+    const cave_0 = (meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id;
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    for (carve) |cell| {
+        _ = try world.setDenseTile(floor1, cell[0], cell[1], cave_0);
+    }
+    return world;
+}
+
+fn placePlayerFlush(data: *DataSystem, player: Player, cell: [2]u16) void {
+    const body = data.movementBodyPtr(player.entity).?;
+    const x = @as(f32, @floatFromInt(cell[0])) * 32;
+    const y = @as(f32, @floatFromInt(cell[1])) * 32;
+    body.previous_x.* = x;
+    body.previous_y.* = y;
+    body.position_x.* = x;
+    body.position_y.* = y;
+}
+
+test "player tile gate slides along solid dirt and is a no-op on the surface" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    // Carve a 1x2 vertical pocket at (3,3)-(3,4) on the dirt plane.
+    var world = try gateTestWorld(&meta, &.{ .{ 3, 3 }, .{ 3, 4 } });
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 1;
+    placePlayerFlush(&data, player, .{ 3, 3 });
+
+    // Move diagonally: +x into solid (cell 4,3), +y into carved (cell 3,4).
+    const body = data.movementBodyPtr(player.entity).?;
+    body.position_x.* = 3 * 32 + 6;
+    body.position_y.* = 3 * 32 + 6;
+    body.velocity_x.* = 100;
+    body.velocity_y.* = 100;
+
+    gatePlayerToWalkableTiles(&world, &data, player);
+
+    // X reverted (wall), velocity_x zeroed; Y allowed (open pocket), velocity_y kept.
+    try std.testing.expectEqual(@as(f32, 3 * 32), body.position_x.*);
+    try std.testing.expectEqual(@as(f32, 0), body.velocity_x.*);
+    try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_y.*);
+    try std.testing.expectEqual(@as(f32, 100), body.velocity_y.*);
+
+    // On the surface the gate never blocks: same push from level 0 is untouched.
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 3, 3 });
+    body.position_x.* = 3 * 32 + 6;
+    body.position_y.* = 3 * 32 + 6;
+    gatePlayerToWalkableTiles(&world, &data, player);
+    try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_x.*);
+    try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_y.*);
 }

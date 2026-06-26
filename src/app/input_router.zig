@@ -77,7 +77,7 @@ pub fn routeEvent(policy: InputRoutingPolicy, event: *const c.SDL_Event, input: 
 
 pub fn contextForAction(action: Action) InputContext {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp => .gameplay,
+        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp, .digDown => .gameplay,
         .pause, .resumeGame, .quit => .app,
         .toggleDebugOverlay => .debug,
         .menuUp, .menuDown, .menuLeft, .menuRight => .ui,
@@ -106,7 +106,7 @@ pub const ContextFlags = struct {
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp => true,
+        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp, .digDown => true,
         else => false,
     };
 }
