@@ -19,6 +19,8 @@ pub const Action = enum(usize) {
     menuDown,
     menuLeft,
     menuRight,
+    digDown,
+    digUp,
 };
 
 const action_count = @typeInfo(Action).@"enum".fields.len;
@@ -42,6 +44,8 @@ pub const default_key_bindings = [_]KeyBinding{
     .{ .key = c.SDLK_DOWN, .action = .menuDown },
     .{ .key = c.SDLK_LEFT, .action = .menuLeft },
     .{ .key = c.SDLK_RIGHT, .action = .menuRight },
+    .{ .key = c.SDLK_E, .action = .digDown },
+    .{ .key = c.SDLK_Q, .action = .digUp },
 };
 
 pub const InputState = struct {
@@ -116,7 +120,7 @@ const movement_actions = [_]Action{
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown => true,
+        .moveLeft, .moveRight, .moveUp, .moveDown, .digDown, .digUp => true,
         else => false,
     };
 }

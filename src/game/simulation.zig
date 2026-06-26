@@ -373,9 +373,16 @@ pub const CollisionContact = struct {
     penetration: f32,
 };
 
+/// Per-step player dig request captured in the `main_thread_inputs` phase and
+/// consumed by the pipeline-owned dig controller in `processors`. Single value:
+/// the player digs at most one faced cell per fixed step.
+pub const DigIntent = enum { none, down, up };
+
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
+    // Transient player intent for this step; reset each `beginStep`.
+    dig_intent: DigIntent = .none,
     // These streams are transient frame outputs. Producers reserve/count per
     // range, write range-owned records, then consumers read mergedItems only
     // after the producer stage has finished.
@@ -424,6 +431,7 @@ pub const SimulationFrame = struct {
     }
 
     pub fn clearRetainingCapacity(self: *SimulationFrame) void {
+        self.dig_intent = .none;
         self.events.clearRetainingCapacity();
         self.navigation_intents.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();

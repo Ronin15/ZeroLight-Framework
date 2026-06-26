@@ -12,6 +12,7 @@ const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
 const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
@@ -20,6 +21,7 @@ const component_masks = @import("data_system.zig").component_masks;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const DataSystem = @import("data_system.zig").DataSystem;
+const DigConfig = @import("dig_controller.zig").DigConfig;
 const EntityId = @import("data_system.zig").EntityId;
 const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
@@ -33,6 +35,7 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const CollisionContact = @import("simulation.zig").CollisionContact;
+const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
@@ -117,6 +120,10 @@ pub const GameDemoState = struct {
     last_nav_update_stats: NavUpdateStats = .{},
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
     collision_sfx_cooldown_count: usize = 0,
+    // Rising-edge latches so one held dig key digs one cell per press, not per
+    // frame. Input is main-thread state, so the latch lives on the state.
+    dig_down_held_last: bool = false,
+    dig_up_held_last: bool = false,
     music_started: bool = false,
     jet_loop_active: bool = false,
     // Set when a pause interrupts an active jet loop: onPause has no audio
@@ -157,6 +164,7 @@ pub const GameDemoState = struct {
                 bounds_width,
                 bounds_height,
             ),
+            try digConfigFromRuntimeAssets(runtime_assets),
             // No thread system on this path (tests): serial, slot 0 only.
             1,
         );
@@ -185,6 +193,7 @@ pub const GameDemoState = struct {
             world.worldWidthPixels(),
             world.worldHeightPixels(),
             world,
+            try digConfigFromRuntimeAssets(runtime_assets),
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
@@ -194,6 +203,23 @@ pub const GameDemoState = struct {
         return state;
     }
 
+    /// Resolves the dig depth-policy tile ids from the runtime tileset metadata.
+    /// The faced floor layer is dense layer 0 in both the demo and procedural
+    /// worlds.
+    fn digConfigFromRuntimeAssets(runtime_assets: *const RuntimeAssets) !DigConfig {
+        const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
+        return digConfigFromMeta(meta);
+    }
+
+    fn digConfigFromMeta(meta: *const WorldTilesetMeta) !DigConfig {
+        return .{
+            .ground_layer = 0,
+            .surface_id = (meta.tileByName("grass") orelse return error.WorldTilesetMissingDigTile).id,
+            .dirt_id = (meta.tileByName("dirt") orelse return error.WorldTilesetMissingDigTile).id,
+            .pit_id = (meta.tileByName("void_pit") orelse return error.WorldTilesetMissingDigTile).id,
+        };
+    }
+
     fn initWithWorld(
         allocator: std.mem.Allocator,
         viewport_width: f32,
@@ -201,6 +227,7 @@ pub const GameDemoState = struct {
         simulation_bounds_width: f32,
         simulation_bounds_height: f32,
         world_value: WorldSystem,
+        dig_config: DigConfig,
         worker_participant_count: usize,
     ) !GameDemoState {
         var world = world_value;
@@ -248,6 +275,7 @@ pub const GameDemoState = struct {
                 .worker_participant_count = worker_participant_count,
             },
             .navigation_world = &world,
+            .dig = dig_config,
         });
         errdefer pipeline.deinit();
 
@@ -297,6 +325,7 @@ pub const GameDemoState = struct {
         self.simulation_frame.phase = .main_thread_inputs;
         var input_timer = StageTimer.start();
         try self.player.applyInput(&self.data, context.input);
+        self.captureDigIntent(context.input);
         input_timer.stop(context.perf, .gameplay_input);
 
         var ambient_audio_timer = StageTimer.start();
@@ -306,6 +335,7 @@ pub const GameDemoState = struct {
         const pipeline_stats = try self.pipeline.update(.{
             .data = &self.data,
             .frame = &self.simulation_frame,
+            .world = &self.world,
             .player = self.player,
             .thread_system = context.thread_system,
             .delta_seconds = context.delta_seconds,
@@ -342,6 +372,21 @@ pub const GameDemoState = struct {
                 self.last_nav_update_stats,
             );
         }
+    }
+
+    /// Translates the held dig actions into this step's `dig_intent`, firing on
+    /// the rising edge so one press digs one cell. Down wins if both fire the
+    /// same frame. The pipeline-owned dig controller consumes the intent.
+    fn captureDigIntent(self: *GameDemoState, input: *const InputState) void {
+        const down_held = input.isHeld(.digDown);
+        const up_held = input.isHeld(.digUp);
+        if (down_held and !self.dig_down_held_last) {
+            self.simulation_frame.dig_intent = .down;
+        } else if (up_held and !self.dig_up_held_last) {
+            self.simulation_frame.dig_intent = .up;
+        }
+        self.dig_down_held_last = down_held;
+        self.dig_up_held_last = up_held;
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -1205,9 +1250,12 @@ const ObstacleSpec = struct {
 fn initDemoForTest(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     const world = try WorldSystem.initDemoFromAssetStore(allocator, asset_store, bounds_width, bounds_height);
+    var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    const dig_config = try GameDemoState.digConfigFromMeta(&meta);
     // The helper-based demo tests dispatch with a 0-worker thread system
     // (participantSlotCount = 1), so one scratch slot suffices.
-    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world, 1);
+    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world, dig_config, 1);
 }
 
 fn runtimeAssetsWithWorldTexture() !RuntimeAssets {
@@ -1436,6 +1484,76 @@ test "demo world tile event invalidates navigation after commit reaction" {
         }
     }
     try std.testing.expect(nav_invalidated);
+}
+
+// Drives one dig step through the wired pipeline controller and post-commit
+// reaction, returning whether navigation was invalidated this step.
+fn digStepForTest(demo: *GameDemoState, intent: DigIntent) !bool {
+    demo.simulation_frame.beginStep();
+    demo.simulation_frame.dig_intent = intent;
+    try demo.pipeline.dig.process(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
+    try demo.processPostCommitEvents();
+    for (demo.simulation_frame.events.mergedItems()) |event| {
+        switch (event.payload) {
+            .nav_region_invalidated => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+test "demo dig intent fires once on the rising edge of a held key" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    var input = InputState{};
+    input.setHeld(.digDown, true);
+
+    demo.simulation_frame.beginStep();
+    demo.captureDigIntent(&input);
+    try std.testing.expectEqual(DigIntent.down, demo.simulation_frame.dig_intent);
+
+    // Still held next step: no second dig.
+    demo.simulation_frame.beginStep();
+    demo.captureDigIntent(&input);
+    try std.testing.expectEqual(DigIntent.none, demo.simulation_frame.dig_intent);
+
+    // Release, then press again: the rising edge fires once more.
+    input.setHeld(.digDown, false);
+    demo.simulation_frame.beginStep();
+    demo.captureDigIntent(&input);
+    try std.testing.expectEqual(DigIntent.none, demo.simulation_frame.dig_intent);
+
+    input.setHeld(.digDown, true);
+    demo.simulation_frame.beginStep();
+    demo.captureDigIntent(&input);
+    try std.testing.expectEqual(DigIntent.down, demo.simulation_frame.dig_intent);
+}
+
+test "demo dig deepens a cell to a blocking pit and reopens it on dig up" {
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    // Player at cell (3,3) facing right -> faced cell (4,3).
+    const body = demo.data.movementBodyPtr(demo.player.entity).?;
+    body.position_x.* = 96;
+    body.position_y.* = 96;
+    demo.data.facingPtr(demo.player.entity).?.* = .right;
+
+    // Normalize the faced cell to surface so two dig-downs reach the pit.
+    _ = try demo.world.setDenseTile(0, 4, 3, demo.pipeline.dig.surface_id);
+
+    // Dig down: surface -> dirt stays walkable (the ramp), no nav change.
+    _ = try digStepForTest(&demo, .down);
+    try std.testing.expect(!demo.world.denseTileBlocksMovement(0, 4, 3));
+
+    // Dig down again: dirt -> void_pit blocks and invalidates navigation.
+    try std.testing.expect(try digStepForTest(&demo, .down));
+    try std.testing.expect(demo.world.denseTileBlocksMovement(0, 4, 3));
+
+    // Dig up: void_pit -> dirt reopens the cell and re-masks navigation.
+    try std.testing.expect(try digStepForTest(&demo, .up));
+    try std.testing.expect(!demo.world.denseTileBlocksMovement(0, 4, 3));
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {

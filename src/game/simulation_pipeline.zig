@@ -15,6 +15,8 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const DigConfig = @import("dig_controller.zig").DigConfig;
+const DigController = @import("dig_controller.zig").DigController;
 const Player = @import("player.zig").Player;
 const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
@@ -44,6 +46,7 @@ pub const SimulationPipelineConfig = struct {
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
+    dig: DigConfig = .{},
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -52,6 +55,9 @@ pub const SimulationPipelineConfig = struct {
 pub const SimulationPipelineUpdateContext = struct {
     data: *DataSystem,
     frame: *SimulationFrame,
+    /// Mutable world for the dig controller's world-tile authoring. Borrowed for
+    /// the step only; persistent tile facts stay owned by the gameplay state.
+    world: *WorldSystem,
     player: Player,
     thread_system: *ThreadSystem,
     delta_seconds: f32,
@@ -84,6 +90,7 @@ pub const SimulationPipeline = struct {
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
+    dig: DigController,
     nav_cell_size: f32,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
@@ -117,6 +124,7 @@ pub const SimulationPipeline = struct {
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
+            .dig = DigController.init(config.dig),
             .nav_cell_size = config.nav_cell_size,
         };
     }
@@ -181,6 +189,10 @@ pub const SimulationPipeline = struct {
         const scope = SimulationScope.fullActive(data.simulationScopeStatsFullActive());
 
         frame.phase = .processors;
+        // Player-authored world edit. Runs first; its world_tile_changed event is
+        // deferred and re-masks navigation in merge_outputs regardless of order.
+        try self.dig.process(context.world, data, context.player, frame);
+
         const ai_slice = data.aiAgentSliceConst();
         const move_slice = data.movementBodySliceConst();
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
@@ -308,6 +320,14 @@ test "pipeline updates full active player-only state through serial path" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(2, 2, 2, 4, 2, 2);
@@ -334,6 +354,7 @@ test "pipeline updates full active player-only state through serial path" {
     const stats = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
+        .world = &world,
         .player = player,
         .thread_system = &threads,
         .delta_seconds = 0.016,

@@ -781,6 +781,16 @@ pub const WorldSystem = struct {
         };
     }
 
+    /// Maps a world-space point to its containing cell, or `null` when the point
+    /// lies outside the world bounds. Inverse of `cellRect`; traversal-safe.
+    pub fn cellContaining(self: *const WorldSystem, world_x: f32, world_y: f32) ?struct { x: u16, y: u16 } {
+        if (world_x < 0 or world_y < 0) return null;
+        const cell_x = @as(u32, @intFromFloat(world_x / self.tile_size));
+        const cell_y = @as(u32, @intFromFloat(world_y / self.tile_size));
+        if (cell_x >= self.width or cell_y >= self.height) return null;
+        return .{ .x = @intCast(cell_x), .y = @intCast(cell_y) };
+    }
+
     pub fn chunkCoordForCell(self: *const WorldSystem, x: u16, y: u16) struct { x: i32, y: i32 } {
         return .{
             .x = @intCast(x / self.chunk_size_tiles),
