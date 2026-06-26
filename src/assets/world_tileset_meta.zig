@@ -110,6 +110,8 @@ pub const WorldTilesetMeta = struct {
         return self.parsed.value.theme;
     }
 
+    /// Returned `AtlasInfo` slices (`path`, `sprite_asset_id`) borrow the parsed
+    /// JSON and are valid until this meta object is deinitialized.
     pub fn atlas(self: WorldTilesetMeta) AtlasInfo {
         const json_atlas = self.parsed.value.atlas;
         return .{
@@ -136,6 +138,9 @@ pub const WorldTilesetMeta = struct {
         return self.parsed.value.tile_count;
     }
 
+    /// Returned `TileEntry` slices (`name`, `category`, and `properties`
+    /// strings) borrow the parsed JSON and are valid until this meta object is
+    /// deinitialized.
     pub fn tileAtIndex(self: WorldTilesetMeta, index: usize) ?TileEntry {
         if (index >= self.parsed.value.tiles.len) return null;
         return jsonTileToEntry(self.parsed.value.tiles[index]);
@@ -151,6 +156,8 @@ pub const WorldTilesetMeta = struct {
         return sourceRectFromTile(self.parsed.value.tiles[index]);
     }
 
+    /// Returned `TileEntry` slices borrow the parsed JSON and are valid until
+    /// this meta object is deinitialized.
     pub fn tileByName(self: WorldTilesetMeta, tile_name: []const u8) ?TileEntry {
         const id = self.name_to_id.get(tile_name) orelse return null;
         const index = self.id_to_index.get(id) orelse return null;

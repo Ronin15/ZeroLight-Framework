@@ -93,6 +93,7 @@ pub const Engine = struct {
         errdefer audio_service.deinit();
         var audio_commands = AudioCommandBuffer.init(allocator, app_config.audio.max_commands_per_step);
         errdefer audio_commands.deinit();
+        try audio_commands.reserve();
 
         var renderer = try Renderer.init(allocator, window.handle, assets, app_config);
         errdefer renderer.deinit();
@@ -118,6 +119,7 @@ pub const Engine = struct {
 
         var transitions = StateTransitions.init(allocator);
         errdefer transitions.deinit();
+        try transitions.reserve(StateTransitions.default_capacity);
 
         var thread_system = try ThreadSystem.init(allocator, process_init.io, app_config.threading);
         errdefer thread_system.deinit();
@@ -164,9 +166,12 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
-        self.thread_system.deinit();
+        // Tear states (and any pending transition payloads) down before the thread
+        // system so a state that drains or awaits worker work in its deinit still
+        // has a live pool to do it against.
         self.transitions.deinit();
         self.states.deinit();
+        self.thread_system.deinit();
         self.debug_overlay.deinit();
         self.text_service.deinit(&self.renderer);
         self.runtime_assets.deinit(&self.asset_cache, &self.renderer);
@@ -197,12 +202,15 @@ pub const Engine = struct {
         const perf_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
         var event_count: u64 = 0;
         var event: c.SDL_Event = undefined;
+        // State transitions queued by handleEvent are deferred until applyTransitions
+        // below, so the active stack (and thus the routing policy) cannot change mid
+        // batch. Compute the policy once rather than per polled event.
+        const routing_policy = self.states.inputRoutingPolicy();
         while (c.SDL_PollEvent(&event)) {
             if (comptime runtime_perf_log.enabled) {
                 event_count += 1;
                 self.recordPresentationEventMetrics(event.type);
             }
-            const routing_policy = self.states.inputRoutingPolicy();
             switch (event.type) {
                 c.SDL_EVENT_QUIT => {
                     log.debug("quit requested by SDL event", .{});

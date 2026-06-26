@@ -100,7 +100,7 @@ pub const MainMenuState = struct {
         _ = context.thread_system;
 
         const renderer = context.renderer;
-        const text_service = context.text_service orelse return;
+        const text_service = context.text_service;
 
         if (self.text_dirty or !self.title_text.isValid()) {
             try self.prepareTextViews(text_service, renderer);

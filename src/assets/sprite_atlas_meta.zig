@@ -83,6 +83,8 @@ pub const SpriteAtlasMeta = struct {
         return self.parsed.value.name;
     }
 
+    /// Returned `AtlasInfo` slices (`path`, `sprite_asset_id`) borrow the parsed
+    /// JSON and are valid until this meta object is deinitialized.
     pub fn atlas(self: SpriteAtlasMeta) AtlasInfo {
         const json_atlas = self.parsed.value.atlas;
         return .{
@@ -124,6 +126,8 @@ pub const SpriteAtlasMeta = struct {
         return self.source_rects[index];
     }
 
+    /// Returned `SpriteEntry` slices (`name`, `category`) borrow the parsed JSON
+    /// and are valid until this meta object is deinitialized.
     pub fn spriteByName(self: SpriteAtlasMeta, sprite_name: []const u8) ?SpriteEntry {
         const id = self.name_to_id.get(sprite_name) orelse return null;
         const index = self.id_to_index.get(id) orelse return null;

@@ -90,7 +90,7 @@ pub const LoadingState = struct {
             .logical,
         );
         self.rendered_once = true;
-        const text_service = context.text_service orelse return;
+        const text_service = context.text_service;
         if (self.text_dirty or !self.title_text.isValid()) {
             try self.prepareTextViews(text_service, context.renderer);
         }

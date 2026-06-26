@@ -64,11 +64,30 @@ pub const RuntimeAssets = struct {
         renderer: *Renderer,
         audio: *AudioService,
     ) !void {
+        return self.preloadWithBackend(allocator, asset_store, cache, @ptrCast(renderer), audio);
+    }
+
+    pub fn deinit(self: *RuntimeAssets, cache: *AssetCache, renderer: *Renderer) void {
+        self.deinitWithBackend(cache, @ptrCast(renderer));
+    }
+
+    /// Shared preload implementation. Production threads a `*Renderer` as the
+    /// texture backend context; tests thread a fake backend through the same
+    /// path so they exercise real preload/validation/release logic. The context
+    /// must match the `TextureBackend` the cache was created with.
+    fn preloadWithBackend(
+        self: *RuntimeAssets,
+        allocator: std.mem.Allocator,
+        asset_store: AssetStore,
+        cache: *AssetCache,
+        backend_context: *anyopaque,
+        audio: *AudioService,
+    ) !void {
         self.allocator = allocator;
-        errdefer self.deinit(cache, renderer);
+        errdefer self.deinitWithBackend(cache, backend_context);
 
         for (manifest.sprite_assets) |spec| {
-            try self.preloadSprite(asset_store, cache, renderer, spec);
+            try self.preloadSprite(asset_store, cache, backend_context, spec);
         }
         try self.loadAtlasMetadata(asset_store, .{});
         for (manifest.audio_assets) |spec| {
@@ -77,11 +96,11 @@ pub const RuntimeAssets = struct {
         }
     }
 
-    pub fn deinit(self: *RuntimeAssets, cache: *AssetCache, renderer: *Renderer) void {
+    fn deinitWithBackend(self: *RuntimeAssets, cache: *AssetCache, backend_context: *anyopaque) void {
         deinitAtlasMetaSlots(&self.atlas_meta);
 
         for (&self.sprite_slots) |*slot| {
-            cache.releaseTexture(renderer, &slot.lease);
+            cache.releaseTextureWithContext(backend_context, &slot.lease);
             slot.* = .{};
         }
         self.audio_status = initAudioStatus();
@@ -177,7 +196,7 @@ pub const RuntimeAssets = struct {
         self: *RuntimeAssets,
         asset_store: AssetStore,
         cache: *AssetCache,
-        renderer: *Renderer,
+        backend_context: *anyopaque,
         spec: manifest.SpriteAssetSpec,
     ) !void {
         const index = manifest.spriteIndex(spec.id);
@@ -192,15 +211,15 @@ pub const RuntimeAssets = struct {
                     return error.RequiredStartupSpriteUnavailable;
                 }
                 log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
-                self.releaseSpriteSlot(cache, renderer, index);
+                self.releaseSpriteSlot(cache, backend_context, index);
                 self.sprite_slots[index].status = .unavailable;
                 return;
             },
             else => return err,
         }
 
-        const lease = try cache.acquireTexture(renderer, spec.path);
-        self.releaseSpriteSlot(cache, renderer, index);
+        const lease = try cache.acquireTextureWithContext(backend_context, spec.path);
+        self.releaseSpriteSlot(cache, backend_context, index);
         self.sprite_slots[index] = .{
             .status = .available,
             .lease = lease,
@@ -208,8 +227,8 @@ pub const RuntimeAssets = struct {
         };
     }
 
-    fn releaseSpriteSlot(self: *RuntimeAssets, cache: *AssetCache, renderer: *Renderer, index: usize) void {
-        cache.releaseTexture(renderer, &self.sprite_slots[index].lease);
+    fn releaseSpriteSlot(self: *RuntimeAssets, cache: *AssetCache, backend_context: *anyopaque, index: usize) void {
+        cache.releaseTextureWithContext(backend_context, &self.sprite_slots[index].lease);
         self.sprite_slots[index] = .{};
     }
 };
@@ -559,11 +578,17 @@ test "startup preload loads atlas metadata when installed atlases are available"
     }
 }
 
+// Test helpers drive the real production preload/release path with a fake
+// texture backend instead of re-implementing it, so they cannot drift from the
+// renderer-backed path. The backend pointer is threaded through the cache's
+// public backend-context seam, exactly as production threads a `*Renderer`.
+const FakeBackend = @import("cache.zig").testing.Backend;
+
 fn preloadSpriteSpecsForTest(
     runtime_assets: *RuntimeAssets,
     asset_store: AssetStore,
     cache: *AssetCache,
-    fake: anytype,
+    fake: *FakeBackend,
     specs: []const manifest.SpriteAssetSpec,
 ) !void {
     errdefer deinitWithTestBackend(runtime_assets, cache, fake);
@@ -577,69 +602,22 @@ fn preloadWithTestBackend(
     runtime_assets: *RuntimeAssets,
     asset_store: AssetStore,
     cache: *AssetCache,
-    fake: anytype,
+    fake: *FakeBackend,
     audio: *AudioService,
 ) !void {
-    errdefer deinitWithTestBackend(runtime_assets, cache, fake);
-    runtime_assets.allocator = std.testing.allocator;
-
-    for (manifest.sprite_assets) |spec| {
-        try preloadSpriteWithTestBackend(runtime_assets, asset_store, cache, fake, spec);
-    }
-    try runtime_assets.loadAtlasMetadata(asset_store, .{});
-    for (manifest.audio_assets) |spec| {
-        const available = try audio.preloadAudio(spec.id, spec.path, spec.kind, spec.predecode);
-        runtime_assets.audio_status[manifest.audioIndex(spec.id)] = if (available) .available else .unavailable;
-    }
+    return runtime_assets.preloadWithBackend(std.testing.allocator, asset_store, cache, @ptrCast(fake), audio);
 }
 
-fn deinitWithTestBackend(runtime_assets: *RuntimeAssets, cache: *AssetCache, fake: anytype) void {
-    const cache_testing = @import("cache.zig").testing;
-    deinitAtlasMetaSlots(&runtime_assets.atlas_meta);
-
-    for (&runtime_assets.sprite_slots) |*slot| {
-        cache_testing.releaseTexture(cache, fake, &slot.lease);
-        slot.* = .{};
-    }
-    runtime_assets.audio_status = initAudioStatus();
+fn deinitWithTestBackend(runtime_assets: *RuntimeAssets, cache: *AssetCache, fake: *FakeBackend) void {
+    runtime_assets.deinitWithBackend(cache, @ptrCast(fake));
 }
 
 fn preloadSpriteWithTestBackend(
     runtime_assets: *RuntimeAssets,
     asset_store: AssetStore,
     cache: *AssetCache,
-    fake: anytype,
+    fake: *FakeBackend,
     spec: manifest.SpriteAssetSpec,
 ) !void {
-    const cache_testing = @import("cache.zig").testing;
-    const index = manifest.spriteIndex(spec.id);
-
-    try @import("assets.zig").validateRelativePath(spec.path);
-    if (asset_store.resolveReadablePath(spec.path)) |path| {
-        asset_store.allocator.free(path);
-    } else |err| switch (err) {
-        error.FileNotFound => {
-            if (isRequiredStartupSprite(spec.id)) {
-                return error.RequiredStartupSpriteUnavailable;
-            }
-            releaseSpriteSlotWithTestBackend(runtime_assets, cache, fake, index);
-            runtime_assets.sprite_slots[index].status = .unavailable;
-            return;
-        },
-        else => return err,
-    }
-
-    const lease = try cache_testing.acquireTexture(cache, fake, spec.path);
-    releaseSpriteSlotWithTestBackend(runtime_assets, cache, fake, index);
-    runtime_assets.sprite_slots[index] = .{
-        .status = .available,
-        .lease = lease,
-        .source_rect = sourceRect(spec.source_rect),
-    };
-}
-
-fn releaseSpriteSlotWithTestBackend(runtime_assets: *RuntimeAssets, cache: *AssetCache, fake: anytype, index: usize) void {
-    const cache_testing = @import("cache.zig").testing;
-    cache_testing.releaseTexture(cache, fake, &runtime_assets.sprite_slots[index].lease);
-    runtime_assets.sprite_slots[index] = .{};
+    return runtime_assets.preloadSprite(asset_store, cache, @ptrCast(fake), spec);
 }

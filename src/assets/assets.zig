@@ -69,7 +69,7 @@ pub const AssetStore = struct {
     }
 };
 
-pub fn validateRelativePath(relative_path: []const u8) !void {
+pub fn validateRelativePath(relative_path: []const u8) error{InvalidAssetPath}!void {
     if (relative_path.len == 0 or std.fs.path.isAbsolute(relative_path)) {
         return error.InvalidAssetPath;
     }

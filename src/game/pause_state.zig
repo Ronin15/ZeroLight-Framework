@@ -88,7 +88,7 @@ fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").R
 }
 
 fn drawPrompt(self: *PauseState, context: RenderContext) !void {
-    const text_service = context.text_service orelse return;
+    const text_service = context.text_service;
     if (!self.prompt.isValid()) {
         self.prompt = try text_service.prepareDefaultText(context.renderer, PauseState.prompt_text, PauseState.prompt_color);
     }

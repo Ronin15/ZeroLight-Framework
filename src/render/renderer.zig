@@ -409,11 +409,14 @@ pub const Renderer = struct {
     pub fn endFrame(self: *Renderer, thread_system: ?*ThreadSystem) !FrameResult {
         try self.ensureFrameBatchCapacity();
         const window_size = try self.currentWindowSize();
-        const pre_acquire_drawable_size = self.currentDrawableSize() catch |err| switch (err) {
+        // Cheap pre-acquire probe: a zero/invalid drawable means there is no
+        // swapchain yet, so skip the frame before doing any prep. Presentation is
+        // computed (and logged) exactly once below, from the acquired size, so a
+        // single resize does not emit two "presentation changed" debug lines.
+        _ = self.currentDrawableSize() catch |err| switch (err) {
             error.InvalidDrawableSize => return .skipped_no_swapchain,
             else => return err,
         };
-        _ = self.updatePresentation(window_size, pre_acquire_drawable_size);
         // Sorting, texture metadata snapshots, and optional worker vertex prep
         // happen before acquiring the swapchain to keep the acquired window short.
         try self.prepareFrameCommands(thread_system);
@@ -1397,6 +1400,59 @@ test "draw list interleaves static and dynamic by render order across z" {
     try std.testing.expectEqual(DrawSource.dynamic, list.items[1].source);
     try std.testing.expectEqual(@as(i32, 0), list.items[1].order.depth);
     try std.testing.expectEqual(DrawSource.static, list.items[2].source);
+    try std.testing.expectEqual(@as(i32, 1), list.items[2].order.depth);
+}
+
+test "same-texture dynamic run straddling a static span interleaves by order" {
+    const allocator = std.testing.allocator;
+
+    // Two dynamic sprites share one texture but sit at world(-2) and world(1).
+    // buildDrawGroups must split them into order-homogeneous groups so a static
+    // span at world(0) sorts BETWEEN them in the merged draw list. A single group
+    // keyed at the lower depth would draw both dynamic sprites before the span.
+    var batch = sprite_batch.SpriteBatch.init(allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(4, 4 * 6, 4);
+
+    const dynamic_texture = TextureId.init(1, 1) catch unreachable;
+    try batch.drawSprite(.{
+        .texture = dynamic_texture,
+        .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(-2),
+    });
+    try batch.drawSprite(.{
+        .texture = dynamic_texture,
+        .dest = .{ .x = 2, .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(1),
+    });
+
+    const desc = resources.TextureDesc{ .width = 8, .height = 8 };
+    const resolver = sprite_batch.TextureResolver{
+        .context = &desc,
+        .resolve = struct {
+            fn resolve(ctx: *const anyopaque, id: TextureId) ?resources.TextureDesc {
+                _ = id;
+                return @as(*const resources.TextureDesc, @ptrCast(@alignCast(ctx))).*;
+            }
+        }.resolve,
+    };
+    batch.buildSerial(resolver);
+    try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
+
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 2, .world, RenderOrder.world(0), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, batch.draw_groups.items);
+
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[0].source);
+    try std.testing.expectEqual(@as(i32, -2), list.items[0].order.depth);
+    try std.testing.expectEqual(DrawSource.static, list.items[1].source);
+    try std.testing.expectEqual(@as(i32, 0), list.items[1].order.depth);
+    try std.testing.expectEqual(DrawSource.dynamic, list.items[2].source);
     try std.testing.expectEqual(@as(i32, 1), list.items[2].order.depth);
 }
 

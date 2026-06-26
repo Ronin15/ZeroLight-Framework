@@ -61,8 +61,12 @@ pub fn loadPng(assets: AssetStore, relative_path: []const u8) !LoadedImage {
     const pitch: usize = @intCast(converted.*.pitch);
     const byte_len = pitch * @as(usize, @intCast(converted.*.h));
     const owned_pixels = try assets.allocator.dupe(u8, @as([*]const u8, @ptrCast(pixels))[0..byte_len]);
-    errdefer assets.allocator.free(owned_pixels);
 
+    // Dimension/pitch/buffer-length validation is the renderer's responsibility:
+    // `gpu.texture.validatePixels` rejects bad width/height/pitch/length before any
+    // GPU work, so the decode path keeps a single upload gate and does not duplicate
+    // it here. `byte_len` above is pitch * height by construction, so `owned_pixels`
+    // always satisfies that gate's length check.
     log.debug("loaded PNG image \"{s}\" {}x{} pitch={}", .{ relative_path, width, height, pitch });
     return .{
         .allocator = assets.allocator,

@@ -588,27 +588,27 @@ fn processRange(particles: *ParticleSlice, range: ParallelRange, delta_seconds: 
         simd.storeFloat4Slice(particles.position_x[index..], next_position_x);
         simd.storeFloat4Slice(particles.position_y[index..], next_position_y);
         simd.storeFloat4Slice(particles.age[index..], next_age);
-        simd.storeFloat4Slice(particles.size[index..], lerpFloat4(
+        simd.storeFloat4Slice(particles.size[index..], simd.lerpFloat4(
             simd.loadFloat4(particles.start_size[index..]),
             simd.loadFloat4(particles.end_size[index..]),
             normalized_age,
         ));
-        simd.storeFloat4Slice(particles.color_r[index..], lerpFloat4(
+        simd.storeFloat4Slice(particles.color_r[index..], simd.lerpFloat4(
             simd.loadFloat4(particles.start_color_r[index..]),
             simd.loadFloat4(particles.end_color_r[index..]),
             normalized_age,
         ));
-        simd.storeFloat4Slice(particles.color_g[index..], lerpFloat4(
+        simd.storeFloat4Slice(particles.color_g[index..], simd.lerpFloat4(
             simd.loadFloat4(particles.start_color_g[index..]),
             simd.loadFloat4(particles.end_color_g[index..]),
             normalized_age,
         ));
-        simd.storeFloat4Slice(particles.color_b[index..], lerpFloat4(
+        simd.storeFloat4Slice(particles.color_b[index..], simd.lerpFloat4(
             simd.loadFloat4(particles.start_color_b[index..]),
             simd.loadFloat4(particles.end_color_b[index..]),
             normalized_age,
         ));
-        simd.storeFloat4Slice(particles.color_a[index..], lerpFloat4(
+        simd.storeFloat4Slice(particles.color_a[index..], simd.lerpFloat4(
             simd.loadFloat4(particles.start_color_a[index..]),
             simd.loadFloat4(particles.end_color_a[index..]),
             normalized_age,
@@ -643,19 +643,11 @@ fn processParticleScalar(particles: *ParticleSlice, index: usize, delta_seconds:
     particles.age[index] += delta_seconds;
 
     const t = math.clamp(particles.age[index] / particles.lifetime[index], 0, 1);
-    particles.size[index] = lerpScalar(particles.start_size[index], particles.end_size[index], t);
-    particles.color_r[index] = lerpScalar(particles.start_color_r[index], particles.end_color_r[index], t);
-    particles.color_g[index] = lerpScalar(particles.start_color_g[index], particles.end_color_g[index], t);
-    particles.color_b[index] = lerpScalar(particles.start_color_b[index], particles.end_color_b[index], t);
-    particles.color_a[index] = lerpScalar(particles.start_color_a[index], particles.end_color_a[index], t);
-}
-
-fn lerpFloat4(start: simd.Float4, end: simd.Float4, amount: simd.Float4) simd.Float4 {
-    return simd.addFloat4(start, simd.mulFloat4(simd.subFloat4(end, start), amount));
-}
-
-fn lerpScalar(start: f32, end: f32, amount: f32) f32 {
-    return start + (end - start) * amount;
+    particles.size[index] = math.lerp(particles.start_size[index], particles.end_size[index], t);
+    particles.color_r[index] = math.lerp(particles.start_color_r[index], particles.end_color_r[index], t);
+    particles.color_g[index] = math.lerp(particles.start_color_g[index], particles.end_color_g[index], t);
+    particles.color_b[index] = math.lerp(particles.start_color_b[index], particles.end_color_b[index], t);
+    particles.color_a[index] = math.lerp(particles.start_color_a[index], particles.end_color_a[index], t);
 }
 
 const ParticleJobContext = struct {

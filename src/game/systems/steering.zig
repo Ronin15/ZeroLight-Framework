@@ -1154,7 +1154,7 @@ fn spatialCell(value: f32, cell_size: f32) i32 {
 }
 
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
-    return @sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y));
+    return math.length(.{ .x = a.x - b.x, .y = a.y - b.y });
 }
 
 fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {

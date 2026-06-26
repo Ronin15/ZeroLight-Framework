@@ -389,7 +389,18 @@ pub const SpriteBatch = struct {
             const first_vertex: u32 = @intCast(prepared_index * 6);
             const group_presentation = presentationForCoordinateSpace(command.sprite.coordinate_space);
 
-            if (active_texture == null or !textureIdsEqual(active_texture.?, command.sprite.texture) or active_presentation != group_presentation) {
+            // Break on order change as well as texture/presentation so every group
+            // is order-homogeneous. A same-texture run spanning multiple depths must
+            // not collapse into one group keyed at its lowest depth, or a static
+            // (dense tilemap) span whose order lands inside that range could no
+            // longer interleave between the run's depths in the merged draw list.
+            // Contiguous same-order groups re-coalesce in the renderer when nothing
+            // interleaves, so this does not inflate the steady-state draw count.
+            if (active_texture == null or
+                !textureIdsEqual(active_texture.?, command.sprite.texture) or
+                active_presentation != group_presentation or
+                !renderOrdersEqual(active_order, command.sprite.order))
+            {
                 if (active_texture) |texture| {
                     self.draw_groups.appendAssumeCapacity(.{
                         .source = .dynamic,
@@ -402,8 +413,6 @@ pub const SpriteBatch = struct {
                 }
                 active_texture = command.sprite.texture;
                 active_presentation = group_presentation;
-                // Submission is nondecreasing, so the first command's order is the
-                // group's min order — the correct key for merging with static spans.
                 active_order = command.sprite.order;
                 active_first_vertex = first_vertex;
                 active_vertex_count = 6;
@@ -531,15 +540,11 @@ fn writeSpriteQuad(
     };
     const indices = [_]usize{ 0, 1, 2, 1, 3, 2 };
 
-    const rotation_cos = @cos(sprite.rotation);
-    const rotation_sin = @sin(sprite.rotation);
+    const rotation = math.sinCos(sprite.rotation);
 
     var positions: [4]math.Vec2 = undefined;
     for (local, 0..) |point, index| {
-        const rotated = math.Vec2{
-            .x = point.x * rotation_cos - point.y * rotation_sin,
-            .y = point.x * rotation_sin + point.y * rotation_cos,
-        };
+        const rotated = math.rotate2D(point, rotation);
         const world = math.Vec2{
             .x = sprite.dest.x + sprite.origin.x + rotated.x,
             .y = sprite.dest.y + sprite.origin.y + rotated.y,
@@ -573,6 +578,10 @@ pub fn presentationForCoordinateSpace(coordinate_space: CoordinateSpace) Coordin
 
 fn textureIdsEqual(lhs: TextureId, rhs: TextureId) bool {
     return lhs.index == rhs.index and lhs.generation == rhs.generation;
+}
+
+fn renderOrdersEqual(lhs: RenderOrder, rhs: RenderOrder) bool {
+    return lhs.domain == rhs.domain and lhs.depth == rhs.depth;
 }
 
 fn testTextureId(index: u32, generation: u32) TextureId {
@@ -761,6 +770,40 @@ test "batch builder preserves ordered submission stream" {
     try std.testing.expectEqual(@as(f32, 10), batch.vertices.items[0].position[0]);
     try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
     try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[0]);
+}
+
+test "batch builder splits a same-texture run on render order change" {
+    const allocator = std.testing.allocator;
+    const slots = [_]TestTextureSlot{
+        .{ .id = testTextureId(0, 1), .desc = .{ .width = 8, .height = 8 } },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = try initBatchTest(allocator, &table);
+    defer batch.deinit();
+
+    // One texture, two depths. Without an order break these collapse into a single
+    // group keyed at the lower depth, so a static span at the depth between them
+    // could not interleave in the merged draw list.
+    try batch.drawSprite(.{
+        .texture = testTextureId(0, 1),
+        .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(-2),
+    });
+    try batch.drawSprite(.{
+        .texture = testTextureId(0, 1),
+        .dest = .{ .x = 2, .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(1),
+    });
+
+    batch.buildSerial(table.resolver());
+
+    try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
+    try std.testing.expectEqual(@as(i32, -2), batch.draw_groups.items[0].order.depth);
+    try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[0].vertex_count);
+    try std.testing.expectEqual(@as(i32, 1), batch.draw_groups.items[1].order.depth);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[1].first_vertex);
+    try std.testing.expectEqual(@as(u32, 6), batch.draw_groups.items[1].vertex_count);
 }
 
 test "world and logical vertices stay independent of drawable presentation" {

@@ -107,6 +107,12 @@ pub const AudioCommandBuffer = struct {
         self.* = undefined;
     }
 
+    /// Reserves the full per-step bound up front so the buffer is allocation-free
+    /// from the first fixed step, not just after the first frame warms it up.
+    pub fn reserve(self: *AudioCommandBuffer) !void {
+        try self.commands.ensureTotalCapacity(self.allocator, self.max_commands);
+    }
+
     pub fn beginStep(self: *AudioCommandBuffer) void {
         self.clearRetainingCapacity();
     }
@@ -209,6 +215,10 @@ pub const AudioService = struct {
     // (e.g. a wrong-kind asset re-emitted each frame) logs once rather than at the
     // step rate. Cleared when a command succeeds, so a recurrence warns again.
     last_warned_command_error: ?anyerror = null,
+    // Same warn-once dedup for the non-command control ops (pause stop-all, bus and
+    // music gain updates). A persistent backend failure such as device loss would
+    // otherwise be silently swallowed; this surfaces it once per recurring error.
+    last_warned_control_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, assetStore: assets.AssetStore, config: AudioConfig) !AudioService {
         var service = AudioService{
@@ -483,25 +493,57 @@ pub const AudioService = struct {
     }
 
     fn stopAllSfx(self: *AudioService) void {
+        var first_error: ?anyerror = null;
         for (self.sfx_tracks.items) |*slot| {
-            self.backend.stop_track(self.backend_context, slot.handle, 0) catch {};
-            self.clearTrackPosition(slot) catch {};
+            self.backend.stop_track(self.backend_context, slot.handle, 0) catch |err| {
+                if (first_error == null) first_error = err;
+            };
+            self.clearTrackPosition(slot) catch |err| {
+                if (first_error == null) first_error = err;
+            };
             slot.looping_id = null;
             slot.priority = 0;
             slot.request_gain = 1.0;
             slot.frequency_ratio = 1.0;
         }
+        self.noteControlResult(first_error);
     }
 
     fn applyBusGains(self: *AudioService) void {
+        var first_error: ?anyerror = null;
         for (self.sfx_tracks.items) |slot| {
-            self.backend.set_track_gain(self.backend_context, slot.handle, slot.request_gain * self.sfx_gain) catch {};
+            self.backend.set_track_gain(self.backend_context, slot.handle, slot.request_gain * self.sfx_gain) catch |err| {
+                if (first_error == null) first_error = err;
+            };
         }
-        self.applyMusicGain();
+        self.setMusicTrackGain() catch |err| {
+            if (first_error == null) first_error = err;
+        };
+        self.noteControlResult(first_error);
     }
 
     fn applyMusicGain(self: *AudioService) void {
-        self.backend.set_track_gain(self.backend_context, self.music_track, self.effectiveMusicGain()) catch {};
+        self.noteControlResult(if (self.setMusicTrackGain()) null else |err| err);
+    }
+
+    fn setMusicTrackGain(self: *AudioService) !void {
+        try self.backend.set_track_gain(self.backend_context, self.music_track, self.effectiveMusicGain());
+    }
+
+    /// Warn-once handoff for non-command control ops: warns a recurring backend
+    /// failure a single time, and clears the dedup after a fully successful pass
+    /// so a later recurrence (e.g. after recovery) warns again. Gain/stop failures
+    /// stay non-fatal because audio is best-effort and the next op retries.
+    fn noteControlResult(self: *AudioService, first_error: ?anyerror) void {
+        const err = first_error orelse {
+            self.last_warned_control_error = null;
+            return;
+        };
+        const already_warned = if (self.last_warned_control_error) |last| last == err else false;
+        if (!already_warned) {
+            log.warn("audio control op failed: {}", .{err});
+            self.last_warned_control_error = err;
+        }
     }
 
     fn effectiveMusicGain(self: *const AudioService) f32 {

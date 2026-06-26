@@ -60,7 +60,11 @@ pub const AssetCache = struct {
         };
     }
 
-    fn acquireTextureWithContext(
+    /// Backend-context seam shared by the renderer-facing wrappers and asset
+    /// owners that thread their own texture backend (e.g. a `*Renderer` or, in
+    /// tests, a fake backend) through the cache. The context must match the
+    /// `TextureBackend` the cache was created with.
+    pub fn acquireTextureWithContext(
         self: *AssetCache,
         backend_context: *anyopaque,
         relative_path: []const u8,
@@ -116,7 +120,9 @@ pub const AssetCache = struct {
         };
     }
 
-    fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
+    /// Backend-context counterpart to `acquireTextureWithContext`; see its note
+    /// on matching the cache's `TextureBackend`.
+    pub fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
         if (lease.owner_id != self.owner_id) return;
         const handle = lease.handle;
         const texture = lease.id;
@@ -369,14 +375,6 @@ pub const testing = if (builtin.is_test) struct {
 
     pub fn deinitCache(cache: *AssetCache, fake: *Backend) void {
         cache.deinitWithContext(fake);
-    }
-
-    pub fn acquireTexture(cache: *AssetCache, fake: *Backend, relative_path: []const u8) !TextureLease {
-        return cache.acquireTextureWithContext(fake, relative_path);
-    }
-
-    pub fn releaseTexture(cache: *AssetCache, fake: *Backend, lease: *TextureLease) void {
-        cache.releaseTextureWithContext(fake, lease);
     }
 
     pub fn uploadCount(fake: *const Backend) u32 {

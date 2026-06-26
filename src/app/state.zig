@@ -71,7 +71,7 @@ pub const UpdateContext = struct {
 pub const RenderContext = struct {
     renderer: *Renderer,
     runtime_assets: *const RuntimeAssets,
-    text_service: ?*TextService,
+    text_service: *TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
     ui_stack_order: UiStackOrder = .base,
@@ -179,6 +179,11 @@ pub const StateTransitions = struct {
     allocator: std.mem.Allocator,
     requests: std.ArrayList(Request) = .empty,
 
+    // Per-frame transitions come from a small number of sources (a couple of
+    // queued events plus the active state's update), so a modest reserve keeps
+    // the queue allocation-free from frame 0 without over-allocating.
+    pub const default_capacity = 8;
+
     const Request = union(enum) {
         none,
         replace: StateRequest,
@@ -200,6 +205,12 @@ pub const StateTransitions = struct {
     pub fn deinit(self: *StateTransitions) void {
         self.destroyPendingStates();
         self.requests.deinit(self.allocator);
+    }
+
+    /// Reserves the per-frame request bound up front so queuing transitions during
+    /// event/update dispatch is allocation-free from frame 0.
+    pub fn reserve(self: *StateTransitions, capacity: usize) !void {
+        try self.requests.ensureTotalCapacity(self.allocator, capacity);
     }
 
     pub fn clear(self: *StateTransitions) void {
@@ -641,13 +652,14 @@ fn testUpdateContext(
 fn testRenderContext(
     renderer: *Renderer,
     runtime_assets: *const RuntimeAssets,
+    text_service: *TextService,
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
 ) RenderContext {
     return .{
         .renderer = renderer,
         .runtime_assets = runtime_assets,
-        .text_service = null,
+        .text_service = text_service,
         .interpolation_alpha = interpolation_alpha,
         .thread_system = thread_system,
     };
@@ -1174,7 +1186,11 @@ test "opaque state render policy hides states below it" {
     _ = try stack.pushOverlay(TestingState, .{ .render_count = &overlay_count });
 
     var renderer: Renderer = undefined;
-    try stack.render(testRenderContext(&renderer, &runtime_assets, 0.0, &threads));
+    // TestingState.render never touches text_service; an unset service pointer
+    // mirrors the unset renderer pointer above (the render context only needs a
+    // valid non-null address here).
+    var text_service: TextService = undefined;
+    try stack.render(testRenderContext(&renderer, &runtime_assets, &text_service, 0.0, &threads));
 
     try std.testing.expectEqual(@as(u32, 0), bottom_count);
     try std.testing.expectEqual(@as(u32, 1), opaque_count);
@@ -1232,7 +1248,8 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     try std.testing.expectEqual(@as(usize, 0), transitions.requests.items.len);
 
     var renderer: Renderer = undefined;
-    try stack.render(testRenderContext(&renderer, &runtime_assets, 0.0, &threads));
+    var text_service: TextService = undefined;
+    try stack.render(testRenderContext(&renderer, &runtime_assets, &text_service, 0.0, &threads));
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, render_order.items);
 }
 

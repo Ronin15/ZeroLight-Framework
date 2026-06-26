@@ -87,6 +87,12 @@ pub fn divFloat4(lhs: Float4, rhs: Float4) Float4 {
     return lhs / rhs;
 }
 
+/// Per-lane linear interpolation between `start` and `end` by `amount`. SIMD
+/// counterpart of `math.lerp`.
+pub fn lerpFloat4(start: Float4, end: Float4, amount: Float4) Float4 {
+    return start + (end - start) * amount;
+}
+
 /// Per-lane truncating integer division. Lowered lane-by-lane because Zig's `/`
 /// operator rejects signed integer operands (it requires @divTrunc/@divFloor/
 /// @divExact), so there is no single signed-vector divide to fold this into.

@@ -628,7 +628,8 @@ fn deterministicUnitDir(seed: u64, key: u32) AiDir {
     h ^= h >> 31;
     const u = @as(f32, @floatFromInt(h & 0xffffffff)) / 4294967295.0;
     const angle = u * 2.0 * std.math.pi;
-    return .{ .x = @cos(angle), .y = @sin(angle) };
+    const rotation = math.sinCos(angle);
+    return .{ .x = rotation.cos, .y = rotation.sin };
 }
 
 const AiSeparationContext = struct {
