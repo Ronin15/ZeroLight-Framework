@@ -19,6 +19,9 @@ const render_prep = @import("render_prep.zig");
 
 pub const Player = struct {
     entity: EntityId = EntityId.invalid,
+    // The Z-level (plane) the player currently stands on. Drives which level the
+    // dig acts on and syncs the body's `position_z` for the render slice.
+    current_level: u16 = 0,
 
     const initial_position = math.Vec2{ .x = 400, .y = 225 };
     const size = math.Vec2{ .x = 32, .y = 32 };

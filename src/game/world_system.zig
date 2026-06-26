@@ -35,6 +35,10 @@ const WorldDepth = render_depth.WorldDepth;
 pub const TileId = u16;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
 pub const default_chunk_size_tiles: u16 = 8;
+// Z gap between stacked levels (planes). Exceeds the WorldDepth band span so a
+// lower plane's bands never sort above a higher plane's. Levels descend by this
+// step: level 0 (surface) is highest, deeper levels lower.
+pub const level_z_step: i32 = 16;
 
 pub const TileFlags = packed struct(u8) {
     walkable: bool = false,
@@ -250,6 +254,10 @@ pub const WorldSystem = struct {
     // old vertex cache this never flips on a pan — the quads are full-world and the
     // camera lives in the shader, so panning uploads nothing.
     dense_quads_dirty: bool = true,
+    // The plane the dense geometry was last submitted for. Floors above the active
+    // plane are skipped so descending reveals the player's level; a change forces a
+    // re-submit even without a structural edit. Sentinel forces the first submit.
+    submitted_active_level: u16 = std.math.maxInt(u16),
 
     pub fn initDemo(
         allocator: std.mem.Allocator,
@@ -258,7 +266,10 @@ pub const WorldSystem = struct {
         bounds_height: f32,
     ) !WorldSystem {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
-        return try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
+        var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
+        errdefer world.deinit();
+        try world.addUndergroundLevels(meta);
+        return world;
     }
 
     pub fn initProcedural(
@@ -268,7 +279,10 @@ pub const WorldSystem = struct {
         thread_system: *ThreadSystem,
     ) !WorldSystem {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
-        return try initProceduralFromMeta(allocator, meta, config, thread_system);
+        var world = try initProceduralFromMeta(allocator, meta, config, thread_system);
+        errdefer world.deinit();
+        try world.addUndergroundLevels(meta);
+        return world;
     }
 
     pub fn initProceduralFromMeta(
@@ -385,7 +399,10 @@ pub const WorldSystem = struct {
     ) !WorldSystem {
         var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
         defer meta.deinit();
-        return try initDemoFromMeta(allocator, &meta, bounds_width, bounds_height);
+        var world = try initDemoFromMeta(allocator, &meta, bounds_width, bounds_height);
+        errdefer world.deinit();
+        try world.addUndergroundLevels(&meta);
+        return world;
     }
 
     pub fn deinit(self: *WorldSystem) void {
@@ -519,10 +536,14 @@ pub const WorldSystem = struct {
         self: *WorldSystem,
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
+        active_level: u16,
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
         try self.uploadDenseLayerBuffers(renderer);
-        if (!self.dense_quads_dirty) return;
+        // Re-submit on a structural change OR when the visible plane changed: floors
+        // above the player's plane are skipped so they don't occlude the level the
+        // player stands on (the render slice follows the player down).
+        if (!self.dense_quads_dirty and active_level == self.submitted_active_level) return;
 
         // The tilemap atlas params are baked from the world atlas dimensions at init;
         // the bound runtime texture must match. Safe-build only, and only on a
@@ -539,6 +560,9 @@ pub const WorldSystem = struct {
         const world_w = self.worldWidthPixels();
         const world_h = self.worldHeightPixels();
         for (0..layer_count) |layer_index| {
+            // Skip floors above the player's plane (a lower level index draws on
+            // top), so the player and the level they stand on are not occluded.
+            if (self.denseLayerLevel(layer_index) < active_level) continue;
             // Only the world-space corners (position) are consumed by the tilemap
             // shader; the source/uv are ignored, so the source rect is a placeholder.
             var quad: [6]Vertex = undefined;
@@ -555,6 +579,7 @@ pub const WorldSystem = struct {
             );
         }
         self.dense_quads_dirty = false;
+        self.submitted_active_level = active_level;
     }
 
     /// Flushes queued per-cell tile edits (digs/builds) to the GPU in one batched
@@ -605,8 +630,24 @@ pub const WorldSystem = struct {
     }
 
     pub fn setDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
-        if (layer_index >= self.dense_level_indices.items.len) return error.InvalidWorldLayer;
         try self.validateTileId(tile_id);
+        return self.writeDenseTileCell(layer_index, x, y, tile_id);
+    }
+
+    /// Clears a dense floor cell to the empty/see-through state (`invalid_tile_id`):
+    /// the tilemap shader discards it, revealing the layer drawn below, and
+    /// `flagsFor` treats it as non-blocking. This is how a dig punches a hole
+    /// through one plane to expose the level beneath.
+    pub fn clearDenseTile(self: *WorldSystem, layer_index: usize, x: u16, y: u16) !?WorldTileChangedEvent {
+        return self.writeDenseTileCell(layer_index, x, y, invalid_tile_id);
+    }
+
+    /// Shared dense-cell write: bounds-checks, updates the CPU tile field (the
+    /// source of truth), queues one GPU cell edit once the layer buffer exists,
+    /// and returns the compact change event. Tile-id validity is the caller's
+    /// concern, so an empty (`invalid_tile_id`) write is allowed here.
+    fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
+        if (layer_index >= self.dense_level_indices.items.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const tile_index = self.denseLayerOffset(layer_index) + self.cellIndex(x, y);
         const old_tile_id = self.dense_tile_ids.items[tile_index];
@@ -715,6 +756,41 @@ pub const WorldSystem = struct {
 
     pub fn levelCount(self: *const WorldSystem) usize {
         return self.level_base_z.items.len;
+    }
+
+    /// Render/plane z baseline for a level. An actor whose `position_z` equals
+    /// this draws in that level's render slice.
+    pub fn levelBaseZ(self: *const WorldSystem, level_index: u16) i32 {
+        return self.level_base_z.items[level_index];
+    }
+
+    /// The dense floor layer for a level (first `.floor` band on it), or null if
+    /// the level has none. Cold path (dig/traversal, not per-frame per-cell).
+    pub fn denseFloorLayerForLevel(self: *const WorldSystem, level_index: u16) ?usize {
+        for (self.dense_level_indices.items, 0..) |dense_level, layer_index| {
+            if (dense_level != level_index) continue;
+            if (self.dense_depth_bands.items[layer_index] == .floor) return layer_index;
+        }
+        return null;
+    }
+
+    /// Whether a level's floor cell is an empty (dug-through) hole. False when the
+    /// level has no floor layer or the cell is out of bounds.
+    pub fn denseFloorIsEmpty(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
+        if (x >= self.width or y >= self.height) return false;
+        const layer = self.denseFloorLayerForLevel(level_index) orelse return false;
+        return self.denseTile(layer, x, y) == invalid_tile_id;
+    }
+
+    /// If a ramp link touches `(level, cell)`, returns the level on its other end
+    /// (the plane you'd traverse to). Also the dedupe check for ramp digging.
+    pub fn rampLinkOtherLevel(self: *const WorldSystem, level_index: u16, cell: CellCoord) ?u16 {
+        for (self.level_links.items) |link| {
+            if (link.kind != .ramp) continue;
+            if (link.level_a == level_index and link.cell_a.x == cell.x and link.cell_a.y == cell.y) return link.level_b;
+            if (link.level_b == level_index and link.cell_b.x == cell.x and link.cell_b.y == cell.y) return link.level_a;
+        }
+        return null;
     }
 
     // Per-level composed navigability: a level's blocked mask is the OR of every
@@ -827,6 +903,20 @@ pub const WorldSystem = struct {
         // is built lazily on the next submit (uploadDenseLayerBuffers resumes).
         self.dense_quads_dirty = true;
         return layer_index;
+    }
+
+    /// Adds the two solid underground planes beneath the surface (level 0): a dirt
+    /// floor one step down, a dark floor two steps down. Digging a hole in a plane
+    /// reveals the one below; stacked by descending `base_z` so the surface draws on
+    /// top. Call once on an already-built surface world (its dense layers are the
+    /// last appended, so no held tile slice is invalidated).
+    pub fn addUndergroundLevels(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
+        const dirt = try self.requireTileByName(meta, "dirt");
+        const dirt_dark = try self.requireTileByName(meta, "dirt_dark");
+        const level_dirt = try self.addLevel(-level_z_step);
+        const level_void = try self.addLevel(-2 * level_z_step);
+        _ = try self.addDenseLayer(level_dirt, 0, .floor, dirt);
+        _ = try self.addDenseLayer(level_void, 0, .floor, dirt_dark);
     }
 
     pub fn addSparseTile(

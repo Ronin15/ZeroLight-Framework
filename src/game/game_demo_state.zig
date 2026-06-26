@@ -122,8 +122,11 @@ pub const GameDemoState = struct {
     collision_sfx_cooldown_count: usize = 0,
     // Rising-edge latches so one held dig key digs one cell per press, not per
     // frame. Input is main-thread state, so the latch lives on the state.
-    dig_down_held_last: bool = false,
-    dig_up_held_last: bool = false,
+    dig_hole_held_last: bool = false,
+    dig_ramp_held_last: bool = false,
+    // Last grid cell the player occupied, so plane traversal (fall/ramp) fires
+    // only on cell entry — anti-oscillation and the one-level-per-fall guard.
+    player_last_cell: ?world_system.CellCoord = null,
     music_started: bool = false,
     jet_loop_active: bool = false,
     // Set when a pause interrupts an active jet loop: onPause has no audio
@@ -203,9 +206,8 @@ pub const GameDemoState = struct {
         return state;
     }
 
-    /// Resolves the dig depth-policy tile ids from the runtime tileset metadata.
-    /// The faced floor layer is dense layer 0 in both the demo and procedural
-    /// worlds.
+    /// Resolves the dig controller's tile config (the walkable ramp tile) from the
+    /// runtime tileset metadata.
     fn digConfigFromRuntimeAssets(runtime_assets: *const RuntimeAssets) !DigConfig {
         const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
         return digConfigFromMeta(meta);
@@ -213,10 +215,7 @@ pub const GameDemoState = struct {
 
     fn digConfigFromMeta(meta: *const WorldTilesetMeta) !DigConfig {
         return .{
-            .ground_layer = 0,
-            .surface_id = (meta.tileByName("grass") orelse return error.WorldTilesetMissingDigTile).id,
-            .dirt_id = (meta.tileByName("dirt") orelse return error.WorldTilesetMissingDigTile).id,
-            .pit_id = (meta.tileByName("void_pit") orelse return error.WorldTilesetMissingDigTile).id,
+            .ramp_tile = (meta.tileByName("cobblestone") orelse return error.WorldTilesetMissingDigTile).id,
         };
     }
 
@@ -237,6 +236,10 @@ pub const GameDemoState = struct {
         const player = try Player.spawn(&data);
         try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
         try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+        // Player starts on the surface plane (level 0); sync render z to that plane.
+        const player_body = data.movementBodyPtr(player.entity).?;
+        player_body.position_z.* = world.levelBaseZ(0);
+        player_body.previous_z.* = world.levelBaseZ(0);
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
         const test_squares = try spawnTestSquares(&data);
@@ -344,6 +347,10 @@ pub const GameDemoState = struct {
             .perf = context.perf,
         });
 
+        // After movement: drop the player a plane on entering a hole, or follow a
+        // ramp link. State-owned because the pipeline only gets the player by value.
+        self.applyPlaneTraversal();
+
         var collision_audio_timer = StageTimer.start();
         self.queueCollisionAudio(context.audio, context.delta_seconds);
         collision_audio_timer.stop(context.perf, .gameplay_audio);
@@ -375,18 +382,57 @@ pub const GameDemoState = struct {
     }
 
     /// Translates the held dig actions into this step's `dig_intent`, firing on
-    /// the rising edge so one press digs one cell. Down wins if both fire the
+    /// the rising edge so one press digs one cell. Hole wins if both fire the
     /// same frame. The pipeline-owned dig controller consumes the intent.
     fn captureDigIntent(self: *GameDemoState, input: *const InputState) void {
-        const down_held = input.isHeld(.digDown);
-        const up_held = input.isHeld(.digUp);
-        if (down_held and !self.dig_down_held_last) {
-            self.simulation_frame.dig_intent = .down;
-        } else if (up_held and !self.dig_up_held_last) {
-            self.simulation_frame.dig_intent = .up;
+        const hole_held = input.isHeld(.digHole);
+        const ramp_held = input.isHeld(.digRamp);
+        if (hole_held and !self.dig_hole_held_last) {
+            self.simulation_frame.dig_intent = .hole;
+        } else if (ramp_held and !self.dig_ramp_held_last) {
+            self.simulation_frame.dig_intent = .ramp;
         }
-        self.dig_down_held_last = down_held;
-        self.dig_up_held_last = up_held;
+        self.dig_hole_held_last = hole_held;
+        self.dig_ramp_held_last = ramp_held;
+    }
+
+    /// Updates the player's plane after movement. On entering a new cell: follow a
+    /// ramp link to its other plane, else fall one level if standing over a hole
+    /// with a level below. The cell-entry guard prevents ramp oscillation and caps
+    /// a hole to a single one-level drop.
+    fn applyPlaneTraversal(self: *GameDemoState) void {
+        const body = self.data.movementBodyConst(self.player.entity) orelse return;
+        const visual = self.data.primitiveVisualConst(self.player.entity) orelse return;
+        const center_x = body.position.x + visual.size.x * 0.5;
+        const center_y = body.position.y + visual.size.y * 0.5;
+        const target = self.world.cellContaining(center_x, center_y) orelse return;
+        const cell = world_system.CellCoord{ .x = target.x, .y = target.y };
+
+        if (self.player_last_cell) |last| {
+            if (last.x == cell.x and last.y == cell.y) return;
+        }
+        self.player_last_cell = cell;
+
+        if (self.world.rampLinkOtherLevel(self.player.current_level, cell)) |other| {
+            self.setPlayerLevel(other);
+            return;
+        }
+        const below: usize = @as(usize, self.player.current_level) + 1;
+        if (below < self.world.levelCount() and
+            self.world.denseFloorIsEmpty(self.player.current_level, cell.x, cell.y))
+        {
+            self.setPlayerLevel(@intCast(below));
+        }
+    }
+
+    /// Moves the player onto a plane: tracks the level and snaps the body's render
+    /// z (and its previous, since z is not interpolated) to that plane's base.
+    fn setPlayerLevel(self: *GameDemoState, level: u16) void {
+        self.player.current_level = level;
+        const body = self.data.movementBodyPtr(self.player.entity) orelse return;
+        const z = self.world.levelBaseZ(level);
+        body.position_z.* = z;
+        body.previous_z.* = z;
     }
 
     pub fn render(self: *GameDemoState, context: RenderContext) !void {
@@ -412,7 +458,7 @@ pub const GameDemoState = struct {
         // Each dense layer is one retained GPU tilemap quad, uploaded once and
         // unchanged on a pan. Sparse tiles and dynamic entities stream through the
         // ordered batch and the renderer merges all three by render order.
-        try self.world.submitStaticDenseGeometry(renderer, runtime_assets);
+        try self.world.submitStaticDenseGeometry(renderer, runtime_assets, self.player.current_level);
         // Apply any tile edits (digs/builds) to the layer storage buffers.
         try self.world.flushDenseTileEdits(renderer);
 
@@ -1486,20 +1532,19 @@ test "demo world tile event invalidates navigation after commit reaction" {
     try std.testing.expect(nav_invalidated);
 }
 
-// Drives one dig step through the wired pipeline controller and post-commit
-// reaction, returning whether navigation was invalidated this step.
-fn digStepForTest(demo: *GameDemoState, intent: DigIntent) !bool {
+// Drives one faced-cell dig through the wired pipeline controller.
+fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
     demo.simulation_frame.beginStep();
     demo.simulation_frame.dig_intent = intent;
     try demo.pipeline.dig.process(&demo.world, &demo.data, demo.player, &demo.simulation_frame);
-    try demo.processPostCommitEvents();
-    for (demo.simulation_frame.events.mergedItems()) |event| {
-        switch (event.payload) {
-            .nav_region_invalidated => return true,
-            else => {},
-        }
-    }
-    return false;
+}
+
+// Places the player so its center sits in tile cell (cx, cy).
+fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
+    const body = demo.data.movementBodyPtr(demo.player.entity).?;
+    const visual = demo.data.primitiveVisualConst(demo.player.entity).?;
+    body.position_x.* = @as(f32, @floatFromInt(cx)) * 32 + 16 - visual.size.x * 0.5;
+    body.position_y.* = @as(f32, @floatFromInt(cy)) * 32 + 16 - visual.size.y * 0.5;
 }
 
 test "demo dig intent fires once on the rising edge of a held key" {
@@ -1507,11 +1552,11 @@ test "demo dig intent fires once on the rising edge of a held key" {
     defer demo.deinit();
 
     var input = InputState{};
-    input.setHeld(.digDown, true);
+    input.setHeld(.digHole, true);
 
     demo.simulation_frame.beginStep();
     demo.captureDigIntent(&input);
-    try std.testing.expectEqual(DigIntent.down, demo.simulation_frame.dig_intent);
+    try std.testing.expectEqual(DigIntent.hole, demo.simulation_frame.dig_intent);
 
     // Still held next step: no second dig.
     demo.simulation_frame.beginStep();
@@ -1519,41 +1564,48 @@ test "demo dig intent fires once on the rising edge of a held key" {
     try std.testing.expectEqual(DigIntent.none, demo.simulation_frame.dig_intent);
 
     // Release, then press again: the rising edge fires once more.
-    input.setHeld(.digDown, false);
+    input.setHeld(.digHole, false);
     demo.simulation_frame.beginStep();
     demo.captureDigIntent(&input);
     try std.testing.expectEqual(DigIntent.none, demo.simulation_frame.dig_intent);
 
-    input.setHeld(.digDown, true);
+    input.setHeld(.digHole, true);
     demo.simulation_frame.beginStep();
     demo.captureDigIntent(&input);
-    try std.testing.expectEqual(DigIntent.down, demo.simulation_frame.dig_intent);
+    try std.testing.expectEqual(DigIntent.hole, demo.simulation_frame.dig_intent);
 }
 
-test "demo dig deepens a cell to a blocking pit and reopens it on dig up" {
+test "demo dig hole drops the player one plane and a ramp climbs back" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
 
-    // Player at cell (3,3) facing right -> faced cell (4,3).
-    const body = demo.data.movementBodyPtr(demo.player.entity).?;
-    body.position_x.* = 96;
-    body.position_y.* = 96;
     demo.data.facingPtr(demo.player.entity).?.* = .right;
+    placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
+    demo.applyPlaneTraversal(); // seed player_last_cell = (3,3)
+    try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
-    // Normalize the faced cell to surface so two dig-downs reach the pit.
-    _ = try demo.world.setDenseTile(0, 4, 3, demo.pipeline.dig.surface_id);
+    // Dig a hole in the faced cell on the surface plane.
+    try digFacedForTest(&demo, .hole);
+    const floor0 = demo.world.denseFloorLayerForLevel(0).?;
+    try std.testing.expectEqual(world_system.invalid_tile_id, demo.world.denseTile(floor0, 4, 3));
 
-    // Dig down: surface -> dirt stays walkable (the ramp), no nav change.
-    _ = try digStepForTest(&demo, .down);
-    try std.testing.expect(!demo.world.denseTileBlocksMovement(0, 4, 3));
+    // Walk into the hole -> fall exactly one level onto the dirt plane.
+    placePlayerInCell(&demo, 4, 3);
+    demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
+    try std.testing.expectEqual(demo.world.levelBaseZ(1), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
-    // Dig down again: dirt -> void_pit blocks and invalidates navigation.
-    try std.testing.expect(try digStepForTest(&demo, .down));
-    try std.testing.expect(demo.world.denseTileBlocksMovement(0, 4, 3));
+    // Standing put: no second fall.
+    demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
-    // Dig up: void_pit -> dirt reopens the cell and re-masks navigation.
-    try std.testing.expect(try digStepForTest(&demo, .up));
-    try std.testing.expect(!demo.world.denseTileBlocksMovement(0, 4, 3));
+    // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
+    try digFacedForTest(&demo, .ramp);
+    try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
+    placePlayerInCell(&demo, 5, 3);
+    demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
+    try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {
