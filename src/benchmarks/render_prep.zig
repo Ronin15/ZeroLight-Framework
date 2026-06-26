@@ -83,16 +83,16 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         batch.adaptive_tuner = tuner;
     }
 
+    // Warm up and settle through the same decomposed path used for measurement so
+    // settled_before_measurement and work_tuning reflect the path actually timed.
     for (0..options.warmup_iterations) |_| {
-        try submitOrderedCommandsOnce(&batch, item_count);
-        _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
+        _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!batch.adaptive_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
-            try submitOrderedCommandsOnce(&batch, item_count);
-            _ = try runOnce(&batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case);
+            _ = try runMeasuredOnce(item_count, &batch, table.resolver(), if (threads) |*thread_system| thread_system else null, case, io);
         }
     }
     const settled_before_measurement = if (case.adaptive) batch.adaptive_tuner.isSettled() else false;
@@ -119,23 +119,6 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         stats.work_tuning = suite.workTuningSummary(batch.adaptive_tuner.report(), settled_before_measurement);
     }
     return stats;
-}
-
-fn runOnce(
-    batch: *sprite_batch.SpriteBatch,
-    resolver: sprite_batch.TextureResolver,
-    thread_system: ?*ThreadSystem,
-    case: suite.BenchmarkCase,
-) !sprite_batch.SpritePrepStats {
-    if (!case.usesThreadSystem()) {
-        return batch.buildAssumeCapacity(resolver, null, .{ .adaptive = false });
-    }
-
-    return batch.buildAssumeCapacity(resolver, thread_system.?, .{
-        .items_per_range = benchmarkItemsPerRange(case),
-        .max_worker_threads = case.maxWorkerThreads(),
-        .adaptive = case.adaptive,
-    });
 }
 
 fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
@@ -231,7 +214,7 @@ fn u128ToU64Saturated(value: u128) u64 {
 }
 
 fn snapshotCommands(
-    snapshot: *@TypeOf(sprite_batch.SpriteBatch.init(undefined).commands),
+    snapshot: *sprite_batch.SpriteBatch.CommandList,
     allocator: std.mem.Allocator,
     commands: anytype,
 ) !void {
@@ -404,10 +387,35 @@ test "render prep benchmark profiles sweep multiple command counts" {
 fn commandsEqual(lhs: anytype, rhs: anytype) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
-        if (left.sprite.order.domain != right.sprite.order.domain) return false;
-        if (left.sprite.order.depth != right.sprite.order.depth) return false;
-        if (left.sprite.texture.index != right.sprite.texture.index) return false;
-        if (left.sprite.texture.generation != right.sprite.texture.generation) return false;
+        const a = left.sprite;
+        const b = right.sprite;
+        if (a.order.domain != b.order.domain) return false;
+        if (a.order.depth != b.order.depth) return false;
+        if (a.texture.index != b.texture.index) return false;
+        if (a.texture.generation != b.texture.generation) return false;
+        // The batch must consume the ordered stream read-only: a build pass that
+        // rewrites any geometry/material field in place is a regression, so compare
+        // the full command, not just order + texture.
+        if (!rectEqual(a.dest, b.dest)) return false;
+        if (!optionalRectEqual(a.source, b.source)) return false;
+        if (!colorEqual(a.tint, b.tint)) return false;
+        if (a.origin.x != b.origin.x or a.origin.y != b.origin.y) return false;
+        if (a.rotation != b.rotation) return false;
+        if (a.coordinate_space != b.coordinate_space) return false;
     }
     return true;
+}
+
+fn rectEqual(a: sprite_batch.Rect, b: sprite_batch.Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+fn optionalRectEqual(a: ?sprite_batch.Rect, b: ?sprite_batch.Rect) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return rectEqual(a.?, b.?);
+}
+
+fn colorEqual(a: anytype, b: anytype) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
 }

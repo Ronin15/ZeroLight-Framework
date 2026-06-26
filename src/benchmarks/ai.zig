@@ -43,7 +43,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.reserveStreams(rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reserveStreams(suite.rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
 
     for (0..count) |index| {
         const entity = try data.createEntity();
@@ -149,10 +149,6 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
-}
-
-fn rangeCount(item_count: usize, items_per_range: usize) usize {
-    return (item_count + items_per_range - 1) / items_per_range;
 }
 
 test "ai benchmark fixture creates requested agents and movement bodies" {

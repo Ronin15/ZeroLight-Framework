@@ -392,20 +392,25 @@ pub const GameDemoState = struct {
     fn collectDynamicRenderRecords(self: *GameDemoState) !void {
         try self.ensureDynamicRenderCapacity();
         self.dynamic_render.clearRetainingCapacity();
-        for (self.data.primitiveVisualSliceConst().entities) |entity| {
-            if (self.dynamicBodyRenderDepth(entity)) |depth| {
-                self.dynamic_render.appendAssumeCapacity(.{
-                    .depth = depth,
-                    .kind = .{ .entity_body = entity },
-                });
-            }
+        // Walk the dense visual columns and join only position_z from the movement
+        // store, instead of rebuilding whole MovementBody/PrimitiveVisual structs
+        // per entity each render frame.
+        const movement = self.data.movementBodySliceConst();
+        const visuals = self.data.primitiveVisualSliceConst();
+        for (visuals.entities, 0..) |entity, visual_index| {
+            const movement_index = self.data.movementBodyDenseIndex(entity) orelse continue;
+            const position_z = movement.position_z[movement_index];
+            const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
+            self.dynamic_render.appendAssumeCapacity(.{
+                .depth = render_prep.worldOrder(position_z, depth_band).depth,
+                .kind = .{ .entity_body = entity },
+            });
             if (sameEntity(entity, self.player.entity)) {
-                if (self.playerMarkerRenderDepth()) |depth| {
-                    self.dynamic_render.appendAssumeCapacity(.{
-                        .depth = depth,
-                        .kind = .player_marker,
-                    });
-                }
+                const marker_band: WorldDepth = @enumFromInt(visuals.marker_depth_values[visual_index]);
+                self.dynamic_render.appendAssumeCapacity(.{
+                    .depth = render_prep.worldOrder(position_z, marker_band).depth,
+                    .kind = .player_marker,
+                });
             }
         }
 
@@ -450,18 +455,6 @@ pub const GameDemoState = struct {
                 .particle => |particle_index| try self.submitParticleRender(renderer, interpolation_alpha, particle_index),
             }
         }
-    }
-
-    fn dynamicBodyRenderDepth(self: *const GameDemoState, entity: EntityId) ?i32 {
-        const body = self.data.movementBodyConst(entity) orelse return null;
-        const visual = self.data.primitiveVisualConst(entity) orelse return null;
-        return render_prep.worldOrder(body.position_z, visual.depth).depth;
-    }
-
-    fn playerMarkerRenderDepth(self: *const GameDemoState) ?i32 {
-        const body = self.data.movementBodyConst(self.player.entity) orelse return null;
-        const visual = self.data.primitiveVisualConst(self.player.entity) orelse return null;
-        return render_prep.worldOrder(body.position_z, visual.marker_depth_band).depth;
     }
 
     fn recordRuntimePerfStats(
@@ -688,7 +681,14 @@ pub const GameDemoState = struct {
 
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets) !StructuralCommitStats {
         try self.validateStructuralAssetReferences(runtime_assets);
-        const extra_event_count: usize = if (self.structuralCommandsMayInvalidateNavigation()) 1 else 0;
+        // processPostCommitEvents appends at most one nav_region_invalidated event,
+        // driven by EITHER structural commands applied this frame OR invalidating
+        // world events already queued in the stream (e.g. a dig's world_tile_changed
+        // that did not originate from a structural command). Reserve the slot for
+        // both sources so the post-commit append never trips a tight capacity_limit.
+        const may_invalidate_navigation = self.structuralCommandsMayInvalidateNavigation() or
+            self.pendingEventsMayInvalidateNavigation();
+        const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         try self.processPostCommitEvents();
         try self.ensureDynamicRenderCapacity();
@@ -767,6 +767,17 @@ pub const GameDemoState = struct {
             .set_collision_response => |set| self.data.isAlive(set.entity),
             else => false,
         };
+    }
+
+    // Whether a structural-commit event already in the stream will drive a
+    // post-commit nav invalidation. Mirrors the stage/payload filter in
+    // processPostCommitEvents so the capacity reservation matches what it appends.
+    fn pendingEventsMayInvalidateNavigation(self: *const GameDemoState) bool {
+        for (self.simulation_frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (eventInvalidatesNavigation(event)) return true;
+        }
+        return false;
     }
 
     fn eventInvalidatesNavigation(event: SimulationEvent) bool {

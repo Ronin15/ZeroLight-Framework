@@ -84,6 +84,10 @@ pub const Renderer = struct {
     // tile_data_buffers). Kept here rather than on each DrawGroup so the per-frame
     // draw-group sort/coalesce/merge stays small.
     tile_data_params: std.ArrayList(TilemapParams) = .empty,
+    // Cell count per tile-data buffer (parallel to tile_data_buffers) so the
+    // dig-edit upload boundary can reject an out-of-range element_index before it
+    // becomes an out-of-bounds GPU buffer write.
+    tile_data_counts: std.ArrayList(u32) = .empty,
     // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
     // for one batched dig upload per frame.
     tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
@@ -194,6 +198,7 @@ pub const Renderer = struct {
         }
         self.tile_data_buffers.deinit(self.allocator);
         self.tile_data_params.deinit(self.allocator);
+        self.tile_data_counts.deinit(self.allocator);
         self.tile_edit_scratch.deinit(self.allocator);
         self.deinitBatchStorage();
         self.static_vertices.deinit(self.allocator);
@@ -511,6 +516,9 @@ pub const Renderer = struct {
                 // Bind the texture/sampler only on a real texture change; SDL_GPU
                 // keeps the binding across pipeline switches, so consecutive groups
                 // sharing a texture skip a redundant bind (matters at many groups).
+                // This is only safe because the sprite and tilemap pipelines share
+                // the same fragment sampler slot (fragment samplers, first_slot 0);
+                // a third material with a different sampler layout must not assume it.
                 if (active_texture == null or
                     active_texture.?.index != group.texture.index or
                     active_texture.?.generation != group.texture.generation)
@@ -672,6 +680,7 @@ pub const Renderer = struct {
     /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
     /// the handle. Built once per dense layer at world load.
     pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32, params: TilemapParams) !TileDataId {
+        const cell_count = std.math.cast(u32, tiles.len) orelse return error.TileDataBufferTooLarge;
         const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
         errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
         const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
@@ -679,6 +688,8 @@ pub const Renderer = struct {
         try self.tile_data_buffers.append(self.allocator, buffer);
         errdefer _ = self.tile_data_buffers.pop();
         try self.tile_data_params.append(self.allocator, params);
+        errdefer _ = self.tile_data_params.pop();
+        try self.tile_data_counts.append(self.allocator, cell_count);
         log.debug("created tilemap tile-data buffer {d}: {d} cells", .{ index, tiles.len });
         return @enumFromInt(index);
     }
@@ -692,6 +703,15 @@ pub const Renderer = struct {
         try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, edits.len);
         for (edits) |edit| {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
+            // Reject an out-of-range cell index here so it never becomes an
+            // out-of-bounds GPU buffer write downstream in uploadStorageRegions.
+            if (edit.element_index >= self.tileDataCount(edit.buffer)) {
+                log.warn("dropped tile-data edit: cell {d} out of range for buffer {d}", .{
+                    edit.element_index,
+                    @intFromEnum(edit.buffer),
+                });
+                continue;
+            }
             self.tile_edit_scratch.appendAssumeCapacity(.{
                 .buffer = buffer,
                 .element_index = edit.element_index,
@@ -701,11 +721,32 @@ pub const Renderer = struct {
         try gpu_buffer.uploadStorageRegions(self.device, self.tile_edit_scratch.items);
     }
 
+    /// Releases every renderer-owned tile-data storage buffer and resets the
+    /// parallel handle/params/count lists. Required before rebuilding the dense
+    /// tilemap when the renderer outlives the world that created the buffers; app
+    /// shutdown goes through `deinit`, which performs the same release.
+    pub fn releaseTileDataBuffers(self: *Renderer) void {
+        for (self.tile_data_buffers.items) |buffer| {
+            c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        }
+        self.tile_data_buffers.clearRetainingCapacity();
+        self.tile_data_params.clearRetainingCapacity();
+        self.tile_data_counts.clearRetainingCapacity();
+        self.tile_edit_scratch.clearRetainingCapacity();
+    }
+
     fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
         if (id == .invalid) return null;
         const index = @intFromEnum(id);
         if (index >= self.tile_data_buffers.items.len) return null;
         return self.tile_data_buffers.items[index];
+    }
+
+    fn tileDataCount(self: *const Renderer, id: TileDataId) u32 {
+        if (id == .invalid) return 0;
+        const index = @intFromEnum(id);
+        if (index >= self.tile_data_counts.items.len) return 0;
+        return self.tile_data_counts.items[index];
     }
 
     // Direct load: only called for a tilemap group whose `tile_data` already

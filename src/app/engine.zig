@@ -106,6 +106,9 @@ pub const Engine = struct {
         var text_service = try TextService.init(allocator, assets);
         errdefer text_service.deinit(&renderer);
 
+        // DebugOverlay/FpsCounter must capture only a FontId from text_service, not
+        // a *TextService: Engine is returned by value below, so the address of this
+        // local would dangle. Per-frame use takes &self.text_service explicitly.
         var debug_overlay = DebugOverlay.init(&text_service);
         errdefer debug_overlay.deinit();
 
@@ -502,6 +505,10 @@ fn logInvalidConfig(app_config: config.AppConfig, err: anyerror) void {
         error.InvalidLogicalSize => log.err(
             "logical resolution must be nonzero, got {}x{}",
             .{ app_config.resolution_policy.logical_size.width, app_config.resolution_policy.logical_size.height },
+        ),
+        error.InvalidAssetRoot => log.err(
+            "asset_root must be a non-empty, traversal-safe relative path, got \"{s}\"",
+            .{app_config.asset_root},
         ),
         error.InvalidConfig => log.err(
             "frames_in_flight must be between 1 and 3, got {}",

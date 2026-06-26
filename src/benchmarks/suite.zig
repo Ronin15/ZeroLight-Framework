@@ -542,6 +542,13 @@ pub fn alignItemCount(item_count: usize, alignment: usize) usize {
     return item_count + (alignment - remainder);
 }
 
+/// Ceiling division of `item_count` into ranges of `items_per_range`, shared by
+/// the benchmark fixtures so each does not re-roll its own ceil-division.
+pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
+    if (items_per_range == 0) return 0;
+    return std.math.divCeil(usize, item_count, items_per_range) catch unreachable;
+}
+
 fn parseProfile(value: []const u8) !Profile {
     if (std.mem.eql(u8, value, "quick")) return .quick;
     if (std.mem.eql(u8, value, "standard")) return .standard;

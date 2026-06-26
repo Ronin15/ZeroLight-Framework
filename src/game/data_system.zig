@@ -755,7 +755,7 @@ pub const DataSystem = struct {
         // columns warm for the next state/session.
         self.steering_agents.clearRetainingCapacity();
         self.ai_agents.clearRetainingCapacity();
-        self.asset_refs.clearRetainingCapacity(self.allocator);
+        self.asset_refs.clearRetainingCapacity();
         self.collision_bounds.clearRetainingCapacity();
         self.collision_responses.clearRetainingCapacity();
         self.primitive_visuals.clearRetainingCapacity();
@@ -880,6 +880,12 @@ pub const DataSystem = struct {
 
     pub fn primitiveVisualSliceConst(self: *const DataSystem) ConstPrimitiveVisualSlice {
         return self.primitive_visuals.sliceConst();
+    }
+
+    pub fn primitiveVisualDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.primitive_visual_index orelse return null;
+        return @intCast(dense_index);
     }
 
     pub fn setAssetReference(self: *DataSystem, id: EntityId, asset_ref: AssetReference) !void {
@@ -1400,7 +1406,7 @@ pub const DataSystem = struct {
     }
 
     fn removeAssetReferenceAt(self: *DataSystem, index: usize) void {
-        const moved = self.asset_refs.removeAt(self.allocator, index);
+        const moved = self.asset_refs.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].asset_ref_index = @intCast(index);
     }
 
@@ -1970,8 +1976,7 @@ const AssetReferenceStore = struct {
         return index;
     }
 
-    fn removeAt(self: *AssetReferenceStore, allocator: std.mem.Allocator, index: usize) ?EntityId {
-        _ = allocator;
+    fn removeAt(self: *AssetReferenceStore, index: usize) ?EntityId {
         const last = self.entities.items.len - 1;
         const moved_entity = if (index != last) self.entities.items[last] else null;
         self.entities.items[index] = self.entities.items[last];
@@ -1991,8 +1996,7 @@ const AssetReferenceStore = struct {
         };
     }
 
-    fn clearRetainingCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        _ = allocator;
+    fn clearRetainingCapacity(self: *AssetReferenceStore) void {
         self.entities.clearRetainingCapacity();
         self.sprite_ids.clearRetainingCapacity();
         self.atlas_entry_ids.clearRetainingCapacity();

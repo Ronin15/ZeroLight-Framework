@@ -176,8 +176,9 @@ pub const AiSystem = struct {
         );
         const rcount = intent_selection.range_count;
 
-        const target_x = if (system_config.seek_target) |t| t.x else computeTarget(movement, .x);
-        const target_y = if (system_config.seek_target) |t| t.y else computeTarget(movement, .y);
+        const target = if (system_config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        const target_x = target.x;
+        const target_y = target.y;
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
 
@@ -250,8 +251,9 @@ pub const AiSystem = struct {
         navigation_stream.addCount(range_base, entity_count);
         try navigation_stream.prefixAppendedRanges(range_base);
         var writer = navigation_stream.rangeWriter(range_base);
-        const tx = if (config.seek_target) |t| t.x else computeTarget(movement, .x);
-        const ty = if (config.seek_target) |t| t.y else computeTarget(movement, .y);
+        const target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        const tx = target.x;
+        const ty = target.y;
         for (range.start..range.end) |i| {
             const base_dir = decideDir(
                 self.behaviors.items[i],
@@ -544,12 +546,18 @@ fn sumU16(values: []const u16) usize {
     return total;
 }
 
-fn computeTarget(movement: ConstMovementBodySlice, axis: enum { x, y }) f32 {
-    if (movement.entities.len == 0) return if (axis == .x) @as(f32, 400) else @as(f32, 225);
-    var sum: f32 = 0;
-    const coords = if (axis == .x) movement.previous_x else movement.previous_y;
-    for (coords) |v| sum += v;
-    return sum / @as(f32, @floatFromInt(movement.entities.len));
+// Center of mass of the previous-frame positions, computed in a single pass over
+// both axes so the no-seek-target fallback scans the population once, not twice.
+fn computeTargetCenter(movement: ConstMovementBodySlice) AiDir {
+    if (movement.entities.len == 0) return .{ .x = 400, .y = 225 };
+    var sum_x: f32 = 0;
+    var sum_y: f32 = 0;
+    for (movement.previous_x, movement.previous_y) |x, y| {
+        sum_x += x;
+        sum_y += y;
+    }
+    const inv = 1.0 / @as(f32, @floatFromInt(movement.entities.len));
+    return .{ .x = sum_x * inv, .y = sum_y * inv };
 }
 
 const AiDir = struct { x: f32, y: f32 };
@@ -568,14 +576,9 @@ fn decideDir(
     var dx: f32 = 0;
     var dy: f32 = 0;
     if (seek_w > 0) {
-        const sx = tx - px;
-        const sy = ty - py;
-        const len2 = sx * sx + sy * sy;
-        if (len2 > 0.0001) {
-            const il = 1.0 / @sqrt(len2);
-            dx += sx * il * seek_w;
-            dy += sy * il * seek_w;
-        }
+        const seek = math.normalizeOrZeroFinite(tx - px, ty - py, 0.0001);
+        dx += seek.x * seek_w;
+        dy += seek.y * seek_w;
     }
     // Wander (or default) adds deterministic perturbation using seed+entity key. A value of
     // 30 preserves the old unit perturbation, while smaller/larger values blend accordingly.

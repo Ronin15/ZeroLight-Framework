@@ -42,12 +42,9 @@ pub fn readJsonAsset(
     const bytes = try allocator.dupe(u8, read);
     errdefer allocator.free(bytes);
 
-    const parsed = std.json.parseFromSlice(T, allocator, bytes, .{
+    const parsed = try std.json.parseFromSlice(T, allocator, bytes, .{
         .ignore_unknown_fields = true,
-    }) catch |err| {
-        allocator.free(bytes);
-        return err;
-    };
+    });
 
     return .{ .bytes = bytes, .parsed = parsed };
 }
@@ -186,8 +183,6 @@ pub fn parseAnimationValue(
 
         const gop = try animations.getOrPut(key);
         if (gop.found_existing) {
-            allocator.free(key);
-            allocator.free(owned_ids);
             return error.DuplicateEntryName;
         }
 
@@ -237,6 +232,27 @@ test "readJsonAsset copies into caller allocator" {
 
     defer deinitJsonAsset(std.testing.allocator, loaded.bytes, &loaded.parsed);
     try std.testing.expectEqual(@as(u32, 1), loaded.parsed.value.version);
+}
+
+test "readJsonAsset frees the duped bytes exactly once when parse fails" {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    const Mismatch = struct {
+        // A required field the sidecar does not contain forces parseFromSlice to
+        // fail after the bytes are duped; the errdefer must free them exactly
+        // once (a double free here would trip the testing allocator).
+        field_absent_from_file: u32,
+    };
+
+    try std.testing.expectError(
+        error.MissingField,
+        readJsonAsset(
+            std.testing.allocator,
+            asset_store,
+            "sprites/world_tileset.json",
+            1024 * 1024,
+            Mismatch,
+        ),
+    );
 }
 
 test "buildEntryIndexes rejects duplicate ids and names" {

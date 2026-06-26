@@ -76,13 +76,13 @@ pub const Color = extern struct {
 
 fn validateAssetRoot(asset_root: []const u8) !void {
     if (asset_root.len == 0 or std.fs.path.isAbsolute(asset_root)) {
-        return error.InvalidConfig;
+        return error.InvalidAssetRoot;
     }
 
     var components = std.fs.path.componentIterator(asset_root);
     while (components.next()) |component| {
         if (std.mem.eql(u8, component.name, ".") or std.mem.eql(u8, component.name, "..")) {
-            return error.InvalidConfig;
+            return error.InvalidAssetRoot;
         }
     }
 }
@@ -120,10 +120,10 @@ test "app config validation rejects invalid frame latency" {
 test "app config validation keeps asset roots relative and traversal-safe" {
     try (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "content" }).validate();
     try (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "content/runtime" }).validate();
-    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "" }).validate());
-    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "/tmp/assets" }).validate());
-    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "../content" }).validate());
-    try std.testing.expectError(error.InvalidConfig, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "./assets" }).validate());
+    try std.testing.expectError(error.InvalidAssetRoot, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "" }).validate());
+    try std.testing.expectError(error.InvalidAssetRoot, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "/tmp/assets" }).validate());
+    try std.testing.expectError(error.InvalidAssetRoot, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "../content" }).validate());
+    try std.testing.expectError(error.InvalidAssetRoot, (AppConfig{ .app_name = "test", .window_title = "test", .asset_root = "./assets" }).validate());
 }
 
 test "audio config validation rejects invalid values" {

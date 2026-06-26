@@ -112,13 +112,13 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
         const next_x = simd.addFloat4(position_x, simd.mulFloat4(velocity_x, dt));
         const next_y = simd.addFloat4(position_y, simd.mulFloat4(velocity_y, dt));
 
-        storeFloat4(slice.previous_x[index..], position_x);
-        storeFloat4(slice.previous_y[index..], position_y);
+        simd.storeFloat4Slice(slice.previous_x[index..], position_x);
+        simd.storeFloat4Slice(slice.previous_y[index..], position_y);
         for (index..index + simd.lane_count) |z_index| {
             slice.previous_z[z_index] = slice.position_z[z_index];
         }
-        storeFloat4(slice.position_x[index..], next_x);
-        storeFloat4(slice.position_y[index..], next_y);
+        simd.storeFloat4Slice(slice.position_x[index..], next_x);
+        simd.storeFloat4Slice(slice.position_y[index..], next_y);
     }
 
     while (index < range.end) : (index += 1) {
@@ -144,14 +144,6 @@ fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delt
         slice.previous_z[index] = slice.position_z[index];
         slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
         slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
-    }
-}
-
-fn storeFloat4(values: []f32, vector: simd.Float4) void {
-    std.debug.assert(values.len >= simd.lane_count);
-    const stored = simd.toFloatArray(vector);
-    inline for (0..simd.lane_count) |lane| {
-        values[lane] = stored[lane];
     }
 }
 

@@ -232,6 +232,11 @@ pub const WorldSystem = struct {
     visible_min_tile_y: u16 = 0,
     visible_max_tile_x_exclusive: u16 = 0,
     visible_max_tile_y_exclusive: u16 = 0,
+    // Visible sparse-tile count cached at each visibility update so the per-frame
+    // sprite-command reservation reads it directly instead of rescanning all
+    // sparse tiles. Refreshed whenever visibility changes (the only producer that
+    // runs before the reservation each render frame).
+    visible_sparse_count: usize = 0,
 
     // World atlas dimensions captured at init: source of truth for the tilemap
     // atlas params and the safe-build runtime-texture-match assert.
@@ -427,7 +432,7 @@ pub const WorldSystem = struct {
     /// render from the retained static buffer and no longer stream through the
     /// dynamic sprite batch, so only visible sparse tiles count here.
     pub fn reserveRenderRecords(self: *const WorldSystem) usize {
-        return self.visibleSparseTileCount();
+        return self.visible_sparse_count;
     }
 
     pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
@@ -460,7 +465,10 @@ pub const WorldSystem = struct {
     }
 
     pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16) void {
-        if (self.chunk_visible.items.len == 0) return;
+        if (self.chunk_visible.items.len == 0) {
+            self.visible_sparse_count = 0;
+            return;
+        }
         const chunks_x = self.chunksX();
         const chunks_y = self.chunksY();
         const tile_size = self.tile_size;
@@ -487,6 +495,10 @@ pub const WorldSystem = struct {
             // uploads nothing.
             self.chunk_visible.items[index] = visible;
         }
+
+        // Refresh the cached visible-sparse count from the freshly-updated
+        // visibility so reserveRenderRecords stays a no-op scan.
+        self.visible_sparse_count = self.visibleSparseTileCount();
     }
 
     pub fn worldWidthPixels(self: *const WorldSystem) f32 {
@@ -655,6 +667,16 @@ pub const WorldSystem = struct {
             const id = try renderer.createTileDataBuffer(scratch, self.tilemap_params);
             self.dense_layer_tile_buffers.appendAssumeCapacity(id);
         }
+    }
+
+    /// Releases the renderer-owned tile-data buffers this world created and drops
+    /// the local handles, keeping the world's handle list and the renderer in
+    /// sync. The symmetric teardown for `uploadDenseLayerBuffers`: call before
+    /// rebuilding the dense tilemap when the renderer outlives the world. App
+    /// shutdown instead frees these through `Renderer.deinit`.
+    pub fn releaseDenseLayerBuffers(self: *WorldSystem, renderer: *Renderer) void {
+        renderer.releaseTileDataBuffers();
+        self.dense_layer_tile_buffers.clearRetainingCapacity();
     }
 
     /// The tile-data storage buffer handle for a dense layer (`.invalid` until

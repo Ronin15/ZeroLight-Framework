@@ -1,3 +1,4 @@
+// Copyright (c) 2026 Hammer Forged Games
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
@@ -54,8 +55,8 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     errdefer data.deinit();
     var frame = SimulationFrame.init(allocator);
     errdefer frame.deinit();
-    try frame.reserveStreams(rangeCount(count, steering_range_alignment_items), 0, count, 0, 0, 0);
-    try frame.reservePathRequests(rangeCount(count, steering_range_alignment_items), count);
+    try frame.reserveStreams(suite.rangeCount(count, steering_range_alignment_items), 0, count, 0, 0, 0);
+    try frame.reservePathRequests(suite.rangeCount(count, steering_range_alignment_items), count);
     var pathfinding = PathfindingSystem.init(allocator);
     errdefer pathfinding.deinit();
     try pathfinding.reserve(.{
@@ -210,10 +211,6 @@ fn gridSide(count: usize) usize {
     var side: usize = 1;
     while (side * side < count) : (side += 1) {}
     return side;
-}
-
-fn rangeCount(item_count: usize, items_per_range: usize) usize {
-    return (item_count + items_per_range - 1) / items_per_range;
 }
 
 test "steering benchmark fixture creates requested agents" {

@@ -188,8 +188,10 @@ pub const SpritePrepStats = struct {
 };
 
 pub const SpriteBatch = struct {
+    pub const CommandList = std.ArrayList(SpriteCommand);
+
     allocator: std.mem.Allocator,
-    commands: std.ArrayList(SpriteCommand) = .empty,
+    commands: CommandList = .empty,
     prepared_commands: std.ArrayList(PreparedSpriteCommand) = .empty,
     vertices: std.ArrayList(Vertex) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,

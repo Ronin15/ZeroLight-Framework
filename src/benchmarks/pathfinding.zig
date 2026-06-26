@@ -115,7 +115,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize, workload: Workl
     errdefer data.deinit();
     var requests = RangeOutputStream(PathRequest).init(allocator);
     errdefer requests.deinit();
-    try requests.reserve(rangeCount(count, suite.default_items_per_range), count);
+    try requests.reserve(suite.rangeCount(count, suite.default_items_per_range), count);
 
     const side = fixtureGridSide(count, workload);
     try addObstacleField(&data, side, workload);
@@ -436,10 +436,6 @@ fn hardLaneCount(side: usize) usize {
 
 fn hardColumnCount(side: usize) usize {
     return @max(@as(usize, 1), side / 2 - 1);
-}
-
-fn rangeCount(item_count: usize, items_per_range: usize) usize {
-    return (item_count + items_per_range - 1) / items_per_range;
 }
 
 fn fixtureGridSide(item_count: usize, workload: Workload) usize {

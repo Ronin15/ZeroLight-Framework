@@ -283,16 +283,19 @@ fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void
 
 fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: f32) void {
     const ai_slice = data.aiAgentSliceConst();
+    // Read only the size columns from the dense visual store rather than
+    // rebuilding the whole PrimitiveVisual struct per AI entity each step.
+    const visuals = data.primitiveVisualSliceConst();
     for (ai_slice.entities) |entity| {
         const body = data.movementBodyPtr(entity) orelse continue;
-        const visual = data.primitiveVisualConst(entity) orelse continue;
+        const visual_index = data.primitiveVisualDenseIndex(entity) orelse continue;
 
-        const max_x = bounds_width - visual.size.x;
+        const max_x = bounds_width - visuals.size_x[visual_index];
         const new_x = math.clamp(body.position_x.*, 0, max_x);
         if (new_x != body.position_x.*) body.velocity_x.* = 0;
         body.position_x.* = new_x;
 
-        const max_y = bounds_height - visual.size.y;
+        const max_y = bounds_height - visuals.size_y[visual_index];
         const new_y = math.clamp(body.position_y.*, 0, max_y);
         if (new_y != body.position_y.*) body.velocity_y.* = 0;
         body.position_y.* = new_y;

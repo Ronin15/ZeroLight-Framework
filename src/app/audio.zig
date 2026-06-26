@@ -205,6 +205,10 @@ pub const AudioService = struct {
     listener: math.Vec2 = .{},
     paused: bool = false,
     sequence: u64 = 1,
+    // Last command error warned about, so a command that fails every fixed step
+    // (e.g. a wrong-kind asset re-emitted each frame) logs once rather than at the
+    // step rate. Cleared when a command succeeds, so a recurrence warns again.
+    last_warned_command_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, assetStore: assets.AssetStore, config: AudioConfig) !AudioService {
         var service = AudioService{
@@ -322,9 +326,15 @@ pub const AudioService = struct {
         // Individual command failures are contained so one bad asset does not
         // prevent later commands in the same frame from being attempted.
         for (commands.items()) |command| {
-            self.applyCommand(command) catch |err| {
-                log.warn("audio command ignored: {}", .{err});
-            };
+            if (self.applyCommand(command)) {
+                self.last_warned_command_error = null;
+            } else |err| {
+                const already_warned = if (self.last_warned_command_error) |last| last == err else false;
+                if (!already_warned) {
+                    log.warn("audio command ignored: {}", .{err});
+                    self.last_warned_command_error = err;
+                }
+            }
         }
     }
 
