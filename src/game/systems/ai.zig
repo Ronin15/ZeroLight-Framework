@@ -678,9 +678,9 @@ fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) Separ
                 const dy = job.pos_y[index] - job.pos_y[entry.index];
                 const dist2 = dx * dx + dy * dy;
                 if (dist2 > 0.1 and dist2 < separation_radius2) {
-                    const invd = 1.0 / @sqrt(dist2);
-                    result.x += dx * invd;
-                    result.y += dy * invd;
+                    const dir = math.normalizeOrZeroFinite(dx, dy, 0);
+                    result.x += dir.x;
+                    result.y += dir.y;
                     result.neighbor_count += 1;
                     if (result.neighbor_count >= max_separation_neighbors) return result;
                 }

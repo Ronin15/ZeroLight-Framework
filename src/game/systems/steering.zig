@@ -924,10 +924,10 @@ fn accumulateObstacleSample(
     }
     const dist2 = dx * dx + dy * dy;
     if (dist2 > 0.0001 and dist2 < radius * radius) {
-        const dist = @sqrt(dist2);
-        const strength = (1.0 - dist / radius) * weight;
-        ax.* += (dx / dist) * strength;
-        ay.* += (dy / dist) * strength;
+        const push = math.lengthDirection(dx, dy, 0);
+        const strength = (1.0 - push.length / radius) * weight;
+        ax.* += push.direction.x * strength;
+        ay.* += push.direction.y * strength;
         obstacle_count.* += 1;
     }
 }
@@ -969,7 +969,7 @@ fn accumulateAgentAvoidanceBounded(
                 const combined_radius = avoidance_radius + job.all_agent_radii[other_index];
                 const dist2 = dx * dx + dy * dy;
                 if (dist2 > 0.0001 and dist2 < combined_radius * combined_radius) {
-                    accumulateAgentSample(dx, dy, dist2, combined_radius, weight, ax, ay, sample_count);
+                    accumulateAgentSample(dx, dy, combined_radius, weight, ax, ay, sample_count);
                 }
             }
         }
@@ -979,17 +979,16 @@ fn accumulateAgentAvoidanceBounded(
 fn accumulateAgentSample(
     dx: f32,
     dy: f32,
-    dist2: f32,
     combined_radius: f32,
     weight: f32,
     ax: *f32,
     ay: *f32,
     sample_count: *u16,
 ) void {
-    const dist = @sqrt(dist2);
-    const strength = (1.0 - dist / combined_radius) * weight;
-    ax.* += (dx / dist) * strength;
-    ay.* += (dy / dist) * strength;
+    const push = math.lengthDirection(dx, dy, 0);
+    const strength = (1.0 - push.length / combined_radius) * weight;
+    ax.* += push.direction.x * strength;
+    ay.* += push.direction.y * strength;
     sample_count.* += 1;
 }
 

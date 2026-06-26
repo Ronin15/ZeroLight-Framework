@@ -87,7 +87,7 @@ pub const RuntimeAssets = struct {
         errdefer self.deinitWithBackend(cache, backend_context);
 
         for (manifest.sprite_assets) |spec| {
-            try self.preloadSprite(asset_store, cache, backend_context, spec);
+            try self.preloadSprite(asset_store, cache, backend_context, spec, .{});
         }
         try self.loadAtlasMetadata(asset_store, .{});
         for (manifest.audio_assets) |spec| {
@@ -151,7 +151,7 @@ pub const RuntimeAssets = struct {
 
     /// Loads atlas metadata at startup so gameplay can validate numeric IDs even
     /// when optional sprite textures fall back to primitives.
-    fn loadAtlasMetadata(self: *RuntimeAssets, asset_store: AssetStore, options: LoadAtlasMetadataOptions) !void {
+    fn loadAtlasMetadata(self: *RuntimeAssets, asset_store: AssetStore, options: PreloadOptions) !void {
         for (manifest.sprite_assets) |spec| {
             if (spec.metadata_kind == null) continue;
             if (self.spriteStatus(spec.id) != .available) {
@@ -198,6 +198,7 @@ pub const RuntimeAssets = struct {
         cache: *AssetCache,
         backend_context: *anyopaque,
         spec: manifest.SpriteAssetSpec,
+        options: PreloadOptions,
     ) !void {
         const index = manifest.spriteIndex(spec.id);
 
@@ -207,10 +208,14 @@ pub const RuntimeAssets = struct {
         } else |err| switch (err) {
             error.FileNotFound => {
                 if (isRequiredStartupSprite(spec.id)) {
-                    log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                    if (options.log_unavailable) {
+                        log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                    }
                     return error.RequiredStartupSpriteUnavailable;
                 }
-                log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                if (options.log_unavailable) {
+                    log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                }
                 self.releaseSpriteSlot(cache, backend_context, index);
                 self.sprite_slots[index].status = .unavailable;
                 return;
@@ -239,7 +244,9 @@ const SpriteSlot = struct {
     source_rect: ?Rect = null,
 };
 
-const LoadAtlasMetadataOptions = struct {
+/// Controls whether unavailable-asset diagnostics are logged. Production startup
+/// preload logs (the default); callers exercising negative paths suppress it.
+const PreloadOptions = struct {
     log_unavailable: bool = true,
 };
 
@@ -299,7 +306,7 @@ test "missing startup sprite marks id unavailable without requiring renderer acc
     try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
         .id = .demo_tile,
         .path = "missing/nope.png",
-    });
+    }, .{ .log_unavailable = false });
 
     try std.testing.expectEqual(AssetStatus.unavailable, runtime_assets.spriteStatus(.demo_tile));
     try std.testing.expect(runtime_assets.sprite(.demo_tile) == null);
@@ -318,7 +325,7 @@ test "missing required startup sprite fails preload" {
         preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
             .id = .world_tileset,
             .path = "missing/world_tileset.png",
-        }),
+        }, .{ .log_unavailable = false }),
     );
 
     try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.spriteStatus(.world_tileset));
@@ -393,8 +400,8 @@ test "runtime asset sprite replacement keeps one live cache retain" {
         .id = .demo_tile,
         .path = "sprites/demo_tile.png",
     };
-    try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, spec);
-    try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, spec);
+    try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, spec, .{});
+    try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, spec, .{});
 
     try std.testing.expectEqual(AssetStatus.available, runtime_assets.spriteStatus(.demo_tile));
     try std.testing.expectEqual(@as(u32, 1), cache_testing.uploadCount(&fake));
@@ -415,11 +422,11 @@ test "runtime asset missing sprite replacement releases the previous lease" {
     try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
         .id = .demo_tile,
         .path = "sprites/demo_tile.png",
-    });
+    }, .{});
     try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
         .id = .demo_tile,
         .path = "missing/nope.png",
-    });
+    }, .{ .log_unavailable = false });
 
     try std.testing.expectEqual(AssetStatus.unavailable, runtime_assets.spriteStatus(.demo_tile));
     try std.testing.expect(runtime_assets.sprite(.demo_tile) == null);
@@ -594,7 +601,7 @@ fn preloadSpriteSpecsForTest(
     errdefer deinitWithTestBackend(runtime_assets, cache, fake);
 
     for (specs) |spec| {
-        try preloadSpriteWithTestBackend(runtime_assets, asset_store, cache, fake, spec);
+        try preloadSpriteWithTestBackend(runtime_assets, asset_store, cache, fake, spec, .{});
     }
 }
 
@@ -618,6 +625,7 @@ fn preloadSpriteWithTestBackend(
     cache: *AssetCache,
     fake: *FakeBackend,
     spec: manifest.SpriteAssetSpec,
+    options: PreloadOptions,
 ) !void {
-    return runtime_assets.preloadSprite(asset_store, cache, @ptrCast(fake), spec);
+    return runtime_assets.preloadSprite(asset_store, cache, @ptrCast(fake), spec, options);
 }

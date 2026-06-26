@@ -81,6 +81,26 @@ pub fn normalizeOrDefaultFinite(dx: f32, dy: f32, epsilon: f32, default: Vec2) V
     return .{ .x = nx, .y = ny };
 }
 
+/// Magnitude paired with the unit direction of `(dx, dy)`, both derived from a
+/// single `@sqrt` so falloff math can reuse the length without a second square
+/// root. Returns zero length and direction when an input is non-finite or the
+/// squared length is at or below `epsilon`. Shares the reciprocal-sqrt
+/// convention of `normalizeOrZeroFinite` (its `.direction` equals that helper's
+/// result for the same inputs).
+pub const LengthDirection = struct {
+    length: f32 = 0,
+    direction: Vec2 = .{},
+};
+
+pub fn lengthDirection(dx: f32, dy: f32, epsilon: f32) LengthDirection {
+    if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return .{};
+    const len2 = dx * dx + dy * dy;
+    if (!std.math.isFinite(len2) or len2 <= epsilon) return .{};
+    const len = @sqrt(len2);
+    const inv = 1.0 / len;
+    return .{ .length = len, .direction = .{ .x = dx * inv, .y = dy * inv } };
+}
+
 /// Clamp using `@min(@max(...))`. Differs from `clamp` only in NaN handling: a
 /// NaN `value` yields a bound rather than propagating NaN. Scalar counterpart
 /// of `simd.clampFloat4`.
@@ -140,6 +160,21 @@ test "lerp matches simd.lerpFloat4 per lane" {
         const vector = simd.lerpFloat4(simd.splatFloat4(s), simd.splatFloat4(e), simd.splatFloat4(a));
         try std.testing.expectApproxEqAbs(lerp(s, e, a), vector[0], 0.0001);
     }
+}
+
+test "lengthDirection matches length and normalizeOrZeroFinite" {
+    const cases = [_][2]f32{ .{ 3, 4 }, .{ -5, 12 }, .{ 0.5, -0.25 }, .{ 100, 0 } };
+    for (cases) |c| {
+        const ld = lengthDirection(c[0], c[1], 0);
+        const dir = normalizeOrZeroFinite(c[0], c[1], 0);
+        try std.testing.expectEqual(length(.{ .x = c[0], .y = c[1] }), ld.length);
+        try std.testing.expectEqual(dir.x, ld.direction.x);
+        try std.testing.expectEqual(dir.y, ld.direction.y);
+    }
+    // Degenerate and non-finite inputs collapse to zero.
+    try std.testing.expectEqual(@as(f32, 0), lengthDirection(0, 0, 0).length);
+    const nan = std.math.nan(f32);
+    try std.testing.expectEqual(@as(f32, 0), lengthDirection(nan, 1, 0).direction.x);
 }
 
 test "length helpers measure 3-4-5 vector" {
