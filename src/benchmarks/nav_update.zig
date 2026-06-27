@@ -3,11 +3,12 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Measures the cost of an incremental nav abstract-graph update (`applyNavUpdates`) on a
-//! large multi-level world. The headline case is a single-chunk underground dig: with the
-//! dirty-bounded rebuild it patches only the affected chunk plus its border neighbors, so
-//! its cost is independent of the level size. The fixture is built once outside the timed
-//! region; the timed loop toggles the same tile open then blocked so the world returns to
-//! its start state and the dirty set stays bounded.
+//! large multi-level world. Each case toggles a dirty footprint of `item_count` tiles open
+//! then blocked; with the dirty-bounded rebuild only the chunks the footprint touches (plus
+//! their border neighbors) are patched, so cost tracks the dirty region, not the level size.
+//! Footprints span the production batch range (1 cell up to the nav_dirty_edit_capacity cap,
+//! doubled for headroom). The fixture is built once outside the timed region; each timed
+//! toggle returns the world to its start state so the dirty set stays bounded.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -30,7 +31,13 @@ const world_tiles: u16 = 512;
 const tile_size: f32 = 32.0;
 const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
-const toggle_counts = [_]usize{ 256, 1024, 4096 };
+// Dirty cells fed to one `applyNavUpdates` batch. Production buffers nav edits at
+// `nav_dirty_edit_capacity` (16) and drops the overflow, so a real batch ranges from a
+// single-tile dig (1) up to that cap (16). These counts walk that prod range and double the
+// ends for stress headroom. Batch cost tracks the dirty-chunk footprint, not the level size,
+// so the timed loop runs one toggle per iteration (no inner repeat) and stays well under a
+// second per group.
+const update_counts = [_]usize{ 1, 2, 16, 32 };
 
 const Variant = enum { interior, multichunk };
 
@@ -48,7 +55,7 @@ pub const multichunk_group = suite.BenchmarkGroup{
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     _ = profile;
-    return &toggle_counts;
+    return &update_counts;
 }
 
 pub fn runInteriorCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -77,7 +84,15 @@ const Fixture = struct {
     }
 };
 
-fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant) !Fixture {
+// Smallest square side that holds `cells` tiles; the footprint is filled row-major up to
+// `cells` so the batch edit count matches the requested item count exactly.
+fn squareSide(cells: usize) u16 {
+    var side: u16 = 1;
+    while (@as(usize, side) * @as(usize, side) < cells) side += 1;
+    return side;
+}
+
+fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant, cells: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -98,17 +113,24 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant) !Fix
 
     var edits = std.ArrayList(NavCellEdit).empty;
     errdefer edits.deinit(allocator);
-    switch (variant) {
-        // Cell (40,40) is interior to a 16-tile abstract chunk.
-        .interior => try edits.append(allocator, .{ .level = 1, .x = 40, .y = 40 }),
-        // A 4x4 block straddling the chunk borders at x=32 and y=32 dirties four chunks.
-        .multichunk => {
-            var y: u16 = 30;
-            while (y < 34) : (y += 1) {
-                var x: u16 = 30;
-                while (x < 34) : (x += 1) try edits.append(allocator, .{ .level = 1, .x = x, .y = y });
-            }
-        },
+    // Lay `cells` dirty tiles row-major in a square-ish footprint on level 1. The interior
+    // anchor keeps small batches inside one 16-tile abstract chunk; the multichunk anchor
+    // centers the block on the chunk borders at x=32/y=32 so the footprint straddles four
+    // chunks (the worst-case orthogonal-neighbor fan-out).
+    const side = squareSide(cells);
+    const anchor: struct { x: u16, y: u16 } = switch (variant) {
+        .interior => .{ .x = 40, .y = 40 },
+        .multichunk => .{ .x = @as(u16, 32) -| side / 2, .y = @as(u16, 32) -| side / 2 },
+    };
+    var placed: usize = 0;
+    var dy: u16 = 0;
+    outer: while (placed < cells) : (dy += 1) {
+        var dx: u16 = 0;
+        while (dx < side) : (dx += 1) {
+            if (placed >= cells) break :outer;
+            try edits.append(allocator, .{ .level = 1, .x = anchor.x + dx, .y = anchor.y + dy });
+            placed += 1;
+        }
     }
     // Start state: the edited tiles are blocked.
     for (edits.items) |edit| _ = try world.setDenseTile(obstacle_layer, edit.x, edit.y, tree);
@@ -149,7 +171,7 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // work, so report only the serial case.
     if (case.worker_mode != .serial_direct) return suite.RunStats.skipped("nav update is serial");
 
-    var fixture = try buildFixture(allocator, io, variant);
+    var fixture = try buildFixture(allocator, io, variant, item_count);
     defer fixture.deinit(allocator);
 
     var meta = try world_tileset_meta.load(allocator, AssetStore.init(allocator, io, "assets"), manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -163,17 +185,16 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
-        var elapsed: u64 = 0;
-        var toggle: usize = 0;
-        while (toggle < item_count) : (toggle += 1) elapsed += try runToggle(&fixture, io, grass, tree);
-        // Two timed updates per toggle; report the per-update cost.
-        accumulator.record(elapsed / @max(@as(u64, 1), 2 * item_count), suite.serialBatch(item_count, 1));
+        // One toggle is two timed `applyNavUpdates` over the full footprint; report the
+        // per-update batch cost (items_per_second then reads as dirty cells per second).
+        const elapsed = try runToggle(&fixture, io, grass, tree);
+        accumulator.record(elapsed / 2, suite.serialBatch(item_count, 1));
     }
     return accumulator.finish();
 }
 
 test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
-    var fixture = try buildFixture(std.testing.allocator, std.testing.io, .interior);
+    var fixture = try buildFixture(std.testing.allocator, std.testing.io, .interior, 1);
     defer fixture.deinit(std.testing.allocator);
 
     var meta = try world_tileset_meta.load(std.testing.allocator, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), manifest.spriteSpec(.world_tileset).metadata_path.?);
