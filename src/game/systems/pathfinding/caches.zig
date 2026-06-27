@@ -20,6 +20,7 @@ const hashPathKey = types.hashPathKey;
 const keysEqual = types.keysEqual;
 const emptyKey = types.emptyKey;
 const no_cell = types.no_cell;
+const ChangedSpan = types.ChangedSpan;
 
 pub const KeySet = struct {
     // Fixed-capacity linear-probe set for pending keys. Full sets drop new inserts
@@ -131,6 +132,32 @@ pub const ResultCache = struct {
         self.next_evict = 0;
     }
 
+    // Evicts only cached paths crossing a changed span; paths clear of the edited cells
+    // survive and keep serving hits. Matches on the stored corridor (or plain) cells.
+    pub fn evictCrossing(self: *ResultCache, graph: *const NavGraph, spans: []const ChangedSpan) void {
+        if (spans.len == 0) return;
+        for (self.slots.items, 0..) |*slot, slot_index| {
+            if (!slot.occupied) continue;
+            if (self.crossesSpans(graph, slot_index, slot.result, spans)) {
+                slot.occupied = false;
+                self.len -= 1;
+            }
+        }
+    }
+
+    fn crossesSpans(self: *const ResultCache, graph: *const NavGraph, slot_index: usize, result: PathResult, spans: []const ChangedSpan) bool {
+        if (result.stitched_len != 0) {
+            for (self.stitchedSlice(slot_index, result.stitched_len)) |sc| {
+                if (sc.cell != no_cell and cellInSpans(graph, sc.level, sc.cell, spans)) return true;
+            }
+            return false;
+        }
+        for (self.pathSlice(slot_index, result.path_len)) |cell| {
+            if (cell != no_cell and cellInSpans(graph, result.path_level, cell, spans)) return true;
+        }
+        return false;
+    }
+
     pub fn pathSlice(self: *const ResultCache, slot_index: usize, path_len: usize) []const u32 {
         const base = slot_index * self.path_stride;
         return self.path_cells.items[base .. base + @min(path_len, self.path_stride)];
@@ -221,6 +248,18 @@ pub const ResultCacheSlot = struct {
     occupied: bool = false,
     result: PathResult = .{ .key = emptyKey(0), .path_len = 0 },
 };
+
+// Whether nav cell (level, cell) falls inside any changed span on its level.
+fn cellInSpans(graph: *const NavGraph, level: u16, cell: u32, spans: []const ChangedSpan) bool {
+    const grid = graph.grid(level) orelse return false;
+    const cx: usize = cell % grid.width;
+    const cy: usize = cell / grid.width;
+    for (spans) |s| {
+        if (s.level != level) continue;
+        if (cx >= s.span.min_x and cx <= s.span.max_x and cy >= s.span.min_y and cy <= s.span.max_y) return true;
+    }
+    return false;
+}
 
 // Per-agent waypoint derivation against a cached path. This is the per-step,
 // per-entity refinement promised by the goal-keyed cache.

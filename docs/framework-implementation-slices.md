@@ -2145,6 +2145,22 @@ to a single portal, so escalation cannot subdivide the long segment and would on
 per-frame work — making it effective would require start-chunk-scoped seeding (a global
 corridor-shape change), a design decision left for a future slice.
 
+Deferred follow-up — per-entity NPC level and autonomous descent: the nav
+substrate routes cross-level corridors, but NPCs have no Z of their own. Steering
+hardcodes the agent start level to 0 (`steering.zig` `writePathRequests` and the
+`statusForEntityWorld(..., 0, ...)` query), `PathView` carries no level, and the
+ramp/fall transition logic is player-only (`game_demo_state.zig`). Because the
+world renders only the player's current level and NPCs are drawn at their XY on
+whatever plane the player views, an NPC pathing toward an off-level player appears
+to teleport onto the player's level along its level-0 path. This is the
+`goal-level source (default 0 until multi-level gameplay exists)` open decision
+coming due. Implementing it spans four touch-points: (1) a per-entity level (Z)
+column in `DataSystem`; (2) steering sources `start_level` from it instead of the
+hardcoded 0; (3) `PathView` exposes the next cell's level so an agent traverses a
+link (updating its level column at the link cell) rather than sliding across the
+boundary; (4) render/cull each NPC on its own level, not the player's. Tracked as
+a gameplay slice on top of the Slice 25 substrate, not a pathfinder defect.
+
 ## Emergent AI Track Overview (Slices 26–33)
 
 Goal: layer emergent NPC behavior — perception, memory, emotion, and richer

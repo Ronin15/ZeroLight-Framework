@@ -201,6 +201,12 @@ pub const NavSpan = struct {
     max_y: usize,
 };
 
+// One edit's changed nav-cell rectangle on a level; scopes path-cache eviction to it.
+pub const ChangedSpan = struct {
+    level: u16,
+    span: NavSpan,
+};
+
 // Tile index containing a world coordinate, clamped to [0, count-1]. Negatives map
 // to 0; the float floor guards against the inf/NaN illegal-behavior trap.
 pub fn tileIndexClamped(value: f32, tile_size: f32, count: u16) u16 {

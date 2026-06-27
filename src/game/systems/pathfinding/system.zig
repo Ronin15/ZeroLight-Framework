@@ -93,6 +93,8 @@ pub const PathfindingSystem = struct {
     // to the level count at rebuild so `applyNavUpdates` allocates nothing per edit on
     // the steady path; it is the main-thread post-commit reaction, never a worker.
     affected_levels: std.ArrayList(bool) = .empty,
+    // Per-edit changed nav-cell spans driving scoped cache eviction on incremental updates.
+    nav_changed_spans: std.ArrayList(types.ChangedSpan) = .empty,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -139,6 +141,7 @@ pub const PathfindingSystem = struct {
         self.resize_group_snapshot.deinit(self.allocator);
         self.resize_pending_snapshot.deinit(self.allocator);
         self.affected_levels.deinit(self.allocator);
+        self.nav_changed_spans.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
         self.solved_paths.deinit(self.allocator);
@@ -218,6 +221,8 @@ pub const PathfindingSystem = struct {
             self.group_fields.appendAssumeCapacity(.{});
         }
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
+        // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
+        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -383,31 +388,57 @@ pub const PathfindingSystem = struct {
             self.capacity.nav_full_relabel_level_threshold,
         );
         if (stats.version_bumps != 0) {
-            // The version bump invalidated every goal-keyed key; drop stale work and
-            // group fields so the next request re-solves against the new mask.
+            // Full rebuild bumped nav_version: blunt-invalidate all work and group fields.
             self.clearTransientRequestsRetainingFields();
-            for (self.group_fields.items) |*field| field.state = .empty;
-            self.next_group_evict = 0;
+            self.dropGroupFields();
+        } else if (stats.incremental_rebuilds != 0) {
+            // Incremental edit: keep cached paths clear of it, evict only crossing ones.
+            // Short-lived pending/unavailable/group state is dropped and rebuilt.
+            try self.evictCachedPathsCrossingEdits(world, edits);
+            self.clearRequestStateKeepingCompleted();
+            self.dropGroupFields();
         }
         return stats;
+    }
+
+    // Evicts cached paths crossing this batch's changed-cell spans.
+    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) !void {
+        const world_system = world orelse return;
+        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len);
+        self.nav_changed_spans.clearRetainingCapacity();
+        for (edits) |edit| {
+            const grid = self.graph.grid(edit.level) orelse continue;
+            const span = grid.navSpanForTile(world_system, edit) orelse continue;
+            self.nav_changed_spans.appendAssumeCapacity(.{ .level = edit.level, .span = span });
+        }
+        self.completed.evictCrossing(&self.graph, self.nav_changed_spans.items);
+    }
+
+    fn dropGroupFields(self: *PathfindingSystem) void {
+        for (self.group_fields.items) |*field| field.state = .empty;
+        self.next_group_evict = 0;
     }
 
     pub fn clearRuntimeState(self: *PathfindingSystem) void {
         self.clearTransientRequestsRetainingFields();
         // Plus drop group fields so a stale field is never sampled after a rebuild.
-        for (self.group_fields.items) |*field| field.state = .empty;
-        self.next_group_evict = 0;
+        self.dropGroupFields();
     }
 
     // Clears request/result state while keeping the nav grid and group fields.
     pub fn clearTransientRequestsRetainingFields(self: *PathfindingSystem) void {
+        self.clearRequestStateKeepingCompleted();
+        self.completed.clear();
+    }
+
+    // Clears short-lived request/result state but keeps the result cache for scoped eviction.
+    fn clearRequestStateKeepingCompleted(self: *PathfindingSystem) void {
         self.pending.clearRetainingCapacity();
         self.prepared_requests.clearRetainingCapacity();
         self.solve_results.clearRetainingCapacity();
         self.fallback_indices.clearRetainingCapacity();
         self.solved_paths.clearRetainingCapacity();
         self.group_requests.clearRetainingCapacity();
-        self.completed.clear();
         self.unavailable.clear();
         self.pending_keys.clear();
     }
@@ -2328,10 +2359,10 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
-    try std.testing.expect(system.graph.version != version_before);
-    // The previously cached completed entry was keyed on the old nav_version: it must
-    // no longer answer this goal until re-solved.
+    // A pure incremental dig keeps nav_version stable; invalidation is scoped.
+    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
+    try std.testing.expect(system.graph.version == version_before);
+    // The cached path crossed the now-blocked cell (5,3), so it was evicted: missing.
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default).status);
 
     // Next solve produces a DIFFERENT path that avoids the now-blocked near gap and
@@ -2389,16 +2420,16 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
 
     const changed = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
-    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
 
-    // The wall is now solid: the goal is truly disconnected, so the re-solve is a
-    // definitive unavailable rather than a stale cached available.
+    // The cached path crossed the now-closed gap (5,3), so it was evicted and the
+    // re-solve is a definitive unavailable, not a stale cached available.
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), after.unavailable_results);
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default).status);
 }
 
-test "pathfinding incremental update opens a shorter path when a tile is unblocked" {
+test "pathfinding incremental update retains a still-valid cached path when an off-path tile is unblocked" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
@@ -2423,14 +2454,55 @@ test "pathfinding incremental update opens a shorter path when a tile is unblock
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
 
-    // Open the near gap (5,3) back to grass.
+    // Unblock the near gap (5,3): a cell the cached path (via row 9) does not cross, so
+    // it is retained. Opening a shortcut does not re-route existing agents.
     const changed = (try world.setDenseTile(built.wall_layer, 5, 3, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
     try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
 
-    // The now-shorter route uses the near gap.
+    // The path survived: still available and still routing through the far gap (row 9).
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
+}
+
+test "pathfinding incremental update blocking an off-path cell keeps the cached path as a cache hit" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const built = try buildCorridorWorld(&meta, &.{3});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+
+    const start = tileCenter(1, 5);
+    const goal = tileCenter(9, 5);
     try std.testing.expectEqual(@as(usize, 1), (try solveStep(&system, requester, start, goal)).available_results);
+    // The cached route crosses the row-3 gap and never visits the far corner (9,11).
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 9, 11));
+
+    // Block an off-path cell far from the route: the cached path is left intact (an edit
+    // elsewhere does not invalidate unrelated cached paths).
+    const changed = (try world.setDenseTile(built.wall_layer, 9, 11, tree)) orelse return error.TestExpectedEqual;
+    const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
+
+    // The same goal is served from the surviving cache (a hit): nothing re-solved.
+    const after = try solveStep(&system, requester, start, goal);
+    try std.testing.expectEqual(@as(usize, 0), after.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 1), after.cache_hits);
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
 }
 
@@ -2653,7 +2725,9 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
-    try std.testing.expectEqual(@as(usize, 1), nav_stats.version_bumps);
+    // Incremental edit keeps nav_version stable; the prior unavailable entry is dropped,
+    // so the same cross-level goal re-solves as live.
+    try std.testing.expectEqual(@as(usize, 1), nav_stats.incremental_rebuilds);
 
     var open_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer open_stream.deinit();

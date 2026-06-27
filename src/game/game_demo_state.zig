@@ -797,9 +797,10 @@ pub const GameDemoState = struct {
         if (self.nav_dirty_edits.items.len == 0) return;
         try self.simulation_frame.events.ensureCanAppend(1);
         self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world, self.nav_dirty_edits.items);
-        // Only signal invalidation when the batch actually changed the graph (e.g. a
-        // tile flip whose blocking state truly differed and reached a real level).
-        if (self.last_nav_update_stats.version_bumps == 0) return;
+        // Only signal invalidation when the batch actually changed the graph. An
+        // incremental dig keeps nav_version stable (scoped cache eviction), so gate on
+        // real work (`incremental_rebuilds`) too, not just a full-rebuild version bump.
+        if (self.last_nav_update_stats.version_bumps == 0 and self.last_nav_update_stats.incremental_rebuilds == 0) return;
         try self.simulation_frame.events.appendRequired(.{
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
@@ -1725,9 +1726,10 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
 
     try demo.processPostCommitEvents();
 
-    // The incremental update ran and bumped the version exactly once.
+    // The incremental update ran; a pure incremental dig keeps nav_version stable
+    // (caches are scope-evicted, not version-invalidated), so no version bump.
     try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 1), demo.last_nav_update_stats.version_bumps);
+    try std.testing.expectEqual(@as(usize, 0), demo.last_nav_update_stats.version_bumps);
 
     // Every covered cell is blocked even though the rect overflowed the dirty scratch.
     yy = min_y;

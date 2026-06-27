@@ -412,12 +412,17 @@ pub const NavGraph = struct {
         }
         try self.rebuildLinkEdges(world);
 
-        self.version +%= 1;
-        if (self.version == 0) self.version = 1;
-        for (self.levels.items) |*level_grid| level_grid.version = self.version;
+        // Incremental patch keeps nav_version stable (caller scope-evicts only crossing
+        // paths); a full relabel/edge-cap rebuild bumps it to invalidate all goal-keyed work.
+        const full_rebuild = stats.full_relabel != 0 or stats.edge_cap_fallback != 0;
+        if (full_rebuild) {
+            self.version +%= 1;
+            if (self.version == 0) self.version = 1;
+            for (self.levels.items) |*level_grid| level_grid.version = self.version;
+            stats.version_bumps = 1;
+        }
 
         stats.incremental_rebuilds = 1;
-        stats.version_bumps = 1;
         return stats;
     }
 
