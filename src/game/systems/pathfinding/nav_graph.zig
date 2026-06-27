@@ -12,6 +12,10 @@ const logging = @import("../../../core/logging.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
 const DataSystem = @import("../../data_system.zig").DataSystem;
 const WorldSystem = @import("../../world_system.zig").WorldSystem;
+const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
+const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
@@ -127,6 +131,56 @@ pub const NavLevelGraph = struct {
         return count;
     }
 };
+// Per-worker scratch for one chunk patch: the chunk's transient edge list (filled by
+// discover/intra, drained into the chunk's fixed edge window) and the compaction cursor.
+// One slot per threaded participant so chunk patches run in parallel without sharing
+// writable state; the serial path uses slot 0. Both buffers are per-chunk transient,
+// cleared at the start of each patch. Distinct from NavLevelGraph.edge_scratch, which the
+// init full build reuses to accumulate a whole level's edges.
+const ChunkPatchScratch = struct {
+    edges: std.ArrayList(NavLevelGraph.EdgeScratch) = .empty,
+    cursor: std.ArrayList(u32) = .empty,
+    // Set when this chunk's edges overflowed its fixed window during compaction.
+    overflow: bool = false,
+
+    fn deinit(self: *ChunkPatchScratch, allocator: std.mem.Allocator) void {
+        self.edges.deinit(allocator);
+        self.cursor.deinit(allocator);
+    }
+};
+
+// Optional threading for the incremental chunk-patch loop. When present, applyNavUpdates fans
+// the per-chunk patch across the ThreadSystem using a stage-owned tuner; absent → serial. The
+// adaptive tuner keeps small digs inline and threads only dig-storms, so there is no fixed
+// per-step budget — the tuner IS the work-sizing policy.
+pub const NavPatchThreads = struct {
+    thread_system: *ThreadSystem,
+    tuner: *AdaptiveWorkTuner,
+};
+
+// Job context for the threaded chunk patch. Each dirty chunk is independent — it writes only
+// its own disjoint portal/edge slot windows and uses its worker's own ChunkPatchScratch slot —
+// so chunk patches run race-free and the threaded result is byte-identical to the serial one.
+const NavPatchJob = struct {
+    graph: *NavGraph,
+    world: ?*const WorldSystem,
+    level: u16,
+    chunks: []const u32,
+};
+
+fn patchChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+    const job: *NavPatchJob = @ptrCast(@alignCast(context));
+    const scratch = &job.graph.patch_scratch.items[worker_id.index];
+    for (range.start..range.end) |i| {
+        const overflowed = job.graph.patchChunk(job.level, job.world, job.chunks[i], scratch) catch {
+            // An allocation failure mid-patch forces the post-barrier serial full-rebuild fallback.
+            scratch.overflow = true;
+            continue;
+        };
+        if (overflowed) scratch.overflow = true;
+    }
+}
+
 // Per-level chunk-portal navigation graph plus inter-level link edges. Owns one
 // NavGrid per level (Z-floor) sharing dimensions/cell_size/version. Built once at
 // nav rebuild; queried read-only afterward.
@@ -153,6 +207,9 @@ pub const NavGraph = struct {
     // per-build allocator.alloc) keeps both the init build and the incremental
     // `applyNavUpdates` rebuild allocation-free once the graph has been built once.
     build_u32_scratch: std.ArrayList(u32) = .empty,
+    // Per-participant chunk-patch scratch (worker count + 1, min 1), sized at rebuild. The
+    // threaded incremental patch indexes this by worker id; the serial path uses slot 0.
+    patch_scratch: std.ArrayList(ChunkPatchScratch) = .empty,
 
     // Geometric, chunk-stable slot layout, computed once per dimensions/chunk_tiles and
     // invariant across applyNavUpdates (chunk geometry is identical across levels, so this
@@ -193,6 +250,8 @@ pub const NavGraph = struct {
         self.chunk_portal_base.deinit(self.allocator);
         self.chunk_portal_cap.deinit(self.allocator);
         self.build_u32_scratch.deinit(self.allocator);
+        for (self.patch_scratch.items) |*scratch| scratch.deinit(self.allocator);
+        self.patch_scratch.deinit(self.allocator);
         self.link_edges.deinit(self.allocator);
         for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
         self.level_graphs.deinit(self.allocator);
@@ -296,9 +355,27 @@ pub const NavGraph = struct {
             level_grid.buildComponents();
         }
 
+        // Ensure one chunk-patch scratch slot per threaded participant (workers + main) BEFORE
+        // the abstract build, because buildLevelInit uses slot 0 as its per-chunk edge scratch.
+        const participant_count = @max(@as(usize, 1), memory_budget.worker_participant_count);
+        try self.patch_scratch.ensureTotalCapacity(self.allocator, participant_count);
+        while (self.patch_scratch.items.len < participant_count) self.patch_scratch.appendAssumeCapacity(.{});
+
         self.edge_slack = default_edge_slack;
         try self.buildAbstractGraphs(world);
         try self.rebuildLinkEdges(world);
+
+        // Pre-reserve each slot's edge buffer and compaction cursor to the largest chunk's caps
+        // so a steady-path incremental patch (serial or threaded) allocates nothing; only a
+        // genuine edge-window overflow (which triggers a loud full-rebuild fallback) may grow.
+        var max_edge_cap: usize = 0;
+        for (self.chunk_edge_cap.items) |cap| max_edge_cap = @max(max_edge_cap, cap);
+        var max_portal_cap: usize = 0;
+        for (self.chunk_portal_cap.items) |cap| max_portal_cap = @max(max_portal_cap, cap);
+        for (self.patch_scratch.items) |*scratch| {
+            try scratch.edges.ensureTotalCapacity(self.allocator, max_edge_cap);
+            try scratch.cursor.ensureTotalCapacity(self.allocator, max_portal_cap);
+        }
     }
 
     // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from
@@ -345,6 +422,7 @@ pub const NavGraph = struct {
         edits: []const NavCellEdit,
         affected_levels: *std.ArrayList(bool),
         full_relabel_level_threshold: usize,
+        patch_threads: ?NavPatchThreads,
     ) !NavUpdateStats {
         var stats = NavUpdateStats{};
         if (edits.len == 0 or !self.valid()) return stats;
@@ -393,9 +471,7 @@ pub const NavGraph = struct {
                 self.remaskChangedChunks(level, data, world, edits);
                 self.buildDirtySet(level, world, edits);
                 stats.chunks_patched += self.dirty_set.items.len;
-                for (self.dirty_set.items) |chunk| {
-                    if (try self.patchChunk(level, world, chunk)) overflow = true;
-                }
+                if (try self.patchDirtyChunks(level, world, patch_threads)) overflow = true;
             }
             if (overflow) {
                 // A chunk's edges blew past its fixed window: bump slack and rebuild the
@@ -424,6 +500,38 @@ pub const NavGraph = struct {
 
         stats.incremental_rebuilds = 1;
         return stats;
+    }
+
+    // Patches the current self.dirty_set for one level, serial or threaded. Threaded only when a
+    // patch context is present, there is more than one chunk, and the live participant count fits
+    // the pre-sized scratch slots; otherwise serial (slot 0). Returns true if any chunk overflowed
+    // its edge window. parallelForWithOptions is a barrier, so self.dirty_set stays stable across
+    // the batch and the next level's buildDirtySet runs only after it completes.
+    fn patchDirtyChunks(self: *NavGraph, level: u16, world: ?*const WorldSystem, patch_threads: ?NavPatchThreads) !bool {
+        const chunks = self.dirty_set.items;
+        if (patch_threads) |threads| {
+            const participants = threads.thread_system.participantSlotCount();
+            if (chunks.len > 1 and participants <= self.patch_scratch.items.len) {
+                for (self.patch_scratch.items) |*scratch| scratch.overflow = false;
+                var job = NavPatchJob{ .graph = self, .world = world, .level = level, .chunks = chunks };
+                _ = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
+                    .adaptive = true,
+                    .adaptive_tuner = threads.tuner,
+                    .range_alignment_items = 1,
+                });
+                var overflow = false;
+                for (self.patch_scratch.items) |*scratch| {
+                    if (scratch.overflow) overflow = true;
+                }
+                return overflow;
+            }
+        }
+        var overflow = false;
+        const scratch = &self.patch_scratch.items[0];
+        for (chunks) |chunk| {
+            if (try self.patchChunk(level, world, chunk, scratch)) overflow = true;
+        }
+        return overflow;
     }
 
     // Builds this batch's dirty-chunk set for one level into self.dirty_set: every chunk a
@@ -704,13 +812,19 @@ pub const NavGraph = struct {
         @memset(lg.chunk_order_len.items, 0);
         @memset(lg.chunk_label_len.items, 0);
         lg.edge_scratch.clearRetainingCapacity();
+        // Reuse slot 0 as the per-chunk edge scratch, then accumulate each chunk's edges into
+        // the level's edge_scratch in chunk order (placeLevelEdges drains it once the shared
+        // caps are measured). Serial build path, so slot 0 is never contended here.
+        const scratch = &self.patch_scratch.items[0];
         const chunk_count = self.chunkCount();
         var chunk: u32 = 0;
         while (chunk < chunk_count) : (chunk += 1) {
-            try self.discoverChunkPortals(level, chunk);
+            scratch.edges.clearRetainingCapacity();
+            try self.discoverChunkPortals(level, chunk, scratch);
             if (world) |world_system| self.addChunkLinkPortals(level, chunk, world_system);
-            try self.connectChunkIntraEdges(level, chunk);
+            try self.connectChunkIntraEdges(level, chunk, scratch);
             self.orderChunkPortals(level, chunk);
+            try lg.edge_scratch.appendSlice(self.allocator, scratch.edges.items);
         }
     }
 
@@ -782,14 +896,14 @@ pub const NavGraph = struct {
     // intra-chunk edges, its ordering/label sub-index, and compacts its edges into its fixed
     // window. Touches no other chunk's slots, so the dirty-bounded incremental update never
     // renumbers or rebuilds an unaffected chunk. Returns true on an edge-window overflow.
-    pub fn patchChunk(self: *NavGraph, level: u16, world: ?*const WorldSystem, chunk: u32) !bool {
+    pub fn patchChunk(self: *NavGraph, level: u16, world: ?*const WorldSystem, chunk: u32, scratch: *ChunkPatchScratch) !bool {
         self.clearChunkSlots(level, chunk);
-        self.level_graphs.items[level].edge_scratch.clearRetainingCapacity();
-        try self.discoverChunkPortals(level, chunk);
+        scratch.edges.clearRetainingCapacity();
+        try self.discoverChunkPortals(level, chunk, scratch);
         if (world) |world_system| self.addChunkLinkPortals(level, chunk, world_system);
-        try self.connectChunkIntraEdges(level, chunk);
+        try self.connectChunkIntraEdges(level, chunk, scratch);
         self.orderChunkPortals(level, chunk);
-        return try self.compactChunkEdges(level, chunk);
+        return try self.compactChunkEdges(level, chunk, scratch);
     }
 
     // Tombstones a chunk's whole slot window and clears the cell_to_portal entries of the
@@ -830,33 +944,33 @@ pub const NavGraph = struct {
     // neighbor. The reverse edge lives in the neighbor chunk's window and is emitted when
     // that chunk is patched (both source and neighbor are always in the dirty set), so each
     // shared transition edge is emitted exactly once.
-    pub fn discoverChunkPortals(self: *NavGraph, level: u16, chunk: u32) !void {
+    pub fn discoverChunkPortals(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
         const lg = &self.level_graphs.items[level];
         const blocked = self.levels.items[level].blocked.items;
         const w = self.width;
         const b = self.chunkBounds(chunk);
         if (b.x0 > 0) {
             var y = b.y0;
-            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x0, y * w + b.x0 - 1, chunk);
+            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x0, y * w + b.x0 - 1, chunk, scratch);
         }
         if (b.x1 < w) {
             var y = b.y0;
-            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x1 - 1, y * w + b.x1, chunk);
+            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x1 - 1, y * w + b.x1, chunk, scratch);
         }
         if (b.y0 > 0) {
             var x = b.x0;
-            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, b.y0 * w + x, (b.y0 - 1) * w + x, chunk);
+            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, b.y0 * w + x, (b.y0 - 1) * w + x, chunk, scratch);
         }
         if (b.y1 < self.height) {
             var x = b.x0;
-            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, (b.y1 - 1) * w + x, b.y1 * w + x, chunk);
+            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, (b.y1 - 1) * w + x, b.y1 * w + x, chunk, scratch);
         }
     }
 
-    pub fn tryBorderPair(self: *NavGraph, lg: *NavLevelGraph, level: u16, blocked: []const bool, c_cell: usize, n_cell: usize, chunk: u32) !void {
+    pub fn tryBorderPair(self: *NavGraph, lg: *NavLevelGraph, level: u16, blocked: []const bool, c_cell: usize, n_cell: usize, chunk: u32, scratch: *ChunkPatchScratch) !void {
         if (blocked[c_cell] or blocked[n_cell]) return;
         self.addPortalCell(lg, level, c_cell, chunk);
-        try lg.edge_scratch.append(self.allocator, .{
+        try scratch.edges.append(self.allocator, .{
             .from = self.slotForCell(c_cell),
             .edge = .{ .target = self.slotForCell(n_cell), .cost = cardinal_cost },
         });
@@ -891,7 +1005,7 @@ pub const NavGraph = struct {
 
     // Connects this chunk's live same-chunk-component portals pairwise with octile cost. Both
     // endpoints share the chunk so both directions land in this chunk's edge window.
-    pub fn connectChunkIntraEdges(self: *NavGraph, level: u16, chunk: u32) !void {
+    pub fn connectChunkIntraEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
         const lg = &self.level_graphs.items[level];
         const components = self.levels.items[level].components.items;
         const pbase = self.chunk_portal_base.items[chunk];
@@ -907,8 +1021,8 @@ pub const NavGraph = struct {
                 const cell_j = lg.portals.items[j].cell_index;
                 if (cell_j == no_cell or components[cell_j] != comp_i) continue;
                 const cost = octileCells(self.width, cell_i, cell_j);
-                try lg.edge_scratch.append(self.allocator, .{ .from = i, .edge = .{ .target = j, .cost = cost } });
-                try lg.edge_scratch.append(self.allocator, .{ .from = j, .edge = .{ .target = i, .cost = cost } });
+                try scratch.edges.append(self.allocator, .{ .from = i, .edge = .{ .target = j, .cost = cost } });
+                try scratch.edges.append(self.allocator, .{ .from = j, .edge = .{ .target = i, .cost = cost } });
             }
         }
     }
@@ -948,7 +1062,7 @@ pub const NavGraph = struct {
     // Drains this chunk's edge_scratch into its fixed edge window, grouped by source slot,
     // setting portal_edge_start/portal_edge_count per slot. Returns true (without writing past
     // the window) when the chunk's edges exceed its cap, so the caller can fall back.
-    pub fn compactChunkEdges(self: *NavGraph, level: u16, chunk: u32) !bool {
+    pub fn compactChunkEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !bool {
         const lg = &self.level_graphs.items[level];
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
@@ -956,7 +1070,7 @@ pub const NavGraph = struct {
         const ecap = self.chunk_edge_cap.items[chunk];
         var slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) lg.portal_edge_count.items[slot] = 0;
-        for (lg.edge_scratch.items) |scratch| lg.portal_edge_count.items[scratch.from] += 1;
+        for (scratch.edges.items) |entry| lg.portal_edge_count.items[entry.from] += 1;
         var running = ebase;
         slot = pbase;
         while (slot < pbase + pcap) : (slot += 1) {
@@ -964,14 +1078,16 @@ pub const NavGraph = struct {
             running += lg.portal_edge_count.items[slot];
         }
         if (running - ebase > ecap) return true;
-        // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start.
-        const cursor = try self.buildScratch(pcap);
+        // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start. Uses
+        // this worker's own cursor buffer so parallel chunk patches never share writable state.
+        try setLen(&scratch.cursor, self.allocator, pcap);
+        const cursor = scratch.cursor.items;
         var i: u32 = 0;
         while (i < pcap) : (i += 1) cursor[i] = lg.portal_edge_start.items[pbase + i];
-        for (lg.edge_scratch.items) |scratch| {
-            const dst = cursor[scratch.from - pbase];
-            lg.portal_edges.items[dst] = scratch.edge;
-            cursor[scratch.from - pbase] = dst + 1;
+        for (scratch.edges.items) |entry| {
+            const dst = cursor[entry.from - pbase];
+            lg.portal_edges.items[dst] = entry.edge;
+            cursor[entry.from - pbase] = dst + 1;
         }
         return false;
     }
@@ -1665,5 +1781,56 @@ test "incremental nav update across distant chunks in one batch matches a full r
     // Both distant chunks ended blocked in the incremental graph's mask (no dropped cell).
     const nav = system.graph.grid(0).?;
     for (cells) |cell| try std.testing.expect(nav.isBlockedCell(.{ .x = @intCast(cell.x), .y = @intCast(cell.y) }));
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update threaded chunk patch matches a serial full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    // Dig several chunks (each corner plus the center) in one batch, applied through the
+    // THREADED buffered path. Each chunk patches disjoint slot/edge windows with its own worker
+    // scratch slot, so the threaded result must be byte-identical to a fresh serial full rebuild.
+    // (The adaptive tuner may run this small batch inline; patchChunkJob runs either way, and
+    // parity holds by the disjoint-window design regardless of how it is scheduled.)
+    const cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    for (cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(cap);
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    const inc = system.graph.levelGraph(0).?;
+    const full = rebuilt.graph.levelGraph(0).?;
+    try std.testing.expectEqualSlices(PortalNode, full.portals.items, inc.portals.items);
+    try std.testing.expectEqualSlices(u32, full.cell_to_portal.items, inc.cell_to_portal.items);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }

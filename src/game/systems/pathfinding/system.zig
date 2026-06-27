@@ -19,6 +19,7 @@ const PathRequest = @import("../../simulation.zig").PathRequest;
 const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const NavGraph = @import("nav_graph.zig").NavGraph;
+const NavPatchThreads = @import("nav_graph.zig").NavPatchThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
 const GroupField = @import("group_field.zig").GroupField;
@@ -106,6 +107,9 @@ pub const PathfindingSystem = struct {
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // The incremental nav-update chunk patch is an independently-timed threaded stage, so it
+    // owns its own tuner (per docs: one tuner per stage, never shared across work shapes).
+    nav_patch_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // Live agent count the per-step/memory caps are currently sized for. Elastic
     // resize keeps this tracking the steering-agent crowd: grows fast for battles,
     // shrinks slowly after sustained low load. Zero until the first reserve.
@@ -386,18 +390,37 @@ pub const PathfindingSystem = struct {
     // Runtime request/result state is cleared (caches invalidate on the version bump),
     // while group fields are dropped to .empty so a stale field is never sampled. No
     // whole-world rebuild and no scratch reallocation occur on the steady path.
+    // Serial incremental update over an explicit edit slice (tests, bench, direct callers).
+    // Production uses the buffered path, which can thread the chunk patch.
     pub fn applyNavUpdates(
         self: *PathfindingSystem,
         data: *const DataSystem,
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
+        return self.applyNavUpdatesImpl(data, world, edits, null);
+    }
+
+    fn applyNavUpdatesImpl(
+        self: *PathfindingSystem,
+        data: *const DataSystem,
+        world: ?*const WorldSystem,
+        edits: []const NavCellEdit,
+        thread_system: ?*ThreadSystem,
+    ) !NavUpdateStats {
+        // The chunk patch is a per-stage threaded processor: small digs run inline, dig-storms
+        // fan across workers, decided by the stage-owned nav_patch_tuner (no fixed budget).
+        const patch_threads: ?NavPatchThreads = if (thread_system) |ts|
+            .{ .thread_system = ts, .tuner = &self.nav_patch_tuner }
+        else
+            null;
         const stats = try self.graph.applyNavUpdates(
             data,
             world,
             edits,
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
+            patch_threads,
         );
         if (stats.version_bumps != 0) {
             // Full rebuild bumped nav_version: blunt-invalidate all work and group fields.
@@ -432,9 +455,10 @@ pub const PathfindingSystem = struct {
     }
 
     // Applies the buffered dirty nav cells as one incremental update, then clears the buffer.
-    // Returns zero stats when nothing is buffered.
-    pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem) !NavUpdateStats {
-        const stats = try self.applyNavUpdates(data, world, self.nav_dirty_edits.items);
+    // Returns zero stats when nothing is buffered. A non-null thread_system lets the chunk patch
+    // thread (tuner-gated); null keeps it serial.
+    pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
+        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, thread_system);
         self.nav_dirty_edits.clearRetainingCapacity();
         return stats;
     }
@@ -2657,7 +2681,7 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     try std.testing.expect(marked > abstractCapacity().max_frame_requests);
     try std.testing.expect(system.hasPendingNavUpdates());
 
-    const stats = try system.applyBufferedNavUpdates(&data, &world);
+    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     // The far block — marked last, the first a fixed cap would drop — reached the graph.
     const nav = system.graph.grid(0).?;

@@ -185,8 +185,9 @@ pub const SimulationPipeline = struct {
         self: *SimulationPipeline,
         data: *const DataSystem,
         world: *const WorldSystem,
+        thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
-        return self.pathfinding.applyBufferedNavUpdates(data, world);
+        return self.pathfinding.applyBufferedNavUpdates(data, world, thread_system);
     }
 
     /// Synchronizes interpolation history for pipeline-owned movement state.

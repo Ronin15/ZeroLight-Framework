@@ -548,13 +548,22 @@ through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel`
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
 counted full relabel only past a configured level threshold), and a
 `nav_region_invalidated` event is still emitted whenever the graph actually
-changed. The update runs single-threaded at the main-thread post-commit reaction
-point and is allocation-free on the steady path: the abstract chunk-portal
+changed. The reaction runs at the main-thread post-commit point, but the per-chunk
+abstract patch is a threaded stage: it fans the dirty chunks across the
+`ThreadSystem` through its own `nav_patch_tuner` (one tuner per stage, never shared),
+so a single-tile dig stays inline while a many-chunk dig-storm (NPCs plus the player
+digging at once) parallelizes — the tuner is the work-sizing policy, with no fixed
+per-step budget. Each chunk patches only its own disjoint slot/edge windows using a
+per-participant scratch slot, so the threaded result is byte-identical to the serial
+one (and to a full rebuild). The remask-from-world, component re-flood, and
+`link_edges` rebuild stay on the main-thread reaction. It is allocation-free on the
+steady path: the abstract chunk-portal
 buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
-mark grows no buffer. The system-owned dirty buffer is likewise reserved to a
-steady-path high-water and does one bounded amortized grow only for an unusually
-large structural step. A genuine topology expansion past it (an unblock opening
+mark grows no buffer. The per-participant patch scratch is likewise pre-reserved at
+the build to the largest chunk's caps. The system-owned dirty buffer is likewise
+reserved to a steady-path high-water and does one bounded amortized grow only for an
+unusually large structural step. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
 acceptable on this cold, event-triggered path. The `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border

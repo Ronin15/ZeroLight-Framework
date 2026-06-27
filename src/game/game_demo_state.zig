@@ -356,7 +356,7 @@ pub const GameDemoState = struct {
 
         self.simulation_frame.phase = .merge_outputs;
         var structural_timer = StageTimer.start();
-        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets);
+        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets, context.thread_system);
         structural_timer.stop(context.perf, .gameplay_structural);
         self.simulation_frame.phase = .finished;
 
@@ -753,7 +753,7 @@ pub const GameDemoState = struct {
     // obstacle changes do not carry a cell, so the whole affected level is recomputed
     // via an edit on each touched level. A `nav_region_invalidated` event is still
     // emitted when the graph actually changed.
-    fn processPostCommitEvents(self: *GameDemoState) !void {
+    fn processPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !void {
         self.last_nav_update_stats = .{};
         // The dirty nav-cell buffer is owned by the pathfinding system (it scales with
         // digging and must not drop cells); this reaction only interprets structural events
@@ -785,7 +785,7 @@ pub const GameDemoState = struct {
 
         if (!self.pipeline.hasPendingNavUpdates()) return;
         try self.simulation_frame.events.ensureCanAppend(1);
-        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world);
+        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world, thread_system);
         // Only signal invalidation when the batch actually changed the graph. An
         // incremental dig keeps nav_version stable (scoped cache eviction), so gate on
         // real work (`incremental_rebuilds`) too, not just a full-rebuild version bump.
@@ -796,7 +796,7 @@ pub const GameDemoState = struct {
         });
     }
 
-    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets) !StructuralCommitStats {
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets, thread_system: ?*ThreadSystem) !StructuralCommitStats {
         try self.validateStructuralAssetReferences(runtime_assets);
         // processPostCommitEvents appends at most one nav_region_invalidated event,
         // driven by EITHER structural commands applied this frame OR invalidating
@@ -807,7 +807,7 @@ pub const GameDemoState = struct {
             self.pendingEventsMayInvalidateNavigation();
         const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
-        try self.processPostCommitEvents();
+        try self.processPostCommitEvents(thread_system);
         try self.ensureDynamicRenderCapacity();
         return stats;
     }
@@ -1525,7 +1525,7 @@ test "demo structural asset reference validation rejects invalid atlas entry bef
 
     try std.testing.expectError(
         error.InvalidSpriteAtlasEntry,
-        demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets),
+        demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null),
     );
     const current = demo.data.assetReferenceConst(entity).?;
     try std.testing.expectEqual(previous.sprite, current.sprite);
@@ -1546,7 +1546,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
         .payload = .{ .world_tile_changed = changed },
     });
 
-    try demo.processPostCommitEvents();
+    try demo.processPostCommitEvents(null);
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1706,7 +1706,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
         } },
     });
 
-    try demo.processPostCommitEvents();
+    try demo.processPostCommitEvents(null);
 
     // The incremental update ran; a pure incremental dig keeps nav_version stable
     // (caches are scope-evicted, not version-invalidated), so no version bump.
@@ -1829,7 +1829,7 @@ test "demo frame sprite capacity tracks structural visual growth" {
         writer.finish();
         demo.simulation_frame.structural_commands.finishWrite();
 
-        const stats = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
+        const stats = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
         try std.testing.expectEqual(batch_count, stats.created);
         created += batch_count;
     }
@@ -2188,7 +2188,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
 
     var nav_invalidations: usize = 0;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -2230,7 +2230,7 @@ test "demo preflights navigation invalidation event before structural mutation" 
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null));
     try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
@@ -2266,7 +2266,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null));
     try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
     try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
@@ -2290,7 +2290,7 @@ test "demo unrelated structural component change does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -2325,7 +2325,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
