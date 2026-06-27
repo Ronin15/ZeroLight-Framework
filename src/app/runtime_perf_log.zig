@@ -11,6 +11,12 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 const log = logging.perf;
 
 pub const enabled = builtin.mode == .Debug and logging.enabled(.debug);
+// Comptime gate for hot/frame-adjacent diagnostic logging (e.g. a recovered-degradation
+// warn on an event-driven simulation reaction). Compiled out in release (no hot-path
+// logging) and in test builds, where stderr output during a `--listen` test would corrupt
+// the test-runner protocol. A gated warn is therefore a zero-sized no-op there while
+// staying live in a Debug dev run.
+pub const hot_log_enabled = builtin.mode == .Debug and !builtin.is_test and logging.enabled(.warn);
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FrameResult = enum {
@@ -81,6 +87,8 @@ pub const Metric = enum {
     nav_incremental_rebuilds,
     nav_full_relabel,
     nav_version_bumps,
+    nav_chunks_patched,
+    nav_edge_cap_fallback,
     movement_bodies,
     collision_bodies,
     collision_candidate_pairs,
@@ -530,13 +538,15 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} region_invalidated={}",
+            "perf {d:.1}s nav dirty_chunks={} incremental_rebuilds={} full_relabel={} version_bumps={} chunks_patched={} edge_cap_fallback={} region_invalidated={}",
             .{
                 elapsed_s,
                 self.metricValue(.nav_dirty_chunks),
                 self.metricValue(.nav_incremental_rebuilds),
                 self.metricValue(.nav_full_relabel),
                 self.metricValue(.nav_version_bumps),
+                self.metricValue(.nav_chunks_patched),
+                self.metricValue(.nav_edge_cap_fallback),
                 self.metricValue(.simulation_events_nav_region_invalidated),
             },
         );

@@ -704,6 +704,8 @@ pub const GameDemoState = struct {
         perf.recordMetric(.nav_incremental_rebuilds, metric(nav_update_stats.incremental_rebuilds));
         perf.recordMetric(.nav_full_relabel, metric(nav_update_stats.full_relabel));
         perf.recordMetric(.nav_version_bumps, metric(nav_update_stats.version_bumps));
+        perf.recordMetric(.nav_chunks_patched, metric(nav_update_stats.chunks_patched));
+        perf.recordMetric(.nav_edge_cap_fallback, metric(nav_update_stats.edge_cap_fallback));
     }
 
     fn metric(value: usize) u64 {
