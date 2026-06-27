@@ -106,6 +106,11 @@ pub const SteeringSystem = struct {
     obstacle_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
     spatial_cell_size: f32 = 64.0,
     spatial_obstacle_query_extra: f32 = 0,
+    // Signature of the static-obstacle set + spatial cell size that produced the
+    // obstacle spatial index. Static obstacles never move, so the obstacle cell
+    // entries + sorted ranges are rebuilt only when this changes, not every step.
+    obstacle_index_signature: u64 = 0,
+    obstacle_index_valid: bool = false,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{
         .initial_range_items = steering_range_alignment_items,
         .smallest_range_items = steering_range_alignment_items,
@@ -369,8 +374,6 @@ pub const SteeringSystem = struct {
         self.obstacle_min_y.clearRetainingCapacity();
         self.obstacle_max_x.clearRetainingCapacity();
         self.obstacle_max_y.clearRetainingCapacity();
-        self.obstacle_cell_entries.clearRetainingCapacity();
-        self.obstacle_cell_ranges.clearRetainingCapacity();
         self.spatial_cell_size = spatialCellSize(steering);
         self.spatial_obstacle_query_extra = 0;
 
@@ -394,6 +397,7 @@ pub const SteeringSystem = struct {
         try self.obstacle_max_y.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
         try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
         try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
+        var signature: u64 = 1469598103934665603; // FNV offset basis
         for (collision_responses.entities, 0..) |obstacle_entity, response_index| {
             if (collision_responses.mobilities[response_index] != .static) continue;
             const bounds_index = data.collisionBoundsDenseIndex(obstacle_entity) orelse continue;
@@ -407,13 +411,31 @@ pub const SteeringSystem = struct {
             self.obstacle_min_y.appendAssumeCapacity(min_y);
             self.obstacle_max_x.appendAssumeCapacity(min_x + size_x);
             self.obstacle_max_y.appendAssumeCapacity(min_y + size_y);
+            // Fold identity + geometry so the obstacle index rebuilds whenever the
+            // static set, an obstacle's position/size, or the iteration order changes.
+            signature = foldSignature(signature, obstacle_entity.index);
+            signature = foldSignature(signature, obstacle_entity.generation);
+            signature = foldSignature(signature, @bitCast(min_x));
+            signature = foldSignature(signature, @bitCast(min_y));
+            signature = foldSignature(signature, @bitCast(size_x));
+            signature = foldSignature(signature, @bitCast(size_y));
         }
-        try self.buildSpatialIndexes();
+        // The binning depends on the spatial cell size too.
+        signature = foldSignature(signature, @bitCast(self.spatial_cell_size));
+
+        // Static obstacles never move, so rebuild the (binned + sorted) obstacle
+        // index only when the signature changes; reuse it across steps otherwise.
+        const rebuild_obstacles = !self.obstacle_index_valid or signature != self.obstacle_index_signature;
+        try self.buildSpatialIndexes(rebuild_obstacles);
+        self.obstacle_index_signature = signature;
+        self.obstacle_index_valid = true;
     }
 
-    fn buildSpatialIndexes(self: *SteeringSystem) !void {
+    fn buildSpatialIndexes(self: *SteeringSystem, rebuild_obstacles: bool) !void {
         // Entries are sorted into compact cell ranges so worker queries do a
-        // binary search per neighboring cell instead of scanning every actor.
+        // binary search per neighboring cell instead of scanning every actor. The
+        // agent index rebuilds every step (agents move); the obstacle index is
+        // rebuilt only when its signature changed (static obstacles do not move).
         for (self.all_agent_entities.items, 0..) |_, index| {
             const cell_x = spatialCell(self.all_agent_x.items[index], self.spatial_cell_size);
             const cell_y = spatialCell(self.all_agent_y.items[index], self.spatial_cell_size);
@@ -425,6 +447,9 @@ pub const SteeringSystem = struct {
         }
         try buildCellRanges(self.agent_cell_entries.items, &self.agent_cell_ranges, self.allocator);
 
+        if (!rebuild_obstacles) return;
+        self.obstacle_cell_entries.clearRetainingCapacity();
+        self.obstacle_cell_ranges.clearRetainingCapacity();
         for (self.obstacle_min_x.items, self.obstacle_min_y.items, self.obstacle_max_x.items, self.obstacle_max_y.items, 0..) |min_x, min_y, max_x, max_y, index| {
             const center_x = (min_x + max_x) * 0.5;
             const center_y = (min_y + max_y) * 0.5;
@@ -1154,6 +1179,11 @@ fn spatialCell(value: f32, cell_size: f32) i32 {
     return math.floorToI32(value / @max(cell_size, min_spatial_cell_size));
 }
 
+// FNV-1a fold of one 32-bit word into a running signature.
+fn foldSignature(hash: u64, value: u32) u64 {
+    return (hash ^ value) *% 1099511628211;
+}
+
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
     return math.length(.{ .x = a.x - b.x, .y = a.y - b.y });
 }
@@ -1431,6 +1461,48 @@ test "steering applies local agent and static obstacle avoidance" {
     try std.testing.expect(stats.agent_neighbor_samples > 0);
     try std.testing.expect(stats.obstacle_samples > 0);
     try std.testing.expect(movement.direction_x < 1);
+}
+
+test "steering reuses the static obstacle index until the obstacle set changes" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    _ = try addStaticObstacle(&data, .{ .x = 24, .y = -24 }, .{ .x = 20, .y = 20 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(8);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expect(steering.obstacle_index_valid);
+    const sig1 = steering.obstacle_index_signature;
+    try std.testing.expectEqual(@as(usize, 1), steering.obstacle_cell_entries.items.len);
+
+    // Same static obstacle set next step: signature unchanged, index reused.
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expectEqual(sig1, steering.obstacle_index_signature);
+    try std.testing.expectEqual(@as(usize, 1), steering.obstacle_cell_entries.items.len);
+
+    // Add an obstacle: the set changed, so the signature changes and the index rebuilds.
+    _ = try addStaticObstacle(&data, .{ .x = -24, .y = 24 }, .{ .x = 20, .y = 20 });
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expect(steering.obstacle_index_signature != sig1);
+    try std.testing.expectEqual(@as(usize, 2), steering.obstacle_cell_entries.items.len);
 }
 
 test "steering serial and real threaded workers produce identical movement intents" {

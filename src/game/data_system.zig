@@ -13,6 +13,7 @@ const math = @import("../core/math.zig");
 const render_depth = @import("render_depth.zig");
 const EntitySimulationMetadata = @import("simulation_scope.zig").EntitySimulationMetadata;
 const SimulationScopeStats = @import("simulation_scope.zig").SimulationScopeStats;
+const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const simd = @import("../core/simd.zig");
 const WorldDepth = render_depth.WorldDepth;
 
@@ -617,6 +618,10 @@ pub const DataSystem = struct {
     slots: std.ArrayList(EntitySlot) = .empty,
     first_free_slot: ?u32 = null,
     free_slot_count: usize = 0,
+    // Live entity count per simulation tier, maintained incrementally on
+    // create/destroy/metadata-change so the per-fixed-step scope stats are O(1)
+    // instead of scanning every slot. Indexed by @intFromEnum(SimulationTier).
+    tier_counts: [4]usize = .{ 0, 0, 0, 0 },
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
     primitive_visuals: PrimitiveVisualStore = .{},
@@ -652,6 +657,7 @@ pub const DataSystem = struct {
             slot.alive = true;
             slot.next_free = null;
             slot.simulation = .{};
+            self.tier_counts[@intFromEnum(slot.simulation.tier)] += 1;
             // Reused slots keep their incremented generation so stale IDs cannot
             // address the new entity.
             return EntityId.init(index, slot.generation) catch unreachable;
@@ -660,6 +666,7 @@ pub const DataSystem = struct {
         if (self.slots.items.len >= std.math.maxInt(u32)) return error.TooManyEntities;
         const index: u32 = @intCast(self.slots.items.len);
         try self.slots.append(self.allocator, .{ .generation = 1, .alive = true });
+        self.tier_counts[@intFromEnum(self.slots.items[index].simulation.tier)] += 1;
         return EntityId.init(index, 1) catch unreachable;
     }
 
@@ -679,6 +686,7 @@ pub const DataSystem = struct {
         if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
 
         const retired_slot = &self.slots.items[@intCast(index)];
+        self.tier_counts[@intFromEnum(retired_slot.simulation.tier)] -= 1;
         retired_slot.generation = nextGeneration(retired_slot.generation);
         retired_slot.alive = false;
         retired_slot.next_free = self.first_free_slot;
@@ -723,24 +731,39 @@ pub const DataSystem = struct {
     pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        self.tier_counts[@intFromEnum(slot.simulation.tier)] -= 1;
+        self.tier_counts[@intFromEnum(metadata.tier)] += 1;
         slot.simulation = metadata;
     }
 
-    /// Builds the current full-active scope counters from live slots and dense
-    /// component slices. Later scoped slices should compare against this parity baseline.
+    /// Current full-active scope counters. Tier histograms come from the
+    /// incrementally-maintained `tier_counts` (O(1), no per-step slot scan); stage
+    /// counts come free from dense slice lengths. `scanLiveTierCounts` is the
+    /// parity baseline the counters must match.
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
-        var stats = SimulationScopeStats{
+        return .{
+            .total_entities = self.tier_counts[0] + self.tier_counts[1] + self.tier_counts[2] + self.tier_counts[3],
+            .dormant_entities = self.tier_counts[@intFromEnum(SimulationTier.dormant)],
+            .kinematic_entities = self.tier_counts[@intFromEnum(SimulationTier.kinematic)],
+            .locomotion_entities = self.tier_counts[@intFromEnum(SimulationTier.locomotion)],
+            .cognition_entities = self.tier_counts[@intFromEnum(SimulationTier.cognition)],
             .movement_stage_entities = self.movement_bodies.entities.items.len,
             .collision_stage_entities = self.collision_bounds.entities.items.len,
             .collision_response_stage_entities = self.collision_responses.entities.items.len,
             .ai_stage_entities = self.ai_agents.entities.items.len,
             .steering_stage_entities = self.steering_agents.entities.items.len,
         };
+    }
+
+    /// O(slots) scan of live tiers — the parity baseline for the incrementally
+    /// maintained `tier_counts`. Test/debug only; not on the fixed-step path.
+    pub fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
+        var counts = [4]usize{ 0, 0, 0, 0 };
         for (self.slots.items) |slot| {
             if (!slot.alive) continue;
-            stats.recordEntity(slot.simulation);
+            counts[@intFromEnum(slot.simulation.tier)] += 1;
         }
-        return stats;
+        return counts;
     }
 
     pub fn isStaticNavigationObstacle(self: *const DataSystem, id: EntityId) bool {
@@ -764,6 +787,7 @@ pub const DataSystem = struct {
 
         self.first_free_slot = null;
         self.free_slot_count = self.slots.items.len;
+        self.tier_counts = .{ 0, 0, 0, 0 };
         for (self.slots.items, 0..) |*slot, index| {
             slot.generation = nextGeneration(slot.generation);
             slot.alive = false;
@@ -3397,6 +3421,35 @@ test "data system excludes runtime services and transient frame state" {
     try std.testing.expect(!@hasField(DataSystem, "input"));
     try std.testing.expect(!@hasField(DataSystem, "thread_system"));
     try std.testing.expect(!@hasField(DataSystem, "scratch"));
+}
+
+test "incremental tier counts track create, destroy, metadata change, and reset" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    const e1 = try data.createEntity();
+    const e2 = try data.createEntity();
+    try data.setSimulationMetadata(e1, .{ .tier = .dormant });
+    try data.setSimulationMetadata(e2, .{ .tier = .kinematic });
+    _ = data.destroyEntity(e0); // was cognition (default)
+    const e3 = try data.createEntity(); // reuses e0's slot at cognition
+    try data.setSimulationMetadata(e3, .{ .tier = .locomotion });
+
+    // The incrementally-maintained counters must equal a fresh live scan, and the
+    // public scope stats must agree cell-for-cell.
+    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+    const stats = data.simulationScopeStatsFullActive();
+    const scan = data.scanLiveTierCounts();
+    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.dormant)], stats.dormant_entities);
+    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.kinematic)], stats.kinematic_entities);
+    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.locomotion)], stats.locomotion_entities);
+    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.cognition)], stats.cognition_entities);
+    try std.testing.expectEqual(@as(usize, 3), stats.total_entities);
+
+    data.clearRetainingCapacity();
+    try std.testing.expectEqual([4]usize{ 0, 0, 0, 0 }, data.tier_counts);
+    try std.testing.expectEqual(@as(usize, 0), data.simulationScopeStatsFullActive().total_entities);
 }
 
 fn testBody(base: f32) MovementBody {

@@ -119,6 +119,29 @@ const no_component: u32 = 0;
 const diagonal_cost: u32 = 14;
 const cardinal_cost: u32 = 10;
 const unreachable_cost: u32 = std.math.maxInt(u32);
+// Sentinel for "no parent ref" in the abstract search's packed-ref parent column.
+const no_ref: usize = std.math.maxInt(usize);
+
+comptime {
+    // The abstract search identifies a node by a packed (level << 32) | local_node ref
+    // stored in a usize, so the target must have a 64-bit usize.
+    if (@bitSizeOf(usize) < 64) @compileError("pathfinding abstract node refs require a 64-bit usize");
+}
+
+// Packs a per-level abstract node identity. local is a node index within the level's
+// own NavLevelGraph.portals run, so packing keeps cross-level search keys distinct
+// without a global node numbering.
+fn packRef(level: u16, local: u32) usize {
+    return (@as(usize, level) << 32) | local;
+}
+
+fn refLevel(ref: usize) u16 {
+    return @intCast(ref >> 32);
+}
+
+fn refLocal(ref: usize) u32 {
+    return @truncate(ref);
+}
 
 pub const NavGridError = error{NavWorldTooLarge};
 
@@ -167,6 +190,24 @@ pub const GridCell = struct {
     x: i32,
     y: i32,
 };
+
+// Inclusive nav-cell rectangle (grid coordinates) recomputed by the incremental
+// nav remask for one dirty tile edit.
+const NavSpan = struct {
+    min_x: usize,
+    min_y: usize,
+    max_x: usize,
+    max_y: usize,
+};
+
+// Tile index containing a world coordinate, clamped to [0, count-1]. Negatives map
+// to 0; the float floor guards against the inf/NaN illegal-behavior trap.
+fn tileIndexClamped(value: f32, tile_size: f32, count: u16) u16 {
+    if (!(value > 0)) return 0;
+    const idx = math.floorToI32(value / tile_size);
+    const max_index: i32 = @as(i32, @intCast(count)) - 1;
+    return @intCast(std.math.clamp(idx, 0, max_index));
+}
 
 /// Goal-keyed query identity. nav_version invalidates old work on rebuild without
 /// pointer comparisons. The start cell is intentionally absent so a moving agent
@@ -354,19 +395,23 @@ const OpenNode = struct {
 const NavGrid = struct {
     // Static navigation grid for ONE level (Z-floor). Derived from DataSystem
     // collision rows (level 0 only) and this level's composed world mask. Owns
-    // component labels for cheap disconnected-goal rejection. All levels share the
-    // same dimensions/cell_size; the owning NavGraph holds one NavGrid per level.
+    // CHUNK-LOCAL component labels (a flood never crosses a chunk border) for cheap
+    // intra-chunk reachability; cross-chunk reachability is expressed only via the
+    // abstract portal/link graph. All levels share the same dimensions/cell_size and
+    // chunk_tiles; the owning NavGraph holds one NavGrid per level.
     level: u16 = 0,
     cell_size: f32 = default_cell_size,
     width: usize = 0,
     height: usize = 0,
+    // Abstract chunk side length (cells). Shared with the owning NavGraph so a flood
+    // and the graph agree on chunk boundaries.
+    chunk_tiles: u16 = default_nav_chunk_tiles,
     version: u32 = 1,
     blocked_count: usize = 0,
-    // Highest component label assigned by buildComponents (labels are dense 1..N on
-    // a world-bounded grid). Used to size the per-(level,component) portal index so
-    // abstract seeding scans only the start component's portals.
-    component_count: u32 = 0,
     blocked: std.ArrayList(bool) = .empty,
+    // Chunk-local component labels, encoded chunk_id * (chunk_tiles^2 + 1) + local
+    // (local 1..m within the chunk, 0 reserved for no_component). A chunk's labels
+    // depend only on its own mask, so recomputing a dirty chunk matches a full rebuild.
     components: std.ArrayList(u32) = .empty,
     component_queue: std.ArrayList(usize) = .empty,
 
@@ -386,12 +431,14 @@ const NavGrid = struct {
         width: usize,
         height: usize,
         cell_size: f32,
+        chunk_tiles: u16,
         version: u32,
     ) !void {
         self.level = level;
         self.cell_size = cell_size;
         self.width = width;
         self.height = height;
+        self.chunk_tiles = @max(@as(u16, 1), chunk_tiles);
         self.version = version;
         const cell_count = self.cellCount();
         try self.blocked.ensureTotalCapacity(allocator, cell_count);
@@ -535,39 +582,179 @@ const NavGrid = struct {
         self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
     }
 
-    // Re-derives this single level's blocked mask in place from authoritative static
-    // sources (level-0 collision bodies plus the world mask). Used by the incremental
-    // nav update: a single dirty world cell may overlap several nav cells via its
-    // rect, and a nav cell may be kept blocked by an unrelated overlapping rect, so a
-    // correct unblock requires recomposing this level's mask rather than clearing the
-    // edited cell alone. Bounded by ONE level's cells plus its bodies/sparse columns;
-    // never touches another level. Dimensions/version are retained.
-    fn remarkStaticMask(self: *NavGrid, data: *const DataSystem, world: ?*const WorldSystem) void {
-        @memset(self.blocked.items, false);
-        self.blocked_count = 0;
-        if (self.level == 0) self.markStaticBodies(data);
-        if (world) |world_system| self.markWorldObstacles(world_system);
+    // Re-derives this level's blocked mask for ONLY the nav cells overlapping the
+    // given dirty tile edits, instead of recomposing the whole level. Each affected
+    // nav cell is recomputed from authoritative static sources (the world mask for
+    // every tile overlapping the cell, plus level-0 collision bodies covering it), so
+    // a cell kept blocked by an unrelated overlapping rect stays blocked and a true
+    // unblock is detected — the correctness the whole-level recompose gave, but
+    // bounded by the edit footprint instead of the level's cell count. This is what
+    // keeps a dig off the O(cells) remask path. The mask must already be correct for
+    // unedited cells (it is: built fully at init, then only ever mutated here).
+    fn remarkStaticMaskCells(self: *NavGrid, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+        const world_system = world orelse return;
+        for (edits) |edit| {
+            if (edit.level != self.level) continue;
+            const span = self.navSpanForTile(world_system, edit) orelse continue;
+            var cy = span.min_y;
+            while (cy <= span.max_y) : (cy += 1) {
+                var cx = span.min_x;
+                while (cx <= span.max_x) : (cx += 1) {
+                    const index = cy * self.width + cx;
+                    self.setBlockedValue(index, self.navCellBlockedFromSources(data, world_system, cx, cy));
+                }
+            }
+        }
     }
 
+    // Nav-cell range overlapping an edited world tile's rect (clamped to the grid).
+    // The inverse of markWorldCell: which nav cells must be recomputed for this edit.
+    fn navSpanForTile(self: *const NavGrid, world: *const WorldSystem, edit: NavCellEdit) ?NavSpan {
+        const rect = world.cellRect(edit.x, edit.y) orelse return null;
+        const min_cell = self.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
+        const max_cell = self.worldToCellClamped(.{
+            .x = @max(rect.x, rect.x + rect.w - 0.001),
+            .y = @max(rect.y, rect.y + rect.h - 0.001),
+        });
+        return .{
+            .min_x = @intCast(@min(min_cell.x, max_cell.x)),
+            .min_y = @intCast(@min(min_cell.y, max_cell.y)),
+            .max_x = @intCast(@max(min_cell.x, max_cell.x)),
+            .max_y = @intCast(@max(min_cell.y, max_cell.y)),
+        };
+    }
+
+    // Recomputes one nav cell's blocked state from the authoritative static sources:
+    // any world tile overlapping the cell that blocks movement, or (level 0 only) any
+    // static collision body covering it. Mirrors what markWorldObstacles/
+    // markStaticBodies would set for this cell, so the incremental result is identical
+    // to a full recompose for the cell.
+    fn navCellBlockedFromSources(self: *const NavGrid, data: *const DataSystem, world: *const WorldSystem, ncx: usize, ncy: usize) bool {
+        if (@as(usize, self.level) < world.levelCount()) {
+            const min_x = @as(f32, @floatFromInt(ncx)) * self.cell_size;
+            const min_y = @as(f32, @floatFromInt(ncy)) * self.cell_size;
+            const tx0 = tileIndexClamped(min_x, world.tile_size, world.width);
+            const tx1 = tileIndexClamped(min_x + self.cell_size - 0.001, world.tile_size, world.width);
+            const ty0 = tileIndexClamped(min_y, world.tile_size, world.height);
+            const ty1 = tileIndexClamped(min_y + self.cell_size - 0.001, world.tile_size, world.height);
+            var ty = ty0;
+            while (ty <= ty1) : (ty += 1) {
+                var tx = tx0;
+                while (tx <= tx1) : (tx += 1) {
+                    if (world.levelBlocksMovement(self.level, tx, ty)) return true;
+                }
+            }
+        }
+        return self.level == 0 and self.staticBodyCoversNavCell(data, ncx, ncy);
+    }
+
+    // Whether any static collision body covers nav cell (ncx, ncy), using the same
+    // cell-coverage rule as markStaticBodies/markBlockedRectSimd so the incremental
+    // remask exactly matches a full mark. Bounded by the static-body count.
+    fn staticBodyCoversNavCell(self: *const NavGrid, data: *const DataSystem, ncx: usize, ncy: usize) bool {
+        const bounds = data.collisionBoundsSliceConst();
+        const responses = data.collisionResponseSliceConst();
+        for (responses.entities, 0..) |entity, response_index| {
+            if (responses.mobilities[response_index] != .static) continue;
+            const bounds_index = collisionBoundsIndex(bounds.entities, entity) orelse continue;
+            const body = data.movementBodyConst(entity) orelse continue;
+            const min_x = body.position.x + bounds.offset_x[bounds_index];
+            const min_y = body.position.y + bounds.offset_y[bounds_index];
+            const max_x = min_x + bounds.size_x[bounds_index];
+            const max_y = min_y + bounds.size_y[bounds_index];
+            const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
+            const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - 0.001), .y = @max(min_y, max_y - 0.001) });
+            const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
+            const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
+            const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
+            const cy1: usize = @intCast(@max(min_cell.y, max_cell.y));
+            if (ncx >= cx0 and ncx <= cx1 and ncy >= cy0 and ncy <= cy1) return true;
+        }
+        return false;
+    }
+
+    fn setBlockedValue(self: *NavGrid, index: usize, value: bool) void {
+        if (self.blocked.items[index] == value) return;
+        self.blocked.items[index] = value;
+        if (value) {
+            self.blocked_count += 1;
+        } else {
+            self.blocked_count -= 1;
+        }
+    }
+
+    fn chunksX(self: *const NavGrid) usize {
+        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    fn chunksY(self: *const NavGrid) usize {
+        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    fn chunkOfCell(self: *const NavGrid, index: usize) u32 {
+        const cx = (index % self.width) / self.chunk_tiles;
+        const cy = (index / self.width) / self.chunk_tiles;
+        return @intCast(cy * self.chunksX() + cx);
+    }
+
+    // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk, plus the
+    // reserved 0). Keeps encoded labels of different chunks disjoint.
+    fn chunkLabelStride(self: *const NavGrid) u64 {
+        const ct: u64 = self.chunk_tiles;
+        return ct * ct + 1;
+    }
+
+    // Labels every open cell with a CHUNK-LOCAL component id, chunk by chunk. Because a
+    // flood never leaves its chunk and labels encode the chunk, a full relabel produces
+    // the same labels the per-chunk incremental relabel does.
     fn buildComponents(self: *NavGrid) void {
         @memset(self.components.items, no_component);
-        self.component_queue.clearRetainingCapacity();
-
-        var next_component: u32 = 1;
-        for (self.blocked.items, 0..) |blocked, index| {
-            if (blocked or self.components.items[index] != no_component) continue;
-            self.floodComponent(index, next_component);
-            next_component +%= 1;
-            if (next_component == no_component) next_component = 1;
+        const chunk_count = self.chunksX() * self.chunksY();
+        var chunk_id: u32 = 0;
+        while (chunk_id < chunk_count) : (chunk_id += 1) {
+            self.recomputeChunkComponents(chunk_id);
         }
-        // next_component is one past the last label assigned (labels are 1..N).
-        self.component_count = next_component -% 1;
+    }
+
+    // Clears one chunk's cells to no_component and re-floods them with chunk-local
+    // labels. Idempotent and self-contained: a chunk's result depends only on its own
+    // mask, so the incremental update re-runs this for each dirty chunk.
+    fn recomputeChunkComponents(self: *NavGrid, chunk_id: u32) void {
+        const cx_count = self.chunksX();
+        const cx = chunk_id % cx_count;
+        const cy = chunk_id / cx_count;
+        const x0 = cx * self.chunk_tiles;
+        const y0 = cy * self.chunk_tiles;
+        const x1 = @min(x0 + self.chunk_tiles, self.width);
+        const y1 = @min(y0 + self.chunk_tiles, self.height);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                self.components.items[y * self.width + x] = no_component;
+            }
+        }
+        const base: u64 = @as(u64, chunk_id) * self.chunkLabelStride();
+        var local: u32 = 1;
+        y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                const index = y * self.width + x;
+                if (self.blocked.items[index] or self.components.items[index] != no_component) continue;
+                const label = base + local;
+                std.debug.assert(label < no_cell);
+                self.floodComponent(index, @intCast(label));
+                local += 1;
+            }
+        }
     }
 
     fn floodComponent(self: *NavGrid, start_index: usize, component: u32) void {
         self.component_queue.clearRetainingCapacity();
         self.component_queue.appendAssumeCapacity(start_index);
         self.components.items[start_index] = component;
+        const start_chunk = self.chunkOfCell(start_index);
         var read_index: usize = 0;
         while (read_index < self.component_queue.items.len) : (read_index += 1) {
             const current = self.component_queue.items[read_index];
@@ -576,6 +763,9 @@ const NavGrid = struct {
             for (neighbor_dirs) |dir| {
                 const next_cell = GridCell{ .x = current_x + dir.x, .y = current_y + dir.y };
                 const next_index = self.indexForCell(next_cell) orelse continue;
+                // Chunk-local: a flood stays inside the start cell's chunk; cross-chunk
+                // reachability is carried by the abstract portal graph instead.
+                if (self.chunkOfCell(next_index) != start_chunk) continue;
                 if (self.blocked.items[next_index] or self.components.items[next_index] != no_component) continue;
                 if (dir.diagonal and (self.isBlockedCell(.{ .x = current_x + dir.x, .y = current_y }) or self.isBlockedCell(.{ .x = current_x, .y = current_y + dir.y }))) {
                     continue;
@@ -586,6 +776,9 @@ const NavGrid = struct {
         }
     }
 
+    // True only when both cells share a chunk-local component, i.e. a local path
+    // exists entirely within one chunk. Cross-chunk reachability routes through the
+    // abstract graph, never through this predicate.
     fn connected(self: *const NavGrid, a: usize, b: usize) bool {
         return self.components.items[a] != no_component and self.components.items[a] == self.components.items[b];
     }
@@ -629,14 +822,66 @@ const PortalNode = struct {
     chunk: u32,
 };
 
-// One directed abstract edge in CSR form: edge_targets[i] is reached from the
-// node owning the offset window, at cost edge_costs[i]. crosses_level marks link
-// edges so cross-level traversal can be counted and so refinement knows the first
-// segment ends at a link endpoint rather than a same-level portal.
+// One directed intra-level abstract edge in CSR form: `target` is a LOCAL node index
+// on the SAME level as the owning node, reached at `cost`. Cross-level transitions are
+// NOT edges here — they live in NavGraph.link_edges so a level's CSR depends only on
+// that level's own mask.
 const AbstractEdge = struct {
     target: u32,
     cost: u32,
-    crosses_level: bool,
+};
+
+// A live cross-level (or same-level teleport) link, keyed by CELL on both ends so it
+// survives either endpoint level's node renumbering: the search resolves a cell to a
+// portal node through the partner level's cell_to_portal at query time. Emitted
+// (O(links)) only for links whose BOTH endpoints are open in their level masks.
+const LinkEdge = struct {
+    from_level: u16,
+    from_cell: u32,
+    to_level: u16,
+    to_cell: u32,
+    cost: u32,
+    bidirectional: bool,
+};
+
+// One level's chunk-portal abstract graph. Every node index is LEVEL-LOCAL: edges,
+// portal_order, cell_to_portal, and the compact label index all index this level's own
+// portals run. Rebuilding one level never renumbers or touches another level's
+// NavLevelGraph, so an underground edit leaves the surface graph byte-for-byte intact.
+const NavLevelGraph = struct {
+    portals: std.ArrayList(PortalNode) = .empty,
+    portal_offsets: std.ArrayList(u32) = .empty,
+    portal_edges: std.ArrayList(AbstractEdge) = .empty,
+    // cell_index -> local portal node (no_cell when the cell is not a portal). Sized to
+    // one level's cell_count.
+    cell_to_portal: std.ArrayList(u32) = .empty,
+    // Cell indices written into cell_to_portal this build, so the incremental rebuild
+    // clears only those entries instead of memsetting the whole level array.
+    portal_cells: std.ArrayList(u32) = .empty,
+    // Permutation of 0..portals.len ordered by (chunk-local label, cell); the compact
+    // label index returns contiguous sub-runs of it.
+    portal_order: std.ArrayList(u32) = .empty,
+    level_label_keys: std.ArrayList(u32) = .empty,
+    level_label_starts: std.ArrayList(u32) = .empty,
+    edge_scratch: std.ArrayList(EdgeScratch) = .empty,
+
+    const EdgeScratch = struct {
+        from: u32,
+        edge: AbstractEdge,
+    };
+
+    fn deinit(self: *NavLevelGraph, allocator: std.mem.Allocator) void {
+        self.edge_scratch.deinit(allocator);
+        self.level_label_starts.deinit(allocator);
+        self.level_label_keys.deinit(allocator);
+        self.portal_order.deinit(allocator);
+        self.portal_cells.deinit(allocator);
+        self.cell_to_portal.deinit(allocator);
+        self.portal_edges.deinit(allocator);
+        self.portal_offsets.deinit(allocator);
+        self.portals.deinit(allocator);
+        self.* = undefined;
+    }
 };
 
 // Per-level chunk-portal navigation graph plus inter-level link edges. Owns one
@@ -651,53 +896,26 @@ const NavGraph = struct {
     version: u32 = 1,
     levels: std.ArrayList(NavGrid) = .empty,
 
-    // Abstract nodes (portals) across all levels, with CSR adjacency.
-    portals: std.ArrayList(PortalNode) = .empty,
-    portal_offsets: std.ArrayList(u32) = .empty,
-    portal_edges: std.ArrayList(AbstractEdge) = .empty,
-    // Per-level index into a level-sorted portal-node ordering. A level's portal
-    // nodes occupy level_portal_order[level_portal_offsets[level]..[level+1]]. Within
-    // a level the run is further grouped by connected component, so a level's
-    // component-C portals occupy a contiguous sub-run, and abstract seeding scans only
-    // the START component's portals rather than every portal on the level.
-    level_portal_order: std.ArrayList(u32) = .empty,
-    level_portal_offsets: std.ArrayList(u32) = .empty,
-    // CSR over (level, component): component_portal_offsets is a flat
-    // [level_component_base[level] + component_count[level] + 1] array of begin/end
-    // boundaries into level_portal_order. level_component_base[level] is the start of
-    // a level's block (one entry per component plus a trailing terminator), so the
-    // portals of component C on a level are level_portal_order over
-    // [component_portal_offsets[base+C-1] .. component_portal_offsets[base+C]].
-    // Components are 1..N per level (dense), so the index by C is direct.
-    component_portal_offsets: std.ArrayList(u32) = .empty,
-    level_component_base: std.ArrayList(u32) = .empty,
-    // Scratch used only during rebuild to discover edges before CSR compaction.
-    edge_scratch: std.ArrayList(EdgeScratch) = .empty,
-    // Per-level fast lookup from cell index to portal node index (no_cell when the
-    // cell is not a portal). Sized levels x cell_count and rebuilt each build.
-    cell_to_portal: std.ArrayList(u32) = .empty,
-    // Persistent u32 scratch reused (non-overlapping) by the abstract-graph build
-    // helpers for the portal sort order and the CSR/level cursors. Persisting it (vs
-    // a per-build allocator.alloc) keeps both the init build and the incremental
+    // One per-level abstract graph, paired index-for-index with `levels`. A level's
+    // portal/edge/label arrays are rebuilt independently, so an edit on one level never
+    // touches another level's NavLevelGraph.
+    level_graphs: std.ArrayList(NavLevelGraph) = .empty,
+    // Global live cross-level link edges, rebuilt O(links) every build. Kept OUT of the
+    // per-level CSR so a level's graph depends only on that level's mask; a link edge
+    // references its partner by cell, resolved through the partner level's cell_to_portal
+    // at search time.
+    link_edges: std.ArrayList(LinkEdge) = .empty,
+    // Persistent u32 scratch reused (non-overlapping) by the per-level abstract-graph
+    // build helpers for the portal sort order and the CSR cursors. Persisting it (vs a
+    // per-build allocator.alloc) keeps both the init build and the incremental
     // `applyNavUpdates` rebuild allocation-free once the graph has been built once.
     build_u32_scratch: std.ArrayList(u32) = .empty,
 
-    const EdgeScratch = struct {
-        from: u32,
-        edge: AbstractEdge,
-    };
-
     fn deinit(self: *NavGraph) void {
         self.build_u32_scratch.deinit(self.allocator);
-        self.cell_to_portal.deinit(self.allocator);
-        self.edge_scratch.deinit(self.allocator);
-        self.level_component_base.deinit(self.allocator);
-        self.component_portal_offsets.deinit(self.allocator);
-        self.level_portal_offsets.deinit(self.allocator);
-        self.level_portal_order.deinit(self.allocator);
-        self.portal_edges.deinit(self.allocator);
-        self.portal_offsets.deinit(self.allocator);
-        self.portals.deinit(self.allocator);
+        self.link_edges.deinit(self.allocator);
+        for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
+        self.level_graphs.deinit(self.allocator);
         for (self.levels.items) |*level_grid| level_grid.deinit(self.allocator);
         self.levels.deinit(self.allocator);
         self.* = undefined;
@@ -705,6 +923,18 @@ const NavGraph = struct {
 
     fn levelCount(self: *const NavGraph) usize {
         return self.levels.items.len;
+    }
+
+    fn levelGraph(self: *const NavGraph, level: u16) ?*const NavLevelGraph {
+        if (@as(usize, level) >= self.level_graphs.items.len) return null;
+        return &self.level_graphs.items[level];
+    }
+
+    // Total portal nodes across all levels (diagnostic / test helper).
+    fn totalPortals(self: *const NavGraph) usize {
+        var count: usize = 0;
+        for (self.level_graphs.items) |*level_graph| count += level_graph.portals.items.len;
+        return count;
     }
 
     fn grid(self: *const NavGraph, level: u16) ?*const NavGrid {
@@ -760,10 +990,17 @@ const NavGraph = struct {
             var removed = self.levels.pop().?;
             removed.deinit(self.allocator);
         }
+        // Keep one NavLevelGraph per level, paired with `levels`.
+        try self.level_graphs.ensureTotalCapacity(self.allocator, level_count);
+        while (self.level_graphs.items.len < level_count) self.level_graphs.appendAssumeCapacity(.{});
+        while (self.level_graphs.items.len > level_count) {
+            var removed = self.level_graphs.pop().?;
+            removed.deinit(self.allocator);
+        }
 
         for (self.levels.items, 0..) |*level_grid, level_index| {
             const level: u16 = @intCast(level_index);
-            try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.version);
+            try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.chunk_tiles, self.version);
             // Only level 0 sources DataSystem collision bodies; the demo's
             // entities live on the ground floor. World mask drives every level.
             if (level == 0) level_grid.markStaticBodies(data);
@@ -771,16 +1008,23 @@ const NavGraph = struct {
             level_grid.buildComponents();
         }
 
-        try self.buildAbstractGraph(world);
+        // Build each level's abstract graph independently, then the global link edges.
+        for (0..self.levels.items.len) |level_index| {
+            try self.buildLevelGraph(@intCast(level_index), world, true);
+        }
+        try self.rebuildLinkEdges(world);
     }
 
     // Incrementally folds a batch of static-obstacle edits into the existing graph
-    // WITHOUT a whole-world rebuild. Re-derives the blocked mask + components of only
-    // the affected levels (the bounded per-affected-level fallback: true per-chunk
-    // portal/CSR surgery would require a per-chunk-addressable portal store, a larger
-    // redesign), rebuilds the abstract graph once (bounded by chunk borders), and
-    // bumps `version` once so every goal-keyed cache/pending entry keyed on the old
-    // version re-solves. Unaffected levels keep their masks and components untouched.
+    // WITHOUT a whole-world rebuild. Re-derives the blocked mask + chunk-local
+    // components of only the affected levels, then rebuilds ONLY those levels' abstract
+    // graphs (NavLevelGraph is per-level, so an underground edit leaves the surface
+    // graph byte-for-byte untouched), plus the small global link_edges array (O(links)).
+    // A link's liveness toggle is fully captured by rebuilding link_edges: a link
+    // endpoint's portal membership depends only on its OWN level's mask (liveness — both
+    // endpoints open — is enforced only when emitting link_edges), so the unedited
+    // partner level needs no rebuild. Bumps `version` once so every goal-keyed
+    // cache/pending entry keyed on the old version re-solves.
     // `affected_levels` is caller-owned pre-reserved scratch (sized to level count).
     // Allocation contract: this call is allocation-free at steady state — the abstract
     // buffers are reused at the init build's high-water capacity. A genuine topology
@@ -824,19 +1068,34 @@ const NavGraph = struct {
         if (affected_level_count == 0) return stats;
         stats.dirty_chunks = self.countDirtyChunks(world, edits);
 
-        // Past the threshold the per-level relabel degenerates to relabeling every
-        // level; flag it loudly rather than silently doing whole-world work.
+        // Re-derive the blocked mask of affected levels over the edit footprint only
+        // (already incremental). Past the threshold a level-count blowup degenerates to
+        // relabeling every level; flag it loudly rather than silently doing whole-world
+        // component work.
         const full_relabel = affected_level_count > full_relabel_level_threshold;
         for (self.levels.items, 0..) |*level_grid, level_index| {
             if (!full_relabel and !affected_levels.items[level_index]) continue;
-            level_grid.remarkStaticMask(data, world);
-            level_grid.buildComponents();
+            level_grid.remarkStaticMaskCells(data, world, edits);
+        }
+        if (full_relabel) {
+            for (self.levels.items) |*level_grid| level_grid.buildComponents();
+        } else {
+            // Chunk-local labels: only chunks whose cells changed need re-flooding. A
+            // tile rect can straddle a chunk border, so dirty chunks come from the full
+            // navSpanForTile rect, not just the edit origin.
+            self.recomputeDirtyChunks(world, edits);
         }
 
-        // The abstract graph is shared global structure (portals/CSR span all levels)
-        // and is bounded by chunk borders, not cells, so rebuilding it once after the
-        // affected-level masks change is the bounded incremental step.
-        try self.buildAbstractGraph(world);
+        // Rebuild ONLY the affected levels' abstract graphs (portal discovery stays full
+        // per level, bounded by that level's chunk borders). Unaffected levels keep their
+        // NavLevelGraph arrays untouched — the surface does zero work on an underground
+        // dig. The incremental cell_to_portal clear (reset_all = false) reuses retained
+        // capacity. The global link_edges array is rebuilt once.
+        for (self.levels.items, 0..) |_, level_index| {
+            if (!full_relabel and !affected_levels.items[level_index]) continue;
+            try self.buildLevelGraph(@intCast(level_index), world, false);
+        }
+        try self.rebuildLinkEdges(world);
 
         self.version +%= 1;
         if (self.version == 0) self.version = 1;
@@ -871,6 +1130,32 @@ const NavGraph = struct {
         return count;
     }
 
+    // Re-floods the chunk-local components of every chunk whose cells were touched by
+    // an edit's navSpanForTile rect. recomputeChunkComponents is idempotent, so an edit
+    // straddling a chunk border (or two edits sharing a chunk) re-flooding the same
+    // chunk twice is harmless. Bounded by the edit footprint, not the level cell count.
+    fn recomputeDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+        const world_system = world orelse return;
+        const ct: usize = self.chunk_tiles;
+        for (edits) |edit| {
+            if (@as(usize, edit.level) >= self.levels.items.len) continue;
+            const level_grid = &self.levels.items[edit.level];
+            const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
+            const cx_count = level_grid.chunksX();
+            const cx0 = span.min_x / ct;
+            const cx1 = span.max_x / ct;
+            const cy0 = span.min_y / ct;
+            const cy1 = span.max_y / ct;
+            var cy = cy0;
+            while (cy <= cy1) : (cy += 1) {
+                var cx = cx0;
+                while (cx <= cx1) : (cx += 1) {
+                    level_grid.recomputeChunkComponents(@intCast(cy * cx_count + cx));
+                }
+            }
+        }
+    }
+
     // Nav cell index of the nav cell containing a world tile's origin corner.
     fn navCellIndexForTile(self: *const NavGraph, world: *const WorldSystem, edit: NavCellEdit) ?usize {
         const level_grid = self.grid(edit.level) orelse return null;
@@ -895,37 +1180,66 @@ const NavGraph = struct {
         return @intCast(cy * self.chunksX() + cx);
     }
 
-    // Discovers portals on open chunk borders, builds CSR intra-level adjacency,
-    // then appends inter-level link edges. All work is bounded by chunk borders
-    // (O(levels x cells/chunk_tiles)) and the link count, not total cells.
-    fn buildAbstractGraph(self: *NavGraph, world: ?*const WorldSystem) !void {
-        self.portals.clearRetainingCapacity();
-        self.edge_scratch.clearRetainingCapacity();
-
+    // Rebuilds ONE level's abstract graph from its current mask/components, leaving every
+    // other level's NavLevelGraph untouched. reset_all memsets this level's cell_to_portal
+    // (full rebuild, where it may have just been resized); otherwise only the prior
+    // build's portal cells are cleared (incremental). Shared by the full rebuild and the
+    // per-level incremental path so both produce byte-identical structure.
+    fn buildLevelGraph(self: *NavGraph, level: u16, world: ?*const WorldSystem, reset_all: bool) !void {
         const cell_count = self.cellCount();
-        const total = cell_count * self.levels.items.len;
-        // Cell indices are stored as u32 with no_cell as the sentinel; the
-        // NavMemoryBudget gate enforces this long before the cap is reachable.
-        std.debug.assert(total < no_cell);
-        try self.cell_to_portal.ensureTotalCapacity(self.allocator, total);
-        self.cell_to_portal.items.len = total;
-        @memset(self.cell_to_portal.items, no_cell);
-
-        // Discover portal cells: a cell on a chunk border whose neighbor across
-        // the border is open too. Both border cells become portal nodes.
-        for (self.levels.items, 0..) |*level_grid, level_index| {
-            const level: u16 = @intCast(level_index);
-            try self.discoverLevelPortals(level_grid, level);
+        // cell_index is stored as u32 with no_cell as the not-a-portal sentinel; the
+        // NavMemoryBudget gate enforces cell_count < no_cell long before it is reachable.
+        std.debug.assert(cell_count < no_cell);
+        const lg = &self.level_graphs.items[level];
+        lg.portals.clearRetainingCapacity();
+        lg.edge_scratch.clearRetainingCapacity();
+        try lg.cell_to_portal.ensureTotalCapacity(self.allocator, cell_count);
+        lg.cell_to_portal.items.len = cell_count;
+        if (reset_all) {
+            @memset(lg.cell_to_portal.items, no_cell);
+        } else {
+            // Same size as the prior build: clear only the cells that build wrote.
+            for (lg.portal_cells.items) |cell| lg.cell_to_portal.items[cell] = no_cell;
         }
+        lg.portal_cells.clearRetainingCapacity();
 
-        // Intra-level edges: connect portals within the same chunk-pair span and
-        // portals reachable within a chunk via the level's connected components.
-        try self.buildIntraLevelEdges();
-        // Inter-level link edges from persistent world facts.
-        if (world) |world_system| try self.buildLinkEdges(world_system);
+        // Border portals + cross-border transition edges.
+        try self.discoverLevelPortals(level);
+        // Open link-endpoint cells on THIS level become portals too — membership depends
+        // only on this level's mask (link liveness is decided later in rebuildLinkEdges),
+        // so the intra-chunk pass can connect them to their chunk's local-component peers.
+        if (world) |world_system| try self.addLinkEndpointPortals(level, world_system);
+        // Intra-chunk edges among same-chunk same-local-component portals.
+        try self.buildIntraLevelEdges(level);
+        try self.compactEdges(level);
+        try self.indexPortalsByLevel(level);
+    }
 
-        try self.compactEdges();
-        try self.indexPortalsByLevel();
+    // Rebuilds the global live cross-level link edges (O(links)). A link is live only
+    // when BOTH endpoint cells are open in their level masks. A live link references its
+    // endpoints by CELL, resolved to portal nodes through the partner level's
+    // cell_to_portal at search time, so it never depends on either level's node numbering
+    // and a liveness toggle forces no per-level graph rebuild.
+    fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
+        self.link_edges.clearRetainingCapacity();
+        const world_system = world orelse return;
+        for (world_system.levelLinks()) |link| {
+            if (@as(usize, link.level_a) >= self.levels.items.len) continue;
+            if (@as(usize, link.level_b) >= self.levels.items.len) continue;
+            const grid_a = &self.levels.items[link.level_a];
+            const grid_b = &self.levels.items[link.level_b];
+            const cell_a = grid_a.indexForCell(.{ .x = link.cell_a.x, .y = link.cell_a.y }) orelse continue;
+            const cell_b = grid_b.indexForCell(.{ .x = link.cell_b.x, .y = link.cell_b.y }) orelse continue;
+            if (grid_a.blocked.items[cell_a] or grid_b.blocked.items[cell_b]) continue;
+            try self.link_edges.append(self.allocator, .{
+                .from_level = link.level_a,
+                .from_cell = @intCast(cell_a),
+                .to_level = link.level_b,
+                .to_cell = @intCast(cell_b),
+                .cost = link.traversal_cost +| inter_level_penalty,
+                .bidirectional = link.bidirectional,
+            });
+        }
     }
 
     // Returns a persistent u32 scratch slice of `len`, growing the backing buffer only
@@ -937,108 +1251,62 @@ const NavGraph = struct {
         return self.build_u32_scratch.items;
     }
 
-    // Builds the per-level portal index (level_portal_order grouped by level, then by
-    // connected component within each level) plus the (level, component) CSR so
-    // abstract seeding scans only the START component's portals on the start level,
-    // not every portal on the level or across all levels. Runs after all
-    // portals (including late link endpoints) are appended.
-    fn indexPortalsByLevel(self: *NavGraph) !void {
-        const level_count = self.levels.items.len;
-        try self.level_portal_offsets.ensureTotalCapacity(self.allocator, level_count + 1);
-        self.level_portal_offsets.items.len = level_count + 1;
-        @memset(self.level_portal_offsets.items, 0);
-        for (self.portals.items) |portal| {
-            self.level_portal_offsets.items[@as(usize, portal.level) + 1] += 1;
-        }
-        for (1..level_count + 1) |i| {
-            self.level_portal_offsets.items[i] += self.level_portal_offsets.items[i - 1];
-        }
-        try self.level_portal_order.ensureTotalCapacity(self.allocator, self.portals.items.len);
-        self.level_portal_order.items.len = self.portals.items.len;
-        const cursor = try self.buildScratch(level_count);
-        for (0..level_count) |i| cursor[i] = self.level_portal_offsets.items[i];
-        for (self.portals.items, 0..) |portal, node_index| {
-            const level: usize = portal.level;
-            self.level_portal_order.items[cursor[level]] = @intCast(node_index);
-            cursor[level] += 1;
-        }
-
-        // Per-level base into the flat component CSR: each level contributes
-        // (component_count[level] + 1) offset entries (one begin boundary per
-        // component 1..N plus a trailing terminator). Component 0 (no_component) never
-        // holds a seedable portal, so component C indexes [base + C - 1 .. base + C].
-        try self.level_component_base.ensureTotalCapacity(self.allocator, level_count + 1);
-        self.level_component_base.items.len = level_count + 1;
-        self.level_component_base.items[0] = 0;
-        for (self.levels.items, 0..) |*level_grid, i| {
-            self.level_component_base.items[i + 1] =
-                self.level_component_base.items[i] + level_grid.component_count + 1;
-        }
-        const total_offsets = self.level_component_base.items[level_count];
-        try self.component_portal_offsets.ensureTotalCapacity(self.allocator, total_offsets);
-        self.component_portal_offsets.items.len = total_offsets;
-
-        // For each level, order its portal sub-run by component (an in-place sort over
-        // the level's slice of level_portal_order) and record each component's
-        // [begin, end). The sort keeps seeding's per-component scan contiguous; it is
-        // bounded by the level's portal count (chunk-border count), not by cells.
-        for (self.levels.items, 0..) |*level_grid, level_index| {
-            const level: u16 = @intCast(level_index);
-            const begin = self.level_portal_offsets.items[level];
-            const end = self.level_portal_offsets.items[@as(usize, level) + 1];
-            const base = self.level_component_base.items[level];
-            const slots = level_grid.component_count + 1; // entries this level owns
-            const offsets = self.component_portal_offsets.items[base .. base + slots];
-            const run = self.level_portal_order.items[begin..end];
-            const sort_ctx = PortalComponentSort{ .portals = self.portals.items, .components = level_grid.components.items };
-            std.sort.pdq(u32, run, sort_ctx, PortalComponentSort.lessThan);
-            // After the stable-ordered sort, fill each component's begin boundary by a
-            // single pass: offsets[c-1] is where component c starts (relative to the
-            // global level_portal_order). Components with no portal get an empty range
-            // (begin == end), which the seeding scan skips.
-            var cursor_pos: u32 = begin;
-            var component: u32 = 1;
-            // offsets are indexed 0..slots-1; offsets[c-1] = begin of component c,
-            // offsets[c] = end of component c (= begin of c+1).
-            while (component <= level_grid.component_count) : (component += 1) {
-                offsets[component - 1] = cursor_pos;
-                while (cursor_pos < end and
-                    level_grid.components.items[self.portals.items[run[cursor_pos - begin]].cell_index] == component)
-                {
-                    cursor_pos += 1;
-                }
+    // Builds one level's portal ordering (portal_order, a permutation of 0..portals.len
+    // sorted by chunk-local label then cell) plus the COMPACT label index (one (key,
+    // start) entry per distinct label that owns a portal), so abstract seeding scans only
+    // the start chunk's local-component portals. Bounded by the level's portal count.
+    fn indexPortalsByLevel(self: *NavGraph, level: u16) !void {
+        const lg = &self.level_graphs.items[level];
+        const level_grid = &self.levels.items[level];
+        const n = lg.portals.items.len;
+        try lg.portal_order.ensureTotalCapacity(self.allocator, n);
+        lg.portal_order.items.len = n;
+        for (0..n) |i| lg.portal_order.items[i] = @intCast(i);
+        const sort_ctx = PortalComponentSort{ .portals = lg.portals.items, .components = level_grid.components.items };
+        std.sort.pdq(u32, lg.portal_order.items, sort_ctx, PortalComponentSort.lessThan);
+        lg.level_label_keys.clearRetainingCapacity();
+        lg.level_label_starts.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < n) {
+            const label = level_grid.components.items[lg.portals.items[lg.portal_order.items[i]].cell_index];
+            try lg.level_label_keys.append(self.allocator, label);
+            try lg.level_label_starts.append(self.allocator, @intCast(i));
+            var j = i + 1;
+            while (j < n and level_grid.components.items[lg.portals.items[lg.portal_order.items[j]].cell_index] == label) {
+                j += 1;
             }
-            offsets[slots - 1] = cursor_pos; // trailing terminator (== end for present components)
+            i = j;
         }
     }
 
-    // Returns the portal node indices on `level` (membership in level_portal_order).
+    // Returns all local portal node indices on `level` (its portal_order permutation).
     fn levelPortals(self: *const NavGraph, level: u16) []const u32 {
-        if (@as(usize, level) + 1 >= self.level_portal_offsets.items.len) return &.{};
-        const begin = self.level_portal_offsets.items[level];
-        const end = self.level_portal_offsets.items[@as(usize, level) + 1];
-        return self.level_portal_order.items[begin..end];
+        const lg = self.levelGraph(level) orelse return &.{};
+        return lg.portal_order.items;
     }
 
-    // Returns the portal node indices on `level` that belong to connected `component`
-    // (a contiguous sub-run of levelPortals), so abstract seeding scans only the start
-    // component's portals. An out-of-range component yields an empty slice.
+    // Returns the LOCAL portal node indices on `level` owning chunk-local `component`
+    // (an encoded label), a contiguous sub-run of portal_order, so abstract seeding scans
+    // only the start chunk's local-component portals. A missing label yields an empty
+    // slice. Binary searches the level's compact key run.
     fn levelComponentPortals(self: *const NavGraph, level: u16, component: u32) []const u32 {
         if (component == no_component) return &.{};
-        if (@as(usize, level) + 1 >= self.level_component_base.items.len) return &.{};
-        const level_grid = &self.levels.items[level];
-        if (component > level_grid.component_count) return &.{};
-        const base = self.level_component_base.items[level];
-        const begin = self.component_portal_offsets.items[base + component - 1];
-        const end = self.component_portal_offsets.items[base + component];
-        return self.level_portal_order.items[begin..end];
+        const lg = self.levelGraph(level) orelse return &.{};
+        const keys = lg.level_label_keys.items;
+        const rel = std.sort.binarySearch(u32, keys, component, orderU32) orelse return &.{};
+        const start = lg.level_label_starts.items[rel];
+        const end = if (rel + 1 < keys.len)
+            lg.level_label_starts.items[rel + 1]
+        else
+            @as(u32, @intCast(lg.portal_order.items.len));
+        return lg.portal_order.items[start..end];
     }
 
-    // Discovers border portals and the direct cross-border transition edge between
-    // each open pair. The transition edge is what lets the abstract search step
-    // from one chunk into its neighbor; intra-chunk edges (built later) connect a
-    // chunk's portals to each other.
-    fn discoverLevelPortals(self: *NavGraph, level_grid: *const NavGrid, level: u16) !void {
+    // Discovers border portals and the direct cross-border transition edge between each
+    // open pair on `level`. The transition edge lets the abstract search step from one
+    // chunk into its neighbor; intra-chunk edges (built later) connect a chunk's portals.
+    fn discoverLevelPortals(self: *NavGraph, level: u16) !void {
+        const level_grid = &self.levels.items[level];
         const w = self.width;
         const h = self.height;
         const ct = self.chunk_tiles;
@@ -1071,137 +1339,121 @@ const NavGraph = struct {
         try self.addPortal(level, b);
         const node_a = self.portalIndex(level, a).?;
         const node_b = self.portalIndex(level, b).?;
-        try self.edge_scratch.append(self.allocator, .{
-            .from = node_a,
-            .edge = .{ .target = node_b, .cost = cardinal_cost, .crosses_level = false },
-        });
-        try self.edge_scratch.append(self.allocator, .{
-            .from = node_b,
-            .edge = .{ .target = node_a, .cost = cardinal_cost, .crosses_level = false },
-        });
+        const lg = &self.level_graphs.items[level];
+        try lg.edge_scratch.append(self.allocator, .{ .from = node_a, .edge = .{ .target = node_b, .cost = cardinal_cost } });
+        try lg.edge_scratch.append(self.allocator, .{ .from = node_b, .edge = .{ .target = node_a, .cost = cardinal_cost } });
     }
 
     fn addPortal(self: *NavGraph, level: u16, cell_index: u32) !void {
-        const lookup = @as(usize, level) * self.cellCount() + cell_index;
-        if (self.cell_to_portal.items[lookup] != no_cell) return;
-        const node_index: u32 = @intCast(self.portals.items.len);
-        try self.portals.append(self.allocator, .{
+        const lg = &self.level_graphs.items[level];
+        if (lg.cell_to_portal.items[cell_index] != no_cell) return;
+        const node_index: u32 = @intCast(lg.portals.items.len);
+        try lg.portals.append(self.allocator, .{
             .level = level,
             .cell_index = cell_index,
             .chunk = self.chunkOf(cell_index),
         });
-        self.cell_to_portal.items[lookup] = node_index;
+        lg.cell_to_portal.items[cell_index] = node_index;
+        // Record so the incremental rebuild can clear exactly this cell.
+        try lg.portal_cells.append(self.allocator, cell_index);
     }
 
-    // Connects portals that share a chunk and connected component on the same
-    // level, using octile distance as abstract cost. Grouping by chunk keeps this
-    // O(portals-per-chunk^2 x chunks): portal counts scale with chunk perimeter,
-    // not cells, so the build stays bounded independent of total cell count.
-    fn buildIntraLevelEdges(self: *NavGraph) !void {
-        // Order portal indices by (level, chunk) so each chunk's portals form a
-        // contiguous run we can connect pairwise without a global quadratic scan.
-        const order = try self.buildScratch(self.portals.items.len);
-        for (0..self.portals.items.len) |i| order[i] = @intCast(i);
-        std.sort.pdq(u32, order, self.portals.items, portalChunkLessThan);
+    // Adds open link-endpoint cells on `level` as portals. Membership depends only on
+    // this level's mask (NOT the partner's), so a link going live/dead never changes
+    // another level's portal set: the partner's endpoint stays a portal and the live
+    // link edge lives in the global link_edges array.
+    fn addLinkEndpointPortals(self: *NavGraph, level: u16, world: *const WorldSystem) !void {
+        const level_grid = &self.levels.items[level];
+        for (world.levelLinks()) |link| {
+            if (link.level_a == level) {
+                if (level_grid.indexForCell(.{ .x = link.cell_a.x, .y = link.cell_a.y })) |cell| {
+                    if (!level_grid.blocked.items[cell]) try self.addPortal(level, @intCast(cell));
+                }
+            }
+            if (link.level_b == level) {
+                if (level_grid.indexForCell(.{ .x = link.cell_b.x, .y = link.cell_b.y })) |cell| {
+                    if (!level_grid.blocked.items[cell]) try self.addPortal(level, @intCast(cell));
+                }
+            }
+        }
+    }
+
+    // Connects portals that share a chunk and chunk-local component on `level`, using
+    // octile distance as abstract cost. Grouping by chunk keeps this
+    // O(portals-per-chunk^2 x chunks): portal counts scale with chunk perimeter, not
+    // cells, so the build stays bounded independent of total cell count.
+    fn buildIntraLevelEdges(self: *NavGraph, level: u16) !void {
+        const lg = &self.level_graphs.items[level];
+        // Order portal indices by chunk so each chunk's portals form a contiguous run we
+        // can connect pairwise without a global quadratic scan.
+        const order = try self.buildScratch(lg.portals.items.len);
+        for (0..lg.portals.items.len) |i| order[i] = @intCast(i);
+        std.sort.pdq(u32, order, lg.portals.items, portalChunkLessThan);
 
         var i: usize = 0;
         while (i < order.len) {
-            const head = self.portals.items[order[i]];
+            const head = lg.portals.items[order[i]];
             var j = i + 1;
             while (j < order.len) {
-                const next = self.portals.items[order[j]];
-                if (next.level != head.level or next.chunk != head.chunk) break;
+                const next = lg.portals.items[order[j]];
+                if (next.chunk != head.chunk) break;
                 j += 1;
             }
-            try self.connectChunkPortals(order[i..j]);
+            try self.connectChunkPortals(level, order[i..j]);
             i = j;
         }
     }
 
-    fn connectChunkPortals(self: *NavGraph, group: []const u32) !void {
+    fn connectChunkPortals(self: *NavGraph, level: u16, group: []const u32) !void {
+        const lg = &self.level_graphs.items[level];
+        const level_grid = &self.levels.items[level];
         for (group, 0..) |from_node, a| {
-            const from = self.portals.items[from_node];
-            const level_grid = &self.levels.items[from.level];
+            const from = lg.portals.items[from_node];
             const from_component = level_grid.components.items[from.cell_index];
             if (from_component == no_component) continue;
             for (group[a + 1 ..]) |to_node| {
-                const to = self.portals.items[to_node];
+                const to = lg.portals.items[to_node];
                 if (level_grid.components.items[to.cell_index] != from_component) continue;
                 const cost = octileCells(self.width, from.cell_index, to.cell_index);
-                try self.edge_scratch.append(self.allocator, .{
-                    .from = from_node,
-                    .edge = .{ .target = to_node, .cost = cost, .crosses_level = false },
-                });
-                try self.edge_scratch.append(self.allocator, .{
-                    .from = to_node,
-                    .edge = .{ .target = from_node, .cost = cost, .crosses_level = false },
-                });
+                try lg.edge_scratch.append(self.allocator, .{ .from = from_node, .edge = .{ .target = to_node, .cost = cost } });
+                try lg.edge_scratch.append(self.allocator, .{ .from = to_node, .edge = .{ .target = from_node, .cost = cost } });
             }
         }
     }
 
-    // Resolves persistent LevelLink facts into abstract edges. A link is live only
-    // when both endpoint cells are open in their levels' current masks. Each
-    // endpoint cell becomes a portal node (if it was not already a border portal)
-    // so the abstract search can enter/leave the link.
-    fn buildLinkEdges(self: *NavGraph, world: *const WorldSystem) !void {
-        for (world.levelLinks()) |link| {
-            if (@as(usize, link.level_a) >= self.levels.items.len) continue;
-            if (@as(usize, link.level_b) >= self.levels.items.len) continue;
-            const grid_a = &self.levels.items[link.level_a];
-            const grid_b = &self.levels.items[link.level_b];
-            const cell_a = grid_a.indexForCell(.{ .x = link.cell_a.x, .y = link.cell_a.y }) orelse continue;
-            const cell_b = grid_b.indexForCell(.{ .x = link.cell_b.x, .y = link.cell_b.y }) orelse continue;
-            // Live only if both endpoints are open in their level masks.
-            if (grid_a.blocked.items[cell_a] or grid_b.blocked.items[cell_b]) continue;
-            try self.addPortal(link.level_a, @intCast(cell_a));
-            try self.addPortal(link.level_b, @intCast(cell_b));
-            const node_a = self.portalIndex(link.level_a, @intCast(cell_a)).?;
-            const node_b = self.portalIndex(link.level_b, @intCast(cell_b)).?;
-            const cost = link.traversal_cost +| inter_level_penalty;
-            try self.edge_scratch.append(self.allocator, .{
-                .from = node_a,
-                .edge = .{ .target = node_b, .cost = cost, .crosses_level = true },
-            });
-            if (link.bidirectional) {
-                try self.edge_scratch.append(self.allocator, .{
-                    .from = node_b,
-                    .edge = .{ .target = node_a, .cost = cost, .crosses_level = true },
-                });
-            }
-        }
-    }
-
-    // Compacts edge_scratch into CSR (portal_offsets/portal_edges). A new portal
-    // appended by buildLinkEdges after intra-level edges still gets a valid (empty
-    // or link-only) adjacency window because offsets cover every portal.
-    fn compactEdges(self: *NavGraph) !void {
-        const node_count = self.portals.items.len;
-        try self.portal_offsets.ensureTotalCapacity(self.allocator, node_count + 1);
-        self.portal_offsets.items.len = node_count + 1;
-        @memset(self.portal_offsets.items, 0);
-        for (self.edge_scratch.items) |scratch| {
-            self.portal_offsets.items[scratch.from + 1] += 1;
+    // Compacts one level's edge_scratch into its CSR (portal_offsets/portal_edges). Every
+    // portal gets a valid (possibly empty) adjacency window because offsets cover every
+    // local portal node.
+    fn compactEdges(self: *NavGraph, level: u16) !void {
+        const lg = &self.level_graphs.items[level];
+        const node_count = lg.portals.items.len;
+        try lg.portal_offsets.ensureTotalCapacity(self.allocator, node_count + 1);
+        lg.portal_offsets.items.len = node_count + 1;
+        @memset(lg.portal_offsets.items, 0);
+        for (lg.edge_scratch.items) |scratch| {
+            lg.portal_offsets.items[scratch.from + 1] += 1;
         }
         for (1..node_count + 1) |i| {
-            self.portal_offsets.items[i] += self.portal_offsets.items[i - 1];
+            lg.portal_offsets.items[i] += lg.portal_offsets.items[i - 1];
         }
-        const edge_count = self.edge_scratch.items.len;
-        try self.portal_edges.ensureTotalCapacity(self.allocator, edge_count);
-        self.portal_edges.items.len = edge_count;
+        const edge_count = lg.edge_scratch.items.len;
+        try lg.portal_edges.ensureTotalCapacity(self.allocator, edge_count);
+        lg.portal_edges.items.len = edge_count;
         const cursor = try self.buildScratch(node_count);
-        for (0..node_count) |i| cursor[i] = self.portal_offsets.items[i];
-        for (self.edge_scratch.items) |scratch| {
+        for (0..node_count) |i| cursor[i] = lg.portal_offsets.items[i];
+        for (lg.edge_scratch.items) |scratch| {
             const slot = cursor[scratch.from];
-            self.portal_edges.items[slot] = scratch.edge;
+            lg.portal_edges.items[slot] = scratch.edge;
             cursor[scratch.from] = slot + 1;
         }
     }
 
+    // Local portal node index for a cell on `level`, or null when the cell is not a
+    // portal. Indexes that level's own cell_to_portal directly.
     fn portalIndex(self: *const NavGraph, level: u16, cell_index: u32) ?u32 {
-        if (@as(usize, level) >= self.levels.items.len) return null;
-        const lookup = @as(usize, level) * self.cellCount() + cell_index;
-        const value = self.cell_to_portal.items[lookup];
+        const lg = self.levelGraph(level) orelse return null;
+        if (cell_index >= lg.cell_to_portal.items.len) return null;
+        const value = lg.cell_to_portal.items[cell_index];
         return if (value == no_cell) null else value;
     }
 
@@ -1217,8 +1469,8 @@ const NavGraph = struct {
     }
 };
 
-// Orders portal node indices by (level, chunk) so each chunk's portals form a
-// contiguous run. Ties break on cell index for a deterministic build.
+// Orders a level's portal node indices by chunk (level is constant within one level's
+// run) so each chunk's portals form a contiguous run. Ties break on cell index.
 fn portalChunkLessThan(portals: []const PortalNode, lhs: u32, rhs: u32) bool {
     const a = portals[lhs];
     const b = portals[rhs];
@@ -1227,8 +1479,13 @@ fn portalChunkLessThan(portals: []const PortalNode, lhs: u32, rhs: u32) bool {
     return a.cell_index < b.cell_index;
 }
 
-// Orders a level's portal node indices by connected component (then cell index for a
-// deterministic build) so each component's portals form a contiguous sub-run that
+// Comparator for binarySearch over a level's sorted compact label keys.
+fn orderU32(key: u32, item: u32) std.math.Order {
+    return std.math.order(key, item);
+}
+
+// Orders a level's portal node indices by chunk-local component label (then cell index
+// for a deterministic build) so each label's portals form a contiguous sub-run that
 // abstract seeding can scan in isolation.
 const PortalComponentSort = struct {
     portals: []const PortalNode,
@@ -1349,15 +1606,15 @@ const NavMemoryBudget = struct {
         const portals = levels *| border_cells_per_level +| 2 *| self.link_count;
         // CSR edges scale with portals times a small abstract degree, not with cells.
         const edges = portals *| abstract_degree;
+        // Each level owns a cell_count-sized cell_to_portal, summing to levels*cells.
         const cell_to_portal_bytes = levels *| cell_count *| @sizeOf(u32);
-        // portals buffer + level_portal_order (u32) + portal_offsets (u32) + build
-        // scratch (u32).
-        const portal_buffers = portals *| (portal_node_bytes +| 3 *| @sizeOf(u32));
+        // Per-portal aux buffers (summed across levels): portals buffer + portal_order
+        // (u32) + portal_offsets (u32) + portal_cells (u32) + shared build scratch (u32).
+        const portal_buffers = portals *| (portal_node_bytes +| 4 *| @sizeOf(u32));
         const edge_buffers = edges *| (edge_scratch_bytes +| portal_edge_bytes);
-        // (level, component) seeding CSR: component_portal_offsets has at most
-        // one entry per portal plus per-level terminators; level_component_base has one
-        // entry per level. Bounded by portals + levels, never by cells.
-        const component_index_bytes = (portals +| levels) *| @sizeOf(u32) +|
+        // Compact per-level label index: level_label_keys + level_label_starts each hold
+        // at most one entry per portal. Bounded by portals + levels, never by cells.
+        const component_index_bytes = (2 *| portals +| levels) *| @sizeOf(u32) +|
             (levels +| 1) *| @sizeOf(u32);
         return cell_to_portal_bytes +| portal_buffers +| edge_buffers +| component_index_bytes;
     }
@@ -1903,29 +2160,34 @@ const GroupField = struct {
     }
 };
 
-// Budget-bounded A* over abstract portal nodes. Node g-cost/parent/closed use a
-// node->slot open-addressed hash with generation stamps, so memory is
-// O(max_abstract_nodes), independent of the portal count. `corridor` holds the
-// ordered portal node indices of the chosen route (root start-level portal -> goal
-// portal); `corridor_link[i]` marks whether corridor[i] was reached from corridor
-// [i-1] over an inter-level/teleport LINK edge (a discrete jump) rather than an
-// intra-level edge (walkable by local A*). The stitcher refines each non-link span
-// with local A* and treats each link span as a single jump.
+// Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | local
+// ref. Node g-cost/parent/closed/via_link use a ref->slot open-addressed hash with
+// generation stamps, so memory is O(max_abstract_nodes), independent of the portal
+// count. `corridor` holds the ordered packed refs of the chosen route (root start-level
+// portal -> goal portal); `corridor_link[i]` marks whether corridor[i] was reached from
+// corridor[i-1] over a cross-level/teleport LINK edge (a discrete jump) rather than an
+// intra-level edge (walkable by local A*). The stitcher refines each non-link span with
+// local A* and treats each link span as a single jump.
 const AbstractScratch = struct {
     generation: u32 = 1,
     slot_capacity: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
-    slot_node: std.ArrayList(u32) = .empty,
+    // Node identity is a packed (level << 32) | local ref (usize); slot_parent holds the
+    // parent ref or no_ref. slot_via_link records whether the slot's best parent edge was
+    // a cross-level link (so buildCorridor can mark link transitions without a CSR scan).
+    slot_node: std.ArrayList(usize) = .empty,
     slot_g: std.ArrayList(u32) = .empty,
-    slot_parent: std.ArrayList(u32) = .empty,
+    slot_parent: std.ArrayList(usize) = .empty,
     slot_closed: std.ArrayList(bool) = .empty,
     slot_stamp: std.ArrayList(u32) = .empty,
-    corridor: std.ArrayList(u32) = .empty,
+    slot_via_link: std.ArrayList(bool) = .empty,
+    corridor: std.ArrayList(usize) = .empty,
     corridor_link: std.ArrayList(bool) = .empty,
 
     fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
         self.corridor_link.deinit(allocator);
         self.corridor.deinit(allocator);
+        self.slot_via_link.deinit(allocator);
         self.slot_stamp.deinit(allocator);
         self.slot_closed.deinit(allocator);
         self.slot_parent.deinit(allocator);
@@ -1944,6 +2206,7 @@ const AbstractScratch = struct {
         try self.slot_parent.ensureTotalCapacity(allocator, slot_capacity);
         try self.slot_closed.ensureTotalCapacity(allocator, slot_capacity);
         try self.slot_stamp.ensureTotalCapacity(allocator, slot_capacity);
+        try self.slot_via_link.ensureTotalCapacity(allocator, slot_capacity);
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
         self.slot_node.items.len = slot_capacity;
@@ -1951,6 +2214,7 @@ const AbstractScratch = struct {
         self.slot_parent.items.len = slot_capacity;
         self.slot_closed.items.len = slot_capacity;
         self.slot_stamp.items.len = slot_capacity;
+        self.slot_via_link.items.len = slot_capacity;
         @memset(self.slot_stamp.items, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
@@ -1967,7 +2231,7 @@ const AbstractScratch = struct {
         }
     }
 
-    fn slotFor(self: *AbstractScratch, node: u32) ?usize {
+    fn slotFor(self: *AbstractScratch, node: usize) ?usize {
         const capacity = self.slot_capacity;
         if (capacity == 0) return null;
         const start = hashUsize(node) % capacity;
@@ -1980,8 +2244,9 @@ const AbstractScratch = struct {
             self.slot_stamp.items[index] = self.generation;
             self.slot_node.items[index] = node;
             self.slot_g.items[index] = unreachable_cost;
-            self.slot_parent.items[index] = no_cell;
+            self.slot_parent.items[index] = no_ref;
             self.slot_closed.items[index] = false;
+            self.slot_via_link.items[index] = false;
             return index;
         }
         return null;
@@ -2361,9 +2626,9 @@ pub const PathfindingSystem = struct {
             .link_count = link_count,
         };
         try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget);
-        // The init buildAbstractGraph (inside rebuild) grows the portal/edge buffers to
-        // their real size; clearRetainingCapacity keeps that high-water mark. A later
-        // incremental applyNavUpdates within the high-water mark allocates nothing; a
+        // The init per-level builds (inside rebuild) grow each level's portal/edge
+        // buffers to their real size; clearRetainingCapacity keeps that high-water mark.
+        // A later incremental applyNavUpdates within the high-water mark allocates nothing; a
         // genuine topology expansion past it does one bounded amortized growth (a cold,
         // event-triggered main-thread path — see applyNavUpdates). No O(cells)
         // pre-reserve, so large SPARSE worlds (few portals) stay cheap and pass the gate.
@@ -3102,8 +3367,8 @@ fn stitchCorridor(
 
     var prev_level = request.start_level;
     var prev_cell: usize = start_index;
-    for (scratch.abstract.corridor.items, 0..) |node, i| {
-        const portal = graph.portals.items[node];
+    for (scratch.abstract.corridor.items, 0..) |ref, i| {
+        const portal = graph.level_graphs.items[refLevel(ref)].portals.items[refLocal(ref)];
         // The first corridor portal (i == 0) is on the start level and reached from
         // the start cell by a walkable span; later portals follow corridor_link.
         const is_link = i != 0 and scratch.abstract.corridor_link.items[i];
@@ -3167,12 +3432,37 @@ const AbstractResult = union(enum) {
     none,
 };
 
-// Runs abstract A* over portal/link nodes. On success it writes the ordered corridor
-// of portal node indices (root start-level portal -> goal-level portal) into
-// scratch.abstract.corridor for the stitcher to refine, and reports whether the
-// corridor crosses a level. Per-query work is bounded by the abstract node budget;
-// seeding scans only the start level's portals via the per-level portal index, so it
-// stays bounded independent of total cell count and total portals on other levels.
+// Relaxes one abstract neighbor `neighbor_ref` reached from `parent_ref` at `cost`,
+// recording whether the relaxing edge was a cross-level link. Returns false on
+// saturation (the bounded slot table or open heap is full).
+fn relaxAbstractNode(
+    abstract: *AbstractScratch,
+    parent_ref: usize,
+    parent_g: u32,
+    neighbor_ref: usize,
+    cost: u32,
+    via_link: bool,
+    h: u32,
+) bool {
+    const slot = abstract.slotFor(neighbor_ref) orelse return false;
+    if (abstract.slot_closed.items[slot]) return true;
+    const candidate = parent_g +| cost;
+    if (candidate >= abstract.slot_g.items[slot]) return true;
+    abstract.slot_g.items[slot] = candidate;
+    abstract.slot_parent.items[slot] = parent_ref;
+    abstract.slot_via_link.items[slot] = via_link;
+    if (abstract.open.items.len >= abstract.open.capacity) return false;
+    abstract.open.appendAssumeCapacity(.{ .index = neighbor_ref, .f = candidate +| h, .h = h });
+    siftUp(abstract.open.items, abstract.open.items.len - 1);
+    return true;
+}
+
+// Runs abstract A* over per-level portal CSRs plus the global link_edges. Node identity
+// is a packed (level << 32) | local ref. On success it writes the ordered corridor of
+// refs (root start-level portal -> goal-level portal) into scratch.abstract.corridor for
+// the stitcher to refine, and reports whether the corridor crosses a level. Per-query
+// work is bounded by the abstract node budget; seeding scans only the start chunk's
+// local-component portals, so it stays bounded independent of total cell count.
 fn abstractCorridor(
     graph: *const NavGraph,
     scratch: *SearchScratch,
@@ -3186,22 +3476,22 @@ fn abstractCorridor(
     const abstract = &scratch.abstract;
     abstract.reset();
 
-    // Seed the open set with the start cell's component portals on the start level,
-    // costed by octile distance from the start. The (level, component) portal index
-    // yields only that component's portals, so seeding never scans unreachable
-    // components.
+    // Seed the open set with the start cell's chunk-local-component portals on the start
+    // level, costed by octile distance from the start.
     const start_component = start_grid.components.items[start_index];
     if (start_component == no_component) return .none;
     var seeded: usize = 0;
-    for (graph.levelComponentPortals(start_level, start_component)) |node_index| {
-        const portal = graph.portals.items[node_index];
-        const slot = abstract.slotFor(node_index) orelse return .saturated;
+    for (graph.levelComponentPortals(start_level, start_component)) |local_node| {
+        const portal = graph.level_graphs.items[start_level].portals.items[local_node];
+        const ref = packRef(start_level, local_node);
+        const slot = abstract.slotFor(ref) orelse return .saturated;
         const g = octileCells(graph.width, @intCast(start_index), portal.cell_index);
         abstract.slot_g.items[slot] = g;
-        abstract.slot_parent.items[slot] = no_cell;
+        abstract.slot_parent.items[slot] = no_ref;
+        abstract.slot_via_link.items[slot] = false;
         if (abstract.open.items.len >= abstract.open.capacity) return .saturated;
         const h = octileCells(graph.width, portal.cell_index, @intCast(goal_index));
-        abstract.open.appendAssumeCapacity(.{ .index = node_index, .f = g + h, .h = h });
+        abstract.open.appendAssumeCapacity(.{ .index = ref, .f = g + h, .h = h });
         siftUp(abstract.open.items, abstract.open.items.len - 1);
         seeded += 1;
     }
@@ -3211,88 +3501,88 @@ fn abstractCorridor(
 
     while (abstract.open.items.len != 0) {
         const current = popHeap(&abstract.open);
-        const node_index: u32 = @intCast(current.index);
-        const current_slot = abstract.slotFor(node_index) orelse return .saturated;
+        const current_ref = current.index;
+        const current_slot = abstract.slotFor(current_ref) orelse return .saturated;
         if (abstract.slot_closed.items[current_slot]) continue;
         abstract.slot_closed.items[current_slot] = true;
 
-        const portal = graph.portals.items[node_index];
-        // Goal reached: this portal is on the goal level and shares the goal's
+        const level = refLevel(current_ref);
+        const local = refLocal(current_ref);
+        const lg = &graph.level_graphs.items[level];
+        const portal = lg.portals.items[local];
+        // Goal reached: this portal is on the goal level and shares the goal's chunk-local
         // component, so the local refiner can finish from here.
-        if (portal.level == goal_level and goal_component != no_component and
+        if (level == goal_level and goal_component != no_component and
             goal_grid.components.items[portal.cell_index] == goal_component)
         {
-            if (!buildCorridor(graph, abstract, node_index, start_level)) return .none;
+            if (!buildCorridor(abstract, current_ref, start_level)) return .none;
             return .{ .found = .{ .crosses_level = start_level != goal_level } };
         }
 
-        const begin = graph.portal_offsets.items[node_index];
-        const end = graph.portal_offsets.items[node_index + 1];
         const current_g = abstract.slot_g.items[current_slot];
-        for (graph.portal_edges.items[begin..end]) |edge| {
-            const next_slot = abstract.slotFor(edge.target) orelse return .saturated;
-            if (abstract.slot_closed.items[next_slot]) continue;
-            const candidate = current_g +| edge.cost;
-            if (candidate >= abstract.slot_g.items[next_slot]) continue;
-            abstract.slot_g.items[next_slot] = candidate;
-            abstract.slot_parent.items[next_slot] = node_index;
-            const target_portal = graph.portals.items[edge.target];
-            // Cross-level (non-goal) hops use h=0: admissible but Dijkstra-like
-            // across non-goal levels (no cell coordinate is comparable to the goal
-            // until the search reaches a goal-level portal), so it never overestimates.
-            const h = if (target_portal.level == goal_level)
+        // Intra-level CSR edges (target is a local node on the same level).
+        const begin = lg.portal_offsets.items[local];
+        const end = lg.portal_offsets.items[local + 1];
+        for (lg.portal_edges.items[begin..end]) |edge| {
+            const target_portal = lg.portals.items[edge.target];
+            // Same-level non-goal hops still have a comparable goal cell when level ==
+            // goal_level; otherwise h=0 keeps the estimate admissible.
+            const h = if (level == goal_level)
                 octileCells(graph.width, target_portal.cell_index, @intCast(goal_index))
             else
                 0;
-            if (abstract.open.items.len >= abstract.open.capacity) return .saturated;
-            abstract.open.appendAssumeCapacity(.{ .index = edge.target, .f = candidate +| h, .h = h });
-            siftUp(abstract.open.items, abstract.open.items.len - 1);
+            if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(level, edge.target), edge.cost, false, h)) return .saturated;
+        }
+        // Cross-level link edges: resolve the partner endpoint cell to its portal node on
+        // the partner level through that level's cell_to_portal. h=0 unless the partner is
+        // on the goal level (no cell coordinate is comparable to the goal until then).
+        for (graph.link_edges.items) |link| {
+            if (link.from_level == level and link.from_cell == portal.cell_index) {
+                const to_local = graph.level_graphs.items[link.to_level].cell_to_portal.items[link.to_cell];
+                if (to_local != no_cell) {
+                    const h = if (link.to_level == goal_level) octileCells(graph.width, link.to_cell, @intCast(goal_index)) else 0;
+                    if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.to_level, to_local), link.cost, true, h)) return .saturated;
+                }
+            }
+            if (link.bidirectional and link.to_level == level and link.to_cell == portal.cell_index) {
+                const from_local = graph.level_graphs.items[link.from_level].cell_to_portal.items[link.from_cell];
+                if (from_local != no_cell) {
+                    const h = if (link.from_level == goal_level) octileCells(graph.width, link.from_cell, @intCast(goal_index)) else 0;
+                    if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.from_level, from_local), link.cost, true, h)) return .saturated;
+                }
+            }
         }
     }
     return .none;
 }
 
-// Walks the abstract parent chain from the reached goal-level portal back to its
-// seeded start-level root, writing the ordered portal node sequence (root -> goal
-// portal) into abstract.corridor. Returns true when the corridor is well-formed
-// (its root is a start-level portal). O(hops), not O(cells).
-fn buildCorridor(graph: *const NavGraph, abstract: *AbstractScratch, goal_node: u32, start_level: u16) bool {
+// Walks the abstract parent chain from the reached goal-level portal back to its seeded
+// start-level root, writing the ordered packed-ref sequence (root -> goal portal) into
+// abstract.corridor and the per-step link flags into corridor_link from the recorded
+// slot_via_link. Returns true when the corridor's root is a start-level portal.
+fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) bool {
     abstract.corridor.clearRetainingCapacity();
-    // Walk parents goal->root into the corridor buffer, then reverse to root->goal.
-    var node = goal_node;
+    var node = goal_ref;
     while (true) {
         if (abstract.corridor.items.len >= abstract.corridor.capacity) break;
         abstract.corridor.appendAssumeCapacity(node);
         const slot = abstract.slotFor(node) orelse break;
         const parent = abstract.slot_parent.items[slot];
-        if (parent == no_cell) break;
+        if (parent == no_ref) break;
         node = parent;
     }
-    std.mem.reverse(u32, abstract.corridor.items);
+    std.mem.reverse(usize, abstract.corridor.items);
     if (abstract.corridor.items.len == 0) return false;
-    // Mark which corridor transitions are LINK edges (discrete jumps) by inspecting
-    // the abstract edge between each consecutive pair. corridor_link[0] is false
-    // (no predecessor); corridor_link[i] is the edge type into corridor[i].
+    // corridor_link[0] is false (no predecessor); corridor_link[i] is whether corridor[i]
+    // was reached over a cross-level link, read from the recorded slot flag.
     abstract.corridor_link.clearRetainingCapacity();
     abstract.corridor_link.appendAssumeCapacity(false);
     for (1..abstract.corridor.items.len) |i| {
-        const from_node = abstract.corridor.items[i - 1];
-        const to_node = abstract.corridor.items[i];
-        abstract.corridor_link.appendAssumeCapacity(edgeIsLink(graph, from_node, to_node));
+        const ref = abstract.corridor.items[i];
+        const via_link = if (abstract.slotFor(ref)) |slot| abstract.slot_via_link.items[slot] else false;
+        abstract.corridor_link.appendAssumeCapacity(via_link);
     }
-    const root_portal = graph.portals.items[abstract.corridor.items[0]];
-    return root_portal.level == start_level;
-}
-
-// Returns whether the abstract edge from `from_node` to `to_node` is a link edge
-// (discrete inter-level/teleport jump) rather than a walkable intra-level edge.
-fn edgeIsLink(graph: *const NavGraph, from_node: u32, to_node: u32) bool {
-    const begin = graph.portal_offsets.items[from_node];
-    const end = graph.portal_offsets.items[from_node + 1];
-    for (graph.portal_edges.items[begin..end]) |edge| {
-        if (edge.target == to_node) return edge.crosses_level;
-    }
-    return false;
+    return refLevel(abstract.corridor.items[0]) == start_level;
 }
 
 // Budget-bounded heap A* over one level's grid. Fills scratch.path_scratch with
@@ -3630,6 +3920,383 @@ test "pathfinding nav grid blocked set matches per-level composed mask" {
     }
     try std.testing.expect(expected_blocked > 0);
     try std.testing.expectEqual(expected_blocked, system.graph.grid(0).?.blocked_count);
+}
+
+// Normalized abstract edge identity for parity comparison: stable across the two
+// independent builds' portal-node numbering because it keys on (level, cell) endpoints.
+const ParityEdge = struct {
+    level_from: u16,
+    cell_from: u32,
+    level_to: u16,
+    cell_to: u32,
+    cost: u32,
+    crosses_level: bool,
+
+    fn lessThan(_: void, a: ParityEdge, b: ParityEdge) bool {
+        if (a.level_from != b.level_from) return a.level_from < b.level_from;
+        if (a.cell_from != b.cell_from) return a.cell_from < b.cell_from;
+        if (a.level_to != b.level_to) return a.level_to < b.level_to;
+        if (a.cell_to != b.cell_to) return a.cell_to < b.cell_to;
+        if (a.cost != b.cost) return a.cost < b.cost;
+        return @intFromBool(a.crosses_level) < @intFromBool(b.crosses_level);
+    }
+};
+
+// Collects every abstract edge of `graph` as a normalized (level,cell)->(level,cell)
+// tuple multiset (sorted), independent of portal-node numbering: each level's CSR edges
+// (crosses_level=false) plus the global link_edges (crosses_level=true, both directions
+// for a bidirectional link).
+fn collectParityEdges(graph: *const NavGraph, out: *std.ArrayList(ParityEdge)) !void {
+    out.clearRetainingCapacity();
+    for (graph.level_graphs.items) |*lg| {
+        for (lg.portals.items, 0..) |from, node_index| {
+            const begin = lg.portal_offsets.items[node_index];
+            const end = lg.portal_offsets.items[node_index + 1];
+            for (lg.portal_edges.items[begin..end]) |edge| {
+                const to = lg.portals.items[edge.target];
+                try out.append(std.testing.allocator, .{
+                    .level_from = from.level,
+                    .cell_from = from.cell_index,
+                    .level_to = to.level,
+                    .cell_to = to.cell_index,
+                    .cost = edge.cost,
+                    .crosses_level = false,
+                });
+            }
+        }
+    }
+    for (graph.link_edges.items) |link| {
+        try out.append(std.testing.allocator, .{
+            .level_from = link.from_level,
+            .cell_from = link.from_cell,
+            .level_to = link.to_level,
+            .cell_to = link.to_cell,
+            .cost = link.cost,
+            .crosses_level = true,
+        });
+        if (link.bidirectional) {
+            try out.append(std.testing.allocator, .{
+                .level_from = link.to_level,
+                .cell_from = link.to_cell,
+                .level_to = link.from_level,
+                .cell_to = link.from_cell,
+                .cost = link.cost,
+                .crosses_level = true,
+            });
+        }
+    }
+    std.sort.pdq(ParityEdge, out.items, {}, ParityEdge.lessThan);
+}
+
+// Asserts the incremental graph `a` is identical to the full-rebuild graph `b`:
+// (a) per-level blocked mask + count, (b) per-level chunk-local component labels
+// cell-by-cell, (c) portals as the normalized {(level,cell)} set via cell_to_portal
+// membership agreement, and (d) edges as the normalized multiset.
+fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    try t.expectEqual(a.levels.items.len, b.levels.items.len);
+    try t.expectEqual(a.cellCount(), b.cellCount());
+    const cell_count = a.cellCount();
+    for (a.levels.items, 0..) |*ga, level_index| {
+        const gb = &b.levels.items[level_index];
+        try t.expectEqual(ga.blocked_count, gb.blocked_count);
+        for (0..cell_count) |i| {
+            try t.expectEqual(ga.blocked.items[i], gb.blocked.items[i]);
+            try t.expectEqual(ga.components.items[i], gb.components.items[i]);
+        }
+    }
+    // (c) per-level cell_to_portal membership agreement (the {(level,cell)} portal set
+    // agrees on which cells are portals).
+    for (a.level_graphs.items, 0..) |*la, level_index| {
+        const lb = &b.level_graphs.items[level_index];
+        try t.expectEqual(cell_count, la.cell_to_portal.items.len);
+        try t.expectEqual(cell_count, lb.cell_to_portal.items.len);
+        for (0..cell_count) |i| {
+            try t.expectEqual(la.cell_to_portal.items[i] == no_cell, lb.cell_to_portal.items[i] == no_cell);
+        }
+    }
+    // (d) edges as a normalized sorted multiset.
+    var a_edges = std.ArrayList(ParityEdge).empty;
+    defer a_edges.deinit(std.testing.allocator);
+    var b_edges = std.ArrayList(ParityEdge).empty;
+    defer b_edges.deinit(std.testing.allocator);
+    try collectParityEdges(a, &a_edges);
+    try collectParityEdges(b, &b_edges);
+    try t.expectEqual(a_edges.items.len, b_edges.items.len);
+    for (a_edges.items, b_edges.items) |ea, eb| {
+        try t.expectEqual(ea, eb);
+    }
+}
+
+test "incremental nav update remask matches the composed world mask across levels" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        std.testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    // Small 4-tile chunks (abstractCapacity) so the 8x8 nav grid spans 2x2 chunks per
+    // level and the edits straddle chunk boundaries — exercising chunk-local relabel.
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+
+    // Each edit flips a tile's blocking state: carve an underground tunnel cell,
+    // punch an underground drop-hole, and block a surface cell.
+    const cave_0 = (meta.tileByName("cave_0") orelse return error.TestExpectedEqual).id;
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    _ = try world.setDenseTile(floor1, 3, 3, cave_0); // solid dirt -> walkable tunnel
+    _ = try world.clearDenseTile(floor1, 4, 3); // solid dirt -> see-through hole
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+    _ = try world.setDenseTile(floor0, 2, 2, tree); // surface walkable -> blocked
+
+    const edits = [_]NavCellEdit{
+        .{ .level = 1, .x = 3, .y = 3 },
+        .{ .level = 1, .x = 4, .y = 3 },
+        .{ .level = 0, .x = 2, .y = 2 },
+    };
+    _ = try system.applyNavUpdates(&data, &world, &edits);
+
+    // The incremental remask must equal the authoritative composed mask on every
+    // level and cell, with a consistent blocked_count — i.e. identical to a full
+    // recompose, but touching only the dirty footprint.
+    for (0..world.levelCount()) |level_usize| {
+        const level: u16 = @intCast(level_usize);
+        const grid = system.graph.grid(level).?;
+        var expected_blocked: usize = 0;
+        for (0..world.height) |y_usize| {
+            const y: u16 = @intCast(y_usize);
+            for (0..world.width) |x_usize| {
+                const x: u16 = @intCast(x_usize);
+                const expect = world.levelBlocksMovement(level, x, y);
+                if (expect) expected_blocked += 1;
+                try std.testing.expectEqual(expect, grid.isBlockedCell(.{ .x = @intCast(x), .y = @intCast(y) }));
+            }
+        }
+        try std.testing.expectEqual(expected_blocked, grid.blocked_count);
+    }
+
+    // The incremental graph must be IDENTICAL to a full rebuild against the same
+    // post-edit world/data: same masks, same chunk-local component labels, same portals,
+    // and the same abstract edge multiset.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+// Counts live cross-level link edges in `graph` (directed, expanding a bidirectional
+// link into its two directions to match collectParityEdges).
+fn countCrossLevelEdges(graph: *const NavGraph) usize {
+    var count: usize = 0;
+    for (graph.link_edges.items) |link| count += if (link.bidirectional) 2 else 1;
+    return count;
+}
+
+test "incremental nav update splitting a chunk-local component matches a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 12x12 open world, 4-tile chunks. Chunk (1,1) spans cells x4..7, y4..7 and starts
+    // as one open local component.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const grid = system.graph.grid(0).?;
+    const left = grid.indexForCell(.{ .x = 4, .y = 5 }).?;
+    const right = grid.indexForCell(.{ .x = 6, .y = 5 }).?;
+    // Before: both cells share chunk (1,1)'s single open local component.
+    try std.testing.expect(grid.connected(left, right));
+
+    // Drop a full-height wall at x=5 inside chunk (1,1), bisecting its open region.
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    var edits = std.ArrayList(NavCellEdit).empty;
+    defer edits.deinit(std.testing.allocator);
+    var wy: u16 = 4;
+    while (wy <= 7) : (wy += 1) {
+        const changed = (try world.setDenseTile(wall_layer, 5, wy, tree)) orelse return error.TestExpectedEqual;
+        try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
+    }
+    _ = try system.applyNavUpdates(&data, &world, edits.items);
+
+    // After: the chunk-local component split into two distinct labels.
+    try std.testing.expect(grid.componentOf(left) != no_component);
+    try std.testing.expect(grid.componentOf(right) != no_component);
+    try std.testing.expect(!grid.connected(left, right));
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update on a chunk border flips a neighbor chunk's portal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 12x12 open world, 4-tile chunks. The vertical border at x=4 puts cell (3,5) in
+    // chunk (0,1) and its open neighbor (4,5) in chunk (1,1); both are border portals.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const grid = system.graph.grid(0).?;
+    const near = grid.indexForCell(.{ .x = 3, .y = 5 }).?; // chunk (0,1), the edited side
+    const neighbor = grid.indexForCell(.{ .x = 4, .y = 5 }).?; // chunk (1,1)
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(near)) != null);
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(neighbor)) != null);
+    const neighbor_label_before = grid.componentOf(neighbor);
+
+    // Block (3,5) on the chunk (0,1) side: the (3,5)|(4,5) portal pair disappears, so
+    // the NEIGHBOR chunk (1,1)'s portal at (4,5) flips off even though only chunk (0,1)
+    // is relabeled.
+    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    const changed = (try world.setDenseTile(obstacle_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(near)) == null);
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(neighbor)) == null);
+    // The neighbor chunk's component labels were NOT recomputed: (4,5) keeps its label.
+    try std.testing.expectEqual(neighbor_label_before, grid.componentOf(neighbor));
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update opening a ramp endpoint adds a live LevelLink edge" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 2, 2, tree); // ramp endpoint starts blocked
+    try world.addLevelLink(.{
+        .kind = .stair,
+        .level_a = 0,
+        .cell_a = .{ .x = 10, .y = 10 },
+        .level_b = 1,
+        .cell_b = .{ .x = 2, .y = 2 },
+        .traversal_cost = 5,
+        .bidirectional = true,
+    });
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    // Endpoint blocked => link not live => no cross-level edge.
+    try std.testing.expectEqual(@as(usize, 0), countCrossLevelEdges(&system.graph));
+
+    // Dig the ramp endpoint open: buildLinkEdges re-derives the link as live.
+    const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    // Bidirectional link now contributes its crosses_level edge pair.
+    try std.testing.expect(countCrossLevelEdges(&system.graph) > 0);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental underground dig leaves the surface level abstract graph byte-identical" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // Open 12x12 surface (level 0) spanning many 4-tile chunks, plus an underground
+    // level 1 with a diggable obstacle. The surface graph is large (the regression the
+    // per-level split targets); an underground dig must do ZERO work on it.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 5, 5, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    // Snapshot level 0's per-level abstract graph contents.
+    const lg0 = system.graph.levelGraph(0).?;
+    try std.testing.expect(lg0.portals.items.len > 0);
+    const portals_before = try std.testing.allocator.dupe(PortalNode, lg0.portals.items);
+    defer std.testing.allocator.free(portals_before);
+    const edges_before = try std.testing.allocator.dupe(AbstractEdge, lg0.portal_edges.items);
+    defer std.testing.allocator.free(edges_before);
+    const offsets_before = try std.testing.allocator.dupe(u32, lg0.portal_offsets.items);
+    defer std.testing.allocator.free(offsets_before);
+    const c2p_before = try std.testing.allocator.dupe(u32, lg0.cell_to_portal.items);
+    defer std.testing.allocator.free(c2p_before);
+
+    // Dig an UNDERGROUND-only cell open (level 1).
+    const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    const stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    // The surface's portals, CSR edges, offsets, and cell_to_portal are byte-for-byte
+    // unchanged: an underground edit costs nothing on the (large) surface graph.
+    const lg0_after = system.graph.levelGraph(0).?;
+    try std.testing.expectEqualSlices(PortalNode, portals_before, lg0_after.portals.items);
+    try std.testing.expectEqualSlices(AbstractEdge, edges_before, lg0_after.portal_edges.items);
+    try std.testing.expectEqualSlices(u32, offsets_before, lg0_after.portal_offsets.items);
+    try std.testing.expectEqualSlices(u32, c2p_before, lg0_after.cell_to_portal.items);
+    // Sanity: the underground level DID change (not a no-op batch).
+    try std.testing.expect(!system.graph.grid(1).?.isBlockedCell(.{ .x = 5, .y = 5 }));
+
+    // And it still matches a full rebuild on every level.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 
 test "pathfinding individual solve produces deterministic available path and waypoint" {
@@ -4143,7 +4810,7 @@ test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra fie
     const allocator = std.testing.allocator;
     var grid = NavGrid{};
     defer grid.deinit(allocator);
-    try grid.prepare(allocator, 0, 20, 20, default_cell_size, 1);
+    try grid.prepare(allocator, 0, 20, 20, default_cell_size, default_nav_chunk_tiles, 1);
     // A diagonal-ish obstacle pattern so the field has equal-cost cells reachable from
     // multiple predecessors (the case where pop order could change flow directions).
     const blocked_cells = [_][2]usize{ .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 6, 5 }, .{ 7, 5 }, .{ 10, 10 }, .{ 11, 10 }, .{ 12, 10 }, .{ 3, 12 }, .{ 4, 12 }, .{ 14, 6 }, .{ 14, 7 } };
@@ -4699,7 +5366,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     try std.testing.expect(one_level_start_portals > 0);
     // The extra open levels add many total portals, but the start level's seeded
     // count is unchanged: seeding never touches the other levels' portals.
-    try std.testing.expect(four_system.graph.portals.items.len > four_level_start_portals);
+    try std.testing.expect(four_system.graph.totalPortals() > four_level_start_portals);
     try std.testing.expectEqual(one_level_start_portals, four_level_start_portals);
 
     // The per-query abstract search completes within the node budget regardless of
@@ -4995,16 +5662,16 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     try std.testing.expectEqual(PathStatus.pending, view.status);
 }
 
-test "pathfinding component-scoped portal seeding only scans the start component" {
+test "pathfinding chunk-local portal seeding scans only the start chunk's local component" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var meta = try loadTestWorldMeta(std.testing.allocator);
     defer meta.deinit();
 
     // A 12x12-cell world split into TWO disconnected open regions by a SOLID vertical
-    // tree wall at column 5 (no gaps). Left (cols 0..4) and right (cols 6..11) are
-    // different connected components on level 0, each spanning several 4-tile chunks
-    // so each has its own border portals.
+    // tree wall at column 5 (no gaps). Left (cols 0..4) and right (cols 6..11) span
+    // several 4-tile chunks, so the chunk-local labels of cells in different chunks
+    // differ even within one region.
     const built = try buildCorridorWorld(&meta, &.{});
     var world = built.world;
     defer world.deinit();
@@ -5019,26 +5686,36 @@ test "pathfinding component-scoped portal seeding only scans the start component
     const right_cell = grid.indexForCell(.{ .x = 9, .y = 5 }).?;
     const left_component = grid.componentOf(left_cell);
     const right_component = grid.componentOf(right_cell);
-    // The wall genuinely splits the world into two components.
+    // Chunk-local labels: the two cells sit in different chunks AND different regions,
+    // so their encoded labels differ.
     try std.testing.expect(left_component != no_component);
     try std.testing.expect(right_component != no_component);
     try std.testing.expect(left_component != right_component);
 
-    // The (level, component) index partitions the level's portals: every portal in a
-    // component's slice belongs to that component, the two slices are disjoint, and
-    // together they cover all of the level's portals. Seeding therefore scans ONLY the
-    // start component's portals instead of the level's full border.
+    // levelComponentPortals returns exactly the start CHUNK's local-component portals:
+    // every returned portal shares the queried encoded label (hence the same chunk and
+    // the same chunk-local component), and the two query results are disjoint.
+    const left_chunk = grid.chunkOfCell(left_cell);
+    const right_chunk = grid.chunkOfCell(right_cell);
     const left_portals = system.graph.levelComponentPortals(0, left_component);
     const right_portals = system.graph.levelComponentPortals(0, right_component);
     try std.testing.expect(left_portals.len > 0);
     try std.testing.expect(right_portals.len > 0);
+    const level0_graph = system.graph.levelGraph(0).?;
     for (left_portals) |node| {
-        try std.testing.expectEqual(left_component, grid.componentOf(system.graph.portals.items[node].cell_index));
+        const cell = level0_graph.portals.items[node].cell_index;
+        try std.testing.expectEqual(left_component, grid.componentOf(cell));
+        try std.testing.expectEqual(left_chunk, grid.chunkOfCell(cell));
     }
     for (right_portals) |node| {
-        try std.testing.expectEqual(right_component, grid.componentOf(system.graph.portals.items[node].cell_index));
+        const cell = level0_graph.portals.items[node].cell_index;
+        try std.testing.expectEqual(right_component, grid.componentOf(cell));
+        try std.testing.expectEqual(right_chunk, grid.chunkOfCell(cell));
     }
-    try std.testing.expectEqual(system.graph.levelPortals(0).len, left_portals.len + right_portals.len);
+    // The two slices are disjoint (different labels), and each is a strict subset of the
+    // level's full portal set (chunk-local seeding never scans the whole border).
+    try std.testing.expect(left_portals.len < system.graph.levelPortals(0).len);
+    try std.testing.expect(right_portals.len < system.graph.levelPortals(0).len);
 
     // Correctness preserved: a cross-component goal (no link) is unavailable, and a
     // same-component goal stays reachable.
@@ -5366,7 +6043,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     defer system.deinit();
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
-    const high_water = system.graph.portals.items.len;
+    const high_water = system.graph.totalPortals();
     try std.testing.expect(high_water > 0);
 
     // The failing allocator must cover BOTH the system AND the nav graph (which holds
@@ -5387,7 +6064,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     const opened = (try world.setDenseTile(built.wall_layer, 5, 3, grass)) orelse return error.TestExpectedEqual;
     const open_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
     try std.testing.expectEqual(@as(usize, 1), open_stats.incremental_rebuilds);
-    try std.testing.expect(system.graph.portals.items.len <= high_water);
+    try std.testing.expect(system.graph.totalPortals() <= high_water);
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -5420,7 +6097,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     defer system.deinit();
     try system.reserve(abstractCapacity());
     try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
-    try std.testing.expectEqual(@as(usize, 0), system.graph.portals.items.len);
+    try std.testing.expectEqual(@as(usize, 0), system.graph.totalPortals());
 
     // Open a 6x6 block spanning chunk borders, creating new portals past the (zero)
     // init high-water mark. The growth is allowed and the build completes correctly.
@@ -5438,7 +6115,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 1), stats.version_bumps);
     // The expansion produced new portals (the abstract graph grew past init).
-    try std.testing.expect(system.graph.portals.items.len > 0);
+    try std.testing.expect(system.graph.totalPortals() > 0);
 
     // A subsequent edit within the NEW high-water mark is allocation-free again.
     const closed = (try world.setDenseTile(wall_layer, 4, 4, tree)) orelse return error.TestExpectedEqual;

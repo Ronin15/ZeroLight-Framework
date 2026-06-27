@@ -240,6 +240,15 @@ pub const WorldSystem = struct {
     // sparse tiles. Refreshed whenever visibility changes (the only producer that
     // runs before the reservation each render frame).
     visible_sparse_count: usize = 0,
+    // Cached visible-window bounds (tile + chunk) from the last visibility update.
+    // The window only changes when the camera crosses a tile boundary, so a still
+    // camera or a sub-tile pan early-outs instead of rewriting every chunk_visible
+    // flag (O(chunks*levels)) and rescanning every sparse tile each render frame.
+    visibility_window_valid: bool = false,
+    last_min_chunk_x: u16 = 0,
+    last_min_chunk_y: u16 = 0,
+    last_max_chunk_x: u16 = 0,
+    last_max_chunk_y: u16 = 0,
 
     // World atlas dimensions captured at init: source of truth for the tilemap
     // atlas params and the safe-build runtime-texture-match assert.
@@ -494,14 +503,31 @@ pub const WorldSystem = struct {
         const min_tile_y = floorTileClamped(rect.y, tile_size, self.height);
         const max_tile_x = floorTileClamped(visibleMaxCoord(rect.x, rect.w), tile_size, self.width);
         const max_tile_y = floorTileClamped(visibleMaxCoord(rect.y, rect.h), tile_size, self.height);
-        self.visible_min_tile_x = min_tile_x;
-        self.visible_min_tile_y = min_tile_y;
-        self.visible_max_tile_x_exclusive = max_tile_x + 1;
-        self.visible_max_tile_y_exclusive = max_tile_y + 1;
         const min_chunk_x = saturatingSubU16(min_tile_x / self.chunk_size_tiles, overscan_chunks);
         const min_chunk_y = saturatingSubU16(min_tile_y / self.chunk_size_tiles, overscan_chunks);
         const max_chunk_x = @min(chunks_x - 1, max_tile_x / self.chunk_size_tiles + overscan_chunks);
         const max_chunk_y = @min(chunks_y - 1, max_tile_y / self.chunk_size_tiles + overscan_chunks);
+
+        // Early-out when the visible window is unchanged: chunk_visible and the
+        // sparse count are fully determined by these bounds, so a still camera or a
+        // sub-tile pan needs no rewrite or rescan.
+        if (self.visibility_window_valid and
+            min_tile_x == self.visible_min_tile_x and min_tile_y == self.visible_min_tile_y and
+            max_tile_x + 1 == self.visible_max_tile_x_exclusive and max_tile_y + 1 == self.visible_max_tile_y_exclusive and
+            min_chunk_x == self.last_min_chunk_x and min_chunk_y == self.last_min_chunk_y and
+            max_chunk_x == self.last_max_chunk_x and max_chunk_y == self.last_max_chunk_y)
+        {
+            return;
+        }
+        self.visible_min_tile_x = min_tile_x;
+        self.visible_min_tile_y = min_tile_y;
+        self.visible_max_tile_x_exclusive = max_tile_x + 1;
+        self.visible_max_tile_y_exclusive = max_tile_y + 1;
+        self.last_min_chunk_x = min_chunk_x;
+        self.last_min_chunk_y = min_chunk_y;
+        self.last_max_chunk_x = max_chunk_x;
+        self.last_max_chunk_y = max_chunk_y;
+        self.visibility_window_valid = true;
 
         for (0..self.chunk_visible.items.len) |index| {
             const chunk_x: u16 = @intCast(self.chunk_x.items[index]);
@@ -949,6 +975,8 @@ pub const WorldSystem = struct {
         self.sparse_depth_values.appendAssumeCapacity(world_z);
         self.sparse_flags.appendAssumeCapacity(flags);
         self.render_index_dirty = true;
+        // The sparse set changed, so the cached visible-sparse count must refresh.
+        self.visibility_window_valid = false;
         if (!flags.blocks_movement) return null;
         return .{
             .level = level_index,
@@ -1035,6 +1063,9 @@ pub const WorldSystem = struct {
     }
 
     fn rebuildChunks(self: *WorldSystem) !void {
+        // The chunk set is changing, so the cached visible-window early-out must
+        // repopulate chunk_visible on the next call.
+        self.visibility_window_valid = false;
         const chunks_x = ceilDiv(self.width, self.chunk_size_tiles);
         const chunks_y = ceilDiv(self.height, self.chunk_size_tiles);
         const chunk_count = @as(usize, chunks_x) * @as(usize, chunks_y) * self.level_base_z.items.len;
