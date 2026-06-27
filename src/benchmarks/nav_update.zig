@@ -18,6 +18,7 @@ const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const WorldSystem = @import("../game/world_system.zig").WorldSystem;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const NavCellEdit = @import("../game/systems/pathfinding.zig").NavCellEdit;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const TileId = @import("../game/world_system.zig").TileId;
@@ -27,19 +28,24 @@ fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u
     return (meta.tileByName(name) orelse return error.TileNotFound).id;
 }
 
-// World side length in nav cells/tiles. 512 with 32px tiles spans 32x32 abstract chunks per
-// level — the scale where a non-incremental rebuild crossed a millisecond.
-const world_tiles: u16 = 512;
+// World side length in nav cells/tiles. The incremental update is dirty-bounded and provably
+// world-size-independent (see nav_graph tests), so the bench world only needs to hold the
+// largest footprint plus a few chunks of margin — NOT a full game world. A small world keeps
+// the per-case fixture rebuild (O(world^2), the dominant bench cost) cheap so the Debug bench
+// completes quickly; 128 tiles = 8x8 abstract chunks, room for the 64x64 dig-storm footprint.
+const world_tiles: u16 = 128;
 const tile_size: f32 = 32.0;
 const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
 // Dirty cells fed to one `applyNavUpdates` batch (the footprint). The small end {1,2,16,32}
 // is the production batch range (a single-tile dig up to the dirty-edit cap, doubled for
-// headroom) and measures realistic per-dig cost on the SERIAL path. The large end
-// {256,1024,4096} is a dig-storm tier (many actors digging at once) that touches enough
-// chunks for the threaded chunk patch to engage, so the threaded cases can show the
-// serial-vs-threaded scaling. Cost tracks the dirty-chunk footprint, not the level size.
-const update_counts = [_]usize{ 1, 2, 16, 32, 256, 1024, 4096, 16384, 65536 };
+// headroom) and measures realistic per-dig cost. The large end {256,1024,4096} is a dig-storm
+// tier (many actors digging at once) that touches enough chunks for the threaded remask/patch
+// stages to engage and show serial-vs-threaded scaling. Counts are kept small enough that the
+// Debug bench (the default) completes quickly with performant code; the adaptive tuner scales
+// the threaded stages in Debug, and scales them further in release. Cost tracks the dirty-chunk
+// footprint, not the level size.
+const update_counts = [_]usize{ 1, 2, 16, 32, 256, 1024, 4096 };
 
 // The threaded chunk patch only pays off once a batch spans many chunks. Below this footprint
 // the adaptive tuner keeps the patch inline anyway, so the threaded cases skip the small end
@@ -73,13 +79,18 @@ pub fn runMultichunkCase(allocator: std.mem.Allocator, io: std.Io, options: suit
     return runCase(allocator, io, options, case, item_count, .multichunk);
 }
 
+// The world + nav system are identical for every case and count of a variant (only the dirty
+// footprint's anchor/size changes), and the incremental update is provably world-size-independent,
+// so the EXPENSIVE O(world^2) rebuild is done ONCE per variant and reused across every case/count
+// (see sharedFixture). Only `edits` is regenerated per count; the toggle re-derives nav state.
 const Fixture = struct {
     data: DataSystem,
     world: WorldSystem,
     system: PathfindingSystem,
     obstacle_layer: usize,
-    // Underground tiles toggled each iteration (one for interior, a straddling block for
-    // multichunk). These are blocked at the start state and returned to it after a toggle.
+    grass: TileId,
+    tree: TileId,
+    // Tiles toggled each timed iteration: the current count's footprint on level 1.
     edits: std.ArrayList(NavCellEdit),
 
     fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
@@ -91,6 +102,32 @@ const Fixture = struct {
     }
 };
 
+// One reusable fixture per variant, built lazily on first use and freed by deinitCaches at the
+// end of the run. The suite drives counts ascending and each variant's footprints are nested at a
+// stable anchor, so a later (larger) count's open-half toggle clears any prior count's blocked
+// cells — no per-count world reset needed.
+var shared_fixtures: [@typeInfo(Variant).@"enum".fields.len]?Fixture = .{ null, null };
+
+pub fn deinitCaches(allocator: std.mem.Allocator) void {
+    for (&shared_fixtures) |*slot| {
+        if (slot.*) |*fixture| fixture.deinit(allocator);
+        slot.* = null;
+    }
+}
+
+// Returns the variant's reusable fixture, building it once (world + nav sized for the maximum
+// threaded participant count, so every case fits) on first use.
+fn sharedFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant) !*Fixture {
+    const slot = &shared_fixtures[@intFromEnum(variant)];
+    if (slot.* == null) {
+        var probe = try ThreadSystem.init(allocator, io, .{});
+        const max_participants = probe.participantSlotCount();
+        probe.deinit();
+        slot.* = try buildSharedFixture(allocator, io, max_participants);
+    }
+    return &slot.*.?;
+}
+
 // Smallest square side that holds `cells` tiles; the footprint is filled row-major up to
 // `cells` so the batch edit count matches the requested item count exactly.
 fn squareSide(cells: usize) u16 {
@@ -99,7 +136,9 @@ fn squareSide(cells: usize) u16 {
     return side;
 }
 
-fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant, cells: usize, participant_count: usize) !Fixture {
+// Builds the reusable world + nav system (all cells open), sized for `participant_count` so any
+// threaded case fits. The dig footprint is set later per count by setFootprint.
+fn buildSharedFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !Fixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
@@ -118,12 +157,30 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant, cell
     _ = try world.addDenseLayer(2, 0, .floor, grass);
     const obstacle_layer = try world.addDenseLayer(1, 0, .obstacle, grass);
 
-    var edits = std.ArrayList(NavCellEdit).empty;
-    errdefer edits.deinit(allocator);
-    // Lay `cells` dirty tiles row-major in a square-ish footprint on level 1. The interior
-    // anchor keeps small batches inside one 16-tile abstract chunk; the multichunk anchor
-    // centers the block on the chunk borders at x=32/y=32 so the footprint straddles four
-    // chunks (the worst-case orthogonal-neighbor fan-out).
+    var system = PathfindingSystem.init(allocator);
+    errdefer system.deinit();
+    // Size the per-participant nav scratch for the largest threaded case (workers + main) so the
+    // threaded stages never fall back to serial for lack of scratch slots.
+    try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
+    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size);
+
+    return .{
+        .data = data,
+        .world = world,
+        .system = system,
+        .obstacle_layer = obstacle_layer,
+        .grass = grass,
+        .tree = tree,
+        .edits = .empty,
+    };
+}
+
+// Regenerates the current count's dirty footprint on level 1. The interior anchor keeps small
+// batches inside one 16-tile abstract chunk; the multichunk anchor centers the block on the chunk
+// borders at x=32/y=32 so it straddles four chunks (worst-case orthogonal-neighbor fan-out). The
+// world is not mutated here — the toggle establishes the open/blocked state.
+fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Variant, cells: usize) !void {
+    fixture.edits.clearRetainingCapacity();
     const side = squareSide(cells);
     const anchor: struct { x: u16, y: u16 } = switch (variant) {
         .interior => .{ .x = 40, .y = 40 },
@@ -135,27 +192,10 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant, cell
         var dx: u16 = 0;
         while (dx < side) : (dx += 1) {
             if (placed >= cells) break :outer;
-            try edits.append(allocator, .{ .level = 1, .x = anchor.x + dx, .y = anchor.y + dy });
+            try fixture.edits.append(allocator, .{ .level = 1, .x = anchor.x + dx, .y = anchor.y + dy });
             placed += 1;
         }
     }
-    // Start state: the edited tiles are blocked.
-    for (edits.items) |edit| _ = try world.setDenseTile(obstacle_layer, edit.x, edit.y, tree);
-
-    var system = PathfindingSystem.init(allocator);
-    errdefer system.deinit();
-    // Size the per-participant patch scratch for the case's worker count (workers + main) so the
-    // threaded patch never falls back to serial for lack of scratch slots.
-    try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
-    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size);
-
-    return .{
-        .data = data,
-        .world = world,
-        .system = system,
-        .obstacle_layer = obstacle_layer,
-        .edits = edits,
-    };
 }
 
 // One open/blocked toggle of the edited tiles, returning the world to its start state. Each
@@ -164,11 +204,11 @@ fn buildFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant, cell
 // so the measurement reflects the abstract-graph patch cost the task targets. A non-null
 // thread_system routes through the threaded buffered path (markNavDirty + applyBufferedNavUpdates);
 // null runs the serial slice path.
-fn runToggle(fixture: *Fixture, io: std.Io, open_tile: u16, blocked_tile: u16, thread_system: ?*ThreadSystem) !u64 {
+fn runToggle(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
     var elapsed: u64 = 0;
-    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, open_tile);
+    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.grass);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
-    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, blocked_tile);
+    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
     elapsed += try timeNavUpdate(fixture, io, thread_system);
     return elapsed;
 }
@@ -197,8 +237,8 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         return suite.RunStats.skipped("footprint too small to thread");
     }
 
-    // Build the thread system first so the nav patch scratch is sized for the real participant
-    // count (workers + main); the chunk patch fans across it through the system's nav_patch_tuner.
+    // A per-case thread system caps the worker pool for this case; the tuner decides how many of
+    // it to use. Cheap to spawn relative to the (now one-time) nav rebuild.
     var threads: ?ThreadSystem = null;
     if (case.usesThreadSystem()) {
         threads = try ThreadSystem.init(allocator, io, .{
@@ -207,45 +247,48 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         });
     }
     defer if (threads) |*thread_system| thread_system.deinit();
-    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
     const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
 
-    var fixture = try buildFixture(allocator, io, variant, item_count, participant_count);
-    defer fixture.deinit(allocator);
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| fixture.system.nav_patch_tuner = tuner;
-
-    var meta = try world_tileset_meta.load(allocator, AssetStore.init(allocator, io, "assets"), manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
-    const grass = try requireTile(&meta, "grass");
-    const tree = try requireTile(&meta, "tree_0");
+    // Reuse the variant's world + nav system (built once); only the footprint changes per count.
+    const fixture = try sharedFixture(allocator, io, variant);
+    try setFootprint(fixture, allocator, variant, item_count);
+    // Reset both stage tuners per case so a prior case's training never leaks into this one (a
+    // fresh system would have fresh tuners). Adaptive cases use the configured probing tuner.
+    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
+        fixture.system.nav_remask_tuner = tuner;
+        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
+    } else {
+        fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
+        fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
+    }
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
     // allocation-free) and the tuner has trained an inline baseline before timing.
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runToggle(&fixture, io, grass, tree, thread_ptr);
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runToggle(fixture, io, thread_ptr);
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
         // One toggle is two timed nav updates over the full footprint; report the per-update
         // batch cost (items_per_second then reads as dirty cells per second).
-        const elapsed = try runToggle(&fixture, io, grass, tree, thread_ptr);
+        const elapsed = try runToggle(fixture, io, thread_ptr);
         accumulator.record(elapsed / 2, suite.serialBatch(item_count, 1));
     }
     var stats = accumulator.finish();
-    // Report the worker profile the chunk patch actually used so threaded rows are not mistaken
-    // for serial ones (the tuner may keep a borderline footprint inline).
-    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    // Report the worker profile each stage actually used so threaded rows are not mistaken for
+    // serial ones (a tuner may keep a borderline footprint inline). Primary = the remask/re-flood
+    // stage (runs first and dominates at scale); secondary = the abstract chunk patch.
+    stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
+    stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
     return stats;
 }
 
 test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
-    var fixture = try buildFixture(std.testing.allocator, std.testing.io, .interior, 1, 1);
+    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
     defer fixture.deinit(std.testing.allocator);
+    try setFootprint(&fixture, std.testing.allocator, .interior, 1);
 
-    var meta = try world_tileset_meta.load(std.testing.allocator, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
-    const grass = try requireTile(&meta, "grass");
-
-    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, grass);
+    // Block the single interior cell to force a real patch.
+    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
     const stats = try fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
     // One interior chunk plus its four orthogonal neighbors, with no full-rebuild fallback.
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);

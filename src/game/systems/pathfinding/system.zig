@@ -19,7 +19,7 @@ const PathRequest = @import("../../simulation.zig").PathRequest;
 const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const NavGraph = @import("nav_graph.zig").NavGraph;
-const NavPatchThreads = @import("nav_graph.zig").NavPatchThreads;
+const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
 const GroupField = @import("group_field.zig").GroupField;
@@ -107,8 +107,10 @@ pub const PathfindingSystem = struct {
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    // The incremental nav-update chunk patch is an independently-timed threaded stage, so it
-    // owns its own tuner (per docs: one tuner per stage, never shared across work shapes).
+    // The incremental nav update has two independently-timed threaded stages — remask + component
+    // re-flood, and the abstract chunk patch — so each owns its own tuner (per docs: one tuner
+    // per stage, never shared across work shapes).
+    nav_remask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_patch_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // Live agent count the per-step/memory caps are currently sized for. Elastic
     // resize keeps this tracking the steering-agent crowd: grows fast for battles,
@@ -408,10 +410,11 @@ pub const PathfindingSystem = struct {
         edits: []const NavCellEdit,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
-        // The chunk patch is a per-stage threaded processor: small digs run inline, dig-storms
-        // fan across workers, decided by the stage-owned nav_patch_tuner (no fixed budget).
-        const patch_threads: ?NavPatchThreads = if (thread_system) |ts|
-            .{ .thread_system = ts, .tuner = &self.nav_patch_tuner }
+        // The incremental update has two per-stage threaded processors (remask/re-flood and the
+        // abstract patch), each fanned across workers by its own tuner: small digs run inline,
+        // dig-storms thread. No fixed budget — the tuners are the work-sizing policy.
+        const update_threads: ?NavUpdateThreads = if (thread_system) |ts|
+            .{ .thread_system = ts, .remask_tuner = &self.nav_remask_tuner, .patch_tuner = &self.nav_patch_tuner }
         else
             null;
         const stats = try self.graph.applyNavUpdates(
@@ -420,7 +423,7 @@ pub const PathfindingSystem = struct {
             edits,
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
-            patch_threads,
+            update_threads,
         );
         if (stats.version_bumps != 0) {
             // Full rebuild bumped nav_version: blunt-invalidate all work and group fields.

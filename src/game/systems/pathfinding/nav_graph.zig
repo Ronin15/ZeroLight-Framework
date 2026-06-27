@@ -150,13 +150,41 @@ const ChunkPatchScratch = struct {
     }
 };
 
-// Optional threading for the incremental chunk-patch loop. When present, applyNavUpdates fans
-// the per-chunk patch across the ThreadSystem using a stage-owned tuner; absent → serial. The
-// adaptive tuner keeps small digs inline and threads only dig-storms, so there is no fixed
-// per-step budget — the tuner IS the work-sizing policy.
-pub const NavPatchThreads = struct {
+// Per-worker scratch for the threaded remask + component re-flood stage: the BFS queue for the
+// chunk-local component flood and a private blocked-count delta. One slot per participant so
+// chunks re-flood in parallel without sharing the queue or racing the shared blocked counter;
+// the serial path uses slot 0 and the deltas are summed once after the barrier.
+const ChunkRemaskScratch = struct {
+    queue: std.ArrayList(usize) = .empty,
+    blocked_delta: isize = 0,
+
+    fn deinit(self: *ChunkRemaskScratch, allocator: std.mem.Allocator) void {
+        self.queue.deinit(allocator);
+    }
+};
+
+// Threading context for ONE incremental nav-update stage (remask or patch): the shared thread
+// system plus that stage's own adaptive tuner. The adaptive tuner keeps small digs inline and
+// threads only dig-storms, so there is no fixed per-step budget — the tuner IS the policy.
+pub const NavStageThreads = struct {
     thread_system: *ThreadSystem,
     tuner: *AdaptiveWorkTuner,
+};
+
+// Threading for a whole incremental update: the shared thread system plus a SEPARATE tuner per
+// stage (remask/re-flood vs. abstract patch are different work shapes, so each owns its tuner
+// per the one-tuner-per-stage rule). Absent → fully serial.
+pub const NavUpdateThreads = struct {
+    thread_system: *ThreadSystem,
+    remask_tuner: *AdaptiveWorkTuner,
+    patch_tuner: *AdaptiveWorkTuner,
+
+    fn remask(self: NavUpdateThreads) NavStageThreads {
+        return .{ .thread_system = self.thread_system, .tuner = self.remask_tuner };
+    }
+    fn patch(self: NavUpdateThreads) NavStageThreads {
+        return .{ .thread_system = self.thread_system, .tuner = self.patch_tuner };
+    }
 };
 
 // Job context for the threaded chunk patch. Each dirty chunk is independent — it writes only
@@ -179,6 +207,27 @@ fn patchChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId)
             continue;
         };
         if (overflowed) scratch.overflow = true;
+    }
+}
+
+// Job context for the threaded remask + component re-flood. Each changed chunk re-derives only
+// its own mask/component cells (disjoint), so chunks run race-free; the blocked-count delta is
+// accumulated into this worker's scratch slot and summed after the barrier.
+const NavRemaskJob = struct {
+    graph: *NavGraph,
+    data: *const DataSystem,
+    world: *const WorldSystem,
+    level: u16,
+    chunks: []const u32,
+};
+
+fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+    const job: *NavRemaskJob = @ptrCast(@alignCast(context));
+    const level_grid = &job.graph.levels.items[job.level];
+    const scratch = &job.graph.remask_scratch.items[worker_id.index];
+    for (range.start..range.end) |i| {
+        scratch.blocked_delta += level_grid.remaskChunkFromWorld(job.chunks[i], job.data, job.world);
+        level_grid.recomputeChunkComponents(job.chunks[i], &scratch.queue);
     }
 }
 
@@ -211,9 +260,13 @@ pub const NavGraph = struct {
     // Per-participant chunk-patch scratch (worker count + 1, min 1), sized at rebuild. The
     // threaded incremental patch indexes this by worker id; the serial path uses slot 0.
     patch_scratch: std.ArrayList(ChunkPatchScratch) = .empty,
-    // Batch shape of the most recent dirty-chunk patch (which worker profile the tuner picked),
-    // for benchmark/diagnostic reporting. Not part of the graph contract.
+    // Per-participant scratch for the threaded remask + component re-flood stage (workers + 1,
+    // min 1), sized at rebuild. Indexed by worker id; the serial path uses slot 0.
+    remask_scratch: std.ArrayList(ChunkRemaskScratch) = .empty,
+    // Batch shape of the most recent patch / remask stage (which worker profile the tuner
+    // picked), for benchmark/diagnostic reporting. Not part of the graph contract.
     last_patch_batch: BatchStats = .{},
+    last_remask_batch: BatchStats = .{},
 
     // Geometric, chunk-stable slot layout, computed once per dimensions/chunk_tiles and
     // invariant across applyNavUpdates (chunk geometry is identical across levels, so this
@@ -242,10 +295,15 @@ pub const NavGraph = struct {
     dirty_set: std.ArrayList(u32) = .empty,
     dirty_stamp: std.ArrayList(u32) = .empty,
     dirty_epoch: u32 = 0,
+    // Deduped list of CHANGED chunks (those containing edits) for one level, the work-list for
+    // the remask-from-world + component re-flood stage. Distinct from dirty_set, which also
+    // includes border neighbors for the abstract patch stage.
+    changed_chunks: std.ArrayList(u32) = .empty,
 
     pub fn deinit(self: *NavGraph) void {
         self.dirty_stamp.deinit(self.allocator);
         self.dirty_set.deinit(self.allocator);
+        self.changed_chunks.deinit(self.allocator);
         self.chunk_link_count.deinit(self.allocator);
         self.chunk_link_base.deinit(self.allocator);
         self.chunk_link_cells.deinit(self.allocator);
@@ -256,6 +314,8 @@ pub const NavGraph = struct {
         self.build_u32_scratch.deinit(self.allocator);
         for (self.patch_scratch.items) |*scratch| scratch.deinit(self.allocator);
         self.patch_scratch.deinit(self.allocator);
+        for (self.remask_scratch.items) |*scratch| scratch.deinit(self.allocator);
+        self.remask_scratch.deinit(self.allocator);
         self.link_edges.deinit(self.allocator);
         for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
         self.level_graphs.deinit(self.allocator);
@@ -380,6 +440,15 @@ pub const NavGraph = struct {
             try scratch.edges.ensureTotalCapacity(self.allocator, max_edge_cap);
             try scratch.cursor.ensureTotalCapacity(self.allocator, max_portal_cap);
         }
+
+        // Per-participant remask/re-flood scratch: a BFS queue sized to one chunk's cell count
+        // (a chunk-local flood never leaves its chunk) so a threaded re-flood is allocation-free.
+        try self.remask_scratch.ensureTotalCapacity(self.allocator, participant_count);
+        while (self.remask_scratch.items.len < participant_count) self.remask_scratch.appendAssumeCapacity(.{});
+        const chunk_cells = @as(usize, self.chunk_tiles) * @as(usize, self.chunk_tiles);
+        for (self.remask_scratch.items) |*scratch| {
+            try scratch.queue.ensureTotalCapacity(self.allocator, chunk_cells);
+        }
     }
 
     // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from
@@ -426,10 +495,13 @@ pub const NavGraph = struct {
         edits: []const NavCellEdit,
         affected_levels: *std.ArrayList(bool),
         full_relabel_level_threshold: usize,
-        patch_threads: ?NavPatchThreads,
+        update_threads: ?NavUpdateThreads,
     ) !NavUpdateStats {
         var stats = NavUpdateStats{};
         if (edits.len == 0 or !self.valid()) return stats;
+        // Each stage runs through its own tuner (remask/re-flood vs. abstract patch).
+        const remask_threads: ?NavStageThreads = if (update_threads) |t| t.remask() else null;
+        const patch_threads: ?NavStageThreads = if (update_threads) |t| t.patch() else null;
 
         const level_count = self.levels.items.len;
         // Capacity is pre-reserved to the level count at rebuild, so this is a no-op
@@ -459,7 +531,7 @@ pub const NavGraph = struct {
         if (full_relabel) {
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
-                self.remaskChangedChunks(@intCast(level_index), data, world, edits);
+                self.remaskChangedChunks(@intCast(level_index), data, world, edits, remask_threads);
             }
             for (self.levels.items) |*level_grid| level_grid.buildComponents();
             try self.buildAbstractGraphs(world);
@@ -472,7 +544,7 @@ pub const NavGraph = struct {
                 // Changed chunks: remask from world + re-flood components (deduped). Neighbor
                 // chunks added by buildDirtySet are NOT remasked/re-flooded — their mask is
                 // untouched — only their abstract layer is patched below.
-                self.remaskChangedChunks(level, data, world, edits);
+                self.remaskChangedChunks(level, data, world, edits, remask_threads);
                 self.buildDirtySet(level, world, edits);
                 stats.chunks_patched += self.dirty_set.items.len;
                 if (try self.patchDirtyChunks(level, world, patch_threads)) overflow = true;
@@ -511,7 +583,7 @@ pub const NavGraph = struct {
     // the pre-sized scratch slots; otherwise serial (slot 0). Returns true if any chunk overflowed
     // its edge window. parallelForWithOptions is a barrier, so self.dirty_set stays stable across
     // the batch and the next level's buildDirtySet runs only after it completes.
-    fn patchDirtyChunks(self: *NavGraph, level: u16, world: ?*const WorldSystem, patch_threads: ?NavPatchThreads) !bool {
+    fn patchDirtyChunks(self: *NavGraph, level: u16, world: ?*const WorldSystem, patch_threads: ?NavStageThreads) !bool {
         const chunks = self.dirty_set.items;
         if (patch_threads) |threads| {
             const participants = threads.thread_system.participantSlotCount();
@@ -579,22 +651,23 @@ pub const NavGraph = struct {
     // Counts distinct abstract chunks (per level) touched by the dirty edits, using
     // the nav cell at each edited tile's origin. Quadratic in the edit count, which
     // is bounded by the per-step world-event budget; purely diagnostic.
-    pub fn countDirtyChunks(self: *const NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
+    // Counts distinct abstract chunks (by edit-origin cell) touched by the batch — a diagnostic
+    // recorded only when perf logging is enabled. O(edits) via the dirty-chunk stamp; the prior
+    // O(edits^2) pairwise scan was only acceptable while edits were capped, but the dirty buffer
+    // is now uncapped (scales with simultaneous diggers), so the quadratic form must not run.
+    // Dedup is by chunk id; a cross-level same-chunk-id collision under-counts by one, which is
+    // immaterial for a diagnostic. Bumps the dirty epoch, which downstream stages re-bump.
+    pub fn countDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
         const world_system = world orelse return 0;
+        self.dirty_epoch +%= 1;
+        const epoch = self.dirty_epoch;
         var count: usize = 0;
-        for (edits, 0..) |edit, i| {
+        for (edits) |edit| {
             const cell_index = self.navCellIndexForTile(world_system, edit) orelse continue;
             const chunk = self.chunkOf(cell_index);
-            var seen = false;
-            for (edits[0..i]) |prior| {
-                if (prior.level != edit.level) continue;
-                const prior_index = self.navCellIndexForTile(world_system, prior) orelse continue;
-                if (self.chunkOf(prior_index) == chunk) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) count += 1;
+            if (self.dirty_stamp.items[chunk] == epoch) continue;
+            self.dirty_stamp.items[chunk] = epoch;
+            count += 1;
         }
         return count;
     }
@@ -606,11 +679,13 @@ pub const NavGraph = struct {
     // footprint's chunk set, not the level cell count. Reads the world whole-chunk so cells the
     // producer coalesced or dropped are still correct. The epoch bump is independent of
     // buildDirtySet's (called next per level), so the two never alias a stamp.
-    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit, remask_threads: ?NavStageThreads) void {
         const world_system = world orelse return;
         const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
         const cx_count = level_grid.chunksX();
+        // Build the deduped changed-chunk work-list for this level.
+        self.changed_chunks.clearRetainingCapacity();
         self.dirty_epoch +%= 1;
         const epoch = self.dirty_epoch;
         for (edits) |edit| {
@@ -625,11 +700,46 @@ pub const NavGraph = struct {
                     const chunk: u32 = @intCast(cy * cx_count + cx);
                     if (self.dirty_stamp.items[chunk] == epoch) continue;
                     self.dirty_stamp.items[chunk] = epoch;
-                    level_grid.remaskChunkFromWorld(chunk, data, world_system);
-                    level_grid.recomputeChunkComponents(chunk);
+                    self.changed_chunks.appendAssumeCapacity(chunk);
                 }
             }
         }
+
+        // Remask-from-world + component re-flood for each changed chunk. Each chunk writes only
+        // its own mask/component cells (disjoint), so this fans across workers; remaskChunkFromWorld
+        // returns a blocked-count delta accumulated per worker (no shared counter write) and applied
+        // once after the barrier.
+        const chunks = self.changed_chunks.items;
+        var delta: isize = 0;
+        if (remask_threads) |threads| {
+            const participants = threads.thread_system.participantSlotCount();
+            if (chunks.len > 1 and participants <= self.remask_scratch.items.len) {
+                for (self.remask_scratch.items) |*scratch| scratch.blocked_delta = 0;
+                var job = NavRemaskJob{ .graph = self, .data = data, .world = world_system, .level = level, .chunks = chunks };
+                self.last_remask_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, remaskChunkJob, .{
+                    .adaptive = true,
+                    .adaptive_tuner = threads.tuner,
+                    .range_alignment_items = 1,
+                });
+                for (self.remask_scratch.items) |*scratch| delta += scratch.blocked_delta;
+                applyBlockedDelta(level_grid, delta);
+                return;
+            }
+        }
+        self.last_remask_batch = .{ .item_count = chunks.len, .ran_inline = true };
+        const queue = &self.remask_scratch.items[0].queue;
+        for (chunks) |chunk| {
+            delta += level_grid.remaskChunkFromWorld(chunk, data, world_system);
+            level_grid.recomputeChunkComponents(chunk, queue);
+        }
+        applyBlockedDelta(level_grid, delta);
+    }
+
+    // Applies a signed blocked-cell delta to a level grid's count after a (possibly threaded)
+    // remask. The net count is always non-negative (a remask cannot unblock more than is blocked).
+    fn applyBlockedDelta(level_grid: *NavGrid, delta: isize) void {
+        const signed: isize = @as(isize, @intCast(level_grid.blocked_count)) + delta;
+        level_grid.blocked_count = @intCast(signed);
     }
 
     // Nav cell index of the nav cell containing a world tile's origin corner.
@@ -746,6 +856,7 @@ pub const NavGraph = struct {
 
         // Size the dirty-set scratch (bounded by chunk count) and per-chunk stamps.
         try self.dirty_set.ensureTotalCapacity(self.allocator, chunk_count);
+        try self.changed_chunks.ensureTotalCapacity(self.allocator, chunk_count);
         try setLen(&self.dirty_stamp, self.allocator, chunk_count);
         @memset(self.dirty_stamp.items, 0);
         self.dirty_epoch = 0;

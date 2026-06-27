@@ -220,9 +220,11 @@ pub const NavGrid = struct {
     // Re-derives the blocked mask of EVERY cell in one chunk from the world + static bodies,
     // so a dirty chunk is correct regardless of which individual cells the caller enumerated
     // (coalesced rects, or upstream-coalesced batches). Uses the same per-cell source rule as
-    // the full mark, so a remask is byte-identical to a full rebuild. setBlockedValue is a
-    // no-op for unchanged cells, so blocked_count stays exact.
-    pub fn remaskChunkFromWorld(self: *NavGrid, chunk_id: u32, data: *const DataSystem, world: *const WorldSystem) void {
+    // the full mark, so a remask is byte-identical to a full rebuild. Returns the net change in
+    // blocked-cell count WITHOUT touching `blocked_count`, so this is safe to run on a worker
+    // thread for a chunk it exclusively owns; the caller sums the deltas and applies them to
+    // `blocked_count` once after the (possibly threaded) remask completes.
+    pub fn remaskChunkFromWorld(self: *NavGrid, chunk_id: u32, data: *const DataSystem, world: *const WorldSystem) isize {
         const cx_count = self.chunksX();
         const cx = chunk_id % cx_count;
         const cy = chunk_id / cx_count;
@@ -230,13 +232,19 @@ pub const NavGrid = struct {
         const y0 = cy * self.chunk_tiles;
         const x1 = @min(x0 + self.chunk_tiles, self.width);
         const y1 = @min(y0 + self.chunk_tiles, self.height);
+        var delta: isize = 0;
         var y = y0;
         while (y < y1) : (y += 1) {
             var x = x0;
             while (x < x1) : (x += 1) {
-                self.setBlockedValue(y * self.width + x, self.navCellBlockedFromSources(data, world, x, y));
+                const index = y * self.width + x;
+                const value = self.navCellBlockedFromSources(data, world, x, y);
+                if (self.blocked.items[index] == value) continue;
+                self.blocked.items[index] = value;
+                delta += if (value) 1 else -1;
             }
         }
+        return delta;
     }
 
     // Nav-cell range overlapping an edited world tile's rect (clamped to the grid).
@@ -300,16 +308,6 @@ pub const NavGrid = struct {
         return false;
     }
 
-    pub fn setBlockedValue(self: *NavGrid, index: usize, value: bool) void {
-        if (self.blocked.items[index] == value) return;
-        self.blocked.items[index] = value;
-        if (value) {
-            self.blocked_count += 1;
-        } else {
-            self.blocked_count -= 1;
-        }
-    }
-
     pub fn chunksX(self: *const NavGrid) usize {
         return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
     }
@@ -339,14 +337,16 @@ pub const NavGrid = struct {
         const chunk_count = self.chunksX() * self.chunksY();
         var chunk_id: u32 = 0;
         while (chunk_id < chunk_count) : (chunk_id += 1) {
-            self.recomputeChunkComponents(chunk_id);
+            self.recomputeChunkComponents(chunk_id, &self.component_queue);
         }
     }
 
     // Clears one chunk's cells to no_component and re-floods them with chunk-local
     // labels. Idempotent and self-contained: a chunk's result depends only on its own
-    // mask, so the incremental update re-runs this for each dirty chunk.
-    pub fn recomputeChunkComponents(self: *NavGrid, chunk_id: u32) void {
+    // mask, so the incremental update re-runs this for each dirty chunk. `queue` is the
+    // BFS scratch — `&self.component_queue` on the serial path, or a per-worker queue when
+    // dirty chunks are re-flooded in parallel (the flood writes only this chunk's cells).
+    pub fn recomputeChunkComponents(self: *NavGrid, chunk_id: u32, queue: *std.ArrayList(usize)) void {
         const cx_count = self.chunksX();
         const cx = chunk_id % cx_count;
         const cy = chunk_id / cx_count;
@@ -371,20 +371,20 @@ pub const NavGrid = struct {
                 if (self.blocked.items[index] or self.components.items[index] != no_component) continue;
                 const label = base + local;
                 std.debug.assert(label < no_cell);
-                self.floodComponent(index, @intCast(label));
+                self.floodComponent(index, @intCast(label), queue);
                 local += 1;
             }
         }
     }
 
-    pub fn floodComponent(self: *NavGrid, start_index: usize, component: u32) void {
-        self.component_queue.clearRetainingCapacity();
-        self.component_queue.appendAssumeCapacity(start_index);
+    pub fn floodComponent(self: *NavGrid, start_index: usize, component: u32, queue: *std.ArrayList(usize)) void {
+        queue.clearRetainingCapacity();
+        queue.appendAssumeCapacity(start_index);
         self.components.items[start_index] = component;
         const start_chunk = self.chunkOfCell(start_index);
         var read_index: usize = 0;
-        while (read_index < self.component_queue.items.len) : (read_index += 1) {
-            const current = self.component_queue.items[read_index];
+        while (read_index < queue.items.len) : (read_index += 1) {
+            const current = queue.items[read_index];
             const current_x: i32 = @intCast(current % self.width);
             const current_y: i32 = @intCast(current / self.width);
             for (neighbor_dirs) |dir| {
@@ -401,7 +401,7 @@ pub const NavGrid = struct {
                     continue;
                 }
                 self.components.items[next_index] = component;
-                self.component_queue.appendAssumeCapacity(next_index);
+                queue.appendAssumeCapacity(next_index);
             }
         }
     }

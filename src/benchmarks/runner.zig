@@ -61,5 +61,7 @@ pub fn main(init: std.process.Init) !void {
         },
     };
 
+    // nav_update reuses one world+nav fixture per variant across all cases/counts; free them here.
+    defer nav_update.deinitCaches(init.gpa);
     try suite.runAll(init.gpa, init.io, &benchmark_groups, options);
 }
