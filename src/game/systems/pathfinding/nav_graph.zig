@@ -16,6 +16,7 @@ const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ParallelRange = @import("../../../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
+const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
@@ -210,6 +211,9 @@ pub const NavGraph = struct {
     // Per-participant chunk-patch scratch (worker count + 1, min 1), sized at rebuild. The
     // threaded incremental patch indexes this by worker id; the serial path uses slot 0.
     patch_scratch: std.ArrayList(ChunkPatchScratch) = .empty,
+    // Batch shape of the most recent dirty-chunk patch (which worker profile the tuner picked),
+    // for benchmark/diagnostic reporting. Not part of the graph contract.
+    last_patch_batch: BatchStats = .{},
 
     // Geometric, chunk-stable slot layout, computed once per dimensions/chunk_tiles and
     // invariant across applyNavUpdates (chunk geometry is identical across levels, so this
@@ -514,7 +518,7 @@ pub const NavGraph = struct {
             if (chunks.len > 1 and participants <= self.patch_scratch.items.len) {
                 for (self.patch_scratch.items) |*scratch| scratch.overflow = false;
                 var job = NavPatchJob{ .graph = self, .world = world, .level = level, .chunks = chunks };
-                _ = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
+                self.last_patch_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
                     .adaptive = true,
                     .adaptive_tuner = threads.tuner,
                     .range_alignment_items = 1,
@@ -526,6 +530,7 @@ pub const NavGraph = struct {
                 return overflow;
             }
         }
+        self.last_patch_batch = .{ .item_count = chunks.len, .ran_inline = true };
         var overflow = false;
         const scratch = &self.patch_scratch.items[0];
         for (chunks) |chunk| {
