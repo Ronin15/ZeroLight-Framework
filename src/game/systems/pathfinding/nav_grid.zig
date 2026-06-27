@@ -217,18 +217,24 @@ pub const NavGrid = struct {
     // bounded by the edit footprint instead of the level's cell count. This is what
     // keeps a dig off the O(cells) remask path. The mask must already be correct for
     // unedited cells (it is: built fully at init, then only ever mutated here).
-    pub fn remarkStaticMaskCells(self: *NavGrid, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
-        const world_system = world orelse return;
-        for (edits) |edit| {
-            if (edit.level != self.level) continue;
-            const span = self.navSpanForTile(world_system, edit) orelse continue;
-            var cy = span.min_y;
-            while (cy <= span.max_y) : (cy += 1) {
-                var cx = span.min_x;
-                while (cx <= span.max_x) : (cx += 1) {
-                    const index = cy * self.width + cx;
-                    self.setBlockedValue(index, self.navCellBlockedFromSources(data, world_system, cx, cy));
-                }
+    // Re-derives the blocked mask of EVERY cell in one chunk from the world + static bodies,
+    // so a dirty chunk is correct regardless of which individual cells the caller enumerated
+    // (coalesced rects, or upstream-coalesced batches). Uses the same per-cell source rule as
+    // the full mark, so a remask is byte-identical to a full rebuild. setBlockedValue is a
+    // no-op for unchanged cells, so blocked_count stays exact.
+    pub fn remaskChunkFromWorld(self: *NavGrid, chunk_id: u32, data: *const DataSystem, world: *const WorldSystem) void {
+        const cx_count = self.chunksX();
+        const cx = chunk_id % cx_count;
+        const cy = chunk_id / cx_count;
+        const x0 = cx * self.chunk_tiles;
+        const y0 = cy * self.chunk_tiles;
+        const x1 = @min(x0 + self.chunk_tiles, self.width);
+        const y1 = @min(y0 + self.chunk_tiles, self.height);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                self.setBlockedValue(y * self.width + x, self.navCellBlockedFromSources(data, world, x, y));
             }
         }
     }

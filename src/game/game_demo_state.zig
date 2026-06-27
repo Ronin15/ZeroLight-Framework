@@ -32,7 +32,6 @@ const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
-const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const DigIntent = @import("simulation.zig").DigIntent;
@@ -64,11 +63,6 @@ const obstacle_count = 2;
 const collision_sfx_cooldown_capacity = 32;
 const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_contact_capacity = 64;
-// Soft cap on dirty nav cells buffered per step. A single obstacle rect expands to
-// (w*h) cell edits and can exceed this; overflow is dropped on purpose because
-// applyNavUpdates remasks the whole affected level, so the buffer only needs to flag
-// which levels/chunks changed, not enumerate every cell.
-const nav_dirty_edit_capacity = 16;
 const demo_music = AudioAssetId.demo_music;
 const collision_sfx = AudioAssetId.collision_sfx;
 const jet_sfx = AudioAssetId.player_jet_sfx;
@@ -111,11 +105,6 @@ pub const GameDemoState = struct {
     dynamic_render: DynamicRenderPrep,
     test_squares: [test_square_count]EntityId,
     obstacles: [obstacle_count]EntityId,
-    // Pre-reserved dirty-edit scratch for incremental nav updates. The post-commit
-    // reaction maps blocking world-tile/obstacle events into nav cell edits here, then
-    // feeds them to `pipeline.applyNavUpdates`. Reserved to the event capacity so the
-    // reaction allocates nothing per edit on the steady path.
-    nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
     collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
@@ -305,14 +294,10 @@ pub const GameDemoState = struct {
         };
         state.syncCameraToPlayer();
         try state.ensureDynamicRenderCapacity();
-        // Reserve the dirty-cell scratch once so buffering stays allocation-free on
-        // the steady path; see nav_dirty_edit_capacity for the soft-cap/overflow rule.
-        try state.nav_dirty_edits.ensureTotalCapacity(allocator, nav_dirty_edit_capacity);
         return state;
     }
 
     pub fn deinit(self: *GameDemoState) void {
-        self.nav_dirty_edits.deinit(self.data.allocator);
         self.dynamic_render.deinit();
         self.particles.deinit();
         self.world.deinit();
@@ -770,19 +755,23 @@ pub const GameDemoState = struct {
     // emitted when the graph actually changed.
     fn processPostCommitEvents(self: *GameDemoState) !void {
         self.last_nav_update_stats = .{};
-        self.nav_dirty_edits.clearRetainingCapacity();
+        // The dirty nav-cell buffer is owned by the pathfinding system (it scales with
+        // digging and must not drop cells); this reaction only interprets structural events
+        // into changed cells and forwards them. Clear first so a skipped apply never leaks
+        // stale edits into the next step.
+        self.pipeline.clearNavDirty();
         var entity_obstacle_change = false;
         for (self.simulation_frame.events.mergedItems()) |event| {
             if (event.stage != .structural_commit) continue;
             if (!eventInvalidatesNavigation(event)) continue;
             switch (event.payload) {
-                .world_tile_changed => |changed| self.recordNavDirtyCell(changed.level, changed.x, changed.y),
+                .world_tile_changed => |changed| try self.pipeline.markNavDirty(changed.level, changed.x, changed.y),
                 .world_obstacle_changed => |changed| {
                     var y = changed.min_y;
                     while (y < changed.max_y_exclusive) : (y += 1) {
                         var x = changed.min_x;
                         while (x < changed.max_x_exclusive) : (x += 1) {
-                            self.recordNavDirtyCell(changed.level, x, y);
+                            try self.pipeline.markNavDirty(changed.level, x, y);
                         }
                     }
                 },
@@ -792,11 +781,11 @@ pub const GameDemoState = struct {
                 else => entity_obstacle_change = true,
             }
         }
-        if (entity_obstacle_change) self.recordNavDirtyCell(0, 0, 0);
+        if (entity_obstacle_change) try self.pipeline.markNavDirty(0, 0, 0);
 
-        if (self.nav_dirty_edits.items.len == 0) return;
+        if (!self.pipeline.hasPendingNavUpdates()) return;
         try self.simulation_frame.events.ensureCanAppend(1);
-        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world, self.nav_dirty_edits.items);
+        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world);
         // Only signal invalidation when the batch actually changed the graph. An
         // incremental dig keeps nav_version stable (scoped cache eviction), so gate on
         // real work (`incremental_rebuilds`) too, not just a full-rebuild version bump.
@@ -805,13 +794,6 @@ pub const GameDemoState = struct {
             .stage = .domain_reaction,
             .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
         });
-    }
-
-    // Appends one dirty nav cell edit, dropping silently if the bounded scratch is
-    // full (the version bump still invalidates caches for the cells that fit).
-    fn recordNavDirtyCell(self: *GameDemoState, level: u16, x: u16, y: u16) void {
-        if (self.nav_dirty_edits.items.len >= self.nav_dirty_edits.capacity) return;
-        self.nav_dirty_edits.appendAssumeCapacity(.{ .level = level, .x = x, .y = y });
     }
 
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets) !StructuralCommitStats {
@@ -1697,10 +1679,10 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
     const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
     const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
 
-    // Block a rect whose cell count (5x5 = 25) exceeds nav_dirty_edit_capacity (16) so
-    // the rect-expansion loop overflows the dirty-edit scratch. The level-wide remask
-    // must still leave EVERY covered cell blocked (the dirty set only flags affected
-    // levels/chunks; remask reads the level's full current mask).
+    // A multi-cell obstacle rect: the post-commit reaction expands it to cells, forwards them
+    // to the pathfinding system's dirty buffer, and applyNavUpdates blocks every covered cell.
+    // This is the play-state reaction check (world stays consistent); the engine's no-drop and
+    // whole-chunk remask behavior is covered by the pathfinding system tests.
     const obstacle_layer = try demo.world.addDenseLayer(0, 0, .obstacle, grass);
     const min_x: u16 = 2;
     const min_y: u16 = 2;

@@ -95,6 +95,14 @@ pub const PathfindingSystem = struct {
     affected_levels: std.ArrayList(bool) = .empty,
     // Per-edit changed nav-cell spans driving scoped cache eviction on incremental updates.
     nav_changed_spans: std.ArrayList(types.ChangedSpan) = .empty,
+    // System-owned dirty nav-cell buffer for the per-step incremental update. Producers
+    // (e.g. the gameplay state's post-commit reaction) interpret structural events into
+    // changed cells and push them here via markNavDirty; applyBufferedNavUpdates coalesces
+    // them to a per-chunk remask and clears the buffer. Grows rather than drops, so any
+    // number of simultaneous diggers/obstacle edits in one step still reach the nav graph
+    // (a dropped cell would leave the graph stale against the world). Reserved at capacity
+    // so typical steps are allocation-free; a large step does one bounded amortized grow.
+    nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -142,6 +150,7 @@ pub const PathfindingSystem = struct {
         self.resize_pending_snapshot.deinit(self.allocator);
         self.affected_levels.deinit(self.allocator);
         self.nav_changed_spans.deinit(self.allocator);
+        self.nav_dirty_edits.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
         self.solved_paths.deinit(self.allocator);
@@ -223,6 +232,9 @@ pub const PathfindingSystem = struct {
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
         // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
         try self.nav_changed_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
+        // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
+        // grows (never drops) for an unusually large structural step.
+        try self.nav_dirty_edits.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -398,6 +410,32 @@ pub const PathfindingSystem = struct {
             self.clearRequestStateKeepingCompleted();
             self.dropGroupFields();
         }
+        return stats;
+    }
+
+    // Clears the system-owned dirty nav-cell buffer. Call once before a step's marking pass so
+    // an error path that skips the apply never leaks stale edits into the next step.
+    pub fn clearNavDirty(self: *PathfindingSystem) void {
+        self.nav_dirty_edits.clearRetainingCapacity();
+    }
+
+    // Records one changed nav cell for the next incremental update. Grows the buffer rather
+    // than dropping: applyBufferedNavUpdates coalesces cells to a per-chunk remask, and a
+    // dropped cell would leave the nav graph stale against the world.
+    pub fn markNavDirty(self: *PathfindingSystem, level: u16, x: u16, y: u16) !void {
+        try self.nav_dirty_edits.append(self.allocator, .{ .level = level, .x = x, .y = y });
+    }
+
+    // Whether any dirty nav cell is buffered for this step.
+    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
+        return self.nav_dirty_edits.items.len != 0;
+    }
+
+    // Applies the buffered dirty nav cells as one incremental update, then clears the buffer.
+    // Returns zero stats when nothing is buffered.
+    pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem) !NavUpdateStats {
+        const stats = try self.applyNavUpdates(data, world, self.nav_dirty_edits.items);
+        self.nav_dirty_edits.clearRetainingCapacity();
         return stats;
     }
 
@@ -2574,6 +2612,64 @@ test "pathfinding incremental update with no real change does no work" {
     try std.testing.expectEqual(@as(usize, 0), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
     try std.testing.expectEqual(version_before, system.graph.version);
+}
+
+test "pathfinding buffered nav updates grow without dropping and clear after apply" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 512 extent at cell_size 32 is 16 nav cells/side; with 4-tile chunks that is a 4x4 chunk
+    // grid, so the far block below lands in the opposite-corner chunk from the near block.
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    // Mark far more dirty cells than the steady-path reserve (max_frame_requests = 8): a 24-cell
+    // near block, then a 3-cell far block in the opposite-corner chunk LAST. A drop-on-cap would
+    // lose the far block and its chunk would never remask; the grow-don't-drop buffer must carry
+    // every cell so the far chunk still ends blocked.
+    var marked: usize = 0;
+    var ny: u16 = 0;
+    while (ny < 6) : (ny += 1) {
+        var nx: u16 = 0;
+        while (nx < 4) : (nx += 1) {
+            _ = (try world.setDenseTile(obstacle, nx, ny, tree)) orelse return error.TestExpectedEqual;
+            try system.markNavDirty(0, nx, ny);
+            marked += 1;
+        }
+    }
+    var fx: u16 = 13;
+    while (fx < 16) : (fx += 1) {
+        _ = (try world.setDenseTile(obstacle, fx, 13, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, fx, 13);
+        marked += 1;
+    }
+    try std.testing.expect(marked > abstractCapacity().max_frame_requests);
+    try std.testing.expect(system.hasPendingNavUpdates());
+
+    const stats = try system.applyBufferedNavUpdates(&data, &world);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    // The far block — marked last, the first a fixed cap would drop — reached the graph.
+    const nav = system.graph.grid(0).?;
+    fx = 13;
+    while (fx < 16) : (fx += 1) try std.testing.expect(nav.isBlockedCell(.{ .x = @intCast(fx), .y = 13 }));
+    // applyBuffered clears the buffer, so the next step starts empty.
+    try std.testing.expect(!system.hasPendingNavUpdates());
+
+    // clearNavDirty drops a marking pass without applying it.
+    try system.markNavDirty(0, 0, 0);
+    system.clearNavDirty();
+    try std.testing.expect(!system.hasPendingNavUpdates());
 }
 
 test "pathfinding incremental update is allocation-free at steady state (within init high-water mark)" {

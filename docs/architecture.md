@@ -527,15 +527,23 @@ orchestration may run inline, and expensive consumers should split over
 immutable event slices and write range-owned outputs. `GameDemoState` consumes
 structural events after the commit point and, on static obstacle-affecting
 changes, folds them into the state-owned pathfinding nav graph INCREMENTALLY
-rather than rebuilding the whole world. Blocking `world_tile_changed` /
+rather than rebuilding the whole world. The play state only INTERPRETS events
+into changed nav cells; the dirty buffer and the update itself are owned by
+`PathfindingSystem` (the named owner for work that scales with digging/obstacle
+edits), not the main-thread play state. Blocking `world_tile_changed` /
 `world_obstacle_changed` edits (only when `old_blocks_movement !=
-new_blocks_movement`) plus entity-driven obstacle changes are collected into a
-pre-reserved dirty nav-cell set and fed to `pipeline.applyNavUpdates`, which
-recomputes only the affected levels' blocked masks and components, rebuilds the
-chunk-portal abstract graph once (bounded by chunk borders, not cells), and bumps
-`nav_version` exactly once per batch so every goal-keyed cache/pending entry and
-group field keyed on the old version re-solves. Unaffected levels are never
-touched, and the whole-world build runs only at init. The reaction is recorded
+new_blocks_movement`) plus entity-driven obstacle changes are forwarded to the
+system-owned dirty buffer via `pipeline.markNavDirty`, and `pipeline.applyNavUpdates`
+coalesces them to the set of touched chunks, RE-DERIVES each touched chunk's
+blocked mask from the world WHOLE-CHUNK (so a coalesced rect or a large multi-actor
+batch can never leave a cell stale against the world), recomputes those chunks'
+components, patches the chunk-portal abstract graph once (bounded by chunk borders,
+not cells), and bumps `nav_version` exactly once per batch so every goal-keyed
+cache/pending entry and group field keyed on the old version re-solves. The dirty
+buffer GROWS rather than dropping, so any number of simultaneous diggers or
+obstacle edits in one step all reach the graph — a dropped cell would leave the
+graph stale. Unaffected chunks are never touched, and the whole-world build runs
+only at init. The reaction is recorded
 through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
 counted full relabel only past a configured level threshold), and a
@@ -544,7 +552,9 @@ changed. The update runs single-threaded at the main-thread post-commit reaction
 point and is allocation-free on the steady path: the abstract chunk-portal
 buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
-mark grows no buffer. A genuine topology expansion past it (an unblock opening
+mark grows no buffer. The system-owned dirty buffer is likewise reserved to a
+steady-path high-water and does one bounded amortized grow only for an unusually
+large structural step. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
 acceptable on this cold, event-triggered path. The `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border

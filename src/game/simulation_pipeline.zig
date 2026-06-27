@@ -29,7 +29,6 @@ const MovementSystem = @import("systems/movement.zig").MovementSystem;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
-const NavCellEdit = @import("systems/pathfinding.zig").NavCellEdit;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
@@ -161,16 +160,33 @@ pub const SimulationPipeline = struct {
         try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size);
     }
 
-    /// Folds a batch of static-obstacle edits into the existing nav graph
-    /// incrementally (affected levels only, single `nav_version` bump) rather than
-    /// rebuilding the whole world. The whole-world build path stays init-only.
+    /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
+    /// marking pass so a skipped apply never leaks stale edits into the next step.
+    pub fn clearNavDirty(self: *SimulationPipeline) void {
+        self.pathfinding.clearNavDirty();
+    }
+
+    /// Records one changed nav cell (from a structural event) for the next incremental
+    /// update. The system-owned buffer grows rather than drops, so any number of edits in
+    /// one step reach the nav graph.
+    pub fn markNavDirty(self: *SimulationPipeline, level: u16, x: u16, y: u16) !void {
+        try self.pathfinding.markNavDirty(level, x, y);
+    }
+
+    /// Whether any dirty nav cell is buffered for this step.
+    pub fn hasPendingNavUpdates(self: *const SimulationPipeline) bool {
+        return self.pathfinding.hasPendingNavUpdates();
+    }
+
+    /// Folds the buffered static-obstacle edits into the existing nav graph incrementally
+    /// (affected levels only, single `nav_version` bump) rather than rebuilding the whole
+    /// world, then clears the buffer. The whole-world build path stays init-only.
     pub fn applyNavUpdates(
         self: *SimulationPipeline,
         data: *const DataSystem,
         world: *const WorldSystem,
-        edits: []const NavCellEdit,
     ) !NavUpdateStats {
-        return self.pathfinding.applyNavUpdates(data, world, edits);
+        return self.pathfinding.applyBufferedNavUpdates(data, world);
     }
 
     /// Synchronizes interpolation history for pipeline-owned movement state.

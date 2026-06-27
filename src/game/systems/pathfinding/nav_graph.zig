@@ -368,29 +368,29 @@ pub const NavGraph = struct {
         // Purely diagnostic and O(edits^2); only pay for it when perf logging consumes it.
         if (runtime_perf_log.enabled) stats.dirty_chunks = self.countDirtyChunks(world, edits);
 
-        // Re-derive the blocked mask of affected levels over the edit footprint only.
-        // Past the threshold a level-count blowup degenerates to a full graph rebuild;
-        // flag it loudly rather than silently doing whole-world component work.
+        // Re-derive the blocked mask + chunk-local components of every chunk an edit touched,
+        // reading the world over the WHOLE chunk (not just enumerated cells) so cells the
+        // producer coalesced or dropped upstream are still correct. Deduped per chunk and
+        // byte-identical to a full mark. Past the threshold a level-count blowup degenerates
+        // to a full graph rebuild; flag it loudly rather than silently doing whole-world work.
         const full_relabel = affected_level_count > full_relabel_level_threshold;
-        for (self.levels.items, 0..) |*level_grid, level_index| {
-            if (!full_relabel and !affected_levels.items[level_index]) continue;
-            level_grid.remarkStaticMaskCells(data, world, edits);
-        }
-
         if (full_relabel) {
+            for (self.levels.items, 0..) |_, level_index| {
+                if (!affected_levels.items[level_index]) continue;
+                self.remaskChangedChunks(@intCast(level_index), data, world, edits);
+            }
             for (self.levels.items) |*level_grid| level_grid.buildComponents();
             try self.buildAbstractGraphs(world);
             stats.full_relabel = 1;
         } else {
-            // Chunk-local labels: only chunks whose cells changed need re-flooding (a tile
-            // rect can straddle a chunk border, so dirty chunks come from the full
-            // navSpanForTile rect). Neighbor chunks added below are NOT re-flooded — their
-            // mask is untouched — only their abstract layer is patched.
-            self.recomputeDirtyChunks(world, edits);
             var overflow = false;
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
                 const level: u16 = @intCast(level_index);
+                // Changed chunks: remask from world + re-flood components (deduped). Neighbor
+                // chunks added by buildDirtySet are NOT remasked/re-flooded — their mask is
+                // untouched — only their abstract layer is patched below.
+                self.remaskChangedChunks(level, data, world, edits);
                 self.buildDirtySet(level, world, edits);
                 stats.chunks_patched += self.dirty_set.items.len;
                 for (self.dirty_set.items) |chunk| {
@@ -486,27 +486,34 @@ pub const NavGraph = struct {
         return count;
     }
 
-    // Re-floods the chunk-local components of every chunk whose cells were touched by
-    // an edit's navSpanForTile rect. recomputeChunkComponents is idempotent, so an edit
-    // straddling a chunk border (or two edits sharing a chunk) re-flooding the same
-    // chunk twice is harmless. Bounded by the edit footprint, not the level cell count.
-    pub fn recomputeDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+    // For ONE level, re-derives the blocked mask (from the world, whole-chunk) and re-floods
+    // the chunk-local components of every distinct chunk an edit's navSpanForTile rect touches.
+    // Deduped via the dirty-chunk stamp so a multi-cell edit, a border-straddling rect, or
+    // several edits sharing a chunk remask/re-flood it exactly once. Bounded by the edit
+    // footprint's chunk set, not the level cell count. Reads the world whole-chunk so cells the
+    // producer coalesced or dropped are still correct. The epoch bump is independent of
+    // buildDirtySet's (called next per level), so the two never alias a stamp.
+    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
         const world_system = world orelse return;
+        const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
+        const cx_count = level_grid.chunksX();
+        self.dirty_epoch +%= 1;
+        const epoch = self.dirty_epoch;
         for (edits) |edit| {
-            if (@as(usize, edit.level) >= self.levels.items.len) continue;
-            const level_grid = &self.levels.items[edit.level];
+            if (edit.level != level) continue;
             const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
-            const cx_count = level_grid.chunksX();
-            const cx0 = span.min_x / ct;
-            const cx1 = span.max_x / ct;
-            const cy0 = span.min_y / ct;
+            var cy = span.min_y / ct;
             const cy1 = span.max_y / ct;
-            var cy = cy0;
             while (cy <= cy1) : (cy += 1) {
-                var cx = cx0;
+                var cx = span.min_x / ct;
+                const cx1 = span.max_x / ct;
                 while (cx <= cx1) : (cx += 1) {
-                    level_grid.recomputeChunkComponents(@intCast(cy * cx_count + cx));
+                    const chunk: u32 = @intCast(cy * cx_count + cx);
+                    if (self.dirty_stamp.items[chunk] == epoch) continue;
+                    self.dirty_stamp.items[chunk] = epoch;
+                    level_grid.remaskChunkFromWorld(chunk, data, world_system);
+                    level_grid.recomputeChunkComponents(chunk);
                 }
             }
         }
@@ -1612,4 +1619,51 @@ test "incremental single-chunk dig patches a constant chunk set independent of w
     }
     try std.testing.expectEqual(@as(usize, 5), patched[0]);
     try std.testing.expectEqual(patched[0], patched[1]);
+}
+
+test "incremental nav update across distant chunks in one batch matches a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 512 extent at cell_size 32 is 16 nav cells/side; with 4-tile chunks that is a 4x4 chunk
+    // grid, so the two digs below land in opposite-corner chunks with clear space between them.
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    // Two digs in opposite-corner chunks applied as ONE batch. The whole-chunk remask-from-world
+    // must reach BOTH distant chunks; a producer that dropped either (or a per-cell remask that
+    // missed a coalesced cell) would leave that chunk stale, so the incremental graph must equal
+    // a fresh full rebuild against the same world.
+    const cells = [_]struct { x: u16, y: u16 }{ .{ .x = 1, .y = 1 }, .{ .x = 13, .y = 13 } };
+    var edits: [cells.len]NavCellEdit = undefined;
+    for (cells, 0..) |cell, i| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        edits[i] = .{ .level = 0, .x = cell.x, .y = cell.y };
+    }
+    _ = try system.applyNavUpdates(&data, &world, &edits);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    const inc = system.graph.levelGraph(0).?;
+    const full = rebuilt.graph.levelGraph(0).?;
+    try std.testing.expectEqualSlices(PortalNode, full.portals.items, inc.portals.items);
+    try std.testing.expectEqualSlices(u32, full.cell_to_portal.items, inc.cell_to_portal.items);
+    // Both distant chunks ended blocked in the incremental graph's mask (no dropped cell).
+    const nav = system.graph.grid(0).?;
+    for (cells) |cell| try std.testing.expect(nav.isBlockedCell(.{ .x = @intCast(cell.x), .y = @intCast(cell.y) }));
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
