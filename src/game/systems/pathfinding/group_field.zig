@@ -249,3 +249,83 @@ pub const GroupField = struct {
         return grid.cellCenter(next_index);
     }
 };
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+const OpenNode = types.OpenNode;
+const popHeap = types.popHeap;
+const siftUp = types.siftUp;
+const default_cell_size = types.default_cell_size;
+const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
+
+// Reference reverse-Dijkstra integration field over a NavGrid using a binary heap with
+// the same octile step costs, strict-improvement relaxation, and (cost, index) tie
+// order as a priority-queue Dijkstra. The production GroupField's Dial's bucket queue
+// must reproduce this field byte-for-byte (costs AND flow directions).
+fn referenceFlowField(allocator: std.mem.Allocator, grid: *const NavGrid, goal_index: usize, out_cost: []u32, out_dir: []u8) !void {
+    @memset(out_cost, unreachable_cost);
+    @memset(out_dir, GroupField.no_flow);
+    var heap = std.ArrayList(OpenNode).empty;
+    defer heap.deinit(allocator);
+    out_cost[goal_index] = 0;
+    try heap.append(allocator, .{ .index = goal_index, .f = 0, .h = 0 });
+    while (heap.items.len != 0) {
+        const current = popHeap(&heap);
+        if (out_cost[current.index] != current.f) continue;
+        const cx: i32 = @intCast(current.index % grid.width);
+        const cy: i32 = @intCast(current.index / grid.width);
+        for (neighbor_dirs, 0..) |dir, dir_index| {
+            const next_index = grid.indexForCell(.{ .x = cx + dir.x, .y = cy + dir.y }) orelse continue;
+            if (grid.isBlockedIndex(next_index)) continue;
+            if (dir.diagonal and (grid.isBlockedCell(.{ .x = cx + dir.x, .y = cy }) or grid.isBlockedCell(.{ .x = cx, .y = cy + dir.y }))) continue;
+            const candidate = current.f + (if (dir.diagonal) diagonal_cost else cardinal_cost);
+            if (candidate >= out_cost[next_index]) continue;
+            out_cost[next_index] = candidate;
+            out_dir[next_index] = oppositeDirIndex(dir_index);
+            try heap.append(allocator, .{ .index = next_index, .f = candidate, .h = 0 });
+            siftUp(heap.items, heap.items.len - 1);
+        }
+    }
+}
+
+test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra field" {
+    const allocator = std.testing.allocator;
+    var grid = NavGrid{};
+    defer grid.deinit(allocator);
+    try grid.prepare(allocator, 0, 20, 20, default_cell_size, default_nav_chunk_tiles, 1);
+    // A diagonal-ish obstacle pattern so the field has equal-cost cells reachable from
+    // multiple predecessors (the case where pop order could change flow directions).
+    const blocked_cells = [_][2]usize{ .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 6, 5 }, .{ 7, 5 }, .{ 10, 10 }, .{ 11, 10 }, .{ 12, 10 }, .{ 3, 12 }, .{ 4, 12 }, .{ 14, 6 }, .{ 14, 7 } };
+    for (blocked_cells) |bc| grid.markBlockedIndex(bc[1] * grid.width + bc[0]);
+    grid.buildComponents();
+
+    const cell_count = grid.cellCount();
+    const ref_cost = try allocator.alloc(u32, cell_count);
+    defer allocator.free(ref_cost);
+    const ref_dir = try allocator.alloc(u8, cell_count);
+    defer allocator.free(ref_dir);
+    const goal_index = 9 * grid.width + 9;
+    try referenceFlowField(allocator, &grid, goal_index, ref_cost, ref_dir);
+
+    var field = GroupField{};
+    defer field.deinit(allocator);
+    try field.reserve(allocator, cell_count);
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1));
+    // Build in tiny budgeted chunks so the cross-frame resume path is exercised too.
+    var guard: usize = 0;
+    while (field.state == .building and guard < cell_count + 8) : (guard += 1) {
+        _ = field.expand(&grid, 7);
+    }
+    try std.testing.expectEqual(GroupFieldState.ready, field.state);
+
+    // Every cell's integration cost and flow direction matches the reference exactly.
+    for (0..cell_count) |i| {
+        const dial_cost = field.cost(i);
+        try std.testing.expectEqual(ref_cost[i], dial_cost);
+        if (ref_cost[i] != unreachable_cost) {
+            try std.testing.expectEqual(ref_dir[i], field.flow_dir.items[i]);
+        }
+    }
+}

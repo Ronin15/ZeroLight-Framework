@@ -120,3 +120,27 @@ pub const NavMemoryBudget = struct {
         if (self.requiredBytes(width, height) > self.max_bytes) return NavGridError.NavWorldTooLarge;
     }
 };
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+const DataSystem = @import("../../data_system.zig").DataSystem;
+const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const test_support = @import("test_support.zig");
+const addNavBody = test_support.addNavBody;
+const baselineCapacity = test_support.baselineCapacity;
+
+test "pathfinding rebuild fails loud on oversized nav world" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_nav_memory_bytes = 1024;
+    try system.reserve(capacity);
+    // 512x512 cells far exceed a 1 KiB nav-memory ceiling.
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, system.rebuildStaticNavGrid(&data, 512, 512, 32));
+}

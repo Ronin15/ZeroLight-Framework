@@ -451,3 +451,69 @@ pub fn staticBodyWorldRect(data: *const DataSystem, bounds: anytype, entity: Ent
         .max_y = min_y + bounds.size_y[bounds_index],
     };
 }
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const test_support = @import("test_support.zig");
+const baselineCapacity = test_support.baselineCapacity;
+const addNavBody = test_support.addNavBody;
+
+test "pathfinding nav grid blocked set matches per-level composed mask" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const asset_store = @import("../../../assets/assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try @import("../../../assets/world_tileset_meta.zig").load(
+        std.testing.allocator,
+        asset_store,
+        @import("../../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const extra_band = try world.addDenseLayer(0, 0, .obstacle, grass);
+    _ = try world.setDenseTile(extra_band, 5, 6, tree);
+    _ = try world.setDenseTile(extra_band, 2, 1, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+
+    var expected_blocked: usize = 0;
+    for (0..world.height) |y_usize| {
+        const y: u16 = @intCast(y_usize);
+        for (0..world.width) |x_usize| {
+            const x: u16 = @intCast(x_usize);
+            const expect_blocked = world.levelBlocksMovement(0, x, y);
+            if (expect_blocked) expected_blocked += 1;
+            try std.testing.expectEqual(expect_blocked, system.graph.grid(0).?.isBlockedCell(.{
+                .x = @intCast(x),
+                .y = @intCast(y),
+            }));
+        }
+    }
+    try std.testing.expect(expected_blocked > 0);
+    try std.testing.expectEqual(expected_blocked, system.graph.grid(0).?.blocked_count);
+}
+
+test "pathfinding nav grid survives degenerate cell size and bounds" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, true);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+
+    // cell_size 0 and a non-finite bound would feed inf/NaN into @intFromFloat;
+    // the guard collapses to at least a 1x1 grid instead of crashing.
+    try system.rebuildStaticNavGrid(&data, std.math.inf(f32), 256, 0);
+    try std.testing.expect(system.graph.width >= 1);
+    try std.testing.expect(system.graph.height >= 1);
+}

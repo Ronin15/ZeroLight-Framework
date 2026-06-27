@@ -1054,3 +1054,557 @@ pub const PortalComponentSort = struct {
         return a_cell < b_cell;
     }
 };
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const test_support = @import("test_support.zig");
+const abstractCapacity = test_support.abstractCapacity;
+const loadTestWorldMeta = test_support.loadTestWorldMeta;
+const requireTestTile = test_support.requireTestTile;
+
+// Normalized abstract edge identity for parity comparison: stable across the two
+// independent builds' portal-node numbering because it keys on (level, cell) endpoints.
+const ParityEdge = struct {
+    level_from: u16,
+    cell_from: u32,
+    level_to: u16,
+    cell_to: u32,
+    cost: u32,
+    crosses_level: bool,
+
+    fn lessThan(_: void, a: ParityEdge, b: ParityEdge) bool {
+        if (a.level_from != b.level_from) return a.level_from < b.level_from;
+        if (a.cell_from != b.cell_from) return a.cell_from < b.cell_from;
+        if (a.level_to != b.level_to) return a.level_to < b.level_to;
+        if (a.cell_to != b.cell_to) return a.cell_to < b.cell_to;
+        if (a.cost != b.cost) return a.cost < b.cost;
+        return @intFromBool(a.crosses_level) < @intFromBool(b.crosses_level);
+    }
+};
+
+// Collects every abstract edge of `graph` as a normalized (level,cell)->(level,cell)
+// tuple multiset (sorted), independent of portal-node numbering: each level's CSR edges
+// (crosses_level=false) plus the global link_edges (crosses_level=true, both directions
+// for a bidirectional link).
+fn collectParityEdges(graph: *const NavGraph, out: *std.ArrayList(ParityEdge)) !void {
+    out.clearRetainingCapacity();
+    for (graph.level_graphs.items) |*lg| {
+        for (lg.portals.items, 0..) |from, node_index| {
+            if (from.cell_index == no_cell) continue;
+            const begin = lg.portal_edge_start.items[node_index];
+            const end = begin + lg.portal_edge_count.items[node_index];
+            for (lg.portal_edges.items[begin..end]) |edge| {
+                const to = lg.portals.items[edge.target];
+                try out.append(std.testing.allocator, .{
+                    .level_from = from.level,
+                    .cell_from = from.cell_index,
+                    .level_to = to.level,
+                    .cell_to = to.cell_index,
+                    .cost = edge.cost,
+                    .crosses_level = false,
+                });
+            }
+        }
+    }
+    for (graph.link_edges.items) |link| {
+        try out.append(std.testing.allocator, .{
+            .level_from = link.from_level,
+            .cell_from = link.from_cell,
+            .level_to = link.to_level,
+            .cell_to = link.to_cell,
+            .cost = link.cost,
+            .crosses_level = true,
+        });
+        if (link.bidirectional) {
+            try out.append(std.testing.allocator, .{
+                .level_from = link.to_level,
+                .cell_from = link.to_cell,
+                .level_to = link.from_level,
+                .cell_to = link.from_cell,
+                .cost = link.cost,
+                .crosses_level = true,
+            });
+        }
+    }
+    std.sort.pdq(ParityEdge, out.items, {}, ParityEdge.lessThan);
+}
+
+// Asserts the incremental graph `a` is identical to the full-rebuild graph `b`:
+// (a) per-level blocked mask + count, (b) per-level chunk-local component labels
+// cell-by-cell, (c) portals as the normalized {(level,cell)} set via cell_to_portal
+// membership agreement, and (d) edges as the normalized multiset.
+fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
+    const t = std.testing;
+    try t.expectEqual(a.levels.items.len, b.levels.items.len);
+    try t.expectEqual(a.cellCount(), b.cellCount());
+    const cell_count = a.cellCount();
+    for (a.levels.items, 0..) |*ga, level_index| {
+        const gb = &b.levels.items[level_index];
+        try t.expectEqual(ga.blocked_count, gb.blocked_count);
+        for (0..cell_count) |i| {
+            try t.expectEqual(ga.blocked.items[i], gb.blocked.items[i]);
+            try t.expectEqual(ga.components.items[i], gb.components.items[i]);
+        }
+    }
+    // (c) per-level cell_to_portal membership agreement (the {(level,cell)} portal set
+    // agrees on which cells are portals).
+    for (a.level_graphs.items, 0..) |*la, level_index| {
+        const lb = &b.level_graphs.items[level_index];
+        try t.expectEqual(cell_count, la.cell_to_portal.items.len);
+        try t.expectEqual(cell_count, lb.cell_to_portal.items.len);
+        for (0..cell_count) |i| {
+            try t.expectEqual(la.cell_to_portal.items[i] == no_cell, lb.cell_to_portal.items[i] == no_cell);
+        }
+    }
+    // (d) edges as a normalized sorted multiset.
+    var a_edges = std.ArrayList(ParityEdge).empty;
+    defer a_edges.deinit(std.testing.allocator);
+    var b_edges = std.ArrayList(ParityEdge).empty;
+    defer b_edges.deinit(std.testing.allocator);
+    try collectParityEdges(a, &a_edges);
+    try collectParityEdges(b, &b_edges);
+    try t.expectEqual(a_edges.items.len, b_edges.items.len);
+    for (a_edges.items, b_edges.items) |ea, eb| {
+        try t.expectEqual(ea, eb);
+    }
+}
+
+test "incremental nav update remask matches the composed world mask across levels" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const asset_store = @import("../../../assets/assets.zig").AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try @import("../../../assets/world_tileset_meta.zig").load(
+        std.testing.allocator,
+        asset_store,
+        @import("../../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    // Small 4-tile chunks (abstractCapacity) so the 8x8 nav grid spans 2x2 chunks per
+    // level and the edits straddle chunk boundaries — exercising chunk-local relabel.
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+
+    // Each edit flips a tile's blocking state: carve an underground tunnel cell,
+    // punch an underground drop-hole, and block a surface cell.
+    const cave_0 = (meta.tileByName("cave_0") orelse return error.TestExpectedEqual).id;
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    _ = try world.setDenseTile(floor1, 3, 3, cave_0); // solid dirt -> walkable tunnel
+    _ = try world.clearDenseTile(floor1, 4, 3); // solid dirt -> see-through hole
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+    _ = try world.setDenseTile(floor0, 2, 2, tree); // surface walkable -> blocked
+
+    const edits = [_]NavCellEdit{
+        .{ .level = 1, .x = 3, .y = 3 },
+        .{ .level = 1, .x = 4, .y = 3 },
+        .{ .level = 0, .x = 2, .y = 2 },
+    };
+    _ = try system.applyNavUpdates(&data, &world, &edits);
+
+    // The incremental remask must equal the authoritative composed mask on every
+    // level and cell, with a consistent blocked_count — i.e. identical to a full
+    // recompose, but touching only the dirty footprint.
+    for (0..world.levelCount()) |level_usize| {
+        const level: u16 = @intCast(level_usize);
+        const grid = system.graph.grid(level).?;
+        var expected_blocked: usize = 0;
+        for (0..world.height) |y_usize| {
+            const y: u16 = @intCast(y_usize);
+            for (0..world.width) |x_usize| {
+                const x: u16 = @intCast(x_usize);
+                const expect = world.levelBlocksMovement(level, x, y);
+                if (expect) expected_blocked += 1;
+                try std.testing.expectEqual(expect, grid.isBlockedCell(.{ .x = @intCast(x), .y = @intCast(y) }));
+            }
+        }
+        try std.testing.expectEqual(expected_blocked, grid.blocked_count);
+    }
+
+    // The incremental graph must be IDENTICAL to a full rebuild against the same
+    // post-edit world/data: same masks, same chunk-local component labels, same portals,
+    // and the same abstract edge multiset.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+// Counts live cross-level link edges in `graph` (directed, expanding a bidirectional
+// link into its two directions to match collectParityEdges).
+fn countCrossLevelEdges(graph: *const NavGraph) usize {
+    var count: usize = 0;
+    for (graph.link_edges.items) |link| count += if (link.bidirectional) 2 else 1;
+    return count;
+}
+
+test "incremental nav update splitting a chunk-local component matches a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 12x12 open world, 4-tile chunks. Chunk (1,1) spans cells x4..7, y4..7 and starts
+    // as one open local component.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const grid = system.graph.grid(0).?;
+    const left = grid.indexForCell(.{ .x = 4, .y = 5 }).?;
+    const right = grid.indexForCell(.{ .x = 6, .y = 5 }).?;
+    // Before: both cells share chunk (1,1)'s single open local component.
+    try std.testing.expect(grid.connected(left, right));
+
+    // Drop a full-height wall at x=5 inside chunk (1,1), bisecting its open region.
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    var edits = std.ArrayList(NavCellEdit).empty;
+    defer edits.deinit(std.testing.allocator);
+    var wy: u16 = 4;
+    while (wy <= 7) : (wy += 1) {
+        const changed = (try world.setDenseTile(wall_layer, 5, wy, tree)) orelse return error.TestExpectedEqual;
+        try edits.append(std.testing.allocator, .{ .level = changed.level, .x = changed.x, .y = changed.y });
+    }
+    _ = try system.applyNavUpdates(&data, &world, edits.items);
+
+    // After: the chunk-local component split into two distinct labels.
+    try std.testing.expect(grid.componentOf(left) != no_component);
+    try std.testing.expect(grid.componentOf(right) != no_component);
+    try std.testing.expect(!grid.connected(left, right));
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update on a chunk border flips a neighbor chunk's portal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 12x12 open world, 4-tile chunks. The vertical border at x=4 puts cell (3,5) in
+    // chunk (0,1) and its open neighbor (4,5) in chunk (1,1); both are border portals.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const grid = system.graph.grid(0).?;
+    const near = grid.indexForCell(.{ .x = 3, .y = 5 }).?; // chunk (0,1), the edited side
+    const neighbor = grid.indexForCell(.{ .x = 4, .y = 5 }).?; // chunk (1,1)
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(near)) != null);
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(neighbor)) != null);
+    const neighbor_label_before = grid.componentOf(neighbor);
+
+    // Block (3,5) on the chunk (0,1) side: the (3,5)|(4,5) portal pair disappears, so
+    // the NEIGHBOR chunk (1,1)'s portal at (4,5) flips off even though only chunk (0,1)
+    // is relabeled.
+    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    const changed = (try world.setDenseTile(obstacle_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(near)) == null);
+    try std.testing.expect(system.graph.portalIndex(0, @intCast(neighbor)) == null);
+    // The neighbor chunk's component labels were NOT recomputed: (4,5) keeps its label.
+    try std.testing.expectEqual(neighbor_label_before, grid.componentOf(neighbor));
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update opening a ramp endpoint adds a live LevelLink edge" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 2, 2, tree); // ramp endpoint starts blocked
+    try world.addLevelLink(.{
+        .kind = .stair,
+        .level_a = 0,
+        .cell_a = .{ .x = 10, .y = 10 },
+        .level_b = 1,
+        .cell_b = .{ .x = 2, .y = 2 },
+        .traversal_cost = 5,
+        .bidirectional = true,
+    });
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    // Endpoint blocked => link not live => no cross-level edge.
+    try std.testing.expectEqual(@as(usize, 0), countCrossLevelEdges(&system.graph));
+
+    // Dig the ramp endpoint open: buildLinkEdges re-derives the link as live.
+    const changed = (try world.setDenseTile(level1_obstacle, 2, 2, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    // Bidirectional link now contributes its crosses_level edge pair.
+    try std.testing.expect(countCrossLevelEdges(&system.graph) > 0);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental underground dig leaves the surface level abstract graph byte-identical" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // Open 12x12 surface (level 0) spanning many 4-tile chunks, plus an underground
+    // level 1 with a diggable obstacle. The surface graph is large (the regression the
+    // per-level split targets); an underground dig must do ZERO work on it.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 5, 5, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    // Snapshot level 0's per-level abstract graph contents.
+    const lg0 = system.graph.levelGraph(0).?;
+    try std.testing.expect(lg0.liveCount() > 0);
+    const portals_before = try std.testing.allocator.dupe(PortalNode, lg0.portals.items);
+    defer std.testing.allocator.free(portals_before);
+    const edges_before = try std.testing.allocator.dupe(AbstractEdge, lg0.portal_edges.items);
+    defer std.testing.allocator.free(edges_before);
+    const start_before = try std.testing.allocator.dupe(u32, lg0.portal_edge_start.items);
+    defer std.testing.allocator.free(start_before);
+    const count_before = try std.testing.allocator.dupe(u32, lg0.portal_edge_count.items);
+    defer std.testing.allocator.free(count_before);
+    const c2p_before = try std.testing.allocator.dupe(u32, lg0.cell_to_portal.items);
+    defer std.testing.allocator.free(c2p_before);
+
+    // Dig an UNDERGROUND-only cell open (level 1).
+    const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(changed.old_blocks_movement and !changed.new_blocks_movement);
+    const stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    // The surface's portals, CSR edges/windows, and cell_to_portal are byte-for-byte
+    // unchanged: an underground edit costs nothing on the (large) surface graph.
+    const lg0_after = system.graph.levelGraph(0).?;
+    try std.testing.expectEqualSlices(PortalNode, portals_before, lg0_after.portals.items);
+    try std.testing.expectEqualSlices(AbstractEdge, edges_before, lg0_after.portal_edges.items);
+    try std.testing.expectEqualSlices(u32, start_before, lg0_after.portal_edge_start.items);
+    try std.testing.expectEqualSlices(u32, count_before, lg0_after.portal_edge_count.items);
+    try std.testing.expectEqualSlices(u32, c2p_before, lg0_after.cell_to_portal.items);
+    // Sanity: the underground level DID change (not a no-op batch).
+    try std.testing.expect(!system.graph.grid(1).?.isBlockedCell(.{ .x = 5, .y = 5 }));
+
+    // And it still matches a full rebuild on every level.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental dig keeps the changed level's portal slots byte-identical to a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 5, 5, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    const changed = (try world.setDenseTile(level1_obstacle, 5, 5, grass)) orelse return error.TestExpectedEqual;
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+
+    // The slot layout is pure geometry and liveness a pure function of the (identical) mask,
+    // so portals[] and cell_to_portal[] on the CHANGED level are byte-identical to a fresh
+    // full rebuild even though the edge windows (per-chunk slack) are not.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const inc = system.graph.levelGraph(1).?;
+    const full = rebuilt.graph.levelGraph(1).?;
+    try std.testing.expectEqualSlices(PortalNode, full.portals.items, inc.portals.items);
+    try std.testing.expectEqualSlices(u32, full.cell_to_portal.items, inc.cell_to_portal.items);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update applies the same edit batch deterministically" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    // Apply a multi-cell straddling edit, snapshot the changed level, then rebuild from the
+    // same start state and apply the same batch again: the result must be identical.
+    const edits = [_]NavCellEdit{ .{ .level = 0, .x = 5, .y = 5 }, .{ .level = 0, .x = 6, .y = 5 }, .{ .level = 0, .x = 5, .y = 6 } };
+    _ = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
+    _ = (try world.setDenseTile(obstacle, 6, 5, tree)) orelse return error.TestExpectedEqual;
+    _ = (try world.setDenseTile(obstacle, 5, 6, tree)) orelse return error.TestExpectedEqual;
+    _ = try system.applyNavUpdates(&data, &world, &edits);
+
+    const portals_a = try std.testing.allocator.dupe(PortalNode, system.graph.levelGraph(0).?.portals.items);
+    defer std.testing.allocator.free(portals_a);
+    const c2p_a = try std.testing.allocator.dupe(u32, system.graph.levelGraph(0).?.cell_to_portal.items);
+    defer std.testing.allocator.free(c2p_a);
+    var edges_a = std.ArrayList(ParityEdge).empty;
+    defer edges_a.deinit(std.testing.allocator);
+    try collectParityEdges(&system.graph, &edges_a);
+
+    var second = PathfindingSystem.init(std.testing.allocator);
+    defer second.deinit();
+    try second.reserve(abstractCapacity());
+    try second.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    var edges_b = std.ArrayList(ParityEdge).empty;
+    defer edges_b.deinit(std.testing.allocator);
+    try collectParityEdges(&second.graph, &edges_b);
+
+    try std.testing.expectEqualSlices(PortalNode, portals_a, second.graph.levelGraph(0).?.portals.items);
+    try std.testing.expectEqualSlices(u32, c2p_a, second.graph.levelGraph(0).?.cell_to_portal.items);
+    try std.testing.expectEqual(edges_a.items.len, edges_b.items.len);
+    for (edges_a.items, edges_b.items) |ea, eb| try std.testing.expectEqual(ea, eb);
+}
+
+test "incremental dig overflowing a chunk edge window falls back to a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    // Wall the whole world at init so every chunk's edge window is sized to the floor. Then
+    // open a large block so an affected chunk's edges blow past the floor*slack window,
+    // forcing the loud edge-cap fallback.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    const wall_layer = try world.addDenseLayer(0, 0, .obstacle, tree);
+    var y: u16 = 0;
+    while (y < 12) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 12) : (x += 1) _ = try world.setDenseTile(wall_layer, x, y, tree);
+    }
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    var edits = std.ArrayList(NavCellEdit).empty;
+    defer edits.deinit(std.testing.allocator);
+    y = 0;
+    while (y < 12) : (y += 1) {
+        var x: u16 = 0;
+        while (x < 12) : (x += 1) {
+            const opened = (try world.setDenseTile(wall_layer, x, y, grass)) orelse continue;
+            try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
+        }
+    }
+    const stats = try system.applyNavUpdates(&data, &world, edits.items);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), stats.edge_cap_fallback);
+
+    // The fallback still produces a graph equivalent to an independent full rebuild.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental single-chunk dig patches a constant chunk set independent of world size" {
+    // The dirty-bounded work proxy: a one-cell dig in an interior chunk patches that chunk
+    // plus its four orthogonal neighbors (5), regardless of how large the level is. If this
+    // ever scaled with world size, dirty-bounding would have silently regressed.
+    const extents = [_]f32{ 512, 1024 };
+    var patched: [extents.len]usize = undefined;
+    for (extents, 0..) |extent, i| {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var meta = try loadTestWorldMeta(std.testing.allocator);
+        defer meta.deinit();
+        const grass = try requireTestTile(&meta, "grass");
+        const tree = try requireTestTile(&meta, "tree_0");
+
+        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        defer world.deinit();
+        const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(abstractCapacity());
+        try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+        // Cell (5,5) sits in chunk (1,1) (4-tile chunks): interior for both worlds.
+        const changed = (try world.setDenseTile(obstacle, 5, 5, tree)) orelse return error.TestExpectedEqual;
+        const stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+        patched[i] = stats.chunks_patched;
+    }
+    try std.testing.expectEqual(@as(usize, 5), patched[0]);
+    try std.testing.expectEqual(patched[0], patched[1]);
+}

@@ -41,5 +41,5 @@ test {
     _ = @import("pathfinding/caches.zig");
     _ = @import("pathfinding/solve.zig");
     _ = @import("pathfinding/system.zig");
-    _ = @import("pathfinding/tests.zig");
+    _ = @import("pathfinding/test_support.zig");
 }

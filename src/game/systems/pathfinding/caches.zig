@@ -315,3 +315,44 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCe
     const next = if (nearest + 1 < best_run_end) nearest + 1 else nearest;
     return start_grid.cellCenter(stitched[next].cell);
 }
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+test "pathfinding fixed-capacity unavailable key set has explicit fixed capacity" {
+    var keys = KeySet{};
+    defer keys.deinit(std.testing.allocator);
+    try keys.reserve(std.testing.allocator, 1);
+    var first_key = emptyKey(1);
+    first_key.goal.x = 1;
+    var second_key = emptyKey(1);
+    second_key.goal.x = 2;
+
+    try std.testing.expect(keys.insert(first_key));
+    try std.testing.expect(keys.contains(first_key));
+    try std.testing.expect(!keys.insert(second_key));
+    try std.testing.expect(keys.contains(first_key));
+    try std.testing.expect(!keys.contains(second_key));
+}
+
+test "pathfinding result cache evicts deterministically and stores paths" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try cache.reserve(std.testing.allocator, 1, 4, 8);
+    var first_key = emptyKey(1);
+    first_key.goal.x = 1;
+    var second_key = emptyKey(1);
+    second_key.goal.x = 2;
+
+    cache.put(first_key, &.{ 0, 1, 2 }, &.{}, 0, &stats);
+    try std.testing.expect(cache.find(first_key) != null);
+    cache.put(second_key, &.{ 3, 4 }, &.{}, 0, &stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
+    try std.testing.expect(cache.find(first_key) == null);
+    const slot = cache.slotIndex(second_key).?;
+    const stored = cache.pathSlice(slot, cache.slots.items[slot].result.path_len);
+    try std.testing.expectEqual(@as(usize, 2), stored.len);
+    try std.testing.expectEqual(@as(u32, 3), stored[0]);
+}
