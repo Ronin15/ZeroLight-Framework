@@ -1,0 +1,453 @@
+// Copyright (c) 2026 Hammer Forged Games
+// All rights reserved.
+// Licensed under the MIT License - see LICENSE file for details
+
+//! Static per-level navigation grid: composes one Z-floor's blocked mask from
+//! DataSystem static bodies (level 0) and the world mask, owns chunk-local
+//! component labels, and supports the bounded incremental remask used by digs.
+
+const std = @import("std");
+const math = @import("../../../core/math.zig");
+const simd = @import("../../../core/simd.zig");
+const DataSystem = @import("../../data_system.zig").DataSystem;
+const EntityId = @import("../../data_system.zig").EntityId;
+const WorldSystem = @import("../../world_system.zig").WorldSystem;
+const types = @import("types.zig");
+const default_cell_size = types.default_cell_size;
+const default_nav_chunk_tiles = types.default_nav_chunk_tiles;
+const no_cell = types.no_cell;
+const no_component = types.no_component;
+const GridCell = types.GridCell;
+const NavSpan = types.NavSpan;
+const NavCellEdit = types.NavCellEdit;
+const tileIndexClamped = types.tileIndexClamped;
+const setLen = types.setLen;
+const neighbor_dirs = types.neighbor_dirs;
+const collisionBoundsIndex = types.collisionBoundsIndex;
+
+pub const NavGrid = struct {
+    // Static navigation grid for ONE level (Z-floor). Derived from DataSystem
+    // collision rows (level 0 only) and this level's composed world mask. Owns
+    // CHUNK-LOCAL component labels (a flood never crosses a chunk border) for cheap
+    // intra-chunk reachability; cross-chunk reachability is expressed only via the
+    // abstract portal/link graph. All levels share the same dimensions/cell_size and
+    // chunk_tiles; the owning NavGraph holds one NavGrid per level.
+    level: u16 = 0,
+    cell_size: f32 = default_cell_size,
+    width: usize = 0,
+    height: usize = 0,
+    // Abstract chunk side length (cells). Shared with the owning NavGraph so a flood
+    // and the graph agree on chunk boundaries.
+    chunk_tiles: u16 = default_nav_chunk_tiles,
+    version: u32 = 1,
+    blocked_count: usize = 0,
+    blocked: std.ArrayList(bool) = .empty,
+    // Chunk-local component labels, encoded chunk_id * (chunk_tiles^2 + 1) + local
+    // (local 1..m within the chunk, 0 reserved for no_component). A chunk's labels
+    // depend only on its own mask, so recomputing a dirty chunk matches a full rebuild.
+    components: std.ArrayList(u32) = .empty,
+    component_queue: std.ArrayList(usize) = .empty,
+
+    pub fn deinit(self: *NavGrid, allocator: std.mem.Allocator) void {
+        self.component_queue.deinit(allocator);
+        self.components.deinit(allocator);
+        self.blocked.deinit(allocator);
+        self.* = undefined;
+    }
+
+    // Sizes this level's arrays and clears them. Dimensions/version are assigned
+    // by the owning NavGraph so every level stays consistent.
+    pub fn prepare(
+        self: *NavGrid,
+        allocator: std.mem.Allocator,
+        level: u16,
+        width: usize,
+        height: usize,
+        cell_size: f32,
+        chunk_tiles: u16,
+        version: u32,
+    ) !void {
+        self.level = level;
+        self.cell_size = cell_size;
+        self.width = width;
+        self.height = height;
+        self.chunk_tiles = @max(@as(u16, 1), chunk_tiles);
+        self.version = version;
+        const cell_count = self.cellCount();
+        try setLen(&self.blocked, allocator, cell_count);
+        try setLen(&self.components, allocator, cell_count);
+        try self.component_queue.ensureTotalCapacity(allocator, cell_count);
+        @memset(self.blocked.items, false);
+        @memset(self.components.items, no_component);
+        self.blocked_count = 0;
+        self.component_queue.clearRetainingCapacity();
+    }
+
+    // Marks DataSystem static collision bodies as blocked. Only level 0 consumes
+    // collision bodies (the demo's entities live on the ground floor); other
+    // levels source obstacles purely from their world mask.
+    pub fn markStaticBodies(self: *NavGrid, data: *const DataSystem) void {
+        const bounds = data.collisionBoundsSliceConst();
+        const responses = data.collisionResponseSliceConst();
+        for (responses.entities, 0..) |entity, response_index| {
+            if (responses.mobilities[response_index] != .static) continue;
+            const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
+            self.markBlockedRectSimd(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+        }
+    }
+
+    pub fn cellCount(self: *const NavGrid) usize {
+        return self.width * self.height;
+    }
+
+    pub fn valid(self: *const NavGrid) bool {
+        return self.width != 0 and self.height != 0 and self.blocked.items.len == self.cellCount();
+    }
+
+    pub fn worldToCellClamped(self: *const NavGrid, value: math.Vec2) GridCell {
+        const max_x: i32 = @intCast(self.width - 1);
+        const max_y: i32 = @intCast(self.height - 1);
+        const raw_x: i32 = math.floorToI32(value.x / self.cell_size);
+        const raw_y: i32 = math.floorToI32(value.y / self.cell_size);
+        return .{
+            .x = std.math.clamp(raw_x, 0, max_x),
+            .y = std.math.clamp(raw_y, 0, max_y),
+        };
+    }
+
+    pub fn cellCenter(self: *const NavGrid, index: usize) math.Vec2 {
+        const x = index % self.width;
+        const y = index / self.width;
+        return .{
+            .x = (@as(f32, @floatFromInt(x)) + 0.5) * self.cell_size,
+            .y = (@as(f32, @floatFromInt(y)) + 0.5) * self.cell_size,
+        };
+    }
+
+    pub fn indexForCell(self: *const NavGrid, cell: GridCell) ?usize {
+        if (cell.x < 0 or cell.y < 0) return null;
+        const x: usize = @intCast(cell.x);
+        const y: usize = @intCast(cell.y);
+        if (x >= self.width or y >= self.height) return null;
+        return y * self.width + x;
+    }
+
+    pub fn isBlockedIndex(self: *const NavGrid, index: usize) bool {
+        std.debug.assert(index < self.blocked.items.len);
+        return self.blocked.items[index];
+    }
+
+    pub fn isBlockedCell(self: *const NavGrid, cell: GridCell) bool {
+        const index = self.indexForCell(cell) orelse return true;
+        return self.isBlockedIndex(index);
+    }
+
+    pub fn markBlockedRectSimd(self: *NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
+        if (!self.valid()) return;
+        const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
+        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - 0.001), .y = @max(min_y, max_y - 0.001) });
+        const row_start: usize = @intCast(@min(min_cell.y, max_cell.y));
+        const row_end: usize = @intCast(@max(min_cell.y, max_cell.y));
+        const col_start_i = @min(min_cell.x, max_cell.x);
+        const col_end_i = @max(min_cell.x, max_cell.x);
+        const col_start: usize = @intCast(col_start_i);
+        const col_end: usize = @intCast(col_end_i);
+        const col_end_vec = simd.splatInt4(@intCast(col_end_i));
+
+        var y = row_start;
+        while (y <= row_end) : (y += 1) {
+            var x = col_start;
+            while (x + simd.lane_count <= col_end + 1) : (x += simd.lane_count) {
+                const lanes = simd.int4(@intCast(x), @intCast(x + 1), @intCast(x + 2), @intCast(x + 3));
+                const active = lanes <= col_end_vec;
+                inline for (0..simd.lane_count) |lane| {
+                    if (active[lane]) self.markBlockedIndex(y * self.width + x + lane);
+                }
+            }
+            while (x <= col_end) : (x += 1) {
+                self.markBlockedIndex(y * self.width + x);
+            }
+        }
+    }
+
+    pub fn markBlockedIndex(self: *NavGrid, index: usize) void {
+        if (!self.blocked.items[index]) {
+            self.blocked.items[index] = true;
+            self.blocked_count += 1;
+        }
+    }
+
+    // Composes this level's blocked mask from the world's dense bands and sparse
+    // obstacles by iterating those columns directly. Dense bands cost
+    // O(bands x cells) inherently; sparse obstacles cost O(sparse) total. This
+    // avoids polling levelBlocksMovement per cell, which rescanned every sparse
+    // obstacle for every cell (O(cells x sparse)).
+    pub fn markWorldObstacles(self: *NavGrid, world: *const WorldSystem) void {
+        if (@as(usize, self.level) >= world.levelCount()) return;
+        for (0..world.denseLayerCount()) |layer_index| {
+            if (world.denseLayerLevel(layer_index) != self.level) continue;
+            for (0..world.height) |y_usize| {
+                const y: u16 = @intCast(y_usize);
+                for (0..world.width) |x_usize| {
+                    const x: u16 = @intCast(x_usize);
+                    if (!world.denseTileBlocksMovement(layer_index, x, y)) continue;
+                    self.markWorldCell(world, x, y);
+                }
+            }
+        }
+        for (0..world.sparseTileCount()) |sparse_index| {
+            if (world.sparseTileLevel(sparse_index) != self.level) continue;
+            if (!world.sparseTileBlocksMovement(sparse_index)) continue;
+            const cell = world.sparseTileCellCoord(sparse_index);
+            self.markWorldCell(world, cell.x, cell.y);
+        }
+    }
+
+    pub fn markWorldCell(self: *NavGrid, world: *const WorldSystem, x: u16, y: u16) void {
+        const rect = world.cellRect(x, y) orelse return;
+        self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+    }
+
+    // Re-derives this level's blocked mask for ONLY the nav cells overlapping the
+    // given dirty tile edits, instead of recomposing the whole level. Each affected
+    // nav cell is recomputed from authoritative static sources (the world mask for
+    // every tile overlapping the cell, plus level-0 collision bodies covering it), so
+    // a cell kept blocked by an unrelated overlapping rect stays blocked and a true
+    // unblock is detected — the correctness the whole-level recompose gave, but
+    // bounded by the edit footprint instead of the level's cell count. This is what
+    // keeps a dig off the O(cells) remask path. The mask must already be correct for
+    // unedited cells (it is: built fully at init, then only ever mutated here).
+    pub fn remarkStaticMaskCells(self: *NavGrid, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+        const world_system = world orelse return;
+        for (edits) |edit| {
+            if (edit.level != self.level) continue;
+            const span = self.navSpanForTile(world_system, edit) orelse continue;
+            var cy = span.min_y;
+            while (cy <= span.max_y) : (cy += 1) {
+                var cx = span.min_x;
+                while (cx <= span.max_x) : (cx += 1) {
+                    const index = cy * self.width + cx;
+                    self.setBlockedValue(index, self.navCellBlockedFromSources(data, world_system, cx, cy));
+                }
+            }
+        }
+    }
+
+    // Nav-cell range overlapping an edited world tile's rect (clamped to the grid).
+    // The inverse of markWorldCell: which nav cells must be recomputed for this edit.
+    pub fn navSpanForTile(self: *const NavGrid, world: *const WorldSystem, edit: NavCellEdit) ?NavSpan {
+        const rect = world.cellRect(edit.x, edit.y) orelse return null;
+        const min_cell = self.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
+        const max_cell = self.worldToCellClamped(.{
+            .x = @max(rect.x, rect.x + rect.w - 0.001),
+            .y = @max(rect.y, rect.y + rect.h - 0.001),
+        });
+        return .{
+            .min_x = @intCast(@min(min_cell.x, max_cell.x)),
+            .min_y = @intCast(@min(min_cell.y, max_cell.y)),
+            .max_x = @intCast(@max(min_cell.x, max_cell.x)),
+            .max_y = @intCast(@max(min_cell.y, max_cell.y)),
+        };
+    }
+
+    // Recomputes one nav cell's blocked state from the authoritative static sources:
+    // any world tile overlapping the cell that blocks movement, or (level 0 only) any
+    // static collision body covering it. Mirrors what markWorldObstacles/
+    // markStaticBodies would set for this cell, so the incremental result is identical
+    // to a full recompose for the cell.
+    pub fn navCellBlockedFromSources(self: *const NavGrid, data: *const DataSystem, world: *const WorldSystem, ncx: usize, ncy: usize) bool {
+        if (@as(usize, self.level) < world.levelCount()) {
+            const min_x = @as(f32, @floatFromInt(ncx)) * self.cell_size;
+            const min_y = @as(f32, @floatFromInt(ncy)) * self.cell_size;
+            const tx0 = tileIndexClamped(min_x, world.tile_size, world.width);
+            const tx1 = tileIndexClamped(min_x + self.cell_size - 0.001, world.tile_size, world.width);
+            const ty0 = tileIndexClamped(min_y, world.tile_size, world.height);
+            const ty1 = tileIndexClamped(min_y + self.cell_size - 0.001, world.tile_size, world.height);
+            var ty = ty0;
+            while (ty <= ty1) : (ty += 1) {
+                var tx = tx0;
+                while (tx <= tx1) : (tx += 1) {
+                    if (world.levelBlocksMovement(self.level, tx, ty)) return true;
+                }
+            }
+        }
+        return self.level == 0 and self.staticBodyCoversNavCell(data, ncx, ncy);
+    }
+
+    // Whether any static collision body covers nav cell (ncx, ncy), using the same
+    // cell-coverage rule as markStaticBodies/markBlockedRectSimd so the incremental
+    // remask exactly matches a full mark. Bounded by the static-body count.
+    pub fn staticBodyCoversNavCell(self: *const NavGrid, data: *const DataSystem, ncx: usize, ncy: usize) bool {
+        const bounds = data.collisionBoundsSliceConst();
+        const responses = data.collisionResponseSliceConst();
+        for (responses.entities, 0..) |entity, response_index| {
+            if (responses.mobilities[response_index] != .static) continue;
+            const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
+            const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
+            const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - 0.001), .y = @max(rect.min_y, rect.max_y - 0.001) });
+            const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
+            const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
+            const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
+            const cy1: usize = @intCast(@max(min_cell.y, max_cell.y));
+            if (ncx >= cx0 and ncx <= cx1 and ncy >= cy0 and ncy <= cy1) return true;
+        }
+        return false;
+    }
+
+    pub fn setBlockedValue(self: *NavGrid, index: usize, value: bool) void {
+        if (self.blocked.items[index] == value) return;
+        self.blocked.items[index] = value;
+        if (value) {
+            self.blocked_count += 1;
+        } else {
+            self.blocked_count -= 1;
+        }
+    }
+
+    pub fn chunksX(self: *const NavGrid) usize {
+        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    pub fn chunksY(self: *const NavGrid) usize {
+        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    pub fn chunkOfCell(self: *const NavGrid, index: usize) u32 {
+        const cx = (index % self.width) / self.chunk_tiles;
+        const cy = (index / self.width) / self.chunk_tiles;
+        return @intCast(cy * self.chunksX() + cx);
+    }
+
+    // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk, plus the
+    // reserved 0). Keeps encoded labels of different chunks disjoint.
+    pub fn chunkLabelStride(self: *const NavGrid) u64 {
+        const ct: u64 = self.chunk_tiles;
+        return ct * ct + 1;
+    }
+
+    // Labels every open cell with a CHUNK-LOCAL component id, chunk by chunk. Because a
+    // flood never leaves its chunk and labels encode the chunk, a full relabel produces
+    // the same labels the per-chunk incremental relabel does.
+    pub fn buildComponents(self: *NavGrid) void {
+        @memset(self.components.items, no_component);
+        const chunk_count = self.chunksX() * self.chunksY();
+        var chunk_id: u32 = 0;
+        while (chunk_id < chunk_count) : (chunk_id += 1) {
+            self.recomputeChunkComponents(chunk_id);
+        }
+    }
+
+    // Clears one chunk's cells to no_component and re-floods them with chunk-local
+    // labels. Idempotent and self-contained: a chunk's result depends only on its own
+    // mask, so the incremental update re-runs this for each dirty chunk.
+    pub fn recomputeChunkComponents(self: *NavGrid, chunk_id: u32) void {
+        const cx_count = self.chunksX();
+        const cx = chunk_id % cx_count;
+        const cy = chunk_id / cx_count;
+        const x0 = cx * self.chunk_tiles;
+        const y0 = cy * self.chunk_tiles;
+        const x1 = @min(x0 + self.chunk_tiles, self.width);
+        const y1 = @min(y0 + self.chunk_tiles, self.height);
+        var y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                self.components.items[y * self.width + x] = no_component;
+            }
+        }
+        const base: u64 = @as(u64, chunk_id) * self.chunkLabelStride();
+        var local: u32 = 1;
+        y = y0;
+        while (y < y1) : (y += 1) {
+            var x = x0;
+            while (x < x1) : (x += 1) {
+                const index = y * self.width + x;
+                if (self.blocked.items[index] or self.components.items[index] != no_component) continue;
+                const label = base + local;
+                std.debug.assert(label < no_cell);
+                self.floodComponent(index, @intCast(label));
+                local += 1;
+            }
+        }
+    }
+
+    pub fn floodComponent(self: *NavGrid, start_index: usize, component: u32) void {
+        self.component_queue.clearRetainingCapacity();
+        self.component_queue.appendAssumeCapacity(start_index);
+        self.components.items[start_index] = component;
+        const start_chunk = self.chunkOfCell(start_index);
+        var read_index: usize = 0;
+        while (read_index < self.component_queue.items.len) : (read_index += 1) {
+            const current = self.component_queue.items[read_index];
+            const current_x: i32 = @intCast(current % self.width);
+            const current_y: i32 = @intCast(current / self.width);
+            for (neighbor_dirs) |dir| {
+                const next_cell = GridCell{ .x = current_x + dir.x, .y = current_y + dir.y };
+                const next_index = self.indexForCell(next_cell) orelse continue;
+                // Chunk-local: a flood stays inside the start cell's chunk; cross-chunk
+                // reachability is carried by the abstract portal graph instead.
+                if (self.chunkOfCell(next_index) != start_chunk) continue;
+                if (self.blocked.items[next_index] or self.components.items[next_index] != no_component) continue;
+                // next_cell is in-bounds, so its component coords are too; index the
+                // orthogonal diagonal cells directly instead of via isBlockedCell.
+                const width_i: i32 = @intCast(self.width);
+                if (dir.diagonal and (self.blocked.items[@intCast(current_y * width_i + next_cell.x)] or self.blocked.items[@intCast(next_cell.y * width_i + current_x)])) {
+                    continue;
+                }
+                self.components.items[next_index] = component;
+                self.component_queue.appendAssumeCapacity(next_index);
+            }
+        }
+    }
+
+    // True only when both cells share a chunk-local component, i.e. a local path
+    // exists entirely within one chunk. Cross-chunk reachability routes through the
+    // abstract graph, never through this predicate.
+    pub fn connected(self: *const NavGrid, a: usize, b: usize) bool {
+        return self.components.items[a] != no_component and self.components.items[a] == self.components.items[b];
+    }
+
+    pub fn componentOf(self: *const NavGrid, index: usize) u32 {
+        return self.components.items[index];
+    }
+
+    // Projects a blocked goal cell to the nearest open cell on this level within a
+    // bounded radius. Returns the open index, or null if none is reachable.
+    pub fn projectToNearestOpen(self: *const NavGrid, cell: GridCell, radius: i32) ?usize {
+        if (self.indexForCell(cell)) |index| {
+            if (!self.isBlockedIndex(index)) return index;
+        }
+        var ring: i32 = 1;
+        while (ring <= radius) : (ring += 1) {
+            var dy: i32 = -ring;
+            while (dy <= ring) : (dy += 1) {
+                var dx: i32 = -ring;
+                while (dx <= ring) : (dx += 1) {
+                    // Only walk the ring perimeter; interior rings were checked.
+                    if (@abs(dx) != ring and @abs(dy) != ring) continue;
+                    const candidate = GridCell{ .x = cell.x + dx, .y = cell.y + dy };
+                    const index = self.indexForCell(candidate) orelse continue;
+                    if (!self.isBlockedIndex(index)) return index;
+                }
+            }
+        }
+        return null;
+    }
+};
+pub const StaticBodyRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+
+// World-space AABB of `entity`'s static collision body, or null if it has no bounds
+// or movement body. Shared by markStaticBodies and staticBodyCoversNavCell so the
+// full mark and the incremental cell-coverage test derive identical geometry.
+pub fn staticBodyWorldRect(data: *const DataSystem, bounds: anytype, entity: EntityId) ?StaticBodyRect {
+    const bounds_index = collisionBoundsIndex(bounds.entities, entity) orelse return null;
+    const body = data.movementBodyConst(entity) orelse return null;
+    const min_x = body.position.x + bounds.offset_x[bounds_index];
+    const min_y = body.position.y + bounds.offset_y[bounds_index];
+    return .{
+        .min_x = min_x,
+        .min_y = min_y,
+        .max_x = min_x + bounds.size_x[bounds_index],
+        .max_y = min_y + bounds.size_y[bounds_index],
+    };
+}
