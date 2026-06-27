@@ -13,6 +13,7 @@ const PathfindingCapacity = @import("../game/systems/pathfinding.zig").Pathfindi
 const PathfindingStats = @import("../game/systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("../game/systems/pathfinding.zig").PathfindingSystem;
 const default_max_fallback_requests_per_step = @import("../game/systems/pathfinding.zig").default_max_fallback_requests_per_step;
+const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").default_max_solves_per_frame;
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const suite = @import("suite.zig");
 
@@ -309,6 +310,24 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
     stats.deferred_count = last_stats.deferred_requests;
     stats.fallback_deferred_count = last_stats.fallback_deferred_requests;
     stats.cache_evictions = last_stats.cache_evictions;
+
+    // Throughput must reflect items actually serviced this step, not the requested
+    // count. Cold solves are capped at the per-frame amortization ceiling, so a
+    // 1024-request row only performs min(1024, ceiling) solves and defers the rest to
+    // later frames; counting all 1024 would inflate the curve to look like the solver
+    // scales past the cap when its real per-step work is flat at the ceiling. Report
+    // serviced/sec (solves when cold, cache hits when hot); both equal item_count when
+    // nothing is deferred, so honest rows are unchanged.
+    const serviced = stats.candidate_pairs;
+    if (mode == .cold_hard_fallback) {
+        // Cold fallbacks are bounded by the effective fallback limit, which is the
+        // configured fallback budget clamped to the per-frame ceiling; anything beyond
+        // that defers. This pins the "no silent cap drift" invariant.
+        std.debug.assert(serviced == @min(item_count, @min(fallback_budget, default_max_solves_per_frame)));
+    }
+    if (stats.mean_ns != 0) {
+        stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
+    }
     if (case.adaptive and mode == .cold_hard_fallback) {
         stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), fallback_settled_before_measurement);
     }

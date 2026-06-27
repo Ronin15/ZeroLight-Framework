@@ -431,7 +431,7 @@ pub const NavGraph = struct {
             try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.chunk_tiles);
             // Only level 0 sources DataSystem collision bodies; the demo's
             // entities live on the ground floor. World mask drives every level.
-            if (level == 0) level_grid.markStaticBodies(data);
+            if (level == 0) try level_grid.markStaticBodies(self.allocator, data);
             if (world) |world_system| level_grid.markWorldObstacles(world_system);
             level_grid.buildComponents();
         }
@@ -796,6 +796,10 @@ pub const NavGraph = struct {
     // remask. The net count is always non-negative (a remask cannot unblock more than is blocked).
     fn applyBlockedDelta(level_grid: *NavGrid, delta: isize) void {
         const signed: isize = @as(isize, @intCast(level_grid.blocked_count)) + delta;
+        // The summed per-worker deltas must keep blocked_count non-negative; a negative
+        // net would mean a remask double-counted an unblock. Assert before the @intCast
+        // would otherwise wrap into a huge usize.
+        std.debug.assert(signed >= 0);
         level_grid.blocked_count = @intCast(signed);
     }
 
@@ -870,7 +874,10 @@ pub const NavGraph = struct {
         const lo = self.chunk_link_base.items[chunk];
         const len = self.chunk_link_count.items[chunk];
         const run = self.chunk_link_cells.items[lo .. lo + len];
-        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse return 0;
+        // slotForCell only reaches here for a non-perimeter portal cell, which is by
+        // construction an interior link endpoint recorded in this chunk's run. A miss is
+        // an invariant violation; surface it loudly instead of aliasing onto slot 0.
+        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable;
         return @intCast(rel);
     }
 
@@ -907,7 +914,10 @@ pub const NavGraph = struct {
             self.chunk_portal_base.items[c] = running;
             const cap = 4 * ct + self.chunk_link_count.items[c];
             self.chunk_portal_cap.items[c] = cap;
-            running += cap;
+            // Saturating, matching the edge-cap prefix sum: the memory-budget gate rejects
+            // worlds anywhere near a u32 slot-count overflow, but keep the arithmetic loud
+            // rather than silently wrapping if one ever slips through.
+            running +|= cap;
         }
         self.total_slots = running;
 

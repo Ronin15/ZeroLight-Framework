@@ -1156,6 +1156,13 @@ fn u128ToU64Saturated(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
 }
 
+// Items-per-second from a single mean duration. Lets a group override the throughput
+// numerator (e.g. items actually serviced vs requested) without re-deriving total_ns.
+pub fn itemsPerSecond(items: usize, mean_ns: u64) u64 {
+    if (mean_ns == 0) return 0;
+    return u128ToU64Saturated((@as(u128, items) * std.time.ns_per_s) / mean_ns);
+}
+
 fn u128ToUsizeSaturated(value: u128) usize {
     return if (value > std.math.maxInt(usize)) std.math.maxInt(usize) else @intCast(value);
 }

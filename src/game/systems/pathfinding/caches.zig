@@ -259,7 +259,7 @@ pub const ResultCache = struct {
         self.slots.items[slot_index] = .{
             .occupied = true,
             .stamp = step,
-            .result = .{ .key = key, .path_len = stored_len, .path_level = path_level, .stitched_len = stitched_len },
+            .result = .{ .key = key, .path_len = @intCast(stored_len), .path_level = path_level, .stitched_len = @intCast(stitched_len) },
         };
     }
 
@@ -273,6 +273,7 @@ pub const ResultCache = struct {
 
     pub fn findOrEvictSlot(self: *ResultCache, key: PathQueryKey, stats: *PathfindingStats) usize {
         const capacity = self.slots.items.len;
+        std.debug.assert(capacity != 0); // callers guard this; assert before `% capacity`
         const start = hashPathKey(key) % capacity;
         for (0..capacity) |probe| {
             const index = (start + probe) % capacity;
@@ -304,22 +305,9 @@ pub const ResultCache = struct {
     pub fn writePath(self: *ResultCache, slot_index: usize, path: []const u32) usize {
         const base = slot_index * self.path_stride;
         const dst = self.path_cells.items[base .. base + self.path_stride];
-        if (path.len <= self.path_stride) {
-            @memcpy(dst[0..path.len], path);
-            return path.len;
-        }
-        // Downsample by stride to preserve forward direction within the budget.
-        const stored = self.path_stride;
-        if (stored == 1) {
-            // A single-cell budget can only keep the start; avoids a divide-by-zero below.
-            dst[0] = path[0];
-            return 1;
-        }
-        for (0..stored) |i| {
-            const src_index = (i * (path.len - 1)) / (stored - 1);
-            dst[i] = path[src_index];
-        }
-        return stored;
+        // One shared contract with the worker solve buffer: copy when it fits, else
+        // stride-downsample so the stored path still spans start->goal.
+        return types.downsamplePathInto(dst, path);
     }
 };
 pub const ResultCacheSlot = struct {
@@ -519,4 +507,25 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     const stored = cache.pathSlice(slot, cache.slots.items[slot].result.path_len);
     try std.testing.expectEqual(@as(usize, 2), stored.len);
     try std.testing.expectEqual(@as(u32, 3), stored[0]);
+}
+
+test "pathfinding result cache downsamples an over-stride path to span start and goal" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    const stride = 4;
+    try cache.reserve(std.testing.allocator, 2, stride, 8);
+
+    // A path longer than the stride is downsampled, not head-truncated: it keeps the
+    // stride length and still spans start->goal, so the agent reaches the goal instead
+    // of dead-ending at the truncation boundary (which would store the head [10..13]).
+    var key = emptyKey(1);
+    key.goal.x = 7;
+    const long = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17 };
+    cache.put(key, &long, &.{}, 0, 0, &stats);
+    const slot = cache.slotIndex(key).?;
+    const stored = cache.pathSlice(slot, cache.slots.items[slot].result.path_len);
+    try std.testing.expectEqual(@as(usize, stride), stored.len);
+    try std.testing.expectEqual(@as(u32, 10), stored[0]); // start preserved
+    try std.testing.expectEqual(@as(u32, 17), stored[stored.len - 1]); // goal preserved
 }

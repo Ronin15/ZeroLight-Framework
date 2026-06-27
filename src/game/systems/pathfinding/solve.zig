@@ -185,7 +185,9 @@ pub fn stitchCorridor(
             if (scratch.stitched_scratch.items.len >= cap) return .budget_exhausted;
             scratch.stitched_scratch.appendAssumeCapacity(.{ .level = portal.level, .cell = portal.cell_index });
         } else {
-            const grid = graph.grid(prev_level).?;
+            // prev_level indexes a live level by construction (it came from the corridor
+            // we just built); spill rather than panic if a malformed graph ever violates that.
+            const grid = graph.grid(prev_level) orelse return .none;
             switch (appendSegment(scratch, grid, prev_level, prev_cell, portal.cell_index, cap)) {
                 .found => {},
                 else => |r| return r,
@@ -477,12 +479,15 @@ pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_in
 pub fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: usize, path: []const u32, path_level: u16) void {
     const stride = system.capacity.max_stored_path_cells;
     const offset = path_slot * stride;
-    const copy_len = @min(path.len, stride);
-    @memcpy(system.worker_path_pool.items[offset .. offset + copy_len], path[0..copy_len]);
+    // Downsample (not head-truncate) an over-stride plain path so the agent keeps
+    // progressing to the goal instead of stalling at the stride boundary. Shares the
+    // result cache's contract via downsamplePathInto.
+    const dst = system.worker_path_pool.items[offset .. offset + stride];
+    const stored_len = types.downsamplePathInto(dst, path);
     system.solved_paths.items[pending_index] = .{
         .key = system.pending.items[pending_index].key,
         .offset = offset,
-        .len = copy_len,
+        .len = stored_len,
         .path_level = path_level,
     };
 }

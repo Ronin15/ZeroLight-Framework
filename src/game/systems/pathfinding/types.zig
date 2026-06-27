@@ -64,13 +64,16 @@ pub const default_capacity_shrink_window: u32 = 120;
 // Per-step / per-memory caps are derived from agent_count via these ratios so a
 // crowd of n drives n in-flight requests and a 4n result cache.
 pub const cached_results_per_agent: usize = 4;
-// Fixed per-frame A* solve/fallback amortization ceiling, independent of the agent
+// Per-frame A* solve/fallback amortization ceiling, independent of the agent
 // population: population scales the queue and cache (all agents can be queued, all
-// paths cached), NOT the per-tick A* work, so frame time does not grow with army
-// size. The adaptive fallback tuner sets the actual operating point under this
-// ceiling; 256 is only the burst cap. Clamped down to the population so a tiny demo
-// (8 agents) still caps at 8, and held at 256 once the crowd grows past it.
-pub const default_max_solves_per_frame: usize = 256;
+// paths cached), NOT the per-tick A* work, so a diverse-goal burst from a big group
+// spreads across frames (the defer queue carries the remainder) instead of spiking a
+// single frame. The shared-goal common case is absorbed by the group flow field, so
+// this ceiling only backstops the pathological all-different-goals burst. The adaptive
+// fallback tuner threads the work under it; 512 reflects the threaded per-frame budget
+// (raised from the single-thread-era 256). Clamped down to the population so a tiny
+// demo (8 agents) still caps at 8.
+pub const default_max_solves_per_frame: usize = 512;
 // Generous default nav-memory ceiling. The build-time gate fails loud well before
 // real allocation pressure; tests use a tiny ceiling to exercise the gate.
 pub const default_max_nav_memory_bytes: usize = 512 * 1024 * 1024;
@@ -376,16 +379,45 @@ pub const StitchedCell = struct {
 pub const PathResult = struct {
     key: PathQueryKey,
     // Plain-path cells (start-to-goal order) for a same-component local solve,
-    // stored in the cache slot's path buffer and indexed on path_level.
-    path_len: usize,
+    // stored in the cache slot's path buffer and indexed on path_level. u32 (not usize):
+    // cell counts are bounded by max_stored_path_cells, and this struct is stored in
+    // every cache slot (up to max_agent_budget of them), so the narrower field matters.
+    path_len: u32,
     // Level the plain path cells index into (equals key.goal_level for a local solve).
     path_level: u16 = 0,
     // Number of stitched (level,cell) cells stored in the slot's stitched buffer.
     // Zero for a plain same-component local solve (path_len cells suffice); set for
     // an abstract chunk/cross-level corridor, whose full obstacle-aware path is
     // stitched from per-segment local A* and walked per-agent on its current level.
-    stitched_len: usize = 0,
+    stitched_len: u32 = 0,
 };
+
+// Copies a plain (same-component, single-level) path into `dst`, stride-downsampling
+// when `src` is longer than `dst` so the stored cells still span start->goal and keep
+// forward direction within the budget. Returns the cell count written. Head-truncating
+// instead would dead-end the agent at the stride boundary (no successor cell -> stall
+// until the cache TTL re-solves); downsampling keeps it progressing across the whole
+// span. Downsampled cells are NOT guaranteed grid-adjacent, so this is only valid for
+// the plain path the query treats as approximate — the abstract stitched corridor is
+// stored whole. Shared by the worker solve buffer (recordPath) and the result cache
+// (writePath) so both follow one contract.
+pub fn downsamplePathInto(dst: []u32, src: []const u32) usize {
+    if (src.len <= dst.len) {
+        @memcpy(dst[0..src.len], src);
+        return src.len;
+    }
+    if (dst.len <= 1) {
+        // A single-cell (or empty) budget can only keep the start; also guards the
+        // dst.len - 1 divisor below.
+        if (dst.len == 1) dst[0] = src[0];
+        return dst.len;
+    }
+    for (0..dst.len) |i| {
+        const src_index = (i * (src.len - 1)) / (dst.len - 1);
+        dst[i] = src[src_index];
+    }
+    return dst.len;
+}
 
 pub const PathSolveResult = union(enum) {
     // Successful solve carries the solved path through pending_index lookup.
@@ -420,6 +452,7 @@ pub fn octileCells(width: usize, a: u32, b: u32) u32 {
     return @intCast(@min(cost, @as(u64, std.math.maxInt(u32))));
 }
 pub fn popHeap(heap: *std.ArrayList(OpenNode)) OpenNode {
+    std.debug.assert(heap.items.len != 0); // empty pop would underflow `last` below
     const result = heap.items[0];
     const last = heap.items.len - 1;
     heap.items[0] = heap.items[last];

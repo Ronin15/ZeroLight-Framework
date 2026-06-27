@@ -149,6 +149,7 @@ pub const GroupField = struct {
     // queue. Returns true when the field finished. The distance cursor advances only
     // forward, so the build resumes correctly across budgeted frames.
     pub fn expand(self: *GroupField, grid: *const NavGrid, budget: usize) bool {
+        std.debug.assert(budget != 0); // a zero budget makes no progress and never reaches .ready
         var expansions: usize = 0;
         while (true) {
             if (expansions >= budget) return false;

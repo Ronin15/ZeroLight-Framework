@@ -198,8 +198,9 @@ pub const PathfindingSystem = struct {
         cap.max_frame_requests = clamped;
         cap.max_pending_requests = clamped;
         cap.max_cached_results = clamped *| cached_results_per_agent;
-        // Fixed per-frame solve/fallback ceiling, capped down to the population (fallback
-        // <= solves). Independent of crowd size; the adaptive tuner operates under it.
+        // Per-frame solve/fallback amortization ceiling, clamped down to the population
+        // (fallback <= solves). Independent of crowd size so a diverse-goal burst spreads
+        // across frames; the adaptive tuner threads the work under it.
         const solve_ceiling = @min(default_max_solves_per_frame, clamped);
         cap.max_solved_requests_per_step = solve_ceiling;
         cap.max_fallback_requests_per_step = solve_ceiling;
@@ -684,15 +685,25 @@ pub const PathfindingSystem = struct {
                 system_config.fallback_adaptive_tuner = &self.fallback_tuner;
             }
             // The configured participant count sized the per-cell scratch at the nav
-            // build; this is the safety assertion that the live thread system never
-            // exceeds it. No allocation here — the solve loop is allocation-free.
-            const participants = thread_system.participantSlotCount();
-            if (participants > self.scratch_slots.items.len) return error.PathfindingScratchCapacityExceeded;
+            // build. In a correct configuration scratch is sized to participantSlotCount
+            // (the app/bench reserve with it), so the clamp below is a no-op. A debug
+            // build asserts that contract loudly to catch a reserve/thread-system
+            // mismatch during development; a release build clamps the worker fan-out to
+            // the reserved scratch so worker indices stay in range and pathfinding
+            // degrades to fewer workers rather than failing the frame. Scratch is never
+            // grown past the memory-budgeted count, and the solve loop stays
+            // allocation-free.
+            std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
+            const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
+            const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
+                @min(requested, max_workers_for_scratch)
+            else
+                max_workers_for_scratch;
             self.resetSolvedPaths();
             var context = SolveJobContext{ .system = self };
             stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
                 .items_per_range = system_config.items_per_range,
-                .max_worker_threads = system_config.max_worker_threads,
+                .max_worker_threads = scratch_clamped_workers,
                 .range_alignment_items = pathfinding_range_alignment_items,
                 .adaptive = system_config.adaptive,
                 .adaptive_tuner = system_config.fallback_adaptive_tuner,
@@ -2968,7 +2979,8 @@ test "pathfinding per-frame solve budget stays fixed while queue and cache scale
     try system.rebuildStaticNavGrid(&data, 512, 512, 32);
 
     // A 4096-agent population grows the queue and cache to population, but the
-    // per-frame A* solve and fallback budgets stay pinned to the fixed ceiling.
+    // per-frame A* solve and fallback budgets stay pinned to the fixed amortization
+    // ceiling so a diverse-goal burst spreads across frames.
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
     try appendPathRequest(&stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 480, .y = 480 } });

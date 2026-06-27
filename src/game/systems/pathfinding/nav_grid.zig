@@ -46,8 +46,14 @@ pub const NavGrid = struct {
     // depend only on its own mask, so recomputing a dirty chunk matches a full rebuild.
     components: std.ArrayList(u32) = .empty,
     component_queue: std.ArrayList(usize) = .empty,
+    // Level-0 static-body coverage, rasterized once when markStaticBodies runs at a full
+    // build. Static bodies are constant between rebuilds, so an incremental remask reads
+    // this O(1) per cell instead of re-scanning every static body (and its entity-index
+    // lookup) per cell. Empty on non-zero levels (they never source collision bodies).
+    static_blocked: std.ArrayList(bool) = .empty,
 
     pub fn deinit(self: *NavGrid, allocator: std.mem.Allocator) void {
+        self.static_blocked.deinit(allocator);
         self.component_queue.deinit(allocator);
         self.components.deinit(allocator);
         self.blocked.deinit(allocator);
@@ -86,13 +92,38 @@ pub const NavGrid = struct {
     // Marks DataSystem static collision bodies as blocked. Only level 0 consumes
     // collision bodies (the demo's entities live on the ground floor); other
     // levels source obstacles purely from their world mask.
-    pub fn markStaticBodies(self: *NavGrid, data: *const DataSystem) void {
+    pub fn markStaticBodies(self: *NavGrid, allocator: std.mem.Allocator, data: *const DataSystem) !void {
         const bounds = data.collisionBoundsSliceConst();
         const responses = data.collisionResponseSliceConst();
+        // Build the per-cell coverage cache alongside the live mask so an incremental
+        // remask is O(1) per cell. Same rect->cell rule as the mask, so the cache and a
+        // full mark agree exactly (the remask-vs-rebuild parity tests guard this).
+        try setLen(&self.static_blocked, allocator, self.cellCount());
+        @memset(self.static_blocked.items, false);
         for (responses.entities, 0..) |entity, response_index| {
             if (responses.mobilities[response_index] != .static) continue;
             const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
             self.markBlockedRectSimd(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+            self.rasterizeStaticCoverage(rect);
+        }
+    }
+
+    // Sets the static-coverage cache true for every cell a static body's world rect
+    // overlaps, using the same clamped rect->cell mapping as markBlockedRectSimd and
+    // staticBodyCoversNavCell so all three agree on which cells a body covers.
+    fn rasterizeStaticCoverage(self: *NavGrid, rect: StaticBodyRect) void {
+        const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
+        const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - 0.001), .y = @max(rect.min_y, rect.max_y - 0.001) });
+        const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
+        const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
+        const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
+        const cy1: usize = @intCast(@max(min_cell.y, max_cell.y));
+        var cy = cy0;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = cx0;
+            while (cx <= cx1) : (cx += 1) {
+                self.static_blocked.items[cy * self.width + cx] = true;
+            }
         }
     }
 
@@ -162,15 +193,21 @@ pub const NavGrid = struct {
         const col_start: usize = @intCast(col_start_i);
         const col_end: usize = @intCast(col_end_i);
 
+        const all_blocked: simd.Mask4 = @splat(true);
         var y = row_start;
         while (y <= row_end) : (y += 1) {
             var x = col_start;
             // The loop guard keeps every lane within [col_start, col_end], so all lanes are
             // always in range — no per-lane mask needed; the scalar tail covers the remainder.
+            // Genuine vector op: load the lane window, count lanes not yet set (only those
+            // increment blocked_count), then store all-true in one vector write.
             while (x + simd.lane_count <= col_end + 1) : (x += simd.lane_count) {
-                inline for (0..simd.lane_count) |lane| {
-                    self.markBlockedIndex(y * self.width + x + lane);
-                }
+                const base = y * self.width + x;
+                const window = self.blocked.items[base .. base + simd.lane_count];
+                const before: simd.Mask4 = window[0..simd.lane_count].*;
+                const already: u32 = @reduce(.Add, @as(@Vector(simd.lane_count, u32), @intFromBool(before)));
+                self.blocked_count += simd.lane_count - @as(usize, already);
+                window[0..simd.lane_count].* = all_blocked;
             }
             while (x <= col_end) : (x += 1) {
                 self.markBlockedIndex(y * self.width + x);
@@ -285,6 +322,12 @@ pub const NavGrid = struct {
     // cell-coverage rule as markStaticBodies/markBlockedRectSimd so the incremental
     // remask exactly matches a full mark. Bounded by the static-body count.
     pub fn staticBodyCoversNavCell(self: *const NavGrid, data: *const DataSystem, ncx: usize, ncy: usize) bool {
+        // Fast path: the coverage cache built at the last full mark. Static bodies are
+        // constant between rebuilds, so this is authoritative and O(1).
+        if (self.static_blocked.items.len == self.cellCount()) {
+            return self.static_blocked.items[ncy * self.width + ncx];
+        }
+        // Fallback: scan static bodies directly (cache not yet built for this grid).
         const bounds = data.collisionBoundsSliceConst();
         const responses = data.collisionResponseSliceConst();
         for (responses.entities, 0..) |entity, response_index| {

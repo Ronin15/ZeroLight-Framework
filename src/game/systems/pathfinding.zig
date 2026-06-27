@@ -30,6 +30,7 @@ pub const PathfindingConfig = @import("pathfinding/types.zig").PathfindingConfig
 pub const NavGridError = @import("pathfinding/types.zig").NavGridError;
 pub const pathfinding_range_alignment_items = @import("pathfinding/types.zig").pathfinding_range_alignment_items;
 pub const default_max_fallback_requests_per_step = @import("pathfinding/types.zig").default_max_fallback_requests_per_step;
+pub const default_max_solves_per_frame = @import("pathfinding/types.zig").default_max_solves_per_frame;
 
 test {
     _ = @import("pathfinding/types.zig");
