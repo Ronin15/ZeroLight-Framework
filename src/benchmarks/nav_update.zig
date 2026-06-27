@@ -5,11 +5,15 @@
 //! Measures the cost of an incremental nav abstract-graph update on a large multi-level world.
 //! Each case toggles a dirty footprint of `item_count` tiles open then blocked; with the
 //! dirty-bounded rebuild only the chunks the footprint touches (plus their border neighbors)
-//! are patched, so cost tracks the dirty region, not the level size. The serial case runs the
-//! full footprint range (prod-scale digs up through a dig-storm); the threaded cases run the
-//! dig-storm tier through the system's threaded chunk patch so the report shows serial-vs-
-//! threaded scaling. The fixture is built once outside the timed region; each timed toggle
-//! returns the world to its start state so the dirty set stays bounded.
+//! are patched, so cost tracks the dirty region, not the level size. Every count is a dig-storm
+//! footprint sized to sweep an increasing dirty-chunk count, so each case traces a serial-vs-
+//! threaded SCALING CURVE through the system's threaded remask/patch stages. Two variants give
+//! two curves with different dig-storm SHAPES: `multichunk` is one compact excavation (cells in a
+//! contiguous border-straddling block; curve over cluster size), `scattered` is one cell per
+//! distinct chunk (many diggers spread across the map; curve over dirty-chunk count). The fixture is
+//! built once outside the timed region; each timed toggle returns the world to its start state so
+//! the dirty set stays bounded. Debug is the real test; release scales the curve even higher via
+//! the same adaptive tuner.
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -30,26 +34,36 @@ fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u
 
 // World side length in nav cells/tiles. The incremental update is dirty-bounded and provably
 // world-size-independent (see nav_graph tests), so the bench world only needs to hold the
-// largest footprint plus a few chunks of margin — NOT a full game world. A small world keeps
-// the per-case fixture rebuild (O(world^2), the dominant bench cost) cheap so the Debug bench
-// completes quickly; 128 tiles = 8x8 abstract chunks, room for the 64x64 dig-storm footprint.
-const world_tiles: u16 = 128;
+// largest footprint plus a few chunks of margin — NOT a full game world. The fixture is built
+// ONCE per variant and reused, so the world only has to be big enough to hold the largest
+// dig-storm footprint at its anchor: 256 tiles = 16x16 abstract chunks, room for the 128x128
+// (16384-cell) footprint at the interior anchor (40) with margin.
+const world_tiles: u16 = 256;
 const tile_size: f32 = 32.0;
 const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
-// Dirty cells fed to one `applyNavUpdates` batch (the footprint). The small end {1,2,16,32}
-// is the production batch range (a single-tile dig up to the dirty-edit cap, doubled for
-// headroom) and measures realistic per-dig cost. The large end {256,1024,4096} is a dig-storm
-// tier (many actors digging at once) that touches enough chunks for the threaded remask/patch
-// stages to engage and show serial-vs-threaded scaling. Counts are kept small enough that the
-// Debug bench (the default) completes quickly with performant code; the adaptive tuner scales
-// the threaded stages in Debug, and scales them further in release. Cost tracks the dirty-chunk
-// footprint, not the level size.
-const update_counts = [_]usize{ 1, 2, 16, 32, 256, 1024, 4096 };
+// Abstract chunk side in tiles; must match the nav build's default_nav_chunk_tiles (the bench
+// reserves with the default nav_chunk_tiles). Used to place the scattered footprint one dirty
+// cell per distinct chunk, so its item_count equals the dirty-chunk count.
+const nav_chunk_tiles: u16 = 16;
+const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
+const total_chunks: usize = chunks_per_side * chunks_per_side;
 
-// The threaded chunk patch only pays off once a batch spans many chunks. Below this footprint
-// the adaptive tuner keeps the patch inline anyway, so the threaded cases skip the small end
-// (the serial rows already report that cost) and only run the dig-storm tier.
+// Dirty cells fed to one `applyNavUpdates` batch (the footprint). Every count is a dig-storm
+// tier (many actors digging at once) sized to sweep an increasing dirty-chunk count, so the
+// threaded remask/patch stages trace a full serial-vs-threaded SCALING CURVE: with 16-tile
+// chunks the footprints span roughly 4 -> 9 -> 20 -> 36 -> 72 chunks, so the adaptive tuner
+// engages more workers as the batch grows. Sub-256 footprints are intentionally omitted — they
+// never trip the tuner into threading (it correctly keeps a single-tile dig inline) and a tiny
+// footprint's cost is dominated by the fixed per-update overhead (the serial link-edge rebuild),
+// not the incremental work, so they add no signal to the threading curve. Counts stay bounded so
+// the Debug bench (the default) completes in reasonable time; the adaptive tuner scales the
+// threaded stages in Debug, and further in release. Cost tracks the dirty-chunk footprint.
+const update_counts = [_]usize{ 256, 1024, 4096, 8192, 16384 };
+
+// The threaded stages only pay off once a batch spans many chunks; the smallest footprint is at
+// this floor. Kept as an explicit guard so the threaded cases never run a footprint the tuner
+// would just keep inline (which would report a no-op threaded row).
 const threaded_min_cells: usize = 256;
 
 // Nav work items are independent chunks with no SIMD-lane grouping, so a chunk-per-range is the
@@ -65,12 +79,17 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
         suite.alignItemCount(suite.default_items_per_range, nav_range_alignment_items);
 }
 
-const Variant = enum { interior, multichunk };
+const Variant = enum { scattered, multichunk };
+
+// Scattered counts are dirty-CHUNK counts (one cell per distinct chunk), capped at the world's
+// chunk total (256). Its curve is parameterized by how many chunks the dig-storm touches — the
+// "many NPCs digging all over the map" case that maximizes the threaded fan-out per cell.
+const scattered_counts = [_]usize{ 16, 32, 64, 128, 256 };
 
 pub const group = suite.BenchmarkGroup{
-    .name = "nav-update-interior",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runInteriorCase,
+    .name = "nav-update-scattered",
+    .defaultItemCounts = scatteredItemCounts,
+    .runCase = runScatteredCase,
 };
 
 pub const multichunk_group = suite.BenchmarkGroup{
@@ -84,8 +103,13 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
     return &update_counts;
 }
 
-pub fn runInteriorCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCase(allocator, io, options, case, item_count, .interior);
+pub fn scatteredItemCounts(profile: suite.Profile) []const usize {
+    _ = profile;
+    return &scattered_counts;
+}
+
+pub fn runScatteredCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCase(allocator, io, options, case, item_count, .scattered);
 }
 
 pub fn runMultichunkCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -188,26 +212,49 @@ fn buildSharedFixture(allocator: std.mem.Allocator, io: std.Io, participant_coun
     };
 }
 
-// Regenerates the current count's dirty footprint on level 1. The interior anchor keeps small
-// batches inside one 16-tile abstract chunk; the multichunk anchor centers the block on the chunk
-// borders at x=32/y=32 so it straddles four chunks (worst-case orthogonal-neighbor fan-out). The
-// world is not mutated here — the toggle establishes the open/blocked state.
+// Regenerates the current count's dirty footprint on level 1. The two variants apply different
+// dig-storm SHAPES so each traces a distinct scaling-under-load curve (cost is per-chunk, since the
+// remask is whole-chunk, so shape matters more than position):
+//   - scattered: one dirty cell per distinct chunk (chunk centers, row-major), so `cells` == the
+//     dirty-chunk count. Maximizes chunks (and thus threaded fan-out) per cell — many diggers
+//     spread across the map. Capped at the world's chunk total.
+//   - multichunk: a compact square block CENTERED on a chunk border at the world midpoint, so it
+//     maximally straddles chunk boundaries (worst-case neighbor fan-out). One big excavation.
+// Both keep their footprints nested as the count grows (scattered shares the row-major prefix,
+// multichunk shares the center), so the ascending-count toggle re-derivation needs no per-count
+// world reset. The world is not mutated here — the toggle establishes the open/blocked state.
 fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Variant, cells: usize) !void {
     fixture.edits.clearRetainingCapacity();
-    const side = squareSide(cells);
-    const anchor: struct { x: u16, y: u16 } = switch (variant) {
-        .interior => .{ .x = 40, .y = 40 },
-        .multichunk => .{ .x = @as(u16, 32) -| side / 2, .y = @as(u16, 32) -| side / 2 },
-    };
-    var placed: usize = 0;
-    var dy: u16 = 0;
-    outer: while (placed < cells) : (dy += 1) {
-        var dx: u16 = 0;
-        while (dx < side) : (dx += 1) {
-            if (placed >= cells) break :outer;
-            try fixture.edits.append(allocator, .{ .level = 1, .x = anchor.x + dx, .y = anchor.y + dy });
-            placed += 1;
-        }
+    switch (variant) {
+        .scattered => {
+            const n = @min(cells, total_chunks);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const cx = i % chunks_per_side;
+                const cy = i / chunks_per_side;
+                const x: u16 = @intCast(cx * nav_chunk_tiles + nav_chunk_tiles / 2);
+                const y: u16 = @intCast(cy * nav_chunk_tiles + nav_chunk_tiles / 2);
+                try fixture.edits.append(allocator, .{ .level = 1, .x = x, .y = y });
+            }
+        },
+        .multichunk => {
+            const side = squareSide(cells);
+            // world_tiles/2 is a multiple of chunk_tiles, i.e. a chunk boundary; centering the
+            // block there keeps it border-straddling at every size.
+            const center: u16 = world_tiles / 2;
+            const ax: u16 = center -| side / 2;
+            const ay: u16 = center -| side / 2;
+            var placed: usize = 0;
+            var dy: u16 = 0;
+            outer: while (placed < cells) : (dy += 1) {
+                var dx: u16 = 0;
+                while (dx < side) : (dx += 1) {
+                    if (placed >= cells) break :outer;
+                    try fixture.edits.append(allocator, .{ .level = 1, .x = ax + dx, .y = ay + dy });
+                    placed += 1;
+                }
+            }
+        },
     }
 }
 
@@ -244,9 +291,11 @@ fn timeNavUpdate(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !
 
 fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, variant: Variant) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
-    // Threaded cases only run the dig-storm tier; below it the patch stays inline anyway and the
-    // serial rows already report that cost, so skip to keep the matrix cheap.
-    if (case.usesThreadSystem() and item_count < threaded_min_cells) {
+    // Scattered footprints are one cell per chunk, so every count already spans many chunks and is
+    // worth threading; compact footprints need enough cells to span several chunks first, so they
+    // skip below the threaded floor (the serial rows already report that small-cluster cost).
+    const min_thread_cells: usize = if (variant == .multichunk) threaded_min_cells else 0;
+    if (case.usesThreadSystem() and item_count < min_thread_cells) {
         return suite.RunStats.skipped("footprint too small to thread");
     }
 
@@ -319,9 +368,11 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
     var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
     defer fixture.deinit(std.testing.allocator);
-    try setFootprint(&fixture, std.testing.allocator, .interior, 1);
+    // A single mid-chunk cell (compact footprint at the world-center chunk) -> its chunk plus its
+    // four orthogonal neighbors, no full-rebuild fallback.
+    try setFootprint(&fixture, std.testing.allocator, .multichunk, 1);
 
-    // Block the single interior cell to force a real patch.
+    // Block the single cell to force a real patch.
     for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
     const stats = try fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
     // One interior chunk plus its four orthogonal neighbors, with no full-rebuild fallback.
