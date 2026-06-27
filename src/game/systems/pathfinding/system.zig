@@ -559,27 +559,30 @@ pub const PathfindingSystem = struct {
         self.pending_keys.clear();
     }
 
-    pub fn statusForWorld(self: *const PathfindingSystem, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2, agent_class: PathAgentClass) PathView {
+    // `waypoint_hint` (optional, in/out) is the caller's per-agent last-matched path
+    // index; it lets the waypoint derivation probe a small forward window before a full
+    // path scan. Pass null to skip the hint (full scan every call).
+    pub fn statusForWorld(self: *const PathfindingSystem, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2, agent_class: PathAgentClass, waypoint_hint: ?*u32) PathView {
         const key = self.graph.keyForWorld(goal_level, goal, agent_class) orelse return .{ .status = .unavailable };
         const start_grid = self.graph.grid(start_level) orelse return .{ .status = .unavailable };
         const start_cell = start_grid.worldToCellClamped(start);
         const start_index = start_grid.indexForCell(start_cell) orelse return .{ .status = .unavailable };
-        return self.statusForKeyAndStart(key, start_level, start_index);
+        return self.statusForKeyAndStart(key, start_level, start_index, waypoint_hint);
     }
 
     fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
         const goal_grid = self.graph.grid(key.goal_level) orelse return .{ .status = .unavailable };
         if (goal_grid.indexForCell(key.goal)) |goal_index| {
-            return self.statusForKeyAndStart(key, key.goal_level, goal_index);
+            return self.statusForKeyAndStart(key, key.goal_level, goal_index, null);
         }
-        return self.statusForKeyAndStart(key, key.goal_level, 0);
+        return self.statusForKeyAndStart(key, key.goal_level, 0, null);
     }
 
     // Group field first (when ready), then individual cache, then negative cache,
     // then pending. Missing means the caller may enqueue a request. The start cell
     // is interpreted on `start_level`; cached corridors derive against the level
     // their stored cells index into (start level for cross-level corridors).
-    fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize) PathView {
+    fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize, waypoint_hint: ?*u32) PathView {
         if (self.findGroupField(key)) |field| {
             if (field.state == .ready) {
                 // The group field is built on the goal level. Sample at the agent's
@@ -596,7 +599,7 @@ pub const PathfindingSystem = struct {
             }
         }
         if (self.completed.slotIndex(key)) |slot| {
-            const result = self.completed.slots.items[slot].result;
+            const result = self.completed.resultAt(slot);
             const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
             const path = self.completed.pathSlice(slot, result.path_len);
             // Abstract chunk/cross-level corridor: a full obstacle-aware stitched
@@ -605,7 +608,7 @@ pub const PathfindingSystem = struct {
             // and cross-floor routes converge without any straight-line cut.
             if (result.stitched_len != 0) {
                 const stitched = self.completed.stitchedSlice(slot, result.stitched_len);
-                if (waypointFromStitched(&self.graph, stitched, start_level, start_index)) |waypoint| {
+                if (waypointFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint)) |waypoint| {
                     return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
                 }
                 // Agent's level is not yet covered by the corridor (e.g. it has not
@@ -618,7 +621,7 @@ pub const PathfindingSystem = struct {
             // Plain same-component local solve: derive a forward waypoint from the
             // agent's current cell against the stored path.
             if (result.path_level == start_level) {
-                if (waypointFromPath(path_grid, path, start_index)) |waypoint| {
+                if (waypointFromPath(path_grid, path, start_index, waypoint_hint)) |waypoint| {
                     return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.path_len };
                 }
             }
@@ -1117,7 +1120,7 @@ test "pathfinding individual solve produces deterministic available path and way
     const stats = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
 
-    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 96, .y = 96 }, .default);
+    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 96, .y = 96 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
     try std.testing.expectEqual(@as(f32, 48), view.next_waypoint.x);
     try std.testing.expectEqual(@as(f32, 48), view.next_waypoint.y);
@@ -1174,7 +1177,7 @@ test "pathfinding projects goal in obstacle to nearest open cell" {
     const stats = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.goal_projected);
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
-    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 104, .y = 104 }, .default).status);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 104, .y = 104 }, .default, null).status);
 }
 
 test "pathfinding spills to pending when node budget is exhausted" {
@@ -1219,7 +1222,7 @@ test "pathfinding rejects disconnected goals" {
 
     const stats = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
-    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default).status);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
 }
 
 test "pathfinding deferred_requests equals post-compaction pending in both update paths" {
@@ -1314,7 +1317,7 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
     try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
     try std.testing.expectEqual(@as(usize, 3), second_stats.group_field_samples);
 
-    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default);
+    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
 }
 
@@ -1345,7 +1348,7 @@ test "pathfinding skips the group flow field below the agent threshold" {
     const below_stats = try system.updateSerial(&below, 8, .{});
     try std.testing.expectEqual(@as(usize, 0), below_stats.group_fields_built);
     try std.testing.expectEqual(@as(usize, 1), below_stats.accepted_requests);
-    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default).status);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default, null).status);
 
     // Three agents (== threshold): the shared field now builds.
     var at = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -1576,8 +1579,8 @@ test "pathfinding threaded solve matches serial solve" {
     defer threads.deinit();
     _ = try threaded_system.update(&stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1 });
 
-    const serial_view = serial_system.statusForWorld(0, .{ .x = 16, .y = 16 }, 0, .{ .x = 144, .y = 144 }, .default);
-    const threaded_view = threaded_system.statusForWorld(0, .{ .x = 16, .y = 16 }, 0, .{ .x = 144, .y = 144 }, .default);
+    const serial_view = serial_system.statusForWorld(0, .{ .x = 16, .y = 16 }, 0, .{ .x = 144, .y = 144 }, .default, null);
+    const threaded_view = threaded_system.statusForWorld(0, .{ .x = 16, .y = 16 }, 0, .{ .x = 144, .y = 144 }, .default, null);
     try std.testing.expectEqual(serial_view.status, threaded_view.status);
     try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
     try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
@@ -1633,8 +1636,8 @@ test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
     // threaded; a shared worker path stripe would corrupt all-but-one.
     for (0..count) |i| {
         const gy: f32 = @as(f32, @floatFromInt(i)) * 32.0 + 8.0;
-        const serial_view = serial_system.statusForWorld(0, .{ .x = 8, .y = gy }, 0, .{ .x = 480, .y = gy }, .default);
-        const threaded_view = threaded_system.statusForWorld(0, .{ .x = 8, .y = gy }, 0, .{ .x = 480, .y = gy }, .default);
+        const serial_view = serial_system.statusForWorld(0, .{ .x = 8, .y = gy }, 0, .{ .x = 480, .y = gy }, .default, null);
+        const threaded_view = threaded_system.statusForWorld(0, .{ .x = 8, .y = gy }, 0, .{ .x = 480, .y = gy }, .default, null);
         try std.testing.expectEqual(PathStatus.available, serial_view.status);
         try std.testing.expectEqual(serial_view.status, threaded_view.status);
         try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
@@ -1708,7 +1711,7 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     try std.testing.expectEqual(@as(usize, 1), stats.cross_level_solves);
     try std.testing.expectEqual(@as(usize, 1), stats.abstract_solves);
 
-    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default);
+    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
     // First waypoint steers toward the level-0 link endpoint (10,10) center area,
     // i.e. to the right/down of the start cell (0,0).
@@ -1746,7 +1749,7 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
     const stats = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 0), stats.pending_requests);
-    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default);
+    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.unavailable, view.status);
 }
 
@@ -1860,7 +1863,7 @@ test "pathfinding per-level obstacle independence: level 0 obstacle is absent on
     });
     const stats = try system.updateSerial(&stream, 8, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.available_results);
-    const view = system.statusForWorld(1, .{ .x = 16, .y = 16 }, 1, .{ .x = 176, .y = 176 }, .default);
+    const view = system.statusForWorld(1, .{ .x = 16, .y = 16 }, 1, .{ .x = 176, .y = 176 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
 }
 
@@ -1925,7 +1928,7 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
         });
         const stats = try system.updateSerial(&stream, 8, .{});
         if (step == 0 and stats.abstract_solves != 0) first_via_abstract = true;
-        const view = system.statusForWorld(0, start_world, 0, cellCenterWorld(goal_cell), .default);
+        const view = system.statusForWorld(0, start_world, 0, cellCenterWorld(goal_cell), .default, null);
         if (view.status == .unavailable) return error.TestUnexpectedResult;
         if (view.status != .available) continue;
         if (agent.x == goal_cell.x and agent.y == goal_cell.y) {
@@ -2079,7 +2082,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     }
 
     // The on-level member samples the ready group field.
-    const on_view = system.statusForWorld(1, .{ .x = 16, .y = 16 }, 1, goal, .default);
+    const on_view = system.statusForWorld(1, .{ .x = 16, .y = 16 }, 1, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, on_view.status);
 
     // After the field is ready, the off-level member must still reach .available
@@ -2087,7 +2090,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     var reached = false;
     var off_guard: usize = 0;
     while (off_guard < 64) : (off_guard += 1) {
-        const off_view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, goal, .default);
+        const off_view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, goal, .default, null);
         if (off_view.status == .available) {
             reached = true;
             break;
@@ -2215,7 +2218,7 @@ test "pathfinding cross-level corridor stays obstacle-free on the destination le
             .goal = cellCenterWorld(goal_cell),
         });
         _ = try system.updateSerial(&stream, 8, .{});
-        const view = system.statusForWorld(level, start_world, 1, cellCenterWorld(goal_cell), .default);
+        const view = system.statusForWorld(level, start_world, 1, cellCenterWorld(goal_cell), .default, null);
         if (view.status == .unavailable) return error.TestUnexpectedResult;
         if (view.status != .available) continue;
         if (level == 1 and agent.x == goal_cell.x and agent.y == goal_cell.y) {
@@ -2287,7 +2290,7 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     try std.testing.expect(stats.budget_exhausted >= 1);
     try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
-    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default);
+    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.pending, view.status);
 }
 
@@ -2467,7 +2470,7 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     const goal = tileCenter(9, 5);
     const before = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), before.available_results);
-    const view_before = system.statusForWorld(0, start, 0, goal, .default);
+    const view_before = system.statusForWorld(0, start, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, view_before.status);
 
     // The cached path must cross the wall through the near gap (row 3): some stored
@@ -2487,13 +2490,13 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
     try std.testing.expect(system.graph.version == version_before);
     // The cached path crossed the now-blocked cell (5,3), so it was evicted: missing.
-    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
 
     // Next solve produces a DIFFERENT path that avoids the now-blocked near gap and
     // routes through the far gap (row 9).
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), after.available_results);
-    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
 }
@@ -2505,7 +2508,7 @@ fn cachedPathTouchesCell(system: *const PathfindingSystem, start: math.Vec2, goa
     const key = system.graph.keyForWorld(0, goal, .default) orelse return false;
     _ = start;
     const slot = system.completed.slotIndex(key) orelse return false;
-    const result = system.completed.slots.items[slot].result;
+    const result = system.completed.resultAt(slot);
     const grid = system.graph.grid(0) orelse return false;
     const target = grid.indexForCell(.{ .x = @intCast(cx), .y = @intCast(cy) }) orelse return false;
     if (result.stitched_len != 0) {
@@ -2550,7 +2553,7 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
     // re-solve is a definitive unavailable, not a stale cached available.
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), after.unavailable_results);
-    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, start, 0, goal, .default, null).status);
 }
 
 test "pathfinding incremental update retains a still-valid cached path when an off-path tile is unblocked" {
@@ -2587,7 +2590,7 @@ test "pathfinding incremental update retains a still-valid cached path when an o
     try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
 
     // The path survived: still available and still routing through the far gap (row 9).
-    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default).status);
+    try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
     try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
     try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
 }

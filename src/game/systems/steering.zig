@@ -608,7 +608,7 @@ pub const SteeringSystem = struct {
         // paths enter backoff, and available paths steer toward the next waypoint.
         // Single-level default start level (0).
         const goal_distance = distance(start, selected.intent.goal);
-        const view = pathfinding.statusForWorld(0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class);
+        const view = pathfinding.statusForWorld(0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
         switch (view.status) {
             .available => {
                 stats.path_available_count += 1;
@@ -767,6 +767,10 @@ const RuntimeRow = struct {
     stuck_steps: u16 = 0,
     replan_cooldown: u16 = 0,
     unavailable_backoff: u16 = 0,
+    // Last-matched index into the agent's cached path, passed to the pathfinding query so
+    // its per-step waypoint derivation probes a small forward window instead of scanning
+    // the whole shared path. A stale value (goal/path changed) only misses and falls back.
+    waypoint_hint: u32 = 0,
 };
 
 const SteeringAgentView = struct {

@@ -22,6 +22,12 @@ const emptyKey = types.emptyKey;
 const no_cell = types.no_cell;
 const ChangedSpan = types.ChangedSpan;
 
+// Forward window probed around a per-agent waypoint hint before falling back to a full
+// path scan. Agents walk a shared goal-keyed path monotonically (~1 cell/step), so the
+// next match is almost always within a few cells of last step's index; this turns the
+// per-agent waypoint derivation from O(path_len) into O(window) in the common case.
+const waypoint_hint_window: usize = 8;
+
 pub const KeySet = struct {
     // Fixed-capacity linear-probe set for pending keys. Full sets drop new inserts
     // instead of allocating during the fixed-step update.
@@ -88,8 +94,14 @@ pub const KeySetSlot = struct {
 
 // Goal-keyed cache. Each slot owns a fixed path buffer so a moving agent can
 // derive a forward waypoint from its current cell against the stored path.
+//
+// SoA layout: the probe-hot {occupied, key} slots stay dense so a linear-probe scan
+// (slotIndex/findOrEvictSlot) never drags the cold TTL/length payload across cache
+// lines. The cold payload (stamp + path/stitched lengths + level) is a parallel array
+// indexed by the same slot, alongside the per-slot path/stitched cell stripes.
 pub const ResultCache = struct {
-    slots: std.ArrayList(ResultCacheSlot) = .empty,
+    slots: std.ArrayList(ProbeSlot) = .empty,
+    payloads: std.ArrayList(SlotPayload) = .empty,
     path_cells: std.ArrayList(u32) = .empty,
     path_stride: usize = 0,
     // Per-slot full stitched (level,cell) corridor path: one obstacle-aware, mostly
@@ -103,8 +115,20 @@ pub const ResultCache = struct {
     pub fn deinit(self: *ResultCache, allocator: std.mem.Allocator) void {
         self.stitched.deinit(allocator);
         self.path_cells.deinit(allocator);
+        self.payloads.deinit(allocator);
         self.slots.deinit(allocator);
         self.* = undefined;
+    }
+
+    // Reconstructs the full PathResult for a slot from its hot key and cold payload.
+    pub fn resultAt(self: *const ResultCache, index: usize) PathResult {
+        const payload = self.payloads.items[index];
+        return .{
+            .key = self.slots.items[index].key,
+            .path_len = payload.path_len,
+            .path_level = payload.path_level,
+            .stitched_len = payload.stitched_len,
+        };
     }
 
     pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, path_stride: usize, stitched_stride: usize) !void {
@@ -116,9 +140,11 @@ pub const ResultCache = struct {
         const total_cells = capacity * path_stride;
         const total_stitched = capacity * stitched_stride;
         if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
+        if (capacity < self.payloads.capacity) self.payloads.shrinkAndFree(allocator, 0);
         if (total_cells < self.path_cells.capacity) self.path_cells.shrinkAndFree(allocator, 0);
         if (total_stitched < self.stitched.capacity) self.stitched.shrinkAndFree(allocator, 0);
         try setLen(&self.slots, allocator, capacity);
+        try setLen(&self.payloads, allocator, capacity);
         try setLen(&self.path_cells, allocator, total_cells);
         @memset(self.path_cells.items, no_cell);
         try setLen(&self.stitched, allocator, total_stitched);
@@ -144,7 +170,7 @@ pub const ResultCache = struct {
             changed = false;
             for (self.slots.items, 0..) |slot, slot_index| {
                 if (!slot.occupied) continue;
-                if (self.crossesSpans(graph, slot_index, slot.result, spans)) {
+                if (self.crossesSpans(graph, slot_index, self.payloads.items[slot_index], spans)) {
                     self.removeAt(slot_index);
                     changed = true;
                     break;
@@ -169,19 +195,21 @@ pub const ResultCache = struct {
             if (probe == index) break; // wrapped fully (also guards capacity == 1)
             const slot = self.slots.items[probe];
             if (!slot.occupied) break;
-            const home = hashPathKey(slot.result.key) % capacity;
+            const home = hashPathKey(slot.key) % capacity;
             // Keep the entry where it is when its home is cyclically within (hole, probe];
             // otherwise it can move up to fill the hole without becoming unreachable.
             if (inCyclicRange(hole, probe, home)) continue;
             self.slots.items[hole] = slot;
-            self.movePayload(probe, hole);
+            self.payloads.items[hole] = self.payloads.items[probe];
+            self.moveSlotCells(probe, hole);
             self.slots.items[probe].occupied = false;
             hole = probe;
         }
     }
 
-    // Copies a slot's path and stitched payload from one index to another (back-shift move).
-    fn movePayload(self: *ResultCache, from: usize, to: usize) void {
+    // Copies a slot's path and stitched cell stripes from one index to another (back-shift
+    // move). The {occupied,key} slot and the cold payload are moved by the caller.
+    fn moveSlotCells(self: *ResultCache, from: usize, to: usize) void {
         if (self.path_stride != 0) {
             const fb = from * self.path_stride;
             const tb = to * self.path_stride;
@@ -194,15 +222,15 @@ pub const ResultCache = struct {
         }
     }
 
-    fn crossesSpans(self: *const ResultCache, graph: *const NavGraph, slot_index: usize, result: PathResult, spans: []const ChangedSpan) bool {
-        if (result.stitched_len != 0) {
-            for (self.stitchedSlice(slot_index, result.stitched_len)) |sc| {
+    fn crossesSpans(self: *const ResultCache, graph: *const NavGraph, slot_index: usize, payload: SlotPayload, spans: []const ChangedSpan) bool {
+        if (payload.stitched_len != 0) {
+            for (self.stitchedSlice(slot_index, payload.stitched_len)) |sc| {
                 if (sc.cell != no_cell and cellInSpans(graph, sc.level, sc.cell, spans)) return true;
             }
             return false;
         }
-        for (self.pathSlice(slot_index, result.path_len)) |cell| {
-            if (cell != no_cell and cellInSpans(graph, result.path_level, cell, spans)) return true;
+        for (self.pathSlice(slot_index, payload.path_len)) |cell| {
+            if (cell != no_cell and cellInSpans(graph, payload.path_level, cell, spans)) return true;
         }
         return false;
     }
@@ -224,7 +252,7 @@ pub const ResultCache = struct {
         for (0..capacity) |probe| {
             const index = (start + probe) % capacity;
             const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.result.key, key)) return index;
+            if (slot.occupied and keysEqual(slot.key, key)) return index;
             if (!slot.occupied and self.len < capacity) return null;
         }
         return null;
@@ -232,18 +260,18 @@ pub const ResultCache = struct {
 
     pub fn find(self: *const ResultCache, key: PathQueryKey) ?PathResult {
         const index = self.slotIndex(key) orelse return null;
-        return self.slots.items[index].result;
+        return self.resultAt(index);
     }
 
     // find, but a result older than `ttl` steps is dropped (returns null) so the caller
     // re-solves it against current geometry. ttl 0 disables expiry.
     pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
         const index = self.slotIndex(key) orelse return null;
-        if (ttl != 0 and (step -% self.slots.items[index].stamp) >= ttl) {
+        if (ttl != 0 and (step -% self.payloads.items[index].stamp) >= ttl) {
             self.removeAt(index);
             return null;
         }
-        return self.slots.items[index].result;
+        return self.resultAt(index);
     }
 
     // Writes a plain local-solve path (start-to-goal cell order) on `path_level` plus
@@ -256,10 +284,12 @@ pub const ResultCache = struct {
         const slot_index = self.findOrEvictSlot(key, stats);
         const stored_len = self.writePath(slot_index, path);
         const stitched_len = self.writeStitched(slot_index, stitched);
-        self.slots.items[slot_index] = .{
-            .occupied = true,
+        self.slots.items[slot_index] = .{ .occupied = true, .key = key };
+        self.payloads.items[slot_index] = .{
             .stamp = step,
-            .result = .{ .key = key, .path_len = @intCast(stored_len), .path_level = path_level, .stitched_len = @intCast(stitched_len) },
+            .path_len = @intCast(stored_len),
+            .path_level = path_level,
+            .stitched_len = @intCast(stitched_len),
         };
     }
 
@@ -278,7 +308,7 @@ pub const ResultCache = struct {
         for (0..capacity) |probe| {
             const index = (start + probe) % capacity;
             const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.result.key, key)) return index;
+            if (slot.occupied and keysEqual(slot.key, key)) return index;
             if (!slot.occupied and self.len < capacity) {
                 self.len += 1;
                 return index;
@@ -310,11 +340,20 @@ pub const ResultCache = struct {
         return types.downsamplePathInto(dst, path);
     }
 };
-pub const ResultCacheSlot = struct {
+// Probe-hot slot: only the fields a linear-probe scan touches (occupancy + key).
+pub const ProbeSlot = struct {
     occupied: bool = false,
+    key: PathQueryKey = emptyKey(0),
+};
+
+// Cold per-slot payload, parallel to ProbeSlot. Read only on a hit / TTL check, so it
+// is kept off the probe-scan cache lines.
+pub const SlotPayload = struct {
     // step_counter when the entry was written, for TTL refresh.
     stamp: u32 = 0,
-    result: PathResult = .{ .key = emptyKey(0), .path_len = 0 },
+    path_len: u32 = 0,
+    path_level: u16 = 0,
+    stitched_len: u32 = 0,
 };
 
 // Whether `x` lies in the cyclic half-open-then-closed interval (start, end] on a ring of
@@ -338,14 +377,24 @@ fn cellInSpans(graph: *const NavGraph, level: u16, cell: u32, spans: []const Cha
 
 // Per-agent waypoint derivation against a cached path. This is the per-step,
 // per-entity refinement promised by the goal-keyed cache.
-pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: usize) ?math.Vec2 {
+pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: usize, hint: ?*u32) ?math.Vec2 {
     if (path.len == 0) return null;
     if (path.len == 1) return grid.cellCenter(path[0]);
+    // Hinted fast path: probe a small forward window from last step's match before the
+    // full scan. A cell appears at most once on an A* path, so a window hit is the unique
+    // occurrence and a stale hint can only miss (never mis-step), falling back to the scan.
+    if (hint) |h| {
+        const from = @min(@as(usize, h.*), path.len - 1);
+        const to = @min(from + waypoint_hint_window, path.len);
+        for (from..to) |i| {
+            if (path[i] == start_index) return waypointAt(grid, path, i, hint);
+        }
+    }
     // Exact match: step to the next cell on the path.
     for (path[0 .. path.len - 1], 0..) |cell, i| {
-        if (cell == start_index) return grid.cellCenter(path[i + 1]);
+        if (cell == start_index) return waypointAt(grid, path, i, hint);
     }
-    if (path[path.len - 1] == start_index) return grid.cellCenter(path[path.len - 1]);
+    if (path[path.len - 1] == start_index) return waypointAt(grid, path, path.len - 1, hint);
     // Off-path: head toward the nearest path cell's successor.
     const start_x: i32 = @intCast(start_index % grid.width);
     const start_y: i32 = @intCast(start_index / grid.width);
@@ -362,7 +411,14 @@ pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: us
             best_index = i;
         }
     }
-    const next = if (best_index + 1 < path.len) best_index + 1 else best_index;
+    return waypointAt(grid, path, best_index, hint);
+}
+
+// Records the matched/nearest index in the hint and returns the heading to its successor
+// (or the cell itself at the path end), shared by the hinted and full-scan branches.
+fn waypointAt(grid: *const NavGrid, path: []const u32, index: usize, hint: ?*u32) math.Vec2 {
+    if (hint) |h| h.* = @intCast(index);
+    const next = if (index + 1 < path.len) index + 1 else index;
     return grid.cellCenter(path[next]);
 }
 
@@ -374,8 +430,20 @@ pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: us
 // so the heading is always to a traversable neighbor — never a straight-line cut
 // across a blocked cell. Returns null when the agent's level has no run in the path
 // (a cross-level agent has not yet reached a level the corridor covers).
-pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCell, start_level: u16, start_index: usize) ?math.Vec2 {
+pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCell, start_level: u16, start_index: usize, hint: ?*u32) ?math.Vec2 {
     const start_grid = graph.grid(start_level) orelse return null;
+    // Hinted fast path: probe a forward window for an exact cell match on the agent's
+    // level before the full run scan. A cell appears at most once per level run, so a hit
+    // is unambiguous; a stale hint only misses and falls back to the scan.
+    if (hint) |h| {
+        const from = @min(@as(usize, h.*), stitched.len -| 1);
+        const to = @min(from + waypoint_hint_window, stitched.len);
+        for (from..to) |j| {
+            if (stitched[j].level == start_level and stitched[j].cell == start_index) {
+                return stitchedWaypointAt(start_grid, stitched, start_level, j, hint);
+            }
+        }
+    }
     // Scan the path's contiguous runs on the agent's level. An exact match (the agent
     // is on a path cell) walks to that cell's successor within the run. Otherwise fall
     // back to the run holding the nearest cell on this level and walk from there.
@@ -395,8 +463,7 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCe
         const run_end = i; // exclusive
         for (run_begin..run_end) |j| {
             if (stitched[j].cell == start_index) {
-                const next = if (j + 1 < run_end) j + 1 else j;
-                return start_grid.cellCenter(stitched[next].cell);
+                return stitchedWaypointAt(start_grid, stitched, start_level, j, hint);
             }
             const cx: i32 = @intCast(stitched[j].cell % start_grid.width);
             const cy: i32 = @intCast(stitched[j].cell / start_grid.width);
@@ -426,13 +493,43 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCe
             nearest = j;
         }
     }
-    const next = if (nearest + 1 < best_run_end) nearest + 1 else nearest;
-    return start_grid.cellCenter(stitched[next].cell);
+    return stitchedWaypointAt(start_grid, stitched, start_level, nearest, hint);
+}
+
+// Records the matched/nearest stitched index in the hint and returns the heading to its
+// successor within the same-level run (or the cell itself at the run's end). The run is
+// grid-adjacent, so the successor is always one traversable step.
+fn stitchedWaypointAt(grid: *const NavGrid, stitched: []const StitchedCell, level: u16, j: usize, hint: ?*u32) math.Vec2 {
+    if (hint) |h| h.* = @intCast(j);
+    const next = if (j + 1 < stitched.len and stitched[j + 1].level == level) j + 1 else j;
+    return grid.cellCenter(stitched[next].cell);
 }
 
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
+
+test "pathfinding waypoint hint matches full scan and recovers from a stale hint" {
+    const grid = NavGrid{ .width = 100, .height = 1, .cell_size = 1 };
+    const path = [_]u32{ 10, 11, 12, 13, 14, 15 };
+
+    // Baseline: agent on cell 12 heads to its successor 13.
+    const baseline = waypointFromPath(&grid, &path, 12, null).?;
+    try std.testing.expectEqual(grid.cellCenter(13).x, baseline.x);
+
+    // A hint pointing near the match takes the windowed fast path and records the index.
+    var fresh: u32 = 1;
+    const hinted = waypointFromPath(&grid, &path, 12, &fresh).?;
+    try std.testing.expectEqual(baseline.x, hinted.x);
+    try std.testing.expectEqual(@as(u32, 2), fresh); // index of cell 12
+
+    // An out-of-range/stale hint misses the window, falls back to the full scan, and is
+    // repaired to the real index — same waypoint, never a mis-step.
+    var stale: u32 = 999;
+    const recovered = waypointFromPath(&grid, &path, 12, &stale).?;
+    try std.testing.expectEqual(baseline.x, recovered.x);
+    try std.testing.expectEqual(@as(u32, 2), stale);
+}
 
 test "pathfinding fixed-capacity unavailable key set has explicit fixed capacity" {
     var keys = KeySet{};
@@ -504,7 +601,7 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(cache.find(first_key) == null);
     const slot = cache.slotIndex(second_key).?;
-    const stored = cache.pathSlice(slot, cache.slots.items[slot].result.path_len);
+    const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
     try std.testing.expectEqual(@as(usize, 2), stored.len);
     try std.testing.expectEqual(@as(u32, 3), stored[0]);
 }
@@ -524,7 +621,7 @@ test "pathfinding result cache downsamples an over-stride path to span start and
     const long = [_]u32{ 10, 11, 12, 13, 14, 15, 16, 17 };
     cache.put(key, &long, &.{}, 0, 0, &stats);
     const slot = cache.slotIndex(key).?;
-    const stored = cache.pathSlice(slot, cache.slots.items[slot].result.path_len);
+    const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
     try std.testing.expectEqual(@as(usize, stride), stored.len);
     try std.testing.expectEqual(@as(u32, 10), stored[0]); // start preserved
     try std.testing.expectEqual(@as(u32, 17), stored[stored.len - 1]); // goal preserved
