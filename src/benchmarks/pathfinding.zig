@@ -5,6 +5,9 @@
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
+const WorkerId = @import("../app/thread_system.zig").WorkerId;
+const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const math = @import("../core/math.zig");
 const DataSystem = @import("../game/data_system.zig").DataSystem;
 const PathRequest = @import("../game/simulation.zig").PathRequest;
@@ -53,6 +56,17 @@ pub const hard_fallback_budget_group = suite.BenchmarkGroup{
     .runCase = runHardFallbackBudgetCase,
 };
 
+// Query tier: per-agent statusForWorld against a WARM cache, distinct from the solve
+// groups (which measure update) and from steering/ai (which measure avoidance). Each
+// agent reads its own cached path mid-route, so this isolates the cache probe and the
+// per-step waypoint derivation — the crowd-scale path-following lookup. The queries are
+// read-only and independent, so they fan across workers (each agent owns its hint slot).
+pub const query_group = suite.BenchmarkGroup{
+    .name = "pathfinding-query",
+    .defaultItemCounts = queryDefaultItemCounts,
+    .runCase = runQueryCase,
+};
+
 const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
@@ -62,6 +76,11 @@ const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
 const unreachable_quick_counts = [_]usize{ 8, 16, 32 };
 const unreachable_standard_counts = [_]usize{ 16, 32, 64, 1024 };
 const unreachable_stress_counts = [_]usize{ 64, 128, 1024 };
+// Lean (two counts per profile): the query loop is cheap, and a crowd at and well above
+// the per-frame solve ceiling is enough to show the cache-probe and waypoint-scan cost.
+const query_quick_counts = [_]usize{ 256, 1024 };
+const query_standard_counts = [_]usize{ 1024, 4096 };
+const query_stress_counts = [_]usize{ 4096, 10000 };
 
 const Workload = enum {
     common_goal,
@@ -108,6 +127,14 @@ pub fn unreachableDefaultItemCounts(profile: suite.Profile) []const usize {
         .quick => &unreachable_quick_counts,
         .standard => &unreachable_standard_counts,
         .stress => &unreachable_stress_counts,
+    };
+}
+
+pub fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        .quick => &query_quick_counts,
+        .standard => &query_standard_counts,
+        .stress => &query_stress_counts,
     };
 }
 
@@ -356,6 +383,132 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
         suite.alignItemCount(suite.default_items_per_range, pathfinding_range_alignment_items);
 }
 
+const QueryContext = struct {
+    system: *const PathfindingSystem,
+    // Per-agent query inputs, all indexed by agent. starts[i] is the agent's CURRENT cell
+    // (mid-route), goals[i] its goal. hints[i] is its private waypoint hint (disjoint write
+    // per worker). sink[i] consumes the returned status so the query is not elided.
+    starts: []const math.Vec2,
+    goals: []const math.Vec2,
+    hints: []u32,
+    sink: []u8,
+};
+
+fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
+    _ = worker_id;
+    const ctx: *QueryContext = @ptrCast(@alignCast(context));
+    for (range.start..range.end) |i| {
+        const view = ctx.system.statusForWorld(0, ctx.starts[i], 0, ctx.goals[i], .default, &ctx.hints[i]);
+        ctx.sink[i] = @intFromEnum(view.status);
+    }
+}
+
+fn runQueries(ctx: *QueryContext, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, item_count: usize) BatchStats {
+    if (thread_system) |ts| {
+        return ts.parallelForWithOptions(item_count, ctx, queryJob, .{
+            .items_per_range = benchmarkItemsPerRange(case),
+            .max_worker_threads = case.maxWorkerThreads(),
+            .range_alignment_items = pathfinding_range_alignment_items,
+            .adaptive = case.adaptive,
+        });
+    }
+    queryJob(@ptrCast(ctx), .{ .start = 0, .end = item_count }, WorkerId.main);
+    return suite.serialBatch(item_count, pathfinding_range_alignment_items);
+}
+
+// Per-agent statusForWorld against a warm cache: isolates the result-cache probe and the
+// per-step waypoint derivation (the crowd path-following lookup). Agents are queried from
+// the MIDPOINT of their own cached path so the waypoint scan has a deep match to find —
+// exactly the cost the per-agent hint optimizes.
+pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+
+    var fixture = try createFixture(allocator, item_count, .unique_open);
+    defer fixture.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+
+    const grid_side = fixtureGridSide(item_count, .unique_open);
+    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+
+    try system.reserve(.{
+        .max_group_fields = 8,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = @max(item_count, 1),
+    });
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+
+    // Warm the cache: solve every agent's path. Solves are capped per frame, so run enough
+    // frames to drain the queue (re-submitted already-cached requests are cheap no-ops).
+    const warm_frames = item_count / 256 + 4;
+    for (0..warm_frames) |_| {
+        _ = try system.updateSerial(&fixture.requests, item_count, .{});
+    }
+
+    const starts = try allocator.alloc(math.Vec2, item_count);
+    defer allocator.free(starts);
+    const goals = try allocator.alloc(math.Vec2, item_count);
+    defer allocator.free(goals);
+    const hints = try allocator.alloc(u32, item_count);
+    defer allocator.free(hints);
+    const sink = try allocator.alloc(u8, item_count);
+    defer allocator.free(sink);
+    @memset(hints, 0);
+    @memset(sink, 0);
+
+    const grid = system.graph.grid(0).?;
+    var warm_paths: usize = 0;
+    for (0..item_count) |i| {
+        const goal_cell = requestGoalCell(i, grid_side, .unique_open);
+        const goal_world = math.Vec2{ .x = @as(f32, @floatFromInt(goal_cell.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(goal_cell.y)) * 32.0 + 8.0 };
+        goals[i] = goal_world;
+        // Default query position: the agent's own start cell (front of the path).
+        const start_cell = requestStartCell(i, grid_side, .unique_open);
+        starts[i] = .{ .x = @as(f32, @floatFromInt(start_cell.x)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(start_cell.y)) * 32.0 + 8.0 };
+        // If the path is cached, move the query position to its midpoint so the waypoint
+        // derivation must locate a deep cell (the hint's target case).
+        if (system.graph.keyForWorld(0, goal_world, .default)) |key| {
+            if (system.completed.slotIndex(key)) |slot| {
+                const path = system.completed.pathSlice(slot, system.completed.resultAt(slot).path_len);
+                if (path.len > 0) {
+                    starts[i] = grid.cellCenter(path[path.len / 2]);
+                    warm_paths += 1;
+                }
+            }
+        }
+    }
+
+    var context = QueryContext{ .system = &system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
+
+    // Warmup also settles each agent's hint to its midpoint index.
+    for (0..options.warmup_iterations) |_| {
+        _ = runQueries(&context, if (threads) |*thread_system| thread_system else null, case, item_count);
+    }
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    for (0..options.iterations) |_| {
+        const start_ns = suite.nowNs(io);
+        const batch = runQueries(&context, if (threads) |*thread_system| thread_system else null, case, item_count);
+        const end_ns = suite.nowNs(io);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), batch);
+    }
+
+    var stats = accumulator.finish();
+    stats.output_count = item_count;
+    stats.candidate_pairs = warm_paths; // agents served from a warm cached path
+    return stats;
+}
+
 fn appendRequest(stream: *RangeOutputStream(PathRequest), request: PathRequest) !void {
     const range_base = try stream.appendRangeCounts(1);
     stream.addCount(range_base, 1);
@@ -483,6 +636,20 @@ test "pathfinding benchmark tiny serial case runs without display" {
     try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
     try std.testing.expect(stats.batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 32), stats.output_count);
+}
+
+test "pathfinding query benchmark warms the cache and queries every agent" {
+    const options = suite.Options{
+        .warmup_iterations = 1,
+        .iterations = 1,
+    };
+    const stats = try runQueryCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 32);
+    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+    try std.testing.expect(stats.batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 32), stats.output_count);
+    // Every agent's path must be warm in the cache, so the measured loop exercises the
+    // populated-cache probe and the waypoint derivation rather than the missing path.
+    try std.testing.expectEqual(@as(usize, 32), stats.candidate_pairs);
 }
 
 test "pathfinding hard fallback budget preserves request denominator" {
