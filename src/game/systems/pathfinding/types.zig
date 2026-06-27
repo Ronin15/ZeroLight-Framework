@@ -105,6 +105,9 @@ pub const default_max_abstract_nodes: usize = 4096;
 // the cap spills to a later frame (budget_exhausted) and is retried from the agent's
 // advanced position, so the cap is never a silent truncation.
 pub const default_max_stitched_path_cells: usize = 512;
+// Steps after which a cached result is re-solved when next requested, so an agent
+// picks up world changes that did not directly cross its path. 0 disables. ~5s at 60Hz.
+pub const default_cache_ttl_steps: u32 = 300;
 
 pub const no_parent: usize = std.math.maxInt(usize);
 pub const no_cell: u32 = std.math.maxInt(u32);

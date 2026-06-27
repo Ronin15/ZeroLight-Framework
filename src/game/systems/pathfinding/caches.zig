@@ -186,11 +186,23 @@ pub const ResultCache = struct {
         return self.slots.items[index].result;
     }
 
+    // find, but a result older than `ttl` steps is dropped (returns null) so the caller
+    // re-solves it against current geometry. ttl 0 disables expiry.
+    pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
+        const index = self.slotIndex(key) orelse return null;
+        if (ttl != 0 and (step -% self.slots.items[index].stamp) >= ttl) {
+            self.slots.items[index].occupied = false;
+            self.len -= 1;
+            return null;
+        }
+        return self.slots.items[index].result;
+    }
+
     // Writes a plain local-solve path (start-to-goal cell order) on `path_level` plus
     // an optional full stitched (level,cell) corridor path. The plain path, when used,
     // is only downsampled when it exceeds the stride; the stitched path is bounded at
     // the solve side and stored whole, so its consecutive cells stay traversable.
-    pub fn put(self: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, stats: *PathfindingStats) void {
+    pub fn put(self: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
         const capacity = self.slots.items.len;
         if (capacity == 0 or self.path_stride == 0) return;
         const slot_index = self.findOrEvictSlot(key, stats);
@@ -198,6 +210,7 @@ pub const ResultCache = struct {
         const stitched_len = self.writeStitched(slot_index, stitched);
         self.slots.items[slot_index] = .{
             .occupied = true,
+            .stamp = step,
             .result = .{ .key = key, .path_len = stored_len, .path_level = path_level, .stitched_len = stitched_len },
         };
     }
@@ -246,6 +259,8 @@ pub const ResultCache = struct {
 };
 pub const ResultCacheSlot = struct {
     occupied: bool = false,
+    // step_counter when the entry was written, for TTL refresh.
+    stamp: u32 = 0,
     result: PathResult = .{ .key = emptyKey(0), .path_len = 0 },
 };
 
@@ -385,9 +400,9 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     var second_key = emptyKey(1);
     second_key.goal.x = 2;
 
-    cache.put(first_key, &.{ 0, 1, 2 }, &.{}, 0, &stats);
+    cache.put(first_key, &.{ 0, 1, 2 }, &.{}, 0, 0, &stats);
     try std.testing.expect(cache.find(first_key) != null);
-    cache.put(second_key, &.{ 3, 4 }, &.{}, 0, &stats);
+    cache.put(second_key, &.{ 3, 4 }, &.{}, 0, 0, &stats);
     try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
     try std.testing.expect(cache.find(first_key) == null);
     const slot = cache.slotIndex(second_key).?;

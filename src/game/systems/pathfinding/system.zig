@@ -409,7 +409,14 @@ pub const PathfindingSystem = struct {
         for (edits) |edit| {
             const grid = self.graph.grid(edit.level) orelse continue;
             const span = grid.navSpanForTile(world_system, edit) orelse continue;
-            self.nav_changed_spans.appendAssumeCapacity(.{ .level = edit.level, .span = span });
+            // One-cell halo: also evict paths running ALONGSIDE the change so an agent
+            // beside a newly-opened cell re-solves into the opening.
+            self.nav_changed_spans.appendAssumeCapacity(.{ .level = edit.level, .span = .{
+                .min_x = span.min_x -| 1,
+                .min_y = span.min_y -| 1,
+                .max_x = @min(span.max_x + 1, grid.width - 1),
+                .max_y = @min(span.max_y + 1, grid.height - 1),
+            } });
         }
         self.completed.evictCrossing(&self.graph, self.nav_changed_spans.items);
     }
@@ -657,7 +664,7 @@ pub const PathfindingSystem = struct {
                     }
                 }
             }
-            if (self.completed.find(prepared.key) != null) {
+            if (self.completed.findFresh(prepared.key, self.step_counter, types.default_cache_ttl_steps) != null) {
                 stats.duplicate_requests += 1;
                 stats.cache_hits += 1;
                 stats.available_results += 1;
@@ -914,7 +921,7 @@ pub const PathfindingSystem = struct {
                     const solved = self.solved_paths.items[pending_index];
                     const path = self.worker_path_pool.items[solved.offset .. solved.offset + solved.len];
                     const stitched = self.worker_stitched_pool.items[solved.stitched_offset .. solved.stitched_offset + solved.stitched_len];
-                    self.completed.put(key, path, stitched, solved.path_level, stats);
+                    self.completed.put(key, path, stitched, solved.path_level, self.step_counter, stats);
                     stats.solved_requests += 1;
                     stats.available_results += 1;
                     if (solved.via_abstract) stats.abstract_solves += 1;
