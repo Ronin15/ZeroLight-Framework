@@ -10,6 +10,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const NavGridError = types.NavGridError;
 const StitchedCell = types.StitchedCell;
+const OpenNode = types.OpenNode;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
 
@@ -61,11 +62,15 @@ pub const NavMemoryBudget = struct {
         const static_bytes = per_level_bytes *| levels;
         // Group-field registry: max_group_fields x cells x per-cell field bytes.
         const group_registry_bytes = self.max_group_fields *| cell_count *| self.group_field_bytes_per_cell;
-        // Per-participant A* scratch is direct per-cell arrays, so each slot is
-        // O(cells). The gate counts exactly the participant slots that are sized during
-        // the build (the real resident scratch), so a large world fails loud here
-        // rather than degrading at query time.
-        const scratch_bytes = self.worker_participant_count *| cell_count *| scratch_slot_bytes;
+        // Per-participant A* scratch. The direct per-cell state arrays are O(cells); on top
+        // of those each participant also reserves the open heap (node budget) and the path
+        // reconstruction buffer (node budget vs. stored-path cells), which scale with the
+        // reserve config rather than the cell count. Counting both keeps the gate honest
+        // about real resident scratch so a large world fails loud here, not at query time.
+        const per_participant_scratch_bytes = (cell_count *| scratch_slot_bytes) +|
+            (self.max_explored_nodes *| @sizeOf(OpenNode)) +|
+            (@max(self.max_explored_nodes, self.max_stored_path_cells) *| @sizeOf(u32));
+        const scratch_bytes = self.worker_participant_count *| per_participant_scratch_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.

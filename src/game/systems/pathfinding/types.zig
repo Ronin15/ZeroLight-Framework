@@ -542,9 +542,6 @@ pub fn emptyKey(nav_version: u32) PathQueryKey {
     };
 }
 
-// Grows (amortized) or shrinks-and-frees a per-step scratch list's backing capacity
-// to `capacity`, leaving it empty. Used for lists the update repopulates each step,
-// so no contents need to survive the resize. Shrinking frees memory back.
 // Grows `list` to hold exactly `len` items (reusing capacity) and sets the active
 // length, leaving the new tail uninitialized — callers fill or @memset it. Collapses
 // the repeated ensureTotalCapacity + items.len pair.
@@ -553,6 +550,9 @@ pub fn setLen(list: anytype, allocator: std.mem.Allocator, len: usize) !void {
     list.items.len = len;
 }
 
+// Grows (amortized) or shrinks-and-frees a per-step scratch list's backing capacity
+// to `capacity`, leaving it empty. Used for lists the update repopulates each step,
+// so no contents need to survive the resize. Shrinking frees memory back.
 pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize) !void {
     if (capacity < list.capacity) {
         list.clearRetainingCapacity();

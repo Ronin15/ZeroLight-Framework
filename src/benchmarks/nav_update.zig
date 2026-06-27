@@ -52,6 +52,19 @@ const update_counts = [_]usize{ 1, 2, 16, 32, 256, 1024, 4096 };
 // (the serial rows already report that cost) and only run the dig-storm tier.
 const threaded_min_cells: usize = 256;
 
+// Nav work items are independent chunks with no SIMD-lane grouping, so a chunk-per-range is the
+// natural alignment for both threaded stages.
+const nav_range_alignment_items: usize = 1;
+
+// Fixed range size for a NON-adaptive control case, so the adaptive rows can be compared against
+// fixed-partition controls. Adaptive cases return null (the tuner sizes ranges). Mirrors the
+// collision bench's benchmarkItemsPerRange so all benches share the same control scheme.
+fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
+    if (case.adaptive) return null;
+    return case.itemsPerRange(nav_range_alignment_items) orelse
+        suite.alignItemCount(suite.default_items_per_range, nav_range_alignment_items);
+}
+
 const Variant = enum { interior, multichunk };
 
 pub const group = suite.BenchmarkGroup{
@@ -254,17 +267,34 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     try setFootprint(fixture, allocator, variant, item_count);
     // Reset both stage tuners per case so a prior case's training never leaks into this one (a
     // fresh system would have fresh tuners). Adaptive cases use the configured probing tuner.
-    if (suite.adaptiveTunerForCase(case, 1)) |tuner| {
+    if (suite.adaptiveTunerForCase(case, nav_range_alignment_items)) |tuner| {
         fixture.system.nav_remask_tuner = tuner;
-        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, 1).?;
+        fixture.system.nav_patch_tuner = suite.adaptiveTunerForCase(case, nav_range_alignment_items).?;
     } else {
         fixture.system.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
         fixture.system.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
     }
+    // Drive the threaded stages with this case's control config: adaptive cases let the tuner
+    // size ranges; fixed control cases pin a fixed partition so the tuner is measured against them.
+    fixture.system.nav_thread_adaptive = case.adaptive;
+    fixture.system.nav_thread_items_per_range = benchmarkItemsPerRange(case);
 
     // Warm so the abstract buffers are at high-water capacity (the steady path is
-    // allocation-free) and the tuner has trained an inline baseline before timing.
+    // allocation-free) and the tuners have trained an inline baseline before timing.
     for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| _ = try runToggle(fixture, io, thread_ptr);
+
+    // Let the adaptive tuners settle on a stable profile before measuring (as collision/
+    // pathfinding do), so a still-learning tuner does not flip inline<->threaded mid-run and
+    // skew the mean. Both nav stages have their own tuner, so both must settle.
+    if (case.adaptive) {
+        var settle_guard: usize = 0;
+        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        while ((!fixture.system.nav_remask_tuner.isSettled() or !fixture.system.nav_patch_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runToggle(fixture, io, thread_ptr);
+        }
+    }
+    const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
+    const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
@@ -279,6 +309,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     // stage (runs first and dominates at scale); secondary = the abstract chunk patch.
     stats.batch = suite.batchSummaryFromBatch(fixture.system.graph.last_remask_batch);
     stats.secondary_batch = suite.batchSummaryFromBatch(fixture.system.graph.last_patch_batch);
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(fixture.system.nav_remask_tuner.report(), remask_settled);
+        stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
+    }
     return stats;
 }
 
@@ -294,4 +328,21 @@ test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 0), stats.edge_cap_fallback);
+}
+
+test "nav update benchmark dig-storm tier stays incremental (no full rebuild)" {
+    // Guards the bench's premise: the largest footprint must still take the incremental path.
+    // A regression that pushed the dig-storm tier into a full relabel / edge-cap fallback would
+    // make the numbers world-size-dependent and no longer measure an incremental update.
+    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
+    defer fixture.deinit(std.testing.allocator);
+    const top_tier = update_counts[update_counts.len - 1];
+    try setFootprint(&fixture, std.testing.allocator, .multichunk, top_tier);
+
+    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
+    const stats = try fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
+    try std.testing.expectEqual(@as(usize, 0), stats.edge_cap_fallback);
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
 }

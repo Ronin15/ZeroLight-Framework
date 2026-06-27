@@ -750,9 +750,10 @@ pub const GameDemoState = struct {
     // affected levels are recomputed and `nav_version` bumps once, instead of a
     // whole-world rebuild. The whole-world build stays init-only. Blocking world-tile
     // and obstacle edits are mapped into dirty nav cell edits; entity-driven static
-    // obstacle changes do not carry a cell, so the whole affected level is recomputed
-    // via an edit on each touched level. A `nav_region_invalidated` event is still
-    // emitted when the graph actually changed.
+    // obstacle changes do not carry a cell (a destroyed entity's footprint is gone), so
+    // level 0 — the only level sourcing collision bodies — is marked whole-level dirty and
+    // re-derived from the world. A `nav_region_invalidated` event is still emitted when the
+    // graph actually changed.
     fn processPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !void {
         self.last_nav_update_stats = .{};
         // The dirty nav-cell buffer is owned by the pathfinding system (it scales with
@@ -775,13 +776,14 @@ pub const GameDemoState = struct {
                         }
                     }
                 },
-                // Entity-component nav changes do not carry a world cell. Mark level 0
-                // (the only level sourcing collision bodies) dirty with a sentinel cell
-                // so its mask/components are recomputed without a whole-world rebuild.
+                // Entity-component nav changes do not carry a world cell. Mark level 0 (the only
+                // level sourcing collision bodies) whole-level dirty so every chunk's mask and
+                // components are re-derived from the world — correct regardless of where on the
+                // level the obstacle was — without a whole-world rebuild.
                 else => entity_obstacle_change = true,
             }
         }
-        if (entity_obstacle_change) try self.pipeline.markNavDirty(0, 0, 0);
+        if (entity_obstacle_change) try self.pipeline.markNavLevelDirty(0);
 
         if (!self.pipeline.hasPendingNavUpdates()) return;
         try self.simulation_frame.events.ensureCanAppend(1);

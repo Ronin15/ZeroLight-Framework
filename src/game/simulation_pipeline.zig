@@ -173,7 +173,13 @@ pub const SimulationPipeline = struct {
         try self.pathfinding.markNavDirty(level, x, y);
     }
 
-    /// Whether any dirty nav cell is buffered for this step.
+    /// Marks a whole level for re-derivation next update, for changes that cannot be reduced to
+    /// specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable).
+    pub fn markNavLevelDirty(self: *SimulationPipeline, level: u16) !void {
+        try self.pathfinding.markNavLevelDirty(level);
+    }
+
+    /// Whether any dirty nav cell or whole-level request is buffered for this step.
     pub fn hasPendingNavUpdates(self: *const SimulationPipeline) bool {
         return self.pathfinding.hasPendingNavUpdates();
     }

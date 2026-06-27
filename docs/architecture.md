@@ -530,16 +530,24 @@ changes, folds them into the state-owned pathfinding nav graph INCREMENTALLY
 rather than rebuilding the whole world. The play state only INTERPRETS events
 into changed nav cells; the dirty buffer and the update itself are owned by
 `PathfindingSystem` (the named owner for work that scales with digging/obstacle
-edits), not the main-thread play state. Blocking `world_tile_changed` /
-`world_obstacle_changed` edits (only when `old_blocks_movement !=
-new_blocks_movement`) plus entity-driven obstacle changes are forwarded to the
-system-owned dirty buffer via `pipeline.markNavDirty`, and `pipeline.applyNavUpdates`
-coalesces them to the set of touched chunks, RE-DERIVES each touched chunk's
-blocked mask from the world WHOLE-CHUNK (so a coalesced rect or a large multi-actor
-batch can never leave a cell stale against the world), recomputes those chunks'
-components, patches the chunk-portal abstract graph once (bounded by chunk borders,
-not cells), and bumps `nav_version` exactly once per batch so every goal-keyed
-cache/pending entry and group field keyed on the old version re-solves. The dirty
+edits), not the main-thread play state. Cell-localizable edits — blocking `world_tile_changed` /
+`world_obstacle_changed` changes (only when `old_blocks_movement !=
+new_blocks_movement`) — are forwarded to the system-owned dirty buffer via
+`pipeline.markNavDirty` (one entry per changed cell). Entity-driven obstacle changes
+do NOT carry a resolvable cell (a destroyed entity's footprint is gone), so they
+forward `pipeline.markNavLevelDirty(0)` instead — a whole-level dirty request that
+re-derives every chunk on level 0 (the only level sourcing collision bodies) from the
+world. `pipeline.applyNavUpdates` coalesces the buffered work to the set of touched
+chunks (or every chunk on a whole-level-dirty level), RE-DERIVES each touched chunk's
+blocked mask from the world WHOLE-CHUNK (so a coalesced rect, a large multi-actor
+batch, or a cell-less entity change can never leave a cell stale against the world),
+recomputes those chunks' components, and patches the chunk-portal abstract graph once
+(bounded by chunk borders, not cells). An incremental batch keeps `nav_version` STABLE
+and evicts only the cached paths crossing the changed cells (a whole-level request,
+whose change is not bounded by edit spans, drops the whole completed-path cache
+instead); only a degenerate full relabel or an edge-cap fallback — a genuine topology
+rebuild — bumps `nav_version` once so every goal-keyed cache/pending entry and group
+field keyed on the old version re-solves. The dirty
 buffer GROWS rather than dropping, so any number of simultaneous diggers or
 obstacle edits in one step all reach the graph — a dropped cell would leave the
 graph stale. Unaffected chunks are never touched, and the whole-world build runs
@@ -548,16 +556,17 @@ through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel`
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
 counted full relabel only past a configured level threshold), and a
 `nav_region_invalidated` event is still emitted whenever the graph actually
-changed. The reaction runs at the main-thread post-commit point, but the per-chunk
-abstract patch is a threaded stage: it fans the dirty chunks across the
-`ThreadSystem` through its own `nav_patch_tuner` (one tuner per stage, never shared),
-so a single-tile dig stays inline while a many-chunk dig-storm (NPCs plus the player
-digging at once) parallelizes — the tuner is the work-sizing policy, with no fixed
-per-step budget. Each chunk patches only its own disjoint slot/edge windows using a
-per-participant scratch slot, so the threaded result is byte-identical to the serial
-one (and to a full rebuild). The remask-from-world, component re-flood, and
-`link_edges` rebuild stay on the main-thread reaction. It is allocation-free on the
-steady path: the abstract chunk-portal
+changed. The reaction runs at the main-thread post-commit point, but it has TWO independently
+threaded stages, each fanned across the `ThreadSystem` by its OWN adaptive tuner (one
+tuner per stage, never shared): the remask-from-world + component re-flood through
+`nav_remask_tuner`, and the per-chunk abstract patch through `nav_patch_tuner`. So a
+single-tile dig stays inline while a many-chunk dig-storm (NPCs plus the player digging
+at once) parallelizes both stages — the tuners are the work-sizing policy, with no fixed
+per-step budget. Each worker re-derives or patches only its chunk's own disjoint
+mask/component cells and slot/edge windows using a per-participant scratch slot, so the
+threaded result is byte-identical to the serial one (and to a full rebuild). Only the
+`link_edges` rebuild stays serial on the main-thread reaction. It is allocation-free on
+the steady path: the abstract chunk-portal
 buffers grow to their real size at the init rebuild and retain that high-water
 capacity, so an incremental rebuild whose topology stays within the high-water
 mark grows no buffer. The per-participant patch scratch is likewise pre-reserved at

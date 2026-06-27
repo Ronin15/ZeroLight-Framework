@@ -608,7 +608,7 @@ pub const SteeringSystem = struct {
         // paths enter backoff, and available paths steer toward the next waypoint.
         // Single-level default start level (0).
         const goal_distance = distance(start, selected.intent.goal);
-        const view = pathfinding.statusForEntityWorld(selected.entity, 0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class);
+        const view = pathfinding.statusForWorld(0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class);
         switch (view.status) {
             .available => {
                 stats.path_available_count += 1;

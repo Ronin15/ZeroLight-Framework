@@ -104,6 +104,10 @@ pub const PathfindingSystem = struct {
     // (a dropped cell would leave the graph stale against the world). Reserved at capacity
     // so typical steps are allocation-free; a large step does one bounded amortized grow.
     nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
+    // Levels to remask + repatch in full this step (deduped). Used when a change cannot be
+    // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
+    // longer resolvable from the entity — so the whole level is re-derived from the world.
+    nav_dirty_levels: std.ArrayList(u16) = .empty,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -112,6 +116,11 @@ pub const PathfindingSystem = struct {
     // per stage, never shared across work shapes).
     nav_remask_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     nav_patch_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // Threaded nav-update control config. Production runs adaptive (the tuners decide range
+    // sizing); the nav-update benchmark pins these to a FIXED partition so the adaptive tuner
+    // can be measured against fixed controls (the shared cross-bench theme).
+    nav_thread_adaptive: bool = true,
+    nav_thread_items_per_range: ?usize = null,
     // Live agent count the per-step/memory caps are currently sized for. Elastic
     // resize keeps this tracking the steering-agent crowd: grows fast for battles,
     // shrinks slowly after sustained low load. Zero until the first reserve.
@@ -142,10 +151,10 @@ pub const PathfindingSystem = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) PathfindingSystem {
+        // Tuners use their field defaults (AdaptiveWorkTuner.init(.{})); no need to re-set them.
         return .{
             .allocator = allocator,
             .graph = .{ .allocator = allocator },
-            .fallback_tuner = AdaptiveWorkTuner.init(.{}),
         };
     }
 
@@ -156,6 +165,7 @@ pub const PathfindingSystem = struct {
         self.resize_pending_snapshot.deinit(self.allocator);
         self.affected_levels.deinit(self.allocator);
         self.nav_changed_spans.deinit(self.allocator);
+        self.nav_dirty_levels.deinit(self.allocator);
         self.nav_dirty_edits.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
@@ -182,7 +192,7 @@ pub const PathfindingSystem = struct {
     // the population so a tiny crowd caps low), so frame time stays bounded as the
     // army grows. Algorithm/memory sizing (scratch, path strides, chunk size, group
     // field count) is left untouched.
-    pub fn deriveCapacity(base: PathfindingCapacity, agent_count: usize) PathfindingCapacity {
+    fn deriveCapacity(base: PathfindingCapacity, agent_count: usize) PathfindingCapacity {
         var cap = base;
         const clamped = std.math.clamp(agent_count, min_capacity_floor, @max(min_capacity_floor, base.max_agent_budget));
         cap.max_frame_requests = clamped;
@@ -219,7 +229,7 @@ pub const PathfindingSystem = struct {
     // amortized and shrink-and-free; the open-addressed caches are re-reserved (which
     // wipes them — reconstructable, and resizes are rare under hysteresis). The
     // caller is responsible for preserving any live cross-step state across the wipe.
-    pub fn applyDerivedCapacity(self: *PathfindingSystem, base: PathfindingCapacity, agent_count: usize) !void {
+    fn applyDerivedCapacity(self: *PathfindingSystem, base: PathfindingCapacity, agent_count: usize) !void {
         const capacity = deriveCapacity(base, agent_count);
         self.capacity = capacity;
         self.effective_agent_capacity = capacity.max_pending_requests;
@@ -275,7 +285,7 @@ pub const PathfindingSystem = struct {
     // pending_keys from the restored pending. The scratch_slots count is the fixed
     // configured participant count (unchanged by an elastic resize) and its per-cell
     // arrays were sized at the nav build, so this never touches them. No worker runs.
-    pub fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize) !void {
+    fn adjustCapacityForAgentCount(self: *PathfindingSystem, agent_count: usize) !void {
         if (self.effective_agent_capacity == 0) return; // not reserved yet
         const target = deriveCapacity(self.capacity, agent_count).max_pending_requests;
         const current = self.effective_agent_capacity;
@@ -303,7 +313,7 @@ pub const PathfindingSystem = struct {
     // live deferred-work queue and group tally. The goal-keyed caches are wiped (a
     // resize behaves like a routine cache miss; re-requests re-solve), exactly as a
     // nav rebuild already does.
-    pub fn resizePreservingLiveState(self: *PathfindingSystem, agent_count: usize) !void {
+    fn resizePreservingLiveState(self: *PathfindingSystem, agent_count: usize) !void {
         self.resize_pending_snapshot.clearRetainingCapacity();
         try self.resize_pending_snapshot.ensureTotalCapacity(self.allocator, self.pending.items.len);
         self.resize_pending_snapshot.appendSliceAssumeCapacity(self.pending.items);
@@ -383,6 +393,12 @@ pub const PathfindingSystem = struct {
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
+        // A rebuild can change cell/chunk counts and thus the per-item work cost, so the
+        // adaptive tuners' learned profiles no longer apply — reset them to relearn against
+        // the new topology rather than acting on a stale cost model.
+        self.fallback_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_remask_tuner = AdaptiveWorkTuner.init(.{});
+        self.nav_patch_tuner = AdaptiveWorkTuner.init(.{});
     }
 
     // Incrementally folds a batch of static-obstacle edits into the existing nav
@@ -400,7 +416,7 @@ pub const PathfindingSystem = struct {
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
-        return self.applyNavUpdatesImpl(data, world, edits, null);
+        return self.applyNavUpdatesImpl(data, world, edits, &.{}, null);
     }
 
     fn applyNavUpdatesImpl(
@@ -408,19 +424,27 @@ pub const PathfindingSystem = struct {
         data: *const DataSystem,
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
+        full_level_ids: []const u16,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
         // The incremental update has two per-stage threaded processors (remask/re-flood and the
         // abstract patch), each fanned across workers by its own tuner: small digs run inline,
         // dig-storms thread. No fixed budget — the tuners are the work-sizing policy.
         const update_threads: ?NavUpdateThreads = if (thread_system) |ts|
-            .{ .thread_system = ts, .remask_tuner = &self.nav_remask_tuner, .patch_tuner = &self.nav_patch_tuner }
+            .{
+                .thread_system = ts,
+                .remask_tuner = &self.nav_remask_tuner,
+                .patch_tuner = &self.nav_patch_tuner,
+                .adaptive = self.nav_thread_adaptive,
+                .items_per_range = self.nav_thread_items_per_range,
+            }
         else
             null;
         const stats = try self.graph.applyNavUpdates(
             data,
             world,
             edits,
+            full_level_ids,
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
             update_threads,
@@ -430,9 +454,16 @@ pub const PathfindingSystem = struct {
             self.clearTransientRequestsRetainingFields();
             self.dropGroupFields();
         } else if (stats.incremental_rebuilds != 0) {
-            // Incremental edit: keep cached paths clear of it, evict only crossing ones.
+            if (full_level_ids.len != 0) {
+                // A whole-level remask is not bounded by edit spans, so scoped eviction cannot
+                // find every stale path. Drop the entire completed cache instead. Graph node ids
+                // are unchanged (no topology rebuild), so nav_version stays stable.
+                self.completed.clear();
+            } else {
+                // Incremental edit: keep cached paths clear of it, evict only crossing ones.
+                try self.evictCachedPathsCrossingEdits(world, edits);
+            }
             // Short-lived pending/unavailable/group state is dropped and rebuilt.
-            try self.evictCachedPathsCrossingEdits(world, edits);
             self.clearRequestStateKeepingCompleted();
             self.dropGroupFields();
         }
@@ -443,6 +474,7 @@ pub const PathfindingSystem = struct {
     // an error path that skips the apply never leaks stale edits into the next step.
     pub fn clearNavDirty(self: *PathfindingSystem) void {
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_levels.clearRetainingCapacity();
     }
 
     // Records one changed nav cell for the next incremental update. Grows the buffer rather
@@ -452,17 +484,28 @@ pub const PathfindingSystem = struct {
         try self.nav_dirty_edits.append(self.allocator, .{ .level = level, .x = x, .y = y });
     }
 
-    // Whether any dirty nav cell is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
-        return self.nav_dirty_edits.items.len != 0;
+    // Marks a whole level for re-derivation next update. Use when a change cannot be reduced to
+    // specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable):
+    // the level's mask/components and abstract layer are rebuilt from the world. Deduped.
+    pub fn markNavLevelDirty(self: *PathfindingSystem, level: u16) !void {
+        for (self.nav_dirty_levels.items) |existing| {
+            if (existing == level) return;
+        }
+        try self.nav_dirty_levels.append(self.allocator, level);
     }
 
-    // Applies the buffered dirty nav cells as one incremental update, then clears the buffer.
-    // Returns zero stats when nothing is buffered. A non-null thread_system lets the chunk patch
-    // thread (tuner-gated); null keeps it serial.
+    // Whether any dirty nav cell or whole-level request is buffered for this step.
+    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
+        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    }
+
+    // Applies the buffered dirty nav cells (and whole-level requests) as one incremental update,
+    // then clears the buffers. Returns zero stats when nothing is buffered. A non-null
+    // thread_system lets the chunk patch thread (tuner-gated); null keeps it serial.
     pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, thread_system);
+        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_levels.items, thread_system);
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_levels.clearRetainingCapacity();
         return stats;
     }
 
@@ -523,12 +566,7 @@ pub const PathfindingSystem = struct {
         return self.statusForKeyAndStart(key, start_level, start_index);
     }
 
-    pub fn statusForEntityWorld(self: *const PathfindingSystem, entity: EntityId, start_level: u16, start: math.Vec2, goal_level: u16, goal: math.Vec2, agent_class: PathAgentClass) PathView {
-        _ = entity;
-        return self.statusForWorld(start_level, start, goal_level, goal, agent_class);
-    }
-
-    pub fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
+    fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
         const goal_grid = self.graph.grid(key.goal_level) orelse return .{ .status = .unavailable };
         if (goal_grid.indexForCell(key.goal)) |goal_index| {
             return self.statusForKeyAndStart(key, key.goal_level, goal_index);
@@ -540,7 +578,7 @@ pub const PathfindingSystem = struct {
     // then pending. Missing means the caller may enqueue a request. The start cell
     // is interpreted on `start_level`; cached corridors derive against the level
     // their stored cells index into (start level for cross-level corridors).
-    pub fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize) PathView {
+    fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize) PathView {
         if (self.findGroupField(key)) |field| {
             if (field.state == .ready) {
                 // The group field is built on the goal level. Sample at the agent's
@@ -598,7 +636,7 @@ pub const PathfindingSystem = struct {
     // and before any accept/solve, so no live worker index or pool offset spans it.
     // A returned solve_count of 0 means no solve runs this step (caller publishes the
     // pending counts and returns).
-    pub fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !usize {
+    fn beginUpdate(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !usize {
         self.step_counter +%= 1;
         try self.adjustCapacityForAgentCount(agent_count);
         var accept_timer = PhaseTimer.begin();
@@ -608,6 +646,19 @@ pub const PathfindingSystem = struct {
         self.serviceGroupFields(stats);
         stats.group_service_ns = group_timer.lap();
         return self.effectiveSolveLimit(config);
+    }
+
+    // Shared solve prologue for update/updateSerial: runs beginUpdate and handles the
+    // no-solve early-out. Returns the solve count, or null when no solve runs this step (the
+    // caller publishes the pending counts via `stats` and returns it unchanged).
+    fn beginSolve(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig, stats: *PathfindingStats) !?usize {
+        const solve_count = try self.beginUpdate(requests, agent_count, config, stats);
+        if (solve_count == 0) {
+            stats.pending_requests = self.pending.items.len;
+            stats.deferred_requests = self.pending.items.len;
+            return null;
+        }
+        return solve_count;
     }
 
     // Shared publish + compaction epilogue; finalizes the pending/deferred counts.
@@ -622,12 +673,7 @@ pub const PathfindingSystem = struct {
 
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
         var stats: PathfindingStats = undefined;
-        const solve_count = try self.beginUpdate(requests, agent_count, config, &stats);
-        if (solve_count == 0) {
-            stats.pending_requests = self.pending.items.len;
-            stats.deferred_requests = self.pending.items.len;
-            return stats;
-        }
+        const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
         var system_config = config;
         self.prepareSolveBuffers(solve_count);
@@ -659,12 +705,7 @@ pub const PathfindingSystem = struct {
 
     pub fn updateSerial(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, config: PathfindingConfig) !PathfindingStats {
         var stats: PathfindingStats = undefined;
-        const solve_count = try self.beginUpdate(requests, agent_count, config, &stats);
-        if (solve_count == 0) {
-            stats.pending_requests = self.pending.items.len;
-            stats.deferred_requests = self.pending.items.len;
-            return stats;
-        }
+        const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(config), &stats);
@@ -689,7 +730,7 @@ pub const PathfindingSystem = struct {
         return stats;
     }
 
-    pub fn resetSolvedPaths(self: *PathfindingSystem) void {
+    fn resetSolvedPaths(self: *PathfindingSystem) void {
         self.solved_paths.clearRetainingCapacity();
         for (0..self.solve_results.items.len) |_| {
             self.solved_paths.appendAssumeCapacity(.{ .key = emptyKey(self.graph.version), .offset = 0, .len = 0 });
@@ -699,7 +740,7 @@ pub const PathfindingSystem = struct {
     // Acceptance is the only stage that mutates the pending-key set. Cached hits
     // never enter pending work. Group-declared requests are recorded so a field
     // can be (re)built lazily; they still get a per-agent fallback while building.
-    pub fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest) PathfindingStats {
+    fn acceptRequests(self: *PathfindingSystem, requests: []const PathRequest) PathfindingStats {
         var stats = PathfindingStats{};
         // Cross-step decaying accumulation: halve every carried tally before this
         // step's requests fold in, so a SUSTAINED shared goal accumulates toward the
@@ -779,7 +820,7 @@ pub const PathfindingSystem = struct {
         return stats;
     }
 
-    pub fn recordGroupRequest(self: *PathfindingSystem, key: PathQueryKey) void {
+    fn recordGroupRequest(self: *PathfindingSystem, key: PathQueryKey) void {
         for (self.group_requests.items) |*existing| {
             if (keysEqual(existing.key, key)) {
                 existing.count += 1;
@@ -796,7 +837,7 @@ pub const PathfindingSystem = struct {
     // The threshold is checked against the cross-step accumulator (acceptRequests),
     // so it reflects SUSTAINED shared-goal demand (~2x per-step intake at
     // equilibrium), not a single-step burst.
-    pub fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
+    fn serviceGroupFields(self: *PathfindingSystem, stats: *PathfindingStats) void {
         if (!self.graph.valid()) return;
         const threshold = self.groupFieldThreshold();
         // Advance any field still building, on its own goal level.
@@ -829,7 +870,7 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    pub fn ensureGroupField(self: *PathfindingSystem, key: PathQueryKey, stats: *PathfindingStats) void {
+    fn ensureGroupField(self: *PathfindingSystem, key: PathQueryKey, stats: *PathfindingStats) void {
         if (self.group_fields.items.len == 0) return;
         // Exact goal cell already has a field: reuse it (build is still advancing
         // if it has not finished). The goal did not cross into a new cell.
@@ -866,7 +907,7 @@ pub const PathfindingSystem = struct {
         stats.cache_evictions += 1;
     }
 
-    pub fn buildGroupSlot(self: *PathfindingSystem, field: *GroupField, key: PathQueryKey, goal_index: usize, stats: *PathfindingStats) void {
+    fn buildGroupSlot(self: *PathfindingSystem, field: *GroupField, key: PathQueryKey, goal_index: usize, stats: *PathfindingStats) void {
         const grid = self.graph.grid(key.goal_level) orelse return;
         if (field.beginBuild(grid, key, goal_index, self.step_counter)) {
             _ = field.expand(grid, self.capacity.group_field_build_budget);
@@ -879,7 +920,7 @@ pub const PathfindingSystem = struct {
     // goal cell. When several such slots exist, the one whose stored goal is
     // nearest the new goal cell is chosen so rebuild selection is deterministic and
     // reuses the most relevant field rather than an arbitrary first match.
-    pub fn staleGroupSlot(self: *PathfindingSystem, key: PathQueryKey) ?usize {
+    fn staleGroupSlot(self: *PathfindingSystem, key: PathQueryKey) ?usize {
         var best_index: ?usize = null;
         var best_dist: i64 = std.math.maxInt(i64);
         for (self.group_fields.items, 0..) |field, index| {
@@ -900,21 +941,21 @@ pub const PathfindingSystem = struct {
         return best_index;
     }
 
-    pub fn findGroupField(self: *const PathfindingSystem, key: PathQueryKey) ?*const GroupField {
+    fn findGroupField(self: *const PathfindingSystem, key: PathQueryKey) ?*const GroupField {
         for (self.group_fields.items) |*field| {
             if (field.state != .empty and keysEqual(field.key, key)) return field;
         }
         return null;
     }
 
-    pub fn findGroupFieldMut(self: *PathfindingSystem, key: PathQueryKey) ?*GroupField {
+    fn findGroupFieldMut(self: *PathfindingSystem, key: PathQueryKey) ?*GroupField {
         for (self.group_fields.items) |*field| {
             if (field.state != .empty and keysEqual(field.key, key)) return field;
         }
         return null;
     }
 
-    pub fn prepareRequestKeys(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
+    fn prepareRequestKeys(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
         self.prepared_requests.clearRetainingCapacity();
         if (!self.graph.valid()) return;
         const capacity = self.prepared_requests.capacity;
@@ -943,7 +984,7 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    pub fn prepareSolveBuffers(self: *PathfindingSystem, solve_count: usize) void {
+    fn prepareSolveBuffers(self: *PathfindingSystem, solve_count: usize) void {
         self.solve_results.clearRetainingCapacity();
         self.fallback_indices.clearRetainingCapacity();
         for (0..solve_count) |_| {
@@ -951,7 +992,7 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    pub fn effectiveSolveLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
+    fn effectiveSolveLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
         const requested_limit = config.max_solved_requests_per_step orelse self.capacity.max_solved_requests_per_step;
         return @min(
             self.pending.items.len,
@@ -962,12 +1003,12 @@ pub const PathfindingSystem = struct {
         );
     }
 
-    pub fn effectiveFallbackLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
+    fn effectiveFallbackLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
         const requested_limit = config.max_fallback_requests_per_step orelse self.capacity.max_fallback_requests_per_step;
         return @min(requested_limit, self.capacity.max_fallback_requests_per_step);
     }
 
-    pub fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
+    fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             if (result == .deferred) {
                 if (self.fallback_indices.items.len < fallback_limit) {
@@ -979,7 +1020,7 @@ pub const PathfindingSystem = struct {
         }
     }
 
-    pub fn publishSolvedResults(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
+    fn publishSolvedResults(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             switch (result) {
                 .available => |key| {
@@ -1008,7 +1049,7 @@ pub const PathfindingSystem = struct {
 
     // Deferred and budget-exhausted entries keep relative order. Solved entries
     // (available/unavailable) are removed, then pending_keys is rebuilt to match.
-    pub fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize) void {
+    fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize) void {
         if (solve_count == 0) return;
         var write_index: usize = 0;
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {

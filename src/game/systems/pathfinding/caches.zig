@@ -134,14 +134,63 @@ pub const ResultCache = struct {
 
     // Evicts only cached paths crossing a changed span; paths clear of the edited cells
     // survive and keep serving hits. Matches on the stored corridor (or plain) cells.
+    // Removal uses back-shift deletion (removeAt), which can relocate later entries to
+    // keep probe chains gap-free, so we restart the scan after each eviction rather than
+    // iterate-while-mutating. Evictions are rare/bounded, so the restart cost is fine.
     pub fn evictCrossing(self: *ResultCache, graph: *const NavGraph, spans: []const ChangedSpan) void {
         if (spans.len == 0) return;
-        for (self.slots.items, 0..) |*slot, slot_index| {
-            if (!slot.occupied) continue;
-            if (self.crossesSpans(graph, slot_index, slot.result, spans)) {
-                slot.occupied = false;
-                self.len -= 1;
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (self.slots.items, 0..) |slot, slot_index| {
+                if (!slot.occupied) continue;
+                if (self.crossesSpans(graph, slot_index, slot.result, spans)) {
+                    self.removeAt(slot_index);
+                    changed = true;
+                    break;
+                }
             }
+        }
+    }
+
+    // Back-shift deletion for the open-addressed slot table. Clearing a slot in the middle
+    // of a probe run would strand later keys behind the gap (lookups early-terminate on the
+    // first truly-empty slot), so we pull up any following entry whose home position lets it
+    // fill the hole, moving its slot struct AND its per-slot path/stitched payload together.
+    // Keeps every probe chain contiguous, which is what the `len < capacity` early-out relies on.
+    fn removeAt(self: *ResultCache, index: usize) void {
+        const capacity = self.slots.items.len;
+        self.slots.items[index].occupied = false;
+        self.len -= 1;
+        var hole = index;
+        var probe = index;
+        while (true) {
+            probe = (probe + 1) % capacity;
+            if (probe == index) break; // wrapped fully (also guards capacity == 1)
+            const slot = self.slots.items[probe];
+            if (!slot.occupied) break;
+            const home = hashPathKey(slot.result.key) % capacity;
+            // Keep the entry where it is when its home is cyclically within (hole, probe];
+            // otherwise it can move up to fill the hole without becoming unreachable.
+            if (inCyclicRange(hole, probe, home)) continue;
+            self.slots.items[hole] = slot;
+            self.movePayload(probe, hole);
+            self.slots.items[probe].occupied = false;
+            hole = probe;
+        }
+    }
+
+    // Copies a slot's path and stitched payload from one index to another (back-shift move).
+    fn movePayload(self: *ResultCache, from: usize, to: usize) void {
+        if (self.path_stride != 0) {
+            const fb = from * self.path_stride;
+            const tb = to * self.path_stride;
+            @memcpy(self.path_cells.items[tb .. tb + self.path_stride], self.path_cells.items[fb .. fb + self.path_stride]);
+        }
+        if (self.stitched_stride != 0) {
+            const fb = from * self.stitched_stride;
+            const tb = to * self.stitched_stride;
+            @memcpy(self.stitched.items[tb .. tb + self.stitched_stride], self.stitched.items[fb .. fb + self.stitched_stride]);
         }
     }
 
@@ -191,8 +240,7 @@ pub const ResultCache = struct {
     pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
         const index = self.slotIndex(key) orelse return null;
         if (ttl != 0 and (step -% self.slots.items[index].stamp) >= ttl) {
-            self.slots.items[index].occupied = false;
-            self.len -= 1;
+            self.removeAt(index);
             return null;
         }
         return self.slots.items[index].result;
@@ -235,10 +283,22 @@ pub const ResultCache = struct {
                 return index;
             }
         }
-        const index = self.next_evict;
+        // Table full: evict a victim (round-robin) with back-shift, then place the new key
+        // at its proper probe position so it stays reachable once the table later drops
+        // below capacity (a victim written at next_evict could otherwise sit off its chain).
+        const victim = self.next_evict;
         self.next_evict = (self.next_evict + 1) % capacity;
         stats.cache_evictions += 1;
-        return index;
+        self.removeAt(victim);
+        const start_new = hashPathKey(key) % capacity;
+        for (0..capacity) |probe| {
+            const index = (start_new + probe) % capacity;
+            if (!self.slots.items[index].occupied) {
+                self.len += 1;
+                return index;
+            }
+        }
+        unreachable; // removeAt freed exactly one slot
     }
 
     pub fn writePath(self: *ResultCache, slot_index: usize, path: []const u32) usize {
@@ -250,6 +310,11 @@ pub const ResultCache = struct {
         }
         // Downsample by stride to preserve forward direction within the budget.
         const stored = self.path_stride;
+        if (stored == 1) {
+            // A single-cell budget can only keep the start; avoids a divide-by-zero below.
+            dst[0] = path[0];
+            return 1;
+        }
         for (0..stored) |i| {
             const src_index = (i * (path.len - 1)) / (stored - 1);
             dst[i] = path[src_index];
@@ -263,6 +328,13 @@ pub const ResultCacheSlot = struct {
     stamp: u32 = 0,
     result: PathResult = .{ .key = emptyKey(0), .path_len = 0 },
 };
+
+// Whether `x` lies in the cyclic half-open-then-closed interval (start, end] on a ring of
+// the table's capacity. Used by back-shift deletion to decide if a probed entry must stay.
+fn inCyclicRange(start: usize, end: usize, x: usize) bool {
+    if (start < end) return x > start and x <= end;
+    return x > start or x <= end;
+}
 
 // Whether nav cell (level, cell) falls inside any changed span on its level.
 fn cellInSpans(graph: *const NavGraph, level: u16, cell: u32, spans: []const ChangedSpan) bool {
@@ -388,6 +460,44 @@ test "pathfinding fixed-capacity unavailable key set has explicit fixed capacity
     try std.testing.expect(!keys.insert(second_key));
     try std.testing.expect(keys.contains(first_key));
     try std.testing.expect(!keys.contains(second_key));
+}
+
+test "pathfinding result cache keeps probe chains intact after mid-chain removal" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    const capacity = 8;
+    try cache.reserve(std.testing.allocator, capacity, 4, 8);
+
+    // Fill the cache to capacity with distinct goal-keyed entries (no eviction yet).
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        cache.put(key, &.{ @intCast(i), @intCast(i + 1) }, &.{}, 0, 0, &stats);
+    }
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        try std.testing.expect(cache.find(key) != null);
+    }
+
+    // Remove two entries that may sit mid-probe-chain. Without back-shift deletion a later
+    // key in a cluster would become unreachable; every surviving key must still be found.
+    for ([_]usize{ 2, 5 }) |target| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(target);
+        const index = cache.slotIndex(key).?;
+        cache.removeAt(index);
+    }
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        if (i == 2 or i == 5) {
+            try std.testing.expect(cache.find(key) == null);
+        } else {
+            try std.testing.expect(cache.find(key) != null);
+        }
+    }
 }
 
 test "pathfinding result cache evicts deterministically and stores paths" {

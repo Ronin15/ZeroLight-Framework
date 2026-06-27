@@ -166,24 +166,32 @@ const ChunkRemaskScratch = struct {
 // Threading context for ONE incremental nav-update stage (remask or patch): the shared thread
 // system plus that stage's own adaptive tuner. The adaptive tuner keeps small digs inline and
 // threads only dig-storms, so there is no fixed per-step budget — the tuner IS the policy.
+// `adaptive`/`items_per_range` are control knobs: production runs adaptive (tuner decides), but
+// the benchmark can pin a FIXED range partition so the adaptive tuner is measured against fixed
+// controls (the shared bench theme).
 pub const NavStageThreads = struct {
     thread_system: *ThreadSystem,
     tuner: *AdaptiveWorkTuner,
+    adaptive: bool = true,
+    items_per_range: ?usize = null,
 };
 
 // Threading for a whole incremental update: the shared thread system plus a SEPARATE tuner per
 // stage (remask/re-flood vs. abstract patch are different work shapes, so each owns its tuner
-// per the one-tuner-per-stage rule). Absent → fully serial.
+// per the one-tuner-per-stage rule). `adaptive`/`items_per_range` are the per-update control
+// config (defaults: adaptive, tuner-chosen ranges). Absent → fully serial.
 pub const NavUpdateThreads = struct {
     thread_system: *ThreadSystem,
     remask_tuner: *AdaptiveWorkTuner,
     patch_tuner: *AdaptiveWorkTuner,
+    adaptive: bool = true,
+    items_per_range: ?usize = null,
 
     fn remask(self: NavUpdateThreads) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.remask_tuner };
+        return .{ .thread_system = self.thread_system, .tuner = self.remask_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
     }
     fn patch(self: NavUpdateThreads) NavStageThreads {
-        return .{ .thread_system = self.thread_system, .tuner = self.patch_tuner };
+        return .{ .thread_system = self.thread_system, .tuner = self.patch_tuner, .adaptive = self.adaptive, .items_per_range = self.items_per_range };
     }
 };
 
@@ -231,9 +239,18 @@ fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId
     }
 }
 
+// Whether `level_index` appears in the whole-level-dirty id list. The list is tiny (one
+// entry per fully-changed level this batch), so a linear scan is cheaper than a bitset.
+fn levelIsFull(full_level_ids: []const u16, level_index: usize) bool {
+    for (full_level_ids) |id| {
+        if (@as(usize, id) == level_index) return true;
+    }
+    return false;
+}
+
 // Per-level chunk-portal navigation graph plus inter-level link edges. Owns one
-// NavGrid per level (Z-floor) sharing dimensions/cell_size/version. Built once at
-// nav rebuild; queried read-only afterward.
+// NavGrid per level (Z-floor) sharing dimensions/cell_size. Built once at nav
+// rebuild; queried read-only afterward.
 pub const NavGraph = struct {
     allocator: std.mem.Allocator,
     cell_size: f32 = default_cell_size,
@@ -411,7 +428,7 @@ pub const NavGraph = struct {
 
         for (self.levels.items, 0..) |*level_grid, level_index| {
             const level: u16 = @intCast(level_index);
-            try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.chunk_tiles, self.version);
+            try level_grid.prepare(self.allocator, level, self.width, self.height, safe_cell_size, self.chunk_tiles);
             // Only level 0 sources DataSystem collision bodies; the demo's
             // entities live on the ground floor. World mask drives every level.
             if (level == 0) level_grid.markStaticBodies(data);
@@ -429,15 +446,17 @@ pub const NavGraph = struct {
         try self.buildAbstractGraphs(world);
         try self.rebuildLinkEdges(world);
 
-        // Pre-reserve each slot's edge buffer and compaction cursor to the largest chunk's caps
-        // so a steady-path incremental patch (serial or threaded) allocates nothing; only a
-        // genuine edge-window overflow (which triggers a loud full-rebuild fallback) may grow.
-        var max_edge_cap: usize = 0;
-        for (self.chunk_edge_cap.items) |cap| max_edge_cap = @max(max_edge_cap, cap);
+        // Pre-reserve each slot's edge buffer and compaction cursor so a patch — serial OR
+        // threaded — never reallocates, including the overflow path that is detected only AFTER
+        // a chunk's full transient edge list is built. The transient list is bounded by a chunk's
+        // border edges (<= pcap) plus its same-component intra pairs (<= pcap*(pcap-1)), i.e.
+        // pcap^2; reserving that keeps a worker-thread append allocation-free even when a chunk's
+        // edges exceed its compaction window (which then triggers the loud full-rebuild fallback).
         var max_portal_cap: usize = 0;
         for (self.chunk_portal_cap.items) |cap| max_portal_cap = @max(max_portal_cap, cap);
+        const max_transient_edges = max_portal_cap *| max_portal_cap;
         for (self.patch_scratch.items) |*scratch| {
-            try scratch.edges.ensureTotalCapacity(self.allocator, max_edge_cap);
+            try scratch.edges.ensureTotalCapacity(self.allocator, max_transient_edges);
             try scratch.cursor.ensureTotalCapacity(self.allocator, max_portal_cap);
         }
 
@@ -493,12 +512,13 @@ pub const NavGraph = struct {
         data: *const DataSystem,
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
+        full_level_ids: []const u16,
         affected_levels: *std.ArrayList(bool),
         full_relabel_level_threshold: usize,
         update_threads: ?NavUpdateThreads,
     ) !NavUpdateStats {
         var stats = NavUpdateStats{};
-        if (edits.len == 0 or !self.valid()) return stats;
+        if ((edits.len == 0 and full_level_ids.len == 0) or !self.valid()) return stats;
         // Each stage runs through its own tuner (remask/re-flood vs. abstract patch).
         const remask_threads: ?NavStageThreads = if (update_threads) |t| t.remask() else null;
         const patch_threads: ?NavStageThreads = if (update_threads) |t| t.patch() else null;
@@ -518,20 +538,32 @@ pub const NavGraph = struct {
                 affected_level_count += 1;
             }
         }
+        // Whole-level dirty requests mark a level fully changed (every chunk remasked + patched).
+        // Used when a change cannot be localized to cells — e.g. a destroyed/toggled static
+        // obstacle whose nav cell is no longer resolvable from the entity.
+        for (full_level_ids) |full_level| {
+            if (@as(usize, full_level) >= level_count) continue;
+            if (!affected_levels.items[full_level]) {
+                affected_levels.items[full_level] = true;
+                affected_level_count += 1;
+            }
+        }
         if (affected_level_count == 0) return stats;
-        // Purely diagnostic and O(edits^2); only pay for it when perf logging consumes it.
+        // Purely diagnostic, O(edits) via the dirty-chunk stamp; only pay for it when perf
+        // logging consumes it.
         if (runtime_perf_log.enabled) stats.dirty_chunks = self.countDirtyChunks(world, edits);
 
-        // Re-derive the blocked mask + chunk-local components of every chunk an edit touched,
-        // reading the world over the WHOLE chunk (not just enumerated cells) so cells the
-        // producer coalesced or dropped upstream are still correct. Deduped per chunk and
-        // byte-identical to a full mark. Past the threshold a level-count blowup degenerates
-        // to a full graph rebuild; flag it loudly rather than silently doing whole-world work.
+        // Re-derive the blocked mask + chunk-local components of every chunk an edit touched
+        // (or every chunk on a whole-level-dirty level), reading the world over the WHOLE chunk
+        // (not just enumerated cells) so cells the producer coalesced or dropped upstream are
+        // still correct. Deduped per chunk and byte-identical to a full mark. Past the threshold
+        // a level-count blowup degenerates to a full graph rebuild; flag it loudly rather than
+        // silently doing whole-world work.
         const full_relabel = affected_level_count > full_relabel_level_threshold;
         if (full_relabel) {
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
-                self.remaskChangedChunks(@intCast(level_index), data, world, edits, remask_threads);
+                self.remaskChangedChunks(@intCast(level_index), data, world, edits, levelIsFull(full_level_ids, level_index), remask_threads);
             }
             for (self.levels.items) |*level_grid| level_grid.buildComponents();
             try self.buildAbstractGraphs(world);
@@ -541,11 +573,12 @@ pub const NavGraph = struct {
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
                 const level: u16 = @intCast(level_index);
+                const full_level = levelIsFull(full_level_ids, level_index);
                 // Changed chunks: remask from world + re-flood components (deduped). Neighbor
                 // chunks added by buildDirtySet are NOT remasked/re-flooded — their mask is
                 // untouched — only their abstract layer is patched below.
-                self.remaskChangedChunks(level, data, world, edits, remask_threads);
-                self.buildDirtySet(level, world, edits);
+                self.remaskChangedChunks(level, data, world, edits, full_level, remask_threads);
+                self.buildDirtySet(level, world, edits, full_level);
                 stats.chunks_patched += self.dirty_set.items.len;
                 if (try self.patchDirtyChunks(level, world, patch_threads)) overflow = true;
             }
@@ -570,7 +603,6 @@ pub const NavGraph = struct {
         if (full_rebuild) {
             self.version +%= 1;
             if (self.version == 0) self.version = 1;
-            for (self.levels.items) |*level_grid| level_grid.version = self.version;
             stats.version_bumps = 1;
         }
 
@@ -591,8 +623,9 @@ pub const NavGraph = struct {
                 for (self.patch_scratch.items) |*scratch| scratch.overflow = false;
                 var job = NavPatchJob{ .graph = self, .world = world, .level = level, .chunks = chunks };
                 self.last_patch_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
-                    .adaptive = true,
+                    .adaptive = threads.adaptive,
                     .adaptive_tuner = threads.tuner,
+                    .items_per_range = threads.items_per_range,
                     .range_alignment_items = 1,
                 });
                 var overflow = false;
@@ -615,9 +648,17 @@ pub const NavGraph = struct {
     // dirty cell falls in, plus each of those chunks' orthogonal (border-sharing) internal
     // neighbors. Diagonal neighbors are excluded — they share only a corner, never a border
     // line, so no transition edge crosses them. Deduped via an epoch-stamped marker.
-    pub fn buildDirtySet(self: *NavGraph, level: u16, world: ?*const WorldSystem, edits: []const NavCellEdit) void {
+    pub fn buildDirtySet(self: *NavGraph, level: u16, world: ?*const WorldSystem, edits: []const NavCellEdit, full_level: bool) void {
         self.dirty_set.clearRetainingCapacity();
-        self.dirty_epoch +%= 1;
+        _ = self.bumpDirtyEpoch();
+        if (full_level) {
+            // Whole level dirty: every chunk is patched (each chunk's own border set already
+            // covers its neighbors, so no separate neighbor pass is needed).
+            const total: u32 = @intCast(self.chunkCount());
+            var chunk: u32 = 0;
+            while (chunk < total) : (chunk += 1) self.addDirtyChunk(chunk);
+            return;
+        }
         const world_system = world orelse return;
         const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
@@ -648,9 +689,18 @@ pub const NavGraph = struct {
         self.dirty_set.appendAssumeCapacity(chunk);
     }
 
-    // Counts distinct abstract chunks (per level) touched by the dirty edits, using
-    // the nav cell at each edited tile's origin. Quadratic in the edit count, which
-    // is bounded by the per-step world-event budget; purely diagnostic.
+    // Advances the dirty-chunk epoch used for O(1) per-batch dedup, returning the live epoch.
+    // On the (astronomically rare) u32 wrap back to 0 it re-zeroes the stamps and skips 0, so a
+    // never-stamped chunk (stamp 0) can never be mistaken for "already seen this batch".
+    fn bumpDirtyEpoch(self: *NavGraph) u32 {
+        self.dirty_epoch +%= 1;
+        if (self.dirty_epoch == 0) {
+            @memset(self.dirty_stamp.items, 0);
+            self.dirty_epoch = 1;
+        }
+        return self.dirty_epoch;
+    }
+
     // Counts distinct abstract chunks (by edit-origin cell) touched by the batch — a diagnostic
     // recorded only when perf logging is enabled. O(edits) via the dirty-chunk stamp; the prior
     // O(edits^2) pairwise scan was only acceptable while edits were capped, but the dirty buffer
@@ -659,8 +709,7 @@ pub const NavGraph = struct {
     // immaterial for a diagnostic. Bumps the dirty epoch, which downstream stages re-bump.
     pub fn countDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
         const world_system = world orelse return 0;
-        self.dirty_epoch +%= 1;
-        const epoch = self.dirty_epoch;
+        const epoch = self.bumpDirtyEpoch();
         var count: usize = 0;
         for (edits) |edit| {
             const cell_index = self.navCellIndexForTile(world_system, edit) orelse continue;
@@ -679,16 +728,23 @@ pub const NavGraph = struct {
     // footprint's chunk set, not the level cell count. Reads the world whole-chunk so cells the
     // producer coalesced or dropped are still correct. The epoch bump is independent of
     // buildDirtySet's (called next per level), so the two never alias a stamp.
-    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit, remask_threads: ?NavStageThreads) void {
+    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit, full_level: bool, remask_threads: ?NavStageThreads) void {
         const world_system = world orelse return;
         const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
         const cx_count = level_grid.chunksX();
         // Build the deduped changed-chunk work-list for this level.
         self.changed_chunks.clearRetainingCapacity();
-        self.dirty_epoch +%= 1;
-        const epoch = self.dirty_epoch;
-        for (edits) |edit| {
+        const epoch = self.bumpDirtyEpoch();
+        if (full_level) {
+            // Whole level dirty: remask + re-flood every chunk on the level.
+            const total: u32 = @intCast(self.chunkCount());
+            var chunk: u32 = 0;
+            while (chunk < total) : (chunk += 1) {
+                self.dirty_stamp.items[chunk] = epoch;
+                self.changed_chunks.appendAssumeCapacity(chunk);
+            }
+        } else for (edits) |edit| {
             if (edit.level != level) continue;
             const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
             var cy = span.min_y / ct;
@@ -717,8 +773,9 @@ pub const NavGraph = struct {
                 for (self.remask_scratch.items) |*scratch| scratch.blocked_delta = 0;
                 var job = NavRemaskJob{ .graph = self, .data = data, .world = world_system, .level = level, .chunks = chunks };
                 self.last_remask_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, remaskChunkJob, .{
-                    .adaptive = true,
+                    .adaptive = threads.adaptive,
                     .adaptive_tuner = threads.tuner,
+                    .items_per_range = threads.items_per_range,
                     .range_alignment_items = 1,
                 });
                 for (self.remask_scratch.items) |*scratch| delta += scratch.blocked_delta;
@@ -838,8 +895,8 @@ pub const NavGraph = struct {
                 try self.recordLinkEndpoint(link.cell_b.x, link.cell_b.y);
             }
         }
-        // Sort each chunk's link-cell run in place (counts already grouped them by chunk on
-        // append? no — append is by discovery order); rebuild as grouped sorted runs.
+        // Endpoints were appended in discovery order; regroup them into per-chunk contiguous
+        // sorted runs so an interior link endpoint maps to a stable tail slot.
         try self.groupLinkCellRuns(chunk_count);
 
         // Portal caps: 4*ct perimeter slots plus the chunk's interior link tail count.
@@ -1481,6 +1538,47 @@ test "incremental nav update remask matches the composed world mask across level
     defer rebuilt.deinit();
     try rebuilt.reserve(abstractCapacity());
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "whole-level dirty re-derives the level from the world and matches a full rebuild" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 12x12 open world, 4-tile chunks (abstractCapacity) -> a 3x3 chunk grid.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+
+    // Block a cell far from chunk (0,0) WITHOUT recording it as an individual dirty cell.
+    // A cell-less reaction (markNavLevelDirty, used for entity-driven obstacle changes whose
+    // footprint is no longer resolvable) must still pick it up via the whole-level remask.
+    const far = (try world.setDenseTile(obstacle_layer, 10, 10, tree)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u16, 0), far.level);
+    try system.markNavLevelDirty(0);
+    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    // A whole-level remask keeps nav_version stable (no topology rebuild).
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
+
+    // The far cell is blocked even though it was never marked as an individual dirty cell —
+    // the old sentinel-cell reaction only remasked chunk (0,0) and would have missed it.
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 10, .y = 10 }));
+
+    // Byte-identical to a full rebuild against the same post-edit world.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 

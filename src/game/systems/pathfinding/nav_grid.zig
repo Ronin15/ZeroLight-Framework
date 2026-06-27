@@ -39,7 +39,6 @@ pub const NavGrid = struct {
     // Abstract chunk side length (cells). Shared with the owning NavGraph so a flood
     // and the graph agree on chunk boundaries.
     chunk_tiles: u16 = default_nav_chunk_tiles,
-    version: u32 = 1,
     blocked_count: usize = 0,
     blocked: std.ArrayList(bool) = .empty,
     // Chunk-local component labels, encoded chunk_id * (chunk_tiles^2 + 1) + local
@@ -55,8 +54,8 @@ pub const NavGrid = struct {
         self.* = undefined;
     }
 
-    // Sizes this level's arrays and clears them. Dimensions/version are assigned
-    // by the owning NavGraph so every level stays consistent.
+    // Sizes this level's arrays and clears them. Dimensions are assigned by the owning
+    // NavGraph so every level stays consistent.
     pub fn prepare(
         self: *NavGrid,
         allocator: std.mem.Allocator,
@@ -65,18 +64,19 @@ pub const NavGrid = struct {
         height: usize,
         cell_size: f32,
         chunk_tiles: u16,
-        version: u32,
     ) !void {
         self.level = level;
         self.cell_size = cell_size;
         self.width = width;
         self.height = height;
         self.chunk_tiles = @max(@as(u16, 1), chunk_tiles);
-        self.version = version;
         const cell_count = self.cellCount();
         try setLen(&self.blocked, allocator, cell_count);
         try setLen(&self.components, allocator, cell_count);
-        try self.component_queue.ensureTotalCapacity(allocator, cell_count);
+        // A component flood never leaves its chunk, so the BFS queue only ever holds at
+        // most one chunk's cells — size it to chunk_tiles^2, not the whole level.
+        const ct: usize = self.chunk_tiles;
+        try self.component_queue.ensureTotalCapacity(allocator, ct * ct);
         @memset(self.blocked.items, false);
         @memset(self.components.items, no_component);
         self.blocked_count = 0;
@@ -142,6 +142,15 @@ pub const NavGrid = struct {
         return self.isBlockedIndex(index);
     }
 
+    // Whether a diagonal step from (cx,cy) to (nx,ny) is corner-blocked: an agent may move
+    // diagonally only when BOTH shared orthogonal neighbors are open (no squeezing through a
+    // corner). All four coordinates MUST be valid in-grid cells — callers bounds-check the
+    // destination first — so this indexes the mask directly without re-running indexForCell.
+    pub inline fn diagonalCornerBlocked(self: *const NavGrid, cx: i32, cy: i32, nx: i32, ny: i32) bool {
+        const w: i32 = @intCast(self.width);
+        return self.blocked.items[@intCast(cy * w + nx)] or self.blocked.items[@intCast(ny * w + cx)];
+    }
+
     pub fn markBlockedRectSimd(self: *NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
         if (!self.valid()) return;
         const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
@@ -152,16 +161,15 @@ pub const NavGrid = struct {
         const col_end_i = @max(min_cell.x, max_cell.x);
         const col_start: usize = @intCast(col_start_i);
         const col_end: usize = @intCast(col_end_i);
-        const col_end_vec = simd.splatInt4(@intCast(col_end_i));
 
         var y = row_start;
         while (y <= row_end) : (y += 1) {
             var x = col_start;
+            // The loop guard keeps every lane within [col_start, col_end], so all lanes are
+            // always in range — no per-lane mask needed; the scalar tail covers the remainder.
             while (x + simd.lane_count <= col_end + 1) : (x += simd.lane_count) {
-                const lanes = simd.int4(@intCast(x), @intCast(x + 1), @intCast(x + 2), @intCast(x + 3));
-                const active = lanes <= col_end_vec;
                 inline for (0..simd.lane_count) |lane| {
-                    if (active[lane]) self.markBlockedIndex(y * self.width + x + lane);
+                    self.markBlockedIndex(y * self.width + x + lane);
                 }
             }
             while (x <= col_end) : (x += 1) {
@@ -208,15 +216,6 @@ pub const NavGrid = struct {
         self.markBlockedRectSimd(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
     }
 
-    // Re-derives this level's blocked mask for ONLY the nav cells overlapping the
-    // given dirty tile edits, instead of recomposing the whole level. Each affected
-    // nav cell is recomputed from authoritative static sources (the world mask for
-    // every tile overlapping the cell, plus level-0 collision bodies covering it), so
-    // a cell kept blocked by an unrelated overlapping rect stays blocked and a true
-    // unblock is detected — the correctness the whole-level recompose gave, but
-    // bounded by the edit footprint instead of the level's cell count. This is what
-    // keeps a dig off the O(cells) remask path. The mask must already be correct for
-    // unedited cells (it is: built fully at init, then only ever mutated here).
     // Re-derives the blocked mask of EVERY cell in one chunk from the world + static bodies,
     // so a dirty chunk is correct regardless of which individual cells the caller enumerated
     // (coalesced rects, or upstream-coalesced batches). Uses the same per-cell source rule as
@@ -225,18 +224,12 @@ pub const NavGrid = struct {
     // thread for a chunk it exclusively owns; the caller sums the deltas and applies them to
     // `blocked_count` once after the (possibly threaded) remask completes.
     pub fn remaskChunkFromWorld(self: *NavGrid, chunk_id: u32, data: *const DataSystem, world: *const WorldSystem) isize {
-        const cx_count = self.chunksX();
-        const cx = chunk_id % cx_count;
-        const cy = chunk_id / cx_count;
-        const x0 = cx * self.chunk_tiles;
-        const y0 = cy * self.chunk_tiles;
-        const x1 = @min(x0 + self.chunk_tiles, self.width);
-        const y1 = @min(y0 + self.chunk_tiles, self.height);
+        const b = self.chunkBounds(chunk_id);
         var delta: isize = 0;
-        var y = y0;
-        while (y < y1) : (y += 1) {
-            var x = x0;
-            while (x < x1) : (x += 1) {
+        var y = b.y0;
+        while (y < b.y1) : (y += 1) {
+            var x = b.x0;
+            while (x < b.x1) : (x += 1) {
                 const index = y * self.width + x;
                 const value = self.navCellBlockedFromSources(data, world, x, y);
                 if (self.blocked.items[index] == value) continue;
@@ -322,6 +315,24 @@ pub const NavGrid = struct {
         return @intCast(cy * self.chunksX() + cx);
     }
 
+    pub const ChunkBounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
+
+    // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid. The single source of
+    // the chunk_id -> cell-rect convention shared by remask and component re-flood.
+    pub fn chunkBounds(self: *const NavGrid, chunk_id: u32) ChunkBounds {
+        const cx_count = self.chunksX();
+        const cx = chunk_id % cx_count;
+        const cy = chunk_id / cx_count;
+        const x0 = cx * self.chunk_tiles;
+        const y0 = cy * self.chunk_tiles;
+        return .{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = @min(x0 + self.chunk_tiles, self.width),
+            .y1 = @min(y0 + self.chunk_tiles, self.height),
+        };
+    }
+
     // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk, plus the
     // reserved 0). Keeps encoded labels of different chunks disjoint.
     pub fn chunkLabelStride(self: *const NavGrid) u64 {
@@ -333,7 +344,8 @@ pub const NavGrid = struct {
     // flood never leaves its chunk and labels encode the chunk, a full relabel produces
     // the same labels the per-chunk incremental relabel does.
     pub fn buildComponents(self: *NavGrid) void {
-        @memset(self.components.items, no_component);
+        // No whole-array clear needed: recomputeChunkComponents clears each chunk's own
+        // cells before re-flooding, and every cell belongs to exactly one chunk.
         const chunk_count = self.chunksX() * self.chunksY();
         var chunk_id: u32 = 0;
         while (chunk_id < chunk_count) : (chunk_id += 1) {
@@ -347,26 +359,20 @@ pub const NavGrid = struct {
     // BFS scratch — `&self.component_queue` on the serial path, or a per-worker queue when
     // dirty chunks are re-flooded in parallel (the flood writes only this chunk's cells).
     pub fn recomputeChunkComponents(self: *NavGrid, chunk_id: u32, queue: *std.ArrayList(usize)) void {
-        const cx_count = self.chunksX();
-        const cx = chunk_id % cx_count;
-        const cy = chunk_id / cx_count;
-        const x0 = cx * self.chunk_tiles;
-        const y0 = cy * self.chunk_tiles;
-        const x1 = @min(x0 + self.chunk_tiles, self.width);
-        const y1 = @min(y0 + self.chunk_tiles, self.height);
-        var y = y0;
-        while (y < y1) : (y += 1) {
-            var x = x0;
-            while (x < x1) : (x += 1) {
+        const b = self.chunkBounds(chunk_id);
+        var y = b.y0;
+        while (y < b.y1) : (y += 1) {
+            var x = b.x0;
+            while (x < b.x1) : (x += 1) {
                 self.components.items[y * self.width + x] = no_component;
             }
         }
         const base: u64 = @as(u64, chunk_id) * self.chunkLabelStride();
         var local: u32 = 1;
-        y = y0;
-        while (y < y1) : (y += 1) {
-            var x = x0;
-            while (x < x1) : (x += 1) {
+        y = b.y0;
+        while (y < b.y1) : (y += 1) {
+            var x = b.x0;
+            while (x < b.x1) : (x += 1) {
                 const index = y * self.width + x;
                 if (self.blocked.items[index] or self.components.items[index] != no_component) continue;
                 const label = base + local;
@@ -394,10 +400,9 @@ pub const NavGrid = struct {
                 // reachability is carried by the abstract portal graph instead.
                 if (self.chunkOfCell(next_index) != start_chunk) continue;
                 if (self.blocked.items[next_index] or self.components.items[next_index] != no_component) continue;
-                // next_cell is in-bounds, so its component coords are too; index the
-                // orthogonal diagonal cells directly instead of via isBlockedCell.
-                const width_i: i32 = @intCast(self.width);
-                if (dir.diagonal and (self.blocked.items[@intCast(current_y * width_i + next_cell.x)] or self.blocked.items[@intCast(next_cell.y * width_i + current_x)])) {
+                // next_cell is in-bounds, so its component coords are too; the helper indexes
+                // the orthogonal diagonal cells directly instead of via isBlockedCell.
+                if (dir.diagonal and self.diagonalCornerBlocked(current_x, current_y, next_cell.x, next_cell.y)) {
                     continue;
                 }
                 self.components.items[next_index] = component;

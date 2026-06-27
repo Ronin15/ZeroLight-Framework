@@ -297,7 +297,12 @@ pub fn abstractCorridor(
         abstract.slot_parent.items[slot] = no_ref;
         abstract.slot_via_link.items[slot] = false;
         if (abstract.open.items.len >= abstract.open.capacity) return .saturated;
-        const h = octileCells(graph.width, portal.cell_index, @intCast(goal_index));
+        // Only the goal level has a cell coordinate comparable to the goal; off-level seed
+        // portals use h=0 to keep the heuristic admissible (matches the relax paths below).
+        const h = if (start_level == goal_level)
+            octileCells(graph.width, portal.cell_index, @intCast(goal_index))
+        else
+            0;
         abstract.open.appendAssumeCapacity(.{ .index = ref, .f = g + h, .h = h });
         siftUp(abstract.open.items, abstract.open.items.len - 1);
         seeded += 1;
@@ -412,7 +417,7 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
     scratch.open.appendAssumeCapacity(.{ .index = start_index, .f = h0, .h = h0 });
 
     while (scratch.open.items.len != 0) {
-        const current = popOpen(scratch);
+        const current = popHeap(&scratch.open);
         const current_slot = scratch.slotFor(current.index) orelse return .budget_exhausted;
         if (scratch.slot_closed.items[current_slot]) continue;
         scratch.slot_closed.items[current_slot] = true;
@@ -432,10 +437,9 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
             if (nx < 0 or ny < 0 or nx >= width or ny >= @as(i32, @intCast(grid.height))) continue;
             const next_index: usize = @intCast(ny * width + nx);
             if (grid.isBlockedIndex(next_index)) continue;
-            // nx/ny and current_x/current_y are already in-bounds, so the two
-            // orthogonal cells of a diagonal step index the mask directly without
-            // re-running indexForCell's sign/bounds checks.
-            if (dir.diagonal and (grid.blocked.items[@intCast(current_y * width + nx)] or grid.blocked.items[@intCast(ny * width + current_x)])) {
+            // nx/ny and current_x/current_y are already in-bounds, so the helper indexes the
+            // two orthogonal cells of a diagonal step directly, with no per-neighbor div/bounds.
+            if (dir.diagonal and grid.diagonalCornerBlocked(current_x, current_y, nx, ny)) {
                 continue;
             }
             const next_slot = scratch.slotFor(next_index) orelse return .budget_exhausted;
@@ -514,8 +518,4 @@ pub fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slo
     @memcpy(system.worker_stitched_pool.items[offset .. offset + count], stitched[0..count]);
     system.solved_paths.items[pending_index].stitched_offset = offset;
     system.solved_paths.items[pending_index].stitched_len = count;
-}
-
-pub fn popOpen(scratch: *SearchScratch) OpenNode {
-    return popHeap(&scratch.open);
 }

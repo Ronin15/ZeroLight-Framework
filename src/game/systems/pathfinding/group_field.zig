@@ -165,10 +165,9 @@ pub const GroupField = struct {
                 const ny = current_y + dir.y;
                 const next_index = grid.indexForCell(.{ .x = nx, .y = ny }) orelse continue;
                 if (grid.isBlockedIndex(next_index)) continue;
-                // next_index is in-bounds, so nx/ny and current_x/current_y are too;
-                // index the orthogonal diagonal cells directly.
-                const width_i: i32 = @intCast(grid.width);
-                if (dir.diagonal and (grid.blocked.items[@intCast(current_y * width_i + nx)] or grid.blocked.items[@intCast(ny * width_i + current_x)])) {
+                // next_index is in-bounds, so nx/ny and current_x/current_y are too; the helper
+                // indexes the orthogonal diagonal cells directly.
+                if (dir.diagonal and grid.diagonalCornerBlocked(current_x, current_y, nx, ny)) {
                     continue;
                 }
                 const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
@@ -203,7 +202,9 @@ pub const GroupField = struct {
     // over empty buckets. Returns null when the queue is empty.
     pub fn popNext(self: *GroupField) ?usize {
         var scanned: u32 = 0;
-        while (scanned <= group_field_buckets) : (scanned += 1) {
+        // The live window spans at most group_field_buckets distinct residues (max octile step =
+        // diagonal_cost), so one pass over every bucket either finds work or drains the queue.
+        while (scanned < group_field_buckets) : (scanned += 1) {
             const b = self.current_distance % group_field_buckets;
             const head = self.buckets.items[b];
             if (head != no_cell) {
@@ -294,7 +295,7 @@ test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra fie
     const allocator = std.testing.allocator;
     var grid = NavGrid{};
     defer grid.deinit(allocator);
-    try grid.prepare(allocator, 0, 20, 20, default_cell_size, default_nav_chunk_tiles, 1);
+    try grid.prepare(allocator, 0, 20, 20, default_cell_size, default_nav_chunk_tiles);
     // A diagonal-ish obstacle pattern so the field has equal-cost cells reachable from
     // multiple predecessors (the case where pop order could change flow directions).
     const blocked_cells = [_][2]usize{ .{ 5, 3 }, .{ 5, 4 }, .{ 5, 5 }, .{ 6, 5 }, .{ 7, 5 }, .{ 10, 10 }, .{ 11, 10 }, .{ 12, 10 }, .{ 3, 12 }, .{ 4, 12 }, .{ 14, 6 }, .{ 14, 7 } };
