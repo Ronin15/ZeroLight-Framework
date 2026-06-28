@@ -66,6 +66,21 @@ adding broad abstraction.
   index — then layers perception → memory → affect → behavior arbitration as
   cognition-gated processor stages, keeping per-frame sensing columnar and routing
   only notable transitions through scalar-only `domain_reaction` events.
+- Land NPC Z-level traversal (Slice 25E) before multi-floor emergent scenarios.
+  The four touch-points are identified; schedule them as acceptance-checked work
+  so the defect is caught in isolation rather than discovered mid-AI-track as a
+  silent teleport behavior.
+- Plan a `ComponentMask` widening from `u32` to `u64` before bit 28 is consumed.
+  Eight component slots are currently used; the emergent-AI track (Slices 26–33)
+  adds at minimum 8 more (faction, RNG seed, spatial index, perception, memory,
+  affect, behavior weights, archetype). Combat, status effects, environmental
+  state, and further domain expansions add more still. The widening touches
+  `Component` (`u5` → `u6`), `ComponentMask` (`u32` → `u64`), `componentMask()`,
+  `EntitySlot.component_mask`, and every `switch` on `Component` — mechanical but
+  broad, cheaper to schedule before AI-track feature pressure mounts.
+  `EntityId.index` stays `u32` (theoretical ceiling ~4.3 B entity slots is already
+  ample for a 2D game; widening to `u64` would grow every `EntitySlot` and dense
+  store row for no practical gain at this scale).
 
 ## Long-Term Gameplay Direction
 
@@ -754,6 +769,16 @@ Readiness: the foundation for this slice is fully present (Slices 22/23/21);
 what remains is wiring. The six checklist items below are the concrete gaps
 between the current full-active pipeline and real scoped behavior.
 
+Architecture assessment note (2026-06-28): confirmed that `allowsMovement`,
+`allowsCollision`, and `allowsCognition` predicates on `SimulationTier` are
+never consulted in `SimulationPipeline.update` — every entity, including dormant
+ones, pays full pipeline cost every step. This is the highest-leverage open item
+in the codebase: until it lands, entity population growth translates directly to
+frame cost with no graduated degradation, and every cognition-tier stage added by
+the AI track bakes in O(all entities) cost. Implement with a parallel
+`scanLiveTierCounts` parity check in debug builds to detect tier-count drift; gate
+the AI stage first and validate under stress before gating collision and movement.
+
 Current foundation (present — do not rebuild):
 
 - `SimulationTier` enum with capability predicates `allowsMovement`,
@@ -1086,21 +1111,65 @@ to a single portal, so escalation cannot subdivide the long segment and would on
 per-frame work — making it effective would require start-chunk-scoped seeding (a global
 corridor-shape change), a design decision left for a future slice.
 
-Deferred follow-up — per-entity NPC level and autonomous descent: the nav
-substrate routes cross-level corridors, but NPCs have no Z of their own. Steering
-hardcodes the agent start level to 0 (`steering.zig` `writePathRequests` and the
-`statusForEntityWorld(..., 0, ...)` query), `PathView` carries no level, and the
-ramp/fall transition logic is player-only (`game_demo_state.zig`). Because the
-world renders only the player's current level and NPCs are drawn at their XY on
-whatever plane the player views, an NPC pathing toward an off-level player appears
-to teleport onto the player's level along its level-0 path. This is the
-`goal-level source (default 0 until multi-level gameplay exists)` open decision
-coming due. Implementing it spans four touch-points: (1) a per-entity level (Z)
-column in `DataSystem`; (2) steering sources `start_level` from it instead of the
-hardcoded 0; (3) `PathView` exposes the next cell's level so an agent traverses a
-link (updating its level column at the link cell) rather than sliding across the
-boundary; (4) render/cull each NPC on its own level, not the player's. Tracked as
-a gameplay slice on top of the Slice 25 substrate, not a pathfinder defect.
+Deferred follow-up: per-entity NPC level and autonomous Z-descent is tracked
+as Slice 25E below. The nav substrate is correct; the gap is four NPC-side
+touch-points in `DataSystem`, `steering.zig`, `PathView`, and render/cull.
+This is a gameplay-side correctness gap, not a pathfinder defect.
+
+## Slice 25E: Per-Entity NPC Level And Autonomous Z-Traversal
+
+Goal: give each NPC entity its own Z-level so it can request cross-level paths,
+traverse ramps and stairs autonomously, and be culled to its own floor instead
+of always rendering on the player's level.
+
+Current foundation:
+
+- Slice 25 provides a fully correct two-tier nav substrate with `LevelLink`
+  records and cross-level A* corridor stitching.
+- `PathRequest`/`NavigationIntent` already carry `start_level`/`goal_level`
+  fields (added in 25C); steering hardcodes `start_level = 0`.
+- The per-level portal graph, `PathView`, and link-edge traversal are complete.
+
+Problem (confirmed silent-behavior gap):
+
+- `steering.zig` `writePathRequests` hardcodes `start_level = 0` and
+  `statusForEntityWorld(..., 0, ...)` ignores the entity's actual floor.
+- `PathView` exposes `next_waypoint` XY but no level; an agent crossing a link
+  cannot detect the level transition and update its own Z.
+- Ramp/fall plane-traversal logic is player-only (`game_demo_state.zig`).
+- NPCs are drawn at their XY on whatever level the player occupies, so an NPC
+  pursuing the player underground appears to teleport along its level-0 path.
+  This produces wrong-but-non-crashing behavior that attributes to AI logic,
+  not a routing defect.
+
+Checklist:
+
+- [ ] Add a per-entity level (Z) column to `DataSystem` (cold metadata, default
+      surface level `0`), following the component-store pattern; initialize in
+      `createEntity`.
+- [ ] Steering sources `start_level` from the entity's level column rather than
+      the hardcoded `0`; add a debug assertion that `steering.start_level ==
+      entity.level` before each path request.
+- [ ] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
+      so an agent can detect a link crossing and commit a level update.
+- [ ] Update the per-step movement/traversal pass to apply NPC level transitions
+      at link cells (mirroring the player ramp/fall logic); update the entity
+      level column through the deferred structural-commit path or an explicit
+      main-thread commit, not inside worker ranges.
+- [ ] Render and cull each NPC on its own level, not the player's.
+- [ ] Add tests covering same-level NPC pathing (no regression), cross-level
+      NPC pursuing an off-level goal (level column updates at the link cell),
+      and NPC render cull matching entity level.
+
+Acceptance checks:
+
+- [ ] An NPC pursuing a player on a different floor routes cross-level via
+      `LevelLink` and updates its level column at the link cell; no teleport.
+- [ ] Intra-level NPC behavior is unchanged (parity test).
+- [ ] NPCs are culled to their own level, not the player's.
+- [ ] No steady-state allocation; debug assertion fires if `steering.start_level`
+      diverges from the entity level column.
+- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
 
 ## Emergent AI Track Overview (Slices 26–33)
 
@@ -1587,6 +1656,7 @@ Acceptance checks:
 23. Atlas-backed world rendering addition.
 24. Scoped simulation tiers and chunk policy.
 25. Z-aware scalable navigation redesign.
+25E. Per-entity NPC level and autonomous Z-traversal.
 26. Entity faction and classification model.
 27. Deterministic per-entity RNG facility.
 28. Shared spatial index service.
@@ -1614,6 +1684,10 @@ current structural, navigation, and world/chunk visibility foundation. Slice 24
 scoped simulation tiers should consume those world/chunk views next. Scoped
 tiers, chunk policy, and tier transitions should use those event signals through
 pipeline-owned controllers instead of adding parallel orchestration paths.
+Slice 25E lands per-entity NPC Z-level before multi-floor emergent scenarios;
+it is a gameplay-side correctness gap (four NPC touch-points in `DataSystem`,
+`steering`, `PathView`, and render cull) on top of the fully correct Slice 25
+nav substrate.
 The emergent-AI track (Slices 26–33) builds on that foundation: it lands the
 framework additions the AI work requires (faction classification, deterministic
 RNG, shared spatial index), then layers perception, memory, affect, and behavior
