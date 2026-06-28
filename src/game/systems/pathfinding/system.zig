@@ -60,6 +60,8 @@ const default_cells_per_group_agent = types.default_cells_per_group_agent;
 const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
+const budget_exhausted_rotate_after = types.budget_exhausted_rotate_after;
+const budget_exhausted_drop_after = types.budget_exhausted_drop_after;
 
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
@@ -133,6 +135,14 @@ pub const PathfindingSystem = struct {
     // group tally by round-tripping them through these. Allocated only at resize.
     resize_pending_snapshot: std.ArrayList(PendingRequest) = .empty,
     resize_group_snapshot: std.ArrayList(GroupRequestTally) = .empty,
+    // Per-step scratch for pending entries rotated to the back of the queue by
+    // compactPendingAfterSolve (chronic budget spillers aged out of the front window).
+    rotate_back_scratch: std.ArrayList(PendingRequest) = .empty,
+    // Requests dropped by an elastic SHRINK (pending/group beyond the smaller capacity).
+    // Accumulated here because the shrink runs in adjustCapacityForAgentCount before
+    // acceptRequests overwrites the step stats; folded into stats.dropped_requests in
+    // beginUpdate and then cleared.
+    resize_dropped: usize = 0,
 
     const SolvedPath = struct {
         key: PathQueryKey,
@@ -161,6 +171,7 @@ pub const PathfindingSystem = struct {
     pub fn deinit(self: *PathfindingSystem) void {
         for (self.scratch_slots.items) |*scratch| scratch.deinit(self.allocator);
         for (self.group_fields.items) |*field| field.deinit(self.allocator);
+        self.rotate_back_scratch.deinit(self.allocator);
         self.resize_group_snapshot.deinit(self.allocator);
         self.resize_pending_snapshot.deinit(self.allocator);
         self.affected_levels.deinit(self.allocator);
@@ -239,6 +250,9 @@ pub const PathfindingSystem = struct {
         try resizeArrayList(PathSolveResult, &self.solve_results, self.allocator, capacity.max_solved_requests_per_step);
         try resizeArrayList(usize, &self.fallback_indices, self.allocator, capacity.max_solved_requests_per_step);
         try resizeArrayList(SolvedPath, &self.solved_paths, self.allocator, capacity.max_solved_requests_per_step);
+        // Sized to the solve window: at most one front-window entry per solved slot can be
+        // rotated to the back in a single compaction.
+        try resizeArrayList(PendingRequest, &self.rotate_back_scratch, self.allocator, capacity.max_solved_requests_per_step);
         try self.completed.reserve(self.allocator, capacity.max_cached_results, capacity.max_stored_path_cells, capacity.max_stitched_path_cells);
         try self.unavailable.reserve(self.allocator, capacity.max_cached_results);
         try self.pending_keys.reserve(self.allocator, capacity.max_pending_requests * 2);
@@ -334,6 +348,10 @@ pub const PathfindingSystem = struct {
         self.group_requests.clearRetainingCapacity();
         const keep_group = @min(self.resize_group_snapshot.items.len, self.group_requests.capacity);
         self.group_requests.appendSliceAssumeCapacity(self.resize_group_snapshot.items[0..keep_group]);
+        // A shrink that drops live deferred work / group tally past the smaller capacity is
+        // a real loss of accepted requests; surface it instead of dropping silently.
+        self.resize_dropped += (self.resize_pending_snapshot.items.len - keep_pending) +
+            (self.resize_group_snapshot.items.len - keep_group);
     }
 
     pub fn rebuildStaticNavGrid(self: *PathfindingSystem, data: *const DataSystem, bounds_width: f32, bounds_height: f32, cell_size: f32) !void {
@@ -598,7 +616,7 @@ pub const PathfindingSystem = struct {
                 }
             }
         }
-        if (self.completed.slotIndex(key)) |slot| {
+        if (self.completed.freshSlotIndex(key, self.step_counter, types.default_cache_ttl_steps)) |slot| {
             const result = self.completed.resultAt(slot);
             const path_grid = self.graph.grid(result.path_level) orelse return .{ .status = .unavailable };
             const path = self.completed.pathSlice(slot, result.path_len);
@@ -645,6 +663,10 @@ pub const PathfindingSystem = struct {
         try self.adjustCapacityForAgentCount(agent_count);
         var accept_timer = PhaseTimer.begin();
         stats.* = self.acceptRequests(requests.mergedItems());
+        // Fold in any requests an elastic shrink dropped (it ran before acceptRequests
+        // reset the step stats), then clear the accumulator.
+        stats.dropped_requests += self.resize_dropped;
+        self.resize_dropped = 0;
         stats.accept_ns = accept_timer.lap();
         var group_timer = PhaseTimer.begin();
         self.serviceGroupFields(stats);
@@ -669,7 +691,7 @@ pub const PathfindingSystem = struct {
     pub fn finishUpdate(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         var publish_timer = PhaseTimer.begin();
         self.publishSolvedResults(solve_count, stats);
-        self.compactPendingAfterSolve(solve_count);
+        self.compactPendingAfterSolve(solve_count, stats);
         stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.items.len;
         stats.deferred_requests = self.pending.items.len;
@@ -1061,21 +1083,47 @@ pub const PathfindingSystem = struct {
         stats.fallback_requests = self.fallback_indices.items.len;
     }
 
-    // Deferred and budget-exhausted entries keep relative order. Solved entries
-    // (available/unavailable) are removed, then pending_keys is rebuilt to match.
-    fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize) void {
+    // Compacts pending after a solve. Solved entries (available/unavailable) are removed.
+    // Deferred entries (not attempted this frame) keep their front order. A budget-exhausted
+    // entry is aged: kept in front until rotate threshold, then rotated to the BACK so the
+    // untouched tail reaches the solve window, then demoted to a hard negative once it has
+    // never fit the per-solve budget across enough retries. Solve-window writes target
+    // indices <= their source, so the in-place rewrite never clobbers an unread entry; the
+    // rotated copies live in rotate_back_scratch. pending_keys is rebuilt to match.
+    fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         if (solve_count == 0) return;
+        self.rotate_back_scratch.clearRetainingCapacity();
         var write_index: usize = 0;
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
-            const keep = switch (result) {
-                .deferred, .budget_exhausted => true,
-                else => false,
-            };
-            if (!keep) continue;
-            self.pending.items[write_index] = self.pending.items[pending_index];
-            write_index += 1;
+            switch (result) {
+                .deferred => {
+                    self.pending.items[write_index] = self.pending.items[pending_index];
+                    write_index += 1;
+                },
+                .budget_exhausted => |key| {
+                    var request = self.pending.items[pending_index];
+                    request.retries +|= 1;
+                    if (request.retries >= budget_exhausted_drop_after) {
+                        // Chronic spiller: a request that never fits the per-solve budget.
+                        // Negative-cache it so it stops consuming a solve slot every frame.
+                        if (!self.unavailable.insert(key)) stats.cache_evictions += 1;
+                        stats.unavailable_results += 1;
+                    } else if (request.retries >= budget_exhausted_rotate_after) {
+                        self.rotate_back_scratch.appendAssumeCapacity(request);
+                    } else {
+                        self.pending.items[write_index] = request;
+                        write_index += 1;
+                    }
+                },
+                else => {},
+            }
         }
         for (self.pending.items[solve_count..]) |pending_request| {
+            self.pending.items[write_index] = pending_request;
+            write_index += 1;
+        }
+        // Aged spillers trail the untouched tail so the tail makes progress before they retry.
+        for (self.rotate_back_scratch.items) |pending_request| {
             self.pending.items[write_index] = pending_request;
             write_index += 1;
         }

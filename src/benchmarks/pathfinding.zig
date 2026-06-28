@@ -20,10 +20,30 @@ const default_max_solves_per_frame = @import("../game/systems/pathfinding.zig").
 const pathfinding_range_alignment_items = @import("../game/systems/pathfinding.zig").pathfinding_range_alignment_items;
 const suite = @import("suite.zig");
 
+// Headline solve curve: cold, DISTINCT-goal individual A* across the 512/frame ceiling.
+// Each measured frame performs min(512, count) real solves and defers the rest, so this is
+// a true cold solver-throughput curve (no goal-keyed dedup), not a single shared-goal solve.
 pub const group = suite.BenchmarkGroup{
     .name = "pathfinding",
-    .defaultItemCounts = defaultItemCounts,
+    .defaultItemCounts = coldSolveItemCounts,
     .runCase = runCase,
+};
+
+// Shared-goal dedup path (kept distinct from the headline solve curve): every agent shares
+// one goal, so all but the first resolve via dedup/group-field off a single cold A* solve.
+pub const dedup_group = suite.BenchmarkGroup{
+    .name = "pathfinding-shared-goal",
+    .defaultItemCounts = defaultItemCounts,
+    .runCase = runDedupCase,
+};
+
+// Multi-frame amortized drain: submit N >> 512 distinct goals once, then step successive
+// frames WITHOUT clearing so `pending` carries the remainder and drains at the per-frame
+// ceiling. Validates the cross-frame carry-over the 512 cap exists for.
+pub const drain_group = suite.BenchmarkGroup{
+    .name = "pathfinding-drain",
+    .defaultItemCounts = drainItemCounts,
+    .runCase = runDrainCase,
 };
 
 pub const fallback_group = suite.BenchmarkGroup{
@@ -70,6 +90,15 @@ pub const query_group = suite.BenchmarkGroup{
 const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
+// Cold-solve curve sits at and well above the 512 ceiling so the deferral ratio is traced
+// (e.g. 4096 -> 512 solved, 3584 deferred). Every count >= the ceiling.
+const cold_solve_quick_counts = [_]usize{ 512, 1024, 2048 };
+const cold_solve_standard_counts = [_]usize{ 512, 1024, 2048, 4096 };
+const cold_solve_stress_counts = [_]usize{ 2048, 4096, 10000 };
+// Drain counts are deep queues (N >> 512) so each cycle spans several drain frames.
+const drain_quick_counts = [_]usize{ 1024, 2048 };
+const drain_standard_counts = [_]usize{ 2048, 4096 };
+const drain_stress_counts = [_]usize{ 4096, 8192 };
 const fallback_quick_counts = [_]usize{ 16, 64, 128 };
 const fallback_standard_counts = [_]usize{ 64, 128, 256, 1024 };
 const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
@@ -91,8 +120,16 @@ const Workload = enum {
 };
 
 const MeasurementMode = enum {
+    // Warm cache: measures the cache-hit probe (no solve runs).
     hot_cache,
-    cold_hard_fallback,
+    // Cold per-cell A* fallback (heavy-obstacle field); serviced = fallback_requests.
+    cold_fallback,
+    // Cold mixed solve (abstract + fallback) on a representative map; serviced = solves.
+    cold_solve,
+
+    fn isCold(self: MeasurementMode) bool {
+        return self != .hot_cache;
+    }
 };
 
 const Fixture = struct {
@@ -111,6 +148,22 @@ pub fn defaultItemCounts(profile: suite.Profile) []const usize {
         .quick => &quick_counts,
         .standard => &standard_counts,
         .stress => &stress_counts,
+    };
+}
+
+pub fn coldSolveItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        .quick => &cold_solve_quick_counts,
+        .standard => &cold_solve_standard_counts,
+        .stress => &cold_solve_stress_counts,
+    };
+}
+
+pub fn drainItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        .quick => &drain_quick_counts,
+        .standard => &drain_standard_counts,
+        .stress => &drain_stress_counts,
     };
 }
 
@@ -170,7 +223,22 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize, workload: Workl
     return .{ .data = data, .requests = requests };
 }
 
+// Headline pathfinding solve curve: cold, DISTINCT-goal individual A* at and above the
+// 512/frame amortization ceiling. min(512, count) solves run this frame; the remainder
+// defers (the drain group measures the carry-over). Distinct goals mean no goal-keyed dedup,
+// so this is a true cold solver-throughput curve, not a single shared-goal solve. The solve
+// budget is the full count so the per-frame ceiling (not a bench-imposed budget) does the
+// capping, and items_per_second reports solves actually serviced, not the requested count.
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .cold_solve, item_count, item_count);
+}
+
+// Shared-goal dedup path: every agent requests the SAME goal cell, so all but the first hash
+// to one PathQueryKey (start is not part of the key) and resolve via dedup/group-field off a
+// single cold A* solve per frame. The transient request state is cleared each iteration so
+// every iteration is a fresh cold dedup. Throughput here is agents-resolved-via-dedup per
+// second (the dedup IS the workload), NOT solver throughput.
+pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var fixture = try createFixture(allocator, item_count, .common_goal);
@@ -206,17 +274,17 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
     system.clearRuntimeState();
-    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+    _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
     for (0..options.warmup_iterations) |_| {
         system.clearTransientRequestsRetainingFields();
-        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+        _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearTransientRequestsRetainingFields();
-            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+            _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
         }
     }
     const solve_settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
@@ -226,18 +294,22 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     for (0..options.iterations) |_| {
         system.clearTransientRequestsRetainingFields();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
+        last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
     }
 
     var stats = accumulator.finish();
-    // Goal-keyed dedup resolves a shared goal once; same-goal duplicates and
-    // warm cache hits are also resolved agents. Count all so output_count still
-    // reflects every requesting agent.
+    // Goal-keyed dedup resolves a shared goal once; same-goal duplicates and warm cache hits
+    // are also resolved agents. Count all so output_count reflects every requesting agent.
     stats.output_count = last_stats.available_results + last_stats.unavailable_results +
         last_stats.duplicate_requests + last_stats.cache_hits;
     stats.candidate_pairs = last_stats.duplicate_requests + last_stats.cache_hits;
+    // Honest denominator: agents resolved via dedup this step (every requesting agent),
+    // explicitly NOT the single A* solve. Equals item_count when nothing is dropped.
+    if (stats.mean_ns != 0) {
+        stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
+    }
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), solve_settled_before_measurement);
     }
@@ -245,31 +317,31 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 }
 
 pub fn runFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .unique_open, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_detour, .hot_cache, item_count, item_count);
 }
 
 pub fn runFallbackUnreachableCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .blocked_unreachable, .hot_cache, item_count, item_count);
 }
 
 pub fn runHardFallbackCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, item_count, item_count);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, item_count);
 }
 
 pub fn runHardFallbackBudgetCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     const fallback_budget = @min(options.fallback_budget orelse hardFallbackBudget(item_count), item_count);
-    return runFallbackWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_hard_fallback, item_count, fallback_budget);
+    return runWorkloadCase(allocator, io, options, case, item_count, .hard_fallback, .cold_fallback, item_count, fallback_budget);
 }
 
 fn hardFallbackBudget(item_count: usize) usize {
     return @min(item_count, default_max_fallback_requests_per_step);
 }
 
-fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
+fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize, workload: Workload, mode: MeasurementMode, solve_budget: usize, fallback_budget: usize) !suite.RunStats {
     if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
 
     var fixture = try createFixture(allocator, item_count, workload);
@@ -305,70 +377,178 @@ fn runFallbackWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: su
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
     system.clearRuntimeState();
-    _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+    _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
 
     for (0..options.warmup_iterations) |_| {
-        if (mode == .cold_hard_fallback) system.clearRuntimeState();
-        _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+        if (mode.isCold()) system.clearRuntimeState();
+        _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
     }
-    if (case.adaptive and mode == .cold_hard_fallback) {
+    if (case.adaptive and mode.isCold()) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearRuntimeState();
-            _ = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+            _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
         }
     }
-    const fallback_settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
+    const settled_before_measurement = if (case.adaptive) system.fallback_tuner.isSettled() else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
     for (0..options.iterations) |_| {
-        if (mode == .cold_hard_fallback) system.clearRuntimeState();
+        if (mode.isCold()) system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
-        last_stats = try runColdOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
+        last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
     }
 
     var stats = accumulator.finish();
     stats.output_count = last_stats.available_results + last_stats.unavailable_results;
-    stats.candidate_pairs = if (mode == .hot_cache) last_stats.cache_hits else last_stats.fallback_requests;
     stats.deferred_count = last_stats.deferred_requests;
     stats.fallback_deferred_count = last_stats.fallback_deferred_requests;
     stats.cache_evictions = last_stats.cache_evictions;
 
-    // Throughput must reflect items actually serviced this step, not the requested
-    // count. Cold solves are capped at the per-frame amortization ceiling, so a
-    // 1024-request row only performs min(1024, ceiling) solves and defers the rest to
-    // later frames; counting all 1024 would inflate the curve to look like the solver
-    // scales past the cap when its real per-step work is flat at the ceiling. Report
-    // serviced/sec (solves when cold, cache hits when hot); both equal item_count when
-    // nothing is deferred, so honest rows are unchanged.
-    const serviced = stats.candidate_pairs;
-    if (mode == .cold_hard_fallback) {
-        // Cold fallbacks are bounded by the effective fallback limit, which is the
-        // configured fallback budget clamped to the per-frame ceiling; anything beyond
-        // that defers. This pins the "no silent cap drift" invariant.
-        std.debug.assert(serviced == @min(item_count, @min(fallback_budget, default_max_solves_per_frame)));
+    // Throughput must reflect items actually serviced this step, not the requested count.
+    // Cold solves are capped at the per-frame amortization ceiling, so a 4096-request row
+    // only performs min(4096, ceiling) solves and defers the rest to later frames; counting
+    // all 4096 would inflate the curve to look like the solver scales past the cap when its
+    // real per-step work is flat at the ceiling. The serviced count is mode-specific: cache
+    // hits when warm, fallback A* solves when cold-fallback, abstract+fallback solves when
+    // cold-solve. All three equal item_count when nothing is deferred, so honest rows match.
+    const serviced: usize = switch (mode) {
+        .hot_cache => last_stats.cache_hits,
+        .cold_fallback => last_stats.fallback_requests,
+        .cold_solve => stats.output_count,
+    };
+    stats.candidate_pairs = serviced;
+    // Pin the "no silent cap drift" invariant: per-frame solves never exceed the ceiling.
+    // cold-fallback counts fallback ATTEMPTS (slots filled), which is exactly the fallback
+    // budget clamped to the ceiling. cold-solve counts SUCCESSES (results published); a long
+    // open-grid path may exhaust the node budget and defer to a later frame, so its serviced
+    // count is bounded by — not always equal to — the solve budget clamped to the ceiling.
+    switch (mode) {
+        .hot_cache => {},
+        .cold_fallback => std.debug.assert(serviced == @min(item_count, @min(fallback_budget, default_max_solves_per_frame))),
+        .cold_solve => std.debug.assert(serviced <= @min(item_count, @min(solve_budget, default_max_solves_per_frame))),
     }
     if (stats.mean_ns != 0) {
         stats.items_per_second = suite.itemsPerSecond(serviced, stats.mean_ns);
     }
-    if (case.adaptive and mode == .cold_hard_fallback) {
-        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), fallback_settled_before_measurement);
+    if (case.adaptive and mode.isCold()) {
+        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), settled_before_measurement);
     }
     return stats;
 }
 
-fn runColdOnce(system: *PathfindingSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
+// Multi-frame amortized drain: submits N >> 512 distinct goals once per cycle, then steps
+// successive frames over an EMPTY request stream WITHOUT clearing, so `pending` carries the
+// remainder and drains at the per-frame ceiling. Each timed sample is one drain frame, so the
+// mean reflects steady carry-over cost (flat ~ceiling solves) rather than the one-time accept.
+pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    if (item_count <= default_max_solves_per_frame) {
+        return suite.RunStats.skipped("count at or below the per-frame ceiling; nothing to drain");
+    }
+
+    var fixture = try createFixture(allocator, item_count, .unique_open);
+    defer fixture.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+    if (suite.adaptiveTunerForCase(case, pathfinding_range_alignment_items)) |tuner| {
+        system.fallback_tuner = tuner;
+    }
+
+    const grid_side = fixtureGridSide(item_count, .unique_open);
+    const world_extent = @as(f32, @floatFromInt(grid_side)) * 32.0;
+
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = 8,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = @max(item_count, 1),
+    });
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+
+    // Drain frames step over an empty stream so no new request is accepted; only the carried
+    // pending queue is solved, isolating steady drain cost from the one-time accept.
+    var empty = RangeOutputStream(PathRequest).init(allocator);
+    defer empty.deinit();
+
+    // Bounds one cycle's drain frames so a stalled queue (a request that never resolves)
+    // can never hang the loop; ceil(N/ceiling) frames empty a healthy queue, plus slack.
+    const drain_frame_budget = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
+
+    // Warmup: a couple of full drain cycles so pools are at high-water and the tuner trains.
+    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+        try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
+        var guard: usize = drain_frame_budget;
+        while (system.pending.items.len > 0 and guard > 0) : (guard -= 1) {
+            const before = system.pending.items.len;
+            _ = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
+            if (system.pending.items.len >= before) break; // no progress: stop draining this cycle
+        }
+    }
+
+    var accumulator = suite.StatsAccumulator.init(item_count);
+    var last_stats = PathfindingStats{};
+    while (accumulator.iterations < options.iterations) {
+        // Refill is untimed: clears completed/pending then accepts all N (this frame also
+        // solves the first ceiling). The timed samples below are pure drain frames.
+        try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
+        var guard: usize = drain_frame_budget;
+        while (system.pending.items.len > 0 and accumulator.iterations < options.iterations and guard > 0) : (guard -= 1) {
+            const before = system.pending.items.len;
+            const start_ns = suite.nowNs(io);
+            last_stats = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
+            const end_ns = suite.nowNs(io);
+            accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+            if (system.pending.items.len >= before) break; // no progress: refill next cycle
+        }
+    }
+
+    var stats = accumulator.finish();
+    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
+    stats.candidate_pairs = last_stats.solved_requests;
+    stats.deferred_count = last_stats.deferred_requests;
+    // Steady per-frame solver throughput: solves serviced in a drain frame, which stays flat
+    // at the ceiling regardless of how deep the carried queue is — that flat per-frame solve
+    // count while `pending` drains is the amortization (per-frame wall cost tracks grid size,
+    // not queue depth).
+    if (stats.mean_ns != 0) {
+        stats.items_per_second = suite.itemsPerSecond(last_stats.solved_requests, stats.mean_ns);
+    }
+    if (case.adaptive) {
+        stats.work_tuning = suite.workTuningSummary(system.fallback_tuner.report(), false);
+    }
+    return stats;
+}
+
+// Resets the result/pending state and accepts all N distinct goals in one frame, so the next
+// frames drain the carried remainder. The accept frame itself solves the first ceiling.
+fn refillDrainQueue(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize) !void {
+    system.clearTransientRequestsRetainingFields();
+    _ = try runColdOnce(system, requests, thread_system, case, agent_count, agent_count, agent_count);
+}
+
+fn runColdOnce(system: *PathfindingSystem, requests: *RangeOutputStream(PathRequest), thread_system: ?*ThreadSystem, case: suite.BenchmarkCase, agent_count: usize, solve_budget: usize, fallback_budget: usize) !PathfindingStats {
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(&fixture.requests, agent_count, .{
+        return try system.updateSerial(requests, agent_count, .{
             .max_solved_requests_per_step = solve_budget,
             .max_fallback_requests_per_step = fallback_budget,
         });
     }
-    return try system.update(&fixture.requests, agent_count, thread_system.?, .{
+    return try system.update(requests, agent_count, thread_system.?, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -632,10 +812,60 @@ test "pathfinding benchmark tiny serial case runs without display" {
         .warmup_iterations = 1,
         .iterations = 1,
     };
+    // Headline cold distinct-goal solve below the ceiling: every request is solved, none
+    // deferred, and the serviced count (candidate_pairs) equals the solves performed.
     const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 32);
     try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
     try std.testing.expect(stats.batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 32), stats.output_count);
+    try std.testing.expectEqual(@as(usize, 32), stats.candidate_pairs);
+    try std.testing.expectEqual(@as(usize, 0), stats.deferred_count);
+}
+
+test "pathfinding headline solve caps at the per-frame ceiling and defers the rest" {
+    const options = suite.Options{
+        .warmup_iterations = 0,
+        .iterations = 1,
+    };
+    // A count above the 512 ceiling performs exactly 512 cold distinct solves and defers
+    // the remainder; the throughput denominator is the serviced solves, not the request count.
+    const over = default_max_solves_per_frame + 64;
+    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], over);
+    try std.testing.expectEqual(@as(usize, default_max_solves_per_frame), stats.output_count);
+    try std.testing.expectEqual(@as(usize, default_max_solves_per_frame), stats.candidate_pairs);
+    try std.testing.expectEqual(@as(usize, 64), stats.deferred_count);
+}
+
+test "pathfinding shared-goal dedup resolves every agent off one solve" {
+    const options = suite.Options{
+        .warmup_iterations = 1,
+        .iterations = 1,
+    };
+    // Every agent shares one goal: one cold solve plus N-1 dedup probes, all N agents
+    // resolved. output_count counts every agent; candidate_pairs counts the dedup resolutions.
+    const stats = try runDedupCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 32);
+    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+    try std.testing.expectEqual(@as(usize, 32), stats.output_count);
+    try std.testing.expectEqual(@as(usize, 31), stats.candidate_pairs);
+}
+
+test "pathfinding drain steadily empties the carried pending queue" {
+    const options = suite.Options{
+        .warmup_iterations = 0,
+        .iterations = 2,
+    };
+    // N above the ceiling: the accept frame solves 512, then drain frames empty the carried
+    // remainder at the ceiling. Each timed sample resolves a flat batch, not the full queue.
+    const stats = try runDrainCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 1024);
+    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+    try std.testing.expect(stats.output_count > 0);
+    try std.testing.expect(stats.output_count <= default_max_solves_per_frame);
+}
+
+test "pathfinding drain skips counts at or below the per-frame ceiling" {
+    const options = suite.Options{ .warmup_iterations = 0, .iterations = 1 };
+    const stats = try runDrainCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], default_max_solves_per_frame);
+    try std.testing.expectEqual(suite.RunStatus.skipped, stats.status);
 }
 
 test "pathfinding query benchmark warms the cache and queries every agent" {

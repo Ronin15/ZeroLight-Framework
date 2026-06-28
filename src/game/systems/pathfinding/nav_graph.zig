@@ -874,9 +874,10 @@ pub const NavGraph = struct {
         const lo = self.chunk_link_base.items[chunk];
         const len = self.chunk_link_count.items[chunk];
         const run = self.chunk_link_cells.items[lo .. lo + len];
-        // slotForCell only reaches here for a non-perimeter portal cell, which is by
-        // construction an interior link endpoint recorded in this chunk's run. A miss is
-        // an invariant violation; surface it loudly instead of aliasing onto slot 0.
+        // slotForCell only reaches here for a non-perimeter portal cell that was already
+        // admitted as a portal. Border cells (tryBorderPair) are perimeter; link endpoints are
+        // gated by tryLinkPortal, which skips any interior cell absent from this run. So a miss
+        // is an invariant violation; surface it loudly instead of aliasing onto slot 0.
         const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable;
         return @intCast(rel);
     }
@@ -1183,7 +1184,26 @@ pub const NavGraph = struct {
     pub fn tryLinkPortal(self: *NavGraph, lg: *NavLevelGraph, level_grid: *const NavGrid, x: u16, y: u16, chunk: u32) void {
         const cell = level_grid.indexForCell(.{ .x = x, .y = y }) orelse return;
         if (self.chunkOf(cell) != chunk or level_grid.blocked.items[cell]) return;
+        // The per-chunk interior link-endpoint runs (and thus the interior slot space) are built
+        // once at init from the init-time link set (computePortalGeometry); the whole-world build
+        // is init-only. A link added at RUNTIME (dig_controller.digRamp) whose INTERIOR endpoint
+        // was not in that set has no reserved slot, so it stays out of the abstract tier: skip it
+        // (no portal, no cross-level edge — exactly as a blocked endpoint) rather than resolving
+        // against an absent run. Perimeter endpoints keep their positional slot and are added
+        // incrementally as normal. The deferred interior endpoint is picked up by the next full
+        // rebuild; cross-level NPC pathing is not active, so this changes no live query.
+        if (!self.isPerimeterCell(cell) and !self.interiorLinkSlotExists(chunk, cell)) return;
         self.addPortalCell(lg, level_grid.level, cell, chunk);
+    }
+
+    // Whether an interior cell has a reserved slot in its chunk's init-built link-endpoint run.
+    // Guards tryLinkPortal so a runtime-added interior endpoint is deferred instead of reaching
+    // linkTailIndex's `orelse unreachable` against a run it was never recorded in.
+    fn interiorLinkSlotExists(self: *const NavGraph, chunk: u32, cell_index: usize) bool {
+        const lo = self.chunk_link_base.items[chunk];
+        const len = self.chunk_link_count.items[chunk];
+        const run = self.chunk_link_cells.items[lo .. lo + len];
+        return std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) != null;
     }
 
     // Connects this chunk's live same-chunk-component portals pairwise with octile cost. Both
@@ -1734,6 +1754,61 @@ test "incremental nav update opening a ramp endpoint adds a live LevelLink edge"
     try rebuilt.reserve(abstractCapacity());
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "runtime interior link endpoint is deferred by the incremental patch, then slotted by a full rebuild" {
+    // dig_controller.digRamp adds a LevelLink AFTER the init geometry build. The abstract slot
+    // geometry is init-only, so a runtime interior endpoint has no reserved slot: the incremental
+    // patch must DEFER it (no portal, no cross-level edge), not resolve against an absent run
+    // (linkTailIndex unreachable). The next full rebuild reserves the slot.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    // 4-tile chunks (abstractCapacity): cell (2,2) is interior to chunk (0,0); (3,2) is a
+    // diggable perimeter neighbor in the same chunk that triggers the chunk's incremental patch.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    const level1_obstacle = try world.addDenseLayer(1, 0, .obstacle, grass);
+    _ = try world.setDenseTile(level1_obstacle, 3, 2, tree);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    const endpoint: u32 = @intCast(system.graph.grid(1).?.indexForCell(.{ .x = 2, .y = 2 }).?);
+    try std.testing.expect(system.graph.portalIndex(1, endpoint) == null); // no link yet
+
+    // Runtime link whose interior endpoint (2,2) was never in the init slot geometry.
+    try world.addLevelLink(.{
+        .kind = .ramp,
+        .level_a = 1,
+        .cell_a = .{ .x = 2, .y = 2 },
+        .level_b = 0,
+        .cell_b = .{ .x = 2, .y = 2 },
+        .traversal_cost = 1,
+        .bidirectional = true,
+    });
+
+    // Dig the neighbor open: drives the incremental patch over chunk (0,0). Must NOT panic.
+    const changed = (try world.setDenseTile(level1_obstacle, 3, 2, grass)) orelse return error.TestExpectedEqual;
+    _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
+    // Deferred: the interior endpoint is NOT slotted as a portal. The walkability-keyed
+    // link_edge still exists, but it is inert — the abstract solver skips any link whose
+    // endpoint resolves to no_cell in cell_to_portal (solve.zig), so it is never traversed.
+    try std.testing.expect(system.graph.portalIndex(1, endpoint) == null);
+
+    // A fresh full rebuild WITH the link present at init reserves the interior slot.
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(abstractCapacity());
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try std.testing.expect(rebuilt.graph.portalIndex(1, endpoint) != null);
 }
 
 test "incremental underground dig leaves the surface level abstract graph byte-identical" {

@@ -143,6 +143,9 @@ const Fixture = struct {
 // end of the run. The suite drives counts ascending and each variant's footprints are nested at a
 // stable anchor, so a later (larger) count's open-half toggle clears any prior count's blocked
 // cells — no per-count world reset needed.
+// OWNERSHIP: this module-global owns heap fixtures across the whole run; any entry point that
+// drives these cases (runner.main, or a test/harness calling runCase directly) MUST call
+// deinitCaches afterward or the fixtures leak.
 var shared_fixtures: [@typeInfo(Variant).@"enum".fields.len]?Fixture = .{ null, null };
 
 pub fn deinitCaches(allocator: std.mem.Allocator) void {
@@ -264,6 +267,12 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
 // so the measurement reflects the abstract-graph patch cost the task targets. A non-null
 // thread_system routes through the threaded buffered path (markNavDirty + applyBufferedNavUpdates);
 // null runs the serial slice path.
+//
+// The two halves are structurally ASYMMETRIC: the block half opens cells back to grass (drops
+// obstacle edges, re-floods regions) while the unblock half re-blocks them (adds obstacles,
+// prunes connectivity), so they touch different amounts of the chunk graph. The caller divides
+// the returned sum by 2, so the reported per-update mean is the AVERAGE of the two — a blended
+// block+unblock cost, not either half in isolation. Returns the summed elapsed of both halves.
 fn runToggle(fixture: *Fixture, io: std.Io, thread_system: ?*ThreadSystem) !u64 {
     var elapsed: u64 = 0;
     for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.grass);
@@ -347,8 +356,10 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     for (0..options.iterations) |_| {
-        // One toggle is two timed nav updates over the full footprint; report the per-update
-        // batch cost (items_per_second then reads as dirty cells per second).
+        // One toggle is two timed nav updates over the full footprint; record their AVERAGE as
+        // the per-update batch cost (items_per_second then reads as dirty cells per second). The
+        // two halves (block vs unblock) are asymmetric, so this mean blends them by design — see
+        // runToggle.
         const elapsed = try runToggle(fixture, io, thread_ptr);
         accumulator.record(elapsed / 2, suite.serialBatch(item_count, 1));
     }

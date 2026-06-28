@@ -263,6 +263,17 @@ pub const ResultCache = struct {
         return self.resultAt(index);
     }
 
+    // Non-mutating freshness gate for the per-frame read path (statusForWorld): returns the
+    // slot only when it is within `ttl`. A const reader cannot evict, so a stale entry simply
+    // reads as a miss here and the caller re-requests; acceptRequests' findFresh does the
+    // actual eviction. Without this, an agent that only polls statusForWorld (never enqueues)
+    // is served a path older than the TTL forever. ttl 0 disables expiry.
+    pub fn freshSlotIndex(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?usize {
+        const index = self.slotIndex(key) orelse return null;
+        if (ttl != 0 and (step -% self.payloads.items[index].stamp) >= ttl) return null;
+        return index;
+    }
+
     // find, but a result older than `ttl` steps is dropped (returns null) so the caller
     // re-solves it against current geometry. ttl 0 disables expiry.
     pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
@@ -583,6 +594,27 @@ test "pathfinding result cache keeps probe chains intact after mid-chain removal
             try std.testing.expect(cache.find(key) != null);
         }
     }
+}
+
+test "pathfinding result cache read-path TTL gate is non-mutating and expires stale entries" {
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try cache.reserve(std.testing.allocator, 4, 4, 8);
+    var key = emptyKey(1);
+    key.goal.x = 3;
+    cache.put(key, &.{ 0, 1, 2 }, &.{}, 0, 100, &stats); // stamped at step 100
+
+    const ttl: u32 = 50;
+    // Within ttl: the read path serves the slot and never evicts (const reader).
+    try std.testing.expect(cache.freshSlotIndex(key, 149, ttl) != null);
+    try std.testing.expect(cache.slotIndex(key) != null); // still resident
+    // At/after ttl: the read path reports a miss so the caller re-requests, but the entry
+    // is left in place for acceptRequests' mutating findFresh to evict.
+    try std.testing.expect(cache.freshSlotIndex(key, 150, ttl) == null);
+    try std.testing.expect(cache.slotIndex(key) != null);
+    // ttl 0 disables expiry.
+    try std.testing.expect(cache.freshSlotIndex(key, 100_000, 0) != null);
 }
 
 test "pathfinding result cache evicts deterministically and stores paths" {

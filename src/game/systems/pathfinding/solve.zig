@@ -305,7 +305,7 @@ pub fn abstractCorridor(
             octileCells(graph.width, portal.cell_index, @intCast(goal_index))
         else
             0;
-        abstract.open.appendAssumeCapacity(.{ .index = ref, .f = g + h, .h = h });
+        abstract.open.appendAssumeCapacity(.{ .index = ref, .f = g +| h, .h = h });
         siftUp(abstract.open.items, abstract.open.items.len - 1);
         seeded += 1;
     }
@@ -318,6 +318,9 @@ pub fn abstractCorridor(
         const current_ref = current.index;
         const current_slot = abstract.slotFor(current_ref) orelse return .saturated;
         if (abstract.slot_closed.items[current_slot]) continue;
+        // Lazy deletion: skip a superseded duplicate left in the heap by an earlier
+        // g-improvement (f-h recovers its g; strict-greater never drops the best entry).
+        if (current.f -% current.h > abstract.slot_g.items[current_slot]) continue;
         abstract.slot_closed.items[current_slot] = true;
 
         const level = refLevel(current_ref);
@@ -329,7 +332,12 @@ pub fn abstractCorridor(
         if (level == goal_level and goal_component != no_component and
             goal_grid.components.items[portal.cell_index] == goal_component)
         {
-            if (!buildCorridor(abstract, current_ref, start_level)) return .none;
+            switch (buildCorridor(abstract, current_ref, start_level)) {
+                .ok => {},
+                // Budget-truncated reconstruction: spill+retry, never a hard negative.
+                .truncated => return .saturated,
+                .none => return .none,
+            }
             return .{ .found = .{ .crosses_level = start_level != goal_level } };
         }
 
@@ -370,15 +378,30 @@ pub fn abstractCorridor(
     return .none;
 }
 
+// Outcome of reconstructing the abstract corridor from the parent chain.
+pub const CorridorBuild = enum {
+    // Full chain root->goal rebuilt and rooted on the start level.
+    ok,
+    // The parent chain filled corridor.capacity before reaching the seed root: a budget
+    // truncation, not an unreachable goal. Spill and retry rather than declare negative.
+    truncated,
+    // Empty, or the chain rooted off the start level: a genuine missing corridor.
+    none,
+};
+
 // Walks the abstract parent chain from the reached goal-level portal back to its seeded
 // start-level root, writing the ordered packed-ref sequence (root -> goal portal) into
 // abstract.corridor and the per-step link flags into corridor_link from the recorded
-// slot_via_link. Returns true when the corridor's root is a start-level portal.
-pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) bool {
+// slot_via_link. Returns .ok when the corridor's root is a start-level portal.
+pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) CorridorBuild {
     abstract.corridor.clearRetainingCapacity();
     var node = goal_ref;
+    var truncated = false;
     while (true) {
-        if (abstract.corridor.items.len >= abstract.corridor.capacity) break;
+        if (abstract.corridor.items.len >= abstract.corridor.capacity) {
+            truncated = true;
+            break;
+        }
         abstract.corridor.appendAssumeCapacity(node);
         const slot = abstract.slotFor(node) orelse break;
         const parent = abstract.slot_parent.items[slot];
@@ -386,7 +409,9 @@ pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u
         node = parent;
     }
     std.mem.reverse(usize, abstract.corridor.items);
-    if (abstract.corridor.items.len == 0) return false;
+    if (abstract.corridor.items.len == 0) return .none;
+    // Capacity cut the chain before the root: a budget spill, not an unreachable goal.
+    if (truncated) return .truncated;
     // corridor_link[0] is false (no predecessor); corridor_link[i] is whether corridor[i]
     // was reached over a cross-level link, read from the recorded slot flag.
     abstract.corridor_link.clearRetainingCapacity();
@@ -396,7 +421,7 @@ pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u
         const via_link = if (abstract.slotFor(ref)) |slot| abstract.slot_via_link.items[slot] else false;
         abstract.corridor_link.appendAssumeCapacity(via_link);
     }
-    return refLevel(abstract.corridor.items[0]) == start_level;
+    return if (refLevel(abstract.corridor.items[0]) == start_level) .ok else .none;
 }
 
 // Budget-bounded heap A* over one level's grid. Fills scratch.path_scratch with
@@ -422,6 +447,11 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
         const current = popHeap(&scratch.open);
         const current_slot = scratch.slotFor(current.index) orelse return .budget_exhausted;
         if (scratch.slot_closed.items[current_slot]) continue;
+        // Lazy deletion: a superseded duplicate (a better g was recorded for this cell
+        // after this entry was queued) is stale — discard it rather than re-expand. f-h
+        // recovers this entry's g; it can only under-estimate under a saturating f, so the
+        // strict-greater test never drops the live best entry.
+        if (current.f -% current.h > scratch.slot_g.items[current_slot]) continue;
         scratch.slot_closed.items[current_slot] = true;
         if (current.index == goal_index) {
             reconstructLocalPath(scratch, start_index, goal_index);
@@ -447,13 +477,13 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
             const next_slot = scratch.slotFor(next_index) orelse return .budget_exhausted;
             if (scratch.slot_closed.items[next_slot]) continue;
             const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
-            const candidate_g = current_g + step_cost;
+            const candidate_g = current_g +| step_cost;
             if (candidate_g >= scratch.slot_g.items[next_slot]) continue;
             scratch.slot_g.items[next_slot] = candidate_g;
             scratch.slot_parent.items[next_slot] = @intCast(current.index);
             const h = octileXY(nx, ny, goal_x, goal_y);
             if (scratch.open.items.len >= scratch.open.capacity) return .budget_exhausted;
-            scratch.open.appendAssumeCapacity(.{ .index = next_index, .f = candidate_g + h, .h = h });
+            scratch.open.appendAssumeCapacity(.{ .index = next_index, .f = candidate_g +| h, .h = h });
             siftUp(scratch.open.items, scratch.open.items.len - 1);
         }
     }

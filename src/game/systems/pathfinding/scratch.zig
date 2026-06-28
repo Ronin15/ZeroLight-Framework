@@ -15,6 +15,7 @@ const hashUsize = types.hashUsize;
 const unreachable_cost = types.unreachable_cost;
 const no_ref = types.no_ref;
 const no_cell = types.no_cell;
+const open_heap_headroom_factor = types.open_heap_headroom_factor;
 
 // Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | local
 // ref. Node g-cost/parent/closed/via_link use a ref->slot open-addressed hash with
@@ -56,7 +57,11 @@ pub const AbstractScratch = struct {
     pub fn reserve(self: *AbstractScratch, allocator: std.mem.Allocator, max_abstract_nodes: usize) !void {
         const slot_capacity = @max(@as(usize, 16), max_abstract_nodes * 2);
         self.slot_capacity = slot_capacity;
-        try self.open.ensureTotalCapacity(allocator, max_abstract_nodes);
+        // Headroom above the distinct-node budget: relaxAbstractNode pushes a fresh entry
+        // on every g-improvement, so the live heap holds stale duplicates the slot table
+        // (slotFor) does not. Sizing it past the budget keeps a sub-budget search from
+        // false-saturating on a full heap.
+        try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_abstract_nodes * open_heap_headroom_factor));
         try setLen(&self.slot_node, allocator, slot_capacity);
         try setLen(&self.slot_g, allocator, slot_capacity);
         try setLen(&self.slot_parent, allocator, slot_capacity);
@@ -156,7 +161,11 @@ pub const SearchScratch = struct {
         // independent of this storage and is enforced by the expansion counter.
         self.cell_count = cell_count;
         self.explored_budget = max_explored_nodes;
-        try self.open.ensureTotalCapacity(allocator, max_explored_nodes);
+        // Open-heap headroom over the distinct-cell budget (see open_heap_headroom_factor):
+        // localAStar pushes a fresh entry per g-improvement and removes the superseded one
+        // only lazily on pop, so the heap must hold more than the distinct-cell count or a
+        // sub-budget search false-spills on a full heap. explored_budget stays the cap.
+        try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_explored_nodes * open_heap_headroom_factor));
         try setLen(&self.slot_g, allocator, cell_count);
         try setLen(&self.slot_parent, allocator, cell_count);
         try setLen(&self.slot_closed, allocator, cell_count);

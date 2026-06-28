@@ -551,7 +551,22 @@ field keyed on the old version re-solves. The dirty
 buffer GROWS rather than dropping, so any number of simultaneous diggers or
 obstacle edits in one step all reach the graph — a dropped cell would leave the
 graph stale. Unaffected chunks are never touched, and the whole-world build runs
-only at init. The reaction is recorded
+only at init. The abstract SLOT GEOMETRY — the per-chunk perimeter slots plus the
+per-chunk interior link-endpoint runs that index portal nodes — is a pure function of the
+dimensions and the INIT-TIME link set, computed once by `computePortalGeometry`; the
+incremental patch never renumbers it. A `LevelLink` ADDED at runtime (e.g.
+`dig_controller.digRamp` carving a ramp) is therefore handled by endpoint: a PERIMETER
+endpoint keeps its positional slot and is admitted as a portal incrementally, while an
+INTERIOR endpoint has no reserved slot and is DEFERRED — `tryLinkPortal` skips it, leaving
+it non-live in the abstract graph (no portal node), exactly as a blocked endpoint would,
+rather than resolving against an absent run. The walkability-keyed `link_edges` entry still
+forms but is inert: the abstract solver only relaxes a link whose partner endpoint resolves
+to a live portal (`cell_to_portal != no_cell`), so a deferred endpoint is never traversed.
+A deferred interior endpoint is reserved by the next full rebuild. This is correct while
+cross-level NPC pathing is inactive — NPC `goal_level` is pinned to the surface, and the
+PLAYER climbs ramps through the `WorldSystem` link tier (`rampLinkOtherLevel`), not the
+abstract graph; making a runtime interior ramp NPC-pathable would require per-chunk
+interior-link slot headroom reserved at init. The reaction is recorded
 through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
 counted full relabel only past a configured level threshold), and a

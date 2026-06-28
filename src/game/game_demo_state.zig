@@ -1641,6 +1641,35 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
 
+test "demo ramp dig drives the real post-commit nav re-mask without panicking on an interior cell" {
+    // Regression: digRamp adds a LevelLink at runtime (dig_controller.zig). The dug cell's
+    // chunk is re-masked at the structural-commit gate via processPostCommitEvents ->
+    // applyNavUpdates. A faced interior cell whose endpoint has no init-built slot must be
+    // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).
+    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    defer demo.deinit();
+
+    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    placePlayerInCell(&demo, 3, 3);
+    try demo.applyPlaneTraversal();
+
+    // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
+    try digFacedForTest(&demo, .hole);
+    placePlayerInCell(&demo, 4, 3);
+    try demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
+
+    try digFacedForTest(&demo, .ramp);
+    try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
+    // The real per-step nav re-mask the live game runs each frame. Must not panic.
+    try demo.processPostCommitEvents(null);
+
+    // The link still climbs planes via the world tier (independent of the abstract graph).
+    placePlayerInCell(&demo, 5, 3);
+    try demo.applyPlaneTraversal();
+    try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
+}
+
 test "demo dig down drops the player through the dirt plane to the void plane" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();

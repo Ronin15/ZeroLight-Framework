@@ -28,6 +28,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     collision_response.trigger_group,
     collision_response.mixed_group,
     pathfinding.group,
+    pathfinding.dedup_group,
+    pathfinding.drain_group,
     pathfinding.fallback_group,
     pathfinding.fallback_detour_group,
     pathfinding.fallback_unreachable_group,

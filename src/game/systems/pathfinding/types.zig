@@ -34,6 +34,12 @@ pub const default_max_fallback_requests_per_step: usize = 128;
 // Budget-bounded A* scratch is sized to this many explored nodes rather than the
 // whole grid. Hitting the budget spills the request to a later frame.
 pub const default_max_explored_nodes: usize = 4096;
+// Open-heap headroom over the distinct-cell node budget. The budget-bounded A* pushes a
+// fresh heap entry on every g-improvement without removing the superseded one, so the live
+// heap can briefly hold several stale entries per open cell. Sizing the heap above the
+// distinct-cell budget (paired with lazy pop-skip of superseded entries) keeps a search
+// that is still under the distinct-cell budget from false-spilling on a full heap.
+pub const open_heap_headroom_factor: usize = 4;
 // Cap on the stored path length per cached individual result. Longer paths are
 // downsampled by stride so a moving agent can still derive a forward waypoint.
 pub const default_max_stored_path_cells: usize = 512;
@@ -111,6 +117,13 @@ pub const default_max_stitched_path_cells: usize = 512;
 // Steps after which a cached result is re-solved when next requested, so an agent
 // picks up world changes that did not directly cross its path. 0 disables. ~5s at 60Hz.
 pub const default_cache_ttl_steps: u32 = 300;
+// Queue-fairness thresholds for a pending entry that keeps budget-spilling. After this
+// many consecutive budget-exhausted retries it is rotated to the BACK of pending so
+// late-queued work behind a chronic spiller still reaches the solver.
+pub const budget_exhausted_rotate_after: u32 = 4;
+// After this many it is demoted to a hard negative (negative-cached) so a request that
+// never fits the per-solve budget stops consuming a solve slot every frame.
+pub const budget_exhausted_drop_after: u32 = 32;
 
 pub const no_parent: usize = std.math.maxInt(usize);
 pub const no_cell: u32 = std.math.maxInt(u32);
@@ -364,6 +377,10 @@ pub const PendingRequest = struct {
     // `no_parent` means projection found no open cell near the goal: a
     // definitive unavailable.
     goal_index: usize,
+    // Consecutive frames this entry has budget-spilled. Drives queue-fairness aging in
+    // compactPendingAfterSolve (rotate-to-back, then demote) so a chronic spiller never
+    // starves the tail. Reset implicitly: a solved entry leaves pending entirely.
+    retries: u32 = 0,
 };
 
 // One cell of a stitched obstacle-aware corridor path, tagged with its level. The
