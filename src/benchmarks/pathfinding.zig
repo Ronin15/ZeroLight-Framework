@@ -91,14 +91,17 @@ const quick_counts = [_]usize{ 128, 512, 1024 };
 const standard_counts = [_]usize{ 512, 1024, 4096 };
 const stress_counts = [_]usize{ 4096, 10000 };
 // Cold-solve curve sits at and well above the 512 ceiling so the deferral ratio is traced
-// (e.g. 4096 -> 512 solved, 3584 deferred). Every count >= the ceiling.
-const cold_solve_quick_counts = [_]usize{ 512, 1024, 2048 };
-const cold_solve_standard_counts = [_]usize{ 512, 1024, 2048, 4096 };
-const cold_solve_stress_counts = [_]usize{ 2048, 4096, 10000 };
-// Drain counts are deep queues (N >> 512) so each cycle spans several drain frames.
-const drain_quick_counts = [_]usize{ 1024, 2048 };
-const drain_standard_counts = [_]usize{ 2048, 4096 };
-const drain_stress_counts = [_]usize{ 4096, 8192 };
+// (e.g. 4096 -> 512 solved, 3584 deferred). Every count >= the ceiling. Counts are kept lean
+// and capped below the 256x256-grid tier (10000): each cold row re-runs the full per-frame
+// solve ceiling on a count-sized grid, so an extra big count costs seconds per profile.
+const cold_solve_quick_counts = [_]usize{512};
+const cold_solve_standard_counts = [_]usize{ 512, 1024, 2048 };
+const cold_solve_stress_counts = [_]usize{ 2048, 4096 };
+// Drain counts are deep queues (N >> 512); each cycle spans ceil(N/512) drain frames, so one
+// count per profile (above the ceiling) already exercises the cross-frame carry-over.
+const drain_quick_counts = [_]usize{1024};
+const drain_standard_counts = [_]usize{2048};
+const drain_stress_counts = [_]usize{4096};
 const fallback_quick_counts = [_]usize{ 16, 64, 128 };
 const fallback_standard_counts = [_]usize{ 64, 128, 256, 1024 };
 const fallback_stress_counts = [_]usize{ 256, 512, 1024 };
@@ -109,7 +112,27 @@ const unreachable_stress_counts = [_]usize{ 64, 128, 1024 };
 // the per-frame solve ceiling is enough to show the cache-probe and waypoint-scan cost.
 const query_quick_counts = [_]usize{ 256, 1024 };
 const query_standard_counts = [_]usize{ 1024, 4096 };
-const query_stress_counts = [_]usize{ 4096, 10000 };
+const query_stress_counts = [_]usize{4096};
+
+// A cold pathfinding frame runs up to the per-frame solve ceiling of A* on a count-sized grid
+// — orders of magnitude heavier than the vectorized subsystem benches the suite measurement
+// defaults (warmup 5 / iterations 30 / adaptive settle up to 48) were sized for. A cold mean is
+// stable in far fewer samples, so the COLD runners use this tighter budget to keep each profile
+// well under a minute; the hot cache/query groups keep the full suite budget. User-supplied
+// --warmup/--iterations smaller than these caps still win (min), so explicit overrides are honored.
+const cold_warmup_cap: usize = 1;
+const cold_iteration_cap: usize = 5;
+const cold_settle_cap: usize = 4;
+
+fn coldWarmup(options: suite.Options) usize {
+    return @min(options.warmup_iterations, cold_warmup_cap);
+}
+fn coldIterations(options: suite.Options) usize {
+    return @min(options.iterations, cold_iteration_cap);
+}
+fn coldSettleLimit(options: suite.Options) usize {
+    return @min(suite.adaptiveSettleIterationLimit(options), cold_settle_cap);
+}
 
 const Workload = enum {
     common_goal,
@@ -275,13 +298,13 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
     system.clearRuntimeState();
     _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
-    for (0..options.warmup_iterations) |_| {
+    for (0..coldWarmup(options)) |_| {
         system.clearTransientRequestsRetainingFields();
         _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        const settle_limit = coldSettleLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearTransientRequestsRetainingFields();
             _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
@@ -291,7 +314,7 @@ pub fn runDedupCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
-    for (0..options.iterations) |_| {
+    for (0..coldIterations(options)) |_| {
         system.clearTransientRequestsRetainingFields();
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, item_count, item_count);
@@ -379,13 +402,17 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
     system.clearRuntimeState();
     _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
 
-    for (0..options.warmup_iterations) |_| {
+    // Cold modes re-solve the full per-frame ceiling every frame, so they use the tighter cold
+    // measurement budget; the hot_cache mode is a cheap probe and keeps the full suite budget.
+    const warmup_count = if (mode.isCold()) coldWarmup(options) else options.warmup_iterations;
+    const measure_count = if (mode.isCold()) coldIterations(options) else options.iterations;
+    for (0..warmup_count) |_| {
         if (mode.isCold()) system.clearRuntimeState();
         _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
     }
     if (case.adaptive and mode.isCold()) {
         var settle_guard: usize = 0;
-        const settle_limit = suite.adaptiveSettleIterationLimit(options);
+        const settle_limit = coldSettleLimit(options);
         while (!system.fallback_tuner.isSettled() and settle_guard < settle_limit) : (settle_guard += 1) {
             system.clearRuntimeState();
             _ = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
@@ -395,7 +422,7 @@ fn runWorkloadCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opti
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
-    for (0..options.iterations) |_| {
+    for (0..measure_count) |_| {
         if (mode.isCold()) system.clearRuntimeState();
         const start_ns = suite.nowNs(io);
         last_stats = try runColdOnce(&system, &fixture.requests, if (threads) |*thread_system| thread_system else null, case, item_count, solve_budget, fallback_budget);
@@ -489,8 +516,10 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     // can never hang the loop; ceil(N/ceiling) frames empty a healthy queue, plus slack.
     const drain_frame_budget = suite.rangeCount(item_count, default_max_solves_per_frame) + 2;
 
+    // Drain is cold (each cycle re-solves ceil(N/ceiling) frames), so use the cold budget.
+    const drain_samples = coldIterations(options);
     // Warmup: a couple of full drain cycles so pools are at high-water and the tuner trains.
-    for (0..@max(@as(usize, 1), options.warmup_iterations)) |_| {
+    for (0..@max(@as(usize, 1), coldWarmup(options))) |_| {
         try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
         var guard: usize = drain_frame_budget;
         while (system.pending.items.len > 0 and guard > 0) : (guard -= 1) {
@@ -502,12 +531,12 @@ pub fn runDrainCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var last_stats = PathfindingStats{};
-    while (accumulator.iterations < options.iterations) {
+    while (accumulator.iterations < drain_samples) {
         // Refill is untimed: clears completed/pending then accepts all N (this frame also
         // solves the first ceiling). The timed samples below are pure drain frames.
         try refillDrainQueue(&system, &fixture.requests, thread_ptr, case, item_count);
         var guard: usize = drain_frame_budget;
-        while (system.pending.items.len > 0 and accumulator.iterations < options.iterations and guard > 0) : (guard -= 1) {
+        while (system.pending.items.len > 0 and accumulator.iterations < drain_samples and guard > 0) : (guard -= 1) {
             const before = system.pending.items.len;
             const start_ns = suite.nowNs(io);
             last_stats = try runColdOnce(&system, &empty, thread_ptr, case, item_count, item_count, item_count);
