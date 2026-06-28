@@ -36,6 +36,7 @@ comptime {
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");
+    _ = @import("game/audio_controller.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/dig_controller.zig");
     _ = @import("game/game_demo_state.zig");

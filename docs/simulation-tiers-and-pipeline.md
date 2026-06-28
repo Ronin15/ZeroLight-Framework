@@ -54,8 +54,10 @@ and before the next `beginStep()`.
 - `finished`
 
 The concrete processor order is pipeline-owned for one gameplay state instance.
-`GameDemoState` currently keeps main-thread input, audio, particles, structural
-commit/domain reactions, and render-prep reservation at the state boundary.
+`GameDemoState` currently keeps main-thread input, particles, structural
+commit/domain reactions, and render-prep reservation at the state boundary; it
+passes the borrowed audio command buffer through the pipeline-owned
+`AudioController` rather than holding audio policy itself.
 `SimulationPipeline` owns AI navigation-intent production, steering/path status,
 pathfinding, sparse movement-intent application, movement, bounds clamp,
 player-vs-world-tile gating, collision detection, and collision response.

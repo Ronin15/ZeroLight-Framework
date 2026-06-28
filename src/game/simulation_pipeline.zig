@@ -17,6 +17,9 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
+const AudioController = @import("audio_controller.zig").AudioController;
+const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
+const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
@@ -90,6 +93,7 @@ pub const SimulationPipeline = struct {
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
     dig: DigController,
+    audio_controller: AudioController,
     nav_cell_size: f32,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
@@ -124,6 +128,7 @@ pub const SimulationPipeline = struct {
             .steering = steering,
             .pathfinding = pathfinding,
             .dig = DigController.init(config.dig),
+            .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
         };
     }
@@ -194,6 +199,48 @@ pub const SimulationPipeline = struct {
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
         return self.pathfinding.applyBufferedNavUpdates(data, world, thread_system);
+    }
+
+    /// Orchestrates the post-commit nav reaction by delegating to the nav-owning
+    /// `PathfindingSystem`, which interprets nav-invalidating events into dirty
+    /// cells, applies the incremental update, and emits the invalidation event.
+    pub fn reactToPostCommitNavEvents(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+        thread_system: ?*ThreadSystem,
+    ) !NavUpdateStats {
+        return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
+    }
+
+    /// Whether any pending structural command may invalidate navigation once
+    /// applied. Delegates to `PathfindingSystem`; used for the pre-commit event
+    /// capacity preflight.
+    pub fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
+        return PathfindingSystem.structuralCommandsMayInvalidateNavigation(data, frame);
+    }
+
+    /// Whether any queued structural-commit event will drive a nav invalidation.
+    pub fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
+        return PathfindingSystem.pendingEventsMayInvalidateNavigation(frame);
+    }
+
+    /// Queues ambient audio (music + movement-gated jet loop) through the owned
+    /// audio controller. Buffer/input/data are borrowed; the controller owns the
+    /// audio-policy runtime state.
+    pub fn queueAmbientAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, input: *const InputState, data: *const DataSystem, player: Player) void {
+        self.audio_controller.queueAmbient(audio, input, data, player);
+    }
+
+    /// Queues collision SFX for this step's contacts through the owned audio controller.
+    pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, delta_seconds: f32) void {
+        self.audio_controller.queueCollision(audio, frame, data, delta_seconds);
+    }
+
+    /// Flags the active jet loop to stop on resume (no command buffer at pause time).
+    pub fn pauseAudio(self: *SimulationPipeline) void {
+        self.audio_controller.onPause();
     }
 
     /// Synchronizes interpolation history for pipeline-owned movement state.

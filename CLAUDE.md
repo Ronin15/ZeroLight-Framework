@@ -49,10 +49,12 @@ boundaries just to make a local change easier.
 - `src/assets/` — runtime asset catalog, safe path resolution, image decode,
   cache, `manifest.zig` (stable sprite/audio IDs), atlas metadata.
 - `src/game/` — gameplay: states/menus, `world_system.zig`, `data_system.zig`,
-  `simulation*.zig` (pipeline, scope), `player.zig`, `dig_controller.zig`,
-  `render_prep.zig`/`render_depth.zig`, and `systems/` (movement, ai, steering,
-  collision, collision_response, particle, and the `pathfinding/` subpackage
-  fronted by `pathfinding.zig`).
+  `simulation*.zig` (pipeline, scope), `player.zig`, pipeline-owned controllers
+  `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
+  and `systems/` (movement, ai, steering, collision, collision_response, particle,
+  and the `pathfinding/` subpackage fronted by `pathfinding.zig`). The
+  `PathfindingSystem` owns nav-invalidation classification and the post-commit nav
+  reaction; the state only invokes it via the pipeline.
 - `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
   GPU smoke probe. `src/benchmarks/` — CPU gameplay/render-prep benchmarks.
 

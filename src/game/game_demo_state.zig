@@ -7,13 +7,11 @@ const math = @import("../core/math.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
-const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
-const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
 const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const AssetReference = @import("data_system.zig").AssetReference;
@@ -33,10 +31,8 @@ const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
-const CollisionContact = @import("simulation.zig").CollisionContact;
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
-const SimulationEvent = @import("simulation.zig").SimulationEvent;
 const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
@@ -60,13 +56,7 @@ const c = @import("../platform/sdl.zig").c;
 
 const test_square_count = 8;
 const obstacle_count = 2;
-const collision_sfx_cooldown_capacity = 32;
-const collision_sfx_cooldown_seconds: f32 = 0.14;
 const demo_contact_capacity = 64;
-const demo_music = AudioAssetId.demo_music;
-const collision_sfx = AudioAssetId.collision_sfx;
-const jet_sfx = AudioAssetId.player_jet_sfx;
-const player_jet_loop_id = LoopingSfxId{ .value = 1 };
 const procedural_world_config = world_system.WorldBuildConfig{
     .width_tiles = 512,
     .height_tiles = 512,
@@ -107,8 +97,6 @@ pub const GameDemoState = struct {
     obstacles: [obstacle_count]EntityId,
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
-    collision_sfx_cooldowns: [collision_sfx_cooldown_capacity]CollisionSfxCooldown = undefined,
-    collision_sfx_cooldown_count: usize = 0,
     // Rising-edge latches so one held dig key digs one cell per press, not per
     // frame. Input is main-thread state, so the latch lives on the state.
     dig_hole_held_last: bool = false,
@@ -120,12 +108,6 @@ pub const GameDemoState = struct {
     // Walkable tile a fall carves into the landing cell so the player never lands
     // embedded in the solid dirt below (matches the dig controller's tunnel tile).
     tunnel_tile: world_system.TileId = 0,
-    music_started: bool = false,
-    jet_loop_active: bool = false,
-    // Set when a pause interrupts an active jet loop: onPause has no audio
-    // command buffer, so the stale engine-side loop is stopped on the first
-    // update after resume before the movement edge can re-trigger it.
-    jet_loop_stop_pending: bool = false,
     camera_previous: Camera2D = .{},
     camera_current: Camera2D = .{},
     viewport_width: f32 = 800,
@@ -323,7 +305,7 @@ pub const GameDemoState = struct {
         input_timer.stop(context.perf, .gameplay_input);
 
         var ambient_audio_timer = StageTimer.start();
-        self.queueAmbientAudio(context.audio, context.input);
+        self.pipeline.queueAmbientAudio(context.audio, context.input, &self.data, self.player);
         ambient_audio_timer.stop(context.perf, .gameplay_audio);
 
         const pipeline_stats = try self.pipeline.update(.{
@@ -343,7 +325,7 @@ pub const GameDemoState = struct {
         try self.applyPlaneTraversal();
 
         var collision_audio_timer = StageTimer.start();
-        self.queueCollisionAudio(context.audio, context.delta_seconds);
+        self.pipeline.queueCollisionAudio(context.audio, &self.simulation_frame, &self.data, context.delta_seconds);
         collision_audio_timer.stop(context.perf, .gameplay_audio);
 
         var particle_timer = StageTimer.start();
@@ -533,7 +515,7 @@ pub const GameDemoState = struct {
 
         const particles = self.particles.sliceConst();
         for (0..particles.len()) |index| {
-            if (!particleRenderable(particles, index)) continue;
+            if (!particles.renderable(index)) continue;
             self.dynamic_render.appendAssumeCapacity(.{
                 .depth = particles.z[index],
                 .kind = .{ .particle = index },
@@ -698,8 +680,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn onPause(self: *GameDemoState) void {
-        if (self.jet_loop_active) self.jet_loop_stop_pending = true;
-        self.jet_loop_active = false;
+        self.pipeline.pauseAudio();
         self.syncInterpolatedState();
     }
 
@@ -745,71 +726,19 @@ pub const GameDemoState = struct {
         };
     }
 
-    // Reacts to committed structural events by folding nav-invalidating world changes
-    // into the existing nav graph INCREMENTALLY (per docs/architecture.md): only
-    // affected levels are recomputed and `nav_version` bumps once, instead of a
-    // whole-world rebuild. The whole-world build stays init-only. Blocking world-tile
-    // and obstacle edits are mapped into dirty nav cell edits; entity-driven static
-    // obstacle changes do not carry a cell (a destroyed entity's footprint is gone), so
-    // level 0 — the only level sourcing collision bodies — is marked whole-level dirty and
-    // re-derived from the world. A `nav_region_invalidated` event is still emitted when the
-    // graph actually changed.
-    fn processPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !void {
-        self.last_nav_update_stats = .{};
-        // The dirty nav-cell buffer is owned by the pathfinding system (it scales with
-        // digging and must not drop cells); this reaction only interprets structural events
-        // into changed cells and forwards them. Clear first so a skipped apply never leaks
-        // stale edits into the next step.
-        self.pipeline.clearNavDirty();
-        var entity_obstacle_change = false;
-        for (self.simulation_frame.events.mergedItems()) |event| {
-            if (event.stage != .structural_commit) continue;
-            if (!eventInvalidatesNavigation(event)) continue;
-            switch (event.payload) {
-                .world_tile_changed => |changed| try self.pipeline.markNavDirty(changed.level, changed.x, changed.y),
-                .world_obstacle_changed => |changed| {
-                    var y = changed.min_y;
-                    while (y < changed.max_y_exclusive) : (y += 1) {
-                        var x = changed.min_x;
-                        while (x < changed.max_x_exclusive) : (x += 1) {
-                            try self.pipeline.markNavDirty(changed.level, x, y);
-                        }
-                    }
-                },
-                // Entity-component nav changes do not carry a world cell. Mark level 0 (the only
-                // level sourcing collision bodies) whole-level dirty so every chunk's mask and
-                // components are re-derived from the world — correct regardless of where on the
-                // level the obstacle was — without a whole-world rebuild.
-                else => entity_obstacle_change = true,
-            }
-        }
-        if (entity_obstacle_change) try self.pipeline.markNavLevelDirty(0);
-
-        if (!self.pipeline.hasPendingNavUpdates()) return;
-        try self.simulation_frame.events.ensureCanAppend(1);
-        self.last_nav_update_stats = try self.pipeline.applyNavUpdates(&self.data, &self.world, thread_system);
-        // Only signal invalidation when the batch actually changed the graph. An
-        // incremental dig keeps nav_version stable (scoped cache eviction), so gate on
-        // real work (`incremental_rebuilds`) too, not just a full-rebuild version bump.
-        if (self.last_nav_update_stats.version_bumps == 0 and self.last_nav_update_stats.incremental_rebuilds == 0) return;
-        try self.simulation_frame.events.appendRequired(.{
-            .stage = .domain_reaction,
-            .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
-        });
-    }
-
     fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets, thread_system: ?*ThreadSystem) !StructuralCommitStats {
         try self.validateStructuralAssetReferences(runtime_assets);
-        // processPostCommitEvents appends at most one nav_region_invalidated event,
-        // driven by EITHER structural commands applied this frame OR invalidating
-        // world events already queued in the stream (e.g. a dig's world_tile_changed
-        // that did not originate from a structural command). Reserve the slot for
-        // both sources so the post-commit append never trips a tight capacity_limit.
-        const may_invalidate_navigation = self.structuralCommandsMayInvalidateNavigation() or
-            self.pendingEventsMayInvalidateNavigation();
+        // The post-commit nav reaction appends at most one nav_region_invalidated
+        // event, driven by EITHER structural commands applied this frame OR
+        // invalidating world events already queued in the stream (e.g. a dig's
+        // world_tile_changed that did not originate from a structural command).
+        // Reserve the slot for both sources so the append never trips a tight
+        // capacity_limit.
+        const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(&self.data, &self.simulation_frame) or
+            SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame);
         const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
-        try self.processPostCommitEvents(thread_system);
+        self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
         try self.ensureDynamicRenderCapacity();
         return stats;
     }
@@ -832,7 +761,7 @@ pub const GameDemoState = struct {
 
     fn submitParticleRender(self: *GameDemoState, renderer: *Renderer, interpolation_alpha: f32, index: usize) !void {
         const particles = self.particles.sliceConst();
-        if (index >= particles.len() or !particleRenderable(particles, index)) return;
+        if (index >= particles.len() or !particles.renderable(index)) return;
         const size = particles.size[index];
         const position = math.lerpVec2(
             .{ .x = particles.previous_x[index], .y = particles.previous_y[index] },
@@ -869,207 +798,11 @@ pub const GameDemoState = struct {
             }
         }
     }
-
-    fn structuralCommandsMayInvalidateNavigation(self: *const GameDemoState) bool {
-        for (self.simulation_frame.structural_commands.mergedItems()) |command| {
-            if (self.structuralCommandMayInvalidateNavigation(command)) return true;
-        }
-        return false;
-    }
-
-    fn structuralCommandMayInvalidateNavigation(self: *const GameDemoState, command: StructuralCommand) bool {
-        return switch (command) {
-            .create_entity => |template| templateCreatesStaticNavigationObstacle(template),
-            .destroy_entity => |entity| self.data.isStaticNavigationObstacle(entity),
-            .set_movement_body => |set| self.data.isAlive(set.entity),
-            .set_collision_bounds => |set| self.data.isAlive(set.entity),
-            .set_collision_response => |set| self.data.isAlive(set.entity),
-            else => false,
-        };
-    }
-
-    // Whether a structural-commit event already in the stream will drive a
-    // post-commit nav invalidation. Mirrors the stage/payload filter in
-    // processPostCommitEvents so the capacity reservation matches what it appends.
-    fn pendingEventsMayInvalidateNavigation(self: *const GameDemoState) bool {
-        for (self.simulation_frame.events.mergedItems()) |event| {
-            if (event.stage != .structural_commit) continue;
-            if (eventInvalidatesNavigation(event)) return true;
-        }
-        return false;
-    }
-
-    fn eventInvalidatesNavigation(event: SimulationEvent) bool {
-        switch (event.payload) {
-            .entity_destroyed => |destroyed| {
-                return destroyed.was_static_navigation_obstacle;
-            },
-            .component_changed => |changed| switch (changed.component) {
-                .movement_body, .collision_bounds => {
-                    return changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle;
-                },
-                .collision_response => {
-                    return changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle;
-                },
-                else => return false,
-            },
-            .world_tile_changed => |changed| {
-                return changed.old_blocks_movement != changed.new_blocks_movement;
-            },
-            .world_obstacle_changed => return true,
-            else => return false,
-        }
-    }
-
-    fn queueAmbientAudio(self: *GameDemoState, audio: *AudioCommandBuffer, input: *const InputState) void {
-        if (!self.music_started) {
-            audio.playMusic(.{
-                .asset = demo_music,
-                .gain = 1.0,
-                .loop = true,
-                .fade_in_ms = 750,
-            }) catch return;
-            self.music_started = true;
-        }
-
-        if (self.jet_loop_stop_pending) {
-            audio.stopLoopingSfx(player_jet_loop_id) catch {};
-            self.jet_loop_stop_pending = false;
-        }
-
-        if (self.data.movementBodyConst(self.player.entity)) |body| {
-            audio.setListener(.{ .x = body.position.x + 16, .y = body.position.y + 16 }) catch {};
-            const player_moving = input.movementVector().x != 0 or input.movementVector().y != 0;
-            if (player_moving and !self.jet_loop_active) {
-                audio.startLoopingSfx(player_jet_loop_id, .{
-                    .asset = jet_sfx,
-                    .gain = 0.34,
-                    .priority = 220,
-                    .frequency_ratio = 1.0,
-                    .position = .{ .x = body.position.x + 16, .y = body.position.y + 16 },
-                }) catch {};
-                self.jet_loop_active = true;
-            } else if (!player_moving and self.jet_loop_active) {
-                audio.stopLoopingSfx(player_jet_loop_id) catch {};
-                self.jet_loop_active = false;
-            }
-        }
-    }
-
-    fn queueCollisionAudio(self: *GameDemoState, audio: *AudioCommandBuffer, delta_seconds: f32) void {
-        self.tickCollisionSfxCooldowns(delta_seconds);
-        for (self.simulation_frame.contacts.mergedItems()) |contact| {
-            if (self.collisionPairOnCooldown(contact.a, contact.b)) continue;
-            const position = self.contactAudioPosition(contact) orelse continue;
-            const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
-            const frequency_ratio = collisionSfxFrequencyRatio(contact);
-            audio.playSfx(.{
-                .asset = collision_sfx,
-                .gain = gain,
-                .priority = 180,
-                .frequency_ratio = frequency_ratio,
-                .position = position,
-            }) catch |err| switch (err) {
-                error.AudioCommandLimitReached => break,
-                else => continue,
-            };
-            self.addCollisionSfxCooldown(contact.a, contact.b);
-        }
-    }
-
-    fn contactAudioPosition(self: *const GameDemoState, contact: CollisionContact) ?math.Vec2 {
-        const a = self.data.movementBodyConst(contact.a) orelse return null;
-        const b = self.data.movementBodyConst(contact.b) orelse return null;
-        return .{
-            .x = (a.position.x + b.position.x) * 0.5,
-            .y = (a.position.y + b.position.y) * 0.5,
-        };
-    }
-
-    fn tickCollisionSfxCooldowns(self: *GameDemoState, delta_seconds: f32) void {
-        var index: usize = 0;
-        while (index < self.collision_sfx_cooldown_count) {
-            self.collision_sfx_cooldowns[index].remaining_seconds -= delta_seconds;
-            if (self.collision_sfx_cooldowns[index].remaining_seconds <= 0) {
-                self.collision_sfx_cooldown_count -= 1;
-                self.collision_sfx_cooldowns[index] = self.collision_sfx_cooldowns[self.collision_sfx_cooldown_count];
-            } else {
-                index += 1;
-            }
-        }
-    }
-
-    fn collisionPairOnCooldown(self: *const GameDemoState, a: EntityId, b: EntityId) bool {
-        const key = CollisionSfxCooldown.keyFor(a, b);
-        for (self.collision_sfx_cooldowns[0..self.collision_sfx_cooldown_count]) |cooldown| {
-            if (cooldown.key == key) return true;
-        }
-        return false;
-    }
-
-    fn addCollisionSfxCooldown(self: *GameDemoState, a: EntityId, b: EntityId) void {
-        const key = CollisionSfxCooldown.keyFor(a, b);
-        if (self.collision_sfx_cooldown_count < self.collision_sfx_cooldowns.len) {
-            self.collision_sfx_cooldowns[self.collision_sfx_cooldown_count] = .{
-                .key = key,
-                .remaining_seconds = collision_sfx_cooldown_seconds,
-            };
-            self.collision_sfx_cooldown_count += 1;
-            return;
-        }
-
-        // Full: evict the slot with the least remaining time (gives newest collision
-        // the longest protection). Linear scan is acceptable (N<=32, cold path).
-        var min_idx: usize = 0;
-        var min_rem = self.collision_sfx_cooldowns[0].remaining_seconds;
-        for (1..self.collision_sfx_cooldown_count) |i| {
-            if (self.collision_sfx_cooldowns[i].remaining_seconds < min_rem) {
-                min_rem = self.collision_sfx_cooldowns[i].remaining_seconds;
-                min_idx = i;
-            }
-        }
-        self.collision_sfx_cooldowns[min_idx] = .{
-            .key = key,
-            .remaining_seconds = collision_sfx_cooldown_seconds,
-        };
-    }
-
-    fn collisionSfxFrequencyRatio(contact: CollisionContact) f32 {
-        var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
-        hash ^= hashBitsFromFloat(@abs(contact.normal_x) * 31.0);
-        hash ^= hashBitsFromFloat(@abs(contact.normal_y) * 47.0) << 8;
-        hash ^= hashBitsFromFloat(std.math.clamp(contact.penetration, 0, 64) * 16.0) << 16;
-        const bucket: f32 = @floatFromInt(hash % 9);
-        return 0.92 + bucket * 0.02;
-    }
-
-    /// Truncates a non-negative magnitude to integer hash bits, guarding
-    /// `@intFromFloat` against non-finite contact normals (illegal behavior).
-    /// The `@min` ceiling is purely an `@intFromFloat` domain guard, not a
-    /// hashing concern: the bounded callers never approach it.
-    fn hashBitsFromFloat(value: f32) u64 {
-        if (!std.math.isFinite(value) or value <= 0) return 0;
-        return @intFromFloat(@min(value, 16_777_216.0));
-    }
 };
 
-const CollisionSfxCooldown = struct {
-    key: u64,
-    remaining_seconds: f32,
-
-    fn keyFor(a: EntityId, b: EntityId) u64 {
-        const a_id = entityAudioKey(a);
-        const b_id = entityAudioKey(b);
-        const low = @min(a_id, b_id);
-        const high = @max(a_id, b_id);
-        return low ^ std.math.rotl(u64, high, 32);
-    }
-
-    fn entityAudioKey(entity: EntityId) u64 {
-        return (@as(u64, entity.generation) << 32) | entity.index;
-    }
-};
-
+// State-owned dynamic render prep: z/depth discovery for dynamic (entity,
+// player-marker, particle) renderables, merged with the world's layer-owned
+// sparse stream by world z in submitLayeredRender.
 const DynamicRenderKind = union(enum) {
     entity_body: EntityId,
     player_marker,
@@ -1127,19 +860,8 @@ fn lessDynamicRenderRecord(_: void, lhs: DynamicRenderRecord, rhs: DynamicRender
         (lhs.depth == rhs.depth and lhs.sequence < rhs.sequence);
 }
 
-fn particleRenderable(particles: @import("systems/particle.zig").ConstParticleSlice, index: usize) bool {
-    return particles.size[index] > 0 and particles.color_a[index] > 0;
-}
-
 fn sameEntity(lhs: EntityId, rhs: EntityId) bool {
     return lhs.index == rhs.index and lhs.generation == rhs.generation;
-}
-
-fn templateCreatesStaticNavigationObstacle(template: EntityTemplate) bool {
-    const response = template.collision_response orelse return false;
-    return response.mobility == .static and
-        template.movement_body != null and
-        template.collision_bounds != null;
 }
 
 fn validateAtlasReferencesInData(data: *const DataSystem, runtime_assets: *const RuntimeAssets) !void {
@@ -1548,7 +1270,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
         .payload = .{ .world_tile_changed = changed },
     });
 
-    try demo.processPostCommitEvents(null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1662,7 +1384,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
-    try demo.processPostCommitEvents(null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
 
     // The link still climbs planes via the world tier (independent of the abstract graph).
     placePlayerInCell(&demo, 5, 3);
@@ -1737,7 +1459,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
         } },
     });
 
-    try demo.processPostCommitEvents(null);
+    demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
 
     // The incremental update ran; a pure incremental dig keeps nav_version stable
     // (caches are scope-evicted, not version-invalidated), so no version bump.
@@ -1943,7 +1665,7 @@ test "demo owns and completes a simulation frame during update" {
         }
     }
     try std.testing.expect(any_square_moved);
-    try std.testing.expect(demo.music_started);
+    try std.testing.expect(demo.pipeline.audio_controller.music_started);
     try std.testing.expect(audio.len() >= 2);
 }
 
@@ -1973,7 +1695,7 @@ test "demo queues jet loop audio only on movement edges" {
         .transitions = &transitions,
         .thread_system = &threads,
     });
-    try std.testing.expect(demo.jet_loop_active);
+    try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
     try std.testing.expect(audio.len() >= 3);
 
     audio.beginStep();
@@ -1985,7 +1707,7 @@ test "demo queues jet loop audio only on movement edges" {
         .transitions = &transitions,
         .thread_system = &threads,
     });
-    try std.testing.expect(demo.jet_loop_active);
+    try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
     try std.testing.expectEqual(@as(usize, 1), audio.len());
 
     input.setHeld(.moveRight, false);
@@ -1998,7 +1720,7 @@ test "demo queues jet loop audio only on movement edges" {
         .transitions = &transitions,
         .thread_system = &threads,
     });
-    try std.testing.expect(!demo.jet_loop_active);
+    try std.testing.expect(!demo.pipeline.audio_controller.jet_loop_active);
     try std.testing.expectEqual(@as(usize, 2), audio.len());
 }
 
@@ -2365,50 +2087,4 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
         }
     }
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.nav_region_invalidated);
-}
-
-test "collision sfx cooldowns harden: cap<=32, full evicts min-remaining, tick compacts for re-add, keyFor pair order" {
-    var demo: GameDemoState = undefined;
-    demo.collision_sfx_cooldown_count = 0;
-    const mk = struct {
-        fn id(i: u32, g: u32) EntityId {
-            return .{ .index = i, .generation = g };
-        }
-    }.id;
-    // keyFor is symmetric for pairs
-    try std.testing.expectEqual(CollisionSfxCooldown.keyFor(mk(1, 10), mk(2, 20)), CollisionSfxCooldown.keyFor(mk(2, 20), mk(1, 10)));
-    // add, tick, fill to 32
-    demo.addCollisionSfxCooldown(mk(1, 1), mk(2, 2));
-    demo.tickCollisionSfxCooldowns(0.01);
-    var n: u32 = 3;
-    while (demo.collision_sfx_cooldown_count < collision_sfx_cooldown_capacity) : (n += 1) {
-        demo.addCollisionSfxCooldown(mk(n, 10), mk(n + 1, 10));
-    }
-    try std.testing.expectEqual(@as(usize, 32), demo.collision_sfx_cooldown_count);
-    // force distinct rems so [0] is min; full add must keep count==32 and evict a min-rem
-    for (&demo.collision_sfx_cooldowns, 0..) |*slot, j| {
-        slot.* = .{ .key = CollisionSfxCooldown.keyFor(mk(@as(u32, @intCast(j)), 99), mk(@as(u32, @intCast(j)) + 100, 99)), .remaining_seconds = 0.01 + @as(f32, @floatFromInt(j)) * 0.001 };
-    }
-    demo.collision_sfx_cooldown_count = 32;
-    const min_key = demo.collision_sfx_cooldowns[0].key;
-    const na = mk(200, 7);
-    const nb = mk(201, 7);
-    demo.addCollisionSfxCooldown(na, nb);
-    try std.testing.expectEqual(@as(usize, 32), demo.collision_sfx_cooldown_count);
-    const nk = CollisionSfxCooldown.keyFor(na, nb);
-    var saw_new = false;
-    var saw_min = false;
-    for (demo.collision_sfx_cooldowns[0..32]) |cd| {
-        if (cd.key == nk) saw_new = true;
-        if (cd.key == min_key) saw_min = true;
-    }
-    try std.testing.expect(saw_new);
-    try std.testing.expect(!saw_min);
-    // tick compacts (removes expired), allowing the pair to be re-added
-    demo.collision_sfx_cooldowns[0].remaining_seconds = 0.001;
-    demo.collision_sfx_cooldown_count = 2;
-    demo.tickCollisionSfxCooldowns(0.01);
-    try std.testing.expectEqual(@as(usize, 1), demo.collision_sfx_cooldown_count);
-    demo.addCollisionSfxCooldown(mk(1, 1), mk(2, 2));
-    try std.testing.expectEqual(@as(usize, 2), demo.collision_sfx_cooldown_count);
 }

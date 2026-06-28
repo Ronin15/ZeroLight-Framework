@@ -19,6 +19,11 @@ const PathAgentClass = @import("../../simulation.zig").PathAgentClass;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const PathRequestKind = @import("../../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
+const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
+const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
+const NavInvalidationReason = @import("../../simulation.zig").NavInvalidationReason;
+const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
+const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
@@ -545,6 +550,100 @@ pub const PathfindingSystem = struct {
         self.nav_dirty_edits.clearRetainingCapacity();
         self.nav_dirty_levels.clearRetainingCapacity();
         return stats;
+    }
+
+    // Reacts to committed structural events: interprets nav-invalidating world/obstacle changes
+    // into dirty nav cells, folds them into the existing nav graph incrementally (affected levels
+    // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
+    // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
+    // changes carry no resolvable cell, so level 0 (the only level sourcing collision bodies) is
+    // marked whole-level dirty. Returns the batch stats (zero when nothing was pending).
+    pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
+        // Clear first so a skipped apply never leaks stale edits into the next step.
+        self.clearNavDirty();
+        var entity_obstacle_change = false;
+        for (frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (!eventInvalidatesNavigation(event)) continue;
+            switch (event.payload) {
+                .world_tile_changed => |changed| try self.markNavDirty(changed.level, changed.x, changed.y),
+                .world_obstacle_changed => |changed| {
+                    var y = changed.min_y;
+                    while (y < changed.max_y_exclusive) : (y += 1) {
+                        var x = changed.min_x;
+                        while (x < changed.max_x_exclusive) : (x += 1) {
+                            try self.markNavDirty(changed.level, x, y);
+                        }
+                    }
+                },
+                else => entity_obstacle_change = true,
+            }
+        }
+        if (entity_obstacle_change) try self.markNavLevelDirty(0);
+
+        if (!self.hasPendingNavUpdates()) return .{};
+        try frame.events.ensureCanAppend(1);
+        const stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        // Only signal invalidation when the batch actually changed the graph: an incremental dig
+        // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
+        if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;
+        try frame.events.appendRequired(.{
+            .stage = .domain_reaction,
+            .payload = .{ .nav_region_invalidated = .{ .reason = NavInvalidationReason.static_obstacle_changed } },
+        });
+        return stats;
+    }
+
+    // Whether a committed structural event affects the static navigation graph.
+    pub fn eventInvalidatesNavigation(event: SimulationEvent) bool {
+        switch (event.payload) {
+            .entity_destroyed => |destroyed| return destroyed.was_static_navigation_obstacle,
+            .component_changed => |changed| switch (changed.component) {
+                .movement_body, .collision_bounds => return changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle,
+                .collision_response => return changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle,
+                else => return false,
+            },
+            .world_tile_changed => |changed| return changed.old_blocks_movement != changed.new_blocks_movement,
+            .world_obstacle_changed => return true,
+            else => return false,
+        }
+    }
+
+    // Whether any queued structural-commit event will drive a post-commit nav invalidation.
+    // Mirrors reactToPostCommitNavEvents's stage/payload filter so a caller can reserve the one
+    // appended event before mutation.
+    pub fn pendingEventsMayInvalidateNavigation(frame: *const SimulationFrame) bool {
+        for (frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (eventInvalidatesNavigation(event)) return true;
+        }
+        return false;
+    }
+
+    // Whether any pending structural command may invalidate navigation once applied.
+    pub fn structuralCommandsMayInvalidateNavigation(data: *const DataSystem, frame: *const SimulationFrame) bool {
+        for (frame.structural_commands.mergedItems()) |command| {
+            if (structuralCommandMayInvalidateNavigation(data, command)) return true;
+        }
+        return false;
+    }
+
+    pub fn structuralCommandMayInvalidateNavigation(data: *const DataSystem, command: StructuralCommand) bool {
+        return switch (command) {
+            .create_entity => |template| templateCreatesStaticNavigationObstacle(template),
+            .destroy_entity => |entity| data.isStaticNavigationObstacle(entity),
+            .set_movement_body => |set| data.isAlive(set.entity),
+            .set_collision_bounds => |set| data.isAlive(set.entity),
+            .set_collision_response => |set| data.isAlive(set.entity),
+            else => false,
+        };
+    }
+
+    pub fn templateCreatesStaticNavigationObstacle(template: EntityTemplate) bool {
+        const response = template.collision_response orelse return false;
+        return response.mobility == .static and
+            template.movement_body != null and
+            template.collision_bounds != null;
     }
 
     // Evicts cached paths crossing this batch's changed-cell spans.

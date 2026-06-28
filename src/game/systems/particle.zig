@@ -141,6 +141,12 @@ pub const ConstParticleSlice = struct {
     pub fn len(self: ConstParticleSlice) usize {
         return self.position_x.len;
     }
+
+    /// A row is renderable once it has positive size and non-transparent alpha;
+    /// expired or invisible rows are skipped by render prep.
+    pub fn renderable(self: ConstParticleSlice, index: usize) bool {
+        return self.size[index] > 0 and self.color_a[index] > 0;
+    }
 };
 
 pub const ParticleSystem = struct {

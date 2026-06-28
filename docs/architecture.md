@@ -64,6 +64,10 @@ game-specific behavior under `src/game/`.
   nav_memory, test_support) for frame-delayed Z-aware grid navigation.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
+- `src/game/audio_controller.zig` is the pipeline-owned controller that turns
+  per-step input and collision contacts into audio command-buffer intents
+  (ambient music, a movement-gated jet loop, and collision SFX with per-pair
+  cooldowns). It owns only audio-policy runtime state, never mixer handles.
 - `src/game/render_depth.zig` defines world depth bands and z-order intent;
   `src/game/render_prep.zig` resolves entities to ordered render-draw records.
 - `src/gpu_smoke.zig` is the GPU smoke executable entry point, while
@@ -196,6 +200,10 @@ gain, priority, frequency, and position only. States do not own `MIX_Mixer`,
 `MIX_Track`, or loaded `MIX_Audio` handles. `Engine` drains audio commands on
 the main thread after fixed-step state updates and state transition application.
 Gameplay pause stops active SFX and ducks music; resume restores music gain.
+Game-side audio policy — which intents to emit, jet-loop edge detection, and SFX
+cooldowns — is the pipeline-owned `AudioController`; the gameplay state passes the
+borrowed command buffer through the pipeline at its input/contact seams and holds
+no audio-policy state.
 
 Raw keyboard input maps to named actions in `src/app/input.zig`.
 `input_router.zig` applies the active state stack's action contexts before
@@ -332,8 +340,10 @@ The current gameplay fixed-step pipeline is:
 stage order, scope stats, budgets, and processor handoff for one gameplay state
 instance, while `StateStack` remains the dispatch/lifetime owner. Future domain
 features should add concrete pipeline-owned controllers rather than growing
-`GameDemoState.update` or introducing a global engine scheduler, reflection
-system, dynamic dependency graph, or callback registry.
+`GameDemoState.update` — or, as controllers accumulate, the pipeline's own
+`update` — or introducing a global engine scheduler, reflection system, dynamic
+dependency graph, or callback registry. The pipeline stays a thin composer; each
+controller and system owns its own internals.
 
 Simulation tiers and active scope belong in the same pipeline boundary.
 Persistent tier and chunk metadata live on cold entity slot data. The current
@@ -531,13 +541,19 @@ producers: required events fail before structural mutation or domain reaction
 side effects, while diagnostic events are dropped and counted. Reaction work has
 explicit ownership rather than a generic main-thread fallback: light
 orchestration may run inline, and expensive consumers should split over
-immutable event slices and write range-owned outputs. `GameDemoState` consumes
-structural events after the commit point and, on static obstacle-affecting
-changes, folds them into the state-owned pathfinding nav graph INCREMENTALLY
-rather than rebuilding the whole world. The play state only INTERPRETS events
-into changed nav cells; the dirty buffer and the update itself are owned by
-`PathfindingSystem` (the named owner for work that scales with digging/obstacle
-edits), not the main-thread play state. Cell-localizable edits — blocking `world_tile_changed` /
+immutable event slices and write range-owned outputs. After the commit point, the
+post-commit nav reaction folds static obstacle-affecting changes into the
+pathfinding nav graph INCREMENTALLY rather than rebuilding the whole world.
+`PathfindingSystem` owns that reaction end to end (`reactToPostCommitNavEvents`):
+interpreting structural events into changed nav cells, the dirty buffer, and the
+incremental update — it is the named owner for work that scales with
+digging/obstacle edits. `SimulationPipeline` orchestrates by delegating to it,
+and the gameplay state only invokes that delegation at its main-thread commit
+seam, holding the resulting `NavUpdateStats`. The nav-invalidation classifiers
+(`eventInvalidatesNavigation`, `structuralCommandsMayInvalidateNavigation`,
+`pendingEventsMayInvalidateNavigation`) are reusable nav policy on
+`PathfindingSystem` too, used for both the reaction and the pre-commit event
+capacity preflight. Cell-localizable edits — blocking `world_tile_changed` /
 `world_obstacle_changed` changes (only when `old_blocks_movement !=
 new_blocks_movement`) — are forwarded to the system-owned dirty buffer via
 `pipeline.markNavDirty` (one entry per changed cell). Entity-driven obstacle changes
