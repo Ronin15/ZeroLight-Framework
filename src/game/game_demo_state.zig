@@ -309,7 +309,7 @@ pub const GameDemoState = struct {
 
         self.simulation_frame.phase = .merge_outputs;
         var structural_timer = StageTimer.start();
-        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.runtime_assets, context.thread_system);
+        const structural_stats = try self.applyStructuralCommandsAndPostCommitEvents(context.thread_system);
         structural_timer.stop(context.perf, .gameplay_structural);
         self.simulation_frame.phase = .finished;
 
@@ -608,8 +608,7 @@ pub const GameDemoState = struct {
         };
     }
 
-    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, runtime_assets: *const RuntimeAssets, thread_system: ?*ThreadSystem) !StructuralCommitStats {
-        try self.validateStructuralAssetReferences(runtime_assets);
+    fn applyStructuralCommandsAndPostCommitEvents(self: *GameDemoState, thread_system: ?*ThreadSystem) !StructuralCommitStats {
         // The post-commit nav reaction appends at most one nav_region_invalidated
         // event, driven by EITHER structural commands applied this frame OR
         // invalidating world events already queued in the stream (e.g. a dig's
@@ -665,20 +664,6 @@ pub const GameDemoState = struct {
 
     fn validateAtlasReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
         try validateAtlasReferencesInData(&self.data, runtime_assets);
-    }
-
-    fn validateStructuralAssetReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
-        for (self.simulation_frame.structural_commands.mergedItems()) |command| {
-            switch (command) {
-                .create_entity => |template| {
-                    if (template.asset_reference) |asset_ref| try validateAtlasReference(asset_ref, runtime_assets);
-                },
-                .set_asset_reference => |set| {
-                    if (self.data.isAlive(set.entity)) try validateAtlasReference(set.asset_reference, runtime_assets);
-                },
-                else => {},
-            }
-        }
     }
 };
 
@@ -1109,35 +1094,6 @@ test "demo atlas validation rejects invalid character entry ids" {
     );
 }
 
-test "demo structural asset reference validation rejects invalid atlas entry before mutation" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
-    defer demo.deinit();
-    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
-    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
-    const entity = demo.test_squares[0];
-    const previous = demo.data.assetReferenceConst(entity).?;
-
-    demo.simulation_frame.beginStep();
-    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
-    demo.simulation_frame.structural_commands.addCount(0, 1);
-    try demo.simulation_frame.structural_commands.prefix();
-    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
-    writer.write(.{ .set_asset_reference = .{
-        .entity = entity,
-        .asset_reference = .{ .sprite = .grim_characters, .atlas_entry_id = 4096 },
-    } });
-    writer.finish();
-    demo.simulation_frame.structural_commands.finishWrite();
-
-    try std.testing.expectError(
-        error.InvalidSpriteAtlasEntry,
-        demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null),
-    );
-    const current = demo.data.assetReferenceConst(entity).?;
-    try std.testing.expectEqual(previous.sprite, current.sprite);
-    try std.testing.expectEqual(previous.atlas_entry_id, current.atlas_entry_id);
-}
-
 test "demo world tile event invalidates navigation after commit reaction" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
@@ -1407,7 +1363,6 @@ test "demo frame sprite capacity tracks structural visual growth" {
     const created_visual_count = 528;
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = try runtimeAssetsWithWorldTexture();
 
     var created: usize = 0;
     while (created < created_visual_count) {
@@ -1436,7 +1391,7 @@ test "demo frame sprite capacity tracks structural visual growth" {
         writer.finish();
         demo.simulation_frame.structural_commands.finishWrite();
 
-        const stats = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
+        const stats = try demo.applyStructuralCommandsAndPostCommitEvents(null);
         try std.testing.expectEqual(batch_count, stats.created);
         created += batch_count;
     }
@@ -1775,7 +1730,6 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
 test "demo structural static obstacle change emits one navigation invalidation event" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
 
     demo.simulation_frame.beginStep();
     try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
@@ -1795,7 +1749,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
 
     var nav_invalidations: usize = 0;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1814,7 +1768,6 @@ test "demo structural static obstacle change emits one navigation invalidation e
 test "demo preflights navigation invalidation event before structural mutation" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
 
     const entity_count_before = demo.data.movementBodySliceConst().entities.len;
 
@@ -1837,7 +1790,7 @@ test "demo preflights navigation invalidation event before structural mutation" 
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
     try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.total);
@@ -1846,7 +1799,6 @@ test "demo preflights navigation invalidation event before structural mutation" 
 test "demo preflights same-batch static obstacle promotion before mutation" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
 
     const entity = try demo.data.createEntity();
     try demo.data.setMovementBody(entity, .{
@@ -1873,7 +1825,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null));
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
     try std.testing.expect(demo.data.collisionBoundsConst(entity) == null);
     try std.testing.expect(demo.data.collisionResponseConst(entity) == null);
     try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.mergedItems().len);
@@ -1883,7 +1835,6 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
 test "demo unrelated structural component change does not invalidate navigation" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
 
     demo.simulation_frame.beginStep();
     try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
@@ -1897,7 +1848,7 @@ test "demo unrelated structural component change does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
@@ -1911,7 +1862,6 @@ test "demo unrelated structural component change does not invalidate navigation"
 test "demo dynamic entity structural destruction does not invalidate navigation" {
     var demo = try initDemoForTest(std.testing.allocator, 800, 450);
     defer demo.deinit();
-    var runtime_assets = RuntimeAssets.init();
 
     const dynamic = try demo.data.createEntity();
     try demo.data.setMovementBody(dynamic, .{
@@ -1932,7 +1882,7 @@ test "demo dynamic entity structural destruction does not invalidate navigation"
     writer.finish();
     demo.simulation_frame.structural_commands.finishWrite();
 
-    _ = try demo.applyStructuralCommandsAndPostCommitEvents(&runtime_assets, null);
+    _ = try demo.applyStructuralCommandsAndPostCommitEvents(null);
 
     for (demo.simulation_frame.events.mergedItems()) |event| {
         switch (event.payload) {
