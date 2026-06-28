@@ -385,6 +385,13 @@ pub const ResultCache = struct {
         for (self.pathSlice(slot_index, payload.path_len)) |cell| {
             if (cell != no_cell and cellInSpans(graph, payload.path_level, cell, spans)) return true;
         }
+        // A plain path that filled the whole stride may be stride-downsampled into non-adjacent
+        // samples (downsamplePathInto), so an edit landing between two stored samples is invisible
+        // to the per-cell scan above. Conservatively treat such a slot as crossing whenever an
+        // edited span touches its level; it simply re-solves. Over-evicts only the boundary case
+        // (a path exactly stride-long is adjacent), never under-evicts. Paths shorter than the
+        // stride are stored exactly and stay precise.
+        if (payload.path_len == self.path_stride and levelInSpans(payload.path_level, spans)) return true;
         return false;
     }
 
@@ -457,7 +464,7 @@ pub const ResultCache = struct {
         };
     }
 
-    pub fn writeStitched(self: *ResultCache, slot_index: usize, stitched: []const StitchedCell) usize {
+    fn writeStitched(self: *ResultCache, slot_index: usize, stitched: []const StitchedCell) usize {
         if (self.stitched_stride == 0) return 0;
         const base = slot_index * self.stitched_stride;
         const copy_len = @min(stitched.len, self.stitched_stride);
@@ -465,7 +472,7 @@ pub const ResultCache = struct {
         return copy_len;
     }
 
-    pub fn findOrEvictSlot(self: *ResultCache, key: PathQueryKey, stats: *PathfindingStats) usize {
+    fn findOrEvictSlot(self: *ResultCache, key: PathQueryKey, stats: *PathfindingStats) usize {
         const capacity = self.slots.items.len;
         std.debug.assert(capacity != 0); // callers guard this; assert before `% capacity`
         const start = hashPathKey(key) % capacity;
@@ -496,7 +503,7 @@ pub const ResultCache = struct {
         unreachable; // removeAt freed exactly one slot
     }
 
-    pub fn writePath(self: *ResultCache, slot_index: usize, path: []const u32) usize {
+    fn writePath(self: *ResultCache, slot_index: usize, path: []const u32) usize {
         const base = slot_index * self.path_stride;
         const dst = self.path_cells.items[base .. base + self.path_stride];
         // One shared contract with the worker solve buffer: copy when it fits, else
@@ -537,6 +544,15 @@ fn cellInSpans(graph: *const NavGraph, level: u16, cell: u32, spans: []const Cha
     for (spans) |s| {
         if (s.level != level) continue;
         if (cx >= s.span.min_x and cx <= s.span.max_x and cy >= s.span.min_y and cy <= s.span.max_y) return true;
+    }
+    return false;
+}
+
+// Whether any changed span touches `level`. Used to conservatively evict downsampled plain
+// paths whose stored samples can hide an edit that falls between them.
+fn levelInSpans(level: u16, spans: []const ChangedSpan) bool {
+    for (spans) |s| {
+        if (s.level == level) return true;
     }
     return false;
 }
@@ -777,6 +793,114 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
     try std.testing.expectEqual(@as(usize, 2), stored.len);
     try std.testing.expectEqual(@as(u32, 3), stored[0]);
+}
+
+// Minimal single-level NavGraph for cache-eviction/waypoint tests: only the grid
+// dimensions are read (cellInSpans / waypointFromStitched), so an empty-backed grid
+// of the requested size suffices. Caller must deinit the returned graph's level list.
+fn makeTestGraph(allocator: std.mem.Allocator, width: usize, height: usize) !NavGraph {
+    var graph = NavGraph{ .allocator = allocator, .width = width, .height = height };
+    try graph.levels.append(allocator, NavGrid{ .width = width, .height = height, .cell_size = 1 });
+    return graph;
+}
+
+test "pathfinding result cache evicts only paths crossing an edited span" {
+    var stats = PathfindingStats{};
+    var graph = try makeTestGraph(std.testing.allocator, 10, 10);
+    defer graph.levels.deinit(std.testing.allocator);
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try cache.reserve(std.testing.allocator, 4, 8, 8);
+
+    // Crossing path runs along row 0 through cell (2,0); clear path sits on row 5. Both are
+    // stored exactly (length < stride), so the per-cell scan is precise — no conservative branch.
+    var crossing = emptyKey(1);
+    crossing.goal.x = 1;
+    cache.put(crossing, &.{ 0, 1, 2, 3 }, &.{}, 0, 0, &stats);
+    var clear = emptyKey(1);
+    clear.goal.x = 2;
+    cache.put(clear, &.{ 50, 51, 52 }, &.{}, 0, 0, &stats);
+
+    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 2, .max_x = 2, .min_y = 0, .max_y = 0 } }};
+    cache.evictCrossing(&graph, &spans);
+
+    try std.testing.expect(cache.find(crossing) == null); // crossed (2,0) -> evicted
+    try std.testing.expect(cache.find(clear) != null); // clear of the edit -> still served
+}
+
+test "pathfinding result cache evicts a downsampled path edited between stored samples" {
+    var stats = PathfindingStats{};
+    var graph = try makeTestGraph(std.testing.allocator, 10, 10);
+    defer graph.levels.deinit(std.testing.allocator);
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    const stride = 4;
+    try cache.reserve(std.testing.allocator, 2, stride, 8);
+
+    // An 8-cell row-0 path is stride-downsampled to samples {0,2,4,7}; cell 5 lies ON the path
+    // but BETWEEN two stored samples. An edit at (5,0) is invisible to the stored-cell scan, so
+    // without the conservative downsample rule the slot survives a real obstruction until TTL.
+    var key = emptyKey(1);
+    key.goal.x = 7;
+    cache.put(key, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, &.{}, 0, 0, &stats);
+    try std.testing.expectEqual(@as(u32, stride), cache.resultAt(cache.slotIndex(key).?).path_len);
+
+    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 5, .max_x = 5, .min_y = 0, .max_y = 0 } }};
+    cache.evictCrossing(&graph, &spans);
+    try std.testing.expect(cache.find(key) == null); // conservatively evicted despite the gap
+}
+
+test "pathfinding group key map keeps probe chains intact after mid-chain removal" {
+    var map = GroupKeyMap{};
+    defer map.deinit(std.testing.allocator);
+    const capacity = 8;
+    try map.reserve(std.testing.allocator, capacity);
+
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        try std.testing.expect(map.insert(key, i));
+    }
+    // Remove two entries that may sit mid-probe-chain; every survivor must stay findable and
+    // keep its group index (back-shift deletion must not strand a later key behind the gap).
+    for ([_]usize{ 2, 5 }) |target| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(target);
+        map.remove(key);
+    }
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        if (i == 2 or i == 5) {
+            try std.testing.expect(map.find(key) == null);
+        } else {
+            try std.testing.expectEqual(i, map.find(key).?);
+        }
+    }
+}
+
+test "pathfinding stitched waypoint matches full scan and recovers from a stale hint" {
+    var graph = try makeTestGraph(std.testing.allocator, 100, 1);
+    defer graph.levels.deinit(std.testing.allocator);
+    const grid = graph.grid(0).?;
+    const stitched = [_]StitchedCell{
+        .{ .level = 0, .cell = 10 }, .{ .level = 0, .cell = 11 },
+        .{ .level = 0, .cell = 12 }, .{ .level = 0, .cell = 13 },
+        .{ .level = 0, .cell = 14 }, .{ .level = 0, .cell = 15 },
+    };
+
+    const baseline = waypointFromStitched(&graph, &stitched, 0, 12, null).?;
+    try std.testing.expectEqual(grid.cellCenter(13).x, baseline.x);
+
+    var fresh: u32 = 1;
+    const hinted = waypointFromStitched(&graph, &stitched, 0, 12, &fresh).?;
+    try std.testing.expectEqual(baseline.x, hinted.x);
+    try std.testing.expectEqual(@as(u32, 2), fresh);
+
+    var stale: u32 = 999;
+    const recovered = waypointFromStitched(&graph, &stitched, 0, 12, &stale).?;
+    try std.testing.expectEqual(baseline.x, recovered.x);
+    try std.testing.expectEqual(@as(u32, 2), stale);
 }
 
 test "pathfinding result cache downsamples an over-stride path to span start and goal" {

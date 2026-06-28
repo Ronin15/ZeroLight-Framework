@@ -161,6 +161,11 @@ pub fn clampInt4(values: Int4, minimum: Int4, maximum: Int4) Int4 {
     return minInt4(maxInt4(values, minimum), maximum);
 }
 
+// Counts the true lanes in a mask via a single vector reduction.
+pub fn countTrue(mask: Mask4) u32 {
+    return @reduce(.Add, @as(@Vector(lane_count, u32), @intFromBool(mask)));
+}
+
 pub fn vectorCount(item_count: usize) usize {
     return item_count / lane_count;
 }
@@ -346,6 +351,16 @@ test "compare select and clamp helpers match scalar behavior" {
         [_]i32{ 0, 2, 6, 10 },
         toIntArray(clampInt4(ints, splatInt4(0), splatInt4(10))),
     );
+}
+
+test "countTrue matches a scalar lane sum" {
+    try std.testing.expectEqual(@as(u32, 0), countTrue(Mask4{ false, false, false, false }));
+    try std.testing.expectEqual(@as(u32, lane_count), countTrue(@splat(true)));
+    try std.testing.expectEqual(@as(u32, 2), countTrue(Mask4{ true, false, true, false }));
+    const mask = Mask4{ true, true, false, true };
+    var scalar: u32 = 0;
+    inline for (0..lane_count) |i| scalar += @intFromBool(mask[i]);
+    try std.testing.expectEqual(scalar, countTrue(mask));
 }
 
 test "tail helpers cover empty partial exact and multi lane counts" {

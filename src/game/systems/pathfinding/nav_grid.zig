@@ -23,7 +23,7 @@ const NavCellEdit = types.NavCellEdit;
 const tileIndexClamped = types.tileIndexClamped;
 const setLen = types.setLen;
 const neighbor_dirs = types.neighbor_dirs;
-const collisionBoundsIndex = types.collisionBoundsIndex;
+const rect_edge_epsilon = types.rect_edge_epsilon;
 
 pub const NavGrid = struct {
     // Static navigation grid for ONE level (Z-floor). Derived from DataSystem
@@ -111,14 +111,7 @@ pub const NavGrid = struct {
             if (responses.mobilities[response_index] != .static) continue;
             const bounds_index = bounds_map.get(entity) orelse continue;
             const body = data.movementBodyConst(entity) orelse continue;
-            const min_x = body.position.x + bounds.offset_x[bounds_index];
-            const min_y = body.position.y + bounds.offset_y[bounds_index];
-            const rect = StaticBodyRect{
-                .min_x = min_x,
-                .min_y = min_y,
-                .max_x = min_x + bounds.size_x[bounds_index],
-                .max_y = min_y + bounds.size_y[bounds_index],
-            };
+            const rect = rectFromBounds(body.position.x, body.position.y, bounds, bounds_index);
             self.markBlockedRectSimd(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
             self.rasterizeStaticCoverage(rect);
         }
@@ -129,7 +122,7 @@ pub const NavGrid = struct {
     // staticBodyCoversNavCell so all three agree on which cells a body covers.
     fn rasterizeStaticCoverage(self: *NavGrid, rect: StaticBodyRect) void {
         const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
-        const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - 0.001), .y = @max(rect.min_y, rect.max_y - 0.001) });
+        const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - rect_edge_epsilon), .y = @max(rect.min_y, rect.max_y - rect_edge_epsilon) });
         const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
         const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
         const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
@@ -201,7 +194,7 @@ pub const NavGrid = struct {
     pub fn markBlockedRectSimd(self: *NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
         if (!self.valid()) return;
         const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
-        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - 0.001), .y = @max(min_y, max_y - 0.001) });
+        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - rect_edge_epsilon), .y = @max(min_y, max_y - rect_edge_epsilon) });
         const row_start: usize = @intCast(@min(min_cell.y, max_cell.y));
         const row_end: usize = @intCast(@max(min_cell.y, max_cell.y));
         const col_start_i = @min(min_cell.x, max_cell.x);
@@ -221,7 +214,7 @@ pub const NavGrid = struct {
                 const base = y * self.width + x;
                 const window = self.blocked.items[base .. base + simd.lane_count];
                 const before: simd.Mask4 = window[0..simd.lane_count].*;
-                const already: u32 = @reduce(.Add, @as(@Vector(simd.lane_count, u32), @intFromBool(before)));
+                const already: u32 = simd.countTrue(before);
                 self.blocked_count += simd.lane_count - @as(usize, already);
                 window[0..simd.lane_count].* = all_blocked;
             }
@@ -299,8 +292,8 @@ pub const NavGrid = struct {
         const rect = world.cellRect(edit.x, edit.y) orelse return null;
         const min_cell = self.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
         const max_cell = self.worldToCellClamped(.{
-            .x = @max(rect.x, rect.x + rect.w - 0.001),
-            .y = @max(rect.y, rect.y + rect.h - 0.001),
+            .x = @max(rect.x, rect.x + rect.w - rect_edge_epsilon),
+            .y = @max(rect.y, rect.y + rect.h - rect_edge_epsilon),
         });
         return .{
             .min_x = @intCast(@min(min_cell.x, max_cell.x)),
@@ -320,9 +313,9 @@ pub const NavGrid = struct {
             const min_x = @as(f32, @floatFromInt(ncx)) * self.cell_size;
             const min_y = @as(f32, @floatFromInt(ncy)) * self.cell_size;
             const tx0 = tileIndexClamped(min_x, world.tile_size, world.width);
-            const tx1 = tileIndexClamped(min_x + self.cell_size - 0.001, world.tile_size, world.width);
+            const tx1 = tileIndexClamped(min_x + self.cell_size - rect_edge_epsilon, world.tile_size, world.width);
             const ty0 = tileIndexClamped(min_y, world.tile_size, world.height);
-            const ty1 = tileIndexClamped(min_y + self.cell_size - 0.001, world.tile_size, world.height);
+            const ty1 = tileIndexClamped(min_y + self.cell_size - rect_edge_epsilon, world.tile_size, world.height);
             var ty = ty0;
             while (ty <= ty1) : (ty += 1) {
                 var tx = tx0;
@@ -350,7 +343,7 @@ pub const NavGrid = struct {
             if (responses.mobilities[response_index] != .static) continue;
             const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
             const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
-            const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - 0.001), .y = @max(rect.min_y, rect.max_y - 0.001) });
+            const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - rect_edge_epsilon), .y = @max(rect.min_y, rect.max_y - rect_edge_epsilon) });
             const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
             const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
             const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
@@ -443,6 +436,9 @@ pub const NavGrid = struct {
     }
 
     pub fn floodComponent(self: *NavGrid, start_index: usize, component: u32, queue: *std.ArrayList(usize)) void {
+        // A flood never leaves its chunk, so the queue only needs chunk_tiles^2 capacity; the
+        // appendAssumeCapacity calls below rely on the caller having reserved at least that.
+        std.debug.assert(queue.capacity >= @as(usize, self.chunk_tiles) * self.chunk_tiles);
         queue.clearRetainingCapacity();
         queue.appendAssumeCapacity(start_index);
         self.components.items[start_index] = component;
@@ -506,20 +502,31 @@ pub const NavGrid = struct {
 };
 pub const StaticBodyRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
 
+// Index of `target` in a collision-bounds entity column, or null if absent. Relocated here
+// from the pathfinding types leaf: this is its only consumer (staticBodyWorldRect).
+fn boundsEntityIndex(entities: []const EntityId, target: EntityId) ?usize {
+    for (entities, 0..) |entity, index| {
+        if (entity.index == target.index and entity.generation == target.generation) return index;
+    }
+    return null;
+}
+
+// World-space AABB from a body origin and its bounds-column entry. Shared by markStaticBodies
+// and staticBodyWorldRect so the full mark and the incremental cell-coverage test derive
+// identical offset/size geometry.
+fn rectFromBounds(px: f32, py: f32, bounds: anytype, idx: usize) StaticBodyRect {
+    const min_x = px + bounds.offset_x[idx];
+    const min_y = py + bounds.offset_y[idx];
+    return .{ .min_x = min_x, .min_y = min_y, .max_x = min_x + bounds.size_x[idx], .max_y = min_y + bounds.size_y[idx] };
+}
+
 // World-space AABB of `entity`'s static collision body, or null if it has no bounds
 // or movement body. Shared by markStaticBodies and staticBodyCoversNavCell so the
 // full mark and the incremental cell-coverage test derive identical geometry.
 pub fn staticBodyWorldRect(data: *const DataSystem, bounds: anytype, entity: EntityId) ?StaticBodyRect {
-    const bounds_index = collisionBoundsIndex(bounds.entities, entity) orelse return null;
+    const bounds_index = boundsEntityIndex(bounds.entities, entity) orelse return null;
     const body = data.movementBodyConst(entity) orelse return null;
-    const min_x = body.position.x + bounds.offset_x[bounds_index];
-    const min_y = body.position.y + bounds.offset_y[bounds_index];
-    return .{
-        .min_x = min_x,
-        .min_y = min_y,
-        .max_x = min_x + bounds.size_x[bounds_index],
-        .max_y = min_y + bounds.size_y[bounds_index],
-    };
+    return rectFromBounds(body.position.x, body.position.y, bounds, bounds_index);
 }
 
 // ----------------------------------------------------------------------------

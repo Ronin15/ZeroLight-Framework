@@ -37,15 +37,15 @@ fn requireTile(meta: *const world_tileset_meta.WorldTilesetMeta, name: []const u
 // largest footprint plus a few chunks of margin — NOT a full game world. The fixture is built
 // ONCE per variant and reused, so the world only has to be big enough to hold the largest
 // dig-storm footprint at its anchor: 256 tiles = 16x16 abstract chunks, room for the 128x128
-// (16384-cell) footprint at the interior anchor (40) with margin.
+// (16384-cell) footprint centered at the world midpoint (tile 128) with margin.
 const world_tiles: u16 = 256;
 const tile_size: f32 = 32.0;
 const world_bounds: f32 = @as(f32, @floatFromInt(world_tiles)) * tile_size;
 
-// Abstract chunk side in tiles; must match the nav build's default_nav_chunk_tiles (the bench
-// reserves with the default nav_chunk_tiles). Used to place the scattered footprint one dirty
-// cell per distinct chunk, so its item_count equals the dirty-chunk count.
-const nav_chunk_tiles: u16 = 16;
+// Abstract chunk side in tiles, sourced from the nav build's default so the scattered footprint
+// stays one dirty cell per distinct chunk (its item_count equals the dirty-chunk count) even if
+// the default changes.
+const nav_chunk_tiles: u16 = @import("../game/systems/pathfinding.zig").default_nav_chunk_tiles;
 const chunks_per_side: usize = @as(usize, world_tiles) / nav_chunk_tiles;
 const total_chunks: usize = chunks_per_side * chunks_per_side;
 
@@ -261,8 +261,11 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
     }
 }
 
-// One open/blocked toggle of the edited tiles, returning the world to its start state. Each
-// half is one nav update, so a toggle is two incremental updates. Only the nav-update call is
+// One open->blocked toggle of the edited tiles: the first half opens them (grass), the second
+// re-blocks them (tree), so a toggle ENDS with the footprint blocked, not back at the all-open
+// start state. The dirty set still stays bounded because each variant's footprints are nested at
+// a stable anchor, so a later (larger) count's open half clears any prior count's blocked cells.
+// Each half is one nav update, so a toggle is two incremental updates. Only the nav-update call is
 // timed (the world tile writes and the dirty-cell marking that set up each half are excluded),
 // so the measurement reflects the abstract-graph patch cost the task targets. A non-null
 // thread_system routes through the threaded buffered path (markNavDirty + applyBufferedNavUpdates);
@@ -354,14 +357,18 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
     const remask_settled = if (case.adaptive) fixture.system.nav_remask_tuner.isSettled() else false;
     const patch_settled = if (case.adaptive) fixture.system.nav_patch_tuner.isSettled() else false;
 
-    var accumulator = suite.StatsAccumulator.init(item_count);
+    // Throughput is over the cells ACTUALLY edited, not the requested count: the scattered
+    // variant caps its footprint at the world chunk total, so a requested count above the cap
+    // edits fewer cells and the denominator must match or cells/sec is overstated.
+    const edited_cells = fixture.edits.items.len;
+    var accumulator = suite.StatsAccumulator.init(edited_cells);
     for (0..options.iterations) |_| {
         // One toggle is two timed nav updates over the full footprint; record their AVERAGE as
         // the per-update batch cost (items_per_second then reads as dirty cells per second). The
         // two halves (block vs unblock) are asymmetric, so this mean blends them by design — see
         // runToggle.
         const elapsed = try runToggle(fixture, io, thread_ptr);
-        accumulator.record(elapsed / 2, suite.serialBatch(item_count, 1));
+        accumulator.record(elapsed / 2, suite.serialBatch(edited_cells, 1));
     }
     var stats = accumulator.finish();
     // Report the worker profile each stage actually used so threaded rows are not mistaken for
@@ -390,6 +397,27 @@ test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
     try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 0), stats.edge_cap_fallback);
+}
+
+test "nav update benchmark scattered footprint is one dirty cell per distinct chunk" {
+    // Guards the scattered variant's premise (and the nav_chunk_tiles coupling): each edit must
+    // land in its own chunk so item_count == dirty-chunk count, capped at the world chunk total.
+    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
+    defer fixture.deinit(std.testing.allocator);
+
+    // Below the cap: every requested cell becomes a distinct-chunk edit.
+    try setFootprint(&fixture, std.testing.allocator, .scattered, 64);
+    try std.testing.expectEqual(@as(usize, 64), fixture.edits.items.len);
+    var seen = [_]bool{false} ** total_chunks;
+    for (fixture.edits.items) |edit| {
+        const chunk = (edit.x / nav_chunk_tiles) + (edit.y / nav_chunk_tiles) * chunks_per_side;
+        try std.testing.expect(!seen[chunk]);
+        seen[chunk] = true;
+    }
+
+    // Above the cap: edit count saturates at the world chunk total, still all distinct.
+    try setFootprint(&fixture, std.testing.allocator, .scattered, total_chunks + 100);
+    try std.testing.expectEqual(total_chunks, fixture.edits.items.len);
 }
 
 test "nav update benchmark dig-storm tier stays incremental (no full rebuild)" {

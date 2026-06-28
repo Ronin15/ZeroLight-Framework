@@ -608,14 +608,6 @@ pub const PathfindingSystem = struct {
         return self.statusForKeyAndStart(key, start_level, start_index, waypoint_hint);
     }
 
-    fn statusForKey(self: *const PathfindingSystem, key: PathQueryKey) PathView {
-        const goal_grid = self.graph.grid(key.goal_level) orelse return .{ .status = .unavailable };
-        if (goal_grid.indexForCell(key.goal)) |goal_index| {
-            return self.statusForKeyAndStart(key, key.goal_level, goal_index, null);
-        }
-        return self.statusForKeyAndStart(key, key.goal_level, 0, null);
-    }
-
     // Group field first (when ready), then individual cache, then negative cache,
     // then pending. Missing means the caller may enqueue a request. The start cell
     // is interpreted on `start_level`; cached corridors derive against the level
@@ -722,13 +714,7 @@ pub const PathfindingSystem = struct {
         const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
         var system_config = config;
-        self.prepareSolveBuffers(solve_count);
-        self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(system_config), &stats);
-        if (builtin.mode == .Debug) {
-            for (self.fallback_indices.items[1..], 0..) |idx, i| {
-                std.debug.assert(self.fallback_indices.items[i] < idx);
-            }
-        }
+        self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(system_config), &stats);
 
         if (self.fallback_indices.items.len != 0) {
             if (system_config.adaptive and system_config.fallback_adaptive_tuner == null and system_config.items_per_range == null) {
@@ -738,14 +724,12 @@ pub const PathfindingSystem = struct {
             // build. In a correct configuration scratch is sized to participantSlotCount
             // (the app/bench reserve with it), so the clamp below is a no-op. A debug
             // build asserts that contract loudly to catch a reserve/thread-system
-            // mismatch during development; a release build logs a warning and clamps the
-            // worker fan-out to the reserved scratch so worker indices stay in range and
-            // pathfinding degrades to fewer workers rather than failing the frame. Scratch
-            // is never grown past the memory-budgeted count, and the solve loop stays
-            // allocation-free.
-            if (thread_system.participantSlotCount() > self.scratch_slots.items.len) {
-                logging.game.warn("pathfinding: scratch slot mismatch ({d} participants, {d} reserved slots); worker fan-out clamped — reserve worker_participant_count to match the thread system", .{ thread_system.participantSlotCount(), self.scratch_slots.items.len });
-            }
+            // mismatch during development; a release build silently clamps the worker
+            // fan-out to the reserved scratch (below) so worker indices stay in range and
+            // pathfinding degrades to fewer workers rather than failing the frame. The warn
+            // is dropped: it sat on the per-fixed-step path and would spam every step under
+            // a misconfiguration whose inputs are step-invariant. Scratch is never grown
+            // past the memory-budgeted count, and the solve loop stays allocation-free.
             std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
             const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
             const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
@@ -771,13 +755,7 @@ pub const PathfindingSystem = struct {
         var stats: PathfindingStats = undefined;
         const solve_count = (try self.beginSolve(requests, agent_count, config, &stats)) orelse return stats;
         var solve_timer = PhaseTimer.begin();
-        self.prepareSolveBuffers(solve_count);
-        self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(config), &stats);
-        if (builtin.mode == .Debug) {
-            for (self.fallback_indices.items[1..], 0..) |idx, i| {
-                std.debug.assert(self.fallback_indices.items[i] < idx);
-            }
-        }
+        self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(config), &stats);
         if (self.fallback_indices.items.len != 0) {
             if (self.scratch_slots.items.len == 0) return error.PathfindingScratchCapacityExceeded;
             self.resetSolvedPaths();
@@ -1067,6 +1045,19 @@ pub const PathfindingSystem = struct {
         }
     }
 
+    // Shared solve-phase setup for the threaded and serial paths. The Debug check
+    // asserts the strict-increase invariant the fallback dispatch relies on; the
+    // len > 1 guard keeps the [1..] slice in-bounds when the list is empty or single.
+    fn prepareSolvePhase(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
+        self.prepareSolveBuffers(solve_count);
+        self.prepareFallbackIndices(solve_count, fallback_limit, stats);
+        if (builtin.mode == .Debug and self.fallback_indices.items.len > 1) {
+            for (self.fallback_indices.items[1..], 0..) |idx, i| {
+                std.debug.assert(self.fallback_indices.items[i] < idx);
+            }
+        }
+    }
+
     fn effectiveSolveLimit(self: *const PathfindingSystem, config: PathfindingConfig) usize {
         const requested_limit = config.max_solved_requests_per_step orelse self.capacity.max_solved_requests_per_step;
         return @min(
@@ -1220,6 +1211,36 @@ test "pathfinding individual solve produces deterministic available path and way
     try std.testing.expect(view.path_len >= 2);
 }
 
+test "pathfinding zero fallback budget leaves an empty fallback list without panicking" {
+    // A zero fallback budget with pending work yields an empty fallback_indices, which
+    // must not panic the strict-increase verification slice (items[1..]) in either path.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    var serial_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer serial_stream.deinit();
+    try appendPathRequest(&serial_stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
+    const serial_stats = try system.updateSerial(&serial_stream, 8, .{ .max_fallback_requests_per_step = 0 });
+    try std.testing.expectEqual(@as(usize, 0), serial_stats.available_results);
+    try std.testing.expectEqual(@as(usize, 1), serial_stats.deferred_requests);
+
+    if (!builtin.single_threaded) {
+        var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+        defer threads.deinit();
+        var threaded_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer threaded_stream.deinit();
+        try appendPathRequest(&threaded_stream, .{ .entity = requester, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 64, .y = 64 } });
+        const threaded_stats = try system.update(&threaded_stream, 8, &threads, .{ .adaptive = false, .items_per_range = 1, .max_fallback_requests_per_step = 0 });
+        try std.testing.expectEqual(@as(usize, 0), threaded_stats.available_results);
+    }
+}
+
 test "pathfinding goal-keyed dedup reuses one accepted request under start drift" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1294,8 +1315,8 @@ test "pathfinding spills to pending when node budget is exhausted" {
     try std.testing.expectEqual(@as(usize, 1), stats.budget_exhausted);
     try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
     try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
-    const key = system.graph.keyForWorld(0, .{ .x = 488, .y = 488 }, .default).?;
-    try std.testing.expectEqual(PathStatus.pending, system.statusForKey(key).status);
+    const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 488, .y = 488 }, .default, null);
+    try std.testing.expectEqual(PathStatus.pending, view.status);
 }
 
 test "pathfinding rejects disconnected goals" {

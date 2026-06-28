@@ -7,6 +7,7 @@
 //! incremental dirty-chunk patch path used by in-place digs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
@@ -217,7 +218,10 @@ fn patchChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId)
     const scratch = &job.graph.patch_scratch.items[worker_id.index];
     for (range.start..range.end) |i| {
         const overflowed = job.graph.patchChunk(job.level, job.world, job.chunks[i], scratch) catch {
-            // An allocation failure mid-patch forces the post-barrier serial full-rebuild fallback.
+            // Any patchChunk error (today only OOM) is folded into the same `overflow` flag as a
+            // genuine edge-window overflow, so both route into the post-barrier full rebuild. This
+            // intentionally conflates the two recovery triggers: the fallback is correct for either,
+            // and an OOM there surfaces loudly anyway. Split the signal only if OOM needs distinct handling.
             scratch.overflow = true;
             continue;
         };
@@ -599,10 +603,12 @@ pub const NavGraph = struct {
                 // A chunk's edges blew past its fixed window: bump slack and rebuild the
                 // whole abstract graph (re-measuring caps so they fit the new topology). Also
                 // surfaced via the edge_cap_fallback counter (recorded as a perf metric by the
-                // app-layer caller). The recovered-degradation warn is comptime-gated to the
-                // hot-path logger so it compiles out in release and test builds.
+                // app-layer caller). This is a cold dig-triggered event (not the per-frame path),
+                // so the recovered-degradation warn is gated on the warn level (a release build
+                // still surfaces it) rather than the Debug-only hot-path flag — but stays out of
+                // test builds, which legitimately trigger this and should not spam stderr.
                 self.edge_slack = std.math.add(u32, self.edge_slack, self.edge_slack) catch self.edge_slack;
-                if (runtime_perf_log.hot_log_enabled)
+                if (comptime logging.enabled(.warn) and !builtin.is_test)
                     logging.game.warn("nav abstract-graph edge-cap fallback: per-chunk edge window overflow, full rebuild with slack {}", .{self.edge_slack});
                 try self.buildAbstractGraphs(world);
                 stats.edge_cap_fallback = 1;
@@ -714,22 +720,35 @@ pub const NavGraph = struct {
         return self.dirty_epoch;
     }
 
-    // Counts distinct abstract chunks (by edit-origin cell) touched by the batch — a diagnostic
-    // recorded only when perf logging is enabled. O(edits) via the dirty-chunk stamp; the prior
-    // O(edits^2) pairwise scan was only acceptable while edits were capped, but the dirty buffer
-    // is now uncapped (scales with simultaneous diggers), so the quadratic form must not run.
-    // Dedup is by chunk id; a cross-level same-chunk-id collision under-counts by one, which is
-    // immaterial for a diagnostic. Bumps the dirty epoch, which downstream stages re-bump.
+    // Counts distinct abstract chunks touched by the batch — a diagnostic recorded only when
+    // perf logging is enabled. Uses each edit's full navSpanForTile rect (matching the real
+    // remask/patch work), so a tile whose cell rect straddles a chunk border is not undercounted.
+    // O(edit-spans) via the dirty-chunk stamp; the prior O(edits^2) pairwise scan was only
+    // acceptable while edits were capped, but the dirty buffer is now uncapped (scales with
+    // simultaneous diggers), so the quadratic form must not run. Dedup is by chunk id; a
+    // cross-level same-chunk-id collision under-counts by one, immaterial for a diagnostic.
+    // Bumps the dirty epoch, which downstream stages re-bump.
     pub fn countDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
         const world_system = world orelse return 0;
         const epoch = self.bumpDirtyEpoch();
+        const ct: usize = self.chunk_tiles;
+        const cx_count = self.chunksX();
         var count: usize = 0;
         for (edits) |edit| {
-            const cell_index = self.navCellIndexForTile(world_system, edit) orelse continue;
-            const chunk = self.chunkOf(cell_index);
-            if (self.dirty_stamp.items[chunk] == epoch) continue;
-            self.dirty_stamp.items[chunk] = epoch;
-            count += 1;
+            const level_grid = self.grid(edit.level) orelse continue;
+            const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
+            var cy = span.min_y / ct;
+            const cy1 = span.max_y / ct;
+            while (cy <= cy1) : (cy += 1) {
+                var cx = span.min_x / ct;
+                const cx1 = span.max_x / ct;
+                while (cx <= cx1) : (cx += 1) {
+                    const chunk: u32 = @intCast(cy * cx_count + cx);
+                    if (self.dirty_stamp.items[chunk] == epoch) continue;
+                    self.dirty_stamp.items[chunk] = epoch;
+                    count += 1;
+                }
+            }
         }
         return count;
     }
@@ -2115,6 +2134,67 @@ test "incremental nav update across distant chunks in one batch matches a full r
     // Both distant chunks ended blocked in the incremental graph's mask (no dropped cell).
     const nav = system.graph.grid(0).?;
     for (cells) |cell| try std.testing.expect(nav.isBlockedCell(.{ .x = @intCast(cell.x), .y = @intCast(cell.y) }));
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "incremental nav update forced-parallel remask and patch match a serial full rebuild" {
+    // The adaptive tuner usually runs a small dig inline, so the threaded remask/patch branches go
+    // unexercised. This pins both: forcing adaptive=false with items_per_range=1 over a multi-chunk
+    // dig drives the parallel path (asserted via ran_inline == false for BOTH stages), and the
+    // disjoint-window result must still be byte-identical to a fresh serial full rebuild.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+    // Force the parallel schedule rather than letting the tuner keep the small batch inline.
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk set
+    // and the patch dirty set exceed one chunk and actually fan out.
+    const cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    for (cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+
+    // Both stages must have actually threaded, not fallen back to the inline slot-0 path.
+    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(cap);
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+
+    const inc = system.graph.levelGraph(0).?;
+    const full = rebuilt.graph.levelGraph(0).?;
+    try std.testing.expectEqualSlices(PortalNode, full.portals.items, inc.portals.items);
+    try std.testing.expectEqualSlices(u32, full.cell_to_portal.items, inc.cell_to_portal.items);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
 }
 

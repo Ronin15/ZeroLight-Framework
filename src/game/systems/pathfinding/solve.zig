@@ -587,3 +587,52 @@ pub fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slo
     system.solved_paths.items[pending_index].stitched_offset = offset;
     system.solved_paths.items[pending_index].stitched_len = count;
 }
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+test "lowerBoundLinkRef finds incident range bounds without bleeding across levels" {
+    // Sorted by (level, cell): two refs at (0,5), one at (0,9), one at (1,5).
+    const refs = [_]LinkEdgeRef{
+        .{ .level = 0, .cell = 5, .index = 0, .reverse = false },
+        .{ .level = 0, .cell = 5, .index = 1, .reverse = false },
+        .{ .level = 0, .cell = 9, .index = 2, .reverse = false },
+        .{ .level = 1, .cell = 5, .index = 3, .reverse = false },
+    };
+
+    // Exact key lands on the FIRST of the equal (0,5) run; the incident loop yields both
+    // (0,5) entries and stops at (0,9).
+    try std.testing.expectEqual(@as(usize, 0), lowerBoundLinkRef(&refs, 0, 5));
+    // A gap key (0,7) lands on the next-greater (0,9); the incident loop sees no (0,7) and
+    // breaks immediately (no false links).
+    try std.testing.expectEqual(@as(usize, 2), lowerBoundLinkRef(&refs, 0, 7));
+    // (0,9) yields only the (0,9) entry and must NOT bleed across the level boundary into (1,5).
+    try std.testing.expectEqual(@as(usize, 2), lowerBoundLinkRef(&refs, 0, 9));
+    // First entry on the next level resolves to the (1,5) index, not the level-0 tail.
+    try std.testing.expectEqual(@as(usize, 3), lowerBoundLinkRef(&refs, 1, 5));
+    // A key past every entry returns items.len.
+    try std.testing.expectEqual(@as(usize, 4), lowerBoundLinkRef(&refs, 2, 0));
+    // The empty slice is well-defined.
+    try std.testing.expectEqual(@as(usize, 0), lowerBoundLinkRef(&.{}, 0, 0));
+}
+
+test "reconstructLocalPath walks the parent chain into start-to-goal order" {
+    var scratch = SearchScratch{};
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.reserve(std.testing.allocator, 64, 16, 16, 16, 16);
+
+    // Freshen each chain cell this generation FIRST (slotFor resets parent on first touch),
+    // then stamp the parent links 0 <- 1 <- 2 <- 3 so the walk has a chain to follow.
+    for ([_]usize{ 0, 1, 2, 3 }) |cell| _ = scratch.slotFor(cell).?;
+    scratch.slot_parent.items[1] = 0;
+    scratch.slot_parent.items[2] = 1;
+    scratch.slot_parent.items[3] = 2;
+
+    reconstructLocalPath(&scratch, 0, 3);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, scratch.path_scratch.items);
+
+    // A start == goal request yields the single start cell.
+    reconstructLocalPath(&scratch, 0, 0);
+    try std.testing.expectEqualSlices(u32, &.{0}, scratch.path_scratch.items);
+}

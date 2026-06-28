@@ -150,3 +150,38 @@ test "pathfinding rebuild fails loud on oversized nav world" {
     // 512x512 cells far exceed a 1 KiB nav-memory ceiling.
     try std.testing.expectError(NavGridError.NavWorldTooLarge, system.rebuildStaticNavGrid(&data, 512, 512, 32));
 }
+
+fn testBudget(max_bytes: usize) NavMemoryBudget {
+    return .{
+        .max_bytes = max_bytes,
+        .level_count = 1,
+        .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
+        .max_group_fields = 8,
+        .max_explored_nodes = 4096,
+        .max_stored_path_cells = 256,
+        .worker_participant_count = 1,
+        .max_cached_results = 256,
+        .max_solved_requests_per_step = 512,
+        .max_stitched_path_cells = 256,
+        .chunk_tiles = 16,
+        .link_count = 0,
+    };
+}
+
+test "nav memory budget saturates on overflowing dimensions instead of wrapping" {
+    // width * height overflows usize. Saturating arithmetic clamps requiredBytes to maxInt so
+    // check rejects; a wrapping (* instead of *|) regression would fold the cell term to a small
+    // value (e.g. (1<<33)*(1<<33) wraps to 4) and could slip under the ceiling. A 1 GiB ceiling
+    // makes the contrast stark: only a saturated estimate exceeds it.
+    const budget = testBudget(1 << 30);
+    const huge: usize = 1 << 33;
+    try std.testing.expect(budget.requiredBytes(huge, huge) == std.math.maxInt(usize));
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, budget.check(huge, huge));
+}
+
+test "nav memory budget passes a large but sparse world" {
+    // A real 1024x1024 single-level world fits comfortably under a 1 GiB ceiling, so the gate is
+    // not merely always-failing — it admits large sparse worlds while rejecting overflowed ones.
+    const budget = testBudget(1 << 30);
+    try budget.check(1024, 1024);
+}

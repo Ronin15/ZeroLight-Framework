@@ -24,13 +24,12 @@ pub const PathView = @import("pathfinding/types.zig").PathView;
 pub const PathStatus = @import("pathfinding/types.zig").PathStatus;
 pub const NavCellEdit = @import("pathfinding/types.zig").NavCellEdit;
 pub const NavUpdateStats = @import("pathfinding/types.zig").NavUpdateStats;
-pub const PathQueryKey = @import("pathfinding/types.zig").PathQueryKey;
-pub const GridCell = @import("pathfinding/types.zig").GridCell;
 pub const PathfindingConfig = @import("pathfinding/types.zig").PathfindingConfig;
 pub const NavGridError = @import("pathfinding/types.zig").NavGridError;
 pub const pathfinding_range_alignment_items = @import("pathfinding/types.zig").pathfinding_range_alignment_items;
 pub const default_max_fallback_requests_per_step = @import("pathfinding/types.zig").default_max_fallback_requests_per_step;
 pub const default_max_solves_per_frame = @import("pathfinding/types.zig").default_max_solves_per_frame;
+pub const default_nav_chunk_tiles = @import("pathfinding/types.zig").default_nav_chunk_tiles;
 
 test {
     _ = @import("pathfinding/types.zig");

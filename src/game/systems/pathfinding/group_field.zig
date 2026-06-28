@@ -98,13 +98,13 @@ pub const GroupField = struct {
         return if (self.stamps.items[index] == self.generation) self.costs.items[index] else unreachable_cost;
     }
 
-    pub fn setCost(self: *GroupField, index: usize, value: u32, dir: u8) void {
+    fn setCost(self: *GroupField, index: usize, value: u32, dir: u8) void {
         self.stamps.items[index] = self.generation;
         self.costs.items[index] = value;
         self.flow_dir.items[index] = dir;
     }
 
-    pub fn nextGeneration(self: *GroupField) void {
+    fn nextGeneration(self: *GroupField) void {
         self.generation +%= 1;
         if (self.generation == 0) {
             @memset(self.stamps.items, 0);
@@ -114,7 +114,7 @@ pub const GroupField = struct {
     }
 
     // Links `index` (already costed) into its distance bucket at the head.
-    pub fn bucketPush(self: *GroupField, index: usize, distance: u32) void {
+    fn bucketPush(self: *GroupField, index: usize, distance: u32) void {
         const b = distance % group_field_buckets;
         const head = self.buckets.items[b];
         self.bucket_next.items[index] = head;
@@ -125,7 +125,7 @@ pub const GroupField = struct {
     }
 
     // Unlinks `index` from its current distance bucket in O(1).
-    pub fn bucketUnlink(self: *GroupField, index: usize, distance: u32) void {
+    fn bucketUnlink(self: *GroupField, index: usize, distance: u32) void {
         const prev = self.bucket_prev.items[index];
         const next = self.bucket_next.items[index];
         if (prev != no_cell) {
@@ -153,9 +153,9 @@ pub const GroupField = struct {
         return true;
     }
 
-    // Expands at most `budget` cells of the integration via Dial's monotone bucket
-    // queue. Returns true when the field finished. The distance cursor advances only
-    // forward, so the build resumes correctly across budgeted frames.
+    /// Expands at most `budget` cells of the integration via Dial's monotone bucket
+    /// queue. Returns true when the field finished. The distance cursor advances only
+    /// forward, so the build resumes correctly across budgeted frames.
     pub fn expand(self: *GroupField, grid: *const NavGrid, budget: usize) bool {
         std.debug.assert(budget != 0); // a zero budget makes no progress and never reaches .ready
         var expansions: usize = 0;
@@ -209,7 +209,7 @@ pub const GroupField = struct {
 
     // Pops the next-lowest-distance queued cell, advancing the monotone distance cursor
     // over empty buckets. Returns null when the queue is empty.
-    pub fn popNext(self: *GroupField) ?usize {
+    fn popNext(self: *GroupField) ?usize {
         var scanned: u32 = 0;
         // The live window spans at most group_field_buckets distinct residues (max octile step =
         // diagonal_cost), so one pass over every bucket either finds work or drains the queue.
@@ -232,7 +232,7 @@ pub const GroupField = struct {
 
     // The cell index of next_index's recorded flow parent (the cell its flow_dir points
     // to), used only for the equal-cost predecessor tie-break.
-    pub fn flowParentIndex(self: *const GroupField, grid: *const NavGrid, next_index: usize) usize {
+    fn flowParentIndex(self: *const GroupField, grid: *const NavGrid, next_index: usize) usize {
         const dir = self.flow_dir.items[next_index];
         if (dir == no_flow) return next_index;
         const neighbor = neighbor_dirs[dir];
@@ -241,7 +241,7 @@ pub const GroupField = struct {
         return grid.indexForCell(.{ .x = x + neighbor.x, .y = y + neighbor.y }) orelse next_index;
     }
 
-    // Samples the flow direction at `cell_index`, returning the stepped waypoint.
+    /// Samples the flow direction at `cell_index`, returning the stepped waypoint.
     pub fn sample(self: *const GroupField, grid: *const NavGrid, cell_index: usize) ?math.Vec2 {
         if (self.state != .ready and self.state != .building) return null;
         if (self.stamps.items[cell_index] != self.generation) return null;

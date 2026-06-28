@@ -3,7 +3,6 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
-const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
@@ -924,4 +923,22 @@ test "pathfinding hard fallback budget preserves request denominator" {
     try std.testing.expectEqual(@as(usize, 8), stats.output_count);
     try std.testing.expectEqual(@as(usize, 8), stats.fallback_deferred_count);
     try std.testing.expectEqual(@as(usize, 8), stats.deferred_count);
+}
+
+test "pathfinding hard fallback services the full ceiling across counts" {
+    // Pins the unbudgeted hard-fallback invariant the runWorkloadCase cold_fallback assert
+    // relies on: the single-cell-per-lane obstacle field forces 100% fallback at every count,
+    // including the larger stress geometries (256/512/1024) where an abstract detour around the
+    // blocking cell would otherwise be possible. Serviced is capped only by the per-frame solve
+    // ceiling, so it equals min(count, ceiling). If a future fixture change let an agent route
+    // abstractly, this fails loudly in Debug rather than only when a benchmark happens to run.
+    const options = suite.Options{ .warmup_iterations = 0, .iterations = 1 };
+    for ([_]usize{ 16, 64, 128, 256, 512, 1024 }) |count| {
+        const expected = @min(count, default_max_solves_per_frame);
+        const stats = try runHardFallbackCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
+        try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+        try std.testing.expectEqual(count, stats.item_count);
+        try std.testing.expectEqual(expected, stats.candidate_pairs);
+        try std.testing.expectEqual(expected, stats.output_count);
+    }
 }

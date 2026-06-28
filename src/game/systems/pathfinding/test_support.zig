@@ -13,6 +13,11 @@ const EntityId = @import("../../data_system.zig").EntityId;
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const PathfindingCapacity = @import("types.zig").PathfindingCapacity;
+const assets = @import("../../../assets/assets.zig");
+const manifest = @import("../../../assets/manifest.zig");
+const world_tileset_meta = @import("../../../assets/world_tileset_meta.zig");
+const WorldTilesetMeta = world_tileset_meta.WorldTilesetMeta;
+const TileId = @import("../../world_system.zig").TileId;
 
 pub fn addNavBody(data: *DataSystem, position: math.Vec2, size: math.Vec2, static: bool) !EntityId {
     const entity = try data.createEntity();
@@ -47,16 +52,16 @@ pub fn baselineCapacity() PathfindingCapacity {
 
 // Loads the world tileset metadata used by the demo. Cross-level/abstract tests
 // build real `WorldSystem` worlds from it (no test-only production hooks).
-pub fn loadTestWorldMeta(allocator: std.mem.Allocator) !@import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta {
-    const asset_store = @import("../../../assets/assets.zig").AssetStore.init(allocator, std.testing.io, "assets");
-    return @import("../../../assets/world_tileset_meta.zig").load(
+pub fn loadTestWorldMeta(allocator: std.mem.Allocator) !WorldTilesetMeta {
+    const asset_store = assets.AssetStore.init(allocator, std.testing.io, "assets");
+    return world_tileset_meta.load(
         allocator,
         asset_store,
-        @import("../../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+        manifest.spriteSpec(.world_tileset).metadata_path.?,
     );
 }
 
-pub fn requireTestTile(meta: *const @import("../../../assets/world_tileset_meta.zig").WorldTilesetMeta, name: []const u8) !@import("../../world_system.zig").TileId {
+pub fn requireTestTile(meta: *const WorldTilesetMeta, name: []const u8) !TileId {
     return (meta.tileByName(name) orelse return error.TestExpectedEqual).id;
 }
 

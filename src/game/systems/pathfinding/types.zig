@@ -134,6 +134,11 @@ pub const unreachable_cost: u32 = std.math.maxInt(u32);
 // Sentinel for "no parent ref" in the abstract search's packed-ref parent column.
 pub const no_ref: usize = std.math.maxInt(usize);
 
+// Half-open-rect shrink applied to a max world coordinate before clamping to a cell, so a
+// rect whose edge lands exactly on a cell boundary does not spuriously include the next
+// cell. Must stay identical at every rect->cell site for remask-vs-rebuild parity.
+pub const rect_edge_epsilon: f32 = 0.001;
+
 comptime {
     // The abstract search identifies a node by a packed (level << 32) | local_node ref
     // stored in a usize, so the target must have a 64-bit usize.
@@ -142,7 +147,9 @@ comptime {
 
 // Packs a per-level abstract node identity. local is a node index within the level's
 // own NavLevelGraph.portals run, so packing keeps cross-level search keys distinct
-// without a global node numbering.
+// without a global node numbering. Sentinel contract: refLevel/refLocal must only decode
+// a real packed ref — decoding no_ref/no_parent (maxInt) would panic the refLevel @intCast,
+// and packRef(0xFFFF, 0xFFFFFFFF) aliases no_ref exactly. Callers guard the sentinel first.
 pub fn packRef(level: u16, local: u32) usize {
     return (@as(usize, level) << 32) | local;
 }
@@ -229,6 +236,7 @@ pub const ChangedSpan = struct {
 // Tile index containing a world coordinate, clamped to [0, count-1]. Negatives map
 // to 0; the float floor guards against the inf/NaN illegal-behavior trap.
 pub fn tileIndexClamped(value: f32, tile_size: f32, count: u16) u16 {
+    if (count == 0) return 0; // empty grid: no valid index, and guards clamp(.,0,-1)
     if (!(value > 0)) return 0;
     const idx = math.floorToI32(value / tile_size);
     const max_index: i32 = @as(i32, @intCast(count)) - 1;
@@ -474,6 +482,14 @@ pub fn orderU32(key: u32, item: u32) std.math.Order {
 }
 // Octile distance between two cell indices, in the same cardinal/diagonal cost
 // units used by the local A*, so abstract and refined costs are comparable.
+// Shared octile cost core: diagonal steps plus straight steps, weighted by the step costs.
+// u64 so a pathological delta cannot overflow mid-formula; both callers saturate to u32.
+fn octileCost(dx: u64, dy: u64) u64 {
+    const diagonal = @min(dx, dy);
+    const straight = @max(dx, dy) - diagonal;
+    return diagonal * diagonal_cost + straight * cardinal_cost;
+}
+
 pub fn octileCells(width: usize, a: u32, b: u32) u32 {
     const ax: i64 = @intCast(a % width);
     const ay: i64 = @intCast(a / width);
@@ -481,10 +497,7 @@ pub fn octileCells(width: usize, a: u32, b: u32) u32 {
     const by: i64 = @intCast(b / width);
     const dx: u64 = @intCast(@abs(bx - ax));
     const dy: u64 = @intCast(@abs(by - ay));
-    const diagonal = @min(dx, dy);
-    const straight = @max(dx, dy) - diagonal;
-    const cost = diagonal * diagonal_cost + straight * cardinal_cost;
-    return @intCast(@min(cost, @as(u64, std.math.maxInt(u32))));
+    return @intCast(@min(octileCost(dx, dy), @as(u64, std.math.maxInt(u32))));
 }
 pub fn popHeap(heap: *std.ArrayList(OpenNode)) OpenNode {
     std.debug.assert(heap.items.len != 0); // empty pop would underflow `last` below
@@ -533,13 +546,12 @@ pub fn oppositeDirIndex(dir_index: usize) u8 {
 }
 
 // Octile heuristic over explicit cell coordinates; callers pass coordinates they
-// already hold so the hot loop avoids re-deriving them via div/mod.
+// already hold so the hot loop avoids re-deriving them via div/mod. Shares octileCost
+// with octileCells so both saturate identically instead of one silently wrapping.
 pub fn octileXY(from_x: i32, from_y: i32, to_x: i32, to_y: i32) u32 {
-    const dx: u32 = @intCast(@abs(to_x - from_x));
-    const dy: u32 = @intCast(@abs(to_y - from_y));
-    const diagonal = @min(dx, dy);
-    const straight = @max(dx, dy) - diagonal;
-    return diagonal * diagonal_cost + straight * cardinal_cost;
+    const dx: u64 = @abs(to_x - from_x);
+    const dy: u64 = @abs(to_y - from_y);
+    return @intCast(@min(octileCost(dx, dy), @as(u64, std.math.maxInt(u32))));
 }
 
 pub fn lessNode(a: OpenNode, b: OpenNode) bool {
@@ -572,12 +584,6 @@ pub fn siftDown(heap: []OpenNode, start_index: usize) void {
     }
 }
 
-pub fn collisionBoundsIndex(entities: []const EntityId, target: EntityId) ?usize {
-    for (entities, 0..) |entity, index| {
-        if (entity.index == target.index and entity.generation == target.generation) return index;
-    }
-    return null;
-}
 pub fn keysEqual(a: PathQueryKey, b: PathQueryKey) bool {
     return a.nav_version == b.nav_version and
         a.agent_class == b.agent_class and
