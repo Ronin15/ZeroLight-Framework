@@ -35,6 +35,15 @@ under `zig-out/bin`. If you run the binary directly, run it from `zig-out/bin`
 or provide a deliberate asset-root layout; launching from the repo root can find
 source assets while missing generated shader outputs.
 
+**Running outside the install directory:** the asset store resolves files in
+this order: (1) the configured asset root (default `assets/`) relative to the
+current working directory; (2) the same relative root resolved from the
+directory containing the executable (exe-relative fallback). The fallback fires
+only when the configured root directory does not exist at all, not when
+individual files are missing. To use it, place a full `assets/` tree beside
+the binary, or invoke with `-Dasset-root=<absolute-path>` at build time to
+bake an absolute path into the binary.
+
 ## Release Modes
 
 The default optimize mode is `Debug`, matching standard Zig build behavior. Use

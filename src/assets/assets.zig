@@ -132,3 +132,12 @@ test "readAlloc enforces maximum byte limit" {
 
     try std.testing.expectError(error.StreamTooLong, assets.readAlloc("shaders/sprite.vert.glsl", 1));
 }
+
+test "readable asset falls back to exe-relative path when configured root is absent" {
+    const allocator = std.testing.allocator;
+    // Root "no_such_assets_root_xyzzy" does not exist → resolveReadablePath
+    // enters the exe-relative fallback path. The fallback finds no file next to
+    // the binary either, returning FileNotFound rather than an unexpected error.
+    const assets = AssetStore.init(allocator, std.testing.io, "no_such_assets_root_xyzzy");
+    try std.testing.expectError(error.FileNotFound, assets.resolveReadablePath("shaders/sprite.vert.spv"));
+}

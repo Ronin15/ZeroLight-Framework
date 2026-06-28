@@ -627,6 +627,18 @@ fn shaderFormatsForTarget(os_tag: std.Target.Os.Tag) u32 {
     };
 }
 
+// Verify at build-compile time that the three currently supported targets each
+// produce a format the runtime selectShaderSetFromFormats accepts (MSL > DXIL >
+// SPIR-V). Adding a fourth OS requires updating this array as well.
+comptime {
+    const runtime_accepted: u32 = shader_format_spirv | shader_format_dxil | shader_format_msl;
+    for ([_]std.Target.Os.Tag{ .macos, .linux, .windows }) |os_tag| {
+        const built = shaderFormatsForTarget(os_tag);
+        if ((built & runtime_accepted) == 0)
+            @compileError("shaderFormatsForTarget produces a format the runtime cannot select");
+    }
+}
+
 fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
     if (target.query.isNative() and target.result.os.tag == .linux and target.result.abi.isGnu()) {
         return true;
@@ -677,7 +689,10 @@ fn addSpirvShaderSteps(b: *std.Build, shader_compiler: []const u8, asset_root: [
             cmd.addFileArg(b.path(stage_source.source_path));
             cmd.addArg("-o");
             const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{stage_source.output_stem}));
-            install_steps[install_index] = &b.addInstallBinFile(spv, b.fmt("{s}/shaders/{s}.spv", .{ asset_root, stage_source.output_stem })).step;
+            const check = b.addCheckFile(spv, .{});
+            const install = b.addInstallBinFile(spv, b.fmt("{s}/shaders/{s}.spv", .{ asset_root, stage_source.output_stem }));
+            install.step.dependOn(&check.step);
+            install_steps[install_index] = &install.step;
             install_index += 1;
         }
     }
@@ -706,7 +721,10 @@ fn addMslShaderSteps(
             msl_cmd.addFileArg(spv);
             msl_cmd.addArgs(&.{ "--msl", "--stage", stage_source.stage.spirvCrossArg(), "--output" });
             const msl = msl_cmd.addOutputFileArg(b.fmt("{s}.msl", .{stage_source.output_stem}));
-            install_steps[install_index] = &b.addInstallBinFile(msl, b.fmt("{s}/shaders/{s}.msl", .{ asset_root, stage_source.output_stem })).step;
+            const check = b.addCheckFile(msl, .{});
+            const install = b.addInstallBinFile(msl, b.fmt("{s}/shaders/{s}.msl", .{ asset_root, stage_source.output_stem }));
+            install.step.dependOn(&check.step);
+            install_steps[install_index] = &install.step;
             install_index += 1;
         }
     }
@@ -742,7 +760,10 @@ fn addDxilShaderSteps(
             const dxil = dxil_cmd.addOutputFileArg(b.fmt("{s}.dxil", .{stage_source.output_stem}));
             dxil_cmd.addFileArg(hlsl);
 
-            install_steps[install_index] = &b.addInstallBinFile(dxil, b.fmt("{s}/shaders/{s}.dxil", .{ asset_root, stage_source.output_stem })).step;
+            const check = b.addCheckFile(dxil, .{});
+            const install = b.addInstallBinFile(dxil, b.fmt("{s}/shaders/{s}.dxil", .{ asset_root, stage_source.output_stem }));
+            install.step.dependOn(&check.step);
+            install_steps[install_index] = &install.step;
             install_index += 1;
         }
     }

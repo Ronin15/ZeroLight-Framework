@@ -18,12 +18,38 @@ driver name so SDL chooses the backend. Sprite material and pipeline creation
 live under `src/render/gpu/` and load the shader files matching
 `SDL_GetGPUShaderFormats()`.
 Runtime shader selection prefers MSL, then DXIL, then SPIR-V when multiple
-formats are available.
+formats are available. A comptime assertion in `build.zig` verifies that every
+supported target's format is accepted by the runtime selector; adding a new OS
+target without wiring its format will fail at build-compile time.
 
-Shader metadata currently exists in both the build graph and the runtime render
-pipeline. When adding a shader or material, update the `shader_programs` table
-in `build.zig` and the render-owned pipeline loader until a shared manifest
-replaces the parallel registries.
+Shader bytecode paths are derived from the program name and stage by
+`src/render/gpu/shader_paths.zig` so that runtime paths are provably consistent
+with the build's output stems. Material descriptors use these helpers instead of
+hardcoded path strings.
+
+## Adding a New Material
+
+To add a new GPU material (shader + pipeline):
+
+1. Create GLSL sources in `assets/shaders/{name}.vert.glsl` and
+   `assets/shaders/{name}.frag.glsl`.
+2. Add an entry to the `shader_programs` array in `build.zig` (name + source
+   paths). The build will compile and check the output files automatically.
+3. Add the new variant to the `Material` enum in
+   `src/render/sprite_batch.zig`.
+4. Create `src/render/gpu/{name}_pipeline.zig` with a material descriptor
+   struct that uses `shader_paths.vertex("{name}", "spv")` etc. for paths and
+   `sprite_pipeline.selectShaderSet` (or `shaderSetForFormat`) for format
+   selection. List resource counts (sampler, storage buffer, uniform buffer
+   counts) — no SDL_GPU handles or game-state references cross this boundary.
+5. Add a `*c.SDL_GPUGraphicsPipeline` field to `Renderer` in
+   `src/render/renderer.zig`.
+6. Call `create{Name}Pipeline()` in `Renderer.init()`.
+7. Add a bind case to the `switch (group.material)` in `Renderer.endFrame()`.
+
+Rule: game-facing draw calls reference `Material` enum tags only. No SDL_GPU
+handles, pipeline pointers, or shader format strings cross the renderer boundary
+into game code.
 
 ## Sprite Rendering
 

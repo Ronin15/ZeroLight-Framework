@@ -12,8 +12,38 @@ const std = @import("std");
 const AssetStore = @import("../../assets/assets.zig").AssetStore;
 const sprite_batch = @import("../sprite_batch.zig");
 const sprite_pipeline = @import("sprite_pipeline.zig");
+const shader_paths = @import("shader_paths.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
+
+test "tilemap shader paths match derived names for each format" {
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "spv"), tilemap_material.spirv_vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "spv"), tilemap_material.spirv_fragment_path);
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "msl"), tilemap_material.msl_vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "msl"), tilemap_material.msl_fragment_path);
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "dxil"), tilemap_material.dxil_vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "dxil"), tilemap_material.dxil_fragment_path);
+}
+
+test "tilemap shaderSetForFormat selects correct paths per format" {
+    const msl = shaderSetForFormat(c.SDL_GPU_SHADERFORMAT_MSL);
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_MSL, msl.format);
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "msl"), msl.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "msl"), msl.fragment_path);
+    try std.testing.expectEqualStrings("main0", msl.entrypoint);
+
+    const dxil = shaderSetForFormat(c.SDL_GPU_SHADERFORMAT_DXIL);
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_DXIL, dxil.format);
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "dxil"), dxil.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "dxil"), dxil.fragment_path);
+    try std.testing.expectEqualStrings("main", dxil.entrypoint);
+
+    const spv = shaderSetForFormat(c.SDL_GPU_SHADERFORMAT_SPIRV);
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_SPIRV, spv.format);
+    try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "spv"), spv.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "spv"), spv.fragment_path);
+    try std.testing.expectEqualStrings("main", spv.entrypoint);
+}
 
 pub const ShaderSet = sprite_pipeline.ShaderSet;
 
@@ -36,14 +66,14 @@ pub const TilemapMaterial = struct {
 
 pub const tilemap_material = TilemapMaterial{
     .name = "tilemap",
-    .spirv_vertex_path = "shaders/tilemap.vert.spv",
-    .spirv_fragment_path = "shaders/tilemap.frag.spv",
+    .spirv_vertex_path = shader_paths.vertex("tilemap", "spv"),
+    .spirv_fragment_path = shader_paths.fragment("tilemap", "spv"),
     .spirv_entrypoint = "main",
-    .dxil_vertex_path = "shaders/tilemap.vert.dxil",
-    .dxil_fragment_path = "shaders/tilemap.frag.dxil",
+    .dxil_vertex_path = shader_paths.vertex("tilemap", "dxil"),
+    .dxil_fragment_path = shader_paths.fragment("tilemap", "dxil"),
     .dxil_entrypoint = "main",
-    .msl_vertex_path = "shaders/tilemap.vert.msl",
-    .msl_fragment_path = "shaders/tilemap.frag.msl",
+    .msl_vertex_path = shader_paths.vertex("tilemap", "msl"),
+    .msl_fragment_path = shader_paths.fragment("tilemap", "msl"),
     .msl_entrypoint = "main0",
     .fragment_samplers = 1,
     .fragment_storage_buffers = 1,

@@ -8,6 +8,7 @@ const log = @import("../../core/logging.zig").render;
 const sprite_batch = @import("../sprite_batch.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
+const shader_paths = @import("shader_paths.zig");
 
 const max_shader_bytes = 1024 * 1024;
 
@@ -28,14 +29,14 @@ pub const SpriteMaterial = struct {
 
 pub const sprite_material = SpriteMaterial{
     .name = "sprite",
-    .spirv_vertex_path = "shaders/sprite.vert.spv",
-    .spirv_fragment_path = "shaders/sprite.frag.spv",
+    .spirv_vertex_path = shader_paths.vertex("sprite", "spv"),
+    .spirv_fragment_path = shader_paths.fragment("sprite", "spv"),
     .spirv_entrypoint = "main",
-    .dxil_vertex_path = "shaders/sprite.vert.dxil",
-    .dxil_fragment_path = "shaders/sprite.frag.dxil",
+    .dxil_vertex_path = shader_paths.vertex("sprite", "dxil"),
+    .dxil_fragment_path = shader_paths.fragment("sprite", "dxil"),
     .dxil_entrypoint = "main",
-    .msl_vertex_path = "shaders/sprite.vert.msl",
-    .msl_fragment_path = "shaders/sprite.frag.msl",
+    .msl_vertex_path = shader_paths.vertex("sprite", "msl"),
+    .msl_fragment_path = shader_paths.fragment("sprite", "msl"),
     .msl_entrypoint = "main0",
     .fragment_samplers = 1,
     .vertex_uniform_buffers = 1,
@@ -265,7 +266,8 @@ test "shader set selection uses spirv when it is the matching format" {
     );
 
     try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_SPIRV, shader_set.format);
-    try std.testing.expectEqualStrings("shaders/sprite.vert.spv", shader_set.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.vertex("sprite", "spv"), shader_set.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("sprite", "spv"), shader_set.fragment_path);
     try std.testing.expectEqualStrings("main", shader_set.entrypoint);
 }
 
@@ -274,4 +276,24 @@ test "shader set selection rejects unsupported format combinations" {
         error.UnsupportedShaderFormat,
         selectShaderSetFromFormats(c.SDL_GPU_SHADERFORMAT_SPIRV, c.SDL_GPU_SHADERFORMAT_MSL),
     );
+}
+
+test "shader set selection matches each platform's single-format build output" {
+    // macOS builds emit MSL only; SDL device on macOS reports MSL only.
+    const msl = try selectShaderSetFromFormats(
+        c.SDL_GPU_SHADERFORMAT_MSL,
+        c.SDL_GPU_SHADERFORMAT_MSL,
+    );
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_MSL, msl.format);
+    try std.testing.expectEqualStrings(shader_paths.vertex("sprite", "msl"), msl.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("sprite", "msl"), msl.fragment_path);
+
+    // Windows builds emit DXIL only; SDL device on Windows reports DXIL only.
+    const dxil = try selectShaderSetFromFormats(
+        c.SDL_GPU_SHADERFORMAT_DXIL,
+        c.SDL_GPU_SHADERFORMAT_DXIL,
+    );
+    try std.testing.expectEqual(c.SDL_GPU_SHADERFORMAT_DXIL, dxil.format);
+    try std.testing.expectEqualStrings(shader_paths.vertex("sprite", "dxil"), dxil.vertex_path);
+    try std.testing.expectEqualStrings(shader_paths.fragment("sprite", "dxil"), dxil.fragment_path);
 }
