@@ -23,7 +23,11 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
 - `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — roadmap sequencing and acceptance.
+- `docs/framework-implementation-slices.md` — live roadmap (Slice 8 hardening,
+  frontier slices 18+, priorities, suggested order); settled slices 0–7 and
+  9–17 are in `docs/framework-implementation-slices-archive.md`.
+- `docs/changelogs/` — per-phase feature changelog summaries.
+- `docs/reviews/` — module deep-dive reviews (e.g. pathfinder).
 
 ## Module Ownership (`src/`)
 
@@ -34,9 +38,10 @@ boundaries just to make a local change easier.
   the fixed-step loop. Keep it thin.
 - `src/config.zig` — shared `AppConfig`, presentation options, clear color, and
   thread-system defaults consumed by build options and runtime startup.
-- `src/app/` — app coordination: `engine.zig`, state stack, `input.zig` +
-  `input_router.zig`, `time_loop.zig` (60Hz), `frame_pacer.zig`, `audio.zig`,
-  `thread_system.zig`, `resolution.zig`.
+- `src/app/` — app coordination: `engine.zig`, `state.zig` (state stack),
+  `input.zig` + `input_router.zig`, `time_loop.zig` (60Hz), `frame_pacer.zig`,
+  `pause_controller.zig`, `audio.zig`, `thread_system.zig`, `resolution.zig`,
+  `runtime_perf_log.zig`.
 - `src/render/` — SDL_GPU rendering: `renderer.zig` is the game-facing facade;
   also `camera.zig`, `resources.zig`, `sprite_batch.zig`, `text.zig`, debug
   overlay. Do **not** import `src/render/gpu/*` outside the render/platform
@@ -44,8 +49,10 @@ boundaries just to make a local change easier.
 - `src/assets/` — runtime asset catalog, safe path resolution, image decode,
   cache, `manifest.zig` (stable sprite/audio IDs), atlas metadata.
 - `src/game/` — gameplay: states/menus, `world_system.zig`, `data_system.zig`,
-  `simulation*.zig` (pipeline, scope), `player.zig`, and `systems/` (movement,
-  ai, steering, collision, particle).
+  `simulation*.zig` (pipeline, scope), `player.zig`, `dig_controller.zig`,
+  `render_prep.zig`/`render_depth.zig`, and `systems/` (movement, ai, steering,
+  collision, collision_response, particle, and the `pathfinding/` subpackage
+  fronted by `pathfinding.zig`).
 - `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
   GPU smoke probe. `src/benchmarks/` — CPU gameplay/render-prep benchmarks.
 
@@ -86,6 +93,8 @@ zig build fmt        # format build.zig, build.zig.zon, and src/
 zig build shaders    # compile GLSL sources to platform GPU shaders
 zig build gpu-smoke  # display-gated renderer pipeline smoke (needs a display)
 zig build package    # install selected-mode binaries and runtime assets
+zig build assets-lint # lint runtime atlases and source sprite consistency
+zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cache
 ```
 
 Default optimize mode is `Debug`. Use `--release=safe|fast|small` only for

@@ -139,6 +139,9 @@ Held gameplay input:
 - `moveRight`
 - `moveUp`
 - `moveDown`
+- `digHole`
+- `digRamp`
+- `digDown`
 
 One-frame commands:
 

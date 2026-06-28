@@ -59,6 +59,13 @@ game-specific behavior under `src/game/`.
   response-policy movement corrections.
 - `src/game/systems/particle.zig` owns state-local transient particle effects
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
+- `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
+  (types, nav_grid, nav_graph, caches, group_field, scratch, solve, system,
+  nav_memory, test_support) for frame-delayed Z-aware grid navigation.
+- `src/game/dig_controller.zig` is the pipeline-owned controller for player
+  digging, authoring world-tile edits and navigation-invalidation signals.
+- `src/game/render_depth.zig` defines world depth bands and z-order intent;
+  `src/game/render_prep.zig` resolves entities to ordered render-draw records.
 - `src/gpu_smoke.zig` is the GPU smoke executable entry point, while
   `src/platform/gpu_smoke_impl.zig` owns the display-gated SDL_GPU probe.
 - `src/platform/sdl.zig` contains shared SDL, SDL_ttf, and SDL_mixer C imports

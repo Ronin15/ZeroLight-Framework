@@ -133,7 +133,7 @@ shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — 
 tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
 layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
 with dynamic entities, so an actor in a dug pit renders between the floor below and
-walls above. `submitStaticDenseGeometry` takes the player's active level and skips
+walls above. `WorldSystem.submitStaticDenseGeometry` takes the player's active level and skips
 the floors above it (re-submitting only when the plane changes), so descending
 reveals the plane the player stands on instead of leaving it buried under the
 surface.
