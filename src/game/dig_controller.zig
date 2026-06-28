@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const math = @import("../core/math.zig");
+const InputState = @import("../app/input.zig").InputState;
 const DataSystem = @import("data_system.zig").DataSystem;
 const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
@@ -25,6 +26,9 @@ const TileId = @import("world_system.zig").TileId;
 const CellCoord = @import("world_system.zig").CellCoord;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
+const DigIntent = @import("simulation.zig").DigIntent;
+const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
+const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 
 /// Walkable tiles the dig carves, resolved by the gameplay state from the tileset
 /// meta and passed in at pipeline init, so the controller stays free of asset
@@ -33,14 +37,55 @@ const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 pub const DigConfig = struct {
     ramp_tile: TileId = 0,
     tunnel_tile: TileId = 0,
+
+    /// Resolves the dig tiles by name from the world tileset metadata. `ramp_tile`
+    /// climbs between planes; `tunnel_tile` is the walkable floor mined through
+    /// solid underground dirt (also the tile a fall carves into its landing cell).
+    pub fn fromMeta(meta: *const WorldTilesetMeta) !DigConfig {
+        return .{
+            .ramp_tile = (meta.tileByName("cobblestone") orelse return error.WorldTilesetMissingDigTile).id,
+            .tunnel_tile = (meta.tileByName("cave_0") orelse return error.WorldTilesetMissingDigTile).id,
+        };
+    }
+
+    pub fn fromRuntimeAssets(runtime_assets: *const RuntimeAssets) !DigConfig {
+        const meta = runtime_assets.worldTilesetMeta() orelse return error.WorldTilesetMetadataUnavailable;
+        return fromMeta(meta);
+    }
 };
 
 pub const DigController = struct {
     ramp_tile: TileId,
     tunnel_tile: TileId,
+    // Rising-edge latches so one held dig key digs one cell per press, not per frame.
+    hole_held_last: bool = false,
+    down_held_last: bool = false,
+    ramp_held_last: bool = false,
+    // Last grid cell the player occupied, so plane traversal (fall/ramp) fires only
+    // on cell entry — anti-oscillation and the one-level-per-fall guard.
+    player_last_cell: ?CellCoord = null,
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
+    }
+
+    /// Translates the held dig actions into this step's `dig_intent` on the rising
+    /// edge so one press digs one cell. When several fire the same frame, hole
+    /// (forward) wins, then down, then ramp. `process` consumes the intent.
+    pub fn captureIntent(self: *DigController, input: *const InputState, frame: *SimulationFrame) void {
+        const hole_held = input.isHeld(.digHole);
+        const down_held = input.isHeld(.digDown);
+        const ramp_held = input.isHeld(.digRamp);
+        if (hole_held and !self.hole_held_last) {
+            frame.dig_intent = .hole;
+        } else if (down_held and !self.down_held_last) {
+            frame.dig_intent = .down;
+        } else if (ramp_held and !self.ramp_held_last) {
+            frame.dig_intent = .ramp;
+        }
+        self.hole_held_last = hole_held;
+        self.down_held_last = down_held;
+        self.ramp_held_last = ramp_held;
     }
 
     /// Applies this step's dig intent to the cell the player faces on their current
@@ -110,7 +155,76 @@ pub const DigController = struct {
         });
         return changed;
     }
+
+    /// Updates the player's plane after movement. On entering a new cell: follow a
+    /// ramp link to its other plane, else fall one level if standing over a hole
+    /// with a level below. The cell-entry guard prevents ramp oscillation and caps
+    /// a hole to a single one-level drop. Player-only by design: NPCs have no
+    /// per-entity plane and stay on the surface, so they never fall or take ramps
+    /// (autonomous NPC descent is a separate, deferred slice).
+    pub fn applyPlaneTraversal(self: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
+        const body = data.movementBodyConst(player.entity) orelse return;
+        const visual = data.primitiveVisualConst(player.entity) orelse return;
+        const center_x = body.position.x + visual.size.x * 0.5;
+        const center_y = body.position.y + visual.size.y * 0.5;
+        const target = world.cellContaining(center_x, center_y) orelse return;
+        const cell = CellCoord{ .x = target.x, .y = target.y };
+
+        if (self.player_last_cell) |last| {
+            if (last.x == cell.x and last.y == cell.y) return;
+        }
+        self.player_last_cell = cell;
+
+        if (world.rampLinkOtherLevel(player.current_level, cell)) |other| {
+            setPlayerLevel(world, data, player, other, cell);
+            return;
+        }
+        const below: usize = @as(usize, player.current_level) + 1;
+        if (below < world.levelCount() and
+            world.denseFloorIsEmpty(player.current_level, cell.x, cell.y))
+        {
+            const below_level: u16 = @intCast(below);
+            // The plane below is solid dirt; carve the landing cell walkable so the
+            // player never lands embedded in rock (else the tile gate would shove
+            // them straight back out). Carve before the snap so the cell is open.
+            try self.carveLandingCell(world, frame, below_level, cell);
+            setPlayerLevel(world, data, player, below_level, cell);
+        }
+    }
+
+    /// Carves a fall's landing cell to the walkable tunnel tile and queues the tile
+    /// change for the post-commit nav re-mask. No-op when the level has no floor
+    /// layer or the cell was already walkable.
+    fn carveLandingCell(self: *const DigController, world: *WorldSystem, frame: *SimulationFrame, level: u16, cell: CellCoord) !void {
+        const floor_layer = world.denseFloorLayerForLevel(level) orelse return;
+        const changed = (try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile)) orelse return;
+        try frame.events.appendRequired(.{
+            .stage = .structural_commit,
+            .payload = .{ .world_tile_changed = changed },
+        });
+    }
 };
+
+/// Moves the player onto a plane: tracks the level and snaps the body's render z
+/// (and its previous, since z is not interpolated) to that plane's base. When
+/// descending into a solid lower plane, also snaps x/y flush onto `cell` so the
+/// one-tile-sized body sits inside the carved pocket rather than straddling the
+/// solid neighbors the tile gate would otherwise shove it out of. Level 0 is fully
+/// open, so no x/y snap there.
+fn setPlayerLevel(world: *const WorldSystem, data: *DataSystem, player: *Player, level: u16, cell: CellCoord) void {
+    player.current_level = level;
+    const body = data.movementBodyPtr(player.entity) orelse return;
+    const z = world.levelBaseZ(level);
+    body.position_z.* = z;
+    body.previous_z.* = z;
+    if (level == 0) return;
+    const snap_x = @as(f32, @floatFromInt(cell.x)) * world.tile_size;
+    const snap_y = @as(f32, @floatFromInt(cell.y)) * world.tile_size;
+    body.position_x.* = snap_x;
+    body.position_y.* = snap_y;
+    body.previous_x.* = snap_x;
+    body.previous_y.* = snap_y;
+}
 
 fn facingOffset(direction: Facing) math.Vec2 {
     return switch (direction) {
@@ -316,4 +430,33 @@ test "dig controller is a no-op for none intent or an off-world target" {
     var off_frame = try runDig(&tw, dig, .hole);
     defer off_frame.deinit();
     try std.testing.expectEqual(@as(usize, 0), off_frame.events.mergedItems().len);
+}
+
+test "dig controller captures intent once on the rising edge of a held key" {
+    var dig = DigController.init(.{});
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    var input = InputState{};
+    input.setHeld(.digHole, true);
+
+    frame.beginStep();
+    dig.captureIntent(&input, &frame);
+    try std.testing.expectEqual(DigIntent.hole, frame.dig_intent);
+
+    // Still held next step: no second dig.
+    frame.beginStep();
+    dig.captureIntent(&input, &frame);
+    try std.testing.expectEqual(DigIntent.none, frame.dig_intent);
+
+    // Release, then press again: the rising edge fires once more.
+    input.setHeld(.digHole, false);
+    frame.beginStep();
+    dig.captureIntent(&input, &frame);
+    try std.testing.expectEqual(DigIntent.none, frame.dig_intent);
+
+    input.setHeld(.digHole, true);
+    frame.beginStep();
+    dig.captureIntent(&input, &frame);
+    try std.testing.expectEqual(DigIntent.hole, frame.dig_intent);
 }

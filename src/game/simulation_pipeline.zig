@@ -60,7 +60,7 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Mutable world for the dig controller's world-tile authoring. Borrowed for
     /// the step only; persistent tile facts stay owned by the gameplay state.
     world: *WorldSystem,
-    player: Player,
+    player: *Player,
     thread_system: *ThreadSystem,
     delta_seconds: f32,
     bounds_width: f32,
@@ -243,6 +243,12 @@ pub const SimulationPipeline = struct {
         self.audio_controller.onPause();
     }
 
+    /// Captures this step's dig intent from held input through the owned dig
+    /// controller. Called in the main-thread input phase, before `update`.
+    pub fn captureDigIntent(self: *SimulationPipeline, input: *const InputState, frame: *SimulationFrame) void {
+        self.dig.captureIntent(input, frame);
+    }
+
     /// Synchronizes interpolation history for pipeline-owned movement state.
     /// State-owned visual effects still synchronize at their own owner.
     pub fn syncPreviousPositions(self: *SimulationPipeline, data: *DataSystem) void {
@@ -261,7 +267,7 @@ pub const SimulationPipeline = struct {
         frame.phase = .processors;
         // Player-authored world edit. Runs first; its world_tile_changed event is
         // deferred and re-masks navigation in merge_outputs regardless of order.
-        try self.dig.process(context.world, data, context.player, frame);
+        try self.dig.process(context.world, data, context.player.*, frame);
 
         const ai_slice = data.aiAgentSliceConst();
         const move_slice = data.movementBodySliceConst();
@@ -315,7 +321,7 @@ pub const SimulationPipeline = struct {
         // before entity collision so downstream stages see the gated position. AI
         // entities stay on the surface (level 0, fully walkable) this slice, so the
         // gate is player-only by design — see docs/simulation-tiers-and-pipeline.md.
-        gatePlayerToWalkableTiles(context.world, data, context.player);
+        gatePlayerToWalkableTiles(context.world, data, context.player.*);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
 
         var collision_timer = StageTimer.start();
@@ -325,6 +331,12 @@ pub const SimulationPipeline = struct {
         var collision_response_timer = StageTimer.start();
         const collision_response_stats = try self.collision_response.update(data, frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
+
+        // After movement/collision settle the player's position, update their plane:
+        // fall into a hole or follow a ramp on cell entry. Player-only; mutates the
+        // borrowed `Player.current_level` and snaps the body, then the dig reaction's
+        // tile change re-masks navigation post-commit.
+        try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
 
         return .{
             .scope = scope,
@@ -444,7 +456,7 @@ test "pipeline updates full active player-only state through serial path" {
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    const player = try Player.spawn(&data);
+    var player = try Player.spawn(&data);
     var world = WorldSystem{
         .allocator = std.testing.allocator,
         .width = 1,
@@ -480,7 +492,7 @@ test "pipeline updates full active player-only state through serial path" {
         .data = &data,
         .frame = &frame,
         .world = &world,
-        .player = player,
+        .player = &player,
         .thread_system = &threads,
         .delta_seconds = 0.016,
         .bounds_width = 800,
