@@ -145,15 +145,15 @@ Checklist:
       tree.
 - [x] Add explicit Windows target output through DXIL.
 - [x] Keep runtime backend selection SDL-driven; do not hard-code GPU driver names.
-- [ ] Consolidate shader-program, material, and runtime pipeline metadata so
+- [x] Consolidate shader-program, material, and runtime pipeline metadata so
       new pipelines do not need parallel registry edits.
-- [ ] Define the material/batcher routing contract for sprites, tile spans,
+- [x] Define the material/batcher routing contract for sprites, tile spans,
       lighting/fire effects, and post-effect passes without exposing SDL_GPU
       handles to game code.
-- [ ] Validate the right shader format list for each target OS.
-- [ ] Add direct runtime asset/shader lookup guidance or tests for direct binary
+- [x] Validate the right shader format list for each target OS.
+- [x] Add direct runtime asset/shader lookup guidance or tests for direct binary
       execution outside the installed binary directory.
-- [ ] Add shader output checks for each supported target path.
+- [x] Add shader output checks for each supported target path.
 
 Acceptance checks:
 
