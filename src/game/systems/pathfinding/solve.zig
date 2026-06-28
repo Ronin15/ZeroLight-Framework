@@ -13,6 +13,7 @@ const WorkerId = @import("../../../app/thread_system.zig").WorkerId;
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavGraph = @import("nav_graph.zig").NavGraph;
+const LinkEdgeRef = @import("nav_graph.zig").LinkEdgeRef;
 const AbstractScratch = @import("scratch.zig").AbstractScratch;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const types = @import("types.zig");
@@ -44,6 +45,8 @@ pub const SolveJobContext = struct {
 pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *SolveJobContext = @ptrCast(@alignCast(context));
     const system = job.system;
+    // scratch_slots is never resized during the parallel region (only in applyDerivedCapacity,
+    // which runs in beginUpdate before parallelForWithOptions), so this pointer stays valid.
     const scratch = &system.scratch_slots.items[worker_id.index];
     for (range.start..range.end) |fallback_index| {
         const pending_index = system.fallback_indices.items[fallback_index];
@@ -197,7 +200,9 @@ pub fn stitchCorridor(
         prev_cell = portal.cell_index;
     }
     // Final span: last corridor cell -> goal cell, a walkable same-level segment.
-    if (prev_level != request.key.goal_level) return .budget_exhausted;
+    // abstractCorridor only returns .found after buildCorridor validates the corridor ends
+    // on goal_level, so prev_level == goal_level here. Dead-code defensive guard.
+    if (prev_level != request.key.goal_level) return .none;
     switch (appendSegment(scratch, goal_grid, prev_level, prev_cell, @intCast(goal_index), cap)) {
         .found => {},
         else => |r| return r,
@@ -264,6 +269,24 @@ pub fn relaxAbstractNode(
     abstract.open.appendAssumeCapacity(.{ .index = neighbor_ref, .f = candidate +| h, .h = h });
     siftUp(abstract.open.items, abstract.open.items.len - 1);
     return true;
+}
+
+// Lower bound into a link_edge_refs slice sorted by (level, cell): returns the index of
+// the first entry with (level, cell) >= (query_level, query_cell), or items.len when all
+// entries are smaller. Used by abstractCorridor to find the incident-link range in O(log n).
+fn lowerBoundLinkRef(items: []const LinkEdgeRef, query_level: u16, query_cell: u32) usize {
+    var lo: usize = 0;
+    var hi: usize = items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const item = items[mid];
+        if (item.level < query_level or (item.level == query_level and item.cell < query_cell)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 // Runs abstract A* over per-level portal CSRs plus the global link_edges. Node identity
@@ -358,15 +381,22 @@ pub fn abstractCorridor(
         // Cross-level link edges: resolve the partner endpoint cell to its portal node on
         // the partner level through that level's cell_to_portal. h=0 unless the partner is
         // on the goal level (no cell coordinate is comparable to the goal until then).
-        for (graph.link_edges.items) |link| {
-            if (link.from_level == level and link.from_cell == portal.cell_index) {
+        // link_edge_refs is sorted by (level, cell) so a binary search finds only the links
+        // incident to this portal, avoiding the O(link_count) full scan per expansion.
+        const ref_start = lowerBoundLinkRef(graph.link_edge_refs.items, level, portal.cell_index);
+        var ri = ref_start;
+        while (ri < graph.link_edge_refs.items.len) {
+            const ref = graph.link_edge_refs.items[ri];
+            if (ref.level != level or ref.cell != portal.cell_index) break;
+            ri += 1;
+            const link = graph.link_edges.items[ref.index];
+            if (!ref.reverse) {
                 const to_local = graph.level_graphs.items[link.to_level].cell_to_portal.items[link.to_cell];
                 if (to_local != no_cell) {
                     const h = if (link.to_level == goal_level) octileCells(graph.width, link.to_cell, @intCast(goal_index)) else 0;
                     if (!relaxAbstractNode(abstract, current_ref, current_g, packRef(link.to_level, to_local), link.cost, true, h)) return .saturated;
                 }
-            }
-            if (link.bidirectional and link.to_level == level and link.to_cell == portal.cell_index) {
+            } else {
                 const from_local = graph.level_graphs.items[link.from_level].cell_to_portal.items[link.from_cell];
                 if (from_local != no_cell) {
                     const h = if (link.from_level == goal_level) octileCells(graph.width, link.from_cell, @intCast(goal_index)) else 0;
@@ -494,13 +524,16 @@ pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_in
     scratch.path_scratch.clearRetainingCapacity();
     var current = goal_index;
     while (true) {
+        // path_scratch is reserved to max(@max(max_explored_nodes, max_stored_path_cells));
+        // A* expansion is bounded by max_explored_nodes, so the parent chain never exceeds
+        // that count and this buffer cannot fill during reconstruction.
+        std.debug.assert(scratch.path_scratch.items.len < scratch.path_scratch.capacity);
         scratch.path_scratch.appendAssumeCapacity(@intCast(current));
         if (current == start_index) break;
         const slot = scratch.slotFor(current) orelse break;
         const parent = scratch.slot_parent.items[slot];
         if (parent == no_cell) break;
         current = parent;
-        if (scratch.path_scratch.items.len >= scratch.path_scratch.capacity) break;
     }
     // path_scratch is goal-to-start; reverse into start-to-goal.
     std.mem.reverse(u32, scratch.path_scratch.items);

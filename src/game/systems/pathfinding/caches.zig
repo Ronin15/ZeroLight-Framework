@@ -85,11 +85,161 @@ pub const KeySet = struct {
         }
         return null;
     }
+
+    // Removes a key from the set using back-shift deletion so probe chains stay
+    // contiguous (an ordinary clear-and-leave-empty would strand later entries).
+    pub fn remove(self: *KeySet, key: PathQueryKey) void {
+        const capacity = self.slots.items.len;
+        if (capacity == 0) return;
+        const start = hashPathKey(key) % capacity;
+        var hole: usize = capacity; // sentinel: not found
+        for (0..capacity) |probe| {
+            const index = (start + probe) % capacity;
+            const slot = self.slots.items[index];
+            if (!slot.occupied) return; // chain end; key not present
+            if (keysEqual(slot.key, key)) {
+                hole = index;
+                break;
+            }
+        }
+        if (hole == capacity) return;
+        self.slots.items[hole].occupied = false;
+        self.len -= 1;
+        // Pull up subsequent entries that can fill the gap without becoming unreachable.
+        const initial_hole = hole;
+        var probe: usize = initial_hole;
+        while (true) {
+            probe = (probe + 1) % capacity;
+            if (probe == initial_hole) break;
+            const slot = self.slots.items[probe];
+            if (!slot.occupied) break;
+            const home = hashPathKey(slot.key) % capacity;
+            if (inCyclicRange(hole, probe, home)) continue;
+            self.slots.items[hole] = slot;
+            self.slots.items[probe].occupied = false;
+            hole = probe;
+        }
+    }
 };
 
 pub const KeySetSlot = struct {
     occupied: bool = false,
     key: PathQueryKey = emptyKey(0),
+};
+
+// Fixed-capacity linear-probe map from goal key to group_requests slot index.
+// Enables O(1) lookup in recordGroupRequest instead of an O(N) linear scan.
+// Stripe index = fallback_index is not relevant here; this maps keys to the
+// dense ArrayList index in group_requests (stable until a swapRemove).
+pub const GroupKeyMap = struct {
+    slots: std.ArrayList(GroupKeyMapSlot) = .empty,
+    len: usize = 0,
+
+    pub fn deinit(self: *GroupKeyMap, allocator: std.mem.Allocator) void {
+        self.slots.deinit(allocator);
+        self.* = undefined;
+    }
+
+    pub fn reserve(self: *GroupKeyMap, allocator: std.mem.Allocator, capacity: usize) !void {
+        if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
+        try setLen(&self.slots, allocator, capacity);
+        self.clear();
+    }
+
+    pub fn clear(self: *GroupKeyMap) void {
+        for (self.slots.items) |*slot| slot.occupied = false;
+        self.len = 0;
+    }
+
+    // Returns the stored group_requests index for this key, or null if absent.
+    pub fn find(self: *const GroupKeyMap, key: PathQueryKey) ?usize {
+        const capacity = self.slots.items.len;
+        if (capacity == 0) return null;
+        const start = hashPathKey(key) % capacity;
+        for (0..capacity) |probe| {
+            const index = (start + probe) % capacity;
+            const slot = self.slots.items[index];
+            if (slot.occupied and keysEqual(slot.key, key)) return slot.group_index;
+            if (!slot.occupied and self.len < capacity) return null;
+        }
+        return null;
+    }
+
+    // Maps key → group_requests index. Returns false when the map is full.
+    pub fn insert(self: *GroupKeyMap, key: PathQueryKey, group_index: usize) bool {
+        const capacity = self.slots.items.len;
+        if (capacity == 0) return false;
+        const start = hashPathKey(key) % capacity;
+        for (0..capacity) |probe| {
+            const index = (start + probe) % capacity;
+            const slot = &self.slots.items[index];
+            if (slot.occupied and keysEqual(slot.key, key)) {
+                slot.group_index = @intCast(group_index);
+                return true;
+            }
+            if (!slot.occupied and self.len < capacity) {
+                slot.* = .{ .occupied = true, .key = key, .group_index = @intCast(group_index) };
+                self.len += 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Updates the stored index for a key that moved due to a swapRemove.
+    pub fn updateIndex(self: *GroupKeyMap, key: PathQueryKey, new_group_index: usize) void {
+        const capacity = self.slots.items.len;
+        if (capacity == 0) return;
+        const start = hashPathKey(key) % capacity;
+        for (0..capacity) |probe| {
+            const index = (start + probe) % capacity;
+            const slot = &self.slots.items[index];
+            if (slot.occupied and keysEqual(slot.key, key)) {
+                slot.group_index = @intCast(new_group_index);
+                return;
+            }
+            if (!slot.occupied and self.len < capacity) return;
+        }
+    }
+
+    // Removes a key using back-shift deletion to keep probe chains gap-free.
+    pub fn remove(self: *GroupKeyMap, key: PathQueryKey) void {
+        const capacity = self.slots.items.len;
+        if (capacity == 0) return;
+        const start = hashPathKey(key) % capacity;
+        var hole: usize = capacity; // sentinel: not found
+        for (0..capacity) |probe| {
+            const index = (start + probe) % capacity;
+            const slot = self.slots.items[index];
+            if (!slot.occupied) return;
+            if (keysEqual(slot.key, key)) {
+                hole = index;
+                break;
+            }
+        }
+        if (hole == capacity) return;
+        self.slots.items[hole].occupied = false;
+        self.len -= 1;
+        const initial_hole = hole;
+        var probe: usize = initial_hole;
+        while (true) {
+            probe = (probe + 1) % capacity;
+            if (probe == initial_hole) break;
+            const slot = self.slots.items[probe];
+            if (!slot.occupied) break;
+            const home = hashPathKey(slot.key) % capacity;
+            if (inCyclicRange(hole, probe, home)) continue;
+            self.slots.items[hole] = slot;
+            self.slots.items[probe].occupied = false;
+            hole = probe;
+        }
+    }
+};
+
+pub const GroupKeyMapSlot = struct {
+    occupied: bool = false,
+    key: PathQueryKey = emptyKey(0),
+    group_index: u16 = 0,
 };
 
 // Goal-keyed cache. Each slot owns a fixed path buffer so a moving agent can
@@ -132,13 +282,13 @@ pub const ResultCache = struct {
     }
 
     pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, path_stride: usize, stitched_stride: usize) !void {
-        self.path_stride = path_stride;
-        self.stitched_stride = stitched_stride;
+        // Totals computed from locals; strides are committed to self only after all
+        // allocations succeed so a mid-reserve OOM never leaves mismatched strides.
+        const total_cells = capacity *| path_stride;
+        const total_stitched = capacity *| stitched_stride;
         // Free the backing on a shrink so an elastic down-resize releases memory; slot
         // probe positions and per-slot strides depend on capacity, so a resized cache
         // is always rebuilt (the goal-keyed entries re-solve on next request).
-        const total_cells = capacity * path_stride;
-        const total_stitched = capacity * stitched_stride;
         if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
         if (capacity < self.payloads.capacity) self.payloads.shrinkAndFree(allocator, 0);
         if (total_cells < self.path_cells.capacity) self.path_cells.shrinkAndFree(allocator, 0);
@@ -149,6 +299,9 @@ pub const ResultCache = struct {
         @memset(self.path_cells.items, no_cell);
         try setLen(&self.stitched, allocator, total_stitched);
         @memset(self.stitched.items, .{ .level = 0, .cell = no_cell });
+        // All allocations succeeded; safe to commit the new strides.
+        self.path_stride = path_stride;
+        self.stitched_stride = stitched_stride;
         self.clear();
     }
 
@@ -359,12 +512,14 @@ pub const ProbeSlot = struct {
 
 // Cold per-slot payload, parallel to ProbeSlot. Read only on a hit / TTL check, so it
 // is kept off the probe-scan cache lines.
+// Field order: three u32s first, then the u16, to avoid the 2-byte internal-padding hole
+// that placing u16 between two u32s would otherwise create. Total size: 16 bytes.
 pub const SlotPayload = struct {
     // step_counter when the entry was written, for TTL refresh.
     stamp: u32 = 0,
     path_len: u32 = 0,
-    path_level: u16 = 0,
     stitched_len: u32 = 0,
+    path_level: u16 = 0,
 };
 
 // Whether `x` lies in the cyclic half-open-then-closed interval (start, end] on a ring of
@@ -401,17 +556,14 @@ pub fn waypointFromPath(grid: *const NavGrid, path: []const u32, start_index: us
             if (path[i] == start_index) return waypointAt(grid, path, i, hint);
         }
     }
-    // Exact match: step to the next cell on the path.
-    for (path[0 .. path.len - 1], 0..) |cell, i| {
-        if (cell == start_index) return waypointAt(grid, path, i, hint);
-    }
-    if (path[path.len - 1] == start_index) return waypointAt(grid, path, path.len - 1, hint);
-    // Off-path: head toward the nearest path cell's successor.
+    // Single pass: an exact match returns immediately; otherwise nearest cell is tracked
+    // for the off-path fallback, avoiding a second full scan.
     const start_x: i32 = @intCast(start_index % grid.width);
     const start_y: i32 = @intCast(start_index / grid.width);
     var best_index: usize = 0;
     var best_dist: i64 = std.math.maxInt(i64);
     for (path, 0..) |cell, i| {
+        if (cell == start_index) return waypointAt(grid, path, i, hint);
         const cx: i32 = @intCast(cell % grid.width);
         const cy: i32 = @intCast(cell / grid.width);
         const ddx: i64 = cx - start_x;
@@ -458,10 +610,12 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCe
     // Scan the path's contiguous runs on the agent's level. An exact match (the agent
     // is on a path cell) walks to that cell's successor within the run. Otherwise fall
     // back to the run holding the nearest cell on this level and walk from there.
+    // Single pass: an exact cell match returns immediately; otherwise nearest_index is
+    // tracked alongside best_dist so the off-path branch needs no second scan.
     var i: usize = 0;
-    var best_run_begin: ?usize = null;
-    var best_run_end: usize = 0;
+    var nearest_index: usize = 0;
     var best_dist: i64 = std.math.maxInt(i64);
+    var found_run = false;
     const start_x: i32 = @intCast(start_index % start_grid.width);
     const start_y: i32 = @intCast(start_index / start_grid.width);
     while (i < stitched.len) {
@@ -483,28 +637,15 @@ pub fn waypointFromStitched(graph: *const NavGraph, stitched: []const StitchedCe
             const dist = ddx * ddx + ddy * ddy;
             if (dist < best_dist) {
                 best_dist = dist;
-                best_run_begin = run_begin;
-                best_run_end = run_end;
+                nearest_index = j;
+                found_run = true;
             }
         }
     }
-    const run_begin = best_run_begin orelse return null;
-    // Off-path on this level: head toward the nearest run cell's successor. The run is
-    // grid-adjacent, so the successor is one traversable step from the nearest cell.
-    var nearest = run_begin;
-    var nearest_dist: i64 = std.math.maxInt(i64);
-    for (run_begin..best_run_end) |j| {
-        const cx: i32 = @intCast(stitched[j].cell % start_grid.width);
-        const cy: i32 = @intCast(stitched[j].cell / start_grid.width);
-        const ddx: i64 = cx - start_x;
-        const ddy: i64 = cy - start_y;
-        const dist = ddx * ddx + ddy * ddy;
-        if (dist < nearest_dist) {
-            nearest_dist = dist;
-            nearest = j;
-        }
-    }
-    return stitchedWaypointAt(start_grid, stitched, start_level, nearest, hint);
+    if (!found_run) return null;
+    // Off-path on this level: head toward the nearest run cell's successor tracked above.
+    // The run is grid-adjacent, so the successor is one traversable step from nearest.
+    return stitchedWaypointAt(start_grid, stitched, start_level, nearest_index, hint);
 }
 
 // Records the matched/nearest stitched index in the hint and returns the heading to its

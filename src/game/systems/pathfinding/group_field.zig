@@ -71,19 +71,27 @@ pub const GroupField = struct {
     }
 
     pub fn reserve(self: *GroupField, allocator: std.mem.Allocator, cell_count: usize) !void {
+        // Mark empty first so a partial failure leaves the field refusing to serve paths.
+        self.state = .empty;
+        if (cell_count < self.costs.capacity) self.costs.shrinkAndFree(allocator, 0);
         try setLen(&self.costs, allocator, cell_count);
+        if (cell_count < self.flow_dir.capacity) self.flow_dir.shrinkAndFree(allocator, 0);
         try setLen(&self.flow_dir, allocator, cell_count);
+        if (cell_count < self.stamps.capacity) self.stamps.shrinkAndFree(allocator, 0);
         try setLen(&self.stamps, allocator, cell_count);
+        if (group_field_buckets < self.buckets.capacity) self.buckets.shrinkAndFree(allocator, 0);
         try setLen(&self.buckets, allocator, group_field_buckets);
+        if (cell_count < self.bucket_next.capacity) self.bucket_next.shrinkAndFree(allocator, 0);
         try setLen(&self.bucket_next, allocator, cell_count);
+        if (cell_count < self.bucket_prev.capacity) self.bucket_prev.shrinkAndFree(allocator, 0);
         try setLen(&self.bucket_prev, allocator, cell_count);
+        if (cell_count < self.queued_stamp.capacity) self.queued_stamp.shrinkAndFree(allocator, 0);
         try setLen(&self.queued_stamp, allocator, cell_count);
         @memset(self.costs.items, unreachable_cost);
         @memset(self.flow_dir.items, no_flow);
         @memset(self.stamps.items, 0);
         @memset(self.buckets.items, no_cell);
         @memset(self.queued_stamp.items, 0);
-        self.state = .empty;
     }
 
     pub fn cost(self: *const GroupField, index: usize) u32 {

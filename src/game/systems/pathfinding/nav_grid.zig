@@ -100,9 +100,25 @@ pub const NavGrid = struct {
         // full mark agree exactly (the remask-vs-rebuild parity tests guard this).
         try setLen(&self.static_blocked, allocator, self.cellCount());
         @memset(self.static_blocked.items, false);
+        // Build entity→bounds-index map once (O(n) over bounds) so the per-static-body
+        // lookup below is O(1) instead of O(n) per entity, avoiding a quadratic scan.
+        var bounds_map = std.AutoHashMap(EntityId, usize).init(allocator);
+        defer bounds_map.deinit();
+        for (bounds.entities, 0..) |entity, i| {
+            try bounds_map.put(entity, i);
+        }
         for (responses.entities, 0..) |entity, response_index| {
             if (responses.mobilities[response_index] != .static) continue;
-            const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
+            const bounds_index = bounds_map.get(entity) orelse continue;
+            const body = data.movementBodyConst(entity) orelse continue;
+            const min_x = body.position.x + bounds.offset_x[bounds_index];
+            const min_y = body.position.y + bounds.offset_y[bounds_index];
+            const rect = StaticBodyRect{
+                .min_x = min_x,
+                .min_y = min_y,
+                .max_x = min_x + bounds.size_x[bounds_index],
+                .max_y = min_y + bounds.size_y[bounds_index],
+            };
             self.markBlockedRectSimd(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
             self.rasterizeStaticCoverage(rect);
         }

@@ -11,6 +11,8 @@ const types = @import("types.zig");
 const NavGridError = types.NavGridError;
 const StitchedCell = types.StitchedCell;
 const OpenNode = types.OpenNode;
+const PortalNode = types.PortalNode;
+const AbstractEdge = types.AbstractEdge;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
 
@@ -43,13 +45,12 @@ pub const NavMemoryBudget = struct {
     // (3 x u32) plus slot_closed (bool). The direct array is indexed by cell_index,
     // so there is no separate slot_cell column.
     const scratch_slot_bytes: usize = 3 * @sizeOf(u32) + 1;
-    // edge_scratch entry (EdgeScratch: u32 from + AbstractEdge{u32,u32,bool}) and the
-    // compacted CSR edge entry (AbstractEdge). Both buffers are reserved to the edge
-    // worst case.
-    const edge_scratch_bytes: usize = @sizeOf(u32) + 2 * @sizeOf(u32) + 1;
-    const portal_edge_bytes: usize = 2 * @sizeOf(u32) + 1;
-    // PortalNode (u16 level + u32 cell_index + u32 chunk), padded.
-    const portal_node_bytes: usize = @sizeOf(u16) + 2 * @sizeOf(u32);
+    // EdgeScratch (u32 from + AbstractEdge) and the compacted CSR edge entry
+    // (AbstractEdge). Both buffers are reserved to the edge worst case.
+    const edge_scratch_bytes: usize = @sizeOf(u32) + @sizeOf(AbstractEdge);
+    const portal_edge_bytes: usize = @sizeOf(AbstractEdge);
+    // PortalNode (u16 level + u32 cell_index + u32 chunk), including alignment padding.
+    const portal_node_bytes: usize = @sizeOf(PortalNode);
 
     // Saturating estimate of total nav memory. An overflowing term clamps to
     // maxInt so the gate rejects rather than wrapping to a small value.

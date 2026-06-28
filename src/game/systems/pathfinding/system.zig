@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const math = @import("../../../core/math.zig");
+const logging = @import("../../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const ThreadSystem = @import("../../../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("../../data_system.zig").DataSystem;
@@ -26,6 +27,7 @@ const GroupField = @import("group_field.zig").GroupField;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const ResultCache = @import("caches.zig").ResultCache;
 const KeySet = @import("caches.zig").KeySet;
+const GroupKeyMap = @import("caches.zig").GroupKeyMap;
 const waypointFromPath = @import("caches.zig").waypointFromPath;
 const waypointFromStitched = @import("caches.zig").waypointFromStitched;
 const solve = @import("solve.zig");
@@ -78,6 +80,9 @@ pub const PathfindingSystem = struct {
     group_fields: std.ArrayList(GroupField) = .empty,
     // Requested group goal keys this step (declared, never detected).
     group_requests: std.ArrayList(GroupRequestTally) = .empty,
+    // O(1) key → group_requests slot-index lookup for recordGroupRequest.
+    // Kept in sync with group_requests: insert on append, remove+updateIndex on swapRemove.
+    group_key_map: GroupKeyMap = .{},
     // One per-cell A* scratch slot per configured threaded participant (workers + 1);
     // all O(cells) arrays are sized during the nav build, not lazily on first solve.
     scratch_slots: std.ArrayList(SearchScratch) = .empty,
@@ -85,7 +90,9 @@ pub const PathfindingSystem = struct {
     // after the worker batch finishes.
     solved_paths: std.ArrayList(SolvedPath) = .empty,
     // Per-worker path pool. Each worker owns a disjoint stripe so reconstruction
-    // never shares writable storage during the batch.
+    // never shares writable storage during the batch. Stripe index = fallback_index
+    // (dense fan-out position, not pending_index), so two requests never collide
+    // even when one worker solves several in the same range.
     worker_path_pool: std.ArrayList(u32) = .empty,
     // Per-solved-request disjoint stitched-path stripe, mirroring worker_path_pool,
     // so a worker's stitched corridor never overwrites another request's during the
@@ -183,6 +190,7 @@ pub const PathfindingSystem = struct {
         self.solved_paths.deinit(self.allocator);
         self.scratch_slots.deinit(self.allocator);
         self.group_requests.deinit(self.allocator);
+        self.group_key_map.deinit(self.allocator);
         self.group_fields.deinit(self.allocator);
         self.pending_keys.deinit(self.allocator);
         self.unavailable.deinit(self.allocator);
@@ -261,6 +269,8 @@ pub const PathfindingSystem = struct {
             self.group_fields.appendAssumeCapacity(.{});
         }
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
+        // 2x load factor so linear probing stays fast at full group_requests occupancy.
+        try self.group_key_map.reserve(self.allocator, capacity.max_solved_requests_per_step * 2);
         // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
         try self.nav_changed_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
@@ -348,6 +358,9 @@ pub const PathfindingSystem = struct {
         self.group_requests.clearRetainingCapacity();
         const keep_group = @min(self.resize_group_snapshot.items.len, self.group_requests.capacity);
         self.group_requests.appendSliceAssumeCapacity(self.resize_group_snapshot.items[0..keep_group]);
+        // Rebuild the group key map to match the restored group_requests entries.
+        self.group_key_map.clear();
+        for (self.group_requests.items, 0..) |tally, idx| _ = self.group_key_map.insert(tally.key, idx);
         // A shrink that drops live deferred work / group tally past the smaller capacity is
         // a real loss of accepted requests; surface it instead of dropping silently.
         self.resize_dropped += (self.resize_pending_snapshot.items.len - keep_pending) +
@@ -479,8 +492,14 @@ pub const PathfindingSystem = struct {
                 // are unchanged (no topology rebuild), so nav_version stays stable.
                 self.completed.clear();
             } else {
-                // Incremental edit: keep cached paths clear of it, evict only crossing ones.
-                try self.evictCachedPathsCrossingEdits(world, edits);
+                // Incremental edit: evict only cached paths that cross the changed cells.
+                // When world is null the span derivation cannot run, so drop the entire
+                // completed cache to avoid serving stale paths through now-blocked cells.
+                if (world != null) {
+                    try self.evictCachedPathsCrossingEdits(world, edits);
+                } else {
+                    self.completed.clear();
+                }
             }
             // Short-lived pending/unavailable/group state is dropped and rebuilt.
             self.clearRequestStateKeepingCompleted();
@@ -573,6 +592,7 @@ pub const PathfindingSystem = struct {
         self.fallback_indices.clearRetainingCapacity();
         self.solved_paths.clearRetainingCapacity();
         self.group_requests.clearRetainingCapacity();
+        self.group_key_map.clear();
         self.unavailable.clear();
         self.pending_keys.clear();
     }
@@ -704,6 +724,11 @@ pub const PathfindingSystem = struct {
         var system_config = config;
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(system_config), &stats);
+        if (builtin.mode == .Debug) {
+            for (self.fallback_indices.items[1..], 0..) |idx, i| {
+                std.debug.assert(self.fallback_indices.items[i] < idx);
+            }
+        }
 
         if (self.fallback_indices.items.len != 0) {
             if (system_config.adaptive and system_config.fallback_adaptive_tuner == null and system_config.items_per_range == null) {
@@ -713,11 +738,14 @@ pub const PathfindingSystem = struct {
             // build. In a correct configuration scratch is sized to participantSlotCount
             // (the app/bench reserve with it), so the clamp below is a no-op. A debug
             // build asserts that contract loudly to catch a reserve/thread-system
-            // mismatch during development; a release build clamps the worker fan-out to
-            // the reserved scratch so worker indices stay in range and pathfinding
-            // degrades to fewer workers rather than failing the frame. Scratch is never
-            // grown past the memory-budgeted count, and the solve loop stays
+            // mismatch during development; a release build logs a warning and clamps the
+            // worker fan-out to the reserved scratch so worker indices stay in range and
+            // pathfinding degrades to fewer workers rather than failing the frame. Scratch
+            // is never grown past the memory-budgeted count, and the solve loop stays
             // allocation-free.
+            if (thread_system.participantSlotCount() > self.scratch_slots.items.len) {
+                logging.game.warn("pathfinding: scratch slot mismatch ({d} participants, {d} reserved slots); worker fan-out clamped — reserve worker_participant_count to match the thread system", .{ thread_system.participantSlotCount(), self.scratch_slots.items.len });
+            }
             std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
             const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
             const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
@@ -745,6 +773,11 @@ pub const PathfindingSystem = struct {
         var solve_timer = PhaseTimer.begin();
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, self.effectiveFallbackLimit(config), &stats);
+        if (builtin.mode == .Debug) {
+            for (self.fallback_indices.items[1..], 0..) |idx, i| {
+                std.debug.assert(self.fallback_indices.items[i] < idx);
+            }
+        }
         if (self.fallback_indices.items.len != 0) {
             if (self.scratch_slots.items.len == 0) return error.PathfindingScratchCapacityExceeded;
             self.resetSolvedPaths();
@@ -857,14 +890,14 @@ pub const PathfindingSystem = struct {
     }
 
     fn recordGroupRequest(self: *PathfindingSystem, key: PathQueryKey) void {
-        for (self.group_requests.items) |*existing| {
-            if (keysEqual(existing.key, key)) {
-                existing.count += 1;
-                return;
-            }
+        if (self.group_key_map.find(key)) |group_index| {
+            self.group_requests.items[group_index].count += 1;
+            return;
         }
         if (self.group_requests.items.len < self.group_requests.capacity) {
+            const new_index = self.group_requests.items.len;
             self.group_requests.appendAssumeCapacity(.{ .key = key, .count = 1 });
+            _ = self.group_key_map.insert(key, new_index);
         }
     }
 
@@ -899,7 +932,13 @@ pub const PathfindingSystem = struct {
         var i: usize = 0;
         while (i < self.group_requests.items.len) {
             if (self.group_requests.items[i].count == 0) {
+                const removed_key = self.group_requests.items[i].key;
+                const last_index = self.group_requests.items.len - 1;
                 _ = self.group_requests.swapRemove(i);
+                self.group_key_map.remove(removed_key);
+                // If the removed slot was not the last, the entry formerly at last_index
+                // was moved to i; update its stored index in the map.
+                if (i < last_index) self.group_key_map.updateIndex(self.group_requests.items[i].key, i);
             } else {
                 i += 1;
             }
@@ -1044,6 +1083,10 @@ pub const PathfindingSystem = struct {
         return @min(requested_limit, self.capacity.max_fallback_requests_per_step);
     }
 
+    // Emits pending indices into fallback_indices for the heap A* batch. Indices come
+    // from a sequential scan of 0..solve_count, so the list is strictly increasing and
+    // every entry is distinct. Concurrent solveFallbackJob writes use these as
+    // solve_results indices; disjointness of those writes depends on this uniqueness.
     fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
             if (result == .deferred) {
@@ -1089,7 +1132,8 @@ pub const PathfindingSystem = struct {
     // untouched tail reaches the solve window, then demoted to a hard negative once it has
     // never fit the per-solve budget across enough retries. Solve-window writes target
     // indices <= their source, so the in-place rewrite never clobbers an unread entry; the
-    // rotated copies live in rotate_back_scratch. pending_keys is rebuilt to match.
+    // rotated copies live in rotate_back_scratch. pending_keys is updated in-place: keys for
+    // solved/dropped entries are removed individually; deferred, rotating, and tail keys stay.
     fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         if (solve_count == 0) return;
         self.rotate_back_scratch.clearRetainingCapacity();
@@ -1108,14 +1152,19 @@ pub const PathfindingSystem = struct {
                         // Negative-cache it so it stops consuming a solve slot every frame.
                         if (!self.unavailable.insert(key)) stats.cache_evictions += 1;
                         stats.unavailable_results += 1;
+                        self.pending_keys.remove(key);
                     } else if (request.retries >= budget_exhausted_rotate_after) {
+                        // Entry moves to the back of pending; key stays in pending_keys.
                         self.rotate_back_scratch.appendAssumeCapacity(request);
                     } else {
                         self.pending.items[write_index] = request;
                         write_index += 1;
                     }
                 },
-                else => {},
+                else => {
+                    // available/unavailable: solved and removed from pending.
+                    self.pending_keys.remove(self.pending.items[pending_index].key);
+                },
             }
         }
         for (self.pending.items[solve_count..]) |pending_request| {
@@ -1128,10 +1177,6 @@ pub const PathfindingSystem = struct {
             write_index += 1;
         }
         self.pending.items.len = write_index;
-        self.pending_keys.clear();
-        for (self.pending.items) |pending_request| {
-            _ = self.pending_keys.insert(pending_request.key);
-        }
     }
 };
 

@@ -37,25 +37,9 @@ const setLen = types.setLen;
 const octileCells = types.octileCells;
 const orderU32 = types.orderU32;
 
-// An abstract-graph node: a portal cell on a specific level. Portals sit on the
-// open border between two adjacent chunks. Abstract A* searches over these nodes
-// plus inter-level link edges, never over raw cells, so its work scales with the
-// chunk-border count, not the total cell count.
-pub const PortalNode = struct {
-    level: u16,
-    cell_index: u32,
-    // Chunk this portal belongs to (chunk_y * chunks_x + chunk_x within a level).
-    chunk: u32,
-};
-
-// One directed intra-level abstract edge in CSR form: `target` is a LOCAL node index
-// on the SAME level as the owning node, reached at `cost`. Cross-level transitions are
-// NOT edges here — they live in NavGraph.link_edges so a level's CSR depends only on
-// that level's own mask.
-pub const AbstractEdge = struct {
-    target: u32,
-    cost: u32,
-};
+// Re-exported from types so callers can import either module.
+pub const PortalNode = types.PortalNode;
+pub const AbstractEdge = types.AbstractEdge;
 
 // A live cross-level (or same-level teleport) link, keyed by CELL on both ends so it
 // survives either endpoint level's node renumbering: the search resolves a cell to a
@@ -68,6 +52,21 @@ pub const LinkEdge = struct {
     to_cell: u32,
     cost: u32,
     bidirectional: bool,
+};
+
+// Entry in the sorted per-(level, cell) index into link_edges. Sorted by (level, cell)
+// so abstractCorridor can binary-search for the incident-link range instead of scanning
+// all link_edges per portal expansion.
+pub const LinkEdgeRef = struct {
+    level: u16,
+    cell: u32,
+    index: u32, // index into link_edges.items
+    reverse: bool, // true: this ref covers the "to" end of a bidirectional link
+
+    fn lessThan(_: void, a: LinkEdgeRef, b: LinkEdgeRef) bool {
+        if (a.level != b.level) return a.level < b.level;
+        return a.cell < b.cell;
+    }
 };
 
 // One level's chunk-portal abstract graph over GEOMETRIC, chunk-stable node slots. A
@@ -154,9 +153,17 @@ const ChunkPatchScratch = struct {
 // chunk-local component flood and a private blocked-count delta. One slot per participant so
 // chunks re-flood in parallel without sharing the queue or racing the shared blocked counter;
 // the serial path uses slot 0 and the deltas are summed once after the barrier.
+// align(64) on `queue` forces @alignOf(ChunkRemaskScratch)==64 and @sizeOf==64 (Zig rounds
+// struct size up to its alignment), so adjacent worker slots occupy separate cache lines
+// and workers accumulating blocked_delta in parallel see no false sharing.
 const ChunkRemaskScratch = struct {
-    queue: std.ArrayList(usize) = .empty,
+    queue: std.ArrayList(usize) align(64) = .empty,
     blocked_delta: isize = 0,
+
+    comptime {
+        std.debug.assert(@sizeOf(ChunkRemaskScratch) == 64);
+        std.debug.assert(@alignOf(ChunkRemaskScratch) == 64);
+    }
 
     fn deinit(self: *ChunkRemaskScratch, allocator: std.mem.Allocator) void {
         self.queue.deinit(allocator);
@@ -269,6 +276,11 @@ pub const NavGraph = struct {
     // references its partner by cell, resolved through the partner level's cell_to_portal
     // at search time.
     link_edges: std.ArrayList(LinkEdge) = .empty,
+    // Sorted per-(level, cell) index into link_edges, rebuilt alongside it. Each entry
+    // points from a (level, cell) key to the link_edges slot incident to it; bidirectional
+    // links get two entries. Sorted by (level, cell) so abstractCorridor binary-searches
+    // for the incident range rather than scanning all link_edges per portal expansion.
+    link_edge_refs: std.ArrayList(LinkEdgeRef) = .empty,
     // Persistent u32 scratch reused (non-overlapping) by the per-level abstract-graph
     // build helpers for the portal sort order and the CSR cursors. Persisting it (vs a
     // per-build allocator.alloc) keeps both the init build and the incremental
@@ -333,6 +345,7 @@ pub const NavGraph = struct {
         self.patch_scratch.deinit(self.allocator);
         for (self.remask_scratch.items) |*scratch| scratch.deinit(self.allocator);
         self.remask_scratch.deinit(self.allocator);
+        self.link_edge_refs.deinit(self.allocator);
         self.link_edges.deinit(self.allocator);
         for (self.level_graphs.items) |*level_graph| level_graph.deinit(self.allocator);
         self.level_graphs.deinit(self.allocator);
@@ -1016,9 +1029,12 @@ pub const NavGraph = struct {
     // when BOTH endpoint cells are open in their level masks. A live link references its
     // endpoints by CELL, resolved to portal nodes through the partner level's
     // cell_to_portal at search time, so it never depends on either level's node numbering
-    // and a liveness toggle forces no per-level graph rebuild.
+    // and a liveness toggle forces no per-level graph rebuild. Also rebuilds link_edge_refs,
+    // the sorted (level, cell) index that lets abstractCorridor find incident links in
+    // O(log(link_count)) rather than scanning the full link_edges slice per portal expansion.
     pub fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
         self.link_edges.clearRetainingCapacity();
+        self.link_edge_refs.clearRetainingCapacity();
         const world_system = world orelse return;
         for (world_system.levelLinks()) |link| {
             if (@as(usize, link.level_a) >= self.levels.items.len) continue;
@@ -1037,6 +1053,25 @@ pub const NavGraph = struct {
                 .bidirectional = link.bidirectional,
             });
         }
+        // Build one ref entry per incident (level, cell) so abstractCorridor can range-lookup
+        // without touching unrelated links. Bidirectional links get a second reverse entry.
+        for (self.link_edges.items, 0..) |link, i| {
+            try self.link_edge_refs.append(self.allocator, .{
+                .level = link.from_level,
+                .cell = link.from_cell,
+                .index = @intCast(i),
+                .reverse = false,
+            });
+            if (link.bidirectional) {
+                try self.link_edge_refs.append(self.allocator, .{
+                    .level = link.to_level,
+                    .cell = link.to_cell,
+                    .index = @intCast(i),
+                    .reverse = true,
+                });
+            }
+        }
+        std.sort.pdq(LinkEdgeRef, self.link_edge_refs.items, {}, LinkEdgeRef.lessThan);
     }
 
     // Returns a persistent u32 scratch slice of `len`, growing the backing buffer only

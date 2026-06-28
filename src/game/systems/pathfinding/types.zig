@@ -450,6 +450,24 @@ pub const OpenNode = struct {
     f: u32,
     h: u32,
 };
+
+// An abstract-graph node: a portal cell on a specific level. Portals sit on the
+// open border between two adjacent chunks. Abstract A* searches over these nodes
+// plus inter-level link edges, never over raw cells.
+pub const PortalNode = struct {
+    level: u16,
+    cell_index: u32,
+    // Chunk this portal belongs to (chunk_y * chunks_x + chunk_x within a level).
+    chunk: u32,
+};
+
+// One directed intra-level abstract edge: `target` is a local node index on the
+// same level as the owning node, reached at `cost`. Cross-level transitions live
+// in NavGraph.link_edges, not here.
+pub const AbstractEdge = struct {
+    target: u32,
+    cost: u32,
+};
 // Comparator for binarySearch over a level's sorted compact label keys.
 pub fn orderU32(key: u32, item: u32) std.math.Order {
     return std.math.order(key, item);
