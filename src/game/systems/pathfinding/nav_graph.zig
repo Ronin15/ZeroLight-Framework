@@ -843,20 +843,22 @@ pub const NavGraph = struct {
         return level_grid.indexForCell(cell);
     }
 
+    // Chunk-tiling geometry for this graph; the shared source agreeing with every level's
+    // NavGrid so the chunk_id<->cell mapping and label encode/decode cannot drift apart.
+    pub fn chunkGeometry(self: *const NavGraph) types.ChunkGeometry {
+        return .{ .width = self.width, .height = self.height, .chunk_tiles = self.chunk_tiles };
+    }
+
     pub fn chunksX(self: *const NavGraph) usize {
-        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
+        return self.chunkGeometry().chunksX();
     }
 
     pub fn chunksY(self: *const NavGraph) usize {
-        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
+        return self.chunkGeometry().chunksY();
     }
 
     pub fn chunkOf(self: *const NavGraph, cell_index: usize) u32 {
-        const x = cell_index % self.width;
-        const y = cell_index / self.width;
-        const cx = x / self.chunk_tiles;
-        const cy = y / self.chunk_tiles;
-        return @intCast(cy * self.chunksX() + cx);
+        return self.chunkGeometry().chunkOf(cell_index);
     }
 
     pub fn chunkCount(self: *const NavGraph) usize {
@@ -1101,11 +1103,11 @@ pub const NavGraph = struct {
         return self.build_u32_scratch.items;
     }
 
-    // Per-chunk label stride matching NavGrid's chunk-local label encoding, so a chunk id
-    // can be recovered from one of its encoded labels by integer division.
-    pub fn labelStride(self: *const NavGraph) u32 {
-        const ct: u32 = self.chunk_tiles;
-        return ct * ct + 1;
+    // Per-chunk label stride matching NavGrid's chunk-local label encoding (one shared
+    // definition in ChunkGeometry), so a chunk id can be recovered from one of its encoded
+    // labels by integer division.
+    pub fn labelStride(self: *const NavGraph) u64 {
+        return self.chunkGeometry().labelStride();
     }
 
     // Returns the LIVE portal node slots on `level` owning chunk-local `component` (an
@@ -1115,7 +1117,7 @@ pub const NavGraph = struct {
     pub fn levelComponentPortals(self: *const NavGraph, level: u16, component: u32) []const u32 {
         if (component == no_component) return &.{};
         const lg = self.levelGraph(level) orelse return &.{};
-        const chunk = component / self.labelStride();
+        const chunk: usize = @intCast(@as(u64, component) / self.labelStride());
         if (chunk >= self.chunkCount()) return &.{};
         const pbase = self.chunk_portal_base.items[chunk];
         const klen = lg.chunk_label_len.items[chunk];
@@ -1164,17 +1166,8 @@ pub const NavGraph = struct {
     }
 
     // Inclusive cell bounds of one chunk, clamped to the grid.
-    pub fn chunkBounds(self: *const NavGraph, chunk: u32) struct { x0: usize, y0: usize, x1: usize, y1: usize } {
-        const cx_count = self.chunksX();
-        const ct: usize = self.chunk_tiles;
-        const cx = chunk % cx_count;
-        const cy = chunk / cx_count;
-        return .{
-            .x0 = cx * ct,
-            .y0 = cy * ct,
-            .x1 = @min(cx * ct + ct, self.width),
-            .y1 = @min(cy * ct + ct, self.height),
-        };
+    pub fn chunkBounds(self: *const NavGraph, chunk: u32) types.ChunkGeometry.Bounds {
+        return self.chunkGeometry().chunkBounds(chunk);
     }
 
     // Scans one chunk's up-to-four INTERNAL borders, adding each open border cell on the

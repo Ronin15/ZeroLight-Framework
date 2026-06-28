@@ -353,43 +353,36 @@ pub const NavGrid = struct {
         return false;
     }
 
+    // Chunk-tiling geometry for this grid; the shared source of the chunk_id<->cell and
+    // label-encoding convention that NavGraph must agree with (see types.ChunkGeometry).
+    pub fn chunkGeometry(self: *const NavGrid) types.ChunkGeometry {
+        return .{ .width = self.width, .height = self.height, .chunk_tiles = self.chunk_tiles };
+    }
+
     pub fn chunksX(self: *const NavGrid) usize {
-        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
+        return self.chunkGeometry().chunksX();
     }
 
     pub fn chunksY(self: *const NavGrid) usize {
-        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
+        return self.chunkGeometry().chunksY();
     }
 
     pub fn chunkOfCell(self: *const NavGrid, index: usize) u32 {
-        const cx = (index % self.width) / self.chunk_tiles;
-        const cy = (index / self.width) / self.chunk_tiles;
-        return @intCast(cy * self.chunksX() + cx);
+        return self.chunkGeometry().chunkOf(index);
     }
 
-    pub const ChunkBounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
+    pub const ChunkBounds = types.ChunkGeometry.Bounds;
 
     // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid. The single source of
     // the chunk_id -> cell-rect convention shared by remask and component re-flood.
     pub fn chunkBounds(self: *const NavGrid, chunk_id: u32) ChunkBounds {
-        const cx_count = self.chunksX();
-        const cx = chunk_id % cx_count;
-        const cy = chunk_id / cx_count;
-        const x0 = cx * self.chunk_tiles;
-        const y0 = cy * self.chunk_tiles;
-        return .{
-            .x0 = x0,
-            .y0 = y0,
-            .x1 = @min(x0 + self.chunk_tiles, self.width),
-            .y1 = @min(y0 + self.chunk_tiles, self.height),
-        };
+        return self.chunkGeometry().chunkBounds(chunk_id);
     }
 
     // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk, plus the
     // reserved 0). Keeps encoded labels of different chunks disjoint.
     pub fn chunkLabelStride(self: *const NavGrid) u64 {
-        const ct: u64 = self.chunk_tiles;
-        return ct * ct + 1;
+        return self.chunkGeometry().labelStride();
     }
 
     // Labels every open cell with a CHUNK-LOCAL component id, chunk by chunk. Because a

@@ -57,9 +57,12 @@ pub const NavMemoryBudget = struct {
     pub fn requiredBytes(self: NavMemoryBudget, width: usize, height: usize) usize {
         const cell_count = width *| height;
         const levels = @max(@as(usize, 1), self.level_count);
-        // Per-level static nav state: components + blocked bitset + flood queue,
-        // one set of arrays per level.
-        const per_level_bytes = (cell_count *| @sizeOf(u32)) +| cell_count +| (cell_count *| @sizeOf(usize));
+        // Per-level static nav state: components (u32) + the blocked and static-body masks
+        // (two byte-per-cell bool columns, NOT a packed bitset) + flood queue, one set of
+        // arrays per level. Counting both bool columns on every level slightly over-counts
+        // the non-zero levels (static-body coverage is level-0 only), which keeps the gate
+        // conservative.
+        const per_level_bytes = (cell_count *| @sizeOf(u32)) +| (2 *| cell_count) +| (cell_count *| @sizeOf(usize));
         const static_bytes = per_level_bytes *| levels;
         // Group-field registry: max_group_fields x cells x per-cell field bytes.
         const group_registry_bytes = self.max_group_fields *| cell_count *| self.group_field_bytes_per_cell;

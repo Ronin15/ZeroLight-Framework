@@ -28,103 +28,153 @@ const ChangedSpan = types.ChangedSpan;
 // per-agent waypoint derivation from O(path_len) into O(window) in the common case.
 const waypoint_hint_window: usize = 8;
 
+// Generic fixed-capacity, open-addressed (linear-probe) table keyed by PathQueryKey with
+// back-shift deletion. Full tables drop new inserts instead of allocating during the
+// fixed-step update. Backs both the pending/negative KeySet (Payload = void) and the
+// group-key -> requests-index map (Payload = u16), so the probe walk and the subtle
+// back-shift compaction live in exactly one place.
+fn ProbeTable(comptime Payload: type) type {
+    return struct {
+        const Self = @This();
+        const Slot = struct {
+            occupied: bool = false,
+            key: PathQueryKey = emptyKey(0),
+            payload: Payload = undefined,
+        };
+        slots: std.ArrayList(Slot) = .empty,
+        len: usize = 0,
+
+        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.slots.deinit(allocator);
+            self.* = undefined;
+        }
+
+        fn reserve(self: *Self, allocator: std.mem.Allocator, capacity: usize) !void {
+            // Free the backing on a shrink so an elastic down-resize releases memory; the
+            // probe positions depend on capacity, so a resized table is always rebuilt.
+            if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
+            try setLen(&self.slots, allocator, capacity);
+            self.clear();
+        }
+
+        fn clear(self: *Self) void {
+            for (self.slots.items) |*slot| slot.occupied = false;
+            self.len = 0;
+        }
+
+        fn findIndex(self: *const Self, key: PathQueryKey) ?usize {
+            const capacity = self.slots.items.len;
+            if (capacity == 0) return null;
+            const start = hashPathKey(key) % capacity;
+            for (0..capacity) |probe| {
+                const index = (start + probe) % capacity;
+                const slot = self.slots.items[index];
+                if (slot.occupied and keysEqual(slot.key, key)) return index;
+                if (!slot.occupied and self.len < capacity) return null;
+            }
+            return null;
+        }
+
+        fn payloadOf(self: *const Self, key: PathQueryKey) ?Payload {
+            const index = self.findIndex(key) orelse return null;
+            return self.slots.items[index].payload;
+        }
+
+        // Inserts key with payload, or updates the payload if key is already present.
+        // Returns false only when the table is full and key is absent.
+        fn put(self: *Self, key: PathQueryKey, payload: Payload) bool {
+            const capacity = self.slots.items.len;
+            if (capacity == 0) return false;
+            const start = hashPathKey(key) % capacity;
+            for (0..capacity) |probe| {
+                const index = (start + probe) % capacity;
+                const slot = &self.slots.items[index];
+                if (slot.occupied and keysEqual(slot.key, key)) {
+                    slot.payload = payload;
+                    return true;
+                }
+                if (!slot.occupied and self.len < capacity) {
+                    slot.* = .{ .occupied = true, .key = key, .payload = payload };
+                    self.len += 1;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Updates the payload of an existing key; no-op if absent.
+        fn update(self: *Self, key: PathQueryKey, payload: Payload) void {
+            const index = self.findIndex(key) orelse return;
+            self.slots.items[index].payload = payload;
+        }
+
+        // Removes a key using back-shift deletion so probe chains stay contiguous (an
+        // ordinary clear-and-leave-empty would strand later entries behind the gap).
+        fn remove(self: *Self, key: PathQueryKey) void {
+            const capacity = self.slots.items.len;
+            if (capacity == 0) return;
+            const start = hashPathKey(key) % capacity;
+            var hole: usize = capacity; // sentinel: not found
+            for (0..capacity) |probe| {
+                const index = (start + probe) % capacity;
+                const slot = self.slots.items[index];
+                if (!slot.occupied) return; // chain end; key not present
+                if (keysEqual(slot.key, key)) {
+                    hole = index;
+                    break;
+                }
+            }
+            if (hole == capacity) return;
+            self.slots.items[hole].occupied = false;
+            self.len -= 1;
+            // Pull up subsequent entries that can fill the gap without becoming unreachable.
+            const initial_hole = hole;
+            var probe: usize = initial_hole;
+            while (true) {
+                probe = (probe + 1) % capacity;
+                if (probe == initial_hole) break;
+                const slot = self.slots.items[probe];
+                if (!slot.occupied) break;
+                const home = hashPathKey(slot.key) % capacity;
+                if (inCyclicRange(hole, probe, home)) continue;
+                self.slots.items[hole] = slot;
+                self.slots.items[probe].occupied = false;
+                hole = probe;
+            }
+        }
+    };
+}
+
+// Fixed-capacity linear-probe set for pending/negative keys. Full sets drop new inserts
+// instead of allocating during the fixed-step update.
 pub const KeySet = struct {
-    // Fixed-capacity linear-probe set for pending keys. Full sets drop new inserts
-    // instead of allocating during the fixed-step update.
-    slots: std.ArrayList(KeySetSlot) = .empty,
-    len: usize = 0,
+    table: ProbeTable(void) = .{},
 
     pub fn deinit(self: *KeySet, allocator: std.mem.Allocator) void {
-        self.slots.deinit(allocator);
-        self.* = undefined;
+        self.table.deinit(allocator);
     }
 
     pub fn reserve(self: *KeySet, allocator: std.mem.Allocator, capacity: usize) !void {
-        // Free the backing on a shrink so an elastic down-resize releases memory; the
-        // probe positions depend on capacity, so a resized set is always rebuilt.
-        if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
-        try setLen(&self.slots, allocator, capacity);
-        self.clear();
+        return self.table.reserve(allocator, capacity);
     }
 
     pub fn clear(self: *KeySet) void {
-        for (self.slots.items) |*slot| slot.occupied = false;
-        self.len = 0;
+        self.table.clear();
     }
 
     pub fn contains(self: *const KeySet, key: PathQueryKey) bool {
-        return self.findIndex(key) != null;
+        return self.table.findIndex(key) != null;
     }
 
+    // Returns true if the key is present after the call (already-present or newly inserted);
+    // false only when the set is full and the key is absent.
     pub fn insert(self: *KeySet, key: PathQueryKey) bool {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return false;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) return true;
-            if (!slot.occupied and self.len < capacity) {
-                self.slots.items[index] = .{ .occupied = true, .key = key };
-                self.len += 1;
-                return true;
-            }
-        }
-        return false;
+        return self.table.put(key, {});
     }
 
-    pub fn findIndex(self: *const KeySet, key: PathQueryKey) ?usize {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return null;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) return index;
-            if (!slot.occupied and self.len < capacity) return null;
-        }
-        return null;
-    }
-
-    // Removes a key from the set using back-shift deletion so probe chains stay
-    // contiguous (an ordinary clear-and-leave-empty would strand later entries).
     pub fn remove(self: *KeySet, key: PathQueryKey) void {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return;
-        const start = hashPathKey(key) % capacity;
-        var hole: usize = capacity; // sentinel: not found
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (!slot.occupied) return; // chain end; key not present
-            if (keysEqual(slot.key, key)) {
-                hole = index;
-                break;
-            }
-        }
-        if (hole == capacity) return;
-        self.slots.items[hole].occupied = false;
-        self.len -= 1;
-        // Pull up subsequent entries that can fill the gap without becoming unreachable.
-        const initial_hole = hole;
-        var probe: usize = initial_hole;
-        while (true) {
-            probe = (probe + 1) % capacity;
-            if (probe == initial_hole) break;
-            const slot = self.slots.items[probe];
-            if (!slot.occupied) break;
-            const home = hashPathKey(slot.key) % capacity;
-            if (inCyclicRange(hole, probe, home)) continue;
-            self.slots.items[hole] = slot;
-            self.slots.items[probe].occupied = false;
-            hole = probe;
-        }
+        self.table.remove(key);
     }
-};
-
-pub const KeySetSlot = struct {
-    occupied: bool = false,
-    key: PathQueryKey = emptyKey(0),
 };
 
 // Fixed-capacity linear-probe map from goal key to group_requests slot index.
@@ -132,114 +182,39 @@ pub const KeySetSlot = struct {
 // Stripe index = fallback_index is not relevant here; this maps keys to the
 // dense ArrayList index in group_requests (stable until a swapRemove).
 pub const GroupKeyMap = struct {
-    slots: std.ArrayList(GroupKeyMapSlot) = .empty,
-    len: usize = 0,
+    table: ProbeTable(u16) = .{},
 
     pub fn deinit(self: *GroupKeyMap, allocator: std.mem.Allocator) void {
-        self.slots.deinit(allocator);
-        self.* = undefined;
+        self.table.deinit(allocator);
     }
 
     pub fn reserve(self: *GroupKeyMap, allocator: std.mem.Allocator, capacity: usize) !void {
-        if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
-        try setLen(&self.slots, allocator, capacity);
-        self.clear();
+        return self.table.reserve(allocator, capacity);
     }
 
     pub fn clear(self: *GroupKeyMap) void {
-        for (self.slots.items) |*slot| slot.occupied = false;
-        self.len = 0;
+        self.table.clear();
     }
 
     // Returns the stored group_requests index for this key, or null if absent.
     pub fn find(self: *const GroupKeyMap, key: PathQueryKey) ?usize {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return null;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) return slot.group_index;
-            if (!slot.occupied and self.len < capacity) return null;
-        }
-        return null;
+        const group_index = self.table.payloadOf(key) orelse return null;
+        return group_index;
     }
 
     // Maps key → group_requests index. Returns false when the map is full.
     pub fn insert(self: *GroupKeyMap, key: PathQueryKey, group_index: usize) bool {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return false;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = &self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) {
-                slot.group_index = @intCast(group_index);
-                return true;
-            }
-            if (!slot.occupied and self.len < capacity) {
-                slot.* = .{ .occupied = true, .key = key, .group_index = @intCast(group_index) };
-                self.len += 1;
-                return true;
-            }
-        }
-        return false;
+        return self.table.put(key, @intCast(group_index));
     }
 
     // Updates the stored index for a key that moved due to a swapRemove.
     pub fn updateIndex(self: *GroupKeyMap, key: PathQueryKey, new_group_index: usize) void {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return;
-        const start = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = &self.slots.items[index];
-            if (slot.occupied and keysEqual(slot.key, key)) {
-                slot.group_index = @intCast(new_group_index);
-                return;
-            }
-            if (!slot.occupied and self.len < capacity) return;
-        }
+        self.table.update(key, @intCast(new_group_index));
     }
 
-    // Removes a key using back-shift deletion to keep probe chains gap-free.
     pub fn remove(self: *GroupKeyMap, key: PathQueryKey) void {
-        const capacity = self.slots.items.len;
-        if (capacity == 0) return;
-        const start = hashPathKey(key) % capacity;
-        var hole: usize = capacity; // sentinel: not found
-        for (0..capacity) |probe| {
-            const index = (start + probe) % capacity;
-            const slot = self.slots.items[index];
-            if (!slot.occupied) return;
-            if (keysEqual(slot.key, key)) {
-                hole = index;
-                break;
-            }
-        }
-        if (hole == capacity) return;
-        self.slots.items[hole].occupied = false;
-        self.len -= 1;
-        const initial_hole = hole;
-        var probe: usize = initial_hole;
-        while (true) {
-            probe = (probe + 1) % capacity;
-            if (probe == initial_hole) break;
-            const slot = self.slots.items[probe];
-            if (!slot.occupied) break;
-            const home = hashPathKey(slot.key) % capacity;
-            if (inCyclicRange(hole, probe, home)) continue;
-            self.slots.items[hole] = slot;
-            self.slots.items[probe].occupied = false;
-            hole = probe;
-        }
+        self.table.remove(key);
     }
-};
-
-pub const GroupKeyMapSlot = struct {
-    occupied: bool = false,
-    key: PathQueryKey = emptyKey(0),
-    group_index: u16 = 0,
 };
 
 // Goal-keyed cache. Each slot owns a fixed path buffer so a moving agent can

@@ -233,6 +233,59 @@ pub const ChangedSpan = struct {
     span: NavSpan,
 };
 
+// Single source of the chunk-tiling geometry shared by NavGrid and NavGraph: the chunk_id
+// <-> cell mapping and the chunk-local label encoding. NavGrid encodes labels as
+// chunk_id * labelStride() + local; NavGraph decodes the owning chunk back via integer
+// division. Both delegate here so the encode/decode and chunk bounds cannot drift apart.
+pub const ChunkGeometry = struct {
+    width: usize,
+    height: usize,
+    chunk_tiles: usize,
+
+    pub const Bounds = struct { x0: usize, y0: usize, x1: usize, y1: usize };
+
+    pub fn chunksX(self: ChunkGeometry) usize {
+        return (self.width + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    pub fn chunksY(self: ChunkGeometry) usize {
+        return (self.height + self.chunk_tiles - 1) / self.chunk_tiles;
+    }
+
+    pub fn chunkCount(self: ChunkGeometry) usize {
+        return self.chunksX() * self.chunksY();
+    }
+
+    pub fn chunkOf(self: ChunkGeometry, cell_index: usize) u32 {
+        const cx = (cell_index % self.width) / self.chunk_tiles;
+        const cy = (cell_index / self.width) / self.chunk_tiles;
+        return @intCast(cy * self.chunksX() + cx);
+    }
+
+    // Cell rect [x0,x1) x [y0,y1) of one chunk, clamped to the grid.
+    pub fn chunkBounds(self: ChunkGeometry, chunk_id: u32) Bounds {
+        const cx_count = self.chunksX();
+        const cx = chunk_id % cx_count;
+        const cy = chunk_id / cx_count;
+        const x0 = cx * self.chunk_tiles;
+        const y0 = cy * self.chunk_tiles;
+        return .{
+            .x0 = x0,
+            .y0 = y0,
+            .x1 = @min(x0 + self.chunk_tiles, self.width),
+            .y1 = @min(y0 + self.chunk_tiles, self.height),
+        };
+    }
+
+    // Per-chunk label stride: chunk_tiles^2 + 1 (max local labels per chunk plus the
+    // reserved 0). Computed in u64 for headroom on the encode multiply; encoded labels
+    // are asserted to fit u32 at the encode site.
+    pub fn labelStride(self: ChunkGeometry) u64 {
+        const ct: u64 = self.chunk_tiles;
+        return ct * ct + 1;
+    }
+};
+
 // Tile index containing a world coordinate, clamped to [0, count-1]. Negatives map
 // to 0; the float floor guards against the inf/NaN illegal-behavior trap.
 pub fn tileIndexClamped(value: f32, tile_size: f32, count: u16) u16 {

@@ -1,5 +1,26 @@
 # Pathfinder Module Review — Synthesis Report
 
+## Resolution status (applied)
+
+All findings were investigated and fixed, phased by risk and gated by `zig build verify`
+at each step. Test count grew from the pre-change baseline to 584 passing.
+
+- **Fixed:** M1–M11, L1 (discharged by the M1 forced-parallel test), L4–L21, N2, N4, N5.
+- **M5 deviation:** kept the strict `==` hard-fallback assert (verified it holds across the
+  stress counts 256/512/1024, incl. the ceiling cap) and pinned it with a deterministic test,
+  instead of relaxing to `<=`.
+- **M9 scope:** extracted a generic `ProbeTable` for `KeySet`/`GroupKeyMap` only;
+  `ResultCache.removeAt` left special-cased (its back-shift moves parallel payload/cell stripes).
+- **Dropped (roadmap-aligned):** L2, L3 — belong to Slice 25C cross-level work / 25B's
+  deliberately start-dropped cache key; touching them now would pre-empt that design.
+- **Not changed by design:** N6 (sanctioned elastic resize); N1 (unnecessary — rebuild is
+  already alloc-free after the first high-water build); N3 (essay comments left intact rather
+  than risk removing the non-obvious perf/algorithm rationale this module deliberately documents).
+
+The findings below are the original review, retained for reference.
+
+---
+
 ## Executive Summary
 
 The `src/game/systems/pathfinding/` module is in strong shape across all three lenses. **Coherency**: the load-bearing cross-file invariants hold — chunk-label encode/decode agreement, disjoint per-chunk threaded write windows, worker stripe/scratch/pending index separation, shared grid dimensions for cross-level cell comparability, and consistent `PathQueryKey`/hash/eq/downsample contracts were all traced and verified. **Cohesion**: the file split is clean and single-responsibility, the public facade (`pathfinding.zig`) is correctly re-export-only, and no external consumer reaches into sub-modules. **Standards**: allocation discipline on hot/per-step paths is meticulous (pre-reserved pools, `appendAssumeCapacity`, generation-stamped scratch), error sets are explicit, and logging is comptime-gated.
