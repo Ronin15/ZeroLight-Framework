@@ -16,6 +16,7 @@ const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const resources = @import("resources.zig");
+const simd = @import("../core/simd.zig");
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 
@@ -542,15 +543,23 @@ fn writeSpriteQuad(
 
     const rotation = math.sinCos(sprite.rotation);
 
+    // The quad's four corners are exactly one SIMD lane group: rotate by the shared
+    // sin/cos, offset into world space, then apply the (identity) emit transform —
+    // all four corners at once. Lane order matches `local`/`uv`/`indices` above.
+    const cos = simd.splatFloat4(rotation.cos);
+    const sin = simd.splatFloat4(rotation.sin);
+    const local_x = simd.float4(local[0].x, local[1].x, local[2].x, local[3].x);
+    const local_y = simd.float4(local[0].y, local[1].y, local[2].y, local[3].y);
+    const rotated_x = simd.subFloat4(simd.mulFloat4(local_x, cos), simd.mulFloat4(local_y, sin));
+    const rotated_y = simd.addFloat4(simd.mulFloat4(local_x, sin), simd.mulFloat4(local_y, cos));
+    const world_x = simd.addFloat4(rotated_x, simd.splatFloat4(sprite.dest.x + sprite.origin.x));
+    const world_y = simd.addFloat4(rotated_y, simd.splatFloat4(sprite.dest.y + sprite.origin.y));
+    const final_x = simd.addFloat4(simd.mulFloat4(world_x, simd.splatFloat4(transform.scale.x)), simd.splatFloat4(transform.offset.x));
+    const final_y = simd.addFloat4(simd.mulFloat4(world_y, simd.splatFloat4(transform.scale.y)), simd.splatFloat4(transform.offset.y));
+    const px = simd.toFloatArray(final_x);
+    const py = simd.toFloatArray(final_y);
     var positions: [4]math.Vec2 = undefined;
-    for (local, 0..) |point, index| {
-        const rotated = math.rotate2D(point, rotation);
-        const world = math.Vec2{
-            .x = sprite.dest.x + sprite.origin.x + rotated.x,
-            .y = sprite.dest.y + sprite.origin.y + rotated.y,
-        };
-        positions[index] = transform.apply(world);
-    }
+    inline for (0..4) |index| positions[index] = .{ .x = px[index], .y = py[index] };
 
     for (indices, 0..) |source_index, out_index| {
         const position = positions[source_index];

@@ -46,6 +46,7 @@ const cognition_stagger_n = @import("../simulation_scope.zig").cognition_stagger
 const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
 const locomotion_halo_chunks = @import("../simulation_scope.zig").locomotion_halo_chunks;
 const kinematic_halo_chunks = @import("../simulation_scope.zig").kinematic_halo_chunks;
+const level_distance_chunks = @import("../simulation_scope.zig").level_distance_chunks;
 const tierForChunkDistance = @import("../simulation_scope.zig").tierForChunkDistance;
 const StructuralCommand = @import("../data_system.zig").StructuralCommand;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
@@ -446,16 +447,7 @@ pub const SimulationScopeSystem = struct {
         const region = visible_region orelse return;
         const scope = data.scopeColumnsSliceConst();
         try out.ensureTotalCapacity(allocator, scope.entities.len);
-        for (scope.entities, 0..) |ent, i| {
-            if (scope.always_active[i]) continue;
-            // Cube LOD distance: chebyshev chunk distance, floored by the per-level
-            // penalty so an off-level entity demotes regardless of its x/y.
-            const distance = region.lodDistance(.{ .x = scope.chunk_x[i], .y = scope.chunk_y[i] }, scope.level[i]);
-            const correct_tier = tierForChunkDistance(distance);
-            if (scope.tier[i] != correct_tier) {
-                out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = ent, .tier = correct_tier } });
-            }
-        }
+        scanTierPolicy(scope, region, 0, scope.entities.len, out);
     }
 
     // ---- Shared threading helpers --------------------------------------------
@@ -629,6 +621,78 @@ fn scanTierAboveThreshold(
     }
 }
 
+/// Vectorized tier-policy scan over a contiguous entity range: computes each
+/// entity's cube LOD distance and target tier four lanes at a time (chebyshev
+/// chunk distance floored by the per-level penalty, then the `tierForChunkDistance`
+/// band ladder via masked selects), then emits a set_simulation_tier command for
+/// every non-pinned entity whose current tier differs. Shared by the serial core
+/// and the threaded job so both stay SIMD; the scalar tail mirrors the scalar
+/// `lodDistance`/`tierForChunkDistance` exactly.
+fn scanTierPolicy(
+    scope: ConstScopeColumnsSlice,
+    region: ActiveRegion,
+    start: usize,
+    end: usize,
+    out: *std.ArrayList(StructuralCommand),
+) void {
+    const min_x = simd.splatInt4(region.min.x);
+    const min_y = simd.splatInt4(region.min.y);
+    const max_x = simd.splatInt4(region.max_exclusive.x - 1);
+    const max_y = simd.splatInt4(region.max_exclusive.y - 1);
+    const region_level = simd.splatInt4(@intCast(region.level));
+    const penalty_per = simd.splatInt4(@intCast(level_distance_chunks));
+    const zero = simd.splatInt4(0);
+    const cog = simd.splatInt4(@intCast(cognition_halo_chunks));
+    const loco = simd.splatInt4(@intCast(locomotion_halo_chunks));
+    const kin = simd.splatInt4(@intCast(kinematic_halo_chunks));
+    const tier_cognition = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.cognition)));
+    const tier_locomotion = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.locomotion)));
+    const tier_kinematic = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.kinematic)));
+    const tier_dormant = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.dormant)));
+
+    var i = start;
+    const vend = start + simd.vectorizedEnd(end - start);
+    while (i < vend) : (i += simd.lane_count) {
+        const cx = simd.loadInt4(scope.chunk_x[i..]);
+        const cy = simd.loadInt4(scope.chunk_y[i..]);
+        const lv = simd.int4(
+            @intCast(scope.level[i]),
+            @intCast(scope.level[i + 1]),
+            @intCast(scope.level[i + 2]),
+            @intCast(scope.level[i + 3]),
+        );
+        // Chebyshev chunk distance: max over each axis of (under-min, over-max, 0).
+        const dx = simd.maxInt4(simd.maxInt4(simd.subInt4(min_x, cx), simd.subInt4(cx, max_x)), zero);
+        const dy = simd.maxInt4(simd.maxInt4(simd.subInt4(min_y, cy), simd.subInt4(cy, max_y)), zero);
+        const chebyshev = simd.maxInt4(dx, dy);
+        // Per-level penalty floors the distance so off-level rows read as far.
+        const level_delta = simd.subInt4(lv, region_level);
+        const level_abs = simd.maxInt4(level_delta, simd.subInt4(zero, level_delta));
+        const distance = simd.maxInt4(chebyshev, simd.mulInt4(level_abs, penalty_per));
+        // Band ladder: start nearest, demote one band per crossed threshold. Since
+        // the halos are monotonic, the farthest crossed threshold wins per lane.
+        var tier = tier_cognition;
+        tier = simd.selectInt4(simd.greaterThanInt4(distance, cog), tier_locomotion, tier);
+        tier = simd.selectInt4(simd.greaterThanInt4(distance, loco), tier_kinematic, tier);
+        tier = simd.selectInt4(simd.greaterThanInt4(distance, kin), tier_dormant, tier);
+        inline for (0..simd.lane_count) |lane| {
+            const idx = i + lane;
+            const correct_tier: SimulationTier = @enumFromInt(tier[lane]);
+            if (!scope.always_active[idx] and scope.tier[idx] != correct_tier) {
+                out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[idx], .tier = correct_tier } });
+            }
+        }
+    }
+    while (i < end) : (i += 1) {
+        if (scope.always_active[i]) continue;
+        const distance = region.lodDistance(.{ .x = scope.chunk_x[i], .y = scope.chunk_y[i] }, scope.level[i]);
+        const correct_tier = tierForChunkDistance(distance);
+        if (scope.tier[i] != correct_tier) {
+            out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[i], .tier = correct_tier } });
+        }
+    }
+}
+
 const CollisionGatherContext = struct {
     data: *const DataSystem,
     bounds_entities: []const EntityId,
@@ -693,15 +757,7 @@ const TierPolicyContext = struct {
 fn tierPolicyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *TierPolicyContext = @ptrCast(@alignCast(context));
     const buffer = &job.ranges[range.index].buffer;
-    const scope = job.scope;
-    for (range.start..range.end) |i| {
-        if (scope.always_active[i]) continue;
-        const distance = job.region.lodDistance(.{ .x = scope.chunk_x[i], .y = scope.chunk_y[i] }, scope.level[i]);
-        const correct_tier = tierForChunkDistance(distance);
-        if (scope.tier[i] != correct_tier) {
-            buffer.commands.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[i], .tier = correct_tier } });
-        }
-    }
+    scanTierPolicy(job.scope, job.region, range.start, range.end, &buffer.commands);
 }
 
 // ---- Work selection (matches collision/ai selectStageWork) ------------------

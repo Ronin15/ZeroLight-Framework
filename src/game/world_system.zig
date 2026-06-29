@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const math = @import("../core/math.zig");
+const simd = @import("../core/simd.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const PreparedSprite = @import("../assets/runtime_assets.zig").PreparedSprite;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
@@ -532,15 +533,33 @@ pub const WorldSystem = struct {
         self.last_max_chunk_y = max_chunk_y;
         self.visibility_window_valid = true;
 
-        for (0..self.chunk_visible.items.len) |index| {
-            const chunk_x: u16 = @intCast(self.chunk_x.items[index]);
-            const chunk_y: u16 = @intCast(self.chunk_y.items[index]);
-            const visible = chunk_x >= min_chunk_x and chunk_x <= max_chunk_x and
-                chunk_y >= min_chunk_y and chunk_y <= max_chunk_y;
-            // Chunk visibility still crops sparse tiles, but no longer drives dense
-            // rendering: each dense layer is one full-world tilemap quad, so a pan
-            // uploads nothing.
-            self.chunk_visible.items[index] = visible;
+        // Visibility is a half-open box test over the chunk-coord columns, four
+        // chunks at a time: `c >= min` becomes `c > min-1` and `c <= max` becomes
+        // `c < max+1` so it maps onto the greater/less helpers, and the per-axis
+        // masks AND together. Chunk visibility still crops sparse tiles, but no
+        // longer drives dense rendering: each dense layer is one full-world tilemap
+        // quad, so a pan uploads nothing.
+        const min_x = simd.splatInt4(@as(i32, min_chunk_x) - 1);
+        const max_x = simd.splatInt4(@as(i32, max_chunk_x) + 1);
+        const min_y = simd.splatInt4(@as(i32, min_chunk_y) - 1);
+        const max_y = simd.splatInt4(@as(i32, max_chunk_y) + 1);
+        const count = self.chunk_visible.items.len;
+        var index: usize = 0;
+        const vectorized_end = simd.vectorizedEnd(count);
+        while (index < vectorized_end) : (index += simd.lane_count) {
+            const cx = simd.loadInt4(self.chunk_x.items[index..]);
+            const cy = simd.loadInt4(self.chunk_y.items[index..]);
+            const visible = simd.greaterThanInt4(cx, min_x) & simd.lessThanInt4(cx, max_x) &
+                simd.greaterThanInt4(cy, min_y) & simd.lessThanInt4(cy, max_y);
+            inline for (0..simd.lane_count) |lane| {
+                self.chunk_visible.items[index + lane] = visible[lane];
+            }
+        }
+        while (index < count) : (index += 1) {
+            const cx = self.chunk_x.items[index];
+            const cy = self.chunk_y.items[index];
+            self.chunk_visible.items[index] = cx >= @as(i32, min_chunk_x) and cx <= @as(i32, max_chunk_x) and
+                cy >= @as(i32, min_chunk_y) and cy <= @as(i32, max_chunk_y);
         }
 
         // Refresh the cached visible-sparse count from the freshly-updated
