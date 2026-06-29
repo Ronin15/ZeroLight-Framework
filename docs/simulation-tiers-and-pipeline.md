@@ -58,9 +58,16 @@ The concrete processor order is pipeline-owned for one gameplay state instance.
 commit/domain reactions, and render-prep reservation at the state boundary; it
 passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
-`SimulationPipeline` owns AI navigation-intent production, steering/path status,
-pathfinding, sparse movement-intent application, movement, bounds clamp,
-player-vs-world-tile gating, collision detection, and collision response.
+`SimulationPipeline` opens each step with the backbone **scope pass** (chunk
+recompute, stagger advance, and the tier/halo/stagger gathers that select which
+entities enter each stage), then owns AI navigation-intent production,
+steering/path status, pathfinding, sparse movement-intent application, movement,
+bounds clamp, player-vs-world-tile gating, collision detection, and collision
+response — AI, movement, and collision run scope-gated through a
+`scope_dense_indices` option. It closes with the **simulation-LOD tier policy**,
+which assigns each entity a cognition/locomotion/kinematic/dormant tier by cube
+distance and emits deferred `set_simulation_tier` commands at the commit seam. See
+`docs/architecture.md` for scope/tier ownership and the gating rules per stage.
 
 The player-vs-tile gate runs right after the bounds clamp and before entity
 collision, so every downstream stage and the camera see the gated position. It

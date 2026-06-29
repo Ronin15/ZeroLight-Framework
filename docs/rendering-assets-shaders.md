@@ -57,18 +57,21 @@ Sprites and colored rectangles flow through an explicit render-prep queue when
 multiple producers can interleave world, effect, UI, or debug records. The queue
 sorts transient draw records by `RenderOrder`: world z first, then UI, then
 debug. `SpriteBatch` remains a strict ordered-stream consumer: it streams the
-per-frame **dynamic** vertex buffer (entities, particles, UI, sparse tiles) and
-submits by texture and coordinate-presentation groups. Texture ownership is
+per-frame **dynamic** vertex data (entities, particles, UI, sparse tiles) and
+submits by texture and coordinate-presentation groups. Vertices are stored
+**SoA**: three per-attribute columns (`position`, `uv`, `color`) emitted into
+three GPU vertex buffers, not one interleaved struct. Texture ownership is
 tracked with generational `TextureId` values so stale or destroyed IDs are
 rejected deterministically during batch prep.
 
-The renderer owns a second, **static** vertex buffer for retained world geometry —
-now just one quad per dense layer (see GPU-Driven Tilemap). Each frame it builds one
-order-merged draw list from the dynamic draw groups plus the static spans,
+The renderer owns a second, **static** set of vertex buffers for retained world
+geometry — now just one quad per dense layer (see GPU-Driven Tilemap). Each frame it
+builds one order-merged draw list from the dynamic draw groups plus the static spans,
 stable-sorted by `RenderOrder` (static appended first, so world/dense geometry draws
-under sparse/dynamic at equal order). It binds the dynamic or static vertex buffer
-per source and the **sprite** or **tilemap** pipeline per `DrawGroup.material`. The
-static buffer re-uploads only on a structural change, so a still or panning frame
+under sparse/dynamic at equal order). Per source it binds that source's three
+per-attribute buffers (position/uv/color at slots 0/1/2; both pipelines declare three
+vertex buffers) and the **sprite** or **tilemap** pipeline per `DrawGroup.material`.
+The static buffers re-upload only on a structural change, so a still or panning frame
 issues no dense vertex work.
 
 `Renderer` remains the game-facing facade. `src/render/sprite_batch.zig` owns
