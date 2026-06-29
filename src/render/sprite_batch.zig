@@ -509,23 +509,6 @@ fn fillPreparedRange(
     }
 }
 
-// Affine map applied to each emitted world-space corner: `p * scale + offset`.
-// World geometry is emitted in world space and the renderer bakes the camera
-// into the draw-time vertex uniform, so CPU emission always uses identity.
-const PositionTransform = struct {
-    scale: math.Vec2 = .{ .x = 1, .y = 1 },
-    offset: math.Vec2 = .{ .x = 0, .y = 0 },
-
-    const identity = PositionTransform{};
-
-    fn apply(self: PositionTransform, point: math.Vec2) math.Vec2 {
-        return .{
-            .x = point.x * self.scale.x + self.offset.x,
-            .y = point.y * self.scale.y + self.offset.y,
-        };
-    }
-};
-
 fn writePreparedSpriteVertices(
     prepared: PreparedSpriteCommand,
     out: VertexColumns,
@@ -533,7 +516,7 @@ fn writePreparedSpriteVertices(
 ) void {
     // All spaces emit world/identity-space geometry; the renderer applies the
     // camera via its vertex uniform, never on the CPU.
-    writeSpriteQuad(prepared.sprite, prepared.texture_desc, .identity, out, base);
+    writeSpriteQuad(prepared.sprite, prepared.texture_desc, out, base);
 }
 
 /// Writes one world-space sprite quad with identity transform. The world builds
@@ -544,7 +527,7 @@ pub fn writeWorldSpriteQuad(
     texture: resources.TextureDesc,
     out: VertexColumns,
 ) void {
-    writeSpriteQuad(sprite, texture, .identity, out, 0);
+    writeSpriteQuad(sprite, texture, out, 0);
 }
 
 // Pure six-vertex quad emission shared by dynamic sprite prep and static tile
@@ -553,7 +536,6 @@ pub fn writeWorldSpriteQuad(
 fn writeSpriteQuad(
     sprite: Sprite,
     texture: resources.TextureDesc,
-    transform: PositionTransform,
     out: VertexColumns,
     base: usize,
 ) void {
@@ -589,8 +571,9 @@ fn writeSpriteQuad(
     const rotation = math.sinCos(sprite.rotation);
 
     // The quad's four corners are exactly one SIMD lane group: rotate by the shared
-    // sin/cos, offset into world space, then apply the (identity) emit transform —
-    // all four corners at once. Lane order matches `local`/`uv`/`indices` above.
+    // sin/cos and offset into world space, all four corners at once. Emission is
+    // always world/identity space, so there is no post-transform. Lane order
+    // matches `local`/`uv`/`indices` above.
     const cos = simd.splatFloat4(rotation.cos);
     const sin = simd.splatFloat4(rotation.sin);
     const local_x = simd.float4(local[0].x, local[1].x, local[2].x, local[3].x);
@@ -599,10 +582,8 @@ fn writeSpriteQuad(
     const rotated_y = simd.addFloat4(simd.mulFloat4(local_x, sin), simd.mulFloat4(local_y, cos));
     const world_x = simd.addFloat4(rotated_x, simd.splatFloat4(sprite.dest.x + sprite.origin.x));
     const world_y = simd.addFloat4(rotated_y, simd.splatFloat4(sprite.dest.y + sprite.origin.y));
-    const final_x = simd.addFloat4(simd.mulFloat4(world_x, simd.splatFloat4(transform.scale.x)), simd.splatFloat4(transform.offset.x));
-    const final_y = simd.addFloat4(simd.mulFloat4(world_y, simd.splatFloat4(transform.scale.y)), simd.splatFloat4(transform.offset.y));
-    const px = simd.toFloatArray(final_x);
-    const py = simd.toFloatArray(final_y);
+    const px = simd.toFloatArray(world_x);
+    const py = simd.toFloatArray(world_y);
     var positions: [4]math.Vec2 = undefined;
     inline for (0..4) |index| positions[index] = .{ .x = px[index], .y = py[index] };
 
