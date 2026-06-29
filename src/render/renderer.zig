@@ -41,7 +41,11 @@ pub const Sprite = sprite_batch.Sprite;
 pub const SpritePrepStats = sprite_batch.SpritePrepStats;
 // Re-exported so world/render-prep code can build retained static vertices
 // without importing the render/gpu boundary.
-pub const Vertex = sprite_batch.Vertex;
+pub const Position = sprite_batch.Position;
+pub const Uv = sprite_batch.Uv;
+pub const VertexColor = sprite_batch.VertexColor;
+pub const VertexColumns = sprite_batch.VertexColumns;
+pub const VertexColumnsConst = sprite_batch.VertexColumnsConst;
 pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
 const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
@@ -65,6 +69,59 @@ pub const TileDataEdit = struct {
     value: u32,
 };
 
+// One GPU vertex buffer + its upload transfer buffer per SoA column. The three
+// buffers are bound together at slots 0/1/2 (Position/Uv/VertexColor); they grow,
+// stage, and release as a unit so their capacities never diverge.
+const VertexStreams = struct {
+    position: *c.SDL_GPUBuffer,
+    uv: *c.SDL_GPUBuffer,
+    color: *c.SDL_GPUBuffer,
+    position_transfer: *c.SDL_GPUTransferBuffer,
+    uv_transfer: *c.SDL_GPUTransferBuffer,
+    color_transfer: *c.SDL_GPUTransferBuffer,
+};
+
+// Creates the three column buffers + three transfer buffers for `vertex_capacity`
+// vertices. Each create has its own errdefer so a mid-sequence failure releases
+// the partially built set.
+fn createVertexStreams(device: *c.SDL_GPUDevice, vertex_capacity: usize) !VertexStreams {
+    const position_bytes = try gpu_buffer.columnBytes(vertex_capacity, @sizeOf(Position));
+    const uv_bytes = try gpu_buffer.columnBytes(vertex_capacity, @sizeOf(Uv));
+    const color_bytes = try gpu_buffer.columnBytes(vertex_capacity, @sizeOf(VertexColor));
+
+    const position = try gpu_buffer.createVertexBuffer(device, position_bytes);
+    errdefer c.SDL_ReleaseGPUBuffer(device, position);
+    const uv = try gpu_buffer.createVertexBuffer(device, uv_bytes);
+    errdefer c.SDL_ReleaseGPUBuffer(device, uv);
+    const color = try gpu_buffer.createVertexBuffer(device, color_bytes);
+    errdefer c.SDL_ReleaseGPUBuffer(device, color);
+
+    const position_transfer = try gpu_buffer.createVertexTransferBuffer(device, position_bytes);
+    errdefer c.SDL_ReleaseGPUTransferBuffer(device, position_transfer);
+    const uv_transfer = try gpu_buffer.createVertexTransferBuffer(device, uv_bytes);
+    errdefer c.SDL_ReleaseGPUTransferBuffer(device, uv_transfer);
+    const color_transfer = try gpu_buffer.createVertexTransferBuffer(device, color_bytes);
+    errdefer c.SDL_ReleaseGPUTransferBuffer(device, color_transfer);
+
+    return .{
+        .position = position,
+        .uv = uv,
+        .color = color,
+        .position_transfer = position_transfer,
+        .uv_transfer = uv_transfer,
+        .color_transfer = color_transfer,
+    };
+}
+
+fn releaseVertexStreams(device: *c.SDL_GPUDevice, streams: VertexStreams) void {
+    c.SDL_ReleaseGPUTransferBuffer(device, streams.position_transfer);
+    c.SDL_ReleaseGPUTransferBuffer(device, streams.uv_transfer);
+    c.SDL_ReleaseGPUTransferBuffer(device, streams.color_transfer);
+    c.SDL_ReleaseGPUBuffer(device, streams.position);
+    c.SDL_ReleaseGPUBuffer(device, streams.uv);
+    c.SDL_ReleaseGPUBuffer(device, streams.color);
+}
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
@@ -72,8 +129,7 @@ pub const Renderer = struct {
     pipeline: *c.SDL_GPUGraphicsPipeline,
     tilemap_pipeline: *c.SDL_GPUGraphicsPipeline,
     sampler: *c.SDL_GPUSampler,
-    vertex_buffer: *c.SDL_GPUBuffer,
-    vertex_transfer_buffer: *c.SDL_GPUTransferBuffer,
+    vertex_streams: VertexStreams,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
     // GPU-driven tilemap tile-data: one graphics-storage-read buffer per dense
@@ -105,10 +161,11 @@ pub const Renderer = struct {
     // re-uploaded only when `static_dirty` (visible set change, dig/build). The
     // GPU buffer persists across frames; the per-frame draw list interleaves
     // these spans with the dynamic batch by render order.
-    static_vertex_buffer: ?*c.SDL_GPUBuffer = null,
-    static_transfer_buffer: ?*c.SDL_GPUTransferBuffer = null,
+    static_streams: ?VertexStreams = null,
     static_capacity_vertices: usize = 0,
-    static_vertices: std.ArrayListUnmanaged(Vertex) = .empty,
+    static_positions: std.ArrayListUnmanaged(Position) = .empty,
+    static_uvs: std.ArrayListUnmanaged(Uv) = .empty,
+    static_colors: std.ArrayListUnmanaged(VertexColor) = .empty,
     static_groups: std.ArrayListUnmanaged(DrawGroup) = .empty,
     static_dirty: bool = false,
     draw_list: std.ArrayListUnmanaged(DrawGroup) = .empty,
@@ -138,11 +195,8 @@ pub const Renderer = struct {
         };
         errdefer c.SDL_ReleaseGPUSampler(device, sampler);
 
-        const vertex_buffer = try gpu_buffer.createVertexBuffer(device, initial_batch_vertices);
-        errdefer c.SDL_ReleaseGPUBuffer(device, vertex_buffer);
-
-        const vertex_transfer_buffer = try gpu_buffer.createVertexTransferBuffer(device, initial_batch_vertices);
-        errdefer c.SDL_ReleaseGPUTransferBuffer(device, vertex_transfer_buffer);
+        const vertex_streams = try createVertexStreams(device, initial_batch_vertices);
+        errdefer releaseVertexStreams(device, vertex_streams);
 
         const target_format = c.SDL_GetGPUSwapchainTextureFormat(device, window);
         const shader_set = try gpu_pipeline.selectShaderSet(device, @intCast(build_options.gpu_shader_formats));
@@ -170,8 +224,7 @@ pub const Renderer = struct {
             .pipeline = pipeline,
             .tilemap_pipeline = tilemap_pipeline,
             .sampler = sampler,
-            .vertex_buffer = vertex_buffer,
-            .vertex_transfer_buffer = vertex_transfer_buffer,
+            .vertex_streams = vertex_streams,
             .batch_capacity_vertices = initial_batch_vertices,
             .batch = sprite_batch.SpriteBatch.init(allocator),
             .resolution_policy = app_config.resolution_policy,
@@ -201,14 +254,14 @@ pub const Renderer = struct {
         self.tile_data_counts.deinit(self.allocator);
         self.tile_edit_scratch.deinit(self.allocator);
         self.deinitBatchStorage();
-        self.static_vertices.deinit(self.allocator);
+        self.static_positions.deinit(self.allocator);
+        self.static_uvs.deinit(self.allocator);
+        self.static_colors.deinit(self.allocator);
         self.static_groups.deinit(self.allocator);
         self.draw_list.deinit(self.allocator);
-        if (self.static_transfer_buffer) |transfer| c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-        if (self.static_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(self.device, buffer);
+        if (self.static_streams) |streams| releaseVertexStreams(self.device, streams);
 
-        c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
-        c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
+        releaseVertexStreams(self.device, self.vertex_streams);
         c.SDL_ReleaseGPUSampler(self.device, self.sampler);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.tilemap_pipeline);
         c.SDL_ReleaseGPUGraphicsPipeline(self.device, self.pipeline);
@@ -262,7 +315,9 @@ pub const Renderer = struct {
     /// change, dig/build), then append spans; the buffer re-uploads once. When
     /// not called, the existing static geometry persists and is reused.
     pub fn beginStaticGeometry(self: *Renderer) void {
-        self.static_vertices.clearRetainingCapacity();
+        self.static_positions.clearRetainingCapacity();
+        self.static_uvs.clearRetainingCapacity();
+        self.static_colors.clearRetainingCapacity();
         self.static_groups.clearRetainingCapacity();
         self.static_dirty = true;
     }
@@ -270,7 +325,9 @@ pub const Renderer = struct {
     /// Reserves retained static storage. Setup/grow-only; call before relying on
     /// allocation-free static rebuilds.
     pub fn reserveStaticGeometry(self: *Renderer, vertex_capacity: usize, span_capacity: usize) !void {
-        try self.static_vertices.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.static_positions.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.static_uvs.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.static_colors.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.static_groups.ensureTotalCapacity(self.allocator, span_capacity);
         self.reserved_static_spans = span_capacity;
         try self.ensureDrawListReservation();
@@ -291,14 +348,18 @@ pub const Renderer = struct {
         self: *Renderer,
         atlas_texture: TextureId,
         order: RenderOrder,
-        vertices: []const Vertex,
+        vertices: VertexColumnsConst,
         tile_data: TileDataId,
     ) !void {
-        if (vertices.len == 0) return;
-        const end = try std.math.add(usize, self.static_vertices.items.len, vertices.len);
-        const first_vertex = std.math.cast(u32, self.static_vertices.items.len) orelse return error.StaticGeometryTooLarge;
+        const vertex_count = vertices.positions.len;
+        std.debug.assert(vertices.uvs.len == vertex_count and vertices.colors.len == vertex_count);
+        if (vertex_count == 0) return;
+        const end = try std.math.add(usize, self.static_positions.items.len, vertex_count);
+        const first_vertex = std.math.cast(u32, self.static_positions.items.len) orelse return error.StaticGeometryTooLarge;
         _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
-        try self.static_vertices.appendSlice(self.allocator, vertices);
+        try self.static_positions.appendSlice(self.allocator, vertices.positions);
+        try self.static_uvs.appendSlice(self.allocator, vertices.uvs);
+        try self.static_colors.appendSlice(self.allocator, vertices.colors);
         try self.static_groups.append(self.allocator, .{
             .source = .static,
             .material = .tilemap,
@@ -306,7 +367,7 @@ pub const Renderer = struct {
             .presentation = .world,
             .order = order,
             .first_vertex = first_vertex,
-            .vertex_count = @intCast(vertices.len),
+            .vertex_count = @intCast(vertex_count),
             .tile_data = tile_data,
         });
         self.static_dirty = true;
@@ -424,13 +485,13 @@ pub const Renderer = struct {
         // coalesced. Rebuilt every frame because the dynamic groups change; the
         // static buffer itself only re-uploads when `static_dirty`.
         try mergeDrawList(&self.draw_list, self.allocator, self.static_groups.items, self.batch.draw_groups.items);
-        const upload_static = self.static_dirty and self.static_vertices.items.len > 0;
+        const upload_static = self.static_dirty and self.static_positions.items.len > 0;
         // Staging before swapchain acquisition is safe across frames in flight
         // only because the transfer buffer is mapped with cycle=true (see
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
-        if (self.batch.vertices.items.len > 0) {
+        if (self.batch.positions.items.len > 0) {
             try self.stageVertices();
         }
         if (upload_static) {
@@ -445,7 +506,7 @@ pub const Renderer = struct {
             .height = frame.height,
         });
 
-        if (self.batch.vertices.items.len > 0) {
+        if (self.batch.positions.items.len > 0) {
             self.recordVertexUpload(command_buffer) catch {
                 return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
             };
@@ -487,9 +548,9 @@ pub const Renderer = struct {
             var active_texture: ?TextureId = null;
             for (self.draw_list.items) |group| {
                 const texture = self.resolveTextureSlot(group.texture) orelse continue;
-                const source_buffer = switch (group.source) {
-                    .dynamic => self.vertex_buffer,
-                    .static => self.static_vertex_buffer orelse continue,
+                const streams = switch (group.source) {
+                    .dynamic => self.vertex_streams,
+                    .static => self.static_streams orelse continue,
                 };
                 const tile_buffer: ?*c.SDL_GPUBuffer = switch (group.material) {
                     .sprite => null,
@@ -505,11 +566,14 @@ pub const Renderer = struct {
                 }
 
                 if (active_source == null or active_source.? != group.source) {
-                    var vertex_binding = c.SDL_GPUBufferBinding{
-                        .buffer = source_buffer,
-                        .offset = 0,
+                    // Slot order is correctness-critical: index 0/1/2 must match the
+                    // pipeline's buffer_slot 0/1/2 (Position/Uv/VertexColor).
+                    var bindings = [_]c.SDL_GPUBufferBinding{
+                        .{ .buffer = streams.position, .offset = 0 },
+                        .{ .buffer = streams.uv, .offset = 0 },
+                        .{ .buffer = streams.color, .offset = 0 },
                     };
-                    c.SDL_BindGPUVertexBuffers(render_pass, 0, &vertex_binding, 1);
+                    c.SDL_BindGPUVertexBuffers(render_pass, 0, &bindings, bindings.len);
                     active_source = group.source;
                 }
 
@@ -894,27 +958,28 @@ pub const Renderer = struct {
         // runtime grow-and-stall is visible rather than silent.
         log.warn("growing vertex batch capacity {} -> {} vertices (GPU stall); reserve capacity to avoid this", .{ self.batch_capacity_vertices, new_capacity });
 
-        const new_vertex_buffer = try gpu_buffer.createVertexBuffer(self.device, new_capacity);
-        errdefer c.SDL_ReleaseGPUBuffer(self.device, new_vertex_buffer);
-
-        const new_vertex_transfer_buffer = try gpu_buffer.createVertexTransferBuffer(self.device, new_capacity);
-        errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_vertex_transfer_buffer);
+        // Build the full new three-buffer set before idling and releasing the old,
+        // so a creation failure leaves the live streams untouched.
+        const new_streams = try createVertexStreams(self.device, new_capacity);
+        errdefer releaseVertexStreams(self.device, new_streams);
 
         _ = c.SDL_WaitForGPUIdle(self.device);
-        c.SDL_ReleaseGPUTransferBuffer(self.device, self.vertex_transfer_buffer);
-        c.SDL_ReleaseGPUBuffer(self.device, self.vertex_buffer);
+        releaseVertexStreams(self.device, self.vertex_streams);
 
-        self.vertex_buffer = new_vertex_buffer;
-        self.vertex_transfer_buffer = new_vertex_transfer_buffer;
+        self.vertex_streams = new_streams;
         self.batch_capacity_vertices = new_capacity;
     }
 
     fn stageVertices(self: *Renderer) !void {
-        try gpu_buffer.stageVertices(self.device, self.vertex_transfer_buffer, self.batch.vertices.items);
+        try gpu_buffer.stageVertices(self.device, self.vertex_streams.position_transfer, std.mem.sliceAsBytes(self.batch.positions.items));
+        try gpu_buffer.stageVertices(self.device, self.vertex_streams.uv_transfer, std.mem.sliceAsBytes(self.batch.uvs.items));
+        try gpu_buffer.stageVertices(self.device, self.vertex_streams.color_transfer, std.mem.sliceAsBytes(self.batch.colors.items));
     }
 
     fn recordVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_transfer_buffer, self.vertex_buffer, self.batch.vertices.items);
+        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.position_transfer, self.vertex_streams.position, std.mem.sliceAsBytes(self.batch.positions.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.uv_transfer, self.vertex_streams.uv, std.mem.sliceAsBytes(self.batch.uvs.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.color_transfer, self.vertex_streams.color, std.mem.sliceAsBytes(self.batch.colors.items));
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
@@ -922,36 +987,38 @@ pub const Renderer = struct {
     // grows only when a dense layer is added, so the GPU-idle stall below is a rare,
     // few-vertex structural event rather than a per-frame cost.
     fn ensureStaticCapacity(self: *Renderer, needed_vertices: usize) !void {
-        if (self.static_vertex_buffer != null and needed_vertices <= self.static_capacity_vertices) return;
+        if (self.static_streams != null and needed_vertices <= self.static_capacity_vertices) return;
 
         var new_capacity = if (self.static_capacity_vertices == 0) needed_vertices else self.static_capacity_vertices;
         while (new_capacity < needed_vertices) {
             new_capacity *= 2;
         }
 
-        const new_buffer = try gpu_buffer.createVertexBuffer(self.device, new_capacity);
-        errdefer c.SDL_ReleaseGPUBuffer(self.device, new_buffer);
-        const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, new_capacity);
-        errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
+        const new_streams = try createVertexStreams(self.device, new_capacity);
+        errdefer releaseVertexStreams(self.device, new_streams);
 
-        if (self.static_vertex_buffer != null) {
+        if (self.static_streams) |streams| {
             _ = c.SDL_WaitForGPUIdle(self.device);
-            if (self.static_transfer_buffer) |transfer| c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            if (self.static_vertex_buffer) |buffer| c.SDL_ReleaseGPUBuffer(self.device, buffer);
+            releaseVertexStreams(self.device, streams);
         }
 
-        self.static_vertex_buffer = new_buffer;
-        self.static_transfer_buffer = new_transfer;
+        self.static_streams = new_streams;
         self.static_capacity_vertices = new_capacity;
     }
 
     fn stageStaticVertices(self: *Renderer) !void {
-        try self.ensureStaticCapacity(self.static_vertices.items.len);
-        try gpu_buffer.stageVertices(self.device, self.static_transfer_buffer.?, self.static_vertices.items);
+        try self.ensureStaticCapacity(self.static_positions.items.len);
+        const streams = self.static_streams.?;
+        try gpu_buffer.stageVertices(self.device, streams.position_transfer, std.mem.sliceAsBytes(self.static_positions.items));
+        try gpu_buffer.stageVertices(self.device, streams.uv_transfer, std.mem.sliceAsBytes(self.static_uvs.items));
+        try gpu_buffer.stageVertices(self.device, streams.color_transfer, std.mem.sliceAsBytes(self.static_colors.items));
     }
 
     fn recordStaticVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        try gpu_buffer.recordVertexUpload(command_buffer, self.static_transfer_buffer.?, self.static_vertex_buffer.?, self.static_vertices.items);
+        const streams = self.static_streams.?;
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, std.mem.sliceAsBytes(self.static_positions.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, std.mem.sliceAsBytes(self.static_uvs.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, std.mem.sliceAsBytes(self.static_colors.items));
     }
 
     pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {
@@ -1221,8 +1288,7 @@ test "texture slots reuse retired slots with fresh generations" {
         .pipeline = undefined,
         .tilemap_pipeline = undefined,
         .sampler = undefined,
-        .vertex_buffer = undefined,
-        .vertex_transfer_buffer = undefined,
+        .vertex_streams = undefined,
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };
@@ -1259,8 +1325,7 @@ test "internal texture slots cannot be destroyed or replaced through public APIs
         .pipeline = undefined,
         .tilemap_pipeline = undefined,
         .sampler = undefined,
-        .vertex_buffer = undefined,
-        .vertex_transfer_buffer = undefined,
+        .vertex_streams = undefined,
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };
@@ -1582,8 +1647,7 @@ test "renderer drawable pixel scale follows current presentation" {
         .pipeline = undefined,
         .tilemap_pipeline = undefined,
         .sampler = undefined,
-        .vertex_buffer = undefined,
-        .vertex_transfer_buffer = undefined,
+        .vertex_streams = undefined,
         .batch_capacity_vertices = 0,
         .batch = sprite_batch.SpriteBatch.init(allocator),
     };

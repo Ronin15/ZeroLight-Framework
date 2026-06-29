@@ -22,7 +22,9 @@ const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const TileDataEdit = @import("../render/renderer.zig").TileDataEdit;
 const Sprite = @import("../render/renderer.zig").Sprite;
-const Vertex = @import("../render/renderer.zig").Vertex;
+const Position = @import("../render/renderer.zig").Position;
+const Uv = @import("../render/renderer.zig").Uv;
+const VertexColor = @import("../render/renderer.zig").VertexColor;
 const writeWorldSpriteQuad = @import("../render/renderer.zig").writeWorldSpriteQuad;
 const TextureId = @import("../render/resources.zig").TextureId;
 const TextureDesc = @import("../render/resources.zig").TextureDesc;
@@ -614,16 +616,18 @@ pub const WorldSystem = struct {
             if (self.denseLayerLevel(layer_index) < active_level) continue;
             // Only the world-space corners (position) are consumed by the tilemap
             // shader; the source/uv are ignored, so the source rect is a placeholder.
-            var quad: [6]Vertex = undefined;
+            var pos: [6]Position = undefined;
+            var uv: [6]Uv = undefined;
+            var col: [6]VertexColor = undefined;
             writeWorldSpriteQuad(.{
                 .texture = TextureId.invalid,
                 .source = .{ .x = 0, .y = 0, .w = self.tile_size, .h = self.tile_size },
                 .dest = .{ .x = 0, .y = 0, .w = world_w, .h = world_h },
-            }, self.atlas_texture, &quad);
+            }, self.atlas_texture, .{ .positions = &pos, .uvs = &uv, .colors = &col });
             try renderer.appendStaticTilemapSpan(
                 prepared.texture,
                 self.denseLayerOrder(layer_index),
-                &quad,
+                .{ .positions = &pos, .uvs = &uv, .colors = &col },
                 self.denseLayerTileBuffer(layer_index),
             );
         }

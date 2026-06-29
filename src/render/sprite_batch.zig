@@ -116,10 +116,27 @@ pub const CoordinatePresentation = enum {
     drawable,
 };
 
-pub const Vertex = extern struct {
-    position: [2]f32,
-    uv: [2]f32,
-    color: [4]f32,
+// SoA vertex layout: three dense per-attribute columns, each its own GPU vertex
+// buffer bound at a fixed slot. `[N]f32` arrays are tightly packed, so no extern.
+// Mapping is fixed across every site: Position slot 0/loc 0/FLOAT2/pitch 8,
+// Uv slot 1/loc 1/FLOAT2/pitch 8, VertexColor slot 2/loc 2/FLOAT4/pitch 16.
+pub const Position = [2]f32;
+pub const Uv = [2]f32;
+pub const VertexColor = [4]f32;
+
+// Mutable column views threaded into vertex emission (workers write disjoint
+// ranges; the world builds 6-corner static spans).
+pub const VertexColumns = struct {
+    positions: []Position,
+    uvs: []Uv,
+    colors: []VertexColor,
+};
+
+// Read-only column views for upload/append paths.
+pub const VertexColumnsConst = struct {
+    positions: []const Position,
+    uvs: []const Uv,
+    colors: []const VertexColor,
 };
 
 // Which renderer-owned vertex buffer a draw group indexes. Dynamic groups index
@@ -194,7 +211,9 @@ pub const SpriteBatch = struct {
     allocator: std.mem.Allocator,
     commands: CommandList = .empty,
     prepared_commands: std.ArrayList(PreparedSpriteCommand) = .empty,
-    vertices: std.ArrayList(Vertex) = .empty,
+    positions: std.ArrayList(Position) = .empty,
+    uvs: std.ArrayList(Uv) = .empty,
+    colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
@@ -211,14 +230,18 @@ pub const SpriteBatch = struct {
     pub fn deinit(self: *SpriteBatch) void {
         self.commands.deinit(self.allocator);
         self.prepared_commands.deinit(self.allocator);
-        self.vertices.deinit(self.allocator);
+        self.positions.deinit(self.allocator);
+        self.uvs.deinit(self.allocator);
+        self.colors.deinit(self.allocator);
         self.draw_groups.deinit(self.allocator);
         self.* = init(self.allocator);
     }
 
     pub fn beginFrame(self: *SpriteBatch) void {
         self.commands.clearRetainingCapacity();
-        self.vertices.clearRetainingCapacity();
+        self.positions.clearRetainingCapacity();
+        self.uvs.clearRetainingCapacity();
+        self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
         self.last_order = null;
@@ -248,7 +271,9 @@ pub const SpriteBatch = struct {
         errdefer self.deinit();
         try self.commands.ensureTotalCapacity(self.allocator, command_capacity);
         try self.prepared_commands.ensureTotalCapacity(self.allocator, command_capacity);
-        try self.vertices.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.positions.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.uvs.ensureTotalCapacity(self.allocator, vertex_capacity);
+        try self.colors.ensureTotalCapacity(self.allocator, vertex_capacity);
         try self.draw_groups.ensureTotalCapacity(self.allocator, draw_group_capacity);
     }
 
@@ -257,7 +282,9 @@ pub const SpriteBatch = struct {
         if (needed_vertices == 0) return;
 
         try self.prepared_commands.ensureTotalCapacity(self.allocator, self.commands.items.len);
-        try self.vertices.ensureTotalCapacity(self.allocator, needed_vertices);
+        try self.positions.ensureTotalCapacity(self.allocator, needed_vertices);
+        try self.uvs.ensureTotalCapacity(self.allocator, needed_vertices);
+        try self.colors.ensureTotalCapacity(self.allocator, needed_vertices);
         try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
     }
 
@@ -292,11 +319,15 @@ pub const SpriteBatch = struct {
     /// Snapshots immutable texture metadata for worker-safe CPU prep without
     /// changing submission order. Callers must reserve for the current command count.
     pub fn snapshotCommandsAssumeCapacity(self: *SpriteBatch, texture_resolver: TextureResolver) usize {
-        self.vertices.clearRetainingCapacity();
+        self.positions.clearRetainingCapacity();
+        self.uvs.clearRetainingCapacity();
+        self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
 
-        std.debug.assert(self.vertices.capacity >= self.commands.items.len * 6);
+        std.debug.assert(self.positions.capacity >= self.commands.items.len * 6);
+        std.debug.assert(self.uvs.capacity >= self.commands.items.len * 6);
+        std.debug.assert(self.colors.capacity >= self.commands.items.len * 6);
         std.debug.assert(self.draw_groups.capacity >= self.commands.items.len);
         std.debug.assert(self.prepared_commands.capacity >= self.commands.items.len);
 
@@ -318,10 +349,18 @@ pub const SpriteBatch = struct {
         prep_config: SpritePrepConfig,
     ) BatchStats {
         const valid_count = self.prepared_commands.items.len;
-        setVertexCountAssumeCapacity(&self.vertices, valid_count * 6);
+        const vertex_count = valid_count * 6;
+        setVertexCountAssumeCapacity(Position, &self.positions, vertex_count);
+        setVertexCountAssumeCapacity(Uv, &self.uvs, vertex_count);
+        setVertexCountAssumeCapacity(VertexColor, &self.colors, vertex_count);
 
         var batch: BatchStats = .{};
         if (valid_count > 0) {
+            const columns = VertexColumns{
+                .positions = self.positions.items,
+                .uvs = self.uvs.items,
+                .colors = self.colors.items,
+            };
             // Worker jobs write disjoint vertex ranges derived from prepared
             // command indices. Draw groups remain serial because they depend on
             // ordered texture/presentation transitions.
@@ -332,16 +371,20 @@ pub const SpriteBatch = struct {
                 }
                 var context = SpritePrepJobContext{
                     .commands = self.prepared_commands.items,
-                    .vertices = self.vertices.items,
+                    .columns = columns,
                 };
+                // Align range boundaries to 4 commands (192/192/384 B per column,
+                // all divisible by 64) so no worker range straddles a cache line in
+                // any of the three columns — avoids false sharing on the seams.
                 batch = threads.parallelForWithOptions(valid_count, &context, writePreparedSpritesJob, .{
                     .items_per_range = system_config.items_per_range,
                     .max_worker_threads = system_config.max_worker_threads,
+                    .range_alignment_items = 4,
                     .adaptive = system_config.adaptive,
                     .adaptive_tuner = system_config.adaptive_tuner,
                 });
             } else {
-                fillPreparedRange(self.prepared_commands.items, self.vertices.items, .{
+                fillPreparedRange(self.prepared_commands.items, columns, .{
                     .start = 0,
                     .end = valid_count,
                 });
@@ -366,7 +409,7 @@ pub const SpriteBatch = struct {
             .command_count = self.commands.items.len,
             .valid_sprite_count = self.prepared_commands.items.len,
             .skipped_invalid_count = self.commands.items.len - self.prepared_commands.items.len,
-            .vertex_count = self.vertices.items.len,
+            .vertex_count = self.positions.items.len,
             .draw_group_count = self.draw_groups.items.len,
             .batch = batch,
         };
@@ -446,26 +489,23 @@ const PreparedSpriteCommand = struct {
 
 const SpritePrepJobContext = struct {
     commands: []const PreparedSpriteCommand,
-    vertices: []Vertex,
+    columns: VertexColumns,
 };
 
 fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpritePrepJobContext = @ptrCast(@alignCast(context));
-    fillPreparedRange(job.commands, job.vertices, range);
+    fillPreparedRange(job.commands, job.columns, range);
 }
 
 fn fillPreparedRange(
     commands: []const PreparedSpriteCommand,
-    vertices: []Vertex,
+    columns: VertexColumns,
     range: ParallelRange,
 ) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= commands.len);
     for (range.start..range.end) |index| {
-        writePreparedSpriteVertices(
-            commands[index],
-            vertices[index * 6 ..][0..6],
-        );
+        writePreparedSpriteVertices(commands[index], columns, index * 6);
     }
 }
 
@@ -488,11 +528,12 @@ const PositionTransform = struct {
 
 fn writePreparedSpriteVertices(
     prepared: PreparedSpriteCommand,
-    out: []Vertex,
+    out: VertexColumns,
+    base: usize,
 ) void {
     // All spaces emit world/identity-space geometry; the renderer applies the
     // camera via its vertex uniform, never on the CPU.
-    writeSpriteQuad(prepared.sprite, prepared.texture_desc, .identity, out);
+    writeSpriteQuad(prepared.sprite, prepared.texture_desc, .identity, out, base);
 }
 
 /// Writes one world-space sprite quad with identity transform. The world builds
@@ -501,20 +542,24 @@ fn writePreparedSpriteVertices(
 pub fn writeWorldSpriteQuad(
     sprite: Sprite,
     texture: resources.TextureDesc,
-    out: []Vertex,
+    out: VertexColumns,
 ) void {
-    writeSpriteQuad(sprite, texture, .identity, out);
+    writeSpriteQuad(sprite, texture, .identity, out, 0);
 }
 
 // Pure six-vertex quad emission shared by dynamic sprite prep and static tile
-// vertex builds, keeping their vertex layout byte-identical.
+// vertex builds, keeping their vertex layout byte-identical. Writes the 6 quad
+// verts into each column at `out.*[base .. base + 6]`.
 fn writeSpriteQuad(
     sprite: Sprite,
     texture: resources.TextureDesc,
     transform: PositionTransform,
-    out: []Vertex,
+    out: VertexColumns,
+    base: usize,
 ) void {
-    std.debug.assert(out.len == 6);
+    std.debug.assert(base + 6 <= out.positions.len);
+    std.debug.assert(base + 6 <= out.uvs.len);
+    std.debug.assert(base + 6 <= out.colors.len);
     const source = sprite.source orelse Rect{
         .x = 0,
         .y = 0,
@@ -561,20 +606,19 @@ fn writeSpriteQuad(
     var positions: [4]math.Vec2 = undefined;
     inline for (0..4) |index| positions[index] = .{ .x = px[index], .y = py[index] };
 
+    // All six verts share the sprite tint — fill the color column in one splat.
+    @memset(out.colors[base..][0..6], VertexColor{ sprite.tint.r, sprite.tint.g, sprite.tint.b, sprite.tint.a });
     for (indices, 0..) |source_index, out_index| {
         const position = positions[source_index];
-        out[out_index] = .{
-            .position = .{ position.x, position.y },
-            .uv = uv[source_index],
-            .color = .{ sprite.tint.r, sprite.tint.g, sprite.tint.b, sprite.tint.a },
-        };
+        out.positions[base + out_index] = .{ position.x, position.y };
+        out.uvs[base + out_index] = uv[source_index];
     }
 }
 
-fn setVertexCountAssumeCapacity(vertices: *std.ArrayList(Vertex), count: usize) void {
-    vertices.clearRetainingCapacity();
-    std.debug.assert(vertices.capacity >= count);
-    vertices.items.len = count;
+fn setVertexCountAssumeCapacity(comptime T: type, column: *std.ArrayList(T), count: usize) void {
+    column.clearRetainingCapacity();
+    std.debug.assert(column.capacity >= count);
+    column.items.len = count;
 }
 
 pub fn presentationForCoordinateSpace(coordinate_space: CoordinateSpace) CoordinatePresentation {
@@ -661,7 +705,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
 
     batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
     try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].texture.index);
     try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
@@ -696,7 +740,7 @@ test "batch builder groups by texture and coordinate presentation" {
 
     batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(usize, 18), batch.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 18), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 3), batch.draw_groups.items.len);
     try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
     try std.testing.expectEqual(@as(u32, 0), batch.draw_groups.items[0].first_vertex);
@@ -737,10 +781,10 @@ test "world vertices ignore camera now that the transform is baked on the GPU" {
 
     // All spaces emit world/identity-space geometry; the camera is applied by
     // the renderer's vertex uniform, never on the CPU.
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[0].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[1]);
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[6].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[0][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[0][1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[6][1]);
     try std.testing.expectEqual(CoordinatePresentation.world, batch.draw_groups.items[0].presentation);
     try std.testing.expectEqual(CoordinatePresentation.logical, batch.draw_groups.items[1].presentation);
 }
@@ -776,9 +820,9 @@ test "batch builder preserves ordered submission stream" {
 
     batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(f32, 10), batch.vertices.items[0].position[0]);
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[0]);
+    try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[12][0]);
 }
 
 test "batch builder splits a same-texture run on render order change" {
@@ -842,12 +886,12 @@ test "world and logical vertices stay independent of drawable presentation" {
 
     batch.buildSerial(table.resolver());
 
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[0].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[0].position[1]);
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[6].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[6].position[1]);
-    try std.testing.expectEqual(@as(f32, 20), batch.vertices.items[12].position[0]);
-    try std.testing.expectEqual(@as(f32, 30), batch.vertices.items[12].position[1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[0][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[0][1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[6][1]);
+    try std.testing.expectEqual(@as(f32, 20), batch.positions.items[12][0]);
+    try std.testing.expectEqual(@as(f32, 30), batch.positions.items[12][1]);
 }
 
 test "safe sprite batch build reserves missing frame storage" {
@@ -866,7 +910,7 @@ test "safe sprite batch build reserves missing frame storage" {
     const stats = try batch.build(table.resolver(), null, .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), stats.command_count);
-    try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
 }
 
@@ -892,7 +936,7 @@ test "warmed sprite batch prep does not allocate" {
     _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
 
     try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
-    try std.testing.expectEqual(@as(usize, 6), batch.vertices.items.len);
+    try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
 }
 
@@ -957,7 +1001,11 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     });
 
     try std.testing.expect(stats.batch.active_worker_threads > 0);
-    try expectEqualVertices(serial.vertices.items, threaded.vertices.items);
+    // The emit path requests 4-command range alignment so worker range seams stay
+    // cache-line-aligned across all three columns; guard the knob so a regression
+    // back to 1 is caught here, not only by a false-sharing slowdown.
+    try std.testing.expectEqual(@as(usize, 4), stats.batch.range_alignment_items);
+    try expectEqualVertices(batchColumns(&serial), batchColumns(&threaded));
     try expectEqualDrawGroups(serial.draw_groups.items, threaded.draw_groups.items);
     try std.testing.expectEqual(serial.lastPrepStats().valid_sprite_count, threaded.lastPrepStats().valid_sprite_count);
     try std.testing.expectEqual(@as(usize, 2), threaded.lastPrepStats().skipped_invalid_count);
@@ -1046,19 +1094,163 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
         .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
         .coordinate_space = .world,
     });
+    // Extra valid sprites so the 4-command range alignment yields more than one
+    // range (>=8 valid -> >=2 aligned ranges), keeping the threaded path from
+    // collapsing to a single inline range and actually recruiting a worker.
+    for (0..5) |index| {
+        try batch.drawSprite(.{
+            .texture = testTextureId(0, 1),
+            .dest = .{
+                .x = @floatFromInt(40 + index),
+                .y = @floatFromInt(index % 3),
+                .w = 6,
+                .h = 6,
+            },
+            .origin = .{ .x = 1, .y = 2 },
+            .rotation = @as(f32, @floatFromInt(index)) * 0.1,
+            .tint = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1 },
+            .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+            .coordinate_space = .world,
+        });
+    }
 }
 
-fn expectEqualVertices(expected: []const Vertex, actual: []const Vertex) !void {
-    try std.testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |lhs, rhs| {
-        try std.testing.expectEqual(lhs.position[0], rhs.position[0]);
-        try std.testing.expectEqual(lhs.position[1], rhs.position[1]);
-        try std.testing.expectEqual(lhs.uv[0], rhs.uv[0]);
-        try std.testing.expectEqual(lhs.uv[1], rhs.uv[1]);
-        try std.testing.expectEqual(lhs.color[0], rhs.color[0]);
-        try std.testing.expectEqual(lhs.color[1], rhs.color[1]);
-        try std.testing.expectEqual(lhs.color[2], rhs.color[2]);
-        try std.testing.expectEqual(lhs.color[3], rhs.color[3]);
+fn batchColumns(batch: *const SpriteBatch) VertexColumnsConst {
+    return .{
+        .positions = batch.positions.items,
+        .uvs = batch.uvs.items,
+        .colors = batch.colors.items,
+    };
+}
+
+fn expectEqualVertices(expected: VertexColumnsConst, actual: VertexColumnsConst) !void {
+    try std.testing.expectEqual(expected.positions.len, actual.positions.len);
+    try std.testing.expectEqual(expected.uvs.len, actual.uvs.len);
+    try std.testing.expectEqual(expected.colors.len, actual.colors.len);
+    for (expected.positions, actual.positions) |lhs, rhs| {
+        try std.testing.expectEqual(lhs[0], rhs[0]);
+        try std.testing.expectEqual(lhs[1], rhs[1]);
+    }
+    for (expected.uvs, actual.uvs) |lhs, rhs| {
+        try std.testing.expectEqual(lhs[0], rhs[0]);
+        try std.testing.expectEqual(lhs[1], rhs[1]);
+    }
+    for (expected.colors, actual.colors) |lhs, rhs| {
+        try std.testing.expectEqual(lhs[0], rhs[0]);
+        try std.testing.expectEqual(lhs[1], rhs[1]);
+        try std.testing.expectEqual(lhs[2], rhs[2]);
+        try std.testing.expectEqual(lhs[3], rhs[3]);
+    }
+}
+
+// AoS oracle: the original interleaved emission arithmetic, kept verbatim so the
+// SoA columns are proven bit-exact against it (same simd/math ops -> last-ULP
+// identical, no approx). Guards column desync and lane/attribute transposition.
+const AosVertex = struct {
+    position: [2]f32,
+    uv: [2]f32,
+    color: [4]f32,
+};
+
+fn aosOracleQuad(sprite: Sprite, texture: resources.TextureDesc, out: *[6]AosVertex) void {
+    const source = sprite.source orelse Rect{
+        .x = 0,
+        .y = 0,
+        .w = @floatFromInt(texture.width),
+        .h = @floatFromInt(texture.height),
+    };
+
+    const tex_u0 = source.x / @as(f32, @floatFromInt(texture.width));
+    const tex_v0 = source.y / @as(f32, @floatFromInt(texture.height));
+    const tex_u1 = (source.x + source.w) / @as(f32, @floatFromInt(texture.width));
+    const tex_v1 = (source.y + source.h) / @as(f32, @floatFromInt(texture.height));
+
+    const local = [_]math.Vec2{
+        .{ .x = -sprite.origin.x, .y = -sprite.origin.y },
+        .{ .x = sprite.dest.w - sprite.origin.x, .y = -sprite.origin.y },
+        .{ .x = -sprite.origin.x, .y = sprite.dest.h - sprite.origin.y },
+        .{ .x = sprite.dest.w - sprite.origin.x, .y = sprite.dest.h - sprite.origin.y },
+    };
+    const uv = [_][2]f32{
+        .{ tex_u0, tex_v0 },
+        .{ tex_u1, tex_v0 },
+        .{ tex_u0, tex_v1 },
+        .{ tex_u1, tex_v1 },
+    };
+    const indices = [_]usize{ 0, 1, 2, 1, 3, 2 };
+
+    const rotation = math.sinCos(sprite.rotation);
+    const cos = simd.splatFloat4(rotation.cos);
+    const sin = simd.splatFloat4(rotation.sin);
+    const local_x = simd.float4(local[0].x, local[1].x, local[2].x, local[3].x);
+    const local_y = simd.float4(local[0].y, local[1].y, local[2].y, local[3].y);
+    const rotated_x = simd.subFloat4(simd.mulFloat4(local_x, cos), simd.mulFloat4(local_y, sin));
+    const rotated_y = simd.addFloat4(simd.mulFloat4(local_x, sin), simd.mulFloat4(local_y, cos));
+    const world_x = simd.addFloat4(rotated_x, simd.splatFloat4(sprite.dest.x + sprite.origin.x));
+    const world_y = simd.addFloat4(rotated_y, simd.splatFloat4(sprite.dest.y + sprite.origin.y));
+    // Identity emit transform (scale=1, offset=0), applied with the same ops as
+    // writeSpriteQuad so the oracle is bit-exact.
+    const final_x = simd.addFloat4(simd.mulFloat4(world_x, simd.splatFloat4(1)), simd.splatFloat4(0));
+    const final_y = simd.addFloat4(simd.mulFloat4(world_y, simd.splatFloat4(1)), simd.splatFloat4(0));
+    const px = simd.toFloatArray(final_x);
+    const py = simd.toFloatArray(final_y);
+    var positions: [4]math.Vec2 = undefined;
+    inline for (0..4) |index| positions[index] = .{ .x = px[index], .y = py[index] };
+
+    for (indices, 0..) |source_index, out_index| {
+        const position = positions[source_index];
+        out[out_index] = .{
+            .position = .{ position.x, position.y },
+            .uv = uv[source_index],
+            .color = .{ sprite.tint.r, sprite.tint.g, sprite.tint.b, sprite.tint.a },
+        };
+    }
+}
+
+test "soa columns reconstruct the AoS oracle vertex layout" {
+    const texture = resources.TextureDesc{ .width = 64, .height = 32 };
+    const sprites = [_]Sprite{
+        .{ .texture = testTextureId(0, 1), .dest = .{ .x = 20, .y = 30, .w = 16, .h = 18 } },
+        .{
+            .texture = testTextureId(0, 1),
+            .source = .{ .x = 4, .y = 6, .w = 12, .h = 10 },
+            .dest = .{ .x = -10, .y = 5, .w = 14, .h = 9 },
+            .origin = .{ .x = 8, .y = 9 },
+            .rotation = 0.37,
+            .tint = .{ .r = 0.2, .g = 0.5, .b = 0.8, .a = 0.9 },
+        },
+        .{
+            .texture = testTextureId(0, 1),
+            .dest = .{ .x = 3, .y = 7, .w = 5, .h = 11 },
+            .origin = .{ .x = 2, .y = 1 },
+            .rotation = -1.2,
+            .tint = .{ .r = 1, .g = 0, .b = 0.25, .a = 0.5 },
+        },
+    };
+
+    for (sprites) |sprite| {
+        var positions: [6]Position = undefined;
+        var uvs: [6]Uv = undefined;
+        var colors: [6]VertexColor = undefined;
+        writeWorldSpriteQuad(sprite, texture, .{
+            .positions = &positions,
+            .uvs = &uvs,
+            .colors = &colors,
+        });
+
+        var oracle: [6]AosVertex = undefined;
+        aosOracleQuad(sprite, texture, &oracle);
+
+        for (0..6) |i| {
+            try std.testing.expectEqual(oracle[i].position[0], positions[i][0]);
+            try std.testing.expectEqual(oracle[i].position[1], positions[i][1]);
+            try std.testing.expectEqual(oracle[i].uv[0], uvs[i][0]);
+            try std.testing.expectEqual(oracle[i].uv[1], uvs[i][1]);
+            try std.testing.expectEqual(oracle[i].color[0], colors[i][0]);
+            try std.testing.expectEqual(oracle[i].color[1], colors[i][1]);
+            try std.testing.expectEqual(oracle[i].color[2], colors[i][2]);
+            try std.testing.expectEqual(oracle[i].color[3], colors[i][3]);
+        }
     }
 }
 

@@ -86,30 +86,46 @@ pub fn createSpritePipeline(
     );
     defer c.SDL_ReleaseGPUShader(device, fragment_shader);
 
-    var vertex_buffer = c.SDL_GPUVertexBufferDescription{
-        .slot = 0,
-        .pitch = @sizeOf(sprite_batch.Vertex),
-        .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-        .instance_step_rate = 0,
+    // One vertex buffer per SoA column: Position slot 0, Uv slot 1, VertexColor
+    // slot 2. Each attribute reads its own buffer at offset 0.
+    var vertex_buffers = [_]c.SDL_GPUVertexBufferDescription{
+        .{
+            .slot = 0,
+            .pitch = @sizeOf(sprite_batch.Position),
+            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+            .instance_step_rate = 0,
+        },
+        .{
+            .slot = 1,
+            .pitch = @sizeOf(sprite_batch.Uv),
+            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+            .instance_step_rate = 0,
+        },
+        .{
+            .slot = 2,
+            .pitch = @sizeOf(sprite_batch.VertexColor),
+            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
+            .instance_step_rate = 0,
+        },
     };
     var vertex_attributes = [_]c.SDL_GPUVertexAttribute{
         .{
             .location = 0,
             .buffer_slot = 0,
             .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = @offsetOf(sprite_batch.Vertex, "position"),
+            .offset = 0,
         },
         .{
             .location = 1,
-            .buffer_slot = 0,
+            .buffer_slot = 1,
             .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = @offsetOf(sprite_batch.Vertex, "uv"),
+            .offset = 0,
         },
         .{
             .location = 2,
-            .buffer_slot = 0,
+            .buffer_slot = 2,
             .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
-            .offset = @offsetOf(sprite_batch.Vertex, "color"),
+            .offset = 0,
         },
     };
 
@@ -126,8 +142,8 @@ pub fn createSpritePipeline(
     var pipeline_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
     pipeline_info.vertex_shader = vertex_shader;
     pipeline_info.fragment_shader = fragment_shader;
-    pipeline_info.vertex_input_state.vertex_buffer_descriptions = &vertex_buffer;
-    pipeline_info.vertex_input_state.num_vertex_buffers = 1;
+    pipeline_info.vertex_input_state.vertex_buffer_descriptions = &vertex_buffers;
+    pipeline_info.vertex_input_state.num_vertex_buffers = vertex_buffers.len;
     pipeline_info.vertex_input_state.vertex_attributes = &vertex_attributes;
     pipeline_info.vertex_input_state.num_vertex_attributes = vertex_attributes.len;
     pipeline_info.primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;

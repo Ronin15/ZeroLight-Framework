@@ -7,26 +7,32 @@ const sprite_batch = @import("../sprite_batch.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
 
-pub fn createVertexBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) !*c.SDL_GPUBuffer {
+pub fn createVertexBuffer(device: *c.SDL_GPUDevice, byte_size: u32) !*c.SDL_GPUBuffer {
     var buffer_info = std.mem.zeroes(c.SDL_GPUBufferCreateInfo);
     buffer_info.usage = c.SDL_GPU_BUFFERUSAGE_VERTEX;
-    buffer_info.size = try vertexByteSize(vertex_capacity);
+    buffer_info.size = byte_size;
     return c.SDL_CreateGPUBuffer(device, &buffer_info) orelse {
         return sdlError("SDL_CreateGPUBuffer");
     };
 }
 
-pub fn createVertexTransferBuffer(device: *c.SDL_GPUDevice, vertex_capacity: usize) !*c.SDL_GPUTransferBuffer {
+pub fn createVertexTransferBuffer(device: *c.SDL_GPUDevice, byte_size: u32) !*c.SDL_GPUTransferBuffer {
     var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
     transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = try vertexByteSize(vertex_capacity);
+    transfer_info.size = byte_size;
     return c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
 }
 
-pub fn stageVertices(device: *c.SDL_GPUDevice, transfer_buffer: *c.SDL_GPUTransferBuffer, vertices: []const sprite_batch.Vertex) !void {
-    const bytes = std.mem.sliceAsBytes(vertices);
+/// Byte size of one per-attribute vertex column (`vertex_capacity` elements of
+/// `element_size` bytes each), rejecting overflow of the SDL `u32` size field.
+pub fn columnBytes(vertex_capacity: usize, element_size: usize) error{GpuBufferTooLarge}!u32 {
+    const bytes = std.math.mul(usize, vertex_capacity, element_size) catch return error.GpuBufferTooLarge;
+    return checkedGpuBytes(bytes);
+}
+
+pub fn stageVertices(device: *c.SDL_GPUDevice, transfer_buffer: *c.SDL_GPUTransferBuffer, bytes: []const u8) !void {
     const mapped = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, true) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
@@ -39,9 +45,8 @@ pub fn recordVertexUpload(
     command_buffer: *c.SDL_GPUCommandBuffer,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
     vertex_buffer: *c.SDL_GPUBuffer,
-    vertices: []const sprite_batch.Vertex,
+    bytes: []const u8,
 ) !void {
-    const bytes = std.mem.sliceAsBytes(vertices);
     const upload_size = try checkedGpuBytes(bytes.len);
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
@@ -197,11 +202,6 @@ pub fn storageByteSize(element_count: usize) error{GpuBufferTooLarge}!u32 {
     return checkedGpuBytes(bytes);
 }
 
-fn vertexByteSize(vertex_capacity: usize) error{GpuBufferTooLarge}!u32 {
-    const bytes = std.math.mul(usize, vertex_capacity, @sizeOf(sprite_batch.Vertex)) catch return error.GpuBufferTooLarge;
-    return checkedGpuBytes(bytes);
-}
-
 fn checkedGpuBytes(byte_count: usize) error{GpuBufferTooLarge}!u32 {
     return std.math.cast(u32, byte_count) orelse error.GpuBufferTooLarge;
 }
@@ -210,15 +210,17 @@ fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
 }
 
-test "vertex buffer byte sizing rejects overflow and SDL u32 overflow" {
-    try std.testing.expectEqual(
-        @as(u32, @sizeOf(sprite_batch.Vertex) * 4),
-        try vertexByteSize(4),
-    );
-    try std.testing.expectError(error.GpuBufferTooLarge, vertexByteSize(std.math.maxInt(usize)));
+test "per-column vertex byte sizing matches element size and rejects overflow" {
+    // Position/Uv columns are 8 bytes/vertex (FLOAT2); the color column is 16
+    // bytes/vertex (FLOAT4).
+    try std.testing.expectEqual(@as(u32, 8 * 4), try columnBytes(4, @sizeOf(sprite_batch.Position)));
+    try std.testing.expectEqual(@as(u32, 8 * 4), try columnBytes(4, @sizeOf(sprite_batch.Uv)));
+    try std.testing.expectEqual(@as(u32, 16 * 4), try columnBytes(4, @sizeOf(sprite_batch.VertexColor)));
+
+    try std.testing.expectError(error.GpuBufferTooLarge, columnBytes(std.math.maxInt(usize), @sizeOf(sprite_batch.Position)));
     try std.testing.expectError(
         error.GpuBufferTooLarge,
-        vertexByteSize(@as(usize, std.math.maxInt(u32)) / @sizeOf(sprite_batch.Vertex) + 1),
+        columnBytes(@as(usize, std.math.maxInt(u32)) / @sizeOf(sprite_batch.VertexColor) + 1, @sizeOf(sprite_batch.VertexColor)),
     );
 }
 
