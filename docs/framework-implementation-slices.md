@@ -853,9 +853,9 @@ Checklist (done):
 
 - [x] Public `WorldSystem.visibleChunkRegion()` and `cognitionActiveRegion(halo)`
       expose the camera chunks (+halo) as an `ActiveRegion`.
-- [x] `SimulationScopeSystem.recomputeEntityChunks` recomputes chunk columns from
-      settled positions as a dense threaded pass (own tuner), off the hot worker
-      ranges that own other writes.
+- [x] Entity chunk columns are derived in-pass by the movement processor from each
+      integrated body's settled position (`movement.ChunkGridParams`), so there is no
+      separate recompute pass; the scope gathers read the chunk columns movement wrote.
 - [x] Scoped gather entry points for movement, collision, and AI (steering
       transitive). Processors keep their hot loops and take a `scope_dense_indices`
       option; null = full-active.
@@ -879,6 +879,16 @@ Acceptance checks:
       and pipeline phase transitions without opening a window.
 - [x] Debug stats report active scope counts so typical runs stay far below 50k
       stress scales by policy.
+
+Known limitations / follow-up:
+
+- The contiguous-SIMD movement fast path only fires when zero entities are dormant
+  (`gatherMovementBodyIndices` returns null → downstream uses the full SoA range). A
+  single dormant body flips the whole population onto the indexed gather/scatter path,
+  so in a steady-state LOD world (always some far entities asleep) the cheap
+  contiguous path rarely runs. Revisit at scale: a compacted-dense movement path or a
+  dormant-fraction threshold that keeps small dormant counts on the contiguous path.
+  Not a correctness issue; tracked for a future hardening pass.
 
 ## Slice 25: Z-Aware Scalable Navigation Redesign
 

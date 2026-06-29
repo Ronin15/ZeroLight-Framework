@@ -789,16 +789,6 @@ pub const DataSystem = struct {
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
-    /// Stores the pre-computed chunk coordinate into the entity's dense scope row.
-    /// No-op for entities without a movement body. The scope system normally writes
-    /// chunk columns in bulk via scopeColumnsSlice(); this is the per-entity path.
-    pub fn setEntityChunk(self: *DataSystem, id: EntityId, chunk: ChunkCoord) void {
-        const slot = self.resolveSlot(id) orelse return;
-        const di: usize = slot.movement_body_index orelse return;
-        self.movement_bodies.chunk_x.items[di] = chunk.x;
-        self.movement_bodies.chunk_y.items[di] = chunk.y;
-    }
-
     /// Changes an entity's simulation tier while preserving chunk, stagger_phase,
     /// and always_active. Processors must not call this inside worker ranges; use
     /// a .set_simulation_tier structural command for deferred tier changes.
@@ -823,7 +813,7 @@ pub const DataSystem = struct {
         self.movement_bodies.previous_z.items[di] = self.movement_bodies.position_z.items[di];
     }
 
-    /// Mutable dense scope columns (chunk_x/y written by the recompute pass).
+    /// Mutable dense scope columns (chunk_x/y written in-pass by the movement processor).
     pub fn scopeColumnsSlice(self: *DataSystem) ScopeColumnsSlice {
         return self.movement_bodies.scopeSlice();
     }
@@ -1684,11 +1674,12 @@ const MovementBodyStore = struct {
     velocity_x: HotF32List = .empty,
     velocity_y: HotF32List = .empty,
     speed: HotF32List = .empty,
-    // Simulation-scope columns ride in dense lockstep with the movement rows so
-    // the scope system's O(N) recompute, movement gather, and tier policy iterate
-    // aligned SoA instead of scattered cold slots. The movement processor's slice
-    // omits these, so movement integration never touches their cache lines. Scope
-    // metadata therefore exists exactly for entities with a movement body.
+    // Simulation-scope columns ride in dense lockstep with the movement rows so the
+    // scope gathers and tier policy iterate aligned SoA instead of scattered cold
+    // slots. The movement integration slice omits tier/level/stagger/always_active
+    // (it writes only chunk_x/y, from each body's new position), so integration
+    // touches no other scope cache lines. Scope metadata therefore exists exactly
+    // for entities with a movement body.
     tier: std.ArrayList(SimulationTier) = .empty,
     chunk_x: HotI32List = .empty,
     chunk_y: HotI32List = .empty,

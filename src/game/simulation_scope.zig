@@ -28,11 +28,13 @@ pub const cognition_halo_chunks: u16 = 16;
 pub const locomotion_halo_chunks: u16 = 32;
 pub const kinematic_halo_chunks: u16 = 48;
 
-/// Chunk-distance weight of one depth/level step in the cube LOD volume: an entity
-/// one level away from the camera's level is treated as this many chunks farther
-/// in the L∞ (chebyshev) ball over (chunk_x, chunk_y, level). One band per level
-/// (≥ a full cognition halo) keeps an off-level entity out of cognition regardless
-/// of its x/y. Tunable to the world's level spacing and per-level perf budget.
+/// Chunk-distance weight of one depth/level step in the cube LOD ball over
+/// (chunk_x, chunk_y, level); applied via `lodDistance`. At the default 16
+/// (= cognition_halo_chunks) one level off the camera lands on the cognition edge,
+/// so an on-screen entity one level away still thinks; two levels off (32) drops to
+/// locomotion, three (48) to kinematic, four+ to dormant. Lower it to keep more
+/// depth layers in cognition (a px depth ÷ px-per-chunk in spirit, like the halos
+/// above). Tunable to the world's level spacing and per-level perf budget.
 pub const level_distance_chunks: u16 = 16;
 
 comptime {
@@ -128,7 +130,9 @@ pub const ActiveRegion = struct {
     }
 };
 
-/// Cold per-entity metadata owned by entity slots, not hot SoA columns.
+/// Per-entity simulation metadata value type for get/set (`simulationMetadata`/
+/// `setSimulationMetadata`). The hot storage is dense SoA columns on the
+/// movement-body store; the hot path reads them directly via `scopeColumnsSlice`.
 pub const EntitySimulationMetadata = struct {
     tier: SimulationTier = .cognition,
     chunk: ChunkCoord = .{},

@@ -49,8 +49,9 @@ game-specific behavior under `src/game/`.
   scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
   counters.
 - `src/game/systems/simulation_scope.zig` owns `SimulationScopeSystem`, the
-  backbone scope processor: chunk recompute, tier/halo/stagger gathers, and the
-  auto tier wake/sleep policy.
+  backbone scope processor: tier/halo/stagger gathers and the auto tier wake/sleep
+  policy (entity chunk columns are derived in-pass by movement, not a separate
+  recompute).
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
@@ -359,9 +360,10 @@ chunk metadata are dense SoA columns on the movement-body store
 movement rows so they exist exactly for simulated entities and the O(N) scope
 passes read/write aligned columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
-that recomputes chunks from settled positions (dense, threaded), derives the
-camera cognition halo from `WorldSystem`, and selects which entities enter each
-stage. Processors keep their hot loops and receive a `scope_dense_indices` option
+that derives the camera cognition halo from `WorldSystem` and selects which entities
+enter each stage; entity chunk columns are derived in-pass by the movement processor
+(not a separate scope recompute).
+Processors keep their hot loops and receive a `scope_dense_indices` option
 (null = full-active) instead of learning world/chunk policy. Movement and
 collision gate on tier only (no chunk filter, so off-screen entities keep moving
 and colliding) and short-circuit to full-active in O(1) via incremental

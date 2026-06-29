@@ -49,6 +49,9 @@ pub const SimulationPipelineConfig = struct {
     steering_agent_capacity: usize = 0,
     static_obstacle_capacity: usize = 0,
     contact_capacity: usize = 0,
+    /// Movement-body count the scope system pre-sizes its gather/tier scratch to,
+    /// so the per-step scope passes are allocation-free after init.
+    movement_body_capacity: usize = 0,
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
@@ -126,6 +129,9 @@ pub const SimulationPipeline = struct {
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
         try collision_response.reserveForContacts(config.contact_capacity);
+        var scope = SimulationScopeSystem.init(allocator);
+        errdefer scope.deinit();
+        try scope.reserve(config.movement_body_capacity);
 
         return .{
             .movement = MovementSystem.init(),
@@ -134,7 +140,7 @@ pub const SimulationPipeline = struct {
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
-            .scope = SimulationScopeSystem.init(allocator),
+            .scope = scope,
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,

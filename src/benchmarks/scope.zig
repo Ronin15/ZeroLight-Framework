@@ -8,17 +8,20 @@
 //! the measured cost reflects the ACTIVE work, not the full entity count.
 //!
 //! The fixture spreads N entities across the chunk grid and assigns each its
-//! simulation-LOD tier by distance from the visible window (`tierForChunkDistance`):
-//! near chunks are cognition, then locomotion, then kinematic, then dormant far out.
-//! So this measures a realistic MIXED-TIER population, not all-cognition:
+//! simulation-LOD tier via the cube `lodDistance` (`tierForChunkDistance`). The x/y
+//! spread stays inside the cognition halo, so the bands here come from the per-level
+//! depth penalty (`level = index % 5`): levels 0-1 cognition, 2 locomotion, 3
+//! kinematic, 4 dormant. So this measures a realistic MIXED-TIER population, not
+//! all-cognition:
 //!   - movement runs on all non-dormant rows (tier gather drops dormant).
 //!   - collision runs on locomotion+cognition (drops dormant+kinematic).
 //!   - AI runs on the cognition subset, further gated by camera halo + stagger.
 //!   - movement derives each integrated body's chunk in-pass (chunk_grid).
 //!
 //! `output_count` reports how many entities actually ran cognition this step, so the
-//! gap between that and N is the scope reduction. Compare items/s against the `ai`
-//! group (full-active cognition at the same N) to read the scoping win directly.
+//! gap between that and N is the scope reduction. Note the timed window covers the
+//! whole scoped step (AI + collision + movement + gathers + tier policy), so it is
+//! not directly comparable to the AI-only `ai` group.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;

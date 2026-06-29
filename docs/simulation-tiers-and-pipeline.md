@@ -58,9 +58,10 @@ The concrete processor order is pipeline-owned for one gameplay state instance.
 commit/domain reactions, and render-prep reservation at the state boundary; it
 passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
-`SimulationPipeline` opens each step with the backbone **scope pass** (chunk
-recompute, stagger advance, and the tier/halo/stagger gathers that select which
-entities enter each stage), then owns AI navigation-intent production,
+`SimulationPipeline` opens each step with the backbone **scope pass** (stagger
+advance and the tier/halo/stagger gathers that select which entities enter each
+stage; chunk columns are derived in-pass by the movement processor, not a separate
+recompute), then owns AI navigation-intent production,
 steering/path status, pathfinding, sparse movement-intent application, movement,
 bounds clamp, player-vs-world-tile gating, collision detection, and collision
 response — AI, movement, and collision run scope-gated through a

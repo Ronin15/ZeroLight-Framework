@@ -219,6 +219,7 @@ pub const GameDemoState = struct {
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
             .contact_capacity = demo_contact_capacity,
+            .movement_body_capacity = test_square_count + obstacle_count + 1,
             // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
             // resolution.
             .nav_cell_size = 32,

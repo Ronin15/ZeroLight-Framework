@@ -142,6 +142,16 @@ pub const SimulationScopeSystem = struct {
         self.movement_indices.deinit(self.allocator);
     }
 
+    /// Pre-sizes the per-step scratch index/command lists to `capacity` movement
+    /// bodies so the serial gathers and tier policy are allocation-free after init.
+    /// The threaded per-range slot buffers still warm on their first threaded step.
+    pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
+        try self.movement_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.ai_indices.ensureTotalCapacity(self.allocator, capacity);
+        try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
+    }
+
     /// Increment the step counter. Call once at the top of each fixed step.
     pub fn advanceStep(self: *SimulationScopeSystem) void {
         self.step_count += 1;
@@ -1116,6 +1126,68 @@ test "scoped movement integrates only non-dormant rows and derives chunk in-pass
         const expect = world.chunkCoordForWorldPos(body.position.x, body.position.y);
         try std.testing.expectEqual(expect.x, meta.chunk.x);
         try std.testing.expectEqual(expect.y, meta.chunk.y);
+    }
+}
+
+test "indexed movement path matches scalar reference across the SIMD block and tail" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const movement = @import("movement.zig");
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+
+    // Nine bodies with the odd dense rows dormant, so the movement gather yields
+    // five non-contiguous indices (0,2,4,6,8): four run through the 4-lane
+    // gather/scatter block, the fifth through the scalar tail. Values are f32-exact
+    // so the indexed result must equal the hand-computed scalar reference exactly.
+    const Spawn = struct { x: f32, y: f32, vx: f32, vy: f32, dormant: bool };
+    const spawns = [_]Spawn{
+        .{ .x = 10, .y = 20, .vx = 4, .vy = -2, .dormant = false },
+        .{ .x = 30, .y = 40, .vx = 8, .vy = 8, .dormant = true },
+        .{ .x = 50, .y = 60, .vx = -6, .vy = 2, .dormant = false },
+        .{ .x = 70, .y = 80, .vx = 16, .vy = -16, .dormant = true },
+        .{ .x = 90, .y = 100, .vx = 2, .vy = 6, .dormant = false },
+        .{ .x = 110, .y = 120, .vx = -32, .vy = 4, .dormant = true },
+        .{ .x = 130, .y = 140, .vx = 12, .vy = -8, .dormant = false },
+        .{ .x = 150, .y = 160, .vx = 24, .vy = 24, .dormant = true },
+        .{ .x = 170, .y = 180, .vx = -4, .vy = 10, .dormant = false },
+    };
+    var ents: [spawns.len]EntityId = undefined;
+    for (spawns, 0..) |s, i| {
+        ents[i] = try data.createEntity();
+        try data.setMovementBody(ents[i], .{ .position = .{ .x = s.x, .y = s.y }, .velocity = .{ .x = s.vx, .y = s.vy } });
+        if (s.dormant) try data.setSimulationTier(ents[i], .dormant);
+    }
+
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    const indices = try sys.gatherMovementBodyIndicesSerial(&data);
+    try std.testing.expect(indices != null);
+    try std.testing.expectEqual(@as(usize, 5), indices.?.len); // > 4-lane block → block + tail
+
+    var slice = data.movementBodySlice();
+    var ms = movement.MovementSystem.init();
+    const dt: f32 = 0.25;
+    _ = ms.update(&slice, &threads, dt, .{ .scope_dense_indices = indices });
+
+    const after = data.movementBodySliceConst();
+    for (spawns, 0..) |s, i| {
+        if (s.dormant) {
+            // Excluded from the index set: position left untouched.
+            try std.testing.expectEqual(s.x, after.position_x[i]);
+            try std.testing.expectEqual(s.y, after.position_y[i]);
+        } else {
+            // Indexed path scatters next into position and old into previous,
+            // per lane and per column — matches the scalar reference exactly.
+            try std.testing.expectEqual(s.x + s.vx * dt, after.position_x[i]);
+            try std.testing.expectEqual(s.y + s.vy * dt, after.position_y[i]);
+            try std.testing.expectEqual(s.x, after.previous_x[i]);
+            try std.testing.expectEqual(s.y, after.previous_y[i]);
+        }
     }
 }
 
