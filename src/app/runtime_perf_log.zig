@@ -115,6 +115,8 @@ pub const Metric = enum {
     scope_collision_response_stage_entities,
     scope_ai_stage_entities,
     scope_steering_stage_entities,
+    scope_stagger_skips,
+    scope_chunk_filtered_entities,
     simulation_events_total,
     simulation_events_dropped,
     simulation_events_entity_created,
@@ -454,7 +456,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s scope total={} dormant={} kinematic={} locomotion={} cognition={} stage movement={} collision={} response={} ai={} steering={}",
+            "perf {d:.1}s scope total={} dormant={} kinematic={} locomotion={} cognition={} stage movement={} collision={} response={} ai={} steering={} stagger_skips={} chunk_filtered={}",
             .{
                 elapsed_s,
                 self.metricValue(.scope_total_entities),
@@ -467,6 +469,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.scope_collision_response_stage_entities),
                 self.metricValue(.scope_ai_stage_entities),
                 self.metricValue(.scope_steering_stage_entities),
+                self.metricValue(.scope_stagger_skips),
+                self.metricValue(.scope_chunk_filtered_entities),
             },
         );
         log.debug(

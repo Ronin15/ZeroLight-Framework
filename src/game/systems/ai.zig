@@ -64,6 +64,9 @@ pub const AiConfig = struct {
     /// and other callers keep the default `individual`.
     nav_request_kind: PathRequestKind = .individual,
     navigation_intents: ?*RangeOutputStream(NavigationIntent) = null,
+    /// When non-null, only these dense ai-store indices participate this step
+    /// (the scope system's cognition halo + stagger selection). Null = all agents.
+    scope_dense_indices: ?[]const u32 = null,
 };
 
 pub const AiStats = struct {
@@ -132,7 +135,7 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
-        try self.gatherAiData(ai_agents, movement, data);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
         const entity_count = self.entities.items.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
@@ -238,7 +241,7 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds;
-        try self.gatherAiData(ai_agents, movement, data);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
         const entity_count = self.entities.items.len;
         if (entity_count == 0) return .{};
         try self.buildSeparationGrid();
@@ -295,9 +298,17 @@ pub const AiSystem = struct {
         };
     }
 
-    fn gatherAiData(self: *AiSystem, ai_slice: ConstAiAgentSlice, movement: ConstMovementBodySlice, data: *const DataSystem) !void {
+    fn gatherAiData(
+        self: *AiSystem,
+        ai_slice: ConstAiAgentSlice,
+        movement: ConstMovementBodySlice,
+        data: *const DataSystem,
+        scope_dense_indices: ?[]const u32,
+    ) !void {
         self.clearWork();
-        const n = ai_slice.entities.len;
+        // n is the candidate count: the scoped subset when the scope system has
+        // selected ai rows for this step, otherwise every ai agent.
+        const n = if (scope_dense_indices) |idx| idx.len else ai_slice.entities.len;
         if (n == 0) return;
         try self.entities.ensureTotalCapacity(self.allocator, n);
         try self.pos_x.ensureTotalCapacity(self.allocator, n);
@@ -314,7 +325,12 @@ pub const AiSystem = struct {
 
         // Preserve ai order for deterministic output. DataSystem rejects stale generations
         // and returns direct dense movement rows without transient high-water index tables.
-        for (ai_slice.entities, 0..) |ent, i| {
+        // The scoped path walks only the selected ai indices; both paths gather the
+        // same per-row columns, so all downstream stages operate on the gathered set.
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
+            const ent = ai_slice.entities[i];
             const mi = data.movementBodyDenseIndex(ent) orelse continue;
             self.entities.appendAssumeCapacity(ent);
             self.pos_x.appendAssumeCapacity(movement.previous_x[mi]);

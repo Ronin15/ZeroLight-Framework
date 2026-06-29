@@ -11,9 +11,12 @@ const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
 const render_depth = @import("render_depth.zig");
+const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
 const EntitySimulationMetadata = @import("simulation_scope.zig").EntitySimulationMetadata;
 const SimulationScopeStats = @import("simulation_scope.zig").SimulationScopeStats;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
+const cognition_stagger_n = @import("simulation_scope.zig").cognition_stagger_n;
+const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const simd = @import("../core/simd.zig");
 const WorldDepth = render_depth.WorldDepth;
 
@@ -135,6 +138,35 @@ pub const ConstMovementBodySlice = struct {
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
+};
+
+/// Dense simulation-scope columns in lockstep with the movement store rows
+/// (index here == movement dense index). The scope system writes chunk_x/y here
+/// during its recompute and reads the columns for the movement gather and tier
+/// policy as aligned SoA. Mutable view exposes only chunk_x/y as writable — the
+/// per-step recompute writes those. tier/stagger_phase/always_active are const
+/// here; they change only through setSimulationTier/setSimulationMetadata, which
+/// keep tier_counts in sync, so a stray write through this view can't desync them.
+pub const ScopeColumnsSlice = struct {
+    entities: []const EntityId,
+    tier: []const SimulationTier,
+    chunk_x: HotI32Slice,
+    chunk_y: HotI32Slice,
+    /// Entity depth/level for the cube LOD distance. Const in the mutable view: set
+    /// via setSimulationMetadata, never by the per-step chunk recompute.
+    level: []const u16,
+    stagger_phase: []const u8,
+    always_active: []const bool,
+};
+
+pub const ConstScopeColumnsSlice = struct {
+    entities: []const EntityId,
+    tier: []const SimulationTier,
+    chunk_x: ConstHotI32Slice,
+    chunk_y: ConstHotI32Slice,
+    level: []const u16,
+    stagger_phase: []const u8,
+    always_active: []const bool,
 };
 
 pub const FacingData = struct {
@@ -339,6 +371,11 @@ pub const AssetReferenceCommand = struct {
     asset_reference: AssetReference,
 };
 
+pub const SimulationTierCommand = struct {
+    entity: EntityId,
+    tier: SimulationTier,
+};
+
 /// Deferred structural work committed after processors finish. Commands carry
 /// stable entity IDs and component values only, never borrowed slices or service
 /// references from the frame that produced them.
@@ -353,6 +390,7 @@ pub const StructuralCommand = union(enum) {
     set_collision_response: CollisionResponseCommand,
     set_ai_agent: AiAgentCommand,
     set_steering_agent: SteeringAgentCommand,
+    set_simulation_tier: SimulationTierCommand,
 };
 
 pub const StructuralCommitStats = struct {
@@ -656,8 +694,9 @@ pub const DataSystem = struct {
             self.free_slot_count -= 1;
             slot.alive = true;
             slot.next_free = null;
-            slot.simulation = .{};
-            self.tier_counts[@intFromEnum(slot.simulation.tier)] += 1;
+            // Scope metadata (tier/chunk/stagger) is born with the movement body
+            // as a dense column row, not on the slot. tier_counts is maintained at
+            // movement-body add/remove.
             // Reused slots keep their incremented generation so stale IDs cannot
             // address the new entity.
             return EntityId.init(index, slot.generation) catch unreachable;
@@ -666,7 +705,6 @@ pub const DataSystem = struct {
         if (self.slots.items.len >= std.math.maxInt(u32)) return error.TooManyEntities;
         const index: u32 = @intCast(self.slots.items.len);
         try self.slots.append(self.allocator, .{ .generation = 1, .alive = true });
-        self.tier_counts[@intFromEnum(self.slots.items[index].simulation.tier)] += 1;
         return EntityId.init(index, 1) catch unreachable;
     }
 
@@ -685,13 +723,13 @@ pub const DataSystem = struct {
         if (slot.ai_agent_index) |dense_index| self.removeAiAgentAt(@intCast(dense_index));
         if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
 
+        // tier_counts is decremented in removeMovementBodyAt (called above) since
+        // the tier now lives on the dense movement-body scope row, not the slot.
         const retired_slot = &self.slots.items[@intCast(index)];
-        self.tier_counts[@intFromEnum(retired_slot.simulation.tier)] -= 1;
         retired_slot.generation = nextGeneration(retired_slot.generation);
         retired_slot.alive = false;
         retired_slot.next_free = self.first_free_slot;
         retired_slot.component_mask = 0;
-        retired_slot.simulation = .{};
         retired_slot.movement_body_index = null;
         retired_slot.facing_index = null;
         retired_slot.primitive_visual_index = null;
@@ -719,27 +757,95 @@ pub const DataSystem = struct {
         return slot.hasComponents(mask);
     }
 
-    /// Returns cold simulation metadata for a live entity.
-    /// Stale, dead, or invalid IDs return null instead of exposing retired slots.
+    /// Returns simulation-scope metadata for a live entity, read from its dense
+    /// movement-body scope row. Entities without a movement body (and stale/dead/
+    /// invalid IDs) return null — scope metadata exists only for simulated entities.
     pub fn simulationMetadata(self: *const DataSystem, id: EntityId) ?EntitySimulationMetadata {
         const slot = self.resolveSlotConst(id) orelse return null;
-        return slot.simulation;
+        const di: usize = slot.movement_body_index orelse return null;
+        return .{
+            .tier = self.movement_bodies.tier.items[di],
+            .chunk = .{ .x = self.movement_bodies.chunk_x.items[di], .y = self.movement_bodies.chunk_y.items[di] },
+            .level = self.movement_bodies.level.items[di],
+            .stagger_phase = self.movement_bodies.stagger_phase.items[di],
+            .always_active = self.movement_bodies.always_active.items[di],
+        };
     }
 
-    /// Updates cold tier/chunk metadata without touching hot component stores.
-    /// This is storage-only in Slice 22; it does not change processor participation.
+    /// Writes the full scope metadata for an entity into its dense scope row.
+    /// Requires a movement body; returns error.InvalidEntity otherwise.
     pub fn setSimulationMetadata(self: *DataSystem, id: EntityId, metadata: EntitySimulationMetadata) !void {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
-        self.tier_counts[@intFromEnum(slot.simulation.tier)] -= 1;
+        const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
+        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[di])] -= 1;
         self.tier_counts[@intFromEnum(metadata.tier)] += 1;
-        slot.simulation = metadata;
+        self.movement_bodies.tier.items[di] = metadata.tier;
+        self.movement_bodies.chunk_x.items[di] = metadata.chunk.x;
+        self.movement_bodies.chunk_y.items[di] = metadata.chunk.y;
+        self.movement_bodies.level.items[di] = metadata.level;
+        self.movement_bodies.stagger_phase.items[di] = metadata.stagger_phase;
+        self.movement_bodies.always_active.items[di] = metadata.always_active;
+        self.snapInterpolationIfStill(di, metadata.tier);
+    }
+
+    /// Stores the pre-computed chunk coordinate into the entity's dense scope row.
+    /// No-op for entities without a movement body. The scope system normally writes
+    /// chunk columns in bulk via scopeColumnsSlice(); this is the per-entity path.
+    pub fn setEntityChunk(self: *DataSystem, id: EntityId, chunk: ChunkCoord) void {
+        const slot = self.resolveSlot(id) orelse return;
+        const di: usize = slot.movement_body_index orelse return;
+        self.movement_bodies.chunk_x.items[di] = chunk.x;
+        self.movement_bodies.chunk_y.items[di] = chunk.y;
+    }
+
+    /// Changes an entity's simulation tier while preserving chunk, stagger_phase,
+    /// and always_active. Processors must not call this inside worker ranges; use
+    /// a .set_simulation_tier structural command for deferred tier changes.
+    pub fn setSimulationTier(self: *DataSystem, id: EntityId, tier: SimulationTier) !void {
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
+        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[di])] -= 1;
+        self.tier_counts[@intFromEnum(tier)] += 1;
+        self.movement_bodies.tier.items[di] = tier;
+        // chunk, stagger_phase, and always_active are intentionally preserved.
+        self.snapInterpolationIfStill(di, tier);
+    }
+
+    /// When an entity enters a non-moving tier, movement stops updating its
+    /// previous position while its position stays frozen — render interpolation
+    /// (lerp previous→position) would otherwise oscillate. Snap previous=position
+    /// so the row renders static until it moves again.
+    fn snapInterpolationIfStill(self: *DataSystem, di: usize, tier: SimulationTier) void {
+        if (tier.allowsMovement()) return;
+        self.movement_bodies.previous_x.items[di] = self.movement_bodies.position_x.items[di];
+        self.movement_bodies.previous_y.items[di] = self.movement_bodies.position_y.items[di];
+        self.movement_bodies.previous_z.items[di] = self.movement_bodies.position_z.items[di];
+    }
+
+    /// Mutable dense scope columns (chunk_x/y written by the recompute pass).
+    pub fn scopeColumnsSlice(self: *DataSystem) ScopeColumnsSlice {
+        return self.movement_bodies.scopeSlice();
+    }
+
+    /// Const dense scope columns for the movement gather and tier policy scans.
+    pub fn scopeColumnsSliceConst(self: *const DataSystem) ConstScopeColumnsSlice {
+        return self.movement_bodies.scopeSliceConst();
+    }
+
+    /// Live count of entities at a given tier (O(1), incrementally maintained).
+    /// The scope system uses this for fast-path gather decisions: when no entity
+    /// is below a stage's required tier, the stage runs full-active with no scan.
+    pub fn tierCount(self: *const DataSystem, tier: SimulationTier) usize {
+        return self.tier_counts[@intFromEnum(tier)];
     }
 
     /// Current full-active scope counters. Tier histograms come from the
     /// incrementally-maintained `tier_counts` (O(1), no per-step slot scan); stage
     /// counts come free from dense slice lengths. `scanLiveTierCounts` is the
-    /// parity baseline the counters must match.
+    /// parity baseline the counters must match. `total_entities` is the count of
+    /// entities carrying a simulation tier (i.e. those with a movement body), not
+    /// the full live-entity set.
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
         return .{
             .total_entities = self.tier_counts[0] + self.tier_counts[1] + self.tier_counts[2] + self.tier_counts[3],
@@ -755,13 +861,13 @@ pub const DataSystem = struct {
         };
     }
 
-    /// O(slots) scan of live tiers — the parity baseline for the incrementally
-    /// maintained `tier_counts`. Test/debug only; not on the fixed-step path.
+    /// O(rows) scan of the dense scope tier column — the parity baseline for the
+    /// incrementally maintained `tier_counts`. Test/debug only; not on the hot path.
+    /// Counts entities with a movement body (the entities that carry a tier).
     pub fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
         var counts = [4]usize{ 0, 0, 0, 0 };
-        for (self.slots.items) |slot| {
-            if (!slot.alive) continue;
-            counts[@intFromEnum(slot.simulation.tier)] += 1;
+        for (self.movement_bodies.tier.items) |tier| {
+            counts[@intFromEnum(tier)] += 1;
         }
         return counts;
     }
@@ -793,7 +899,6 @@ pub const DataSystem = struct {
             slot.alive = false;
             slot.next_free = self.first_free_slot;
             slot.component_mask = 0;
-            slot.simulation = .{};
             slot.movement_body_index = null;
             slot.facing_index = null;
             slot.primitive_visual_index = null;
@@ -823,6 +928,8 @@ pub const DataSystem = struct {
         const dense_index = try self.movement_bodies.append(self.allocator, id, body);
         slot.movement_body_index = dense_index;
         slot.addComponent(.movement_body);
+        // The new scope row defaults to .cognition (see MovementBodyStore.append).
+        self.tier_counts[@intFromEnum(SimulationTier.cognition)] += 1;
     }
 
     pub fn movementBodyPtr(self: *DataSystem, id: EntityId) ?MovementBodyPtr {
@@ -1190,6 +1297,17 @@ pub const DataSystem = struct {
                     stats.components_set += 1;
                     self.recordComponentChange(change_sink, set.entity, .steering_agent, was_static_navigation_obstacle);
                 },
+                .set_simulation_tier => |set| {
+                    // Skip stale IDs and live entities without a movement body
+                    // (tier exists only on simulated rows) — same upsert tolerance
+                    // as the sibling set_* commands, so neither aborts the batch.
+                    if (!self.isAlive(set.entity) or self.movementBodyDenseIndex(set.entity) == null) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    try self.setSimulationTier(set.entity, set.tier);
+                    // Tier is cold slot metadata — no component mask change, no structural event.
+                },
             }
         }
         return stats;
@@ -1240,6 +1358,7 @@ pub const DataSystem = struct {
                 .set_collision_response => |set| try self.preflightSetComponent(set.entity, .collision_response, scratch, &projection, &structural_event_count),
                 .set_ai_agent => |set| try self.preflightSetComponent(set.entity, .ai_agent, scratch, &projection, &structural_event_count),
                 .set_steering_agent => |set| try self.preflightSetComponent(set.entity, .steering_agent, scratch, &projection, &structural_event_count),
+                .set_simulation_tier => {},
             }
         }
 
@@ -1413,6 +1532,9 @@ pub const DataSystem = struct {
     }
 
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
+        // The scope tier row leaves with the movement body, so drop its tier count
+        // before the swap overwrites it. The moved tail row keeps its own tier.
+        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[index])] -= 1;
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
@@ -1462,7 +1584,6 @@ const EntitySlot = struct {
     alive: bool = false,
     next_free: ?u32 = null,
     component_mask: ComponentMask = 0,
-    simulation: EntitySimulationMetadata = .{},
     movement_body_index: ?u32 = null,
     facing_index: ?u32 = null,
     primitive_visual_index: ?u32 = null,
@@ -1563,6 +1684,17 @@ const MovementBodyStore = struct {
     velocity_x: HotF32List = .empty,
     velocity_y: HotF32List = .empty,
     speed: HotF32List = .empty,
+    // Simulation-scope columns ride in dense lockstep with the movement rows so
+    // the scope system's O(N) recompute, movement gather, and tier policy iterate
+    // aligned SoA instead of scattered cold slots. The movement processor's slice
+    // omits these, so movement integration never touches their cache lines. Scope
+    // metadata therefore exists exactly for entities with a movement body.
+    tier: std.ArrayList(SimulationTier) = .empty,
+    chunk_x: HotI32List = .empty,
+    chunk_y: HotI32List = .empty,
+    level: std.ArrayList(u16) = .empty,
+    stagger_phase: std.ArrayList(u8) = .empty,
+    always_active: std.ArrayList(bool) = .empty,
 
     fn append(self: *MovementBodyStore, allocator: std.mem.Allocator, entity: EntityId, body: MovementBody) !u32 {
         if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
@@ -1578,6 +1710,14 @@ const MovementBodyStore = struct {
         self.velocity_x.appendAssumeCapacity(body.velocity.x);
         self.velocity_y.appendAssumeCapacity(body.velocity.y);
         self.speed.appendAssumeCapacity(body.speed);
+        // New scope row defaults: full cognition, chunk recomputed next step, and a
+        // stagger phase derived from the dense index so phases spread evenly.
+        self.tier.appendAssumeCapacity(.cognition);
+        self.chunk_x.appendAssumeCapacity(0);
+        self.chunk_y.appendAssumeCapacity(0);
+        self.level.appendAssumeCapacity(0);
+        self.stagger_phase.appendAssumeCapacity(@intCast(index % cognition_stagger_n));
+        self.always_active.appendAssumeCapacity(false);
         return index;
     }
 
@@ -1631,6 +1771,12 @@ const MovementBodyStore = struct {
         self.velocity_x.items[index] = self.velocity_x.items[last];
         self.velocity_y.items[index] = self.velocity_y.items[last];
         self.speed.items[index] = self.speed.items[last];
+        self.tier.items[index] = self.tier.items[last];
+        self.chunk_x.items[index] = self.chunk_x.items[last];
+        self.chunk_y.items[index] = self.chunk_y.items[last];
+        self.level.items[index] = self.level.items[last];
+        self.stagger_phase.items[index] = self.stagger_phase.items[last];
+        self.always_active.items[index] = self.always_active.items[last];
         _ = self.entities.pop();
         _ = self.position_x.pop();
         _ = self.position_y.pop();
@@ -1641,6 +1787,12 @@ const MovementBodyStore = struct {
         _ = self.velocity_x.pop();
         _ = self.velocity_y.pop();
         _ = self.speed.pop();
+        _ = self.tier.pop();
+        _ = self.chunk_x.pop();
+        _ = self.chunk_y.pop();
+        _ = self.level.pop();
+        _ = self.stagger_phase.pop();
+        _ = self.always_active.pop();
         return moved_entity;
     }
 
@@ -1674,6 +1826,30 @@ const MovementBodyStore = struct {
         };
     }
 
+    fn scopeSlice(self: *MovementBodyStore) ScopeColumnsSlice {
+        return .{
+            .entities = self.entities.items,
+            .tier = self.tier.items,
+            .chunk_x = self.chunk_x.items,
+            .chunk_y = self.chunk_y.items,
+            .level = self.level.items,
+            .stagger_phase = self.stagger_phase.items,
+            .always_active = self.always_active.items,
+        };
+    }
+
+    fn scopeSliceConst(self: *const MovementBodyStore) ConstScopeColumnsSlice {
+        return .{
+            .entities = self.entities.items,
+            .tier = self.tier.items,
+            .chunk_x = self.chunk_x.items,
+            .chunk_y = self.chunk_y.items,
+            .level = self.level.items,
+            .stagger_phase = self.stagger_phase.items,
+            .always_active = self.always_active.items,
+        };
+    }
+
     fn clearRetainingCapacity(self: *MovementBodyStore) void {
         self.entities.clearRetainingCapacity();
         self.position_x.clearRetainingCapacity();
@@ -1685,6 +1861,12 @@ const MovementBodyStore = struct {
         self.velocity_x.clearRetainingCapacity();
         self.velocity_y.clearRetainingCapacity();
         self.speed.clearRetainingCapacity();
+        self.tier.clearRetainingCapacity();
+        self.chunk_x.clearRetainingCapacity();
+        self.chunk_y.clearRetainingCapacity();
+        self.level.clearRetainingCapacity();
+        self.stagger_phase.clearRetainingCapacity();
+        self.always_active.clearRetainingCapacity();
     }
 
     fn deinit(self: *MovementBodyStore, allocator: std.mem.Allocator) void {
@@ -1698,6 +1880,12 @@ const MovementBodyStore = struct {
         self.velocity_x.deinit(allocator);
         self.velocity_y.deinit(allocator);
         self.speed.deinit(allocator);
+        self.tier.deinit(allocator);
+        self.chunk_x.deinit(allocator);
+        self.chunk_y.deinit(allocator);
+        self.level.deinit(allocator);
+        self.stagger_phase.deinit(allocator);
+        self.always_active.deinit(allocator);
         self.* = .{};
     }
 
@@ -1716,6 +1904,12 @@ const MovementBodyStore = struct {
         try self.velocity_x.ensureTotalCapacity(allocator, capacity);
         try self.velocity_y.ensureTotalCapacity(allocator, capacity);
         try self.speed.ensureTotalCapacity(allocator, capacity);
+        try self.tier.ensureTotalCapacity(allocator, capacity);
+        try self.chunk_x.ensureTotalCapacity(allocator, capacity);
+        try self.chunk_y.ensureTotalCapacity(allocator, capacity);
+        try self.level.ensureTotalCapacity(allocator, capacity);
+        try self.stagger_phase.ensureTotalCapacity(allocator, capacity);
+        try self.always_active.ensureTotalCapacity(allocator, capacity);
     }
 };
 
@@ -2557,16 +2751,24 @@ test "entity simulation metadata defaults and rejects stale ids" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
+    // Scope metadata lives on the dense movement-body scope row, so an entity
+    // must have a movement body to carry it. Bodiless entities report null.
     const entity = try data.createEntity();
+    try std.testing.expect(data.simulationMetadata(entity) == null);
+    try data.setMovementBody(entity, .{});
     try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(entity).?);
     try data.setSimulationMetadata(entity, .{
         .tier = .locomotion,
         .chunk = .{ .x = 4, .y = -2 },
+        .level = 3,
     });
     try std.testing.expectEqual(EntitySimulationMetadata{
         .tier = .locomotion,
         .chunk = .{ .x = 4, .y = -2 },
+        .level = 3,
     }, data.simulationMetadata(entity).?);
+    // The scope columns view exposes the same level the metadata round-tripped.
+    try std.testing.expectEqual(@as(u16, 3), data.scopeColumnsSliceConst().level[0]);
 
     try std.testing.expect(data.destroyEntity(entity));
     try std.testing.expect(data.simulationMetadata(entity) == null);
@@ -2574,6 +2776,7 @@ test "entity simulation metadata defaults and rejects stale ids" {
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
+    try data.setMovementBody(reused, .{});
     try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
 }
 
@@ -2582,6 +2785,7 @@ test "entity simulation metadata resets with retained capacity" {
     defer data.deinit();
 
     const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{});
     try data.setSimulationMetadata(entity, .{
         .tier = .dormant,
         .chunk = .{ .x = 9, .y = 3 },
@@ -2590,6 +2794,7 @@ test "entity simulation metadata resets with retained capacity" {
 
     const reused = try data.createEntity();
     try std.testing.expectEqual(entity.index, reused.index);
+    try data.setMovementBody(reused, .{});
     try std.testing.expectEqual(EntitySimulationMetadata{}, data.simulationMetadata(reused).?);
 }
 
@@ -2606,6 +2811,7 @@ test "full active scope stats count tiers and current stage slices" {
     try data.setMovementBody(thinker, .{});
     try data.setAiAgent(thinker, .{});
     try data.setSteeringAgent(thinker, .{});
+    try data.setMovementBody(dormant, .{});
     try data.setSimulationMetadata(mover, .{ .tier = .locomotion });
     try data.setSimulationMetadata(dormant, .{ .tier = .dormant });
 
@@ -3430,10 +3636,16 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
     const e0 = try data.createEntity();
     const e1 = try data.createEntity();
     const e2 = try data.createEntity();
+    // Tier lives on the dense movement-body scope row, so each tiered entity needs
+    // a movement body.
+    try data.setMovementBody(e0, .{});
+    try data.setMovementBody(e1, .{});
+    try data.setMovementBody(e2, .{});
     try data.setSimulationMetadata(e1, .{ .tier = .dormant });
     try data.setSimulationMetadata(e2, .{ .tier = .kinematic });
     _ = data.destroyEntity(e0); // was cognition (default)
     const e3 = try data.createEntity(); // reuses e0's slot at cognition
+    try data.setMovementBody(e3, .{});
     try data.setSimulationMetadata(e3, .{ .tier = .locomotion });
 
     // The incrementally-maintained counters must equal a fresh live scan, and the
@@ -3450,6 +3662,75 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
     data.clearRetainingCapacity();
     try std.testing.expectEqual([4]usize{ 0, 0, 0, 0 }, data.tier_counts);
     try std.testing.expectEqual(@as(usize, 0), data.simulationScopeStatsFullActive().total_entities);
+}
+
+test "set_simulation_tier preserves chunk and stagger_phase" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{});
+    const orig = data.simulationMetadata(entity).?;
+    const orig_chunk = orig.chunk;
+    const orig_phase = orig.stagger_phase;
+
+    try data.setSimulationTier(entity, .locomotion);
+    const updated = data.simulationMetadata(entity).?;
+
+    try std.testing.expectEqual(SimulationTier.locomotion, updated.tier);
+    try std.testing.expectEqual(orig_chunk, updated.chunk);
+    try std.testing.expectEqual(orig_phase, updated.stagger_phase);
+    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+}
+
+test "structural command set_simulation_tier commits and skips stale entities" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const alive = try data.createEntity();
+    try data.setMovementBody(alive, .{});
+    const dead = try data.createEntity();
+    _ = data.destroyEntity(dead);
+    // Live entity with no movement body — tier has no row to land on. Must skip
+    // like a stale ID, not abort the batch (would drop the trailing command).
+    const bodiless = try data.createEntity();
+
+    var commands = [_]StructuralCommand{
+        .{ .set_simulation_tier = .{ .entity = dead, .tier = .dormant } },
+        .{ .set_simulation_tier = .{ .entity = bodiless, .tier = .dormant } },
+        .{ .set_simulation_tier = .{ .entity = alive, .tier = .dormant } },
+    };
+    var sink = NullStructuralChangeSink{};
+    const stats = try data.applyStructuralCommandsWithChangeSink(&commands, &sink);
+
+    try std.testing.expectEqual(@as(usize, 0), stats.created);
+    try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
+    // The command after the skipped ones still applied — no partial commit.
+    try std.testing.expectEqual(SimulationTier.dormant, data.simulationMetadata(alive).?.tier);
+    try std.testing.expectEqual(@as(?EntitySimulationMetadata, null), data.simulationMetadata(bodiless));
+    try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
+}
+
+test "entering a non-moving tier snaps interpolation history to position" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 100, .y = 200 } });
+    const di = data.movementBodyDenseIndex(entity).?;
+    // Diverge previous from position, as a mid-flight integration would leave it.
+    data.movement_bodies.previous_x.items[di] = 10;
+    data.movement_bodies.previous_y.items[di] = 20;
+
+    // Non-moving tier snaps previous = position so render interpolation is static.
+    try data.setSimulationTier(entity, .dormant);
+    try std.testing.expectEqual(@as(f32, 100), data.movement_bodies.previous_x.items[di]);
+    try std.testing.expectEqual(@as(f32, 200), data.movement_bodies.previous_y.items[di]);
+
+    // A moving tier leaves the history untouched (movement will resync it).
+    data.movement_bodies.previous_x.items[di] = 10;
+    try data.setSimulationTier(entity, .cognition);
+    try std.testing.expectEqual(@as(f32, 10), data.movement_bodies.previous_x.items[di]);
 }
 
 fn testBody(base: f32) MovementBody {

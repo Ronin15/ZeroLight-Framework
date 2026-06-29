@@ -111,3 +111,6 @@ release candidates. Minimum toolchain is **Zig 0.16.0**.
   owning module first.
 - Keep changes scoped to the requested slice. Do not reformat or refactor
   unrelated code.
+- Always run a targeted benchmark with `zig build bench -- --group <name>`
+  (optionally `--case`/`--items`) unless explicitly told to run the full suite.
+  Do not run the whole `zig build bench` and filter its output.

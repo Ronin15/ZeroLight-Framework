@@ -26,6 +26,16 @@ pub fn floorToI32(value: f32) i32 {
     return @intFromFloat(floored);
 }
 
+/// World-space coordinate → tile/cell index, clamped to `[0, max_cells - 1]`.
+/// Clamps before narrowing so inf/NaN/out-of-range positions can never reach
+/// the integer cast — the single safe chokepoint for world-pos → grid math.
+pub fn worldPosToCell(world_pos: f32, tile_size: f32, max_cells: u32) u32 {
+    if (max_cells == 0) return 0;
+    const cell = floorToI32(world_pos / tile_size);
+    if (cell < 0) return 0;
+    return @min(@as(u32, @intCast(cell)), max_cells - 1);
+}
+
 /// Linearly interpolates between `start` and `end` by `amount`. Scalar
 /// counterpart of `simd.lerpFloat4`.
 pub fn lerp(start: f32, end: f32, amount: f32) f32 {
@@ -142,6 +152,19 @@ test "floorToI32 floors finite values and saturates non-finite ones" {
     try std.testing.expectEqual(std.math.maxInt(i32), floorToI32(std.math.inf(f32)));
     try std.testing.expectEqual(std.math.minInt(i32), floorToI32(-std.math.inf(f32)));
     try std.testing.expectEqual(std.math.maxInt(i32), floorToI32(1.0e30));
+}
+
+test "worldPosToCell clamps and saturates before narrowing" {
+    // tile_size 32, 10 cells → valid indices [0, 9].
+    try std.testing.expectEqual(@as(u32, 5), worldPosToCell(5 * 32 + 7, 32, 10));
+    try std.testing.expectEqual(@as(u32, 3), worldPosToCell(3 * 32, 32, 10)); // exact boundary
+    try std.testing.expectEqual(@as(u32, 0), worldPosToCell(-1.0, 32, 10)); // negative → 0
+    try std.testing.expectEqual(@as(u32, 9), worldPosToCell(1.0e9, 32, 10)); // huge → max-1
+    try std.testing.expectEqual(@as(u32, 9), worldPosToCell(std.math.inf(f32), 32, 10));
+    try std.testing.expectEqual(@as(u32, 0), worldPosToCell(-std.math.inf(f32), 32, 10));
+    try std.testing.expectEqual(@as(u32, 0), worldPosToCell(std.math.nan(f32), 32, 10));
+    try std.testing.expectEqual(@as(u32, 0), worldPosToCell(100, 32, 0)); // no cells
+    try std.testing.expectEqual(@as(u32, 0), worldPosToCell(100, 32, 1)); // single cell
 }
 
 test "lerpVec2 interpolates between points" {

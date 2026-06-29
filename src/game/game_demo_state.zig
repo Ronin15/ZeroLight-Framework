@@ -25,6 +25,7 @@ const movement_range_alignment_items = @import("data_system.zig").movement_range
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SteeringAgent = @import("data_system.zig").SteeringAgent;
+const simulation_scope = @import("simulation_scope.zig");
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
@@ -208,7 +209,11 @@ pub const GameDemoState = struct {
         }, world_render_overscan_chunks);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
-        try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, 8);
+        // Last arg sizes the structural-command stream: the per-step LOD tier policy
+        // can emit up to one set_simulation_tier per movement body when many cross a
+        // band at once, plus headroom for dig/create bursts — keeps the commit seam
+        // allocation-free on churn frames.
+        try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, test_square_count + 8);
         try simulation_frame.reservePathRequests(8, test_square_count);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = test_square_count,
@@ -464,6 +469,8 @@ pub const GameDemoState = struct {
         perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
         perf.recordMetric(.scope_ai_stage_entities, metric(scope_stats.ai_stage_entities));
         perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
+        perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
+        perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
@@ -1598,18 +1605,24 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     const pre1 = demo.data.movementBodyConst(ai1).?.position;
     const pre3 = demo.data.movementBodyConst(ai3).?.position;
 
-    try demo.update(.{
-        .input = &InputState{},
-        .audio = &audio,
-        .runtime_assets = &runtime_assets,
-        .delta_seconds = 0.016,
-        .transitions = &transitions,
-        .thread_system = &threads,
-    });
-
-    try std.testing.expectEqual(SimulationPhase.finished, demo.simulation_frame.phase);
-    const post_intents = demo.simulation_frame.intents.mergedItems();
-    try std.testing.expect(post_intents.len >= 3); // steering emitted final movement intents for ai-controlled squares
+    // Cognition (AI + steering) is staggered: each entity thinks once per
+    // cognition_stagger_n steps, so a single step drives only a phase subset.
+    // Run a full stagger cycle so every tracked square gets its think step, then
+    // assert all of them were driven by intents over the cycle.
+    var total_intents: usize = 0;
+    for (0..simulation_scope.cognition_stagger_n) |_| {
+        try demo.update(.{
+            .input = &InputState{},
+            .audio = &audio,
+            .runtime_assets = &runtime_assets,
+            .delta_seconds = 0.016,
+            .transitions = &transitions,
+            .thread_system = &threads,
+        });
+        try std.testing.expectEqual(SimulationPhase.finished, demo.simulation_frame.phase);
+        total_intents += demo.simulation_frame.intents.mergedItems().len;
+    }
+    try std.testing.expect(total_intents >= 3); // steering emitted final movement intents across the cycle
 
     const post0 = demo.data.movementBodyConst(ai0).?.position;
     const post1 = demo.data.movementBodyConst(ai1).?.position;

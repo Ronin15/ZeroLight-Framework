@@ -7,6 +7,7 @@
 //! atlas-derived source rect columns. Renderer handles stay outside this owner.
 
 const std = @import("std");
+const math = @import("../core/math.zig");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const PreparedSprite = @import("../assets/runtime_assets.zig").PreparedSprite;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
@@ -29,6 +30,8 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
 const WorldObstacleChangedEvent = @import("simulation.zig").WorldObstacleChangedEvent;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
+const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
+const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
 
@@ -901,6 +904,43 @@ pub const WorldSystem = struct {
         };
     }
 
+    /// Canonical world-space float position → chunk coordinate, clamped to world
+    /// bounds. The movement processor folds an inline copy of this formula in its
+    /// integration pass (`writeChunkRow`), kept in parity by the scoped-movement test.
+    pub fn chunkCoordForWorldPos(self: *const WorldSystem, world_x: f32, world_y: f32) ChunkCoord {
+        const tx: u16 = @intCast(math.worldPosToCell(world_x, self.tile_size, self.width));
+        const ty: u16 = @intCast(math.worldPosToCell(world_y, self.tile_size, self.height));
+        const raw = self.chunkCoordForCell(tx, ty);
+        return .{ .x = raw.x, .y = raw.y };
+    }
+
+    /// Camera-visible chunk rectangle as an ActiveRegion. Returns null when no
+    /// visibility window has been set yet (e.g. before the first render frame).
+    pub fn visibleChunkRegion(self: *const WorldSystem) ?ActiveRegion {
+        if (!self.visibility_window_valid or self.chunk_visible.items.len == 0) return null;
+        std.debug.assert(self.last_max_chunk_x >= self.last_min_chunk_x);
+        std.debug.assert(self.last_max_chunk_y >= self.last_min_chunk_y);
+        return .{
+            .min = .{ .x = @intCast(self.last_min_chunk_x), .y = @intCast(self.last_min_chunk_y) },
+            .max_exclusive = .{
+                .x = @as(i32, self.last_max_chunk_x) + 1,
+                .y = @as(i32, self.last_max_chunk_y) + 1,
+            },
+        };
+    }
+
+    /// Camera-visible chunks expanded by `halo` on every side — the simulation
+    /// cognition active region. Entities outside this region drop to .locomotion.
+    /// Returns null when no visibility window has been set yet.
+    pub fn cognitionActiveRegion(self: *const WorldSystem, halo: u16) ?ActiveRegion {
+        const visible = self.visibleChunkRegion() orelse return null;
+        const h: i32 = @intCast(halo);
+        return .{
+            .min = .{ .x = visible.min.x - h, .y = visible.min.y - h },
+            .max_exclusive = .{ .x = visible.max_exclusive.x + h, .y = visible.max_exclusive.y + h },
+        };
+    }
+
     pub fn addLevel(self: *WorldSystem, base_z: i32) !u16 {
         const index = self.level_base_z.items.len;
         if (index > std.math.maxInt(u16)) return error.WorldLevelOverflow;
@@ -1441,10 +1481,7 @@ fn ceilDiv(value: u16, divisor: u16) u16 {
 }
 
 fn floorTileClamped(value: f32, tile_size: f32, max_tiles: u16) u16 {
-    if (max_tiles <= 1) return 0;
-    const raw: i32 = @intFromFloat(@floor(value / tile_size));
-    const clamped = std.math.clamp(raw, 0, @as(i32, @intCast(max_tiles - 1)));
-    return @intCast(clamped);
+    return @intCast(math.worldPosToCell(value, tile_size, max_tiles));
 }
 
 fn visibleMaxCoord(origin: f32, extent: f32) f32 {
@@ -2035,4 +2072,116 @@ test "dense layers order by z level and quads re-submit only on structural chang
     // dense quads, so it does not re-arm a re-submit either.
     world.setVisibleChunksForWorldRect(.{ .x = 1024, .y = 1024, .w = 128, .h = 128 }, 0);
     try std.testing.expect(!world.dense_quads_dirty);
+}
+
+test "visibleChunkRegion returns null before any visibility call" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    _ = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    _ = try world.addDenseLayer(0, 0, .floor, grass);
+
+    // No setVisibleChunksForWorldRect call yet — window is invalid.
+    try std.testing.expect(world.visibleChunkRegion() == null);
+}
+
+test "visibleChunkRegion returns correct half-open bounds after setVisibleChunksForWorldRect" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 4×4 tiles, chunk_size_tiles=2 → 2×2 grid of chunks (0,0)–(1,1)
+    const tile_size = meta.tileSize();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = tile_size,
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    _ = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    _ = try world.addDenseLayer(0, 0, .floor, grass);
+
+    // Show chunk (0,0) only — rect covering just the first chunk (tiles 0–1).
+    const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0);
+
+    const region = world.visibleChunkRegion() orelse return error.ExpectedRegion;
+    try std.testing.expectEqual(@as(i32, 0), region.min.x);
+    try std.testing.expectEqual(@as(i32, 0), region.min.y);
+    try std.testing.expectEqual(@as(i32, 1), region.max_exclusive.x);
+    try std.testing.expectEqual(@as(i32, 1), region.max_exclusive.y);
+    try std.testing.expect(region.containsChunk(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(!region.containsChunk(.{ .x = 1, .y = 0 }));
+}
+
+test "cognitionActiveRegion expands by halo on all sides" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    const tile_size = meta.tileSize();
+    // 8×8 tiles, chunk_size_tiles=2 → 4×4 chunk grid
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = tile_size,
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    _ = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    _ = try world.addDenseLayer(0, 0, .floor, grass);
+
+    // Show chunks (1,1)–(2,2) (2×2 chunk region in the middle).
+    const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
+    world.setVisibleChunksForWorldRect(.{
+        .x = chunk_pixels,
+        .y = chunk_pixels,
+        .w = chunk_pixels * 2,
+        .h = chunk_pixels * 2,
+    }, 0);
+
+    const visible = world.visibleChunkRegion() orelse return error.ExpectedRegion;
+    const cognition = world.cognitionActiveRegion(4) orelse return error.ExpectedRegion;
+
+    // Halo of 4 expands each side by 4 chunks.
+    try std.testing.expectEqual(visible.min.x - 4, cognition.min.x);
+    try std.testing.expectEqual(visible.min.y - 4, cognition.min.y);
+    try std.testing.expectEqual(visible.max_exclusive.x + 4, cognition.max_exclusive.x);
+    try std.testing.expectEqual(visible.max_exclusive.y + 4, cognition.max_exclusive.y);
+    // Chunks within visible region are inside cognition region.
+    try std.testing.expect(cognition.containsChunk(.{ .x = 1, .y = 1 }));
+    // Chunk well outside visible but within halo is still included.
+    try std.testing.expect(cognition.containsChunk(.{ .x = -1, .y = -1 }));
+}
+
+test "chunkCoordForWorldPos clamps out-of-range and non-finite positions" {
+    // 8×8 tiles, chunk_size_tiles=2 → 4×4 chunk grid; valid chunks [0,3].
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+
+    // In-range maps normally.
+    try std.testing.expectEqual(ChunkCoord{ .x = 1, .y = 2 }, world.chunkCoordForWorldPos(3 * 32, 5 * 32));
+    // Negative and far-past-bounds saturate to the grid edges instead of panicking.
+    try std.testing.expectEqual(ChunkCoord{ .x = 0, .y = 0 }, world.chunkCoordForWorldPos(-1.0e9, -1.0));
+    try std.testing.expectEqual(ChunkCoord{ .x = 3, .y = 3 }, world.chunkCoordForWorldPos(1.0e9, 1.0e9));
+    // Non-finite inputs are guarded by the shared saturating helper.
+    try std.testing.expectEqual(ChunkCoord{ .x = 3, .y = 0 }, world.chunkCoordForWorldPos(std.math.inf(f32), std.math.nan(f32)));
 }

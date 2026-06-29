@@ -46,7 +46,11 @@ game-specific behavior under `src/game/`.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
   orchestration, reusable gameplay systems, and full-active scope stats.
 - `src/game/simulation_scope.zig` defines simulation tiers, active-region
-  scaffolding, cold entity scope metadata, and scope counters.
+  scaffolding, per-entity scope metadata types, stagger/halo constants, and scope
+  counters.
+- `src/game/systems/simulation_scope.zig` owns `SimulationScopeSystem`, the
+  backbone scope processor: chunk recompute, tier/halo/stagger gathers, and the
+  auto tier wake/sleep policy.
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
@@ -298,8 +302,12 @@ Hot gameplay data is stored as scalar columns. The movement-body store exposes
 `velocity_x`, `velocity_y`, and `speed` slices so update processors can load
 lanes directly with `src/core/simd.zig`. Movement processor ranges should align
 to `data_system.movement_range_alignment_items`, which maps one cache line to
-sixteen `f32` elements. Component masks decide whether an entity belongs to a
-system; hot processors iterate already aligned SoA slices.
+sixteen `f32` elements. The same store carries the dense simulation-scope columns
+(`tier`, `chunk_x/y`, `stagger_phase`, `always_active`) as separate aligned arrays
+in lockstep with the movement rows; the movement processor's slice omits them, so
+movement integration never touches their cache lines. Component masks decide
+whether an entity belongs to a system; hot processors iterate already aligned SoA
+slices.
 
 Gameplay states own their `DataSystem`, a transient `SimulationFrame`, and a
 state-owned `SimulationPipeline` for each fixed step. The state clears the
@@ -345,14 +353,24 @@ features should add concrete pipeline-owned controllers rather than growing
 dependency graph, or callback registry. The pipeline stays a thin composer; each
 controller and system owns its own internals.
 
-Simulation tiers and active scope belong in the same pipeline boundary.
-Persistent tier and chunk metadata live on cold entity slot data. The current
-pipeline builds a full-active `SimulationScope` and reports tier/stage counts;
-later scoped slices will use world/chunk/visibility inputs to decide which
-entities enter AI, steering, movement, and collision stages. Processors keep
-today's hot loops and receive scoped gathers instead of learning world/chunk
-policy. CPU benchmarks at 50k scale are throughput ceilings for rare spikes;
-typical frames should scope active work far lower.
+Simulation tiers and active scope belong in the same pipeline boundary. Tier and
+chunk metadata are dense SoA columns on the movement-body store
+(`tier`, `chunk_x/y`, `stagger_phase`, `always_active`), in lockstep with the
+movement rows so they exist exactly for simulated entities and the O(N) scope
+passes read/write aligned columns rather than scattered slots. The pipeline-owned
+`SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
+that recomputes chunks from settled positions (dense, threaded), derives the
+camera cognition halo from `WorldSystem`, and selects which entities enter each
+stage. Processors keep their hot loops and receive a `scope_dense_indices` option
+(null = full-active) instead of learning world/chunk policy. Movement and
+collision gate on tier only (no chunk filter, so off-screen entities keep moving
+and colliding) and short-circuit to full-active in O(1) via incremental
+`tier_counts` when nothing is dormant/kinematic; AI gates on tier + camera halo +
+a per-entity stagger cadence; steering inherits that scope transitively through the
+navigation-intent stream. Tier wake/sleep changes flow through deferred
+`set_simulation_tier` structural commands at the commit seam, never inside worker
+ranges. CPU benchmarks at 50k scale are throughput ceilings for rare spikes;
+typical frames scope active work far lower.
 
 The durable tier model is capability-based, not visibility-based:
 `dormant` entities exist but do not enter normal active scope, `kinematic`

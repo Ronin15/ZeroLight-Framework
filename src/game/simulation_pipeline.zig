@@ -36,7 +36,11 @@ const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
+const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
+const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
+const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
 const WorldSystem = @import("world_system.zig").WorldSystem;
 
 /// Construction policy for the state-owned simulation pipeline.
@@ -92,6 +96,9 @@ pub const SimulationPipeline = struct {
     ai: AiSystem,
     steering: SteeringSystem,
     pathfinding: PathfindingSystem,
+    /// Backbone scope system: recomputes chunks, gates AI/movement/collision by
+    /// tier + camera cognition halo + stagger, and drives auto tier wake/sleep.
+    scope: SimulationScopeSystem,
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
@@ -127,6 +134,7 @@ pub const SimulationPipeline = struct {
             .ai = ai,
             .steering = steering,
             .pathfinding = pathfinding,
+            .scope = SimulationScopeSystem.init(allocator),
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
@@ -136,6 +144,7 @@ pub const SimulationPipeline = struct {
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.scope.deinit();
         self.pathfinding.deinit();
         self.steering.deinit();
         self.ai.deinit();
@@ -262,12 +271,24 @@ pub const SimulationPipeline = struct {
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
         const data = context.data;
         const frame = context.frame;
-        const scope = SimulationScope.fullActive(data.simulationScopeStatsFullActive());
 
         frame.phase = .processors;
         // Player-authored world edit. Runs first; its world_tile_changed event is
         // deferred and re-masks navigation in merge_outputs regardless of order.
         try self.dig.process(context.world, data, context.player.*, frame);
+
+        // Backbone scope pass. Advance the stagger clock, derive the camera
+        // cognition halo, and select the cognition (AI/steering) subset for this
+        // step. Chunk maintenance is folded into movement (below), which derives
+        // each integrated body's chunk in-pass — exact every step at any speed, no
+        // separate recompute. The AI gather reads the chunk movement wrote last
+        // step (the body's current pre-move cell). Movement/collision gate on tier
+        // only (no chunk filter), so they keep running off-screen; cognition gates
+        // on the halo + stagger.
+        self.scope.advanceStep();
+        const cognition_region: ?ActiveRegion = context.world.cognitionActiveRegion(cognition_halo_chunks);
+        const stagger_step = self.scope.staggerStep();
+        const ai_indices = (try self.scope.gatherAiAgentIndices(data, cognition_region, stagger_step, context.thread_system, .{})).indices;
 
         const ai_slice = data.aiAgentSliceConst();
         const move_slice = data.movementBodySliceConst();
@@ -290,6 +311,9 @@ pub const SimulationPipeline = struct {
             // toward the player's nav cell instead of N individual A* solves.
             .nav_request_kind = .group,
             .navigation_intents = &frame.navigation_intents,
+            // Cognition halo + stagger selection. Steering inherits this scope
+            // transitively: it only acts on the navigation intents AI emits here.
+            .scope_dense_indices = ai_indices,
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
@@ -308,9 +332,25 @@ pub const SimulationPipeline = struct {
         applyAiMovementIntents(data, frame);
         apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
 
+        // Movement gates on tier only (no chunk filter): every non-dormant entity
+        // integrates, on- or off-screen. Null = full-active warm SIMD range. Movement
+        // also derives each integrated body's chunk in-pass via chunk_grid, so chunk
+        // stays exact every step with no separate recompute.
+        const movement_scope_indices = (try self.scope.gatherMovementBodyIndices(data, context.thread_system, .{})).indices;
+        const scope_columns = data.scopeColumnsSlice();
         var movement_slice = data.movementBodySlice();
         var movement_timer = StageTimer.start();
-        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{
+            .scope_dense_indices = movement_scope_indices,
+            .chunk_grid = .{
+                .chunk_x = scope_columns.chunk_x,
+                .chunk_y = scope_columns.chunk_y,
+                .tile_size = context.world.tile_size,
+                .chunk_size_tiles = context.world.chunk_size_tiles,
+                .width = context.world.width,
+                .height = context.world.height,
+            },
+        });
         movement_timer.stop(context.perf, .pipeline_movement);
 
         var clamp_timer = StageTimer.start();
@@ -324,8 +364,13 @@ pub const SimulationPipeline = struct {
         gatePlayerToWalkableTiles(context.world, data, context.player.*);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
 
+        // Collision also gates on tier only (no chunk filter): off-screen entities
+        // keep colliding with geometry. Null = full-active.
+        const collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(data, context.thread_system, .{})).indices;
         var collision_timer = StageTimer.start();
-        const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{});
+        const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{
+            .scope_dense_indices = collision_scope_indices,
+        });
         collision_timer.stop(context.perf, .pipeline_collision);
 
         var collision_response_timer = StageTimer.start();
@@ -338,6 +383,25 @@ pub const SimulationPipeline = struct {
         // tile change re-masks navigation post-commit.
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
 
+        // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
+        // kinematic/dormant by its cube distance from the visible region, applied
+        // via deferred structural commands on the frame stream for the commit seam.
+        // Uses the raw visible region (not the cognition halo) so all four bands
+        // are measured from the same origin, anchored at the camera/player level so
+        // off-level entities demote. Queues nothing when no tier changed.
+        var visible_region = context.world.visibleChunkRegion();
+        if (visible_region) |*region| region.level = context.player.current_level;
+        _ = try self.scope.queueTierChanges(data, visible_region, &frame.structural_commands, context.thread_system, .{});
+
+        const scope = self.buildScopeStats(
+            data,
+            cognition_region,
+            ai_indices,
+            movement_scope_indices,
+            collision_scope_indices,
+            steering_stats,
+        );
+
         return .{
             .scope = scope,
             .ai = ai_stats,
@@ -347,6 +411,30 @@ pub const SimulationPipeline = struct {
             .collision = collision_stats,
             .collision_response = collision_response_stats,
         };
+    }
+
+    /// Builds the per-step scope stats: tier histograms and full-active baselines
+    /// from `DataSystem`, with stage entity counts overridden to the actually-scoped
+    /// participation and the stagger/chunk-filter counters from this step.
+    fn buildScopeStats(
+        self: *const SimulationPipeline,
+        data: *const DataSystem,
+        cognition_region: ?ActiveRegion,
+        ai_indices: []const u32,
+        movement_scope_indices: ?[]const u32,
+        collision_scope_indices: ?[]const u32,
+        steering_stats: SteeringStats,
+    ) SimulationScope {
+        var stats = data.simulationScopeStatsFullActive();
+        stats.ai_stage_entities = ai_indices.len;
+        // Steering is transitively scoped via AI's intents; its real participation
+        // is the count of movement intents it actually emitted this step.
+        stats.steering_stage_entities = steering_stats.movement_intent_count;
+        if (movement_scope_indices) |idx| stats.movement_stage_entities = idx.len;
+        if (collision_scope_indices) |idx| stats.collision_stage_entities = idx.len;
+        stats.stagger_skips = self.scope.stagger_skips;
+        stats.chunk_filtered_entities = self.scope.chunk_filtered_entities;
+        return .{ .active_region = cognition_region, .stats = stats };
     }
 };
 

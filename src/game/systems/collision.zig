@@ -39,6 +39,9 @@ pub const CollisionConfig = struct {
     broadphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     narrowphase_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     full_sort_disorder_percent: u8 = 12,
+    /// When non-null, only these dense collision-bounds indices generate contacts
+    /// this step (the scope system excludes dormant/kinematic entities). Null = all.
+    scope_dense_indices: ?[]const u32 = null,
 };
 
 pub const CollisionStats = struct {
@@ -168,7 +171,7 @@ pub const CollisionSystem = struct {
         thread_system: *ThreadSystem,
         config: CollisionConfig,
     ) !CollisionStats {
-        try self.gatherBodies(data);
+        try self.gatherBodies(data, config.scope_dense_indices);
         const body_count = self.entities.items.len;
         if (body_count <= 1) {
             contacts.clearRetainingCapacity();
@@ -250,7 +253,19 @@ pub const CollisionSystem = struct {
         data: *const DataSystem,
         contacts: *RangeOutputStream(CollisionContact),
     ) !CollisionStats {
-        try self.gatherBodies(data);
+        return self.updateSerialScoped(data, contacts, null);
+    }
+
+    /// Single-threaded broad+narrow phase over only the scoped bodies (null =
+    /// all). Mirrors `update`'s scope gather so the serial benchmark case measures
+    /// the same reduced workload as the threaded cases.
+    pub fn updateSerialScoped(
+        self: *CollisionSystem,
+        data: *const DataSystem,
+        contacts: *RangeOutputStream(CollisionContact),
+        scope_dense_indices: ?[]const u32,
+    ) !CollisionStats {
+        try self.gatherBodies(data, scope_dense_indices);
         const body_count = self.entities.items.len;
         if (body_count <= 1) {
             contacts.clearRetainingCapacity();
@@ -290,12 +305,18 @@ pub const CollisionSystem = struct {
         return self.entities.items.len;
     }
 
-    fn gatherBodies(self: *CollisionSystem, data: *const DataSystem) !void {
+    fn gatherBodies(self: *CollisionSystem, data: *const DataSystem, scope_dense_indices: ?[]const u32) !void {
         const bounds = data.collisionBoundsSliceConst();
         self.clearProxiesRetainingCapacity();
-        try self.ensureProxyCapacity(bounds.entities.len);
+        const n = if (scope_dense_indices) |idx| idx.len else bounds.entities.len;
+        try self.ensureProxyCapacity(n);
 
-        for (bounds.entities, 0..) |entity, bounds_index| {
+        // Scoped path walks only the selected collision-bounds rows; both paths
+        // build the same proxy columns, so broad/narrow phase see the gathered set.
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const bounds_index: usize = if (scope_dense_indices) |idx| idx[k] else k;
+            const entity = bounds.entities[bounds_index];
             const movement_index = data.movementBodyDenseIndex(entity) orelse continue;
             const body = data.movementBodyConst(entity) orelse continue;
             const offset_x = bounds.offset_x[bounds_index];
@@ -1032,7 +1053,7 @@ test "narrowphase range buffers merge deterministic contacts and skip rejected c
 
     var system = CollisionSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.gatherBodies(&data);
+    try system.gatherBodies(&data, null);
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 1 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 2 });
     try system.candidate_pairs.append(std.testing.allocator, .{ .a = 0, .b = 3 });
