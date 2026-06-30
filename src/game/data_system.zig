@@ -127,6 +127,8 @@ pub const MovementBodySlice = struct {
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
+    /// Dense drawable flag for render collect; movement-only rows stay false.
+    has_primitive_visual: []bool,
 };
 
 pub const ConstMovementBodySlice = struct {
@@ -140,6 +142,8 @@ pub const ConstMovementBodySlice = struct {
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
+    /// Dense drawable flag for render collect; movement-only rows stay false.
+    has_primitive_visual: []const bool,
 };
 
 /// Dense simulation-scope columns in lockstep with the movement store rows
@@ -239,6 +243,14 @@ pub const RenderEntityComponentIndices = struct {
     movement_body: usize,
     asset_ref: ?usize = null,
     facing: ?usize = null,
+};
+
+/// Primitive-visual and optional facing/asset indices for one movement-body row.
+/// Returned only when the entity carries a drawable primitive visual.
+pub const RenderCollectIndices = struct {
+    visual_index: usize,
+    asset_ref_index: ?usize = null,
+    facing_index: ?usize = null,
 };
 
 pub const CollisionBounds = struct {
@@ -946,6 +958,23 @@ pub const DataSystem = struct {
         };
     }
 
+    /// Drawable indices for a movement-body dense row. The movement index is the
+    /// loop anchor for render collect and matches scope columns (`tier`, `chunk_*`).
+    pub fn renderCollectIndicesForMovement(self: *const DataSystem, movement_index: usize) ?RenderCollectIndices {
+        const movement = self.movement_bodies.sliceConst();
+        if (movement_index >= movement.entities.len) return null;
+        if (!movement.has_primitive_visual[movement_index]) return null;
+        const slot = self.resolveSlotConst(movement.entities[movement_index]) orelse return null;
+        const visual_index = slot.primitive_visual_index orelse return null;
+        const visuals = self.primitive_visuals.sliceConst();
+        std.debug.assert(visual_index < visuals.entities.len);
+        return .{
+            .visual_index = @intCast(visual_index),
+            .asset_ref_index = if (slot.asset_ref_index) |index| @intCast(index) else null,
+            .facing_index = if (slot.facing_index) |index| @intCast(index) else null,
+        };
+    }
+
     pub fn movementBodySlice(self: *DataSystem) MovementBodySlice {
         return self.movement_bodies.slice();
     }
@@ -991,12 +1020,18 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.primitive_visual_index) |index| {
             self.primitive_visuals.set(@intCast(index), visual);
+            if (slot.movement_body_index) |movement_index| {
+                self.movement_bodies.setHasPrimitiveVisual(@intCast(movement_index), true);
+            }
             return;
         }
 
         const dense_index = try self.primitive_visuals.append(self.allocator, id, visual);
         slot.primitive_visual_index = dense_index;
         slot.addComponent(.primitive_visual);
+        if (slot.movement_body_index) |movement_index| {
+            self.movement_bodies.setHasPrimitiveVisual(@intCast(movement_index), true);
+        }
     }
 
     pub fn primitiveVisualConst(self: *const DataSystem, id: EntityId) ?PrimitiveVisual {
@@ -1673,6 +1708,7 @@ const MovementBodyRow = struct {
     velocity_x: f32,
     velocity_y: f32,
     speed: f32,
+    has_primitive_visual: bool = false,
     tier: SimulationTier,
     chunk_x: i32,
     chunk_y: i32,
@@ -1821,6 +1857,10 @@ const MovementBodyStore = struct {
         return self.rows.slice().items(.tier)[index];
     }
 
+    fn setHasPrimitiveVisual(self: *MovementBodyStore, index: usize, has_visual: bool) void {
+        self.rows.slice().items(.has_primitive_visual)[index] = has_visual;
+    }
+
     fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
         const s = self.rows.slice();
         return .{
@@ -1874,6 +1914,7 @@ const MovementBodyStore = struct {
             .velocity_x = s.items(.velocity_x),
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
+            .has_primitive_visual = s.items(.has_primitive_visual),
         };
     }
 
@@ -1890,6 +1931,7 @@ const MovementBodyStore = struct {
             .velocity_x = s.items(.velocity_x),
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
+            .has_primitive_visual = s.items(.has_primitive_visual),
         };
     }
 
@@ -2515,6 +2557,7 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.velocity_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
+    try std.testing.expectEqual(slice.entities.len, slice.has_primitive_visual.len);
 }
 
 fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
@@ -2812,6 +2855,36 @@ test "render entity component indices resolve movement asset and facing slots" {
     try std.testing.expectEqual(with_facing.movement_body, full.movement_body);
 
     try std.testing.expect(data.renderEntityComponentIndices(EntityId.invalid) == null);
+}
+
+test "render collect indices resolve drawable rows from movement dense index" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+    try data.setFacing(entity, .{ .direction = .left });
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+
+    const indices = data.renderCollectIndicesForMovement(0).?;
+    try std.testing.expectEqual(@as(usize, 0), indices.visual_index);
+    try std.testing.expect(indices.asset_ref_index != null);
+    try std.testing.expect(indices.facing_index != null);
+
+    const movement_only = try data.createEntity();
+    try data.setMovementBody(movement_only, testBody(2));
+    try std.testing.expect(!data.movementBodySliceConst().has_primitive_visual[1]);
+    try std.testing.expect(data.renderCollectIndicesForMovement(1) == null);
+    try std.testing.expect(data.renderCollectIndicesForMovement(99) == null);
+
+    _ = data.destroyEntity(entity);
+    try std.testing.expect(data.renderCollectIndicesForMovement(0) == null);
+    try std.testing.expect(data.movementBodySliceConst().entities.len == 1);
 }
 
 test "movement body columns can be loaded directly through simd helpers" {

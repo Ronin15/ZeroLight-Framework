@@ -198,7 +198,42 @@ still culls sparse tiles and sizes dynamic sparse prep (`reserveRenderRecords`);
 it no longer drives dense floor submit. Each in-window dense layer is one
 full-world quad regardless of camera pan — panning uploads nothing. Sparse
 overlays and dense floors interleave in the merged draw list by `RenderOrder`;
-NPC per-level entity cull (Slice 25E) is separate from this floor window.
+Per-entity depth cull (Slice 25E) is separate from this floor window.
+
+### Dynamic entity collect (Slice 24B)
+
+`render_prep.collectDynamicRecords` walks `movementBodySliceConst()` — not the
+primitive-visual entity list. Chunk columns align on `movement_index` for the
+camera chunk gate; scope tier and pin metadata are not read during collect.
+Drawable rows are gated by a dense `has_primitive_visual` column on the movement
+store (movement-only bodies skip slot resolve). Indices for drawable rows come
+from `DataSystem.renderCollectIndicesForMovement` (one slot read per chunk-pass
+row that carries a primitive visual).
+
+Gates before interpolation and `PreparedDraw` construction (in order):
+
+1. **Chunk** — `WorldSystem.visibleChunkRegion()` (camera window; unset skips all
+   rows). Uses `scope.chunk_x/y` from the movement-body scope columns — updated
+   during the movement integration pass. Entities teleported via `setMovementBody`
+   or rendered before the first movement tick may retain default `(0,0)` chunk
+   coords until movement runs; pixel AABB is the second gate.
+2. **Camera AABB** — `VisibleWorldRect.overlapsAabb` on the lerped footprint
+   (camera rect + `overscan_chunks` margin). Demo runtime uses
+   `world_render_overscan_chunks = 1` in `game_demo_state.zig`.
+
+**Simulation tier is not consulted.** Slice 24 LOD (`dormant`/`kinematic`/etc.)
+controls fixed-step processor participation only. Render visibility is camera
+policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
+row does not. Do not add `allowsRender`-style predicates on `SimulationTier`.
+
+**Dense floors (separate cost model):** in-window dense layers still submit one
+full-world tilemap quad per layer (Slice 23B window). GPU clips to the viewport;
+submit/draw count is per-layer, not per visible tile. Chunked dense submit is a
+future optimization if profiling requires it.
+
+A pre-built visible movement dense-index list (parallel to scoped simulation
+gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
+`docs/framework-implementation-slices.md`.
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 

@@ -444,11 +444,16 @@ pub fn collectDynamicRecords(
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
-    for (visuals.entities, 0..) |entity, visual_index| {
-        const indices = scene.data.renderEntityComponentIndices(entity) orelse continue;
-        const movement_index = indices.movement_body;
+    // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
+    // align with movement_index; has_primitive_visual skips movement-only rows
+    // before the deferred slot resolve in renderCollectIndicesForMovement.
+    for (movement.entities, 0..) |entity, movement_index| {
         const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
-        if (!entityChunkVisibleForCollect(is_player, movement_index, scope, visible_chunks)) continue;
+        if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
+        if (!movement.has_primitive_visual[movement_index]) continue;
+
+        const collect_indices = scene.data.renderCollectIndicesForMovement(movement_index) orelse continue;
+        const visual_index = collect_indices.visual_index;
 
         const render_x = math.lerp(
             movement.previous_x[movement_index],
@@ -462,9 +467,9 @@ pub fn collectDynamicRecords(
         );
         const size_x = visuals.size_x[visual_index];
         const size_y = visuals.size_y[visual_index];
-        if (!is_player and !visible.overlapsAabb(render_x, render_y, size_x, size_y)) continue;
+        if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) continue;
 
-        if (indices.asset_ref) |asset_index| {
+        if (collect_indices.asset_ref_index) |asset_index| {
             const asset_ref = assetReferenceAt(assets, asset_index);
             const prepared = preparePrimitiveVisualSoA(
                 movement,
@@ -492,7 +497,7 @@ pub fn collectDynamicRecords(
             });
         }
         if (is_player) {
-            if (indices.facing) |facing_index| {
+            if (collect_indices.facing_index) |facing_index| {
                 if (preparePlayerMarkerSoA(
                     movement,
                     visuals,
@@ -705,17 +710,16 @@ fn markerRectAt(
     };
 }
 
-/// Coarse camera-chunk gate before interpolation and draw prep. Uses the world's
-/// render visibility window (same source as sparse tiles), not simulation-scope
-/// tier/pathfinding policy. Callers must set world visibility before collect;
-/// when the window is unset, non-player entities are skipped.
-fn entityChunkVisibleForCollect(
-    is_player: bool,
+/// Camera chunk gate before interpolation and draw prep. Uses the world's render
+/// visibility window (same source as sparse tiles). Simulation tier is not consulted
+/// here — render visibility is camera policy only; sim LOD lives in the pipeline.
+/// Callers must set world visibility before collect; when the window is unset,
+/// every entity is skipped. Pixel AABB overlap is applied afterward in the caller.
+fn entityVisibleForRenderCollect(
     movement_index: usize,
     scope: ConstScopeColumnsSlice,
     visible_chunks: ?ActiveRegion,
 ) bool {
-    if (is_player) return true;
     const region = visible_chunks orelse return false;
     return region.containsChunk(.{
         .x = scope.chunk_x[movement_index],
@@ -749,14 +753,14 @@ const ScenePrepFixture = struct {
         self.* = undefined;
     }
 
-    fn scene(self: *ScenePrepFixture) GameplayScene {
+    fn scene(self: *ScenePrepFixture, overscan_chunks: u16) GameplayScene {
         return .{
             .data = &self.data,
             .world = &self.world,
             .player_entity = self.player_entity,
             .player_level = 0,
             .particles = &self.particles,
-            .overscan_chunks = 0,
+            .overscan_chunks = overscan_chunks,
         };
     }
 
@@ -770,8 +774,23 @@ const ScenePrepFixture = struct {
     }
 
     fn collect(self: *ScenePrepFixture, visible: VisibleWorldRect, interpolation_alpha: f32) !void {
+        try self.collectWithOverscan(visible, interpolation_alpha, 0);
+    }
+
+    fn collectWithOverscan(
+        self: *ScenePrepFixture,
+        visible: VisibleWorldRect,
+        interpolation_alpha: f32,
+        overscan_chunks: u16,
+    ) !void {
         var runtime_assets = RuntimeAssets.init();
-        try collectDynamicRecords(&self.scene_prep, self.scene(), visible, &runtime_assets, interpolation_alpha);
+        try collectDynamicRecords(
+            &self.scene_prep,
+            self.scene(overscan_chunks),
+            visible,
+            &runtime_assets,
+            interpolation_alpha,
+        );
     }
 };
 
@@ -1000,6 +1019,149 @@ test "dynamic scene prep culls entities outside the visible chunk region before 
     try std.testing.expect(onscreen_obstacle_seen);
 }
 
+test "dynamic scene prep skips collect when visibility window is unset" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const player_entity = try spawnPlayerEntity(&data);
+    _ = try spawnActorEntity(&data, .{ .x = 80, .y = 80 }, .actor);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 512 });
+    defer particles.deinit();
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, 800, 450);
+    defer world.deinit();
+    world.adoptTilesetMeta(meta);
+
+    var scene_prep = DynamicScenePrep.init(std.testing.allocator);
+    defer scene_prep.deinit();
+    try ensureScenePrepCapacity(&scene_prep, .{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    });
+
+    try std.testing.expect(world.visibleChunkRegion() == null);
+
+    var runtime_assets = RuntimeAssets.init();
+    try collectDynamicRecords(&scene_prep, .{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    }, .{
+        .min_x = 0,
+        .min_y = 0,
+        .max_x = 800,
+        .max_y = 450,
+    }, &runtime_assets, 1.0);
+
+    try std.testing.expectEqual(@as(usize, 0), scene_prep.records.items.len);
+}
+
+test "dynamic scene prep honors production overscan chunk margin" {
+    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
+    defer fixture.deinit();
+
+    const chunk_pixels = @as(f32, @floatFromInt(fixture.world.chunk_size_tiles)) * fixture.world.tile_size;
+    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
+    const actor_x = chunk_pixels + 8;
+    const actor_y = 8;
+    actor_body.position_x.* = actor_x;
+    actor_body.position_y.* = actor_y;
+    actor_body.previous_x.* = actor_x;
+    actor_body.previous_y.* = actor_y;
+    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
+        .chunk = .{ .x = 1, .y = 0 },
+    });
+
+    const camera_rect = Rect{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels };
+    const visible = VisibleWorldRect.fromCameraRect(
+        camera_rect,
+        1,
+        fixture.world.chunk_size_tiles,
+        fixture.world.tile_size,
+    );
+
+    fixture.world.setVisibleChunksForWorldRect(camera_rect, 0);
+    try fixture.collectWithOverscan(visible, 1.0, 0);
+    var actor_seen_without_chunk_overscan = false;
+    for (fixture.scene_prep.records.items) |record| {
+        if (drawMatchesEntityPosition(record.draw, actor_x, actor_y)) actor_seen_without_chunk_overscan = true;
+    }
+    try std.testing.expect(!actor_seen_without_chunk_overscan);
+
+    fixture.world.setVisibleChunksForWorldRect(camera_rect, 1);
+    try fixture.collectWithOverscan(visible, 1.0, 1);
+    var actor_seen_with_chunk_overscan = false;
+    for (fixture.scene_prep.records.items) |record| {
+        if (drawMatchesEntityPosition(record.draw, actor_x, actor_y)) actor_seen_with_chunk_overscan = true;
+    }
+    try std.testing.expect(actor_seen_with_chunk_overscan);
+}
+
+test "dynamic scene prep does not gate render on simulation tier" {
+    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
+    defer fixture.deinit();
+
+    try fixture.data.setSimulationTier(fixture.actor_entity, .dormant);
+    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
+    actor_body.position_x.* = 80;
+    actor_body.position_y.* = 80;
+    actor_body.previous_x.* = 80;
+    actor_body.previous_y.* = 80;
+
+    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 800, .h = 450 }, 0);
+
+    try fixture.collect(fixture.fullBoundsVisible(), 1.0);
+
+    var dormant_actor_seen = false;
+    for (fixture.scene_prep.records.items) |record| {
+        if (drawMatchesEntityPosition(record.draw, 80, 80)) dormant_actor_seen = true;
+    }
+
+    try std.testing.expect(dormant_actor_seen);
+}
+
+test "dynamic scene prep culls cognition tier entities off-screen" {
+    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
+    defer fixture.deinit();
+
+    try fixture.data.setSimulationTier(fixture.actor_entity, .cognition);
+    const actor_chunk: i32 = 40;
+    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
+        .chunk = .{ .x = actor_chunk, .y = actor_chunk },
+    });
+    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
+    actor_body.position_x.* = 80;
+    actor_body.position_y.* = 80;
+    actor_body.previous_x.* = 80;
+    actor_body.previous_y.* = 80;
+
+    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 160, .h = 160 }, 0);
+
+    try fixture.collect(.{
+        .min_x = 0,
+        .min_y = 0,
+        .max_x = 160,
+        .max_y = 160,
+    }, 1.0);
+
+    var cognition_actor_seen = false;
+    for (fixture.scene_prep.records.items) |record| {
+        if (drawMatchesEntityPosition(record.draw, 80, 80)) cognition_actor_seen = true;
+    }
+
+    try std.testing.expect(!cognition_actor_seen);
+}
+
 test "dynamic scene prep culls entities and particles outside the visible rect" {
     var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
     defer fixture.deinit();
@@ -1059,8 +1221,8 @@ test "dynamic scene prep culls entities and particles outside the visible rect" 
 
     try std.testing.expect(!offscreen_actor_seen);
     try std.testing.expect(onscreen_obstacle_seen);
-    try std.testing.expect(player_body_seen);
-    try std.testing.expect(player_marker_seen);
+    try std.testing.expect(!player_body_seen);
+    try std.testing.expect(!player_marker_seen);
     try std.testing.expect(!offscreen_particle_seen);
     try std.testing.expect(onscreen_particle_seen);
 }
@@ -1097,7 +1259,7 @@ test "sprite command capacity tracks visual entity growth" {
             1 +
             fixture.particles.activeCount() +
             Renderer.kStackedStateUiHeadroom,
-        spriteCommandCapacity(fixture.scene()),
+        spriteCommandCapacity(fixture.scene(0)),
     );
 }
 
@@ -1244,7 +1406,7 @@ test "visible world rect matches world chunk overscan in pixel space" {
     try std.testing.expectEqual(camera_rect.y + camera_rect.h + overscan_pixels, visible.max_y);
 }
 
-test "visible world rect culls entity aabb outside camera overscan but keeps player" {
+test "visible world rect culls entity aabb outside camera overscan" {
     const visible = VisibleWorldRect.fromCameraRect(.{
         .x = 0,
         .y = 0,

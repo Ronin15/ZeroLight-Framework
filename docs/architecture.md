@@ -180,7 +180,21 @@ six levels below the player, skipping floors above `active_level` so the slice
 follows player level transitions) so draw count
 stays bounded at the surface; all authored layers still retain GPU tile-data
 buffers (Slice 23B). Sparse tiles cull by camera chunk visibility separately.
-See `docs/rendering-assets-shaders.md` and slice 23B in
+Dynamic entities collect from movement-body dense rows (Slice 24B): scope
+columns and `renderCollectIndicesForMovement` align on `movement_index`; render
+visibility is camera chunk + AABB only (simulation tier does not gate draw).
+Dense floor submit uses a per-layer full-world quad inside the 23B window (GPU
+clips; not camera-chunk culled). NPC per-level cull (Slice 25E) is separate.
+See `docs/rendering-assets-shaders.md` and slices 23B/24B in
+`docs/framework-implementation-slices.md`.
+
+Simulation LOD and render visibility are separate policies: tier, halos, and scope
+gathers control fixed-step processor participation; camera chunk window, pixel
+AABB, and render overscan control draw-record construction. Scope pin metadata
+may keep an entity in a higher sim band off-camera; it must not bypass render
+visibility. Open scaling gaps (collect scan cost, dense-floor layer quads,
+movement contiguous-path vs dormant rows, per-entity depth alignment, component
+mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
 `docs/framework-implementation-slices.md`.
 
 Game code submits sprites and rectangles through `Renderer` using prepared

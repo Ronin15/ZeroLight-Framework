@@ -62,7 +62,8 @@ const procedural_world_config = world_system.WorldBuildConfig{
     .height_tiles = 512,
     .chunk_size_tiles = 16,
 };
-const world_render_overscan_chunks: u16 = 0;
+/// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
+const world_render_overscan_chunks: u16 = 1;
 
 /// Comptime-gated wall-clock timer for one gameplay-tick stage. Zero-cost no-op
 /// when perf logging is disabled; samples the SDL nanosecond clock otherwise.

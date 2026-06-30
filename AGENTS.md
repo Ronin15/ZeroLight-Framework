@@ -41,8 +41,11 @@ content changes.
 - Keep `src/main.zig` timing-centric, app/state flow under `src/app/`, rendering
   and GPU resource work under `src/render/`, runtime asset catalog/path work
   under `src/assets/`, and gameplay/data/systems under `src/game/`.
-- Treat implementation slices as full features. Do not mark a slice complete
-  until runtime behavior, docs, tests, and acceptance checks are integrated.
+- Treat implementation slices as full features. Open the slice section in
+  `docs/framework-implementation-slices.md`, follow **Agent Workflow:
+  Implementing A Slice**, and check off that slice's **Checklist** and
+  **Acceptance checks** only when integrated. Do not mark a slice complete from
+  **Scaling Gaps** or index summaries alone.
 - Keep roadmap specifics in `docs/framework-implementation-slices.md`. Keep
   durable architecture guidance in `docs/architecture.md`. Keep agent workflow
   guidance in this file or repo-local `.codex/skills`, but only when it must
