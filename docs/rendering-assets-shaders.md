@@ -170,6 +170,22 @@ the floors above it (re-submitting only when the plane changes), so descending
 reveals the plane the player stands on instead of leaving it buried under the
 surface.
 
+### Tile storage upload `cycle` policy (Slice 23A)
+
+Retained per-layer tile-data storage buffers are **not** ring-buffered. Partial
+dig uploads must never pass `cycle=true` to `SDL_UploadToGPUBuffer` or map the
+tile-edit transfer buffer with `cycle=true` — doing so ping-pongs GPU storage and
+flips visible tiles while CPU state stays correct.
+
+| Resource | `cycle` on upload / map |
+| --- | --- |
+| Dynamic/static **vertex** streams (per-frame ring) | `true` on the last **vertex** upload in the copy pass |
+| **Tile-data storage** buffers (per dense layer, retained) | **always `false`** |
+| Tile-edit transfer buffer (`stageStorageRegions`) | **`false`** |
+
+Tile edits are excluded from the vertex upload `cycle` counter; they are batched
+in the post-acquire copy pass via `recordStorageRegionsInPass`.
+
 Digging authors two kinds of tile edit. A *hole* clears the cell to
 `invalid_tile_id`, which the tilemap fragment shader discards (see-through to the
 plane below) and `flagsFor` treats as non-blocking — the player falls through it. A

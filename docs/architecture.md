@@ -171,6 +171,14 @@ Sprite prep emits presentation-independent world/logical or drawable positions;
 the acquired swapchain interval stays focused on acquired-size presentation
 uniforms, copy-pass upload, render-pass encoding, and submit.
 
+Dense world floors use retained per-layer tile-data storage buffers (Slice 23A):
+partial dig uploads always use `cycle=false`; vertex ring buffers alone use
+`cycle=true` on the final upload in a batched copy pass. Multi-level compositing
+requires back-to-front dense-layer depth order at submit and in `mergeDrawList`.
+Scaling to many depth levels (~120) is a render-window policy problem (Slice
+23B), not a per-tile vertex problem — see
+`docs/framework-implementation-slices.md` slices 23A/23B.
+
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
 texture creation starts from decoded pixels and owns only the GPU texture

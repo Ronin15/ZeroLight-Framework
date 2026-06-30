@@ -66,10 +66,20 @@ adding broad abstraction.
   index — then layers perception → memory → affect → behavior arbitration as
   cognition-gated processor stages, keeping per-frame sensing columnar and routing
   only notable transitions through scalar-only `domain_reaction` events.
+- Land **Slice 23A** (GPU tilemap render hardening) on `expand2` before raising
+  world depth count or merging the efficiency branch. Correctness fixes there
+  (dense-layer depth order, retained tile-storage `cycle=false`, batched copy
+  pass) are prerequisites for any multi-level scale work.
+- Land **Slice 23B** (multi-depth dense-layer render scaling) before building
+  ~120 depth levels or expanding entity stress counts. Surface play currently
+  submits every dense layer at or below the player (`active_level` cull only
+  skips floors above); demo cap `k_max_dense_submit_layers = 16` blocks even the
+  first expansion pass.
 - Land NPC Z-level traversal (Slice 25E) before multi-floor emergent scenarios.
   The four touch-points are identified; schedule them as acceptance-checked work
   so the defect is caught in isolation rather than discovered mid-AI-track as a
-  silent teleport behavior.
+  silent teleport behavior. NPC per-level **entity** cull (25E) is separate from
+  Slice 23B's dense **floor** render window.
 - Plan a `ComponentMask` widening from `u32` to `u64` before bit 28 is consumed.
   Eight component slots are currently used; the emergent-AI track (Slices 26–33)
   adds at minimum 8 more (faction, RNG seed, spatial index, perception, memory,
@@ -646,22 +656,23 @@ Checklist:
       chunk/visibility gates disabled until the post-world-rendering scoped tier
       slice.
 
-Deferred until after world rendering:
+Deferred until after world rendering (completed in Slice 24 unless noted):
 
-- [ ] Add scoped gather entry points for movement, collision, AI, and steering
-      without changing hot processor math or merge rules.
+- [x] Add scoped gather entry points for movement, collision, AI, and steering
+      without changing hot processor math or merge rules (Slice 24).
 - [ ] Add a render-prep handoff that exposes active/visible entity lists and
       dirty world regions without moving SDL_GPU calls, renderer handles, or
       queue ownership into the simulation pipeline.
-- [ ] Keep the existing processor stage order identical to the current
-      `GameDemoState` pipeline while scope shrinks participation.
-- [ ] Add stagger and reduced-cadence policy for cognition without adding a
-      second pipeline.
-- [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
-      stagger skips, and wake promotions.
+- [x] Keep the existing processor stage order identical to the current
+      `GameDemoState` pipeline while scope shrinks participation (Slice 24).
+- [x] Add stagger and reduced-cadence policy for cognition without adding a
+      second pipeline (Slice 24).
+- [x] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
+      stagger skips, and wake promotions (Slice 24).
 - [ ] Document multi-world behavior: inactive worlds stay out of scope; active
       world uses chunk + halo rules.
-- [ ] Update architecture and roadmap cross-links after runtime wiring lands.
+- [x] Update architecture and roadmap cross-links after runtime wiring lands
+      (Slice 24; multi-depth render scaling tracked in Slice 23B).
 
 Acceptance checks:
 
@@ -759,6 +770,168 @@ The runtime loading path now builds a 512x512 procedural segment with
 `ThreadSystem` chunk batches, follows the player with an interpolated sub-pixel
 camera, and renders only camera-visible chunks. World blocking tiles are folded
 into the pathfinding nav-grid rebuild alongside static entity obstacles.
+
+Follow-up slices **23A** (render hardening landed on `expand2`) and **23B**
+(multi-depth render scaling for ~120 levels) extend this foundation; see below.
+
+## Slice 23A: GPU Tilemap Render Hardening
+
+Goal: harden Slice 23's retained GPU tilemap path for production digging and
+multi-level compositing — correct depth ordering, safe partial tile uploads,
+batched copy-pass staging, and pre-acquire CPU prep — without changing
+simulation or `dig_controller` contracts.
+
+Problem (observed on `expand2` before hardening):
+
+- A linear `mergeDrawList` assumed static groups were pre-sorted by depth, but
+  `submitStaticDenseGeometry` appended dense layers in storage order (surface
+  first). That inverted underground compositing (grass/dirt flip, wrong plane
+  visible through holes).
+- Batched copy-pass staging passed `cycle=true` on the final upload when tile
+  edits were the last work in the pass. Retained per-layer `GRAPHICS_STORAGE_READ`
+  tile buffers require `cycle=false`; otherwise each dig ping-ponged GPU tile
+  storage and flipped dirt/grass visually while CPU state stayed correct.
+- Tile edits staged before swapchain acquire could be dropped on skipped frames
+  when using clear-replace upload queues.
+
+Current foundation (landed on `expand2`, runtime-validated):
+
+- `mergeDrawList` stable-sorts static+dynamic groups by `RenderOrder` before
+  coalescing; regression test covers unsorted underground dense depths.
+- `submitStaticDenseGeometry` collects visible layers, sorts back-to-front by
+  render depth at submit, and respects `active_level` (skip floors above the
+  player). Re-submits on `dense_quads_dirty` or plane change only.
+- `recordFrameCopyPass` batches dynamic vertices, optional static vertices, and
+  tile edits in one copy pass; `uploadsRemainingCycle` counts **vertex** uploads
+  only. Tile storage uses `recordStorageRegionsInPass` with **always
+  `cycle=false`** and `MapGPUTransferBuffer(..., false)` for edit staging.
+- `uploadTileDataEdits` appends pending edits (survives skipped frames); digs
+  flush at the render boundary via `WorldSystem.flushDenseTileEdits`.
+- Pre-acquire path: `prepareFrameCommands` / vertex staging before swapchain
+  acquire; tile edits recorded after acquire in the frame copy pass (matches
+  retained-buffer lifetime).
+- `render_prep.submitGameplayFrame` owns layered world submit (static dense →
+  tile-edit flush → sparse/dynamic z-walk); grow-only renderer reservations.
+
+GPU upload `cycle` contract (do not regress):
+
+| Resource | `cycle` on upload |
+| --- | --- |
+| Dynamic/static **vertex** ring streams | `true` on last vertex upload in the copy pass |
+| **Tile-data storage** buffers (per-layer, retained) | **always `false`** |
+| Tile-edit transfer buffer map | **`false`** |
+
+Checklist:
+
+- [x] Restore stable-sort `mergeDrawList` and add unsorted dense-layer regression
+      test.
+- [x] Sort dense layers back-to-front in `submitStaticDenseGeometry` before append.
+- [x] Enforce `cycle=false` for all tile-storage uploads and tile-edit staging.
+- [x] Exclude tile edits from vertex `uploadsRemainingCycle`; batch tile edits in
+      the post-acquire copy pass.
+- [x] Append pending tile edits across skipped frames; flush once per gameplay
+      frame at the render boundary.
+- [x] Keep dig/simulation ownership in `dig_controller` / `WorldSystem` CPU tile
+      fields; render path consumes queued edits only.
+- [x] Extend `render-game-prep` bench static depths to realistic underground
+      stack order (`-2`, `-18`, `-34`).
+- [ ] Land as a coherent commit stack on `expand2` and merge to `world`.
+- [x] Document `cycle` rules in `docs/rendering-assets-shaders.md`.
+- [ ] Optional: restore O(n) linear `mergeDrawList` now that submit-side sort is
+      guaranteed (micro-opt; measure first).
+
+Acceptance checks:
+
+- [x] Dig hole/fall/ramp simulation tests pass unchanged (`dig_controller`,
+      `game_demo_state`).
+- [x] Visual layer stack correct: grass above dirt, carved tunnels show the plane
+      below, no per-dig dirt/grass flip.
+- [x] `zig build verify` passes.
+- [ ] `zig build gpu-smoke` exercises tilemap storage-buffer binds (review
+      follow-up from GPU pipeline review).
+
+Status: implemented and runtime-validated on `expand2`; merge/commit and doc
+sync remain open.
+
+## Slice 23B: Multi-Depth Dense-Layer Render Scaling
+
+Goal: make the Slice 23A retained tilemap path scale to large vertical worlds
+(~120 depth levels, more entities) without linear draw-count and memory blow-up
+at the surface, while preserving the 23A GPU upload invariants.
+
+Problem (current envelope):
+
+- One draw + one full-world storage buffer per **submitted** dense layer. At
+  `active_level = 0` every layer at or below the player is submitted — for 120
+  floors that is 120 draws and ~120 MB GPU tile data at 512² (manageable on
+  desktop, wrong policy for steady-state frame cost).
+- `k_max_dense_submit_layers = 16` in `world_system.zig` hard-fails beyond 16
+  visible dense layers — blocks the first content expansion.
+- `mergeDrawList` is O(n log n) in group count; acceptable at a bounded window,
+  not at 120+ static groups every frame at the surface.
+- Entity render prep already scales via SoA collect + `spriteCommandCapacity`;
+  dense floors are the primary new cost — not per-tile vertex streaming.
+
+Architecture notes:
+
+- Simulation and nav already support multi-level worlds (Slice 25 per-level grids,
+  `LevelLink`, incremental rebuild). This slice is **render visibility policy**
+  only — no dig logic or nav contract changes.
+- Slice 24 cube LOD already demotes off-level / far entities on the **sim**
+  axis; 23B is the matching **render** axis for dense floor layers.
+- Slice 25E adds per-entity level column and NPC render cull; player dense-layer
+  policy stays in `WorldSystem` / `render_prep` (`player_level` today).
+- Chunked or streaming tilemaps are out of scope here unless profiling forces
+  them; prefer a vertical **render window** first.
+
+Recommended policy (default unless gameplay disproves it):
+
+- Submit dense layers only in `[active_level .. active_level + N]` (N tuned to
+  visible stack depth, e.g. 4–8) plus any layers required for surface-hole
+  see-through (at most one ceiling band above the player when standing on
+  level 0).
+- Size `k_max_dense_submit_layers`, `reserveStaticGeometry`, and
+  `draw_list_high_water` from the chosen window — not from total world depth.
+- Pre-size GPU tile-data buffers for all authored dense layers at load (memory
+  is level-count × cell count); culling affects **draw/submit** only unless a
+  later slice adds buffer residency policy.
+
+Checklist:
+
+- [ ] Define `DenseLayerRenderWindow` policy (min/max level offset, hole/ceiling
+      exception rules) and document it beside `submitStaticDenseGeometry`.
+- [ ] Replace demo-only `k_max_dense_submit_layers = 16` with window-derived cap
+      (or explicit world-build budget) and fail loud at world build if exceeded.
+- [ ] Wire window into `submitStaticDenseGeometry` and
+      `GameplayScene.player_level` / camera-level handoff.
+- [ ] Reserve renderer static-group high-water from window + sparse overhead.
+- [ ] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
+      `player_level` 0 vs mid-depth; record `mergeDrawList` and submit cost.
+- [ ] Add unit tests: surface window caps submit count; deep play submits only
+      the near stack; depth order preserved within the window.
+- [ ] Profile GPU memory budget for target level count × world size; document
+      ceiling in `WorldBuildConfig` or load-time gate.
+- [ ] Optional: restore linear `mergeDrawList` after window sort guarantees
+      static order.
+
+Deferred (separate slice if window is insufficient):
+
+- Chunk-aligned dense tilemap regions instead of one full-world quad per layer.
+- Level-of-detail / clip planes for deep underground beyond the window.
+- Tile-data buffer unload for layers far from play (residency policy).
+
+Acceptance checks:
+
+- [ ] World build with ≥32 dense levels succeeds; surface play stays within the
+      configured draw and submit budget.
+- [ ] Digging through a vertical stack at depth 0..N shows correct planes in the
+      window; no 23A regressions (depth order, `cycle=false`).
+- [ ] `zig build bench -- --group render-game-prep` reports stable prep cost at
+      configured window sizes.
+- [ ] `zig build verify` passes.
+
+Status: planned; schedule before `addUndergroundLevels`-style expansion to ~120
+levels or large entity stress scenes.
 
 ## Slice 24: Scoped Simulation Tiers And Chunk Policy
 
@@ -1176,6 +1349,11 @@ This is a gameplay-side correctness gap, not a pathfinder defect.
 Goal: give each NPC entity its own Z-level so it can request cross-level paths,
 traverse ramps and stairs autonomously, and be culled to its own floor instead
 of always rendering on the player's level.
+
+Prerequisite context: Slice 23B scales **dense floor** submission (~120 layers);
+this slice scales **entity** level columns and NPC draw cull. Player floor
+policy (`GameplayScene.player_level` → `submitStaticDenseGeometry`) stays in
+23B; NPCs need their own level column and render-prep filter here.
 
 Current foundation:
 
@@ -1709,6 +1887,8 @@ Acceptance checks:
 21. Typed simulation event system and domain signals.
 22. Simulation pipeline and tier/scope scaffolding.
 23. Atlas-backed world rendering addition.
+23A. GPU tilemap render hardening (`expand2`; merge before depth expansion).
+23B. Multi-depth dense-layer render scaling (~120 levels).
 24. Scoped simulation tiers and chunk policy.
 25. Z-aware scalable navigation redesign.
 25E. Per-entity NPC level and autonomous Z-traversal.
@@ -1734,12 +1914,13 @@ emit typed ordered commands through explicit render-prep phases, persistent data
 stores stable IDs and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
 benchmark-owned render-prep timing stays out of the production path.
 Slice 21 typed simulation/domain events, Slice 22 `SimulationPipeline`
-extraction, and Slice 23 atlas-backed world rendering are in place for the
-current structural, navigation, and world/chunk visibility foundation. Slice 24
-scoped simulation tiers should consume those world/chunk views next. Scoped
-tiers, chunk policy, and tier transitions should use those event signals through
-pipeline-owned controllers instead of adding parallel orchestration paths.
-Slice 25E lands per-entity NPC Z-level before multi-floor emergent scenarios;
+extraction, Slice 23 atlas-backed world rendering, and Slice 24 scoped
+simulation tiers are in place for the current structural, navigation, and
+world/chunk visibility foundation. Slice 23A (GPU tilemap hardening) is
+implemented on `expand2` and should merge before raising world depth count.
+Slice 23B (dense-layer render window for ~120 levels) is the next render-scale
+gate before large underground world build or entity stress expansion. Slice 25E
+lands per-entity NPC Z-level before multi-floor emergent scenarios;
 it is a gameplay-side correctness gap (four NPC touch-points in `DataSystem`,
 `steering`, `PathView`, and render cull) on top of the fully correct Slice 25
 nav substrate.
