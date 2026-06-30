@@ -188,6 +188,10 @@ pub const RunStats = struct {
     work_tuning: ?WorkTuningSummary = null,
     secondary_work_tuning: ?WorkTuningSummary = null,
     render_prep_phases: ?RenderPrepPhaseSummary = null,
+    render_game_prep_phases: ?RenderGamePrepPhaseSummary = null,
+    render_game_prep_sparse_submitted: usize = 0,
+    render_game_prep_dynamic_records: usize = 0,
+    render_game_prep_static_groups: usize = 0,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -241,6 +245,13 @@ pub const RenderPrepPhaseSummary = struct {
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
     draw_group_ns: u64 = 0,
+};
+
+pub const RenderGamePrepPhaseSummary = struct {
+    entity_collect_ns: u64 = 0,
+    merge_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    vertex_emit_ns: u64 = 0,
 };
 
 pub const WorkTuningSummary = struct {
@@ -632,6 +643,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
+    if (std.mem.eql(u8, group_name, "render-game-prep")) return "render entities";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -722,12 +734,13 @@ fn printValidationSummary(
     results: []const CaseResult,
 ) void {
     const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
+    const is_render_game_prep = std.mem.eql(u8, group_name, "render-game-prep");
     // Keep the summary terse and action-oriented: it should call out unusual
     // scheduler behavior or workload counters without pretending to choose
     // runtime tuning policy from one benchmark run.
-    if (is_render_prep) {
+    if (is_render_prep or is_render_game_prep) {
         const focus = adaptive orelse best;
-        const focus_label = if (adaptive != null) "production_adaptive" else "render_prep_focus";
+        const focus_label = if (adaptive != null) "production_adaptive" else if (is_render_game_prep) "render_game_prep_focus" else "render_prep_focus";
         const focus_speedup = speedupBasisPoints(baseline.stats, focus.stats);
         std.debug.print(
             "summary: {s} {s} at {f} ({d}.{d:0>2}x serial). ",
@@ -823,6 +836,29 @@ fn printValidationSummary(
                 std.debug.print(
                     "phases ordered_submit={f} snapshot={f} vertex_emit={f} draw_groups={f}. ",
                     .{ formatDuration(phases.ordered_submit_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
+                );
+            }
+        } else if (std.mem.eql(u8, group_name, "render-game-prep")) {
+            const render_game_prep_focus = adaptive orelse best;
+            const focus_label = if (adaptive != null) "production_adaptive" else "render_game_prep_focus";
+            std.debug.print(
+                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}. ",
+                .{
+                    focus_label,
+                    render_game_prep_focus.case.name,
+                    render_game_prep_focus.stats.candidate_pairs,
+                    render_game_prep_focus.stats.output_count,
+                    render_game_prep_focus.stats.deferred_count,
+                    render_game_prep_focus.stats.sample_count,
+                    render_game_prep_focus.stats.render_game_prep_sparse_submitted,
+                    render_game_prep_focus.stats.render_game_prep_dynamic_records,
+                    render_game_prep_focus.stats.render_game_prep_static_groups,
+                },
+            );
+            if (render_game_prep_focus.stats.render_game_prep_phases) |phases| {
+                std.debug.print(
+                    "phases entity_collect={f} merge={f} snapshot={f} vertex_emit={f}. ",
+                    .{ formatDuration(phases.entity_collect_ns), formatDuration(phases.merge_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns) },
                 );
             }
         } else {
@@ -1042,6 +1078,40 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
             ) catch "workload";
         }
         return std.fmt.bufPrint(buffer, "vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "render-game-prep")) {
+        if (stats.render_game_prep_phases) |phases| {
+            return std.fmt.bufPrint(
+                buffer,
+                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
+                .{
+                    stats.candidate_pairs,
+                    stats.output_count,
+                    stats.deferred_count,
+                    stats.sample_count,
+                    stats.render_game_prep_sparse_submitted,
+                    stats.render_game_prep_dynamic_records,
+                    stats.render_game_prep_static_groups,
+                    formatDuration(phases.entity_collect_ns),
+                    formatDuration(phases.merge_ns),
+                    formatDuration(phases.snapshot_ns),
+                    formatDuration(phases.vertex_emit_ns),
+                },
+            ) catch "workload";
+        }
+        return std.fmt.bufPrint(
+            buffer,
+            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}",
+            .{
+                stats.candidate_pairs,
+                stats.output_count,
+                stats.deferred_count,
+                stats.sample_count,
+                stats.render_game_prep_sparse_submitted,
+                stats.render_game_prep_dynamic_records,
+                stats.render_game_prep_static_groups,
+            },
+        ) catch "workload";
     }
     if (std.mem.startsWith(u8, group_name, "collision-response")) {
         return std.fmt.bufPrint(buffer, "triggers={} intents={}", .{ stats.candidate_pairs, stats.output_count }) catch "workload";

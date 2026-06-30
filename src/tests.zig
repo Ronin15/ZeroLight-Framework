@@ -32,6 +32,7 @@ comptime {
     _ = @import("benchmarks/particles.zig");
     _ = @import("benchmarks/pathfinding.zig");
     _ = @import("benchmarks/render_prep.zig");
+    _ = @import("benchmarks/render_game_prep.zig");
     _ = @import("benchmarks/scope.zig");
     _ = @import("benchmarks/steering.zig");
     _ = @import("core/math.zig");

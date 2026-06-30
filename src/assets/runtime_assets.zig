@@ -9,6 +9,8 @@
 const std = @import("std");
 const AssetCache = @import("cache.zig").AssetCache;
 const AssetStore = @import("assets.zig").AssetStore;
+const StartupTextureInsert = @import("cache.zig").StartupTextureInsert;
+const image = @import("image.zig");
 const AudioAssetId = manifest.AudioAssetId;
 const AudioService = @import("../app/audio.zig").AudioService;
 const Rect = @import("../render/renderer.zig").Rect;
@@ -86,9 +88,7 @@ pub const RuntimeAssets = struct {
         self.allocator = allocator;
         errdefer self.deinitWithBackend(cache, backend_context);
 
-        for (manifest.sprite_assets) |spec| {
-            try self.preloadSprite(asset_store, cache, backend_context, spec, .{});
-        }
+        try self.preloadSpritesBatch(asset_store, cache, backend_context, .{});
         try self.loadAtlasMetadata(asset_store, .{});
         for (manifest.audio_assets) |spec| {
             const available = try audio.preloadAudio(spec.id, spec.path, spec.kind, spec.predecode);
@@ -192,9 +192,95 @@ pub const RuntimeAssets = struct {
         }
     }
 
-    fn preloadSprite(
+    fn preloadSpritesBatch(
         self: *RuntimeAssets,
         asset_store: AssetStore,
+        cache: *AssetCache,
+        backend_context: *anyopaque,
+        options: PreloadOptions,
+    ) !void {
+        const PendingStartupSprite = struct {
+            sprite_id: SpriteAssetId,
+            relative_path: []const u8,
+            image: image.LoadedImage,
+        };
+
+        var pending = std.ArrayList(PendingStartupSprite).empty;
+        defer {
+            for (pending.items) |entry| {
+                var loaded = entry.image;
+                loaded.deinit();
+            }
+            pending.deinit(self.allocator);
+        }
+        errdefer {
+            for (pending.items) |entry| {
+                const index = manifest.spriteIndex(entry.sprite_id);
+                cache.releaseTextureWithContext(backend_context, &self.sprite_slots[index].lease);
+                self.sprite_slots[index] = .{};
+            }
+        }
+
+        try pending.ensureTotalCapacity(self.allocator, manifest.sprite_assets.len);
+
+        for (manifest.sprite_assets) |spec| {
+            const index = manifest.spriteIndex(spec.id);
+            try @import("assets.zig").validateRelativePath(spec.path);
+
+            const loaded_image = image.loadPng(asset_store, spec.path) catch |err| switch (err) {
+                error.FileNotFound => {
+                    if (isRequiredStartupSprite(spec.id)) {
+                        if (options.log_unavailable) {
+                            log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                        }
+                        return error.RequiredStartupSpriteUnavailable;
+                    }
+                    if (options.log_unavailable) {
+                        log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                    }
+                    self.releaseSpriteSlot(cache, backend_context, index);
+                    self.sprite_slots[index].status = .unavailable;
+                    continue;
+                },
+                else => return err,
+            };
+
+            try pending.append(self.allocator, .{
+                .sprite_id = spec.id,
+                .relative_path = spec.path,
+                .image = loaded_image,
+            });
+        }
+
+        if (pending.items.len == 0) return;
+
+        const startup_inserts = try self.allocator.alloc(StartupTextureInsert, pending.items.len);
+        defer self.allocator.free(startup_inserts);
+        for (pending.items, startup_inserts) |entry, *out| {
+            out.* = .{
+                .relative_path = entry.relative_path,
+                .image = entry.image,
+            };
+        }
+
+        const leases = try cache.uploadStartupTexturesBatch(backend_context, startup_inserts);
+        defer self.allocator.free(leases);
+
+        for (pending.items, leases) |entry, lease| {
+            const index = manifest.spriteIndex(entry.sprite_id);
+            const spec = manifest.spriteSpec(entry.sprite_id);
+            self.releaseSpriteSlot(cache, backend_context, index);
+            self.sprite_slots[index] = .{
+                .status = .available,
+                .lease = lease,
+                .source_rect = sourceRect(spec.source_rect),
+            };
+        }
+    }
+
+    fn preloadSprite(
+        self: *RuntimeAssets,
+        _: AssetStore,
         cache: *AssetCache,
         backend_context: *anyopaque,
         spec: manifest.SpriteAssetSpec,
@@ -203,9 +289,8 @@ pub const RuntimeAssets = struct {
         const index = manifest.spriteIndex(spec.id);
 
         try @import("assets.zig").validateRelativePath(spec.path);
-        if (asset_store.resolveReadablePath(spec.path)) |path| {
-            asset_store.allocator.free(path);
-        } else |err| switch (err) {
+
+        const lease = cache.acquireTextureWithContext(backend_context, spec.path) catch |err| switch (err) {
             error.FileNotFound => {
                 if (isRequiredStartupSprite(spec.id)) {
                     if (options.log_unavailable) {
@@ -221,9 +306,7 @@ pub const RuntimeAssets = struct {
                 return;
             },
             else => return err,
-        }
-
-        const lease = try cache.acquireTextureWithContext(backend_context, spec.path);
+        };
         self.releaseSpriteSlot(cache, backend_context, index);
         self.sprite_slots[index] = .{
             .status = .available,

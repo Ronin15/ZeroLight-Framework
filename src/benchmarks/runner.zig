@@ -12,6 +12,7 @@ const nav_update = @import("nav_update.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
 const render_prep = @import("render_prep.zig");
+const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
@@ -40,6 +41,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     nav_update.group,
     nav_update.multichunk_group,
     render_prep.group,
+    render_game_prep.group,
     scope.group,
     steering.group,
 };

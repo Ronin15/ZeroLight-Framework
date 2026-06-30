@@ -53,22 +53,38 @@ pub fn stageVertices(
     c.SDL_UnmapGPUTransferBuffer(device, transfer_buffer);
 }
 
-pub fn recordVertexUpload(
-    command_buffer: *c.SDL_GPUCommandBuffer,
+/// RAII wrapper for one SDL_GPU copy pass. Batch multiple uploads in a single
+/// pass via `recordVertexUploadInPass` / `recordStorageRegionsInPass`, then end
+/// once with `end`. Pass `cycle=true` only on the final upload in the pass.
+pub const CopyPassScope = struct {
+    pass: *c.SDL_GPUCopyPass,
+    open: bool = true,
+
+    pub fn begin(command_buffer: *c.SDL_GPUCommandBuffer) !CopyPassScope {
+        const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
+            return sdlError("SDL_BeginGPUCopyPass");
+        };
+        return .{ .pass = copy_pass };
+    }
+
+    pub fn end(self: *CopyPassScope) void {
+        if (self.open) {
+            c.SDL_EndGPUCopyPass(self.pass);
+            self.open = false;
+        }
+    }
+};
+
+pub fn recordVertexUploadInPass(
+    copy_pass: *c.SDL_GPUCopyPass,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
     vertex_buffer: *c.SDL_GPUBuffer,
     vertex_buffer_byte_size: u32,
     bytes: []const u8,
+    cycle: bool,
 ) !void {
     const upload_size = try checkedGpuBytes(bytes.len);
     try validateUploadBytes(bytes.len, vertex_buffer_byte_size);
-    const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
-        return sdlError("SDL_BeginGPUCopyPass");
-    };
-    var copy_pass_open = true;
-    errdefer if (copy_pass_open) {
-        c.SDL_EndGPUCopyPass(copy_pass);
-    };
 
     var source = c.SDL_GPUTransferBufferLocation{
         .transfer_buffer = transfer_buffer,
@@ -79,9 +95,26 @@ pub fn recordVertexUpload(
         .offset = 0,
         .size = upload_size,
     };
-    c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, true);
-    c.SDL_EndGPUCopyPass(copy_pass);
-    copy_pass_open = false;
+    c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, cycle);
+}
+
+pub fn recordVertexUpload(
+    command_buffer: *c.SDL_GPUCommandBuffer,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    vertex_buffer: *c.SDL_GPUBuffer,
+    vertex_buffer_byte_size: u32,
+    bytes: []const u8,
+) !void {
+    var copy_pass_scope = try CopyPassScope.begin(command_buffer);
+    defer copy_pass_scope.end();
+    try recordVertexUploadInPass(
+        copy_pass_scope.pass,
+        transfer_buffer,
+        vertex_buffer,
+        vertex_buffer_byte_size,
+        bytes,
+        true,
+    );
 }
 
 /// One tile-data storage element. `u32` (not the world's `u16`) keeps the
@@ -182,11 +215,13 @@ pub fn stageStorageRegions(
     c.SDL_UnmapGPUTransferBuffer(device, transfer_buffer);
 }
 
-/// Records partial storage-buffer writes into an open frame command buffer.
-pub fn recordStorageRegions(
-    command_buffer: *c.SDL_GPUCommandBuffer,
+/// Records partial storage-buffer writes into an open copy pass. Pass
+/// `cycle=true` only on the final upload in the pass.
+pub fn recordStorageRegionsInPass(
+    copy_pass: *c.SDL_GPUCopyPass,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
     edits: []const StorageRegion,
+    cycle: bool,
 ) !void {
     if (edits.len == 0) return;
     const element_size: u32 = @sizeOf(StorageElement);
@@ -194,15 +229,9 @@ pub fn recordStorageRegions(
         try validateStorageRegion(edit);
     }
 
-    const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
-        return sdlError("SDL_BeginGPUCopyPass");
-    };
-    var copy_pass_open = true;
-    errdefer if (copy_pass_open) {
-        c.SDL_EndGPUCopyPass(copy_pass);
-    };
     for (edits, 0..) |edit, i| {
         const dst_byte_offset = std.math.mul(usize, edit.element_index, element_size) catch return error.GpuBufferTooLarge;
+        const is_last = i + 1 == edits.len;
         var source = c.SDL_GPUTransferBufferLocation{
             .transfer_buffer = transfer_buffer,
             .offset = @intCast(i * element_size),
@@ -212,10 +241,20 @@ pub fn recordStorageRegions(
             .offset = try checkedGpuBytes(dst_byte_offset),
             .size = element_size,
         };
-        c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
+        c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, if (is_last) cycle else false);
     }
-    c.SDL_EndGPUCopyPass(copy_pass);
-    copy_pass_open = false;
+}
+
+/// Records partial storage-buffer writes into an open frame command buffer.
+pub fn recordStorageRegions(
+    command_buffer: *c.SDL_GPUCommandBuffer,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    edits: []const StorageRegion,
+) !void {
+    if (edits.len == 0) return;
+    var copy_pass_scope = try CopyPassScope.begin(command_buffer);
+    defer copy_pass_scope.end();
+    try recordStorageRegionsInPass(copy_pass_scope.pass, transfer_buffer, edits, true);
 }
 
 /// Uploads a batch of single-cell edits (the dig path) in one transfer buffer +

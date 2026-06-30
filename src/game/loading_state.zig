@@ -193,7 +193,7 @@ test "loading state builds gameplay from runtime atlas metadata" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = try runtimeAssetsWithWorldMetadataForTest();
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
 
     try loading.update(.{
@@ -239,7 +239,7 @@ test "loading state waits for first render before building gameplay" {
     try std.testing.expectEqual(LoadingPhase.pending, loading.phase);
 }
 
-fn runtimeAssetsWithWorldMetadataForTest() !RuntimeAssets {
+fn runtimeAssetsWithDemoMetadataForTest() !RuntimeAssets {
     var runtime_assets = RuntimeAssets.init();
     runtime_assets.allocator = std.testing.allocator;
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };

@@ -341,6 +341,9 @@ pub const Engine = struct {
                 if (comptime runtime_perf_log.enabled) {
                     self.perf_log.recordTiming(.render_enqueue, elapsedNs(perf_enqueue_start_ns, self.nowNs()));
                 }
+                try self.renderer.reserveSpriteCommands(
+                    self.renderer.spriteCommandCount() + Renderer.kOverlayCommandHeadroom,
+                );
                 const perf_overlay_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
                 try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
                 try self.debug_overlay.render(&self.renderer);

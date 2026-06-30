@@ -122,6 +122,68 @@ pub const AssetCache = struct {
 
     /// Backend-context counterpart to `acquireTextureWithContext`; see its note
     /// on matching the cache's `TextureBackend`.
+    /// Inserts startup textures uploaded in one backend batch. Each path must be
+    /// unique and not already cached. Returned leases are owned by the caller.
+    pub fn insertStartupTexturesBatch(
+        self: *AssetCache,
+        _: *anyopaque,
+        inserts: []const StartupTextureInsert,
+        texture_ids: []const TextureId,
+    ) ![]TextureLease {
+        if (inserts.len != texture_ids.len) return error.InvalidStartupTextureBatch;
+        if (inserts.len == 0) return &.{};
+
+        const leases = try self.allocator.alloc(TextureLease, inserts.len);
+        errdefer self.allocator.free(leases);
+
+        for (inserts, texture_ids, leases) |insert, texture, *lease| {
+            try assets.validateRelativePath(insert.relative_path);
+            if (self.entries.contains(insert.relative_path)) return error.DuplicateStartupTexture;
+
+            const owned_path = try self.allocator.dupe(u8, insert.relative_path);
+            errdefer self.allocator.free(owned_path);
+
+            try self.entries.put(self.allocator, owned_path, .{
+                .path = owned_path,
+                .texture = texture,
+                .retain_count = 1,
+            });
+            errdefer {
+                const removed = self.entries.fetchRemove(owned_path);
+                std.debug.assert(removed != null);
+                self.allocator.free(owned_path);
+            }
+
+            const handle = try self.createLease(owned_path, texture);
+            lease.* = .{
+                .handle = handle,
+                .id = texture,
+                .owner_id = self.owner_id,
+            };
+            log.debug("loaded cached texture \"{s}\"", .{owned_path});
+        }
+
+        return leases;
+    }
+
+    /// Decodes and uploads startup textures in one GPU command-buffer batch.
+    pub fn uploadStartupTexturesBatch(
+        self: *AssetCache,
+        backend_context: *anyopaque,
+        inserts: []const StartupTextureInsert,
+    ) ![]TextureLease {
+        if (inserts.len == 0) return &.{};
+
+        const images = try self.allocator.alloc(image.LoadedImage, inserts.len);
+        defer self.allocator.free(images);
+        for (inserts, images) |insert, *out| out.* = insert.image;
+
+        const texture_ids = try self.backend.upload_images_batch(backend_context, self.allocator, images);
+        defer self.allocator.free(texture_ids);
+
+        return try self.insertStartupTexturesBatch(backend_context, inserts, texture_ids);
+    }
+
     pub fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
         if (lease.owner_id != self.owner_id) return;
         const handle = lease.handle;
@@ -284,14 +346,21 @@ const LeaseSlot = struct {
     next_free: ?u32 = null,
 };
 
+pub const StartupTextureInsert = struct {
+    relative_path: []const u8,
+    image: image.LoadedImage,
+};
+
 const TextureBackend = struct {
     upload_image: *const fn (*anyopaque, image.LoadedImage) anyerror!TextureId,
+    upload_images_batch: *const fn (*anyopaque, std.mem.Allocator, []const image.LoadedImage) anyerror![]TextureId,
     destroy_texture: *const fn (*anyopaque, TextureId) void,
 };
 
 fn rendererBackend() TextureBackend {
     return .{
         .upload_image = rendererUploadImage,
+        .upload_images_batch = rendererUploadImagesBatch,
         .destroy_texture = rendererDestroyTexture,
     };
 }
@@ -299,6 +368,12 @@ fn rendererBackend() TextureBackend {
 fn rendererUploadImage(context: *anyopaque, loaded_image: image.LoadedImage) !TextureId {
     const renderer: *Renderer = @ptrCast(@alignCast(context));
     return renderer.createTextureFromPixels(loaded_image.pixels, loaded_image.width, loaded_image.height, loaded_image.pitch);
+}
+
+fn rendererUploadImagesBatch(context: *anyopaque, allocator: std.mem.Allocator, images: []const image.LoadedImage) ![]TextureId {
+    _ = allocator;
+    const renderer: *Renderer = @ptrCast(@alignCast(context));
+    return renderer.createTexturesFromPixelsBatch(images);
 }
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {
@@ -324,6 +399,7 @@ fn nextCacheOwnerId() u64 {
 
 const FakeBackend = struct {
     upload_count: u32 = 0,
+    batch_upload_count: u32 = 0,
     destroy_count: u32 = 0,
     next_index: u32 = 0,
     fail_upload: bool = false,
@@ -334,6 +410,7 @@ const FakeBackend = struct {
     fn backend() TextureBackend {
         return .{
             .upload_image = uploadImage,
+            .upload_images_batch = uploadImagesBatch,
             .destroy_texture = destroyTexture,
         };
     }
@@ -349,6 +426,19 @@ const FakeBackend = struct {
         self.last_height = loaded_image.height;
         self.last_pitch = loaded_image.pitch;
         return texture;
+    }
+
+    fn uploadImagesBatch(context: *anyopaque, allocator: std.mem.Allocator, images: []const image.LoadedImage) ![]TextureId {
+        const self: *FakeBackend = @ptrCast(@alignCast(context));
+        if (self.fail_upload) return error.FakeUploadFailed;
+
+        const ids = try allocator.alloc(TextureId, images.len);
+        errdefer allocator.free(ids);
+        for (images, ids) |loaded_image, *id| {
+            id.* = try uploadImage(context, loaded_image);
+        }
+        self.batch_upload_count += 1;
+        return ids;
     }
 
     fn destroyTexture(context: *anyopaque, texture: TextureId) void {

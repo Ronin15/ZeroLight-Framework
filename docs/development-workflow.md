@@ -231,6 +231,11 @@ render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
 does not open a window or submit SDL_GPU command buffers. Each measured
 iteration submits an already ordered sprite stream into the same `SpriteBatch`
 command storage, then snapshots, emits vertices, and builds draw groups.
+`render-game-prep` extends that coverage with production-shaped game render
+work: dynamic record collection and depth-bucket sparse/dynamic emit, sparse
+visible-tile submission through `WorldSystem`, realistic static+dynamic
+`mergeDrawList` group counts, and phase timings for entity_collect, merge,
+snapshot, and vertex_emit.
 Current production world rendering submits already ordered commands from
 explicit z-layer passes instead of a separate general ordering queue. The
 benchmark owns its phase timers around that shared path and reports ordered
@@ -301,6 +306,7 @@ zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
 zig build bench -- --group steering --details
 zig build bench -- --group render-prep --details
+zig build bench -- --group render-game-prep --details
 zig build bench -- --group pathfinding-hard-fallback --details
 zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
 zig build bench -- --group nav-update-scattered --details

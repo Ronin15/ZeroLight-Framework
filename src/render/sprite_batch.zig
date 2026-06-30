@@ -215,6 +215,7 @@ pub const SpriteBatch = struct {
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
+    frame_reserved: bool = false,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -244,6 +245,7 @@ pub const SpriteBatch = struct {
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
+        self.frame_reserved = false;
         self.last_order = null;
         self.last_prep_stats = .{};
     }
@@ -254,7 +256,14 @@ pub const SpriteBatch = struct {
         }
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
-        try self.commands.append(self.allocator, .{ .sprite = sprite });
+        if (self.frame_reserved) {
+            if (comptime builtin.mode == .Debug) {
+                std.debug.assert(self.commands.items.len < self.commands.capacity);
+            }
+            self.commands.appendAssumeCapacity(.{ .sprite = sprite });
+        } else {
+            try self.commands.append(self.allocator, .{ .sprite = sprite });
+        }
         self.last_order = sprite.order;
     }
 
@@ -1244,4 +1253,27 @@ fn expectEqualDrawGroups(expected: []const DrawGroup, actual: []const DrawGroup)
         try std.testing.expectEqual(lhs.first_vertex, rhs.first_vertex);
         try std.testing.expectEqual(lhs.vertex_count, rhs.vertex_count);
     }
+}
+
+test "draw sprite stays allocation-free after reserve" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    const command_capacity: usize = 8;
+    try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
+    batch.frame_reserved = true;
+    const capacity_before = batch.commands.capacity;
+
+    const texture = TextureId.init(0, 1) catch unreachable;
+    for (0..command_capacity) |i| {
+        try batch.drawSprite(.{
+            .texture = texture,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+
+    try std.testing.expectEqual(capacity_before, batch.commands.capacity);
+    try std.testing.expectEqual(command_capacity, batch.commands.items.len);
 }

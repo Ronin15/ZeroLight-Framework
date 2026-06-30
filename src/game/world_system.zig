@@ -4,7 +4,10 @@
 
 //! State-owned SoA world/tile storage and render preparation.
 //! Persistent world data stores stable tile IDs, level/chunk metadata, and
-//! atlas-derived source rect columns. Renderer handles stay outside this owner.
+//! gameplay tile flags. Atlas source rectangles borrow `tileset_meta` instead of
+//! duplicating rect columns when the caller keeps metadata alive (for example
+//! `RuntimeAssets.worldTilesetMeta()` for the engine lifetime). Renderer handles
+//! stay outside this owner.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -22,6 +25,7 @@ const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const TileDataEdit = @import("../render/renderer.zig").TileDataEdit;
 const Sprite = @import("../render/renderer.zig").Sprite;
+const sprite_batch = @import("../render/sprite_batch.zig");
 const Position = @import("../render/renderer.zig").Position;
 const Uv = @import("../render/renderer.zig").Uv;
 const VertexColor = @import("../render/renderer.zig").VertexColor;
@@ -193,11 +197,13 @@ pub const WorldSystem = struct {
     tile_size: f32,
     chunk_size_tiles: u16,
 
+    /// Borrowed atlas metadata used for `sourceRect` lookups. Satisfied by
+    /// `RuntimeAssets.worldTilesetMeta()` for production startup, or by
+    /// `adoptTilesetMeta` for standalone tests/tools that construct a world
+    /// without a long-lived runtime catalog.
+    tileset_meta: ?*const WorldTilesetMeta = null,
+    owned_tileset_meta: ?WorldTilesetMeta = null,
     catalog_valid: std.ArrayList(bool) = .empty,
-    catalog_source_x: std.ArrayList(f32) = .empty,
-    catalog_source_y: std.ArrayList(f32) = .empty,
-    catalog_source_w: std.ArrayList(f32) = .empty,
-    catalog_source_h: std.ArrayList(f32) = .empty,
     catalog_flags: std.ArrayList(TileFlags) = .empty,
 
     level_base_z: std.ArrayList(i32) = .empty,
@@ -400,17 +406,26 @@ pub const WorldSystem = struct {
         return world;
     }
 
-    pub fn initDemoFromAssetStore(
+    /// Transfers standalone tileset metadata ownership into this world so
+    /// `sourceRect` lookups remain valid after the caller's local `meta` ends.
+    pub fn adoptTilesetMeta(self: *WorldSystem, meta: WorldTilesetMeta) void {
+        if (self.owned_tileset_meta) |*owned| owned.deinit();
+        self.owned_tileset_meta = meta;
+        self.tileset_meta = &self.owned_tileset_meta.?;
+    }
+
+    /// Prefer `initDemo` with `RuntimeAssets` so tileset metadata is not parsed
+    /// again at world construction. Call `adoptTilesetMeta` when the caller's
+    /// `meta` would not outlive the returned world.
+    pub fn initDemoFromMetaWithUnderground(
         allocator: std.mem.Allocator,
-        asset_store: AssetStore,
+        meta: *const WorldTilesetMeta,
         bounds_width: f32,
         bounds_height: f32,
     ) !WorldSystem {
-        var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-        defer meta.deinit();
-        var world = try initDemoFromMeta(allocator, &meta, bounds_width, bounds_height);
+        var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
         errdefer world.deinit();
-        try world.addUndergroundLevels(&meta);
+        try world.addUndergroundLevels(meta);
         return world;
     }
 
@@ -432,11 +447,10 @@ pub const WorldSystem = struct {
         self.level_base_z.deinit(self.allocator);
 
         self.catalog_flags.deinit(self.allocator);
-        self.catalog_source_h.deinit(self.allocator);
-        self.catalog_source_w.deinit(self.allocator);
-        self.catalog_source_y.deinit(self.allocator);
-        self.catalog_source_x.deinit(self.allocator);
         self.catalog_valid.deinit(self.allocator);
+        if (self.owned_tileset_meta) |*meta| meta.deinit();
+        self.owned_tileset_meta = null;
+        self.tileset_meta = null;
         self.* = undefined;
     }
 
@@ -647,6 +661,46 @@ pub const WorldSystem = struct {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
         const bounds = self.visibleTileBounds();
         try self.submitVisibleSparseRange(renderer, prepared, bounds, depth);
+    }
+
+    /// CPU-only sparse submission for benchmarks and headless parity checks. Mirrors
+    /// `submitVisibleSparseRange` but writes ordered sprites into `batch` instead of
+    /// a live `Renderer`.
+    pub fn submitVisibleSparseSprites(
+        self: *const WorldSystem,
+        batch: *sprite_batch.SpriteBatch,
+        texture: TextureId,
+        depth: i32,
+    ) !usize {
+        const bounds = self.visibleTileBounds();
+        const range = self.sparseDepthRange(depth) orelse return 0;
+        const sparse = self.sparse_tiles.slice();
+        const sparse_chunks = sparse.items(.chunk_index);
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_tile_ids = sparse.items(.tile_id);
+        var submitted: usize = 0;
+        for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
+            if (!self.isSparseChunkVisible(sparse_chunks[index])) continue;
+            const cell = sparse_cells[index];
+            if (!self.cellInVisibleBounds(cell, bounds)) continue;
+            const tile_id = sparse_tile_ids[index];
+            const x: u16 = @intCast(cell % self.width);
+            const y: u16 = @intCast(cell / self.width);
+            const source = self.sourceRect(tile_id) orelse return error.MissingTileSourceRect;
+            try batch.drawSprite(.{
+                .texture = texture,
+                .source = source,
+                .dest = .{
+                    .x = @as(f32, @floatFromInt(x)) * self.tile_size,
+                    .y = @as(f32, @floatFromInt(y)) * self.tile_size,
+                    .w = self.tile_size,
+                    .h = self.tile_size,
+                },
+                .order = RenderOrder.world(depth),
+            });
+            submitted += 1;
+        }
+        return submitted;
     }
 
     pub fn firstVisibleSparseDepth(self: *const WorldSystem) ?i32 {
@@ -1090,19 +1144,12 @@ pub const WorldSystem = struct {
     }
 
     fn buildCatalog(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
+        self.tileset_meta = meta;
         const count = catalogCapacity(meta);
         try self.catalog_valid.ensureTotalCapacity(self.allocator, count);
-        try self.catalog_source_x.ensureTotalCapacity(self.allocator, count);
-        try self.catalog_source_y.ensureTotalCapacity(self.allocator, count);
-        try self.catalog_source_w.ensureTotalCapacity(self.allocator, count);
-        try self.catalog_source_h.ensureTotalCapacity(self.allocator, count);
         try self.catalog_flags.ensureTotalCapacity(self.allocator, count);
         for (0..count) |_| {
             self.catalog_valid.appendAssumeCapacity(false);
-            self.catalog_source_x.appendAssumeCapacity(0);
-            self.catalog_source_y.appendAssumeCapacity(0);
-            self.catalog_source_w.appendAssumeCapacity(self.tile_size);
-            self.catalog_source_h.appendAssumeCapacity(self.tile_size);
             self.catalog_flags.appendAssumeCapacity(.{});
         }
 
@@ -1110,10 +1157,6 @@ pub const WorldSystem = struct {
             const tile = meta.tileAtIndex(index) orelse continue;
             const tile_index: usize = tile.id;
             self.catalog_valid.items[tile_index] = true;
-            self.catalog_source_x.items[tile_index] = tile.x;
-            self.catalog_source_y.items[tile_index] = tile.y;
-            self.catalog_source_w.items[tile_index] = tile.width;
-            self.catalog_source_h.items[tile_index] = tile.height;
             self.catalog_flags.items[tile_index] = .{
                 .walkable = tile.properties.walkable,
                 .blocks_movement = tile.properties.blocks_movement,
@@ -1233,11 +1276,13 @@ pub const WorldSystem = struct {
     fn sourceRect(self: *const WorldSystem, tile_id: TileId) ?Rect {
         const index: usize = tile_id;
         if (index >= self.catalog_valid.items.len or !self.catalog_valid.items[index]) return null;
+        const meta = self.tileset_meta orelse return null;
+        const rect = meta.sourceRectForId(tile_id) orelse return null;
         return .{
-            .x = self.catalog_source_x.items[index],
-            .y = self.catalog_source_y.items[index],
-            .w = self.catalog_source_w.items[index],
-            .h = self.catalog_source_h.items[index],
+            .x = rect.x,
+            .y = rect.y,
+            .w = rect.w,
+            .h = rect.h,
         };
     }
 
@@ -1247,7 +1292,7 @@ pub const WorldSystem = struct {
         return self.catalog_flags.items[index];
     }
 
-    fn requireTileByName(self: *const WorldSystem, meta: *const WorldTilesetMeta, name: []const u8) !TileId {
+    pub fn requireTileByName(self: *const WorldSystem, meta: *const WorldTilesetMeta, name: []const u8) !TileId {
         _ = self;
         const tile = meta.tileByName(name) orelse return error.RequiredWorldTileMissing;
         return tile.id;

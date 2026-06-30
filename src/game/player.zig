@@ -10,8 +10,6 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
-const RenderOrder = @import("../render/renderer.zig").RenderOrder;
-const Rect = @import("../render/renderer.zig").Rect;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const render_depth = @import("render_depth.zig");
@@ -90,49 +88,19 @@ pub const Player = struct {
     pub fn submitBodyRender(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, renderer: *Renderer, interpolation_alpha: f32) !void {
         const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
         const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
-        const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-        const body_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.depth));
-
-        const dest = Rect{
-            .x = render_position.x,
-            .y = render_position.y,
-            .w = visual.size.x,
-            .h = visual.size.y,
-        };
-        if (data.assetReferenceConst(self.entity)) |asset_ref| {
-            if (runtime_assets.sprite(asset_ref.sprite)) |sprite| {
-                const source = render_prep.sourceRectForAsset(runtime_assets, asset_ref, sprite.source_rect);
-                if (!asset_ref.hasAtlasEntry() or source != null) {
-                    try renderer.submitOrderedSprite(.{
-                        .texture = sprite.texture,
-                        .source = source,
-                        .dest = dest,
-                        .tint = visual.color,
-                        .order = body_order,
-                    });
-                } else {
-                    try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
-                }
-            } else {
-                try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
-            }
-        } else {
-            try renderer.submitOrderedRectInSpace(dest, visual.color, body_order, .world);
-        }
+        const draw = render_prep.preparePrimitiveVisual(
+            body,
+            visual,
+            data.assetReferenceConst(self.entity),
+            runtime_assets,
+            interpolation_alpha,
+        ) orelse return error.MissingPlayerVisual;
+        try render_prep.submitPreparedDraw(renderer, draw);
     }
 
     pub fn submitMarkerRender(self: Player, data: *const DataSystem, renderer: *Renderer, interpolation_alpha: f32) !void {
-        const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
-        const facing = data.facingConst(self.entity) orelse return error.MissingPlayerFacing;
-        const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
-        const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-        const marker_order = worldOrder(render_depth.worldZWithOffset(body.position_z, visual.marker_depth_band));
-        try renderer.submitOrderedRectInSpace(
-            markerRect(render_position, facing.direction, visual),
-            visual.marker_color,
-            marker_order,
-            .world,
-        );
+        const draw = render_prep.preparePlayerMarker(data, self.entity, interpolation_alpha) orelse return error.MissingPlayerMovementBody;
+        try render_prep.submitPreparedDraw(renderer, draw);
     }
 
     pub fn onPause(self: Player, data: *DataSystem) void {
@@ -161,42 +129,6 @@ fn playerVisual() PrimitiveVisual {
         .marker_length = Player.marker_length,
         .marker_depth = Player.marker_depth,
         .marker_margin = Player.marker_margin,
-    };
-}
-
-fn worldOrder(depth: i32) RenderOrder {
-    return RenderOrder.world(depth);
-}
-
-fn markerRect(position: math.Vec2, facing: Facing, visual: PrimitiveVisual) Rect {
-    const centered_x = (visual.size.x - visual.marker_length) * 0.5;
-    const centered_y = (visual.size.y - visual.marker_length) * 0.5;
-
-    return switch (facing) {
-        .up => .{
-            .x = position.x + centered_x,
-            .y = position.y + visual.marker_margin,
-            .w = visual.marker_length,
-            .h = visual.marker_depth,
-        },
-        .down => .{
-            .x = position.x + centered_x,
-            .y = position.y + visual.size.y - visual.marker_margin - visual.marker_depth,
-            .w = visual.marker_length,
-            .h = visual.marker_depth,
-        },
-        .left => .{
-            .x = position.x + visual.marker_margin,
-            .y = position.y + centered_y,
-            .w = visual.marker_depth,
-            .h = visual.marker_length,
-        },
-        .right => .{
-            .x = position.x + visual.size.x - visual.marker_margin - visual.marker_depth,
-            .y = position.y + centered_y,
-            .w = visual.marker_depth,
-            .h = visual.marker_length,
-        },
     };
 }
 

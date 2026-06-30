@@ -234,6 +234,13 @@ pub const ConstAssetReferenceSlice = struct {
     atlas_entry_ids: []const u16,
 };
 
+/// Dense component indices resolved in one entity-slot lookup for render-hot paths.
+pub const RenderEntityComponentIndices = struct {
+    movement_body: usize,
+    asset_ref: ?usize = null,
+    facing: ?usize = null,
+};
+
 pub const CollisionBounds = struct {
     offset: math.Vec2 = .{},
     size: math.Vec2,
@@ -927,6 +934,16 @@ pub const DataSystem = struct {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.movement_body_index orelse return null;
         return @intCast(dense_index);
+    }
+
+    pub fn renderEntityComponentIndices(self: *const DataSystem, id: EntityId) ?RenderEntityComponentIndices {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const movement_body = slot.movement_body_index orelse return null;
+        return .{
+            .movement_body = @intCast(movement_body),
+            .asset_ref = if (slot.asset_ref_index) |index| @intCast(index) else null,
+            .facing = if (slot.facing_index) |index| @intCast(index) else null,
+        };
     }
 
     pub fn movementBodySlice(self: *DataSystem) MovementBodySlice {

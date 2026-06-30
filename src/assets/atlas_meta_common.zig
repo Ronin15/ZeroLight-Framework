@@ -36,10 +36,10 @@ pub fn readJsonAsset(
     max_bytes: usize,
     comptime T: type,
 ) !struct { bytes: []u8, parsed: std.json.Parsed(T) } {
-    const read = try asset_store.readAlloc(metadata_path, max_bytes);
-    defer asset_store.allocator.free(read);
+    const path = try asset_store.resolveReadablePath(metadata_path);
+    defer asset_store.allocator.free(path);
 
-    const bytes = try allocator.dupe(u8, read);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(asset_store.io, path, allocator, .limited(max_bytes));
     errdefer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(T, allocator, bytes, .{
