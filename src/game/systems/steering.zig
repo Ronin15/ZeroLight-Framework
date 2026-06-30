@@ -32,7 +32,13 @@ const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("pathfinding.zig").PathfindingSystem;
 
 pub const steering_range_alignment_items: usize = @import("../data_system.zig").movement_range_alignment_items;
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(64));
+pub const HotF32Slice = []f32;
+pub const ConstHotF32Slice = []const f32;
+
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, steering_range_alignment_items);
+}
+
 const invalid_index = std.math.maxInt(usize);
 const min_spatial_cell_size: f32 = 1.0;
 const max_agent_candidate_checks: u16 = 64;
@@ -78,30 +84,15 @@ pub const SteeringSystem = struct {
     obstacle_counts: std.ArrayList(u16) = .empty,
     agent_candidate_counts: std.ArrayList(u16) = .empty,
     obstacle_candidate_counts: std.ArrayList(u16) = .empty,
-    // Selected-work columns are range-written by workers and aligned with
+    // Selected-work rows are range-written by workers and aligned with
     // `selected` by index.
-    start_x: HotF32List = .empty,
-    start_y: HotF32List = .empty,
-    base_dir_x: HotF32List = .empty,
-    base_dir_y: HotF32List = .empty,
-    final_dir_x: HotF32List = .empty,
-    final_dir_y: HotF32List = .empty,
-    selected_agent_radii: HotF32List = .empty,
-    selected_avoidance_radii: HotF32List = .empty,
-    selected_avoidance_weights: HotF32List = .empty,
-    selected_max_neighbor_samples: std.ArrayList(u16) = .empty,
+    selected_work_rows: std.MultiArrayList(SelectedWorkRow) = .{},
     // World snapshots are immutable during worker dispatch. DataSystem is not
     // touched from steering worker jobs.
-    all_agent_entities: std.ArrayList(EntityId) = .empty,
-    all_agent_x: HotF32List = .empty,
-    all_agent_y: HotF32List = .empty,
-    all_agent_radii: HotF32List = .empty,
+    agent_snapshot_rows: std.MultiArrayList(AgentSnapshotRow) = .{},
     agent_cell_entries: std.ArrayList(SpatialCellEntry) = .empty,
     agent_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
-    obstacle_min_x: HotF32List = .empty,
-    obstacle_min_y: HotF32List = .empty,
-    obstacle_max_x: HotF32List = .empty,
-    obstacle_max_y: HotF32List = .empty,
+    obstacle_snapshot_rows: std.MultiArrayList(ObstacleSnapshotRow) = .{},
     obstacle_cell_entries: std.ArrayList(SpatialCellEntry) = .empty,
     obstacle_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
     spatial_cell_size: f32 = 64.0,
@@ -123,26 +114,11 @@ pub const SteeringSystem = struct {
     pub fn deinit(self: *SteeringSystem) void {
         self.obstacle_cell_ranges.deinit(self.allocator);
         self.obstacle_cell_entries.deinit(self.allocator);
-        self.obstacle_max_y.deinit(self.allocator);
-        self.obstacle_max_x.deinit(self.allocator);
-        self.obstacle_min_y.deinit(self.allocator);
-        self.obstacle_min_x.deinit(self.allocator);
+        self.obstacle_snapshot_rows.deinit(self.allocator);
         self.agent_cell_ranges.deinit(self.allocator);
         self.agent_cell_entries.deinit(self.allocator);
-        self.all_agent_radii.deinit(self.allocator);
-        self.all_agent_y.deinit(self.allocator);
-        self.all_agent_x.deinit(self.allocator);
-        self.all_agent_entities.deinit(self.allocator);
-        self.selected_max_neighbor_samples.deinit(self.allocator);
-        self.selected_avoidance_weights.deinit(self.allocator);
-        self.selected_avoidance_radii.deinit(self.allocator);
-        self.selected_agent_radii.deinit(self.allocator);
-        self.final_dir_y.deinit(self.allocator);
-        self.final_dir_x.deinit(self.allocator);
-        self.base_dir_y.deinit(self.allocator);
-        self.base_dir_x.deinit(self.allocator);
-        self.start_y.deinit(self.allocator);
-        self.start_x.deinit(self.allocator);
+        self.agent_snapshot_rows.deinit(self.allocator);
+        self.selected_work_rows.deinit(self.allocator);
         self.obstacle_candidate_counts.deinit(self.allocator);
         self.agent_candidate_counts.deinit(self.allocator);
         self.obstacle_counts.deinit(self.allocator);
@@ -169,28 +145,65 @@ pub const SteeringSystem = struct {
         try self.obstacle_counts.ensureTotalCapacity(self.allocator, max_agents);
         try self.agent_candidate_counts.ensureTotalCapacity(self.allocator, max_agents);
         try self.obstacle_candidate_counts.ensureTotalCapacity(self.allocator, max_agents);
-        try self.start_x.ensureTotalCapacity(self.allocator, max_agents);
-        try self.start_y.ensureTotalCapacity(self.allocator, max_agents);
-        try self.base_dir_x.ensureTotalCapacity(self.allocator, max_agents);
-        try self.base_dir_y.ensureTotalCapacity(self.allocator, max_agents);
-        try self.final_dir_x.ensureTotalCapacity(self.allocator, max_agents);
-        try self.final_dir_y.ensureTotalCapacity(self.allocator, max_agents);
-        try self.selected_agent_radii.ensureTotalCapacity(self.allocator, max_agents);
-        try self.selected_avoidance_radii.ensureTotalCapacity(self.allocator, max_agents);
-        try self.selected_avoidance_weights.ensureTotalCapacity(self.allocator, max_agents);
-        try self.selected_max_neighbor_samples.ensureTotalCapacity(self.allocator, max_agents);
-        try self.all_agent_entities.ensureTotalCapacity(self.allocator, max_agents);
-        try self.all_agent_x.ensureTotalCapacity(self.allocator, max_agents);
-        try self.all_agent_y.ensureTotalCapacity(self.allocator, max_agents);
-        try self.all_agent_radii.ensureTotalCapacity(self.allocator, max_agents);
+        try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_agents));
+        try self.agent_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_agents));
         try self.agent_cell_entries.ensureTotalCapacity(self.allocator, max_agents);
         try self.agent_cell_ranges.ensureTotalCapacity(self.allocator, max_agents);
-        try self.obstacle_min_x.ensureTotalCapacity(self.allocator, max_obstacles);
-        try self.obstacle_min_y.ensureTotalCapacity(self.allocator, max_obstacles);
-        try self.obstacle_max_x.ensureTotalCapacity(self.allocator, max_obstacles);
-        try self.obstacle_max_y.ensureTotalCapacity(self.allocator, max_obstacles);
+        try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_obstacles));
         try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, max_obstacles);
         try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, max_obstacles);
+    }
+
+    pub fn selectedWorkSlice(self: *SteeringSystem) SelectedWorkSlice {
+        const s = self.selected_work_rows.slice();
+        return .{
+            .start_x = s.items(.start_x),
+            .start_y = s.items(.start_y),
+            .base_dir_x = s.items(.base_dir_x),
+            .base_dir_y = s.items(.base_dir_y),
+            .final_dir_x = s.items(.final_dir_x),
+            .final_dir_y = s.items(.final_dir_y),
+            .selected_agent_radii = s.items(.selected_agent_radii),
+            .selected_avoidance_radii = s.items(.selected_avoidance_radii),
+            .selected_avoidance_weights = s.items(.selected_avoidance_weights),
+            .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+        };
+    }
+
+    pub fn selectedWorkSliceConst(self: *const SteeringSystem) ConstSelectedWorkSlice {
+        const s = self.selected_work_rows.slice();
+        return .{
+            .start_x = s.items(.start_x),
+            .start_y = s.items(.start_y),
+            .base_dir_x = s.items(.base_dir_x),
+            .base_dir_y = s.items(.base_dir_y),
+            .final_dir_x = s.items(.final_dir_x),
+            .final_dir_y = s.items(.final_dir_y),
+            .selected_agent_radii = s.items(.selected_agent_radii),
+            .selected_avoidance_radii = s.items(.selected_avoidance_radii),
+            .selected_avoidance_weights = s.items(.selected_avoidance_weights),
+            .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+        };
+    }
+
+    pub fn agentSnapshotSliceConst(self: *const SteeringSystem) ConstAgentSnapshotSlice {
+        const s = self.agent_snapshot_rows.slice();
+        return .{
+            .entity = s.items(.entity),
+            .x = s.items(.x),
+            .y = s.items(.y),
+            .radius = s.items(.radius),
+        };
+    }
+
+    pub fn obstacleSnapshotSliceConst(self: *const SteeringSystem) ConstObstacleSnapshotSlice {
+        const s = self.obstacle_snapshot_rows.slice();
+        return .{
+            .min_x = s.items(.min_x),
+            .min_y = s.items(.min_y),
+            .max_x = s.items(.max_x),
+            .max_y = s.items(.max_y),
+        };
     }
 
     pub fn update(
@@ -342,16 +355,7 @@ pub const SteeringSystem = struct {
     }
 
     fn clearSelectedWork(self: *SteeringSystem) void {
-        self.start_x.clearRetainingCapacity();
-        self.start_y.clearRetainingCapacity();
-        self.base_dir_x.clearRetainingCapacity();
-        self.base_dir_y.clearRetainingCapacity();
-        self.final_dir_x.clearRetainingCapacity();
-        self.final_dir_y.clearRetainingCapacity();
-        self.selected_agent_radii.clearRetainingCapacity();
-        self.selected_avoidance_radii.clearRetainingCapacity();
-        self.selected_avoidance_weights.clearRetainingCapacity();
-        self.selected_max_neighbor_samples.clearRetainingCapacity();
+        self.selected_work_rows.clearRetainingCapacity();
     }
 
     fn gatherWorldSnapshot(
@@ -364,39 +368,31 @@ pub const SteeringSystem = struct {
     ) !void {
         // The snapshot uses previous fixed-step positions. Steering output for
         // this step should not depend on partially updated movement columns.
-        self.all_agent_entities.clearRetainingCapacity();
-        self.all_agent_x.clearRetainingCapacity();
-        self.all_agent_y.clearRetainingCapacity();
-        self.all_agent_radii.clearRetainingCapacity();
+        self.agent_snapshot_rows.clearRetainingCapacity();
         self.agent_cell_entries.clearRetainingCapacity();
         self.agent_cell_ranges.clearRetainingCapacity();
-        self.obstacle_min_x.clearRetainingCapacity();
-        self.obstacle_min_y.clearRetainingCapacity();
-        self.obstacle_max_x.clearRetainingCapacity();
-        self.obstacle_max_y.clearRetainingCapacity();
+        self.obstacle_snapshot_rows.clearRetainingCapacity();
         self.spatial_cell_size = spatialCellSize(steering);
         self.spatial_obstacle_query_extra = 0;
 
-        try self.all_agent_entities.ensureTotalCapacity(self.allocator, steering.entities.len);
-        try self.all_agent_x.ensureTotalCapacity(self.allocator, steering.entities.len);
-        try self.all_agent_y.ensureTotalCapacity(self.allocator, steering.entities.len);
-        try self.all_agent_radii.ensureTotalCapacity(self.allocator, steering.entities.len);
+        try self.agent_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(steering.entities.len));
         try self.agent_cell_entries.ensureTotalCapacity(self.allocator, steering.entities.len);
         try self.agent_cell_ranges.ensureTotalCapacity(self.allocator, steering.entities.len);
+        var agent_row_slice = self.agent_snapshot_rows.slice();
         for (steering.entities, 0..) |entity, steering_index| {
             const movement_index = data.movementBodyDenseIndex(entity) orelse continue;
-            self.all_agent_entities.appendAssumeCapacity(entity);
-            self.all_agent_x.appendAssumeCapacity(movement.previous_x[movement_index]);
-            self.all_agent_y.appendAssumeCapacity(movement.previous_y[movement_index]);
-            self.all_agent_radii.appendAssumeCapacity(steering.agent_radii[steering_index]);
+            appendMalRow(AgentSnapshotRow, &self.agent_snapshot_rows, &agent_row_slice, .{
+                .entity = entity,
+                .x = movement.previous_x[movement_index],
+                .y = movement.previous_y[movement_index],
+                .radius = steering.agent_radii[steering_index],
+            });
         }
 
-        try self.obstacle_min_x.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
-        try self.obstacle_min_y.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
-        try self.obstacle_max_x.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
-        try self.obstacle_max_y.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
+        try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(collision_responses.entities.len));
         try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
         try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
+        var obstacle_row_slice = self.obstacle_snapshot_rows.slice();
         var signature: u64 = 1469598103934665603; // FNV offset basis
         for (collision_responses.entities, 0..) |obstacle_entity, response_index| {
             if (collision_responses.mobilities[response_index] != .static) continue;
@@ -407,10 +403,12 @@ pub const SteeringSystem = struct {
             const size_x = collision_bounds.size_x[bounds_index];
             const size_y = collision_bounds.size_y[bounds_index];
             self.spatial_obstacle_query_extra = @max(self.spatial_obstacle_query_extra, @max(size_x, size_y) * 0.5);
-            self.obstacle_min_x.appendAssumeCapacity(min_x);
-            self.obstacle_min_y.appendAssumeCapacity(min_y);
-            self.obstacle_max_x.appendAssumeCapacity(min_x + size_x);
-            self.obstacle_max_y.appendAssumeCapacity(min_y + size_y);
+            appendMalRow(ObstacleSnapshotRow, &self.obstacle_snapshot_rows, &obstacle_row_slice, .{
+                .min_x = min_x,
+                .min_y = min_y,
+                .max_x = min_x + size_x,
+                .max_y = min_y + size_y,
+            });
             // Fold identity + geometry so the obstacle index rebuilds whenever the
             // static set, an obstacle's position/size, or the iteration order changes.
             signature = foldSignature(signature, obstacle_entity.index);
@@ -436,9 +434,10 @@ pub const SteeringSystem = struct {
         // binary search per neighboring cell instead of scanning every actor. The
         // agent index rebuilds every step (agents move); the obstacle index is
         // rebuilt only when its signature changed (static obstacles do not move).
-        for (self.all_agent_entities.items, 0..) |_, index| {
-            const cell_x = spatialCell(self.all_agent_x.items[index], self.spatial_cell_size);
-            const cell_y = spatialCell(self.all_agent_y.items[index], self.spatial_cell_size);
+        const agents = self.agentSnapshotSliceConst();
+        for (0..agents.len()) |index| {
+            const cell_x = spatialCell(agents.x[index], self.spatial_cell_size);
+            const cell_y = spatialCell(agents.y[index], self.spatial_cell_size);
             self.agent_cell_entries.appendAssumeCapacity(.{
                 .cell_x = cell_x,
                 .cell_y = cell_y,
@@ -450,7 +449,12 @@ pub const SteeringSystem = struct {
         if (!rebuild_obstacles) return;
         self.obstacle_cell_entries.clearRetainingCapacity();
         self.obstacle_cell_ranges.clearRetainingCapacity();
-        for (self.obstacle_min_x.items, self.obstacle_min_y.items, self.obstacle_max_x.items, self.obstacle_max_y.items, 0..) |min_x, min_y, max_x, max_y, index| {
+        const obstacles = self.obstacleSnapshotSliceConst();
+        for (0..obstacles.len()) |index| {
+            const min_x = obstacles.min_x[index];
+            const min_y = obstacles.min_y[index];
+            const max_x = obstacles.max_x[index];
+            const max_y = obstacles.max_y[index];
             const center_x = (min_x + max_x) * 0.5;
             const center_y = (min_y + max_y) * 0.5;
             const cell_x = spatialCell(center_x, self.spatial_cell_size);
@@ -475,16 +479,7 @@ pub const SteeringSystem = struct {
         // This stage turns pathfinding status into base directions and marks any
         // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
-        try self.start_x.ensureTotalCapacity(self.allocator, count);
-        try self.start_y.ensureTotalCapacity(self.allocator, count);
-        try self.base_dir_x.ensureTotalCapacity(self.allocator, count);
-        try self.base_dir_y.ensureTotalCapacity(self.allocator, count);
-        try self.final_dir_x.ensureTotalCapacity(self.allocator, count);
-        try self.final_dir_y.ensureTotalCapacity(self.allocator, count);
-        try self.selected_agent_radii.ensureTotalCapacity(self.allocator, count);
-        try self.selected_avoidance_radii.ensureTotalCapacity(self.allocator, count);
-        try self.selected_avoidance_weights.ensureTotalCapacity(self.allocator, count);
-        try self.selected_max_neighbor_samples.ensureTotalCapacity(self.allocator, count);
+        try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(count));
         try resetIndexScratch(&self.runtime_index_by_steering, self.allocator, steering.entities.len);
         for (self.runtime_rows.items, 0..) |row, runtime_index| {
             const steering_index = data.steeringAgentDenseIndex(row.entity) orelse continue;
@@ -492,6 +487,7 @@ pub const SteeringSystem = struct {
         }
 
         var request_count: usize = 0;
+        var work_row_slice = self.selected_work_rows.slice();
         for (self.selected.items) |*selected| {
             const steering_agent = steeringAgentAt(steering, selected.steering_index);
             const start = math.Vec2{
@@ -504,16 +500,18 @@ pub const SteeringSystem = struct {
             const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
 
             self.updateProgress(selected, runtime, path_dir.progress_distance, steering_agent, path_dir.status_allows_replan, stats, &request_count);
-            self.start_x.appendAssumeCapacity(start.x);
-            self.start_y.appendAssumeCapacity(start.y);
-            self.base_dir_x.appendAssumeCapacity(base_dir.x);
-            self.base_dir_y.appendAssumeCapacity(base_dir.y);
-            self.final_dir_x.appendAssumeCapacity(0);
-            self.final_dir_y.appendAssumeCapacity(0);
-            self.selected_agent_radii.appendAssumeCapacity(steering_agent.agent_radius);
-            self.selected_avoidance_radii.appendAssumeCapacity(steering_agent.avoidance_radius);
-            self.selected_avoidance_weights.appendAssumeCapacity(steering_agent.avoidance_weight);
-            self.selected_max_neighbor_samples.appendAssumeCapacity(steering_agent.max_neighbor_samples);
+            appendMalRow(SelectedWorkRow, &self.selected_work_rows, &work_row_slice, .{
+                .start_x = start.x,
+                .start_y = start.y,
+                .base_dir_x = base_dir.x,
+                .base_dir_y = base_dir.y,
+                .final_dir_x = 0,
+                .final_dir_y = 0,
+                .selected_agent_radii = steering_agent.agent_radius,
+                .selected_avoidance_radii = steering_agent.avoidance_radius,
+                .selected_avoidance_weights = steering_agent.avoidance_weight,
+                .selected_max_neighbor_samples = steering_agent.max_neighbor_samples,
+            });
         }
         stats.path_request_count = request_count;
     }
@@ -531,6 +529,7 @@ pub const SteeringSystem = struct {
         var request_writer = frame.path_requests.rangeWriter(request_range_base);
         // Path requests are appended as their own range so steering can coexist
         // with future producers without rebuilding earlier stream offsets.
+        const work = self.selectedWorkSliceConst();
         for (self.selected.items, 0..) |selected, index| {
             if (!selected.emit_path_request) continue;
             request_writer.write(PathRequest{
@@ -542,7 +541,7 @@ pub const SteeringSystem = struct {
                 // lands, source this from a per-entity level column.
                 .start_level = agent_start_level,
                 .goal_level = selected.intent.goal_level,
-                .start = .{ .x = self.start_x.items[index], .y = self.start_y.items[index] },
+                .start = .{ .x = work.start_x[index], .y = work.start_y[index] },
                 .goal = selected.intent.goal,
             });
         }
@@ -713,26 +712,11 @@ pub const SteeringSystem = struct {
     fn jobContext(self: *SteeringSystem, frame: *SimulationFrame, range_base: usize) SteeringJobContext {
         return .{
             .selected = self.selected.items,
-            .start_x = self.start_x.items,
-            .start_y = self.start_y.items,
-            .base_dir_x = self.base_dir_x.items,
-            .base_dir_y = self.base_dir_y.items,
-            .final_dir_x = self.final_dir_x.items,
-            .final_dir_y = self.final_dir_y.items,
-            .selected_agent_radii = self.selected_agent_radii.items,
-            .selected_avoidance_radii = self.selected_avoidance_radii.items,
-            .selected_avoidance_weights = self.selected_avoidance_weights.items,
-            .selected_max_neighbor_samples = self.selected_max_neighbor_samples.items,
-            .all_agent_entities = self.all_agent_entities.items,
-            .all_agent_x = self.all_agent_x.items,
-            .all_agent_y = self.all_agent_y.items,
-            .all_agent_radii = self.all_agent_radii.items,
+            .work = self.selectedWorkSlice(),
+            .agents = self.agentSnapshotSliceConst(),
+            .obstacles = self.obstacleSnapshotSliceConst(),
             .agent_cell_entries = self.agent_cell_entries.items,
             .agent_cell_ranges = self.agent_cell_ranges.items,
-            .obstacle_min_x = self.obstacle_min_x.items,
-            .obstacle_min_y = self.obstacle_min_y.items,
-            .obstacle_max_x = self.obstacle_max_x.items,
-            .obstacle_max_y = self.obstacle_max_y.items,
             .obstacle_cell_entries = self.obstacle_cell_entries.items,
             .obstacle_cell_ranges = self.obstacle_cell_ranges.items,
             .spatial_cell_size = self.spatial_cell_size,
@@ -744,6 +728,95 @@ pub const SteeringSystem = struct {
             .intents = &frame.intents,
             .range_base = range_base,
         };
+    }
+};
+
+const SelectedWorkRow = struct {
+    start_x: f32,
+    start_y: f32,
+    base_dir_x: f32,
+    base_dir_y: f32,
+    final_dir_x: f32,
+    final_dir_y: f32,
+    selected_agent_radii: f32,
+    selected_avoidance_radii: f32,
+    selected_avoidance_weights: f32,
+    selected_max_neighbor_samples: u16,
+};
+
+const AgentSnapshotRow = struct {
+    entity: EntityId,
+    x: f32,
+    y: f32,
+    radius: f32,
+};
+
+const ObstacleSnapshotRow = struct {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+};
+
+fn appendMalRow(comptime Row: type, rows: *std.MultiArrayList(Row), row_slice: *std.MultiArrayList(Row).Slice, row: Row) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+
+pub const SelectedWorkSlice = struct {
+    start_x: HotF32Slice,
+    start_y: HotF32Slice,
+    base_dir_x: HotF32Slice,
+    base_dir_y: HotF32Slice,
+    final_dir_x: HotF32Slice,
+    final_dir_y: HotF32Slice,
+    selected_agent_radii: HotF32Slice,
+    selected_avoidance_radii: HotF32Slice,
+    selected_avoidance_weights: HotF32Slice,
+    selected_max_neighbor_samples: []u16,
+
+    pub fn len(self: SelectedWorkSlice) usize {
+        return self.start_x.len;
+    }
+};
+
+pub const ConstSelectedWorkSlice = struct {
+    start_x: ConstHotF32Slice,
+    start_y: ConstHotF32Slice,
+    base_dir_x: ConstHotF32Slice,
+    base_dir_y: ConstHotF32Slice,
+    final_dir_x: ConstHotF32Slice,
+    final_dir_y: ConstHotF32Slice,
+    selected_agent_radii: ConstHotF32Slice,
+    selected_avoidance_radii: ConstHotF32Slice,
+    selected_avoidance_weights: ConstHotF32Slice,
+    selected_max_neighbor_samples: []const u16,
+
+    pub fn len(self: ConstSelectedWorkSlice) usize {
+        return self.start_x.len;
+    }
+};
+
+pub const ConstAgentSnapshotSlice = struct {
+    entity: []const EntityId,
+    x: ConstHotF32Slice,
+    y: ConstHotF32Slice,
+    radius: ConstHotF32Slice,
+
+    pub fn len(self: ConstAgentSnapshotSlice) usize {
+        return self.entity.len;
+    }
+};
+
+pub const ConstObstacleSnapshotSlice = struct {
+    min_x: ConstHotF32Slice,
+    min_y: ConstHotF32Slice,
+    max_x: ConstHotF32Slice,
+    max_y: ConstHotF32Slice,
+
+    pub fn len(self: ConstObstacleSnapshotSlice) usize {
+        return self.min_x.len;
     }
 };
 
@@ -807,26 +880,11 @@ const SteeringJobContext = struct {
     // Worker context is immutable input plus range-indexed output columns and a
     // pre-prefixed SimulationFrame stream.
     selected: []const SelectedIntent,
-    start_x: []const f32,
-    start_y: []const f32,
-    base_dir_x: []const f32,
-    base_dir_y: []const f32,
-    final_dir_x: []f32,
-    final_dir_y: []f32,
-    selected_agent_radii: []const f32,
-    selected_avoidance_radii: []const f32,
-    selected_avoidance_weights: []const f32,
-    selected_max_neighbor_samples: []const u16,
-    all_agent_entities: []const EntityId,
-    all_agent_x: []const f32,
-    all_agent_y: []const f32,
-    all_agent_radii: []const f32,
+    work: SelectedWorkSlice,
+    agents: ConstAgentSnapshotSlice,
+    obstacles: ConstObstacleSnapshotSlice,
     agent_cell_entries: []const SpatialCellEntry,
     agent_cell_ranges: []const SpatialCellRange,
-    obstacle_min_x: []const f32,
-    obstacle_min_y: []const f32,
-    obstacle_max_x: []const f32,
-    obstacle_max_y: []const f32,
     obstacle_cell_entries: []const SpatialCellEntry,
     obstacle_cell_ranges: []const SpatialCellRange,
     spatial_cell_size: f32,
@@ -867,8 +925,8 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     var writer = job.intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |index| {
         const result = computeAvoidance(job, index);
-        job.final_dir_x[index] = result.direction.x;
-        job.final_dir_y[index] = result.direction.y;
+        job.work.final_dir_x[index] = result.direction.x;
+        job.work.final_dir_y[index] = result.direction.y;
         job.agent_neighbor_counts[index] = result.agent_samples;
         job.obstacle_counts[index] = result.obstacle_samples;
         job.agent_candidate_counts[index] = result.agent_candidate_checks;
@@ -885,21 +943,21 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
 fn computeAvoidance(job: *const SteeringJobContext, index: usize) AvoidanceResult {
     // Start with the path/direct base direction, then add bounded local pushes
     // from nearby agents and static obstacle boxes.
-    var ax = job.base_dir_x[index];
-    var ay = job.base_dir_y[index];
+    var ax = job.work.base_dir_x[index];
+    var ay = job.work.base_dir_y[index];
     var sample_count: u16 = 0;
     var agent_candidate_count: u16 = 0;
-    const max_samples = job.selected_max_neighbor_samples[index];
+    const max_samples = job.work.selected_max_neighbor_samples[index];
     if (max_samples > 0) {
         accumulateAgentAvoidanceBounded(job, index, &ax, &ay, &sample_count, &agent_candidate_count, max_samples);
     }
 
     var obstacle_count: u16 = 0;
     var obstacle_candidate_count: u16 = 0;
-    const start_x = job.start_x[index];
-    const start_y = job.start_y[index];
-    const radius = job.selected_avoidance_radii[index] + job.selected_agent_radii[index];
-    const weight = job.selected_avoidance_weights[index];
+    const start_x = job.work.start_x[index];
+    const start_y = job.work.start_y[index];
+    const radius = job.work.selected_avoidance_radii[index] + job.work.selected_agent_radii[index];
+    const weight = job.work.selected_avoidance_weights[index];
     const obstacle_query_radius = radius + job.spatial_obstacle_query_extra;
     const min_cell_x = spatialCell(start_x - obstacle_query_radius, job.spatial_cell_size);
     const max_cell_x = spatialCell(start_x + obstacle_query_radius, job.spatial_cell_size);
@@ -941,10 +999,10 @@ fn accumulateObstacleSample(
 ) void {
     // Axis-aligned obstacle push uses the closest point on the box. If the agent
     // is inside the box, push away from the center to avoid a zero vector.
-    const min_x = job.obstacle_min_x[obstacle_index];
-    const min_y = job.obstacle_min_y[obstacle_index];
-    const max_x = job.obstacle_max_x[obstacle_index];
-    const max_y = job.obstacle_max_y[obstacle_index];
+    const min_x = job.obstacles.min_x[obstacle_index];
+    const min_y = job.obstacles.min_y[obstacle_index];
+    const max_x = job.obstacles.max_x[obstacle_index];
+    const max_y = job.obstacles.max_y[obstacle_index];
     const closest_x = math.clampMinMax(start_x, min_x, max_x);
     const closest_y = math.clampMinMax(start_y, min_y, max_y);
     var dx = start_x - closest_x;
@@ -974,11 +1032,11 @@ fn accumulateAgentAvoidanceBounded(
 ) void {
     // Candidate and sample caps are separate: candidate caps bound dense-cell
     // cost, while sample caps keep behavior stable for configured agents.
-    const start_x = job.start_x[index];
-    const start_y = job.start_y[index];
-    const avoidance_radius = job.selected_avoidance_radii[index];
-    const query_radius = avoidance_radius + job.selected_agent_radii[index];
-    const weight = job.selected_avoidance_weights[index];
+    const start_x = job.work.start_x[index];
+    const start_y = job.work.start_y[index];
+    const avoidance_radius = job.work.selected_avoidance_radii[index];
+    const query_radius = avoidance_radius + job.work.selected_agent_radii[index];
+    const weight = job.work.selected_avoidance_weights[index];
     const self_entity = job.selected[index].entity;
     const min_cell_x = spatialCell(start_x - query_radius, job.spatial_cell_size);
     const max_cell_x = spatialCell(start_x + query_radius, job.spatial_cell_size);
@@ -994,10 +1052,10 @@ fn accumulateAgentAvoidanceBounded(
                 if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
                 candidate_count.* += 1;
                 const other_index = entry.index;
-                if (entityIdsEqual(job.all_agent_entities[other_index], self_entity)) continue;
-                const dx = start_x - job.all_agent_x[other_index];
-                const dy = start_y - job.all_agent_y[other_index];
-                const combined_radius = avoidance_radius + job.all_agent_radii[other_index];
+                if (entityIdsEqual(job.agents.entity[other_index], self_entity)) continue;
+                const dx = start_x - job.agents.x[other_index];
+                const dy = start_y - job.agents.y[other_index];
+                const combined_radius = avoidance_radius + job.agents.radius[other_index];
                 const dist2 = dx * dx + dy * dy;
                 if (dist2 > 0.0001 and dist2 < combined_radius * combined_radius) {
                     accumulateAgentSample(dx, dy, combined_radius, weight, ax, ay, sample_count);

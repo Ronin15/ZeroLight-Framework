@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const CollisionResponse = @import("../data_system.zig").CollisionResponse;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
@@ -13,7 +14,39 @@ const CollisionTriggerEvent = @import("../simulation.zig").CollisionTriggerEvent
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const simd = @import("../../core/simd.zig");
 
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
+const collision_response_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
+
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, collision_response_range_alignment_items);
+}
+
+const ResponseIntentKind = enum {
+    solid,
+    bounce,
+};
+
+const IntentRow = struct {
+    entity: EntityId,
+    movement_index: usize,
+    normal_x: f32,
+    normal_y: f32,
+    penetration: f32,
+    restitution: f32,
+    correction_x: f32,
+    correction_y: f32,
+    velocity_scale: f32,
+    kind: ResponseIntentKind,
+};
+
+fn appendIntentRow(
+    rows: *std.MultiArrayList(IntentRow),
+    row_slice: *std.MultiArrayList(IntentRow).Slice,
+    row: IntentRow,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
 
 pub const CollisionResponseStats = struct {
     contact_count: usize = 0,
@@ -23,16 +56,8 @@ pub const CollisionResponseStats = struct {
 
 pub const CollisionResponseSystem = struct {
     allocator: std.mem.Allocator,
-    intent_entities: std.ArrayList(EntityId) = .empty,
-    movement_indices: std.ArrayList(usize) = .empty,
-    normal_x: HotF32List = .empty,
-    normal_y: HotF32List = .empty,
-    penetration: HotF32List = .empty,
-    restitution: HotF32List = .empty,
-    correction_x: HotF32List = .empty,
-    correction_y: HotF32List = .empty,
-    velocity_scale: HotF32List = .empty,
-    kinds: std.ArrayList(ResponseIntentKind) = .empty,
+    intent_rows: std.MultiArrayList(IntentRow) = .{},
+    intent_row_slice: std.MultiArrayList(IntentRow).Slice = .empty,
     trigger_pairs: std.ArrayList(CollisionTriggerEvent) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) CollisionResponseSystem {
@@ -41,16 +66,7 @@ pub const CollisionResponseSystem = struct {
 
     pub fn deinit(self: *CollisionResponseSystem) void {
         self.trigger_pairs.deinit(self.allocator);
-        self.kinds.deinit(self.allocator);
-        self.velocity_scale.deinit(self.allocator);
-        self.correction_y.deinit(self.allocator);
-        self.correction_x.deinit(self.allocator);
-        self.restitution.deinit(self.allocator);
-        self.penetration.deinit(self.allocator);
-        self.normal_y.deinit(self.allocator);
-        self.normal_x.deinit(self.allocator);
-        self.movement_indices.deinit(self.allocator);
-        self.intent_entities.deinit(self.allocator);
+        self.intent_rows.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -63,13 +79,14 @@ pub const CollisionResponseSystem = struct {
         self.clearIntentsRetainingCapacity();
         try self.ensureIntentCapacity(contacts.len * 2);
         try self.ensureTriggerCapacity(contacts.len);
+        self.intent_row_slice = self.intent_rows.slice();
         frame.collision_triggers.clearRetainingCapacity();
         const trigger_count = try self.gatherIntentsAndEvents(data, frame, contacts);
         self.computeIntentMathSimd();
         self.applyIntents(data);
         return .{
             .contact_count = contacts.len,
-            .intent_count = self.intent_entities.items.len,
+            .intent_count = self.intent_rows.len,
             .trigger_count = trigger_count,
         };
     }
@@ -154,95 +171,98 @@ pub const CollisionResponseSystem = struct {
         penetration: f32,
         response: CollisionResponse,
     ) void {
-        self.intent_entities.appendAssumeCapacity(entity);
-        self.movement_indices.appendAssumeCapacity(movement_index);
-        self.normal_x.appendAssumeCapacity(normal_x);
-        self.normal_y.appendAssumeCapacity(normal_y);
-        self.penetration.appendAssumeCapacity(penetration);
-        self.restitution.appendAssumeCapacity(response.restitution);
-        self.correction_x.appendAssumeCapacity(0);
-        self.correction_y.appendAssumeCapacity(0);
-        self.velocity_scale.appendAssumeCapacity(0);
-        self.kinds.appendAssumeCapacity(if (response.mode == .bounce) .bounce else .solid);
+        appendIntentRow(&self.intent_rows, &self.intent_row_slice, .{
+            .entity = entity,
+            .movement_index = movement_index,
+            .normal_x = normal_x,
+            .normal_y = normal_y,
+            .penetration = penetration,
+            .restitution = response.restitution,
+            .correction_x = 0,
+            .correction_y = 0,
+            .velocity_scale = 0,
+            .kind = if (response.mode == .bounce) .bounce else .solid,
+        });
     }
 
     fn computeIntentMathSimd(self: *CollisionResponseSystem) void {
-        const count = self.intent_entities.items.len;
+        const count = self.intent_rows.len;
+        if (count == 0) return;
+
+        const s = self.intent_rows.slice();
+        const normal_x = s.items(.normal_x);
+        const normal_y = s.items(.normal_y);
+        const penetration = s.items(.penetration);
+        const restitution = s.items(.restitution);
+        const correction_x = s.items(.correction_x);
+        const correction_y = s.items(.correction_y);
+        const velocity_scale = s.items(.velocity_scale);
+
         var index: usize = 0;
         const negative_one = simd.splatFloat4(-1);
         while (index + simd.lane_count <= count) : (index += simd.lane_count) {
-            const normal_x = simd.loadFloat4(self.normal_x.items[index..]);
-            const normal_y = simd.loadFloat4(self.normal_y.items[index..]);
-            const penetration = simd.loadFloat4(self.penetration.items[index..]);
-            const restitution = simd.loadFloat4(self.restitution.items[index..]);
-            simd.storeFloat4Slice(self.correction_x.items[index..], simd.mulFloat4(normal_x, penetration));
-            simd.storeFloat4Slice(self.correction_y.items[index..], simd.mulFloat4(normal_y, penetration));
-            simd.storeFloat4Slice(self.velocity_scale.items[index..], simd.mulFloat4(restitution, negative_one));
+            const normal_x_lanes = simd.loadFloat4(normal_x[index..]);
+            const normal_y_lanes = simd.loadFloat4(normal_y[index..]);
+            const penetration_lanes = simd.loadFloat4(penetration[index..]);
+            const restitution_lanes = simd.loadFloat4(restitution[index..]);
+            simd.storeFloat4Slice(correction_x[index..], simd.mulFloat4(normal_x_lanes, penetration_lanes));
+            simd.storeFloat4Slice(correction_y[index..], simd.mulFloat4(normal_y_lanes, penetration_lanes));
+            simd.storeFloat4Slice(velocity_scale[index..], simd.mulFloat4(restitution_lanes, negative_one));
         }
 
         while (index < count) : (index += 1) {
-            self.correction_x.items[index] = self.normal_x.items[index] * self.penetration.items[index];
-            self.correction_y.items[index] = self.normal_y.items[index] * self.penetration.items[index];
-            self.velocity_scale.items[index] = -self.restitution.items[index];
+            correction_x[index] = normal_x[index] * penetration[index];
+            correction_y[index] = normal_y[index] * penetration[index];
+            velocity_scale[index] = -restitution[index];
         }
     }
 
     fn applyIntents(self: *CollisionResponseSystem, data: *DataSystem) void {
+        const count = self.intent_rows.len;
+        if (count == 0) return;
+
+        const s = self.intent_rows.slice();
+        const entities = s.items(.entity);
+        const movement_indices = s.items(.movement_index);
+        const normal_x = s.items(.normal_x);
+        const normal_y = s.items(.normal_y);
+        const correction_x = s.items(.correction_x);
+        const correction_y = s.items(.correction_y);
+        const velocity_scale = s.items(.velocity_scale);
+        const kinds = s.items(.kind);
+
         var movement = data.movementBodySlice();
-        for (0..self.intent_entities.items.len) |index| {
-            const movement_index = movementIndexForIntent(data, movement, self.intent_entities.items[index], self.movement_indices.items[index]) orelse continue;
-            movement.position_x[movement_index] += self.correction_x.items[index];
-            movement.position_y[movement_index] += self.correction_y.items[index];
-            if (shouldApplyNormalVelocityResponse(movement.velocity_x[movement_index], self.normal_x.items[index])) {
-                switch (self.kinds.items[index]) {
+        for (0..count) |index| {
+            const movement_index = movementIndexForIntent(data, movement, entities[index], movement_indices[index]) orelse continue;
+            movement.position_x[movement_index] += correction_x[index];
+            movement.position_y[movement_index] += correction_y[index];
+            if (shouldApplyNormalVelocityResponse(movement.velocity_x[movement_index], normal_x[index])) {
+                switch (kinds[index]) {
                     .solid => movement.velocity_x[movement_index] = 0,
-                    .bounce => movement.velocity_x[movement_index] *= self.velocity_scale.items[index],
+                    .bounce => movement.velocity_x[movement_index] *= velocity_scale[index],
                 }
             }
-            if (shouldApplyNormalVelocityResponse(movement.velocity_y[movement_index], self.normal_y.items[index])) {
-                switch (self.kinds.items[index]) {
+            if (shouldApplyNormalVelocityResponse(movement.velocity_y[movement_index], normal_y[index])) {
+                switch (kinds[index]) {
                     .solid => movement.velocity_y[movement_index] = 0,
-                    .bounce => movement.velocity_y[movement_index] *= self.velocity_scale.items[index],
+                    .bounce => movement.velocity_y[movement_index] *= velocity_scale[index],
                 }
             }
         }
     }
 
     fn clearIntentsRetainingCapacity(self: *CollisionResponseSystem) void {
-        self.intent_entities.clearRetainingCapacity();
-        self.movement_indices.clearRetainingCapacity();
-        self.normal_x.clearRetainingCapacity();
-        self.normal_y.clearRetainingCapacity();
-        self.penetration.clearRetainingCapacity();
-        self.restitution.clearRetainingCapacity();
-        self.correction_x.clearRetainingCapacity();
-        self.correction_y.clearRetainingCapacity();
-        self.velocity_scale.clearRetainingCapacity();
-        self.kinds.clearRetainingCapacity();
+        self.intent_rows.clearRetainingCapacity();
         self.trigger_pairs.clearRetainingCapacity();
     }
 
     fn ensureIntentCapacity(self: *CollisionResponseSystem, capacity: usize) !void {
-        try self.intent_entities.ensureTotalCapacity(self.allocator, capacity);
-        try self.movement_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.normal_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.normal_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.penetration.ensureTotalCapacity(self.allocator, capacity);
-        try self.restitution.ensureTotalCapacity(self.allocator, capacity);
-        try self.correction_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.correction_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.velocity_scale.ensureTotalCapacity(self.allocator, capacity);
-        try self.kinds.ensureTotalCapacity(self.allocator, capacity);
+        try self.intent_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
     }
 
     fn ensureTriggerCapacity(self: *CollisionResponseSystem, capacity: usize) !void {
         try self.trigger_pairs.ensureTotalCapacity(self.allocator, capacity);
     }
-};
-
-const ResponseIntentKind = enum {
-    solid,
-    bounce,
 };
 
 fn movementIndexForIntent(data: *const DataSystem, movement: MovementBodySlice, entity: EntityId, cached_index: usize) ?usize {

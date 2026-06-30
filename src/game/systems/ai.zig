@@ -37,7 +37,35 @@ const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(64));
+pub const HotF32Slice = []f32;
+
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, ai_range_alignment_items);
+}
+
+const AiGatherRow = struct {
+    entity: EntityId,
+    pos_x: f32,
+    pos_y: f32,
+    behavior: AiBehavior,
+    wander_amplitude: f32,
+    seek_weight: f32,
+    sep_x: f32,
+    sep_y: f32,
+    separation_neighbor_count: u8,
+    separation_candidate_count: u16,
+};
+
+fn appendAiGatherRow(
+    rows: *std.MultiArrayList(AiGatherRow),
+    row_slice: *std.MultiArrayList(AiGatherRow).Slice,
+    row: AiGatherRow,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+
 const grid_cell_size: f32 = 32.0;
 const separation_radius: f32 = 48.0;
 const separation_radius2: f32 = separation_radius * separation_radius;
@@ -83,18 +111,7 @@ pub const AiStats = struct {
 pub const AiSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
-    entities: std.ArrayList(EntityId) = .empty,
-    pos_x: HotF32List = .empty,
-    pos_y: HotF32List = .empty,
-    behaviors: std.ArrayList(AiBehavior) = .empty,
-    wander_amplitudes: HotF32List = .empty,
-    seek_weights: HotF32List = .empty,
-    // Precomputed separation contributions (main-thread O(N) fill after gather, read-only in workers).
-    // Eliminates per-item O(N) scans inside jobs (was quadratic total in worker path).
-    sep_x: HotF32List = .empty,
-    sep_y: HotF32List = .empty,
-    separation_neighbor_counts: std.ArrayList(u8) = .empty,
-    separation_candidate_counts: std.ArrayList(u16) = .empty,
+    rows: std.MultiArrayList(AiGatherRow) = .{},
     cell_entries: std.ArrayList(CellEntry) = .empty,
     cell_ranges: std.ArrayList(CellRange) = .empty,
     separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -111,16 +128,7 @@ pub const AiSystem = struct {
     pub fn deinit(self: *AiSystem) void {
         self.cell_ranges.deinit(self.allocator);
         self.cell_entries.deinit(self.allocator);
-        self.separation_candidate_counts.deinit(self.allocator);
-        self.separation_neighbor_counts.deinit(self.allocator);
-        self.sep_y.deinit(self.allocator);
-        self.sep_x.deinit(self.allocator);
-        self.seek_weights.deinit(self.allocator);
-        self.wander_amplitudes.deinit(self.allocator);
-        self.behaviors.deinit(self.allocator);
-        self.pos_y.deinit(self.allocator);
-        self.pos_x.deinit(self.allocator);
-        self.entities.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -136,7 +144,7 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
         try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
-        const entity_count = self.entities.items.len;
+        const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
             return .{};
@@ -144,6 +152,7 @@ pub const AiSystem = struct {
 
         const system_config = normalizedConfig(config, self);
         try self.buildSeparationGrid();
+        const gathered = self.rows.slice();
         const separation_selection = selectStageWork(
             thread_system,
             entity_count,
@@ -153,12 +162,12 @@ pub const AiSystem = struct {
             system_config.separation_adaptive_tuner,
         );
         var separation_context = AiSeparationContext{
-            .pos_x = self.pos_x.items,
-            .pos_y = self.pos_y.items,
-            .sep_x = self.sep_x.items,
-            .sep_y = self.sep_y.items,
-            .neighbor_counts = self.separation_neighbor_counts.items,
-            .candidate_counts = self.separation_candidate_counts.items,
+            .pos_x = gathered.items(.pos_x),
+            .pos_y = gathered.items(.pos_y),
+            .sep_x = gathered.items(.sep_x),
+            .sep_y = gathered.items(.sep_y),
+            .neighbor_counts = gathered.items(.separation_neighbor_count),
+            .candidate_counts = gathered.items(.separation_candidate_count),
             .cell_entries = self.cell_entries.items,
             .cell_ranges = self.cell_ranges.items,
         };
@@ -186,14 +195,14 @@ pub const AiSystem = struct {
         const range_base = try navigation_stream.appendRangeCounts(rcount);
 
         var context = AiJobContext{
-            .entities = self.entities.items,
-            .pos_x = self.pos_x.items,
-            .pos_y = self.pos_y.items,
-            .behaviors = self.behaviors.items,
-            .wander_amplitudes = self.wander_amplitudes.items,
-            .seek_weights = self.seek_weights.items,
-            .sep_x = self.sep_x.items,
-            .sep_y = self.sep_y.items,
+            .entities = gathered.items(.entity),
+            .pos_x = gathered.items(.pos_x),
+            .pos_y = gathered.items(.pos_y),
+            .behaviors = gathered.items(.behavior),
+            .wander_amplitudes = gathered.items(.wander_amplitude),
+            .seek_weights = gathered.items(.seek_weight),
+            .sep_x = gathered.items(.sep_x),
+            .sep_y = gathered.items(.sep_y),
             .navigation_intents = navigation_stream,
             .target_x = target_x,
             .target_y = target_y,
@@ -223,8 +232,8 @@ pub const AiSystem = struct {
             .entity_count = entity_count,
             .intent_count = entity_count,
             .navigation_intent_count = entity_count,
-            .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
-            .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
+            .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
+            .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .batch = separation_batch,
@@ -242,10 +251,19 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds;
         try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
-        const entity_count = self.entities.items.len;
+        const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         try self.buildSeparationGrid();
         self.computeAiSeparationsSerial();
+        const gathered = self.rows.slice();
+        const entities = gathered.items(.entity);
+        const pos_x = gathered.items(.pos_x);
+        const pos_y = gathered.items(.pos_y);
+        const behaviors = gathered.items(.behavior);
+        const wander_amplitudes = gathered.items(.wander_amplitude);
+        const seek_weights = gathered.items(.seek_weight);
+        const sep_x = gathered.items(.sep_x);
+        const sep_y = gathered.items(.sep_y);
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -259,27 +277,27 @@ pub const AiSystem = struct {
         const ty = target.y;
         for (range.start..range.end) |i| {
             const base_dir = decideDir(
-                self.behaviors.items[i],
-                self.pos_x.items[i],
-                self.pos_y.items[i],
+                behaviors[i],
+                pos_x[i],
+                pos_y[i],
                 tx,
                 ty,
-                self.wander_amplitudes.items[i],
-                self.seek_weights.items[i],
+                wander_amplitudes[i],
+                seek_weights[i],
                 config.intent_seed,
-                self.entities.items[i].index,
+                entities[i].index,
             );
-            const sep_x = if (i < self.sep_x.items.len) self.sep_x.items[i] else 0;
-            const sep_y = if (i < self.sep_y.items.len) self.sep_y.items[i] else 0;
-            const dir = applySeparationAndNormalize(base_dir, sep_x, sep_y);
+            const sx = if (i < sep_x.len) sep_x[i] else 0;
+            const sy = if (i < sep_y.len) sep_y[i] else 0;
+            const dir = applySeparationAndNormalize(base_dir, sx, sy);
 
             writer.write(.{
-                .entity = self.entities.items[i],
+                .entity = entities[i],
                 .kind = system_config.nav_request_kind,
                 .goal = .{ .x = tx, .y = ty },
                 .direct_direction_x = dir.x,
                 .direct_direction_y = dir.y,
-                .priority = priorityForBehavior(self.behaviors.items[i]),
+                .priority = priorityForBehavior(behaviors[i]),
             });
         }
         writer.finish();
@@ -290,8 +308,8 @@ pub const AiSystem = struct {
             .entity_count = entity_count,
             .intent_count = entity_count,
             .navigation_intent_count = entity_count,
-            .separation_candidate_checks = sumU16(self.separation_candidate_counts.items),
-            .separation_neighbor_samples = sumU8(self.separation_neighbor_counts.items),
+            .separation_candidate_checks = sumU16(gathered.items(.separation_candidate_count)),
+            .separation_neighbor_samples = sumU8(gathered.items(.separation_neighbor_count)),
             .separation_batch = separation_batch,
             .intent_batch = intent_batch,
             .batch = separation_batch,
@@ -310,16 +328,7 @@ pub const AiSystem = struct {
         // selected ai rows for this step, otherwise every ai agent.
         const n = if (scope_dense_indices) |idx| idx.len else ai_slice.entities.len;
         if (n == 0) return;
-        try self.entities.ensureTotalCapacity(self.allocator, n);
-        try self.pos_x.ensureTotalCapacity(self.allocator, n);
-        try self.pos_y.ensureTotalCapacity(self.allocator, n);
-        try self.behaviors.ensureTotalCapacity(self.allocator, n);
-        try self.wander_amplitudes.ensureTotalCapacity(self.allocator, n);
-        try self.seek_weights.ensureTotalCapacity(self.allocator, n);
-        try self.sep_x.ensureTotalCapacity(self.allocator, n);
-        try self.sep_y.ensureTotalCapacity(self.allocator, n);
-        try self.separation_neighbor_counts.ensureTotalCapacity(self.allocator, n);
-        try self.separation_candidate_counts.ensureTotalCapacity(self.allocator, n);
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
         try self.cell_entries.ensureTotalCapacity(self.allocator, n);
         try self.cell_ranges.ensureTotalCapacity(self.allocator, n);
 
@@ -327,50 +336,47 @@ pub const AiSystem = struct {
         // and returns direct dense movement rows without transient high-water index tables.
         // The scoped path walks only the selected ai indices; both paths gather the
         // same per-row columns, so all downstream stages operate on the gathered set.
+        var row_slice = self.rows.slice();
         var k: usize = 0;
         while (k < n) : (k += 1) {
             const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
             const ent = ai_slice.entities[i];
             const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            self.entities.appendAssumeCapacity(ent);
-            self.pos_x.appendAssumeCapacity(movement.previous_x[mi]);
-            self.pos_y.appendAssumeCapacity(movement.previous_y[mi]);
-            self.behaviors.appendAssumeCapacity(ai_slice.behaviors[i]);
-            self.wander_amplitudes.appendAssumeCapacity(ai_slice.wander_amplitudes[i]);
-            self.seek_weights.appendAssumeCapacity(ai_slice.seek_weights[i]);
-            self.sep_x.appendAssumeCapacity(0);
-            self.sep_y.appendAssumeCapacity(0);
-            self.separation_neighbor_counts.appendAssumeCapacity(0);
-            self.separation_candidate_counts.appendAssumeCapacity(0);
+            appendAiGatherRow(&self.rows, &row_slice, .{
+                .entity = ent,
+                .pos_x = movement.previous_x[mi],
+                .pos_y = movement.previous_y[mi],
+                .behavior = ai_slice.behaviors[i],
+                .wander_amplitude = ai_slice.wander_amplitudes[i],
+                .seek_weight = ai_slice.seek_weights[i],
+                .sep_x = 0,
+                .sep_y = 0,
+                .separation_neighbor_count = 0,
+                .separation_candidate_count = 0,
+            });
         }
     }
 
     fn clearWork(self: *AiSystem) void {
-        self.entities.clearRetainingCapacity();
-        self.pos_x.clearRetainingCapacity();
-        self.pos_y.clearRetainingCapacity();
-        self.behaviors.clearRetainingCapacity();
-        self.wander_amplitudes.clearRetainingCapacity();
-        self.seek_weights.clearRetainingCapacity();
-        self.sep_x.clearRetainingCapacity();
-        self.sep_y.clearRetainingCapacity();
-        self.separation_neighbor_counts.clearRetainingCapacity();
-        self.separation_candidate_counts.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
         self.cell_entries.clearRetainingCapacity();
         self.cell_ranges.clearRetainingCapacity();
     }
 
     fn buildSeparationGrid(self: *AiSystem) !void {
-        const n = self.entities.items.len;
+        const n = self.rows.len;
         if (n == 0) return;
-        for (self.sep_x.items) |*v| v.* = 0;
-        for (self.sep_y.items) |*v| v.* = 0;
-        @memset(self.separation_neighbor_counts.items, 0);
-        @memset(self.separation_candidate_counts.items, 0);
+        const gathered = self.rows.slice();
+        const pos_x = gathered.items(.pos_x);
+        const pos_y = gathered.items(.pos_y);
+        @memset(gathered.items(.sep_x), 0);
+        @memset(gathered.items(.sep_y), 0);
+        @memset(gathered.items(.separation_neighbor_count), 0);
+        @memset(gathered.items(.separation_candidate_count), 0);
 
         for (0..n) |index| {
             self.cell_entries.appendAssumeCapacity(.{
-                .cell = cellForPosition(self.pos_x.items[index], self.pos_y.items[index]),
+                .cell = cellForPosition(pos_x[index], pos_y[index]),
                 .index = index,
             });
         }
@@ -388,17 +394,18 @@ pub const AiSystem = struct {
     }
 
     fn computeAiSeparationsSerial(self: *AiSystem) void {
+        const gathered = self.rows.slice();
         var context = AiSeparationContext{
-            .pos_x = self.pos_x.items,
-            .pos_y = self.pos_y.items,
-            .sep_x = self.sep_x.items,
-            .sep_y = self.sep_y.items,
-            .neighbor_counts = self.separation_neighbor_counts.items,
-            .candidate_counts = self.separation_candidate_counts.items,
+            .pos_x = gathered.items(.pos_x),
+            .pos_y = gathered.items(.pos_y),
+            .sep_x = gathered.items(.sep_x),
+            .sep_y = gathered.items(.sep_y),
+            .neighbor_counts = gathered.items(.separation_neighbor_count),
+            .candidate_counts = gathered.items(.separation_candidate_count),
             .cell_entries = self.cell_entries.items,
             .cell_ranges = self.cell_ranges.items,
         };
-        writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.entities.items.len }, WorkerId.main);
+        writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
 

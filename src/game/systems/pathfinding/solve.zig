@@ -259,12 +259,12 @@ pub fn relaxAbstractNode(
     h: u32,
 ) bool {
     const slot = abstract.slotFor(neighbor_ref) orelse return false;
-    if (abstract.slot_closed.items[slot]) return true;
+    if (abstract.slot_closed[slot]) return true;
     const candidate = parent_g +| cost;
-    if (candidate >= abstract.slot_g.items[slot]) return true;
-    abstract.slot_g.items[slot] = candidate;
-    abstract.slot_parent.items[slot] = parent_ref;
-    abstract.slot_via_link.items[slot] = via_link;
+    if (candidate >= abstract.slot_g[slot]) return true;
+    abstract.slot_g[slot] = candidate;
+    abstract.slot_parent[slot] = parent_ref;
+    abstract.slot_via_link[slot] = via_link;
     if (abstract.open.items.len >= abstract.open.capacity) return false;
     abstract.open.appendAssumeCapacity(.{ .index = neighbor_ref, .f = candidate +| h, .h = h });
     siftUp(abstract.open.items, abstract.open.items.len - 1);
@@ -307,6 +307,10 @@ pub fn abstractCorridor(
 ) AbstractResult {
     const abstract = &scratch.abstract;
     abstract.reset();
+    const abstract_closed = abstract.slot_closed;
+    const abstract_g = abstract.slot_g;
+    const abstract_parent = abstract.slot_parent;
+    const abstract_via_link = abstract.slot_via_link;
 
     // Seed the open set with the start cell's chunk-local-component portals on the start
     // level, costed by octile distance from the start.
@@ -318,9 +322,9 @@ pub fn abstractCorridor(
         const ref = packRef(start_level, local_node);
         const slot = abstract.slotFor(ref) orelse return .saturated;
         const g = octileCells(graph.width, @intCast(start_index), portal.cell_index);
-        abstract.slot_g.items[slot] = g;
-        abstract.slot_parent.items[slot] = no_ref;
-        abstract.slot_via_link.items[slot] = false;
+        abstract_g[slot] = g;
+        abstract_parent[slot] = no_ref;
+        abstract_via_link[slot] = false;
         if (abstract.open.items.len >= abstract.open.capacity) return .saturated;
         // Only the goal level has a cell coordinate comparable to the goal; off-level seed
         // portals use h=0 to keep the heuristic admissible (matches the relax paths below).
@@ -340,11 +344,11 @@ pub fn abstractCorridor(
         const current = popHeap(&abstract.open);
         const current_ref = current.index;
         const current_slot = abstract.slotFor(current_ref) orelse return .saturated;
-        if (abstract.slot_closed.items[current_slot]) continue;
+        if (abstract_closed[current_slot]) continue;
         // Lazy deletion: skip a superseded duplicate left in the heap by an earlier
         // g-improvement (f-h recovers its g; strict-greater never drops the best entry).
-        if (current.f -% current.h > abstract.slot_g.items[current_slot]) continue;
-        abstract.slot_closed.items[current_slot] = true;
+        if (current.f -% current.h > abstract_g[current_slot]) continue;
+        abstract_closed[current_slot] = true;
 
         const level = refLevel(current_ref);
         const local = refLocal(current_ref);
@@ -364,7 +368,7 @@ pub fn abstractCorridor(
             return .{ .found = .{ .crosses_level = start_level != goal_level } };
         }
 
-        const current_g = abstract.slot_g.items[current_slot];
+        const current_g = abstract_g[current_slot];
         // Intra-level CSR edges (target is a node slot on the same level).
         const begin = lg.portal_edge_start.items[local];
         const end = begin + lg.portal_edge_count.items[local];
@@ -425,6 +429,8 @@ pub const CorridorBuild = enum {
 // slot_via_link. Returns .ok when the corridor's root is a start-level portal.
 pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) CorridorBuild {
     abstract.corridor.clearRetainingCapacity();
+    const parent_col = abstract.slot_parent;
+    const via_link_col = abstract.slot_via_link;
     var node = goal_ref;
     var truncated = false;
     while (true) {
@@ -434,7 +440,7 @@ pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u
         }
         abstract.corridor.appendAssumeCapacity(node);
         const slot = abstract.slotFor(node) orelse break;
-        const parent = abstract.slot_parent.items[slot];
+        const parent = parent_col[slot];
         if (parent == no_ref) break;
         node = parent;
     }
@@ -448,7 +454,7 @@ pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u
     abstract.corridor_link.appendAssumeCapacity(false);
     for (1..abstract.corridor.items.len) |i| {
         const ref = abstract.corridor.items[i];
-        const via_link = if (abstract.slotFor(ref)) |slot| abstract.slot_via_link.items[slot] else false;
+        const via_link = if (abstract.slotFor(ref)) |slot| via_link_col[slot] else false;
         abstract.corridor_link.appendAssumeCapacity(via_link);
     }
     return if (refLevel(abstract.corridor.items[0]) == start_level) .ok else .none;
@@ -464,25 +470,28 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
         return .found;
     }
     scratch.reset();
+    const cell_closed = scratch.cell_closed;
+    const cell_g = scratch.cell_g;
+    const cell_parent = scratch.cell_parent;
     const width: i32 = @intCast(grid.width);
     const goal_x: i32 = @intCast(goal_index % grid.width);
     const goal_y: i32 = @intCast(goal_index / grid.width);
     const start_slot = scratch.slotFor(start_index) orelse return .budget_exhausted;
-    scratch.slot_g.items[start_slot] = 0;
-    scratch.slot_parent.items[start_slot] = @intCast(start_index);
+    cell_g[start_slot] = 0;
+    cell_parent[start_slot] = @intCast(start_index);
     const h0 = octileXY(@intCast(start_index % grid.width), @intCast(start_index / grid.width), goal_x, goal_y);
     scratch.open.appendAssumeCapacity(.{ .index = start_index, .f = h0, .h = h0 });
 
     while (scratch.open.items.len != 0) {
         const current = popHeap(&scratch.open);
         const current_slot = scratch.slotFor(current.index) orelse return .budget_exhausted;
-        if (scratch.slot_closed.items[current_slot]) continue;
+        if (cell_closed[current_slot]) continue;
         // Lazy deletion: a superseded duplicate (a better g was recorded for this cell
         // after this entry was queued) is stale — discard it rather than re-expand. f-h
         // recovers this entry's g; it can only under-estimate under a saturating f, so the
         // strict-greater test never drops the live best entry.
-        if (current.f -% current.h > scratch.slot_g.items[current_slot]) continue;
-        scratch.slot_closed.items[current_slot] = true;
+        if (current.f -% current.h > cell_g[current_slot]) continue;
+        cell_closed[current_slot] = true;
         if (current.index == goal_index) {
             reconstructLocalPath(scratch, start_index, goal_index);
             return .found;
@@ -492,7 +501,7 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
         // per-neighbor div/mod.
         const current_x: i32 = @intCast(current.index % grid.width);
         const current_y: i32 = @intCast(current.index / grid.width);
-        const current_g = scratch.slot_g.items[current_slot];
+        const current_g = cell_g[current_slot];
         for (neighbor_dirs) |dir| {
             const nx = current_x + dir.x;
             const ny = current_y + dir.y;
@@ -505,12 +514,12 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
                 continue;
             }
             const next_slot = scratch.slotFor(next_index) orelse return .budget_exhausted;
-            if (scratch.slot_closed.items[next_slot]) continue;
+            if (cell_closed[next_slot]) continue;
             const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
             const candidate_g = current_g +| step_cost;
-            if (candidate_g >= scratch.slot_g.items[next_slot]) continue;
-            scratch.slot_g.items[next_slot] = candidate_g;
-            scratch.slot_parent.items[next_slot] = @intCast(current.index);
+            if (candidate_g >= cell_g[next_slot]) continue;
+            cell_g[next_slot] = candidate_g;
+            cell_parent[next_slot] = @intCast(current.index);
             const h = octileXY(nx, ny, goal_x, goal_y);
             if (scratch.open.items.len >= scratch.open.capacity) return .budget_exhausted;
             scratch.open.appendAssumeCapacity(.{ .index = next_index, .f = candidate_g +| h, .h = h });
@@ -522,6 +531,7 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
 
 pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_index: usize) void {
     scratch.path_scratch.clearRetainingCapacity();
+    const parent_col = scratch.cell_parent;
     var current = goal_index;
     while (true) {
         // path_scratch is reserved to max(@max(max_explored_nodes, max_stored_path_cells));
@@ -530,8 +540,7 @@ pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_in
         std.debug.assert(scratch.path_scratch.items.len < scratch.path_scratch.capacity);
         scratch.path_scratch.appendAssumeCapacity(@intCast(current));
         if (current == start_index) break;
-        const slot = scratch.slotFor(current) orelse break;
-        const parent = scratch.slot_parent.items[slot];
+        const parent = parent_col[current];
         if (parent == no_cell) break;
         current = parent;
     }
@@ -625,9 +634,10 @@ test "reconstructLocalPath walks the parent chain into start-to-goal order" {
     // Freshen each chain cell this generation FIRST (slotFor resets parent on first touch),
     // then stamp the parent links 0 <- 1 <- 2 <- 3 so the walk has a chain to follow.
     for ([_]usize{ 0, 1, 2, 3 }) |cell| _ = scratch.slotFor(cell).?;
-    scratch.slot_parent.items[1] = 0;
-    scratch.slot_parent.items[2] = 1;
-    scratch.slot_parent.items[3] = 2;
+    const parent_col = scratch.cell_parent;
+    parent_col[1] = 0;
+    parent_col[2] = 1;
+    parent_col[3] = 2;
 
     reconstructLocalPath(&scratch, 0, 3);
     try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3 }, scratch.path_scratch.items);

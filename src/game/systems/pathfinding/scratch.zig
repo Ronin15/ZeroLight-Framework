@@ -10,12 +10,26 @@ const std = @import("std");
 const types = @import("types.zig");
 const OpenNode = types.OpenNode;
 const StitchedCell = types.StitchedCell;
-const setLen = types.setLen;
-const hashUsize = types.hashUsize;
 const unreachable_cost = types.unreachable_cost;
 const no_ref = types.no_ref;
 const no_cell = types.no_cell;
 const open_heap_headroom_factor = types.open_heap_headroom_factor;
+
+pub const AbstractSlotRow = struct {
+    node: usize = 0,
+    g: u32 = 0,
+    parent: usize = 0,
+    closed: bool = false,
+    stamp: u32 = 0,
+    via_link: bool = false,
+};
+
+pub const SearchCellRow = struct {
+    g: u32 = 0,
+    parent: u32 = 0,
+    closed: bool = false,
+    stamp: u32 = 0,
+};
 
 // Budget-bounded A* over abstract portal nodes keyed by a packed (level << 32) | local
 // ref. Node g-cost/parent/closed/via_link use a ref->slot open-addressed hash with
@@ -29,27 +43,24 @@ pub const AbstractScratch = struct {
     generation: u32 = 1,
     slot_capacity: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
-    // Node identity is a packed (level << 32) | local ref (usize); slot_parent holds the
-    // parent ref or no_ref. slot_via_link records whether the slot's best parent edge was
+    // Node identity is a packed (level << 32) | local ref (usize); parent holds the
+    // parent ref or no_ref. via_link records whether the slot's best parent edge was
     // a cross-level link (so buildCorridor can mark link transitions without a CSR scan).
-    slot_node: std.ArrayList(usize) = .empty,
-    slot_g: std.ArrayList(u32) = .empty,
-    slot_parent: std.ArrayList(usize) = .empty,
-    slot_closed: std.ArrayList(bool) = .empty,
-    slot_stamp: std.ArrayList(u32) = .empty,
-    slot_via_link: std.ArrayList(bool) = .empty,
+    slots: std.MultiArrayList(AbstractSlotRow) = .{},
+    // Cached slot columns; refreshed on reserve. slotFor runs in tight A* loops.
+    slot_stamp: []u32 = &[_]u32{},
+    slot_node: []usize = &[_]usize{},
+    slot_g: []u32 = &[_]u32{},
+    slot_parent: []usize = &[_]usize{},
+    slot_closed: []bool = &[_]bool{},
+    slot_via_link: []bool = &[_]bool{},
     corridor: std.ArrayList(usize) = .empty,
     corridor_link: std.ArrayList(bool) = .empty,
 
     pub fn deinit(self: *AbstractScratch, allocator: std.mem.Allocator) void {
         self.corridor_link.deinit(allocator);
         self.corridor.deinit(allocator);
-        self.slot_via_link.deinit(allocator);
-        self.slot_stamp.deinit(allocator);
-        self.slot_closed.deinit(allocator);
-        self.slot_parent.deinit(allocator);
-        self.slot_g.deinit(allocator);
-        self.slot_node.deinit(allocator);
+        self.slots.deinit(allocator);
         self.open.deinit(allocator);
         self.* = undefined;
     }
@@ -62,17 +73,23 @@ pub const AbstractScratch = struct {
         // (slotFor) does not. Sizing it past the budget keeps a sub-budget search from
         // false-saturating on a full heap.
         try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_abstract_nodes * open_heap_headroom_factor));
-        try setLen(&self.slot_node, allocator, slot_capacity);
-        try setLen(&self.slot_g, allocator, slot_capacity);
-        try setLen(&self.slot_parent, allocator, slot_capacity);
-        try setLen(&self.slot_closed, allocator, slot_capacity);
-        try setLen(&self.slot_stamp, allocator, slot_capacity);
-        try setLen(&self.slot_via_link, allocator, slot_capacity);
+        try self.slots.resize(allocator, slot_capacity);
+        self.refreshSlotColumns();
         try self.corridor.ensureTotalCapacity(allocator, max_abstract_nodes);
         try self.corridor_link.ensureTotalCapacity(allocator, max_abstract_nodes);
-        @memset(self.slot_stamp.items, 0);
+        @memset(self.slot_stamp, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
+    }
+
+    fn refreshSlotColumns(self: *AbstractScratch) void {
+        const cols = self.slots.slice();
+        self.slot_stamp = cols.items(.stamp);
+        self.slot_node = cols.items(.node);
+        self.slot_g = cols.items(.g);
+        self.slot_parent = cols.items(.parent);
+        self.slot_closed = cols.items(.closed);
+        self.slot_via_link = cols.items(.via_link);
     }
 
     pub fn reset(self: *AbstractScratch) void {
@@ -81,7 +98,7 @@ pub const AbstractScratch = struct {
         self.corridor_link.clearRetainingCapacity();
         self.generation +%= 1;
         if (self.generation == 0) {
-            @memset(self.slot_stamp.items, 0);
+            @memset(self.slot_stamp, 0);
             self.generation = 1;
         }
     }
@@ -89,19 +106,25 @@ pub const AbstractScratch = struct {
     pub fn slotFor(self: *AbstractScratch, node: usize) ?usize {
         const capacity = self.slot_capacity;
         if (capacity == 0) return null;
-        const start = hashUsize(node) % capacity;
+        const stamp = self.slot_stamp;
+        const nodes = self.slot_node;
+        const g = self.slot_g;
+        const parent = self.slot_parent;
+        const closed = self.slot_closed;
+        const via_link = self.slot_via_link;
+        const start = types.hashUsize(node) % capacity;
         for (0..capacity) |probe| {
             const index = (start + probe) % capacity;
-            if (self.slot_stamp.items[index] == self.generation) {
-                if (self.slot_node.items[index] == node) return index;
+            if (stamp[index] == self.generation) {
+                if (nodes[index] == node) return index;
                 continue;
             }
-            self.slot_stamp.items[index] = self.generation;
-            self.slot_node.items[index] = node;
-            self.slot_g.items[index] = unreachable_cost;
-            self.slot_parent.items[index] = no_ref;
-            self.slot_closed.items[index] = false;
-            self.slot_via_link.items[index] = false;
+            stamp[index] = self.generation;
+            nodes[index] = node;
+            g[index] = unreachable_cost;
+            parent[index] = no_ref;
+            closed[index] = false;
+            via_link[index] = false;
             return index;
         }
         return null;
@@ -126,13 +149,15 @@ pub const SearchScratch = struct {
     explored: usize = 0,
     explored_budget: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
-    // Direct per-cell arrays, indexed by cell_index (NOT a hash slot). slot_g/parent/
-    // closed carry the A* state; slot_stamp marks which generation last touched the
-    // cell so stale values from a prior solve read as "untouched".
-    slot_g: std.ArrayList(u32) = .empty,
-    slot_parent: std.ArrayList(u32) = .empty,
-    slot_closed: std.ArrayList(bool) = .empty,
-    slot_stamp: std.ArrayList(u32) = .empty,
+    // Direct per-cell rows, indexed by cell_index (NOT a hash slot). g/parent/closed
+    // carry the A* state; stamp marks which generation last touched the cell so stale
+    // values from a prior solve read as "untouched".
+    cells: std.MultiArrayList(SearchCellRow) = .{},
+    // Cached cell columns; refreshed on reserve. slotFor runs in tight A* loops.
+    cell_stamp: []u32 = &[_]u32{},
+    cell_g: []u32 = &[_]u32{},
+    cell_parent: []u32 = &[_]u32{},
+    cell_closed: []bool = &[_]bool{},
     // Path reconstruction scratch (cell indices, goal-to-start then reversed).
     path_scratch: std.ArrayList(u32) = .empty,
     // Stitched (level,cell) corridor path assembled from per-segment local A* runs
@@ -146,10 +171,7 @@ pub const SearchScratch = struct {
         self.abstract.deinit(allocator);
         self.stitched_scratch.deinit(allocator);
         self.path_scratch.deinit(allocator);
-        self.slot_stamp.deinit(allocator);
-        self.slot_closed.deinit(allocator);
-        self.slot_parent.deinit(allocator);
-        self.slot_g.deinit(allocator);
+        self.cells.deinit(allocator);
         self.open.deinit(allocator);
         self.* = undefined;
     }
@@ -166,16 +188,22 @@ pub const SearchScratch = struct {
         // only lazily on pop, so the heap must hold more than the distinct-cell count or a
         // sub-budget search false-spills on a full heap. explored_budget stays the cap.
         try self.open.ensureTotalCapacity(allocator, @max(@as(usize, 16), max_explored_nodes * open_heap_headroom_factor));
-        try setLen(&self.slot_g, allocator, cell_count);
-        try setLen(&self.slot_parent, allocator, cell_count);
-        try setLen(&self.slot_closed, allocator, cell_count);
-        try setLen(&self.slot_stamp, allocator, cell_count);
+        try self.cells.resize(allocator, cell_count);
+        self.refreshCellColumns();
         try self.path_scratch.ensureTotalCapacity(allocator, @max(max_explored_nodes, max_stored_path_cells));
         // One extra slot lets a segment overflow be detected before truncation.
         try self.stitched_scratch.ensureTotalCapacity(allocator, max_stitched_path_cells + 1);
-        @memset(self.slot_stamp.items, 0);
+        @memset(self.cell_stamp, 0);
         self.generation = 1;
         self.open.clearRetainingCapacity();
+    }
+
+    fn refreshCellColumns(self: *SearchScratch) void {
+        const cols = self.cells.slice();
+        self.cell_stamp = cols.items(.stamp);
+        self.cell_g = cols.items(.g);
+        self.cell_parent = cols.items(.parent);
+        self.cell_closed = cols.items(.closed);
     }
 
     pub fn reset(self: *SearchScratch) void {
@@ -183,7 +211,7 @@ pub const SearchScratch = struct {
         self.explored = 0;
         self.generation +%= 1;
         if (self.generation == 0) {
-            @memset(self.slot_stamp.items, 0);
+            @memset(self.cell_stamp, 0);
             self.generation = 1;
         }
     }
@@ -194,13 +222,17 @@ pub const SearchScratch = struct {
     // never spills. cell_index must be < cell_count (a valid grid cell).
     pub fn slotFor(self: *SearchScratch, cell: usize) ?usize {
         if (cell >= self.cell_count) return null;
-        if (self.slot_stamp.items[cell] == self.generation) return cell;
+        const stamp = self.cell_stamp;
+        const g = self.cell_g;
+        const parent = self.cell_parent;
+        const closed = self.cell_closed;
+        if (stamp[cell] == self.generation) return cell;
         if (self.explored >= self.explored_budget) return null;
         self.explored += 1;
-        self.slot_stamp.items[cell] = self.generation;
-        self.slot_g.items[cell] = unreachable_cost;
-        self.slot_parent.items[cell] = no_cell;
-        self.slot_closed.items[cell] = false;
+        stamp[cell] = self.generation;
+        g[cell] = unreachable_cost;
+        parent[cell] = no_cell;
+        closed[cell] = false;
         return cell;
     }
 };

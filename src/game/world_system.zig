@@ -124,37 +124,42 @@ const SparseDepthRange = struct {
     count: u32,
 };
 
+const ChunkColumnRow = struct {
+    level_index: u16,
+    x: i32,
+    y: i32,
+    cell_min_x: u16,
+    cell_min_y: u16,
+    cell_max_x_exclusive: u16,
+    cell_max_y_exclusive: u16,
+    visible: bool,
+};
+
+const DenseLayerRow = struct {
+    level_index: u16,
+    base_z: i32,
+    depth_band: WorldDepth,
+};
+
+const SparseTileRow = struct {
+    level_index: u16,
+    chunk_index: u32,
+    cell_index: u32,
+    tile_id: TileId,
+    depth_value: i32,
+    flags: TileFlags,
+};
+
 const ChunkColumns = struct {
-    level_indices: std.ArrayList(u16) = .empty,
-    x: std.ArrayList(i32) = .empty,
-    y: std.ArrayList(i32) = .empty,
-    cell_min_x: std.ArrayList(u16) = .empty,
-    cell_min_y: std.ArrayList(u16) = .empty,
-    cell_max_x_exclusive: std.ArrayList(u16) = .empty,
-    cell_max_y_exclusive: std.ArrayList(u16) = .empty,
-    visible: std.ArrayList(bool) = .empty,
+    rows: std.MultiArrayList(ChunkColumnRow) = .{},
 
     fn deinit(self: *ChunkColumns, allocator: std.mem.Allocator) void {
-        self.visible.deinit(allocator);
-        self.cell_max_y_exclusive.deinit(allocator);
-        self.cell_max_x_exclusive.deinit(allocator);
-        self.cell_min_y.deinit(allocator);
-        self.cell_min_x.deinit(allocator);
-        self.y.deinit(allocator);
-        self.x.deinit(allocator);
-        self.level_indices.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureTotalCapacity(self: *ChunkColumns, allocator: std.mem.Allocator, count: usize) !void {
-        try self.level_indices.ensureTotalCapacity(allocator, count);
-        try self.x.ensureTotalCapacity(allocator, count);
-        try self.y.ensureTotalCapacity(allocator, count);
-        try self.cell_min_x.ensureTotalCapacity(allocator, count);
-        try self.cell_min_y.ensureTotalCapacity(allocator, count);
-        try self.cell_max_x_exclusive.ensureTotalCapacity(allocator, count);
-        try self.cell_max_y_exclusive.ensureTotalCapacity(allocator, count);
-        try self.visible.ensureTotalCapacity(allocator, count);
+        try self.rows.ensureTotalCapacity(allocator, count);
     }
 
     fn appendAssumeCapacity(
@@ -168,14 +173,16 @@ const ChunkColumns = struct {
         max_y: u16,
         visible: bool,
     ) void {
-        self.level_indices.appendAssumeCapacity(level_index);
-        self.x.appendAssumeCapacity(chunk_x);
-        self.y.appendAssumeCapacity(chunk_y);
-        self.cell_min_x.appendAssumeCapacity(min_x);
-        self.cell_min_y.appendAssumeCapacity(min_y);
-        self.cell_max_x_exclusive.appendAssumeCapacity(max_x);
-        self.cell_max_y_exclusive.appendAssumeCapacity(max_y);
-        self.visible.appendAssumeCapacity(visible);
+        self.rows.appendAssumeCapacity(.{
+            .level_index = level_index,
+            .x = chunk_x,
+            .y = chunk_y,
+            .cell_min_x = min_x,
+            .cell_min_y = min_y,
+            .cell_max_x_exclusive = max_x,
+            .cell_max_y_exclusive = max_y,
+            .visible = visible,
+        });
     }
 };
 
@@ -196,9 +203,7 @@ pub const WorldSystem = struct {
     level_base_z: std.ArrayList(i32) = .empty,
     level_links: std.ArrayList(LevelLink) = .empty,
 
-    dense_level_indices: std.ArrayList(u16) = .empty,
-    dense_base_z: std.ArrayList(i32) = .empty,
-    dense_depth_bands: std.ArrayList(WorldDepth) = .empty,
+    dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
     dense_tile_ids: std.ArrayList(TileId) = .empty,
     // One renderer-owned tile-data storage buffer per dense layer, built from
     // dense_tile_ids at load. World holds only the opaque handles; the renderer
@@ -212,12 +217,7 @@ pub const WorldSystem = struct {
     // skipped, so the queue stays bounded without an explicit cap.
     dense_tile_edits: std.ArrayList(TileDataEdit) = .empty,
 
-    sparse_level_indices: std.ArrayList(u16) = .empty,
-    sparse_chunk_indices: std.ArrayList(u32) = .empty,
-    sparse_cell_indices: std.ArrayList(u32) = .empty,
-    sparse_tile_ids: std.ArrayList(TileId) = .empty,
-    sparse_depth_values: std.ArrayList(i32) = .empty,
-    sparse_flags: std.ArrayList(TileFlags) = .empty,
+    sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
 
     // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
     // set changes (tracked by render_index_dirty), never per frame. render_depths
@@ -229,14 +229,7 @@ pub const WorldSystem = struct {
     sparse_depth_ranges: std.ArrayList(SparseDepthRange) = .empty,
     render_index_dirty: bool = true,
 
-    chunk_level_indices: std.ArrayList(u16) = .empty,
-    chunk_x: std.ArrayList(i32) = .empty,
-    chunk_y: std.ArrayList(i32) = .empty,
-    chunk_cell_min_x: std.ArrayList(u16) = .empty,
-    chunk_cell_min_y: std.ArrayList(u16) = .empty,
-    chunk_cell_max_x_exclusive: std.ArrayList(u16) = .empty,
-    chunk_cell_max_y_exclusive: std.ArrayList(u16) = .empty,
-    chunk_visible: std.ArrayList(bool) = .empty,
+    chunks: std.MultiArrayList(ChunkColumnRow) = .{},
     visible_min_tile_x: u16 = 0,
     visible_min_tile_y: u16 = 0,
     visible_max_tile_x_exclusive: u16 = 0,
@@ -422,32 +415,18 @@ pub const WorldSystem = struct {
     }
 
     pub fn deinit(self: *WorldSystem) void {
-        self.chunk_visible.deinit(self.allocator);
-        self.chunk_cell_max_y_exclusive.deinit(self.allocator);
-        self.chunk_cell_max_x_exclusive.deinit(self.allocator);
-        self.chunk_cell_min_y.deinit(self.allocator);
-        self.chunk_cell_min_x.deinit(self.allocator);
-        self.chunk_y.deinit(self.allocator);
-        self.chunk_x.deinit(self.allocator);
-        self.chunk_level_indices.deinit(self.allocator);
+        self.chunks.deinit(self.allocator);
 
         self.sparse_depth_ranges.deinit(self.allocator);
         self.sparse_render_order.deinit(self.allocator);
         self.render_depths.deinit(self.allocator);
 
-        self.sparse_flags.deinit(self.allocator);
-        self.sparse_depth_values.deinit(self.allocator);
-        self.sparse_tile_ids.deinit(self.allocator);
-        self.sparse_cell_indices.deinit(self.allocator);
-        self.sparse_chunk_indices.deinit(self.allocator);
-        self.sparse_level_indices.deinit(self.allocator);
+        self.sparse_tiles.deinit(self.allocator);
 
         self.dense_tile_edits.deinit(self.allocator);
         self.dense_layer_tile_buffers.deinit(self.allocator);
         self.dense_tile_ids.deinit(self.allocator);
-        self.dense_depth_bands.deinit(self.allocator);
-        self.dense_base_z.deinit(self.allocator);
-        self.dense_level_indices.deinit(self.allocator);
+        self.dense_layers.deinit(self.allocator);
 
         self.level_links.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
@@ -471,7 +450,9 @@ pub const WorldSystem = struct {
     pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
         const bounds = self.visibleTileBounds();
         var visible_sparse_tiles: usize = 0;
-        for (self.sparse_chunk_indices.items, self.sparse_cell_indices.items) |chunk_index, cell| {
+        const sparse_chunks = self.sparse_tiles.items(.chunk_index);
+        const sparse_cells = self.sparse_tiles.items(.cell_index);
+        for (sparse_chunks, sparse_cells) |chunk_index, cell| {
             if (self.isSparseChunkVisible(chunk_index) and self.cellInVisibleBounds(cell, bounds)) {
                 visible_sparse_tiles += 1;
             }
@@ -482,14 +463,17 @@ pub const WorldSystem = struct {
     pub fn visibleTileCount(self: *const WorldSystem) usize {
         var visible_dense_cells: usize = 0;
         const bounds = self.visibleTileBounds();
-        for (0..self.dense_level_indices.items.len) |layer_index| {
-            for (0..self.chunk_visible.items.len) |chunk_index| {
-                if (!self.chunk_visible.items[chunk_index] or !self.chunkMatchesLayer(chunk_index, layer_index)) continue;
+        const chunk_visible = self.chunks.items(.visible);
+        for (0..self.dense_layers.len) |layer_index| {
+            for (0..self.chunks.len) |chunk_index| {
+                if (!chunk_visible[chunk_index] or !self.chunkMatchesLayer(chunk_index, layer_index)) continue;
                 visible_dense_cells += self.visibleChunkCellCount(chunk_index, bounds);
             }
         }
         var visible_sparse_tiles: usize = 0;
-        for (self.sparse_chunk_indices.items, self.sparse_cell_indices.items) |chunk_index, cell| {
+        const sparse_chunks = self.sparse_tiles.items(.chunk_index);
+        const sparse_cells = self.sparse_tiles.items(.cell_index);
+        for (sparse_chunks, sparse_cells) |chunk_index, cell| {
             if (self.isSparseChunkVisible(chunk_index) and self.cellInVisibleBounds(cell, bounds)) {
                 visible_sparse_tiles += 1;
             }
@@ -498,7 +482,7 @@ pub const WorldSystem = struct {
     }
 
     pub fn setVisibleChunksForWorldRect(self: *WorldSystem, rect: Rect, overscan_chunks: u16) void {
-        if (self.chunk_visible.items.len == 0) {
+        if (self.chunks.len == 0) {
             self.visible_sparse_count = 0;
             return;
         }
@@ -545,22 +529,25 @@ pub const WorldSystem = struct {
         const max_x = simd.splatInt4(@as(i32, max_chunk_x) + 1);
         const min_y = simd.splatInt4(@as(i32, min_chunk_y) - 1);
         const max_y = simd.splatInt4(@as(i32, max_chunk_y) + 1);
-        const count = self.chunk_visible.items.len;
+        const count = self.chunks.len;
+        const chunk_x = self.chunks.items(.x);
+        const chunk_y = self.chunks.items(.y);
+        const chunk_visible = self.chunks.items(.visible);
         var index: usize = 0;
         const vectorized_end = simd.vectorizedEnd(count);
         while (index < vectorized_end) : (index += simd.lane_count) {
-            const cx = simd.loadInt4(self.chunk_x.items[index..]);
-            const cy = simd.loadInt4(self.chunk_y.items[index..]);
+            const cx = simd.loadInt4(chunk_x[index..]);
+            const cy = simd.loadInt4(chunk_y[index..]);
             const visible = simd.greaterThanInt4(cx, min_x) & simd.lessThanInt4(cx, max_x) &
                 simd.greaterThanInt4(cy, min_y) & simd.lessThanInt4(cy, max_y);
             inline for (0..simd.lane_count) |lane| {
-                self.chunk_visible.items[index + lane] = visible[lane];
+                chunk_visible[index + lane] = visible[lane];
             }
         }
         while (index < count) : (index += 1) {
-            const cx = self.chunk_x.items[index];
-            const cy = self.chunk_y.items[index];
-            self.chunk_visible.items[index] = cx >= @as(i32, min_chunk_x) and cx <= @as(i32, max_chunk_x) and
+            const cx = chunk_x[index];
+            const cy = chunk_y[index];
+            chunk_visible[index] = cx >= @as(i32, min_chunk_x) and cx <= @as(i32, max_chunk_x) and
                 cy >= @as(i32, min_chunk_y) and cy <= @as(i32, max_chunk_y);
         }
 
@@ -700,7 +687,7 @@ pub const WorldSystem = struct {
     /// and returns the compact change event. Tile-id validity is the caller's
     /// concern, so an empty (`invalid_tile_id`) write is allowed here.
     fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
-        if (layer_index >= self.dense_level_indices.items.len) return error.InvalidWorldLayer;
+        if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const tile_index = self.denseLayerOffset(layer_index) + self.cellIndex(x, y);
         const old_tile_id = self.dense_tile_ids.items[tile_index];
@@ -719,7 +706,7 @@ pub const WorldSystem = struct {
             });
         }
         return .{
-            .level = self.dense_level_indices.items[layer_index],
+            .level = self.dense_layers.items(.level_index)[layer_index],
             .x = x,
             .y = y,
             .old_tile_id = old_tile_id,
@@ -730,7 +717,7 @@ pub const WorldSystem = struct {
     }
 
     pub fn denseLayerCount(self: *const WorldSystem) usize {
-        return self.dense_level_indices.items.len;
+        return self.dense_layers.len;
     }
 
     /// Widens a dense layer's row-major tile ids into `out` (one `u32` per cell)
@@ -781,7 +768,7 @@ pub const WorldSystem = struct {
     }
 
     pub fn denseTileBlocksMovement(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) bool {
-        if (layer_index >= self.dense_level_indices.items.len) return true;
+        if (layer_index >= self.dense_layers.len) return true;
         if (x >= self.width or y >= self.height) return true;
         return self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement;
     }
@@ -789,18 +776,18 @@ pub const WorldSystem = struct {
     /// Level a dense band belongs to. Lets navigation iterate the dense bands of a
     /// single level directly instead of polling per cell across all levels.
     pub fn denseLayerLevel(self: *const WorldSystem, layer_index: usize) u16 {
-        return self.dense_level_indices.items[layer_index];
+        return self.dense_layers.items(.level_index)[layer_index];
     }
 
     /// Level a sparse tile belongs to. Pairs with `sparseTileCellCoord` so a
     /// per-level sparse-cell set can be built in O(sparse), not O(cells x sparse).
     pub fn sparseTileLevel(self: *const WorldSystem, index: usize) u16 {
-        return self.sparse_level_indices.items[index];
+        return self.sparse_tiles.items(.level_index)[index];
     }
 
     /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index.
     pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
-        const cell = self.sparse_cell_indices.items[index];
+        const cell = self.sparse_tiles.items(.cell_index)[index];
         return .{
             .x = @intCast(cell % self.width),
             .y = @intCast(cell / self.width),
@@ -820,9 +807,11 @@ pub const WorldSystem = struct {
     /// The dense floor layer for a level (first `.floor` band on it), or null if
     /// the level has none. Cold path (dig/traversal, not per-frame per-cell).
     pub fn denseFloorLayerForLevel(self: *const WorldSystem, level_index: u16) ?usize {
-        for (self.dense_level_indices.items, 0..) |dense_level, layer_index| {
+        const dense_levels = self.dense_layers.items(.level_index);
+        const dense_depth_bands = self.dense_layers.items(.depth_band);
+        for (dense_levels, dense_depth_bands, 0..) |dense_level, depth_band, layer_index| {
             if (dense_level != level_index) continue;
-            if (self.dense_depth_bands.items[layer_index] == .floor) return layer_index;
+            if (depth_band == .floor) return layer_index;
         }
         return null;
     }
@@ -855,15 +844,19 @@ pub const WorldSystem = struct {
     pub fn levelBlocksMovement(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
         if (@as(usize, level_index) >= self.level_base_z.items.len) return true;
         if (x >= self.width or y >= self.height) return true;
-        for (self.dense_level_indices.items, 0..) |dense_level, layer_index| {
+        const dense_levels = self.dense_layers.items(.level_index);
+        for (dense_levels, 0..) |dense_level, layer_index| {
             if (dense_level != level_index) continue;
             if (self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement) return true;
         }
         const cell = self.cellIndex(x, y);
-        for (self.sparse_level_indices.items, 0..) |sparse_level, sparse_index| {
+        const sparse_levels = self.sparse_tiles.items(.level_index);
+        const sparse_cells = self.sparse_tiles.items(.cell_index);
+        const sparse_flags = self.sparse_tiles.items(.flags);
+        for (sparse_levels, sparse_cells, sparse_flags) |sparse_level, sparse_cell, flags| {
             if (sparse_level != level_index) continue;
-            if (self.sparse_cell_indices.items[sparse_index] != cell) continue;
-            if (self.sparse_flags.items[sparse_index].blocks_movement) return true;
+            if (sparse_cell != cell) continue;
+            if (flags.blocks_movement) return true;
         }
         return false;
     }
@@ -884,17 +877,17 @@ pub const WorldSystem = struct {
     }
 
     pub fn sparseTileCount(self: *const WorldSystem) usize {
-        return self.sparse_tile_ids.items.len;
+        return self.sparse_tiles.len;
     }
 
     pub fn sparseTileBlocksMovement(self: *const WorldSystem, index: usize) bool {
-        if (index >= self.sparse_flags.items.len) return false;
-        return self.sparse_flags.items[index].blocks_movement;
+        if (index >= self.sparse_tiles.len) return false;
+        return self.sparse_tiles.items(.flags)[index].blocks_movement;
     }
 
     pub fn sparseTileRect(self: *const WorldSystem, index: usize) ?Rect {
-        if (index >= self.sparse_cell_indices.items.len) return null;
-        const cell = self.sparse_cell_indices.items[index];
+        if (index >= self.sparse_tiles.len) return null;
+        const cell = self.sparse_tiles.items(.cell_index)[index];
         const x: u16 = @intCast(cell % self.width);
         const y: u16 = @intCast(cell / self.width);
         return self.cellRect(x, y);
@@ -940,7 +933,7 @@ pub const WorldSystem = struct {
     /// Camera-visible chunk rectangle as an ActiveRegion. Returns null when no
     /// visibility window has been set yet (e.g. before the first render frame).
     pub fn visibleChunkRegion(self: *const WorldSystem) ?ActiveRegion {
-        if (!self.visibility_window_valid or self.chunk_visible.items.len == 0) return null;
+        if (!self.visibility_window_valid or self.chunks.len == 0) return null;
         std.debug.assert(self.last_max_chunk_x >= self.last_min_chunk_x);
         std.debug.assert(self.last_max_chunk_y >= self.last_min_chunk_y);
         return .{
@@ -977,14 +970,14 @@ pub const WorldSystem = struct {
     pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
-        const layer_index = self.dense_level_indices.items.len;
-        try self.dense_level_indices.ensureUnusedCapacity(self.allocator, 1);
-        try self.dense_base_z.ensureUnusedCapacity(self.allocator, 1);
-        try self.dense_depth_bands.ensureUnusedCapacity(self.allocator, 1);
+        const layer_index = self.dense_layers.len;
+        try self.dense_layers.ensureTotalCapacity(self.allocator, layer_index + 1);
         try self.dense_tile_ids.ensureUnusedCapacity(self.allocator, self.cellCount());
-        self.dense_level_indices.appendAssumeCapacity(level_index);
-        self.dense_base_z.appendAssumeCapacity(base_z);
-        self.dense_depth_bands.appendAssumeCapacity(depth);
+        self.dense_layers.appendAssumeCapacity(.{
+            .level_index = level_index,
+            .base_z = base_z,
+            .depth_band = depth,
+        });
         for (0..self.cellCount()) |_| {
             self.dense_tile_ids.appendAssumeCapacity(fill_tile);
         }
@@ -1025,18 +1018,15 @@ pub const WorldSystem = struct {
         const chunk_index = try self.sparseChunkIndexForCell(level_index, x, y);
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
-        try self.sparse_level_indices.ensureUnusedCapacity(self.allocator, 1);
-        try self.sparse_chunk_indices.ensureUnusedCapacity(self.allocator, 1);
-        try self.sparse_cell_indices.ensureUnusedCapacity(self.allocator, 1);
-        try self.sparse_tile_ids.ensureUnusedCapacity(self.allocator, 1);
-        try self.sparse_depth_values.ensureUnusedCapacity(self.allocator, 1);
-        try self.sparse_flags.ensureUnusedCapacity(self.allocator, 1);
-        self.sparse_level_indices.appendAssumeCapacity(level_index);
-        self.sparse_chunk_indices.appendAssumeCapacity(chunk_index);
-        self.sparse_cell_indices.appendAssumeCapacity(cell);
-        self.sparse_tile_ids.appendAssumeCapacity(tile_id);
-        self.sparse_depth_values.appendAssumeCapacity(world_z);
-        self.sparse_flags.appendAssumeCapacity(flags);
+        try self.sparse_tiles.ensureTotalCapacity(self.allocator, self.sparse_tiles.len + 1);
+        self.sparse_tiles.appendAssumeCapacity(.{
+            .level_index = level_index,
+            .chunk_index = chunk_index,
+            .cell_index = cell,
+            .tile_id = tile_id,
+            .depth_value = world_z,
+            .flags = flags,
+        });
         self.render_index_dirty = true;
         // The sparse set changed, so the cached visible-sparse count must refresh.
         self.visibility_window_valid = false;
@@ -1058,11 +1048,15 @@ pub const WorldSystem = struct {
         depth: i32,
     ) !void {
         const range = self.sparseDepthRange(depth) orelse return;
+        const sparse = self.sparse_tiles.slice();
+        const sparse_chunks = sparse.items(.chunk_index);
+        const sparse_cells = sparse.items(.cell_index);
+        const sparse_tile_ids = sparse.items(.tile_id);
         for (self.sparse_render_order.items[range.start..][0..range.count]) |index| {
-            if (!self.isSparseChunkVisible(self.sparse_chunk_indices.items[index])) continue;
-            const cell = self.sparse_cell_indices.items[index];
+            if (!self.isSparseChunkVisible(sparse_chunks[index])) continue;
+            const cell = sparse_cells[index];
             if (!self.cellInVisibleBounds(cell, bounds)) continue;
-            const tile_id = self.sparse_tile_ids.items[index];
+            const tile_id = sparse_tile_ids[index];
             const x: u16 = @intCast(cell % self.width);
             const y: u16 = @intCast(cell / self.width);
             try self.submitTile(renderer, prepared, tile_id, x, y, RenderOrder.world(depth));
@@ -1158,24 +1152,8 @@ pub const WorldSystem = struct {
             }
         }
 
-        var old = ChunkColumns{
-            .level_indices = self.chunk_level_indices,
-            .x = self.chunk_x,
-            .y = self.chunk_y,
-            .cell_min_x = self.chunk_cell_min_x,
-            .cell_min_y = self.chunk_cell_min_y,
-            .cell_max_x_exclusive = self.chunk_cell_max_x_exclusive,
-            .cell_max_y_exclusive = self.chunk_cell_max_y_exclusive,
-            .visible = self.chunk_visible,
-        };
-        self.chunk_level_indices = next.level_indices;
-        self.chunk_x = next.x;
-        self.chunk_y = next.y;
-        self.chunk_cell_min_x = next.cell_min_x;
-        self.chunk_cell_min_y = next.cell_min_y;
-        self.chunk_cell_max_x_exclusive = next.cell_max_x_exclusive;
-        self.chunk_cell_max_y_exclusive = next.cell_max_y_exclusive;
-        self.chunk_visible = next.visible;
+        var old = ChunkColumns{ .rows = self.chunks };
+        self.chunks = next.rows;
         next = .{};
         old.deinit(self.allocator);
 
@@ -1192,8 +1170,8 @@ pub const WorldSystem = struct {
     }
 
     fn rebuildRenderDepthIndex(self: *WorldSystem) !void {
-        const sparse_count = self.sparse_tile_ids.items.len;
-        const depth_values = self.sparse_depth_values.items;
+        const sparse_count = self.sparse_tiles.len;
+        const depth_values = self.sparse_tiles.items(.depth_value);
 
         // Sparse indices grouped by (depth, original index) — a total order, so
         // the per-depth windows below preserve the original submission order.
@@ -1217,7 +1195,7 @@ pub const WorldSystem = struct {
 
         // Distinct, ascending union of dense-layer and sparse depths.
         self.render_depths.clearRetainingCapacity();
-        for (0..self.dense_level_indices.items.len) |layer_index| {
+        for (0..self.dense_layers.len) |layer_index| {
             try self.appendRenderDepth(self.denseLayerOrder(layer_index).depth);
         }
         for (self.sparse_depth_ranges.items) |range| {
@@ -1306,10 +1284,11 @@ pub const WorldSystem = struct {
     }
 
     fn visibleChunkCellCount(self: *const WorldSystem, chunk_index: usize, bounds: VisibleTileBounds) usize {
-        const min_x = @max(self.chunk_cell_min_x.items[chunk_index], bounds.min_x);
-        const min_y = @max(self.chunk_cell_min_y.items[chunk_index], bounds.min_y);
-        const max_x = @min(self.chunk_cell_max_x_exclusive.items[chunk_index], bounds.max_x_exclusive);
-        const max_y = @min(self.chunk_cell_max_y_exclusive.items[chunk_index], bounds.max_y_exclusive);
+        const chunks = self.chunks.slice();
+        const min_x = @max(chunks.items(.cell_min_x)[chunk_index], bounds.min_x);
+        const min_y = @max(chunks.items(.cell_min_y)[chunk_index], bounds.min_y);
+        const max_x = @min(chunks.items(.cell_max_x_exclusive)[chunk_index], bounds.max_x_exclusive);
+        const max_y = @min(chunks.items(.cell_max_y_exclusive)[chunk_index], bounds.max_y_exclusive);
         if (min_x >= max_x or min_y >= max_y) return 0;
         return @as(usize, max_x - min_x) * @as(usize, max_y - min_y);
     }
@@ -1343,29 +1322,34 @@ pub const WorldSystem = struct {
     }
 
     fn denseLayerOrder(self: *const WorldSystem, layer_index: usize) RenderOrder {
+        const dense = self.dense_layers.slice();
         return RenderOrder.world(self.worldZForLevel(
-            self.dense_level_indices.items[layer_index],
-            self.dense_base_z.items[layer_index],
-            self.dense_depth_bands.items[layer_index],
+            dense.items(.level_index)[layer_index],
+            dense.items(.base_z)[layer_index],
+            dense.items(.depth_band)[layer_index],
         ));
     }
 
     fn chunkMatchesLayer(self: *const WorldSystem, chunk_index: usize, layer_index: usize) bool {
-        return self.chunk_level_indices.items[chunk_index] == self.dense_level_indices.items[layer_index];
+        const chunks = self.chunks.slice();
+        const dense = self.dense_layers.slice();
+        return chunks.items(.level_index)[chunk_index] == dense.items(.level_index)[layer_index];
     }
 
     fn preservedChunkVisible(self: *const WorldSystem, level_index: u16, chunk_x: i32, chunk_y: i32) bool {
-        for (0..self.chunk_visible.items.len) |index| {
-            if (self.chunk_level_indices.items[index] != level_index) continue;
-            if (self.chunk_x.items[index] != chunk_x or self.chunk_y.items[index] != chunk_y) continue;
-            return self.chunk_visible.items[index];
+        const chunks = self.chunks.slice();
+        for (0..self.chunks.len) |index| {
+            if (chunks.items(.level_index)[index] != level_index) continue;
+            if (chunks.items(.x)[index] != chunk_x or chunks.items(.y)[index] != chunk_y) continue;
+            return chunks.items(.visible)[index];
         }
         return true;
     }
 
     fn isSparseChunkVisible(self: *const WorldSystem, chunk_index: u32) bool {
         const index: usize = chunk_index;
-        return index < self.chunk_visible.items.len and self.chunk_visible.items[index];
+        const chunk_visible = self.chunks.items(.visible);
+        return index < chunk_visible.len and chunk_visible[index];
     }
 
     fn sparseChunkIndexForCell(self: *const WorldSystem, level_index: u16, x: u16, y: u16) !u32 {
@@ -1579,10 +1563,11 @@ test "world render depth index orders sparse tiles by depth then insertion" {
     for (depths[1..], 1..) |depth, idx| {
         try std.testing.expect(depths[idx - 1] < depth);
     }
-    for (0..world.dense_level_indices.items.len) |layer| {
+    for (0..world.dense_layers.len) |layer| {
         try std.testing.expect(containsDepth(depths, world.denseLayerOrder(layer).depth));
     }
-    for (world.sparse_depth_values.items) |depth| {
+    const sparse_depth_values = world.sparse_tiles.items(.depth_value);
+    for (sparse_depth_values) |depth| {
         try std.testing.expect(containsDepth(depths, depth));
     }
 
@@ -1590,7 +1575,7 @@ test "world render depth index orders sparse tiles by depth then insertion" {
     // exact order the old scan-per-depth path visited matching sparse tiles in.
     var reference: [bands.len]u32 = undefined;
     for (0..bands.len) |i| reference[i] = @intCast(i);
-    std.mem.sort(u32, &reference, world.sparse_depth_values.items, sparseDepthIndexLessForTest);
+    std.mem.sort(u32, &reference, sparse_depth_values, sparseDepthIndexLessForTest);
 
     // Actual order produced by walking render_depths through the range index.
     var actual: [bands.len]u32 = undefined;
@@ -1598,7 +1583,7 @@ test "world render depth index orders sparse tiles by depth then insertion" {
     for (depths) |depth| {
         const range = world.sparseDepthRange(depth) orelse continue;
         for (world.sparse_render_order.items[range.start..][0..range.count]) |index| {
-            try std.testing.expectEqual(depth, world.sparse_depth_values.items[index]);
+            try std.testing.expectEqual(depth, sparse_depth_values[index]);
             actual[count] = index;
             count += 1;
         }
@@ -1628,7 +1613,7 @@ test "world render depth index refreshes after runtime sparse insert" {
     try std.testing.expect(!world.render_index_dirty);
     try std.testing.expect(containsDepth(world.render_depths.items, new_depth));
     // Every sparse tile is represented exactly once in the render order.
-    try std.testing.expectEqual(world.sparse_tile_ids.items.len, world.sparse_render_order.items.len);
+    try std.testing.expectEqual(world.sparse_tiles.len, world.sparse_render_order.items.len);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
@@ -1789,7 +1774,7 @@ test "world add level keeps chunks renderable without manual rebuild" {
     _ = try world.addDenseLayer(level0, 0, .floor, grass);
     _ = try world.addDenseLayer(level1, 0, .floor, grass);
 
-    try std.testing.expectEqual(@as(usize, 2), world.chunk_visible.items.len);
+    try std.testing.expectEqual(@as(usize, 2), world.chunks.len);
     try std.testing.expectEqual(@as(usize, 2), world.visibleTileCount());
 }
 
@@ -1807,17 +1792,18 @@ test "world add level preserves existing chunk visibility" {
     try world.buildCatalog(&meta);
 
     const level0 = try world.addLevel(0);
-    world.chunk_visible.items[0] = false;
+    world.chunks.items(.visible)[0] = false;
     const level1 = try world.addLevel(10);
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.addDenseLayer(level0, 0, .floor, grass);
     _ = try world.addDenseLayer(level1, 0, .floor, grass);
 
-    try std.testing.expectEqual(@as(usize, 4), world.chunk_visible.items.len);
-    try std.testing.expect(!world.chunk_visible.items[0]);
-    try std.testing.expect(world.chunk_visible.items[1]);
-    try std.testing.expect(world.chunk_visible.items[2]);
-    try std.testing.expect(world.chunk_visible.items[3]);
+    const chunk_visible = world.chunks.items(.visible);
+    try std.testing.expectEqual(@as(usize, 4), world.chunks.len);
+    try std.testing.expect(!chunk_visible[0]);
+    try std.testing.expect(chunk_visible[1]);
+    try std.testing.expect(chunk_visible[2]);
+    try std.testing.expect(chunk_visible[3]);
     try std.testing.expectEqual(@as(usize, 3), world.visibleTileCount());
 }
 
@@ -1843,7 +1829,7 @@ test "world dense and sparse rendering respects z levels and chunk level filteri
     _ = try world.addSparseTile(level1, 0, 0, deco, 0, .obstacle);
     try world.rebuildChunks();
 
-    try std.testing.expectEqual(@as(usize, 2), world.chunk_visible.items.len);
+    try std.testing.expectEqual(@as(usize, 2), world.chunks.len);
     try std.testing.expectEqual(@as(usize, 3), world.visibleTileCount());
 
     try std.testing.expectEqual(render_depth.worldZ(.floor), world.worldZForLevel(level0, 0, .floor));

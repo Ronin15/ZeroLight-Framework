@@ -27,7 +27,58 @@ const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 
 pub const collision_range_alignment_items: usize = movement_range_alignment_items;
 
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
+pub const HotF32Slice = []f32;
+pub const ConstHotF32Slice = []const f32;
+
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, collision_range_alignment_items);
+}
+
+pub const ProxySlice = struct {
+    entities: []EntityId,
+    movement_indices: []usize,
+    min_x: HotF32Slice,
+    min_y: HotF32Slice,
+    max_x: HotF32Slice,
+    max_y: HotF32Slice,
+
+    pub fn len(self: ProxySlice) usize {
+        return self.entities.len;
+    }
+};
+
+pub const ConstProxySlice = struct {
+    entities: []const EntityId,
+    movement_indices: []const usize,
+    min_x: ConstHotF32Slice,
+    min_y: ConstHotF32Slice,
+    max_x: ConstHotF32Slice,
+    max_y: ConstHotF32Slice,
+
+    pub fn len(self: ConstProxySlice) usize {
+        return self.entities.len;
+    }
+};
+
+const ProxyRow = struct {
+    entity: EntityId,
+    movement_index: usize,
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+};
+
+fn appendProxyRow(
+    rows: *std.MultiArrayList(ProxyRow),
+    row_slice: *std.MultiArrayList(ProxyRow).Slice,
+    row: ProxyRow,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+
 const thread_shared_record_alignment: usize = 64;
 
 pub const CollisionConfig = struct {
@@ -123,12 +174,7 @@ const NarrowphaseRangeSlotList = std.ArrayListAligned(NarrowphaseRangeSlot, .fro
 
 pub const CollisionSystem = struct {
     allocator: std.mem.Allocator,
-    entities: std.ArrayList(EntityId) = .empty,
-    movement_indices: std.ArrayList(usize) = .empty,
-    min_x: HotF32List = .empty,
-    min_y: HotF32List = .empty,
-    max_x: HotF32List = .empty,
-    max_y: HotF32List = .empty,
+    rows: std.MultiArrayList(ProxyRow) = .{},
     order: std.ArrayList(usize) = .empty,
     broadphase_ranges: BroadphaseRangeSlotList = .empty,
     candidate_pairs: std.ArrayList(CandidatePair) = .empty,
@@ -155,13 +201,32 @@ pub const CollisionSystem = struct {
         }
         self.broadphase_ranges.deinit(self.allocator);
         self.order.deinit(self.allocator);
-        self.max_y.deinit(self.allocator);
-        self.max_x.deinit(self.allocator);
-        self.min_y.deinit(self.allocator);
-        self.min_x.deinit(self.allocator);
-        self.movement_indices.deinit(self.allocator);
-        self.entities.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn slice(self: *CollisionSystem) ProxySlice {
+        const s = self.rows.slice();
+        return .{
+            .entities = s.items(.entity),
+            .movement_indices = s.items(.movement_index),
+            .min_x = s.items(.min_x),
+            .min_y = s.items(.min_y),
+            .max_x = s.items(.max_x),
+            .max_y = s.items(.max_y),
+        };
+    }
+
+    pub fn sliceConst(self: *const CollisionSystem) ConstProxySlice {
+        const s = self.rows.slice();
+        return .{
+            .entities = s.items(.entity),
+            .movement_indices = s.items(.movement_index),
+            .min_x = s.items(.min_x),
+            .min_y = s.items(.min_y),
+            .max_x = s.items(.max_x),
+            .max_y = s.items(.max_y),
+        };
     }
 
     pub fn update(
@@ -172,7 +237,7 @@ pub const CollisionSystem = struct {
         config: CollisionConfig,
     ) !CollisionStats {
         try self.gatherBodies(data, config.scope_dense_indices);
-        const body_count = self.entities.items.len;
+        const body_count = self.rows.len;
         if (body_count <= 1) {
             contacts.clearRetainingCapacity();
             return .{ .body_count = body_count };
@@ -266,7 +331,7 @@ pub const CollisionSystem = struct {
         scope_dense_indices: ?[]const u32,
     ) !CollisionStats {
         try self.gatherBodies(data, scope_dense_indices);
-        const body_count = self.entities.items.len;
+        const body_count = self.rows.len;
         if (body_count <= 1) {
             contacts.clearRetainingCapacity();
             return .{ .body_count = body_count };
@@ -302,7 +367,7 @@ pub const CollisionSystem = struct {
     }
 
     pub fn bodyCount(self: *const CollisionSystem) usize {
-        return self.entities.items.len;
+        return self.rows.len;
     }
 
     fn gatherBodies(self: *CollisionSystem, data: *const DataSystem, scope_dense_indices: ?[]const u32) !void {
@@ -313,6 +378,7 @@ pub const CollisionSystem = struct {
 
         // Scoped path walks only the selected collision-bounds rows; both paths
         // build the same proxy columns, so broad/narrow phase see the gathered set.
+        var row_slice = self.rows.slice();
         var k: usize = 0;
         while (k < n) : (k += 1) {
             const bounds_index: usize = if (scope_dense_indices) |idx| idx[k] else k;
@@ -325,36 +391,28 @@ pub const CollisionSystem = struct {
             const size_y = bounds.size_y[bounds_index];
             const min_x = body.position.x + offset_x;
             const min_y = body.position.y + offset_y;
-            self.entities.appendAssumeCapacity(entity);
-            self.movement_indices.appendAssumeCapacity(movement_index);
-            self.min_x.appendAssumeCapacity(min_x);
-            self.min_y.appendAssumeCapacity(min_y);
-            self.max_x.appendAssumeCapacity(min_x + size_x);
-            self.max_y.appendAssumeCapacity(min_y + size_y);
+            appendProxyRow(&self.rows, &row_slice, .{
+                .entity = entity,
+                .movement_index = movement_index,
+                .min_x = min_x,
+                .min_y = min_y,
+                .max_x = min_x + size_x,
+                .max_y = min_y + size_y,
+            });
         }
         try self.ensureOrder();
     }
 
     fn clearProxiesRetainingCapacity(self: *CollisionSystem) void {
-        self.entities.clearRetainingCapacity();
-        self.movement_indices.clearRetainingCapacity();
-        self.min_x.clearRetainingCapacity();
-        self.min_y.clearRetainingCapacity();
-        self.max_x.clearRetainingCapacity();
-        self.max_y.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn ensureProxyCapacity(self: *CollisionSystem, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(self.allocator, capacity);
-        try self.movement_indices.ensureTotalCapacity(self.allocator, capacity);
-        try self.min_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.min_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.max_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.max_y.ensureTotalCapacity(self.allocator, capacity);
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
     }
 
     fn ensureOrder(self: *CollisionSystem) !void {
-        const count = self.entities.items.len;
+        const count = self.rows.len;
         if (self.order.items.len == count) return;
         self.order.clearRetainingCapacity();
         try self.order.ensureTotalCapacity(self.allocator, count);
@@ -470,7 +528,8 @@ pub const CollisionSystem = struct {
         // frames where insertion sort would become the expensive path.
         const full_sort = @as(u128, inversion_count) * 100 > @as(u128, self.order.items.len) * max_percent;
         if (full_sort) {
-            std.mem.sort(usize, self.order.items, self, proxyIndexLessThan);
+            const proxies = self.sliceConst();
+            std.mem.sort(usize, self.order.items, proxies, proxyIndexLessThan);
             return true;
         }
         self.insertionSortOrder();
@@ -478,9 +537,10 @@ pub const CollisionSystem = struct {
     }
 
     fn adjacentInversionCount(self: *const CollisionSystem) usize {
+        const proxies = self.sliceConst();
         var inversions: usize = 0;
         for (1..self.order.items.len) |index| {
-            if (proxyIndexLessThan(self, self.order.items[index], self.order.items[index - 1])) {
+            if (proxyIndexLessThan(proxies, self.order.items[index], self.order.items[index - 1])) {
                 inversions += 1;
             }
         }
@@ -488,11 +548,12 @@ pub const CollisionSystem = struct {
     }
 
     fn insertionSortOrder(self: *CollisionSystem) void {
+        const proxies = self.sliceConst();
         var index: usize = 1;
         while (index < self.order.items.len) : (index += 1) {
             const value = self.order.items[index];
             var insert = index;
-            while (insert > 0 and proxyIndexLessThan(self, value, self.order.items[insert - 1])) : (insert -= 1) {
+            while (insert > 0 and proxyIndexLessThan(proxies, value, self.order.items[insert - 1])) : (insert -= 1) {
                 self.order.items[insert] = self.order.items[insert - 1];
             }
             self.order.items[insert] = value;
@@ -502,12 +563,13 @@ pub const CollisionSystem = struct {
     fn buildBroadphaseCandidatesSimd(self: *CollisionSystem) !BroadphaseStats {
         self.candidate_pairs.clearRetainingCapacity();
         var stats = BroadphaseStats{};
+        const proxies = self.sliceConst();
         const sorted_count = self.order.items.len;
         for (0..sorted_count) |sorted_index| {
             const proxy_index = self.order.items[sorted_index];
-            const proxy_max_x = self.max_x.items[proxy_index];
-            const proxy_min_y = self.min_y.items[proxy_index];
-            const proxy_max_y = self.max_y.items[proxy_index];
+            const proxy_max_x = proxies.max_x[proxy_index];
+            const proxy_min_y = proxies.min_y[proxy_index];
+            const proxy_max_y = proxies.max_y[proxy_index];
             var candidate_sorted_index = sorted_index + 1;
 
             while (candidate_sorted_index + simd.lane_count <= sorted_count) {
@@ -515,12 +577,12 @@ pub const CollisionSystem = struct {
                 inline for (0..simd.lane_count) |lane| {
                     candidate_indices[lane] = self.order.items[candidate_sorted_index + lane];
                 }
-                const candidate_min_x = simd.gatherFloat4(self.min_x.items, candidate_indices);
+                const candidate_min_x = simd.gatherFloat4(proxies.min_x, candidate_indices);
                 const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
                 if (!x_active[0]) break;
 
-                const candidate_min_y = simd.gatherFloat4(self.min_y.items, candidate_indices);
-                const candidate_max_y = simd.gatherFloat4(self.max_y.items, candidate_indices);
+                const candidate_min_y = simd.gatherFloat4(proxies.min_y, candidate_indices);
+                const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
                 const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
                 inline for (0..simd.lane_count) |lane| {
                     if (overlaps[lane]) {
@@ -534,8 +596,8 @@ pub const CollisionSystem = struct {
 
             while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
                 const candidate_index = self.order.items[candidate_sorted_index];
-                if (self.min_x.items[candidate_index] >= proxy_max_x) break;
-                if (overlapsY(self, proxy_index, candidate_index)) {
+                if (proxies.min_x[candidate_index] >= proxy_max_x) break;
+                if (overlapsY(proxies, proxy_index, candidate_index)) {
                     try self.candidate_pairs.append(self.allocator, .{ .a = proxy_index, .b = candidate_index });
                 }
             }
@@ -599,14 +661,15 @@ fn broadphaseCandidatesJob(context: *anyopaque, range: ParallelRange, _: WorkerI
 }
 
 fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelRange) void {
+    const proxies = system.sliceConst();
     const sorted_count = system.order.items.len;
     const buffer = &system.broadphase_ranges.items[range.index].buffer;
 
     for (range.start..range.end) |sorted_index| {
         const proxy_index = system.order.items[sorted_index];
-        const proxy_max_x = system.max_x.items[proxy_index];
-        const proxy_min_y = system.min_y.items[proxy_index];
-        const proxy_max_y = system.max_y.items[proxy_index];
+        const proxy_max_x = proxies.max_x[proxy_index];
+        const proxy_min_y = proxies.min_y[proxy_index];
+        const proxy_max_y = proxies.max_y[proxy_index];
         var candidate_sorted_index = sorted_index + 1;
 
         while (candidate_sorted_index + simd.lane_count <= sorted_count) {
@@ -614,12 +677,12 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
             inline for (0..simd.lane_count) |lane| {
                 candidate_indices[lane] = system.order.items[candidate_sorted_index + lane];
             }
-            const candidate_min_x = simd.gatherFloat4(system.min_x.items, candidate_indices);
+            const candidate_min_x = simd.gatherFloat4(proxies.min_x, candidate_indices);
             const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
             if (!x_active[0]) break;
 
-            const candidate_min_y = simd.gatherFloat4(system.min_y.items, candidate_indices);
-            const candidate_max_y = simd.gatherFloat4(system.max_y.items, candidate_indices);
+            const candidate_min_y = simd.gatherFloat4(proxies.min_y, candidate_indices);
+            const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
             const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
             inline for (0..simd.lane_count) |lane| {
                 if (overlaps[lane]) {
@@ -633,8 +696,8 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
 
         while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
             const candidate_index = system.order.items[candidate_sorted_index];
-            if (system.min_x.items[candidate_index] >= proxy_max_x) break;
-            if (overlapsY(system, proxy_index, candidate_index)) {
+            if (proxies.min_x[candidate_index] >= proxy_max_x) break;
+            if (overlapsY(proxies, proxy_index, candidate_index)) {
                 buffer.appendCandidateAssumeCapacity(.{ .a = proxy_index, .b = candidate_index });
             }
         }
@@ -651,6 +714,7 @@ fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId
 }
 
 fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) void {
+    const proxies = system.sliceConst();
     const buffer = &system.narrowphase_ranges.items[range.index].buffer;
     var index = range.start;
     const zero = simd.splatFloat4(0);
@@ -666,14 +730,14 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
             b_indices[lane] = pair.b;
         }
 
-        const a_min_x = simd.gatherFloat4(system.min_x.items, a_indices);
-        const a_max_x = simd.gatherFloat4(system.max_x.items, a_indices);
-        const a_min_y = simd.gatherFloat4(system.min_y.items, a_indices);
-        const a_max_y = simd.gatherFloat4(system.max_y.items, a_indices);
-        const b_min_x = simd.gatherFloat4(system.min_x.items, b_indices);
-        const b_max_x = simd.gatherFloat4(system.max_x.items, b_indices);
-        const b_min_y = simd.gatherFloat4(system.min_y.items, b_indices);
-        const b_max_y = simd.gatherFloat4(system.max_y.items, b_indices);
+        const a_min_x = simd.gatherFloat4(proxies.min_x, a_indices);
+        const a_max_x = simd.gatherFloat4(proxies.max_x, a_indices);
+        const a_min_y = simd.gatherFloat4(proxies.min_y, a_indices);
+        const a_max_y = simd.gatherFloat4(proxies.max_y, a_indices);
+        const b_min_x = simd.gatherFloat4(proxies.min_x, b_indices);
+        const b_max_x = simd.gatherFloat4(proxies.max_x, b_indices);
+        const b_min_y = simd.gatherFloat4(proxies.min_y, b_indices);
+        const b_max_y = simd.gatherFloat4(proxies.max_y, b_indices);
 
         const overlap_left = a_max_x - b_min_x;
         const overlap_right = b_max_x - a_min_x;
@@ -695,7 +759,7 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
             if (valid[lane]) {
                 buffer.appendContactAssumeCapacity(
                     contactForResolved(
-                        system,
+                        proxies,
                         a_indices[lane],
                         b_indices[lane],
                         normal_x[lane],
@@ -709,22 +773,22 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
 
     while (index < range.end) : (index += 1) {
         const pair = system.candidate_pairs.items[index];
-        if (contactForCandidate(system, pair.a, pair.b)) |contact| {
+        if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
             buffer.appendContactAssumeCapacity(contact);
         }
     }
 }
 
-fn overlapsY(system: *const CollisionSystem, a: usize, b: usize) bool {
-    return system.max_y.items[a] > system.min_y.items[b] and system.max_y.items[b] > system.min_y.items[a];
+fn overlapsY(proxies: ConstProxySlice, a: usize, b: usize) bool {
+    return proxies.max_y[a] > proxies.min_y[b] and proxies.max_y[b] > proxies.min_y[a];
 }
 
-fn contactForCandidate(system: *const CollisionSystem, a: usize, b: usize) ?CollisionContact {
-    const overlap_left = system.max_x.items[a] - system.min_x.items[b];
-    const overlap_right = system.max_x.items[b] - system.min_x.items[a];
+fn contactForCandidate(proxies: ConstProxySlice, a: usize, b: usize) ?CollisionContact {
+    const overlap_left = proxies.max_x[a] - proxies.min_x[b];
+    const overlap_right = proxies.max_x[b] - proxies.min_x[a];
     const overlap_x = @min(overlap_left, overlap_right);
-    const overlap_top = system.max_y.items[a] - system.min_y.items[b];
-    const overlap_bottom = system.max_y.items[b] - system.min_y.items[a];
+    const overlap_top = proxies.max_y[a] - proxies.min_y[b];
+    const overlap_bottom = proxies.max_y[b] - proxies.min_y[a];
     const overlap_y = @min(overlap_top, overlap_bottom);
     if (overlap_x <= 0 or overlap_y <= 0) return null;
 
@@ -732,21 +796,21 @@ fn contactForCandidate(system: *const CollisionSystem, a: usize, b: usize) ?Coll
     var normal_y: f32 = 0;
     var penetration = overlap_x;
     if (overlap_x <= overlap_y) {
-        const center_a = (system.min_x.items[a] + system.max_x.items[a]) * 0.5;
-        const center_b = (system.min_x.items[b] + system.max_x.items[b]) * 0.5;
+        const center_a = (proxies.min_x[a] + proxies.max_x[a]) * 0.5;
+        const center_b = (proxies.min_x[b] + proxies.max_x[b]) * 0.5;
         normal_x = if (center_a <= center_b) -1 else 1;
     } else {
-        const center_a = (system.min_y.items[a] + system.max_y.items[a]) * 0.5;
-        const center_b = (system.min_y.items[b] + system.max_y.items[b]) * 0.5;
+        const center_a = (proxies.min_y[a] + proxies.max_y[a]) * 0.5;
+        const center_b = (proxies.min_y[b] + proxies.max_y[b]) * 0.5;
         normal_y = if (center_a <= center_b) -1 else 1;
         penetration = overlap_y;
     }
 
-    return contactForResolved(system, a, b, normal_x, normal_y, penetration);
+    return contactForResolved(proxies, a, b, normal_x, normal_y, penetration);
 }
 
 fn contactForResolved(
-    system: *const CollisionSystem,
+    proxies: ConstProxySlice,
     a: usize,
     b: usize,
     normal_x: f32,
@@ -754,25 +818,25 @@ fn contactForResolved(
     penetration: f32,
 ) CollisionContact {
     return .{
-        .a = system.entities.items[a],
-        .b = system.entities.items[b],
-        .a_movement_index = system.movement_indices.items[a],
-        .b_movement_index = system.movement_indices.items[b],
+        .a = proxies.entities[a],
+        .b = proxies.entities[b],
+        .a_movement_index = proxies.movement_indices[a],
+        .b_movement_index = proxies.movement_indices[b],
         .normal_x = normal_x,
         .normal_y = normal_y,
         .penetration = penetration,
     };
 }
 
-fn proxyIndexLessThan(system: *const CollisionSystem, lhs: usize, rhs: usize) bool {
-    const lhs_min_x = system.min_x.items[lhs];
-    const rhs_min_x = system.min_x.items[rhs];
+fn proxyIndexLessThan(proxies: ConstProxySlice, lhs: usize, rhs: usize) bool {
+    const lhs_min_x = proxies.min_x[lhs];
+    const rhs_min_x = proxies.min_x[rhs];
     if (lhs_min_x != rhs_min_x) return lhs_min_x < rhs_min_x;
-    const lhs_min_y = system.min_y.items[lhs];
-    const rhs_min_y = system.min_y.items[rhs];
+    const lhs_min_y = proxies.min_y[lhs];
+    const rhs_min_y = proxies.min_y[rhs];
     if (lhs_min_y != rhs_min_y) return lhs_min_y < rhs_min_y;
-    const lhs_entity = system.entities.items[lhs];
-    const rhs_entity = system.entities.items[rhs];
+    const lhs_entity = proxies.entities[lhs];
+    const rhs_entity = proxies.entities[rhs];
     if (lhs_entity.index != rhs_entity.index) return lhs_entity.index < rhs_entity.index;
     return lhs_entity.generation < rhs_entity.generation;
 }
@@ -1198,10 +1262,19 @@ test "threaded collision update reuses warmed range scratch without steady state
     try std.testing.expect(contacts.mergedItems().len > 0);
 }
 
-test "collision scratch columns are cache-line aligned" {
+fn expectProxyColumnsAligned(proxies: ConstProxySlice) !void {
+    const count = proxies.len();
+    try std.testing.expectEqual(count, proxies.movement_indices.len);
+    try std.testing.expectEqual(count, proxies.min_x.len);
+    try std.testing.expectEqual(count, proxies.min_y.len);
+    try std.testing.expectEqual(count, proxies.max_x.len);
+    try std.testing.expectEqual(count, proxies.max_y.len);
+}
+
+test "collision proxy store rounds capacity for cache-line range splitting" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    for (0..collision_range_alignment_items + 1) |index| {
+    for (0..collision_range_alignment_items * 3 + 1) |index| {
         _ = try addBody(&data, @floatFromInt(index * 4), 0, 6);
     }
 
@@ -1211,9 +1284,13 @@ test "collision scratch columns are cache-line aligned" {
     defer contacts.deinit();
     _ = try system.updateSerial(&data, &contacts);
 
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.min_x.items.ptr) % hot_soa_column_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.min_y.items.ptr) % hot_soa_column_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.max_x.items.ptr) % hot_soa_column_alignment);
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(system.max_y.items.ptr) % hot_soa_column_alignment);
+    const proxies = system.sliceConst();
+    try expectProxyColumnsAligned(proxies);
+    // MultiArrayList columns are not 64-byte aligned; capacity is still rounded
+    // for cache-line range splitting via hotStoreCapacity.
+    try std.testing.expectEqual(@as(usize, 16), collision_range_alignment_items);
+    try std.testing.expectEqual(@as(usize, 0), (collision_range_alignment_items * @sizeOf(f32)) % hot_soa_column_alignment);
+    try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 3 + 1), proxies.len());
+    try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 4), hotStoreCapacity(proxies.len()));
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(system.bodyCount()) % simd.lane_count);
 }

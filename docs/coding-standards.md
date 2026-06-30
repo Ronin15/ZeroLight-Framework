@@ -59,6 +59,52 @@ masks are for membership/query decisions, not a replacement for direct slice
 iteration in hot processors. Worker ranges should write disjoint rows and avoid
 sharing writable cache lines in hot SoA columns.
 
+### Dense SoA storage (`std.MultiArrayList`)
+
+Prefer `std.MultiArrayList` when several columns grow, shrink, append, or
+swap-remove **together** as one logical row. This is the default for persistent
+`DataSystem` component stores, state-owned dense pools (for example
+`ParticleSystem`), and per-step gather/scratch buffers built by parallel
+`appendAssumeCapacity` across matching lengths (collision proxies, AI gather
+rows, steering selected-work columns, collision-response intent rows).
+
+Pattern:
+
+- Define a row struct with one field per column (`MovementBodyRow`,
+  `ProxyRow`, `AiGatherRow`, and similar).
+- Store `rows: std.MultiArrayList(Row)`; expose hot paths through `slice()` /
+  `sliceConst()` helpers that return the existing column-slice structs
+  (`ConstMovementBodySlice`, `ParticleSlice`, and similar).
+- Reserve with `rows.ensureTotalCapacity(allocator, hotStoreCapacity(n))` where
+  hot threading/SIMD ranges need item alignment (`alignItemCount` from
+  `thread_system.zig`).
+- Emit or gather with one `rows.appendAssumeCapacity(row)` (or `set`) per row,
+  not N separate column appends.
+- Compact with `rows.swapRemove(index)` when unordered removal is acceptable.
+
+Do **not** migrate to MAL when the layout is intentionally different:
+
+- Hot/cold column splits for cache behavior (for example pathfinding result-cache
+  probe slots vs cold payloads).
+- Striped or arena buffers (`capacity × stride`) that are not one row per index.
+- Thread range slots with cache-line padding to avoid false sharing.
+- Spatial hash grids (`cell_entries` + `cell_ranges`), pair/contact output
+  streams, or single `ArrayList(Struct)` pools where rows are already AoS.
+- Sparse slot maps (`EntitySlot` lookup tables) that are not dense SoA.
+
+Hot-path rules for MAL (mandatory):
+
+- Call `rows.slice()` **once** per stage or function, then reuse column slices
+  (`const ages = s.items(.age)`). Never call `rows.items(.field)` inside a loop;
+  each call rebuilds slice pointers and has caused large regressions in Debug
+  and Release.
+- Publish hot float column types as plain `[]f32` / `[]const f32`. Do not
+  require `[]align(64) f32` on MAL column slices; MAL does not guarantee
+  64-byte column bases. Range alignment (16 items) is for threading chunk
+  boundaries; explicit wide memory loads may need separate alignment planning.
+- Keep `deinit`, `clearRetainingCapacity`, and capacity helpers on the owning
+  store — one MAL replaces many parallel `deinit` / `ensureTotalCapacity` calls.
+
 All vector operations and named math operations go through `core`:
 `src/core/simd.zig` for vector types/ops and `src/core/math.zig` for reusable
 scalar/vector math. This is unconditional and independent of how domain-specific
@@ -73,10 +119,13 @@ its system, but assemble it from `core` primitives. Plain operator arithmetic
 targets raw `@Vector` and named primitives, not basic arithmetic.
 
 Apply SIMD with scale in mind. Use the `src/core/simd.zig` helpers for dense,
-uniform, branch-light float math over contiguous
-aligned SoA columns, always with a scalar tail — this is the pattern in movement,
-collision broadphase/narrowphase, collision response, particle integration, and
-the pathfinding flow field. This framework is built to scale to heavy scenes,
+uniform, branch-light float math over contiguous SoA columns, always with a
+scalar tail — this is the pattern in movement, collision broadphase/narrowphase,
+collision response, particle integration, and the pathfinding flow field. MAL
+column slices are contiguous SoA; prefer codegen-friendly scalar-to-`@Vector`
+loads in `simd.zig` unless a target-specific aligned load is measured and owned.
+
+This framework is built to scale to heavy scenes,
 large battles, and late-game worlds, where per-agent and per-neighbor work
 (AI decision, separation, steering avoidance) becomes the dominant cost. Do not
 dismiss those loops as "low count" — assess them at their target scale, not their
