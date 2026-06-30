@@ -63,7 +63,10 @@ comptime {
     _ = @import("main.zig");
     _ = @import("render/gpu/buffer.zig");
     _ = @import("render/gpu/device.zig");
+    _ = @import("render/gpu/pipeline_common.zig");
+    _ = @import("render/gpu/shader_paths.zig");
     _ = @import("render/gpu/sprite_pipeline.zig");
+    _ = @import("render/gpu/tilemap_pipeline.zig");
     _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
     _ = @import("render/renderer.zig");

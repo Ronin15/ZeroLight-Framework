@@ -2,6 +2,9 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+//! GPU texture upload from CPU pixels. The caller owns the returned SDL texture
+//! until it is registered and released through `Renderer` / `resources.zig`.
+
 const std = @import("std");
 const resources = @import("../resources.zig");
 const sdl = @import("../../platform/sdl.zig");
@@ -9,11 +12,15 @@ const c = sdl.c;
 
 pub const bytes_per_pixel = 4;
 
+/// Live GPU texture plus the descriptor used to register it in the renderer catalog.
+/// Release through `Renderer` registration teardown (`SDL_ReleaseGPUTexture`).
 pub const UploadedTexture = struct {
     texture: *c.SDL_GPUTexture,
     desc: resources.TextureDesc,
 };
 
+/// Validates pixels, uploads to a new GPU texture, and submits a one-shot command
+/// buffer. Caller owns `UploadedTexture.texture` until registered/released.
 pub fn uploadFromPixels(
     device: *c.SDL_GPUDevice,
     pixels: []const u8,
@@ -22,6 +29,7 @@ pub fn uploadFromPixels(
     pitch: usize,
 ) !UploadedTexture {
     try validatePixels(pixels, width, height, pitch);
+    const required_len = try requiredPixelBytes(height, pitch);
     const desc = resources.TextureDesc{
         .width = width,
         .height = height,
@@ -45,7 +53,7 @@ pub fn uploadFromPixels(
 
     var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
     transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = try checkedTextureBytes(pixels.len);
+    transfer_info.size = try checkedTextureBytes(required_len);
     const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
         return sdlError("SDL_CreateGPUTransferBuffer");
     };
@@ -54,8 +62,8 @@ pub fn uploadFromPixels(
     const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
-    const mapped_bytes = @as([*]u8, @ptrCast(mapped))[0..pixels.len];
-    @memcpy(mapped_bytes, pixels);
+    const mapped_bytes = @as([*]u8, @ptrCast(mapped))[0..required_len];
+    @memcpy(mapped_bytes, pixels[0..required_len]);
     c.SDL_UnmapGPUTransferBuffer(device, transfer);
 
     const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
@@ -114,8 +122,12 @@ pub fn validatePixels(pixels: []const u8, width: u32, height: u32, pitch: usize)
     const min_pitch = std.math.mul(usize, @intCast(width), bytes_per_pixel) catch return error.InvalidTexturePixels;
     if (pitch < min_pitch) return error.InvalidTexturePixels;
 
-    const required_len = std.math.mul(usize, pitch, @intCast(height)) catch return error.InvalidTexturePixels;
+    const required_len = try requiredPixelBytes(height, pitch);
     if (pixels.len < required_len) return error.InvalidTexturePixels;
+}
+
+pub fn requiredPixelBytes(height: u32, pitch: usize) error{InvalidTexturePixels}!usize {
+    return std.math.mul(usize, pitch, @intCast(height)) catch error.InvalidTexturePixels;
 }
 
 fn checkedTextureBytes(byte_count: usize) error{TextureUploadTooLarge}!u32 {
@@ -157,4 +169,8 @@ test "texture upload sizing rejects SDL u32 overflow" {
         error.TextureUploadTooLarge,
         checkedPixelsPerRow((@as(usize, std.math.maxInt(u32)) + 1) * bytes_per_pixel),
     );
+}
+
+test "required pixel bytes uses pitch times height" {
+    try std.testing.expectEqual(@as(usize, 24), try requiredPixelBytes(2, 12));
 }

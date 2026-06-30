@@ -9,8 +9,21 @@ const sprite_batch = @import("../sprite_batch.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
 const shader_paths = @import("shader_paths.zig");
+const pipeline_common = @import("pipeline_common.zig");
 
 const max_shader_bytes = 1024 * 1024;
+
+pub const MaterialShaderPaths = struct {
+    spirv_vertex_path: []const u8,
+    spirv_fragment_path: []const u8,
+    spirv_entrypoint: [:0]const u8,
+    dxil_vertex_path: []const u8,
+    dxil_fragment_path: []const u8,
+    dxil_entrypoint: [:0]const u8,
+    msl_vertex_path: []const u8,
+    msl_fragment_path: []const u8,
+    msl_entrypoint: [:0]const u8,
+};
 
 pub const SpriteMaterial = struct {
     name: []const u8,
@@ -86,73 +99,9 @@ pub fn createSpritePipeline(
     );
     defer c.SDL_ReleaseGPUShader(device, fragment_shader);
 
-    // One vertex buffer per SoA column: Position slot 0, Uv slot 1, VertexColor
-    // slot 2. Each attribute reads its own buffer at offset 0.
-    var vertex_buffers = [_]c.SDL_GPUVertexBufferDescription{
-        .{
-            .slot = 0,
-            .pitch = @sizeOf(sprite_batch.Position),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-        .{
-            .slot = 1,
-            .pitch = @sizeOf(sprite_batch.Uv),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-        .{
-            .slot = 2,
-            .pitch = @sizeOf(sprite_batch.VertexColor),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-    };
-    var vertex_attributes = [_]c.SDL_GPUVertexAttribute{
-        .{
-            .location = 0,
-            .buffer_slot = 0,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = 0,
-        },
-        .{
-            .location = 1,
-            .buffer_slot = 1,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = 0,
-        },
-        .{
-            .location = 2,
-            .buffer_slot = 2,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
-            .offset = 0,
-        },
-    };
-
-    var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);
-    color_target.format = target_format;
-    color_target.blend_state.enable_blend = true;
-    color_target.blend_state.src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA;
-    color_target.blend_state.dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-    color_target.blend_state.color_blend_op = c.SDL_GPU_BLENDOP_ADD;
-    color_target.blend_state.src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE;
-    color_target.blend_state.dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-    color_target.blend_state.alpha_blend_op = c.SDL_GPU_BLENDOP_ADD;
-
-    var pipeline_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
-    pipeline_info.vertex_shader = vertex_shader;
-    pipeline_info.fragment_shader = fragment_shader;
-    pipeline_info.vertex_input_state.vertex_buffer_descriptions = &vertex_buffers;
-    pipeline_info.vertex_input_state.num_vertex_buffers = vertex_buffers.len;
-    pipeline_info.vertex_input_state.vertex_attributes = &vertex_attributes;
-    pipeline_info.vertex_input_state.num_vertex_attributes = vertex_attributes.len;
-    pipeline_info.primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-    pipeline_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
-    pipeline_info.rasterizer_state.cull_mode = c.SDL_GPU_CULLMODE_NONE;
-    pipeline_info.rasterizer_state.front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
-    pipeline_info.multisample_state.sample_count = c.SDL_GPU_SAMPLECOUNT_1;
-    pipeline_info.target_info.color_target_descriptions = &color_target;
-    pipeline_info.target_info.num_color_targets = 1;
+    const layout = pipeline_common.SoaSpriteVertexPipelineLayout.init(target_format);
+    var pipeline_info: c.SDL_GPUGraphicsPipelineCreateInfo = undefined;
+    layout.fillCreateInfo(&pipeline_info, vertex_shader, fragment_shader);
 
     return c.SDL_CreateGPUGraphicsPipeline(device, &pipeline_info) orelse {
         return sdlError("SDL_CreateGPUGraphicsPipeline");
@@ -170,37 +119,65 @@ pub fn selectShaderSet(device: *c.SDL_GPUDevice, app_formats: c.SDL_GPUShaderFor
     };
 }
 
+pub fn materialShaderPaths(material: SpriteMaterial) MaterialShaderPaths {
+    return .{
+        .spirv_vertex_path = material.spirv_vertex_path,
+        .spirv_fragment_path = material.spirv_fragment_path,
+        .spirv_entrypoint = material.spirv_entrypoint,
+        .dxil_vertex_path = material.dxil_vertex_path,
+        .dxil_fragment_path = material.dxil_fragment_path,
+        .dxil_entrypoint = material.dxil_entrypoint,
+        .msl_vertex_path = material.msl_vertex_path,
+        .msl_fragment_path = material.msl_fragment_path,
+        .msl_entrypoint = material.msl_entrypoint,
+    };
+}
+
+pub fn shaderSetFromFormat(format: c.SDL_GPUShaderFormat, paths: MaterialShaderPaths) ShaderSet {
+    if (format == c.SDL_GPU_SHADERFORMAT_MSL) return .{
+        .format = format,
+        .vertex_path = paths.msl_vertex_path,
+        .fragment_path = paths.msl_fragment_path,
+        .entrypoint = paths.msl_entrypoint,
+    };
+    if (format == c.SDL_GPU_SHADERFORMAT_DXIL) return .{
+        .format = format,
+        .vertex_path = paths.dxil_vertex_path,
+        .fragment_path = paths.dxil_fragment_path,
+        .entrypoint = paths.dxil_entrypoint,
+    };
+    return .{
+        .format = format,
+        .vertex_path = paths.spirv_vertex_path,
+        .fragment_path = paths.spirv_fragment_path,
+        .entrypoint = paths.spirv_entrypoint,
+    };
+}
+
 pub fn selectShaderSetFromFormats(
     device_formats: c.SDL_GPUShaderFormat,
     app_formats: c.SDL_GPUShaderFormat,
 ) error{UnsupportedShaderFormat}!ShaderSet {
+    return selectShaderSetFromPaths(device_formats, app_formats, materialShaderPaths(sprite_material));
+}
+
+pub fn selectShaderSetFromPaths(
+    device_formats: c.SDL_GPUShaderFormat,
+    app_formats: c.SDL_GPUShaderFormat,
+    paths: MaterialShaderPaths,
+) error{UnsupportedShaderFormat}!ShaderSet {
     const usable_formats = device_formats & app_formats;
 
     if ((usable_formats & c.SDL_GPU_SHADERFORMAT_MSL) != 0) {
-        return .{
-            .format = c.SDL_GPU_SHADERFORMAT_MSL,
-            .vertex_path = sprite_material.msl_vertex_path,
-            .fragment_path = sprite_material.msl_fragment_path,
-            .entrypoint = sprite_material.msl_entrypoint,
-        };
+        return shaderSetFromFormat(c.SDL_GPU_SHADERFORMAT_MSL, paths);
     }
 
     if ((usable_formats & c.SDL_GPU_SHADERFORMAT_DXIL) != 0) {
-        return .{
-            .format = c.SDL_GPU_SHADERFORMAT_DXIL,
-            .vertex_path = sprite_material.dxil_vertex_path,
-            .fragment_path = sprite_material.dxil_fragment_path,
-            .entrypoint = sprite_material.dxil_entrypoint,
-        };
+        return shaderSetFromFormat(c.SDL_GPU_SHADERFORMAT_DXIL, paths);
     }
 
     if ((usable_formats & c.SDL_GPU_SHADERFORMAT_SPIRV) != 0) {
-        return .{
-            .format = c.SDL_GPU_SHADERFORMAT_SPIRV,
-            .vertex_path = sprite_material.spirv_vertex_path,
-            .fragment_path = sprite_material.spirv_fragment_path,
-            .entrypoint = sprite_material.spirv_entrypoint,
-        };
+        return shaderSetFromFormat(c.SDL_GPU_SHADERFORMAT_SPIRV, paths);
     }
 
     return error.UnsupportedShaderFormat;
@@ -231,6 +208,7 @@ pub fn createShader(
         return err;
     };
     defer allocator.free(code);
+    if (code.len == 0) return error.EmptyShaderAsset;
 
     var shader_info = std.mem.zeroes(c.SDL_GPUShaderCreateInfo);
     shader_info.code_size = code.len;
@@ -292,6 +270,11 @@ test "shader set selection rejects unsupported format combinations" {
         error.UnsupportedShaderFormat,
         selectShaderSetFromFormats(c.SDL_GPU_SHADERFORMAT_SPIRV, c.SDL_GPU_SHADERFORMAT_MSL),
     );
+}
+
+test "sprite material shader resource counts match shader binding layout" {
+    try std.testing.expectEqual(@as(u32, 1), sprite_material.fragment_samplers);
+    try std.testing.expectEqual(@as(u32, 1), sprite_material.vertex_uniform_buffers);
 }
 
 test "shader set selection matches each platform's single-format build output" {

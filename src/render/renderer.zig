@@ -79,6 +79,9 @@ const VertexStreams = struct {
     position_transfer: *c.SDL_GPUTransferBuffer,
     uv_transfer: *c.SDL_GPUTransferBuffer,
     color_transfer: *c.SDL_GPUTransferBuffer,
+    position_bytes: u32,
+    uv_bytes: u32,
+    color_bytes: u32,
 };
 
 // Creates the three column buffers + three transfer buffers for `vertex_capacity`
@@ -110,6 +113,9 @@ fn createVertexStreams(device: *c.SDL_GPUDevice, vertex_capacity: usize) !Vertex
         .position_transfer = position_transfer,
         .uv_transfer = uv_transfer,
         .color_transfer = color_transfer,
+        .position_bytes = position_bytes,
+        .uv_bytes = uv_bytes,
+        .color_bytes = color_bytes,
     };
 }
 
@@ -147,6 +153,9 @@ pub const Renderer = struct {
     // Grow-only scratch resolving queued tile-data edits (handles) to GPU buffers
     // for one batched dig upload per frame.
     tile_edit_scratch: std.ArrayList(gpu_buffer.StorageRegion) = .empty,
+    tile_edit_transfer: ?*c.SDL_GPUTransferBuffer = null,
+    tile_edit_transfer_byte_size: u32 = 0,
+    tile_edits_pending: bool = false,
     batch: sprite_batch.SpriteBatch,
     white_texture: TextureId = TextureId.invalid,
     first_free_texture_slot: ?u32 = null,
@@ -253,6 +262,10 @@ pub const Renderer = struct {
         self.tile_data_params.deinit(self.allocator);
         self.tile_data_counts.deinit(self.allocator);
         self.tile_edit_scratch.deinit(self.allocator);
+        if (self.tile_edit_transfer) |transfer| {
+            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+            self.tile_edit_transfer = null;
+        }
         self.deinitBatchStorage();
         self.static_positions.deinit(self.allocator);
         self.static_uvs.deinit(self.allocator);
@@ -516,6 +529,9 @@ pub const Renderer = struct {
                 return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
             };
         }
+        self.recordPendingTileEdits(command_buffer) catch {
+            return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
+        };
         // The static buffer now holds current data on the GPU; reuse it until the
         // next change marks it dirty again.
         self.static_dirty = false;
@@ -761,18 +777,17 @@ pub const Renderer = struct {
         return @enumFromInt(index);
     }
 
-    /// Uploads a batch of single-cell tile edits (the dig path) in one GPU copy
-    /// pass. Edits whose handle no longer resolves are skipped. The scratch list
-    /// resolves handles to buffers and is grow-only across frames.
+    /// Queues a batch of single-cell tile edits (the dig path) for upload during
+    /// the next `endFrame` copy pass. Edits whose handle no longer resolves are
+    /// skipped. The scratch list resolves handles to buffers and is grow-only.
     pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
         if (edits.len == 0) return;
         self.tile_edit_scratch.clearRetainingCapacity();
         try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, edits.len);
         for (edits) |edit| {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
-            // Reject an out-of-range cell index here so it never becomes an
-            // out-of-bounds GPU buffer write downstream in uploadStorageRegions.
-            if (edit.element_index >= self.tileDataCount(edit.buffer)) {
+            const element_count = self.tileDataCount(edit.buffer);
+            if (edit.element_index >= element_count) {
                 log.warn("dropped tile-data edit: cell {d} out of range for buffer {d}", .{
                     edit.element_index,
                     @intFromEnum(edit.buffer),
@@ -782,10 +797,11 @@ pub const Renderer = struct {
             self.tile_edit_scratch.appendAssumeCapacity(.{
                 .buffer = buffer,
                 .element_index = edit.element_index,
+                .element_count = element_count,
                 .value = edit.value,
             });
         }
-        try gpu_buffer.uploadStorageRegions(self.device, self.tile_edit_scratch.items);
+        self.tile_edits_pending = self.tile_edit_scratch.items.len > 0;
     }
 
     /// Releases every renderer-owned tile-data storage buffer and resets the
@@ -799,6 +815,39 @@ pub const Renderer = struct {
         self.tile_data_buffers.clearRetainingCapacity();
         self.tile_data_params.clearRetainingCapacity();
         self.tile_data_counts.clearRetainingCapacity();
+        self.tile_edit_scratch.clearRetainingCapacity();
+        self.tile_edits_pending = false;
+        if (self.tile_edit_transfer) |transfer| {
+            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+            self.tile_edit_transfer = null;
+            self.tile_edit_transfer_byte_size = 0;
+        }
+    }
+
+    fn ensureTileEditTransfer(self: *Renderer, required_bytes: u32) !void {
+        if (self.tile_edit_transfer) |transfer| {
+            if (self.tile_edit_transfer_byte_size >= required_bytes) return;
+            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+            self.tile_edit_transfer = null;
+            self.tile_edit_transfer_byte_size = 0;
+        }
+        self.tile_edit_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
+        self.tile_edit_transfer_byte_size = required_bytes;
+    }
+
+    fn recordPendingTileEdits(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
+        if (!self.tile_edits_pending or self.tile_edit_scratch.items.len == 0) return;
+        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+        try self.ensureTileEditTransfer(required_bytes);
+        const transfer = self.tile_edit_transfer.?;
+        try gpu_buffer.stageStorageRegions(
+            self.device,
+            transfer,
+            self.tile_edit_transfer_byte_size,
+            self.tile_edit_scratch.items,
+        );
+        try gpu_buffer.recordStorageRegions(command_buffer, transfer, self.tile_edit_scratch.items);
+        self.tile_edits_pending = false;
         self.tile_edit_scratch.clearRetainingCapacity();
     }
 
@@ -971,15 +1020,17 @@ pub const Renderer = struct {
     }
 
     fn stageVertices(self: *Renderer) !void {
-        try gpu_buffer.stageVertices(self.device, self.vertex_streams.position_transfer, std.mem.sliceAsBytes(self.batch.positions.items));
-        try gpu_buffer.stageVertices(self.device, self.vertex_streams.uv_transfer, std.mem.sliceAsBytes(self.batch.uvs.items));
-        try gpu_buffer.stageVertices(self.device, self.vertex_streams.color_transfer, std.mem.sliceAsBytes(self.batch.colors.items));
+        const streams = self.vertex_streams;
+        try gpu_buffer.stageVertices(self.device, streams.position_transfer, streams.position_bytes, std.mem.sliceAsBytes(self.batch.positions.items));
+        try gpu_buffer.stageVertices(self.device, streams.uv_transfer, streams.uv_bytes, std.mem.sliceAsBytes(self.batch.uvs.items));
+        try gpu_buffer.stageVertices(self.device, streams.color_transfer, streams.color_bytes, std.mem.sliceAsBytes(self.batch.colors.items));
     }
 
     fn recordVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.position_transfer, self.vertex_streams.position, std.mem.sliceAsBytes(self.batch.positions.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.uv_transfer, self.vertex_streams.uv, std.mem.sliceAsBytes(self.batch.uvs.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, self.vertex_streams.color_transfer, self.vertex_streams.color, std.mem.sliceAsBytes(self.batch.colors.items));
+        const streams = self.vertex_streams;
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, streams.position_bytes, std.mem.sliceAsBytes(self.batch.positions.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, streams.uv_bytes, std.mem.sliceAsBytes(self.batch.uvs.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, streams.color_bytes, std.mem.sliceAsBytes(self.batch.colors.items));
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
@@ -1009,16 +1060,16 @@ pub const Renderer = struct {
     fn stageStaticVertices(self: *Renderer) !void {
         try self.ensureStaticCapacity(self.static_positions.items.len);
         const streams = self.static_streams.?;
-        try gpu_buffer.stageVertices(self.device, streams.position_transfer, std.mem.sliceAsBytes(self.static_positions.items));
-        try gpu_buffer.stageVertices(self.device, streams.uv_transfer, std.mem.sliceAsBytes(self.static_uvs.items));
-        try gpu_buffer.stageVertices(self.device, streams.color_transfer, std.mem.sliceAsBytes(self.static_colors.items));
+        try gpu_buffer.stageVertices(self.device, streams.position_transfer, streams.position_bytes, std.mem.sliceAsBytes(self.static_positions.items));
+        try gpu_buffer.stageVertices(self.device, streams.uv_transfer, streams.uv_bytes, std.mem.sliceAsBytes(self.static_uvs.items));
+        try gpu_buffer.stageVertices(self.device, streams.color_transfer, streams.color_bytes, std.mem.sliceAsBytes(self.static_colors.items));
     }
 
     fn recordStaticVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
         const streams = self.static_streams.?;
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, std.mem.sliceAsBytes(self.static_positions.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, std.mem.sliceAsBytes(self.static_uvs.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, std.mem.sliceAsBytes(self.static_colors.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, streams.position_bytes, std.mem.sliceAsBytes(self.static_positions.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, streams.uv_bytes, std.mem.sliceAsBytes(self.static_uvs.items));
+        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, streams.color_bytes, std.mem.sliceAsBytes(self.static_colors.items));
     }
 
     pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {

@@ -9,10 +9,17 @@
 //! Use these instead of writing path strings in material descriptors to
 //! eliminate per-descriptor typos within a material's six path fields.
 
+const std = @import("std");
+
 pub fn vertex(comptime name: []const u8, comptime ext: []const u8) []const u8 {
     return "shaders/" ++ name ++ ".vert." ++ ext;
 }
 
 pub fn fragment(comptime name: []const u8, comptime ext: []const u8) []const u8 {
     return "shaders/" ++ name ++ ".frag." ++ ext;
+}
+
+test "shader path helpers follow installed naming convention" {
+    try std.testing.expectEqualStrings("shaders/sprite.vert.spv", vertex("sprite", "spv"));
+    try std.testing.expectEqualStrings("shaders/tilemap.frag.msl", fragment("tilemap", "msl"));
 }

@@ -32,7 +32,19 @@ pub fn columnBytes(vertex_capacity: usize, element_size: usize) error{GpuBufferT
     return checkedGpuBytes(bytes);
 }
 
-pub fn stageVertices(device: *c.SDL_GPUDevice, transfer_buffer: *c.SDL_GPUTransferBuffer, bytes: []const u8) !void {
+pub fn validateUploadBytes(byte_count: usize, buffer_byte_size: u32) error{GpuUploadOutOfBounds}!void {
+    if (byte_count > std.math.maxInt(u32) or byte_count > buffer_byte_size) {
+        return error.GpuUploadOutOfBounds;
+    }
+}
+
+pub fn stageVertices(
+    device: *c.SDL_GPUDevice,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    transfer_byte_size: u32,
+    bytes: []const u8,
+) !void {
+    try validateUploadBytes(bytes.len, transfer_byte_size);
     const mapped = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, true) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
@@ -45,9 +57,11 @@ pub fn recordVertexUpload(
     command_buffer: *c.SDL_GPUCommandBuffer,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
     vertex_buffer: *c.SDL_GPUBuffer,
+    vertex_buffer_byte_size: u32,
     bytes: []const u8,
 ) !void {
     const upload_size = try checkedGpuBytes(bytes.len);
+    try validateUploadBytes(bytes.len, vertex_buffer_byte_size);
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
@@ -117,10 +131,15 @@ pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement)
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
+    var copy_pass_open = true;
+    errdefer if (copy_pass_open) {
+        c.SDL_EndGPUCopyPass(copy_pass);
+    };
     var source = c.SDL_GPUTransferBufferLocation{ .transfer_buffer = transfer, .offset = 0 };
     var destination = c.SDL_GPUBufferRegion{ .buffer = buffer, .offset = 0, .size = upload_size };
     c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
     c.SDL_EndGPUCopyPass(copy_pass);
+    copy_pass_open = false;
 
     if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
         return sdlError("SDL_SubmitGPUCommandBuffer");
@@ -133,51 +152,59 @@ pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement)
 pub const StorageRegion = struct {
     buffer: *c.SDL_GPUBuffer,
     element_index: usize,
+    element_count: u32,
     value: StorageElement,
 };
 
-/// Uploads a batch of single-cell edits (the dig path) in one transfer buffer +
-/// one copy pass + one submit, so a multi-cell edit is a single GPU round-trip
-/// rather than one per cell. Edits may target different buffers. `cycle = false`
-/// is mandatory for partial-region writes: `cycle = true` would rotate the whole
-/// buffer to fresh memory and leave every un-written cell garbage. The tradeoff is
-/// a write may race a prior in-flight frame's read of the same cell (self-correcting
-/// next frame), the same in-place pattern as the initial full upload.
-pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegion) !void {
+pub fn validateStorageRegion(edit: StorageRegion) error{GpuUploadOutOfBounds}!void {
+    if (edit.element_index >= edit.element_count) return error.GpuUploadOutOfBounds;
+}
+
+/// Maps edit values into `transfer_buffer` (sized to `storageByteSize(edits.len)`).
+pub fn stageStorageRegions(
+    device: *c.SDL_GPUDevice,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    transfer_byte_size: u32,
+    edits: []const StorageRegion,
+) !void {
     if (edits.len == 0) return;
-    const element_size: u32 = @sizeOf(StorageElement);
-    const total_bytes = try storageByteSize(edits.len);
+    const required_bytes = try storageByteSize(edits.len);
+    if (required_bytes > transfer_byte_size) return error.GpuUploadOutOfBounds;
+    for (edits) |edit| {
+        try validateStorageRegion(edit);
+    }
 
-    var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
-    transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    transfer_info.size = total_bytes;
-    const transfer = c.SDL_CreateGPUTransferBuffer(device, &transfer_info) orelse {
-        return sdlError("SDL_CreateGPUTransferBuffer");
-    };
-    defer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
-
-    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer, false) orelse {
+    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, false) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
     const values = @as([*]StorageElement, @ptrCast(@alignCast(mapped)))[0..edits.len];
     for (edits, values) |edit, *slot| slot.* = edit.value;
-    c.SDL_UnmapGPUTransferBuffer(device, transfer);
+    c.SDL_UnmapGPUTransferBuffer(device, transfer_buffer);
+}
 
-    const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
-        return sdlError("SDL_AcquireGPUCommandBuffer");
-    };
-    var command_buffer_finished = false;
-    errdefer if (!command_buffer_finished) {
-        _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
-    };
+/// Records partial storage-buffer writes into an open frame command buffer.
+pub fn recordStorageRegions(
+    command_buffer: *c.SDL_GPUCommandBuffer,
+    transfer_buffer: *c.SDL_GPUTransferBuffer,
+    edits: []const StorageRegion,
+) !void {
+    if (edits.len == 0) return;
+    const element_size: u32 = @sizeOf(StorageElement);
+    for (edits) |edit| {
+        try validateStorageRegion(edit);
+    }
 
     const copy_pass = c.SDL_BeginGPUCopyPass(command_buffer) orelse {
         return sdlError("SDL_BeginGPUCopyPass");
     };
+    var copy_pass_open = true;
+    errdefer if (copy_pass_open) {
+        c.SDL_EndGPUCopyPass(copy_pass);
+    };
     for (edits, 0..) |edit, i| {
         const dst_byte_offset = std.math.mul(usize, edit.element_index, element_size) catch return error.GpuBufferTooLarge;
         var source = c.SDL_GPUTransferBufferLocation{
-            .transfer_buffer = transfer,
+            .transfer_buffer = transfer_buffer,
             .offset = @intCast(i * element_size),
         };
         var destination = c.SDL_GPUBufferRegion{
@@ -188,6 +215,30 @@ pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegi
         c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, false);
     }
     c.SDL_EndGPUCopyPass(copy_pass);
+    copy_pass_open = false;
+}
+
+/// Uploads a batch of single-cell edits (the dig path) in one transfer buffer +
+/// one copy pass + one submit. Prefer `stageStorageRegions` + `recordStorageRegions`
+/// with a renderer-pooled transfer buffer for per-frame dig work.
+pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegion) !void {
+    if (edits.len == 0) return;
+    const total_bytes = try storageByteSize(edits.len);
+
+    const transfer = try createVertexTransferBuffer(device, total_bytes);
+    defer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
+
+    try stageStorageRegions(device, transfer, total_bytes, edits);
+
+    const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
+        return sdlError("SDL_AcquireGPUCommandBuffer");
+    };
+    var command_buffer_finished = false;
+    errdefer if (!command_buffer_finished) {
+        _ = c.SDL_CancelGPUCommandBuffer(command_buffer);
+    };
+
+    try recordStorageRegions(command_buffer, transfer, edits);
 
     if (!c.SDL_SubmitGPUCommandBuffer(command_buffer)) {
         return sdlError("SDL_SubmitGPUCommandBuffer");
@@ -236,4 +287,27 @@ test "storage byte sizing is 4 bytes per element and rejects overflow" {
 test "GPU byte sizing rejects values above SDL u32 limit" {
     try std.testing.expectEqual(@as(u32, 4096), try checkedGpuBytes(4096));
     try std.testing.expectError(error.GpuBufferTooLarge, checkedGpuBytes(@as(usize, std.math.maxInt(u32)) + 1));
+}
+
+test "vertex upload validation rejects oversized staging slices" {
+    try std.testing.expectError(error.GpuUploadOutOfBounds, validateUploadBytes(4096, 1024));
+    try validateUploadBytes(512, 1024);
+}
+
+test "storage region validation rejects out-of-range element indices" {
+    const in_range = StorageRegion{
+        .buffer = @ptrFromInt(1),
+        .element_index = 3,
+        .element_count = 4,
+        .value = 1,
+    };
+    try validateStorageRegion(in_range);
+
+    const out_of_range = StorageRegion{
+        .buffer = @ptrFromInt(1),
+        .element_index = 4,
+        .element_count = 4,
+        .value = 1,
+    };
+    try std.testing.expectError(error.GpuUploadOutOfBounds, validateStorageRegion(out_of_range));
 }

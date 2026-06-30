@@ -10,8 +10,8 @@
 
 const std = @import("std");
 const AssetStore = @import("../../assets/assets.zig").AssetStore;
-const sprite_batch = @import("../sprite_batch.zig");
 const sprite_pipeline = @import("sprite_pipeline.zig");
+const pipeline_common = @import("pipeline_common.zig");
 const shader_paths = @import("shader_paths.zig");
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
@@ -23,6 +23,13 @@ test "tilemap shader paths match derived names for each format" {
     try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "msl"), tilemap_material.msl_fragment_path);
     try std.testing.expectEqualStrings(shader_paths.vertex("tilemap", "dxil"), tilemap_material.dxil_vertex_path);
     try std.testing.expectEqualStrings(shader_paths.fragment("tilemap", "dxil"), tilemap_material.dxil_fragment_path);
+}
+
+test "tilemap material shader resource counts match shader binding layout" {
+    try std.testing.expectEqual(@as(u32, 1), tilemap_material.fragment_samplers);
+    try std.testing.expectEqual(@as(u32, 1), tilemap_material.fragment_storage_buffers);
+    try std.testing.expectEqual(@as(u32, 1), tilemap_material.fragment_uniform_buffers);
+    try std.testing.expectEqual(@as(u32, 1), tilemap_material.vertex_uniform_buffers);
 }
 
 test "tilemap shaderSetForFormat selects correct paths per format" {
@@ -81,27 +88,24 @@ pub const tilemap_material = TilemapMaterial{
     .vertex_uniform_buffers = 1,
 };
 
+fn materialShaderPaths(material: TilemapMaterial) sprite_pipeline.MaterialShaderPaths {
+    return .{
+        .spirv_vertex_path = material.spirv_vertex_path,
+        .spirv_fragment_path = material.spirv_fragment_path,
+        .spirv_entrypoint = material.spirv_entrypoint,
+        .dxil_vertex_path = material.dxil_vertex_path,
+        .dxil_fragment_path = material.dxil_fragment_path,
+        .dxil_entrypoint = material.dxil_entrypoint,
+        .msl_vertex_path = material.msl_vertex_path,
+        .msl_fragment_path = material.msl_fragment_path,
+        .msl_entrypoint = material.msl_entrypoint,
+    };
+}
+
 /// Tilemap shader paths for the format already chosen by the sprite pipeline's
 /// `selectShaderSet`, so both pipelines load the same backend's bytecode.
 pub fn shaderSetForFormat(format: c.SDL_GPUShaderFormat) ShaderSet {
-    if (format == c.SDL_GPU_SHADERFORMAT_MSL) return .{
-        .format = format,
-        .vertex_path = tilemap_material.msl_vertex_path,
-        .fragment_path = tilemap_material.msl_fragment_path,
-        .entrypoint = tilemap_material.msl_entrypoint,
-    };
-    if (format == c.SDL_GPU_SHADERFORMAT_DXIL) return .{
-        .format = format,
-        .vertex_path = tilemap_material.dxil_vertex_path,
-        .fragment_path = tilemap_material.dxil_fragment_path,
-        .entrypoint = tilemap_material.dxil_entrypoint,
-    };
-    return .{
-        .format = format,
-        .vertex_path = tilemap_material.spirv_vertex_path,
-        .fragment_path = tilemap_material.spirv_fragment_path,
-        .entrypoint = tilemap_material.spirv_entrypoint,
-    };
+    return sprite_pipeline.shaderSetFromFormat(format, materialShaderPaths(tilemap_material));
 }
 
 pub fn createTilemapPipeline(
@@ -141,75 +145,9 @@ pub fn createTilemapPipeline(
     );
     defer c.SDL_ReleaseGPUShader(device, fragment_shader);
 
-    // The layer quad uses the shared SoA column layout; only position (slot 0) is
-    // consumed, but all three slots are declared so the runtime always binds three
-    // buffers and the static slab populates uv/color too (writeWorldSpriteQuad
-    // fills all three columns). Position slot 0, Uv slot 1, VertexColor slot 2.
-    var vertex_buffers = [_]c.SDL_GPUVertexBufferDescription{
-        .{
-            .slot = 0,
-            .pitch = @sizeOf(sprite_batch.Position),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-        .{
-            .slot = 1,
-            .pitch = @sizeOf(sprite_batch.Uv),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-        .{
-            .slot = 2,
-            .pitch = @sizeOf(sprite_batch.VertexColor),
-            .input_rate = c.SDL_GPU_VERTEXINPUTRATE_VERTEX,
-            .instance_step_rate = 0,
-        },
-    };
-    var vertex_attributes = [_]c.SDL_GPUVertexAttribute{
-        .{
-            .location = 0,
-            .buffer_slot = 0,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = 0,
-        },
-        .{
-            .location = 1,
-            .buffer_slot = 1,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2,
-            .offset = 0,
-        },
-        .{
-            .location = 2,
-            .buffer_slot = 2,
-            .format = c.SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4,
-            .offset = 0,
-        },
-    };
-
-    var color_target = std.mem.zeroes(c.SDL_GPUColorTargetDescription);
-    color_target.format = target_format;
-    color_target.blend_state.enable_blend = true;
-    color_target.blend_state.src_color_blendfactor = c.SDL_GPU_BLENDFACTOR_SRC_ALPHA;
-    color_target.blend_state.dst_color_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-    color_target.blend_state.color_blend_op = c.SDL_GPU_BLENDOP_ADD;
-    color_target.blend_state.src_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE;
-    color_target.blend_state.dst_alpha_blendfactor = c.SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
-    color_target.blend_state.alpha_blend_op = c.SDL_GPU_BLENDOP_ADD;
-
-    var pipeline_info = std.mem.zeroes(c.SDL_GPUGraphicsPipelineCreateInfo);
-    pipeline_info.vertex_shader = vertex_shader;
-    pipeline_info.fragment_shader = fragment_shader;
-    pipeline_info.vertex_input_state.vertex_buffer_descriptions = &vertex_buffers;
-    pipeline_info.vertex_input_state.num_vertex_buffers = vertex_buffers.len;
-    pipeline_info.vertex_input_state.vertex_attributes = &vertex_attributes;
-    pipeline_info.vertex_input_state.num_vertex_attributes = vertex_attributes.len;
-    pipeline_info.primitive_type = c.SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
-    pipeline_info.rasterizer_state.fill_mode = c.SDL_GPU_FILLMODE_FILL;
-    pipeline_info.rasterizer_state.cull_mode = c.SDL_GPU_CULLMODE_NONE;
-    pipeline_info.rasterizer_state.front_face = c.SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
-    pipeline_info.multisample_state.sample_count = c.SDL_GPU_SAMPLECOUNT_1;
-    pipeline_info.target_info.color_target_descriptions = &color_target;
-    pipeline_info.target_info.num_color_targets = 1;
+    const layout = pipeline_common.SoaSpriteVertexPipelineLayout.init(target_format);
+    var pipeline_info: c.SDL_GPUGraphicsPipelineCreateInfo = undefined;
+    layout.fillCreateInfo(&pipeline_info, vertex_shader, fragment_shader);
 
     return c.SDL_CreateGPUGraphicsPipeline(device, &pipeline_info) orelse {
         return sdl.sdlError("SDL_CreateGPUGraphicsPipeline");

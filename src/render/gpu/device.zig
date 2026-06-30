@@ -2,11 +2,14 @@
 // All rights reserved.
 // Licensed under the MIT License - see LICENSE file for details
 
+const std = @import("std");
 const config = @import("../../config.zig");
 const log = @import("../../core/logging.zig").render;
 const sdl = @import("../../platform/sdl.zig");
 const c = sdl.c;
 
+/// Creates an SDL_GPU device. Caller owns the returned handle and must release it
+/// with `SDL_DestroyGPUDevice` after releasing all dependent GPU resources.
 pub fn createDevice(shader_formats: c.SDL_GPUShaderFormat, gpu_debug: bool) !*c.SDL_GPUDevice {
     const device = c.SDL_CreateGPUDevice(shader_formats, gpu_debug, null) orelse {
         return sdlError("SDL_CreateGPUDevice");
@@ -21,12 +24,15 @@ pub fn createDevice(shader_formats: c.SDL_GPUShaderFormat, gpu_debug: bool) !*c.
     return device;
 }
 
+/// Claims `window` for `device`. Pair with `SDL_ReleaseWindowFromGPUDevice` before
+/// destroying the device.
 pub fn claimWindow(device: *c.SDL_GPUDevice, window: *c.SDL_Window) !void {
     if (!c.SDL_ClaimWindowForGPUDevice(device, window)) {
         return sdlError("SDL_ClaimWindowForGPUDevice");
     }
 }
 
+/// Configures swapchain parameters on a claimed window. Call after `claimWindow`.
 pub fn configureSwapchain(device: *c.SDL_GPUDevice, window: *c.SDL_Window, app_config: config.AppConfig) !void {
     const selected_present_mode = selectPresentMode(device, window, app_config.present_mode);
 
@@ -44,6 +50,8 @@ pub fn configureSwapchain(device: *c.SDL_GPUDevice, window: *c.SDL_Window, app_c
     }
 }
 
+/// Creates the shared nearest-filtered clamp sampler. Caller owns the handle and
+/// must release it with `SDL_ReleaseGPUSampler` before destroying the device.
 pub fn createSampler(device: *c.SDL_GPUDevice) !*c.SDL_GPUSampler {
     var sampler_info = @import("std").mem.zeroes(c.SDL_GPUSamplerCreateInfo);
     sampler_info.min_filter = c.SDL_GPU_FILTER_NEAREST;
@@ -58,7 +66,7 @@ pub fn createSampler(device: *c.SDL_GPUDevice) !*c.SDL_GPUSampler {
     };
 }
 
-fn presentMode(mode: config.PresentMode) c.SDL_GPUPresentMode {
+pub fn presentMode(mode: config.PresentMode) c.SDL_GPUPresentMode {
     return switch (mode) {
         .vsync => c.SDL_GPU_PRESENTMODE_VSYNC,
         .immediate => c.SDL_GPU_PRESENTMODE_IMMEDIATE,
@@ -66,7 +74,7 @@ fn presentMode(mode: config.PresentMode) c.SDL_GPUPresentMode {
     };
 }
 
-fn selectPresentMode(
+pub fn selectPresentMode(
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
     requested_mode: config.PresentMode,
@@ -76,10 +84,29 @@ fn selectPresentMode(
         return requested_sdl_mode;
     }
 
-    log.warn("requested SDL_GPU present mode is unsupported; falling back to vsync", .{});
+    const fallbacks = [_]c.SDL_GPUPresentMode{
+        c.SDL_GPU_PRESENTMODE_VSYNC,
+        c.SDL_GPU_PRESENTMODE_MAILBOX,
+        c.SDL_GPU_PRESENTMODE_IMMEDIATE,
+    };
+    for (fallbacks) |fallback| {
+        if (c.SDL_WindowSupportsGPUPresentMode(device, window, fallback)) {
+            log.warn("requested SDL_GPU present mode is unsupported; falling back", .{});
+            return fallback;
+        }
+    }
+
+    log.err("no supported SDL_GPU present mode found; using vsync", .{});
     return c.SDL_GPU_PRESENTMODE_VSYNC;
 }
 
 fn sdlError(comptime operation: []const u8) error{SdlError} {
     return sdl.sdlError(operation);
+}
+
+test "present mode maps config enum to SDL_GPU present mode" {
+    const PresentMode = @TypeOf(presentMode(.vsync));
+    try std.testing.expectEqual(@as(PresentMode, @intCast(c.SDL_GPU_PRESENTMODE_VSYNC)), presentMode(.vsync));
+    try std.testing.expectEqual(@as(PresentMode, @intCast(c.SDL_GPU_PRESENTMODE_IMMEDIATE)), presentMode(.immediate));
+    try std.testing.expectEqual(@as(PresentMode, @intCast(c.SDL_GPU_PRESENTMODE_MAILBOX)), presentMode(.mailbox));
 }
