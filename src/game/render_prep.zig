@@ -8,6 +8,7 @@ const math = @import("../core/math.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
 const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
+const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisualSlice;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
@@ -26,6 +27,7 @@ const manifest = @import("../assets/manifest.zig");
 const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const ConstParticleSlice = @import("systems/particle.zig").ConstParticleSlice;
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
@@ -408,15 +410,20 @@ pub fn collectDynamicRecords(
     prep.clearRetainingCapacity();
 
     const movement = scene.data.movementBodySliceConst();
+    const scope = scene.data.scopeColumnsSliceConst();
     const visuals = scene.data.primitiveVisualSliceConst();
     const assets = scene.data.assetReferenceSliceConst();
     const facings = scene.data.facingSliceConst();
+    const visible_chunks = scene.world.visibleChunkRegion();
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
     for (visuals.entities, 0..) |entity, visual_index| {
         const indices = scene.data.renderEntityComponentIndices(entity) orelse continue;
         const movement_index = indices.movement_body;
+        const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
+        if (!entityChunkVisibleForCollect(is_player, movement_index, scope, visible_chunks)) continue;
+
         const render_x = math.lerp(
             movement.previous_x[movement_index],
             movement.position_x[movement_index],
@@ -429,7 +436,6 @@ pub fn collectDynamicRecords(
         );
         const size_x = visuals.size_x[visual_index];
         const size_y = visuals.size_y[visual_index];
-        const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
         if (!is_player and !visible.overlapsAabb(render_x, render_y, size_x, size_y)) continue;
 
         if (indices.asset_ref) |asset_index| {
@@ -688,6 +694,24 @@ fn markerRectAt(
     };
 }
 
+/// Coarse camera-chunk gate before interpolation and draw prep. Uses the world's
+/// render visibility window (same source as sparse tiles), not simulation-scope
+/// tier/pathfinding policy. Callers must set world visibility before collect;
+/// when the window is unset, non-player entities are skipped.
+fn entityChunkVisibleForCollect(
+    is_player: bool,
+    movement_index: usize,
+    scope: ConstScopeColumnsSlice,
+    visible_chunks: ?ActiveRegion,
+) bool {
+    if (is_player) return true;
+    const region = visible_chunks orelse return false;
+    return region.containsChunk(.{
+        .x = scope.chunk_x[movement_index],
+        .y = scope.chunk_y[movement_index],
+    });
+}
+
 fn sortRecordIndexLessThan(records: []const DynamicRenderRecord, lhs_index: usize, rhs_index: usize) bool {
     const lhs = records[lhs_index];
     const rhs = records[rhs_index];
@@ -921,6 +945,48 @@ test "dynamic scene prep includes particles in z order" {
         if (depth == effect_depth_50 or depth == effect_depth_neg_50) particle_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), particle_count);
+}
+
+test "dynamic scene prep culls entities outside the visible chunk region before draw prep" {
+    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
+    defer fixture.deinit();
+
+    const actor_chunk: i32 = 40;
+    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
+        .chunk = .{ .x = actor_chunk, .y = actor_chunk },
+    });
+    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
+    actor_body.position_x.* = 80;
+    actor_body.position_y.* = 80;
+    actor_body.previous_x.* = 80;
+    actor_body.previous_y.* = 80;
+
+    const obstacle_body = fixture.data.movementBodyPtr(fixture.obstacle_entity).?;
+    const obstacle_x = obstacle_body.position_x.*;
+    const obstacle_y = obstacle_body.position_y.*;
+    try fixture.data.setSimulationMetadata(fixture.obstacle_entity, .{
+        .chunk = .{ .x = 0, .y = 0 },
+    });
+
+    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 160, .h = 160 }, 0);
+
+    try fixture.collect(.{
+        .min_x = 0,
+        .min_y = 0,
+        .max_x = 800,
+        .max_y = 450,
+    }, 1.0);
+
+    var offscreen_actor_seen = false;
+    var onscreen_obstacle_seen = false;
+    for (fixture.scene_prep.records.items) |record| {
+        const draw = record.draw;
+        if (drawMatchesEntityPosition(draw, 80, 80)) offscreen_actor_seen = true;
+        if (drawMatchesEntityPosition(draw, obstacle_x, obstacle_y)) onscreen_obstacle_seen = true;
+    }
+
+    try std.testing.expect(!offscreen_actor_seen);
+    try std.testing.expect(onscreen_obstacle_seen);
 }
 
 test "dynamic scene prep culls entities and particles outside the visible rect" {

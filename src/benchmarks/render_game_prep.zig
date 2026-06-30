@@ -90,6 +90,8 @@ const Fixture = struct {
     dynamic_record_capacity: usize,
     last_collected_records: usize = 0,
     sparse_tile_count: usize,
+    world_width_px: f32 = 0,
+    world_height_px: f32 = 0,
 
     fn deinit(self: *Fixture) void {
         self.scene_prep.deinit();
@@ -271,6 +273,7 @@ fn runMeasuredOnce(
 
     const collect_start_ns = suite.nowNs(io);
     try collectProductionDynamicRecords(fixture);
+    setBenchSparseEmitChunkVisibility(fixture);
     const sparse_submitted = try emitLayeredCommands(fixture, batch);
     const collect_end_ns = suite.nowNs(io);
 
@@ -325,10 +328,8 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 }
 
 fn collectProductionDynamicRecords(fixture: *Fixture) !void {
-    const visible = benchCollectVisibleRect(
-        fixture.world.worldWidthPixels(),
-        fixture.world.worldHeightPixels(),
-    );
+    setBenchCollectChunkVisibility(fixture);
+    const visible = benchCollectVisibleRect(fixture.world_width_px, fixture.world_height_px);
     try render_prep.collectDynamicRecords(
         &fixture.scene_prep,
         fixture.gameplayScene(),
@@ -340,7 +341,21 @@ fn collectProductionDynamicRecords(fixture: *Fixture) !void {
     std.debug.assert(fixture.last_collected_records == expectedBenchCollectedRecords(fixture.item_count));
 }
 
-/// Full-world visibility for entity collect. Perf benches target the requested
+fn setBenchCollectChunkVisibility(fixture: *Fixture) void {
+    fixture.world.setVisibleChunksForWorldRect(.{
+        .x = 0,
+        .y = 0,
+        .w = fixture.world_width_px,
+        .h = fixture.world_height_px,
+    }, 0);
+}
+
+fn setBenchSparseEmitChunkVisibility(fixture: *Fixture) void {
+    const camera_rect = cameraWorldRect(fixture.world_width_px, fixture.world_height_px);
+    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks);
+}
+
+/// Full-world pixel bounds for entity collect. Perf benches target the requested
 /// entity count; camera culling is production behavior and is not measured here.
 fn benchCollectVisibleRect(world_width_px: f32, world_height_px: f32) render_prep.VisibleWorldRect {
     return .{
@@ -455,8 +470,8 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, item
         _ = try fixture.world.addSparseTile(level, x, y, deco, @intCast(index % 3), band);
     }
 
-    const camera_rect = cameraWorldRect(world_width_px, world_height_px);
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, world_overscan_chunks);
+    fixture.world_width_px = world_width_px;
+    fixture.world_height_px = world_height_px;
 
     var player_entity: EntityId = undefined;
     for (0..item_count) |index| {
@@ -469,6 +484,7 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, item
             .position_z = @intCast(@as(i32, @intCast(index % 17)) - 8),
             .previous_z = @intCast(@as(i32, @intCast(index % 17)) - 8),
         });
+        syncEntityScopeChunk(&fixture.data, entity, &fixture.world, position);
         try fixture.data.setPrimitiveVisual(entity, .{
             .size = .{ .x = 14 + @as(f32, @floatFromInt(index % 5)), .y = 14 + @as(f32, @floatFromInt(index % 7)) },
             .color = tintFor(index),
@@ -560,6 +576,15 @@ const EntitySpawnLayout = struct {
 fn expectedBenchCollectedRecords(item_count: usize) usize {
     const active_particles = @min(particleCapacity(item_count), @max(item_count / 16, 1));
     return item_count + active_particles;
+}
+
+fn syncEntityScopeChunk(data: *DataSystem, entity: EntityId, world: *const WorldSystem, position: math.Vec2) void {
+    const movement_index = data.movementBodyDenseIndex(entity) orelse return;
+    var scope = data.scopeColumnsSlice();
+    const tx = math.worldPosToCell(position.x, world.tile_size, world.width);
+    const ty = math.worldPosToCell(position.y, world.tile_size, world.height);
+    scope.chunk_x[movement_index] = @intCast(tx / world.chunk_size_tiles);
+    scope.chunk_y[movement_index] = @intCast(ty / world.chunk_size_tiles);
 }
 
 fn entitySpawnLayout(item_count: usize) EntitySpawnLayout {
