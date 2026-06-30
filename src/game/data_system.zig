@@ -17,19 +17,21 @@ const SimulationScopeStats = @import("simulation_scope.zig").SimulationScopeStat
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const cognition_stagger_n = @import("simulation_scope.zig").cognition_stagger_n;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
+const alignItemCount = @import("../app/thread_system.zig").alignItemCount;
 const simd = @import("../core/simd.zig");
 const WorldDepth = render_depth.WorldDepth;
 
 pub const hot_soa_column_alignment: usize = 64;
 pub const movement_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
 
-pub const HotF32Slice = []align(hot_soa_column_alignment) f32;
-pub const ConstHotF32Slice = []align(hot_soa_column_alignment) const f32;
-pub const HotI32Slice = []align(hot_soa_column_alignment) i32;
-pub const ConstHotI32Slice = []align(hot_soa_column_alignment) const i32;
+pub const HotF32Slice = []f32;
+pub const ConstHotF32Slice = []const f32;
+pub const HotI32Slice = []i32;
+pub const ConstHotI32Slice = []const i32;
 
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_soa_column_alignment));
-const HotI32List = std.ArrayListAligned(i32, .fromByteUnits(hot_soa_column_alignment));
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, movement_range_alignment_items);
+}
 
 /// Stable entity handle. The index points at an entity slot and the generation
 /// changes whenever that slot is retired, so stale IDs cannot resolve after
@@ -443,14 +445,14 @@ const StructuralCapacityNeeds = struct {
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
             .slots = data.slots.items.len,
-            .movement_bodies = data.movement_bodies.entities.items.len,
-            .facings = data.facings.entities.items.len,
-            .primitive_visuals = data.primitive_visuals.entities.items.len,
-            .asset_refs = data.asset_refs.entities.items.len,
-            .collision_bounds = data.collision_bounds.entities.items.len,
-            .collision_responses = data.collision_responses.entities.items.len,
-            .ai_agents = data.ai_agents.entities.items.len,
-            .steering_agents = data.steering_agents.entities.items.len,
+            .movement_bodies = data.movement_bodies.len(),
+            .facings = data.facings.len(),
+            .primitive_visuals = data.primitive_visuals.len(),
+            .asset_refs = data.asset_refs.len(),
+            .collision_bounds = data.collision_bounds.len(),
+            .collision_responses = data.collision_responses.len(),
+            .ai_agents = data.ai_agents.len(),
+            .steering_agents = data.steering_agents.len(),
         };
     }
 
@@ -763,13 +765,7 @@ pub const DataSystem = struct {
     pub fn simulationMetadata(self: *const DataSystem, id: EntityId) ?EntitySimulationMetadata {
         const slot = self.resolveSlotConst(id) orelse return null;
         const di: usize = slot.movement_body_index orelse return null;
-        return .{
-            .tier = self.movement_bodies.tier.items[di],
-            .chunk = .{ .x = self.movement_bodies.chunk_x.items[di], .y = self.movement_bodies.chunk_y.items[di] },
-            .level = self.movement_bodies.level.items[di],
-            .stagger_phase = self.movement_bodies.stagger_phase.items[di],
-            .always_active = self.movement_bodies.always_active.items[di],
-        };
+        return self.movement_bodies.scopeMetadataAt(di);
     }
 
     /// Writes the full scope metadata for an entity into its dense scope row.
@@ -778,14 +774,9 @@ pub const DataSystem = struct {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[di])] -= 1;
+        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(di))] -= 1;
         self.tier_counts[@intFromEnum(metadata.tier)] += 1;
-        self.movement_bodies.tier.items[di] = metadata.tier;
-        self.movement_bodies.chunk_x.items[di] = metadata.chunk.x;
-        self.movement_bodies.chunk_y.items[di] = metadata.chunk.y;
-        self.movement_bodies.level.items[di] = metadata.level;
-        self.movement_bodies.stagger_phase.items[di] = metadata.stagger_phase;
-        self.movement_bodies.always_active.items[di] = metadata.always_active;
+        self.movement_bodies.setScopeMetadata(di, metadata);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
 
@@ -795,9 +786,9 @@ pub const DataSystem = struct {
     pub fn setSimulationTier(self: *DataSystem, id: EntityId, tier: SimulationTier) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[di])] -= 1;
+        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(di))] -= 1;
         self.tier_counts[@intFromEnum(tier)] += 1;
-        self.movement_bodies.tier.items[di] = tier;
+        self.movement_bodies.setTier(di, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
     }
@@ -808,9 +799,7 @@ pub const DataSystem = struct {
     /// so the row renders static until it moves again.
     fn snapInterpolationIfStill(self: *DataSystem, di: usize, tier: SimulationTier) void {
         if (tier.allowsMovement()) return;
-        self.movement_bodies.previous_x.items[di] = self.movement_bodies.position_x.items[di];
-        self.movement_bodies.previous_y.items[di] = self.movement_bodies.position_y.items[di];
-        self.movement_bodies.previous_z.items[di] = self.movement_bodies.position_z.items[di];
+        self.movement_bodies.snapPreviousToPosition(di);
     }
 
     /// Mutable dense scope columns (chunk_x/y written in-pass by the movement processor).
@@ -843,11 +832,11 @@ pub const DataSystem = struct {
             .kinematic_entities = self.tier_counts[@intFromEnum(SimulationTier.kinematic)],
             .locomotion_entities = self.tier_counts[@intFromEnum(SimulationTier.locomotion)],
             .cognition_entities = self.tier_counts[@intFromEnum(SimulationTier.cognition)],
-            .movement_stage_entities = self.movement_bodies.entities.items.len,
-            .collision_stage_entities = self.collision_bounds.entities.items.len,
-            .collision_response_stage_entities = self.collision_responses.entities.items.len,
-            .ai_stage_entities = self.ai_agents.entities.items.len,
-            .steering_stage_entities = self.steering_agents.entities.items.len,
+            .movement_stage_entities = self.movement_bodies.len(),
+            .collision_stage_entities = self.collision_bounds.len(),
+            .collision_response_stage_entities = self.collision_responses.len(),
+            .ai_stage_entities = self.ai_agents.len(),
+            .steering_stage_entities = self.steering_agents.len(),
         };
     }
 
@@ -856,7 +845,7 @@ pub const DataSystem = struct {
     /// Counts entities with a movement body (the entities that carry a tier).
     pub fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
         var counts = [4]usize{ 0, 0, 0, 0 };
-        for (self.movement_bodies.tier.items) |tier| {
+        for (self.movement_bodies.scopeSliceConst().tier) |tier| {
             counts[@intFromEnum(tier)] += 1;
         }
         return counts;
@@ -951,7 +940,7 @@ pub const DataSystem = struct {
     pub fn setFacing(self: *DataSystem, id: EntityId, facing: FacingData) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         if (slot.facing_index) |index| {
-            self.facings.directions.items[@intCast(index)] = facing.direction;
+            self.facings.setDirection(@intCast(index), facing.direction);
             return;
         }
 
@@ -963,13 +952,13 @@ pub const DataSystem = struct {
     pub fn facingPtr(self: *DataSystem, id: EntityId) ?*Facing {
         const slot = self.resolveSlot(id) orelse return null;
         const dense_index = slot.facing_index orelse return null;
-        return &self.facings.directions.items[@intCast(dense_index)];
+        return self.facings.directionPtr(@intCast(dense_index));
     }
 
     pub fn facingConst(self: *const DataSystem, id: EntityId) ?FacingData {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.facing_index orelse return null;
-        return .{ .direction = self.facings.directions.items[@intCast(dense_index)] };
+        return .{ .direction = self.facings.directionAt(@intCast(dense_index)) };
     }
 
     pub fn facingSlice(self: *DataSystem) FacingSlice {
@@ -1013,8 +1002,7 @@ pub const DataSystem = struct {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
 
         if (slot.asset_ref_index) |index| {
-            self.asset_refs.sprite_ids.items[@intCast(index)] = asset_ref.sprite;
-            self.asset_refs.atlas_entry_ids.items[@intCast(index)] = asset_ref.atlas_entry_id;
+            self.asset_refs.set(@intCast(index), asset_ref);
             return;
         }
 
@@ -1026,11 +1014,7 @@ pub const DataSystem = struct {
     pub fn assetReferenceConst(self: *const DataSystem, id: EntityId) ?AssetReference {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.asset_ref_index orelse return null;
-        const index: usize = @intCast(dense_index);
-        return .{
-            .sprite = self.asset_refs.sprite_ids.items[index],
-            .atlas_entry_id = self.asset_refs.atlas_entry_ids.items[index],
-        };
+        return self.asset_refs.get(@intCast(dense_index));
     }
 
     pub fn assetReferenceSliceConst(self: *const DataSystem) ConstAssetReferenceSlice {
@@ -1524,7 +1508,7 @@ pub const DataSystem = struct {
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
-        self.tier_counts[@intFromEnum(self.movement_bodies.tier.items[index])] -= 1;
+        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(index))] -= 1;
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
@@ -1661,964 +1645,844 @@ fn validateSteeringAgent(agent: SteeringAgent) !void {
     }
 }
 
+const MovementBodyRow = struct {
+    entity: EntityId,
+    position_x: f32,
+    position_y: f32,
+    position_z: i32,
+    previous_x: f32,
+    previous_y: f32,
+    previous_z: i32,
+    velocity_x: f32,
+    velocity_y: f32,
+    speed: f32,
+    tier: SimulationTier,
+    chunk_x: i32,
+    chunk_y: i32,
+    level: u16,
+    stagger_phase: u8,
+    always_active: bool,
+};
+
+const FacingRow = struct {
+    entity: EntityId,
+    direction: Facing,
+};
+
+const PrimitiveVisualRow = struct {
+    entity: EntityId,
+    size_x: f32,
+    size_y: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    color_a: f32,
+    depth_value: i32,
+    marker_color_r: f32,
+    marker_color_g: f32,
+    marker_color_b: f32,
+    marker_color_a: f32,
+    marker_depth_value: i32,
+    marker_length: f32,
+    marker_depth: f32,
+    marker_margin: f32,
+};
+
+const AssetReferenceRow = struct {
+    entity: EntityId,
+    sprite: SpriteAssetId,
+    atlas_entry_id: u16,
+};
+
+const CollisionBoundsRow = struct {
+    entity: EntityId,
+    offset_x: f32,
+    offset_y: f32,
+    size_x: f32,
+    size_y: f32,
+};
+
+const CollisionResponseRow = struct {
+    entity: EntityId,
+    mode: CollisionResponseMode,
+    mobility: CollisionResponseMobility,
+    restitution: f32,
+};
+
+const AiAgentRow = struct {
+    entity: EntityId,
+    behavior: AiBehavior,
+    wander_amplitude: f32,
+    seek_weight: f32,
+};
+
+const SteeringAgentRow = struct {
+    entity: EntityId,
+    agent_radius: f32,
+    waypoint_tolerance: f32,
+    avoidance_radius: f32,
+    avoidance_weight: f32,
+    max_neighbor_samples: u16,
+    stuck_step_threshold: u16,
+    replan_cooldown_steps: u16,
+    unavailable_backoff_steps: u16,
+};
+
 const MovementBodyStore = struct {
-    // Movement is the hottest component, so scalar fields are separate aligned
-    // columns for SIMD loads and cache-line-aware range splitting.
-    entities: std.ArrayList(EntityId) = .empty,
-    position_x: HotF32List = .empty,
-    position_y: HotF32List = .empty,
-    position_z: HotI32List = .empty,
-    previous_x: HotF32List = .empty,
-    previous_y: HotF32List = .empty,
-    previous_z: HotI32List = .empty,
-    velocity_x: HotF32List = .empty,
-    velocity_y: HotF32List = .empty,
-    speed: HotF32List = .empty,
-    // Simulation-scope columns ride in dense lockstep with the movement rows so the
-    // scope gathers and tier policy iterate aligned SoA instead of scattered cold
-    // slots. The movement integration slice omits tier/level/stagger/always_active
-    // (it writes only chunk_x/y, from each body's new position), so integration
-    // touches no other scope cache lines. Scope metadata therefore exists exactly
-    // for entities with a movement body.
-    tier: std.ArrayList(SimulationTier) = .empty,
-    chunk_x: HotI32List = .empty,
-    chunk_y: HotI32List = .empty,
-    level: std.ArrayList(u16) = .empty,
-    stagger_phase: std.ArrayList(u8) = .empty,
-    always_active: std.ArrayList(bool) = .empty,
+    rows: std.MultiArrayList(MovementBodyRow) = .{},
+
+    fn len(self: *const MovementBodyStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *MovementBodyStore, allocator: std.mem.Allocator, entity: EntityId, body: MovementBody) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.position_x.appendAssumeCapacity(body.position.x);
-        self.position_y.appendAssumeCapacity(body.position.y);
-        self.position_z.appendAssumeCapacity(body.position_z);
-        self.previous_x.appendAssumeCapacity(body.previous_position.x);
-        self.previous_y.appendAssumeCapacity(body.previous_position.y);
-        self.previous_z.appendAssumeCapacity(body.previous_z);
-        self.velocity_x.appendAssumeCapacity(body.velocity.x);
-        self.velocity_y.appendAssumeCapacity(body.velocity.y);
-        self.speed.appendAssumeCapacity(body.speed);
-        // New scope row defaults: full cognition, chunk recomputed next step, and a
-        // stagger phase derived from the dense index so phases spread evenly.
-        self.tier.appendAssumeCapacity(.cognition);
-        self.chunk_x.appendAssumeCapacity(0);
-        self.chunk_y.appendAssumeCapacity(0);
-        self.level.appendAssumeCapacity(0);
-        self.stagger_phase.appendAssumeCapacity(@intCast(index % cognition_stagger_n));
-        self.always_active.appendAssumeCapacity(false);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .position_x = body.position.x,
+            .position_y = body.position.y,
+            .position_z = body.position_z,
+            .previous_x = body.previous_position.x,
+            .previous_y = body.previous_position.y,
+            .previous_z = body.previous_z,
+            .velocity_x = body.velocity.x,
+            .velocity_y = body.velocity.y,
+            .speed = body.speed,
+            .tier = .cognition,
+            .chunk_x = 0,
+            .chunk_y = 0,
+            .level = 0,
+            .stagger_phase = @intCast(index % cognition_stagger_n),
+            .always_active = false,
+        });
         return index;
     }
 
     fn set(self: *MovementBodyStore, index: usize, body: MovementBody) void {
-        self.position_x.items[index] = body.position.x;
-        self.position_y.items[index] = body.position.y;
-        self.position_z.items[index] = body.position_z;
-        self.previous_x.items[index] = body.previous_position.x;
-        self.previous_y.items[index] = body.previous_position.y;
-        self.previous_z.items[index] = body.previous_z;
-        self.velocity_x.items[index] = body.velocity.x;
-        self.velocity_y.items[index] = body.velocity.y;
-        self.speed.items[index] = body.speed;
+        const s = self.rows.slice();
+        s.items(.position_x)[index] = body.position.x;
+        s.items(.position_y)[index] = body.position.y;
+        s.items(.position_z)[index] = body.position_z;
+        s.items(.previous_x)[index] = body.previous_position.x;
+        s.items(.previous_y)[index] = body.previous_position.y;
+        s.items(.previous_z)[index] = body.previous_z;
+        s.items(.velocity_x)[index] = body.velocity.x;
+        s.items(.velocity_y)[index] = body.velocity.y;
+        s.items(.speed)[index] = body.speed;
     }
 
     fn get(self: *const MovementBodyStore, index: usize) MovementBody {
+        const s = self.rows.slice();
         return .{
-            .position = .{ .x = self.position_x.items[index], .y = self.position_y.items[index] },
-            .previous_position = .{ .x = self.previous_x.items[index], .y = self.previous_y.items[index] },
-            .position_z = self.position_z.items[index],
-            .previous_z = self.previous_z.items[index],
-            .velocity = .{ .x = self.velocity_x.items[index], .y = self.velocity_y.items[index] },
-            .speed = self.speed.items[index],
+            .position = .{ .x = s.items(.position_x)[index], .y = s.items(.position_y)[index] },
+            .previous_position = .{ .x = s.items(.previous_x)[index], .y = s.items(.previous_y)[index] },
+            .position_z = s.items(.position_z)[index],
+            .previous_z = s.items(.previous_z)[index],
+            .velocity = .{ .x = s.items(.velocity_x)[index], .y = s.items(.velocity_y)[index] },
+            .speed = s.items(.speed)[index],
         };
     }
 
     fn ptrAt(self: *MovementBodyStore, index: usize) MovementBodyPtr {
+        const s = self.rows.slice();
         return .{
-            .position_x = &self.position_x.items[index],
-            .position_y = &self.position_y.items[index],
-            .position_z = &self.position_z.items[index],
-            .previous_x = &self.previous_x.items[index],
-            .previous_y = &self.previous_y.items[index],
-            .previous_z = &self.previous_z.items[index],
-            .velocity_x = &self.velocity_x.items[index],
-            .velocity_y = &self.velocity_y.items[index],
-            .speed = &self.speed.items[index],
+            .position_x = &s.items(.position_x)[index],
+            .position_y = &s.items(.position_y)[index],
+            .position_z = &s.items(.position_z)[index],
+            .previous_x = &s.items(.previous_x)[index],
+            .previous_y = &s.items(.previous_y)[index],
+            .previous_z = &s.items(.previous_z)[index],
+            .velocity_x = &s.items(.velocity_x)[index],
+            .velocity_y = &s.items(.velocity_y)[index],
+            .speed = &s.items(.speed)[index],
         };
     }
 
+    fn tierAt(self: *const MovementBodyStore, index: usize) SimulationTier {
+        return self.rows.items(.tier)[index];
+    }
+
+    fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
+        const s = self.rows.slice();
+        return .{
+            .tier = s.items(.tier)[index],
+            .chunk = .{ .x = s.items(.chunk_x)[index], .y = s.items(.chunk_y)[index] },
+            .level = s.items(.level)[index],
+            .stagger_phase = s.items(.stagger_phase)[index],
+            .always_active = s.items(.always_active)[index],
+        };
+    }
+
+    fn setScopeMetadata(self: *MovementBodyStore, index: usize, metadata: EntitySimulationMetadata) void {
+        const s = self.rows.slice();
+        s.items(.tier)[index] = metadata.tier;
+        s.items(.chunk_x)[index] = metadata.chunk.x;
+        s.items(.chunk_y)[index] = metadata.chunk.y;
+        s.items(.level)[index] = metadata.level;
+        s.items(.stagger_phase)[index] = metadata.stagger_phase;
+        s.items(.always_active)[index] = metadata.always_active;
+    }
+
+    fn setTier(self: *MovementBodyStore, index: usize, tier: SimulationTier) void {
+        self.rows.slice().items(.tier)[index] = tier;
+    }
+
+    fn snapPreviousToPosition(self: *MovementBodyStore, index: usize) void {
+        const s = self.rows.slice();
+        s.items(.previous_x)[index] = s.items(.position_x)[index];
+        s.items(.previous_y)[index] = s.items(.position_y)[index];
+        s.items(.previous_z)[index] = s.items(.position_z)[index];
+    }
+
     fn removeAt(self: *MovementBodyStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.position_x.items[index] = self.position_x.items[last];
-        self.position_y.items[index] = self.position_y.items[last];
-        self.position_z.items[index] = self.position_z.items[last];
-        self.previous_x.items[index] = self.previous_x.items[last];
-        self.previous_y.items[index] = self.previous_y.items[last];
-        self.previous_z.items[index] = self.previous_z.items[last];
-        self.velocity_x.items[index] = self.velocity_x.items[last];
-        self.velocity_y.items[index] = self.velocity_y.items[last];
-        self.speed.items[index] = self.speed.items[last];
-        self.tier.items[index] = self.tier.items[last];
-        self.chunk_x.items[index] = self.chunk_x.items[last];
-        self.chunk_y.items[index] = self.chunk_y.items[last];
-        self.level.items[index] = self.level.items[last];
-        self.stagger_phase.items[index] = self.stagger_phase.items[last];
-        self.always_active.items[index] = self.always_active.items[last];
-        _ = self.entities.pop();
-        _ = self.position_x.pop();
-        _ = self.position_y.pop();
-        _ = self.position_z.pop();
-        _ = self.previous_x.pop();
-        _ = self.previous_y.pop();
-        _ = self.previous_z.pop();
-        _ = self.velocity_x.pop();
-        _ = self.velocity_y.pop();
-        _ = self.speed.pop();
-        _ = self.tier.pop();
-        _ = self.chunk_x.pop();
-        _ = self.chunk_y.pop();
-        _ = self.level.pop();
-        _ = self.stagger_phase.pop();
-        _ = self.always_active.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn slice(self: *MovementBodyStore) MovementBodySlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .position_x = self.position_x.items,
-            .position_y = self.position_y.items,
-            .position_z = self.position_z.items,
-            .previous_x = self.previous_x.items,
-            .previous_y = self.previous_y.items,
-            .previous_z = self.previous_z.items,
-            .velocity_x = self.velocity_x.items,
-            .velocity_y = self.velocity_y.items,
-            .speed = self.speed.items,
+            .entities = s.items(.entity),
+            .position_x = s.items(.position_x),
+            .position_y = s.items(.position_y),
+            .position_z = s.items(.position_z),
+            .previous_x = s.items(.previous_x),
+            .previous_y = s.items(.previous_y),
+            .previous_z = s.items(.previous_z),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
+            .speed = s.items(.speed),
         };
     }
 
     fn sliceConst(self: *const MovementBodyStore) ConstMovementBodySlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .position_x = self.position_x.items,
-            .position_y = self.position_y.items,
-            .position_z = self.position_z.items,
-            .previous_x = self.previous_x.items,
-            .previous_y = self.previous_y.items,
-            .previous_z = self.previous_z.items,
-            .velocity_x = self.velocity_x.items,
-            .velocity_y = self.velocity_y.items,
-            .speed = self.speed.items,
+            .entities = s.items(.entity),
+            .position_x = s.items(.position_x),
+            .position_y = s.items(.position_y),
+            .position_z = s.items(.position_z),
+            .previous_x = s.items(.previous_x),
+            .previous_y = s.items(.previous_y),
+            .previous_z = s.items(.previous_z),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
+            .speed = s.items(.speed),
         };
     }
 
     fn scopeSlice(self: *MovementBodyStore) ScopeColumnsSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .tier = self.tier.items,
-            .chunk_x = self.chunk_x.items,
-            .chunk_y = self.chunk_y.items,
-            .level = self.level.items,
-            .stagger_phase = self.stagger_phase.items,
-            .always_active = self.always_active.items,
+            .entities = s.items(.entity),
+            .tier = s.items(.tier),
+            .chunk_x = s.items(.chunk_x),
+            .chunk_y = s.items(.chunk_y),
+            .level = s.items(.level),
+            .stagger_phase = s.items(.stagger_phase),
+            .always_active = s.items(.always_active),
         };
     }
 
     fn scopeSliceConst(self: *const MovementBodyStore) ConstScopeColumnsSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .tier = self.tier.items,
-            .chunk_x = self.chunk_x.items,
-            .chunk_y = self.chunk_y.items,
-            .level = self.level.items,
-            .stagger_phase = self.stagger_phase.items,
-            .always_active = self.always_active.items,
+            .entities = s.items(.entity),
+            .tier = s.items(.tier),
+            .chunk_x = s.items(.chunk_x),
+            .chunk_y = s.items(.chunk_y),
+            .level = s.items(.level),
+            .stagger_phase = s.items(.stagger_phase),
+            .always_active = s.items(.always_active),
         };
     }
 
     fn clearRetainingCapacity(self: *MovementBodyStore) void {
-        self.entities.clearRetainingCapacity();
-        self.position_x.clearRetainingCapacity();
-        self.position_y.clearRetainingCapacity();
-        self.position_z.clearRetainingCapacity();
-        self.previous_x.clearRetainingCapacity();
-        self.previous_y.clearRetainingCapacity();
-        self.previous_z.clearRetainingCapacity();
-        self.velocity_x.clearRetainingCapacity();
-        self.velocity_y.clearRetainingCapacity();
-        self.speed.clearRetainingCapacity();
-        self.tier.clearRetainingCapacity();
-        self.chunk_x.clearRetainingCapacity();
-        self.chunk_y.clearRetainingCapacity();
-        self.level.clearRetainingCapacity();
-        self.stagger_phase.clearRetainingCapacity();
-        self.always_active.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *MovementBodyStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.position_x.deinit(allocator);
-        self.position_y.deinit(allocator);
-        self.position_z.deinit(allocator);
-        self.previous_x.deinit(allocator);
-        self.previous_y.deinit(allocator);
-        self.previous_z.deinit(allocator);
-        self.velocity_x.deinit(allocator);
-        self.velocity_y.deinit(allocator);
-        self.speed.deinit(allocator);
-        self.tier.deinit(allocator);
-        self.chunk_x.deinit(allocator);
-        self.chunk_y.deinit(allocator);
-        self.level.deinit(allocator);
-        self.stagger_phase.deinit(allocator);
-        self.always_active.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *MovementBodyStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *MovementBodyStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.position_x.ensureTotalCapacity(allocator, capacity);
-        try self.position_y.ensureTotalCapacity(allocator, capacity);
-        try self.position_z.ensureTotalCapacity(allocator, capacity);
-        try self.previous_x.ensureTotalCapacity(allocator, capacity);
-        try self.previous_y.ensureTotalCapacity(allocator, capacity);
-        try self.previous_z.ensureTotalCapacity(allocator, capacity);
-        try self.velocity_x.ensureTotalCapacity(allocator, capacity);
-        try self.velocity_y.ensureTotalCapacity(allocator, capacity);
-        try self.speed.ensureTotalCapacity(allocator, capacity);
-        try self.tier.ensureTotalCapacity(allocator, capacity);
-        try self.chunk_x.ensureTotalCapacity(allocator, capacity);
-        try self.chunk_y.ensureTotalCapacity(allocator, capacity);
-        try self.level.ensureTotalCapacity(allocator, capacity);
-        try self.stagger_phase.ensureTotalCapacity(allocator, capacity);
-        try self.always_active.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
 
 const FacingStore = struct {
-    // Facing is compact and cold enough to keep as enum rows, but it still
-    // follows the dense entity-row contract for fast membership scans.
-    entities: std.ArrayList(EntityId) = .empty,
-    directions: std.ArrayList(Facing) = .empty,
+    rows: std.MultiArrayList(FacingRow) = .{},
+
+    fn len(self: *const FacingStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *FacingStore, allocator: std.mem.Allocator, entity: EntityId, facing: FacingData) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.directions.appendAssumeCapacity(facing.direction);
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+        const index: u32 = @intCast(self.rows.len);
+        try self.rows.append(allocator, .{
+            .entity = entity,
+            .direction = facing.direction,
+        });
         return index;
     }
 
+    fn setDirection(self: *FacingStore, index: usize, direction: Facing) void {
+        self.rows.slice().items(.direction)[index] = direction;
+    }
+
+    fn directionPtr(self: *FacingStore, index: usize) *Facing {
+        return &self.rows.slice().items(.direction)[index];
+    }
+
+    fn directionAt(self: *const FacingStore, index: usize) Facing {
+        return self.rows.items(.direction)[index];
+    }
+
     fn removeAt(self: *FacingStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.directions.items[index] = self.directions.items[last];
-        _ = self.entities.pop();
-        _ = self.directions.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn slice(self: *FacingStore) FacingSlice {
-        return .{ .entities = self.entities.items, .directions = self.directions.items };
+        const s = self.rows.slice();
+        return .{ .entities = s.items(.entity), .directions = s.items(.direction) };
     }
 
     fn sliceConst(self: *const FacingStore) ConstFacingSlice {
-        return .{ .entities = self.entities.items, .directions = self.directions.items };
+        const s = self.rows.slice();
+        return .{ .entities = s.items(.entity), .directions = s.items(.direction) };
     }
 
     fn clearRetainingCapacity(self: *FacingStore) void {
-        self.entities.clearRetainingCapacity();
-        self.directions.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *FacingStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.directions.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacity(self: *FacingStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.directions.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
 
 const PrimitiveVisualStore = struct {
-    // Visual columns keep render-prep reads linear and avoid touching gameplay
-    // systems that do not care about color, marker, or depth fields.
-    entities: std.ArrayList(EntityId) = .empty,
-    size_x: std.ArrayList(f32) = .empty,
-    size_y: std.ArrayList(f32) = .empty,
-    color_r: std.ArrayList(f32) = .empty,
-    color_g: std.ArrayList(f32) = .empty,
-    color_b: std.ArrayList(f32) = .empty,
-    color_a: std.ArrayList(f32) = .empty,
-    depth_values: std.ArrayList(i32) = .empty,
-    marker_color_r: std.ArrayList(f32) = .empty,
-    marker_color_g: std.ArrayList(f32) = .empty,
-    marker_color_b: std.ArrayList(f32) = .empty,
-    marker_color_a: std.ArrayList(f32) = .empty,
-    marker_depth_values: std.ArrayList(i32) = .empty,
-    marker_lengths: std.ArrayList(f32) = .empty,
-    marker_depths: std.ArrayList(f32) = .empty,
-    marker_margins: std.ArrayList(f32) = .empty,
+    rows: std.MultiArrayList(PrimitiveVisualRow) = .{},
+
+    fn len(self: *const PrimitiveVisualStore) usize {
+        return self.rows.len;
+    }
+
+    fn visualToRow(entity: EntityId, visual: PrimitiveVisual) PrimitiveVisualRow {
+        return .{
+            .entity = entity,
+            .size_x = visual.size.x,
+            .size_y = visual.size.y,
+            .color_r = visual.color.r,
+            .color_g = visual.color.g,
+            .color_b = visual.color.b,
+            .color_a = visual.color.a,
+            .depth_value = render_depth.worldZ(visual.depth),
+            .marker_color_r = visual.marker_color.r,
+            .marker_color_g = visual.marker_color.g,
+            .marker_color_b = visual.marker_color.b,
+            .marker_color_a = visual.marker_color.a,
+            .marker_depth_value = render_depth.worldZ(visual.marker_depth_band),
+            .marker_length = visual.marker_length,
+            .marker_depth = visual.marker_depth,
+            .marker_margin = visual.marker_margin,
+        };
+    }
 
     fn append(self: *PrimitiveVisualStore, allocator: std.mem.Allocator, entity: EntityId, visual: PrimitiveVisual) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.appendColumnsAssumeCapacity(visual);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(visualToRow(entity, visual));
         return index;
     }
 
     fn set(self: *PrimitiveVisualStore, index: usize, visual: PrimitiveVisual) void {
-        self.size_x.items[index] = visual.size.x;
-        self.size_y.items[index] = visual.size.y;
-        self.color_r.items[index] = visual.color.r;
-        self.color_g.items[index] = visual.color.g;
-        self.color_b.items[index] = visual.color.b;
-        self.color_a.items[index] = visual.color.a;
-        self.depth_values.items[index] = render_depth.worldZ(visual.depth);
-        self.marker_color_r.items[index] = visual.marker_color.r;
-        self.marker_color_g.items[index] = visual.marker_color.g;
-        self.marker_color_b.items[index] = visual.marker_color.b;
-        self.marker_color_a.items[index] = visual.marker_color.a;
-        self.marker_depth_values.items[index] = render_depth.worldZ(visual.marker_depth_band);
-        self.marker_lengths.items[index] = visual.marker_length;
-        self.marker_depths.items[index] = visual.marker_depth;
-        self.marker_margins.items[index] = visual.marker_margin;
+        const row = visualToRow(.invalid, visual);
+        const s = self.rows.slice();
+        s.items(.size_x)[index] = row.size_x;
+        s.items(.size_y)[index] = row.size_y;
+        s.items(.color_r)[index] = row.color_r;
+        s.items(.color_g)[index] = row.color_g;
+        s.items(.color_b)[index] = row.color_b;
+        s.items(.color_a)[index] = row.color_a;
+        s.items(.depth_value)[index] = row.depth_value;
+        s.items(.marker_color_r)[index] = row.marker_color_r;
+        s.items(.marker_color_g)[index] = row.marker_color_g;
+        s.items(.marker_color_b)[index] = row.marker_color_b;
+        s.items(.marker_color_a)[index] = row.marker_color_a;
+        s.items(.marker_depth_value)[index] = row.marker_depth_value;
+        s.items(.marker_length)[index] = row.marker_length;
+        s.items(.marker_depth)[index] = row.marker_depth;
+        s.items(.marker_margin)[index] = row.marker_margin;
     }
 
     fn get(self: *const PrimitiveVisualStore, index: usize) PrimitiveVisual {
+        const s = self.rows.slice();
         return .{
-            .size = .{ .x = self.size_x.items[index], .y = self.size_y.items[index] },
+            .size = .{ .x = s.items(.size_x)[index], .y = s.items(.size_y)[index] },
             .color = .{
-                .r = self.color_r.items[index],
-                .g = self.color_g.items[index],
-                .b = self.color_b.items[index],
-                .a = self.color_a.items[index],
+                .r = s.items(.color_r)[index],
+                .g = s.items(.color_g)[index],
+                .b = s.items(.color_b)[index],
+                .a = s.items(.color_a)[index],
             },
-            .depth = @enumFromInt(self.depth_values.items[index]),
+            .depth = @enumFromInt(s.items(.depth_value)[index]),
             .marker_color = .{
-                .r = self.marker_color_r.items[index],
-                .g = self.marker_color_g.items[index],
-                .b = self.marker_color_b.items[index],
-                .a = self.marker_color_a.items[index],
+                .r = s.items(.marker_color_r)[index],
+                .g = s.items(.marker_color_g)[index],
+                .b = s.items(.marker_color_b)[index],
+                .a = s.items(.marker_color_a)[index],
             },
-            .marker_depth_band = @enumFromInt(self.marker_depth_values.items[index]),
-            .marker_length = self.marker_lengths.items[index],
-            .marker_depth = self.marker_depths.items[index],
-            .marker_margin = self.marker_margins.items[index],
+            .marker_depth_band = @enumFromInt(s.items(.marker_depth_value)[index]),
+            .marker_length = s.items(.marker_length)[index],
+            .marker_depth = s.items(.marker_depth)[index],
+            .marker_margin = s.items(.marker_margin)[index],
         };
     }
 
     fn removeAt(self: *PrimitiveVisualStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.size_x.items[index] = self.size_x.items[last];
-        self.size_y.items[index] = self.size_y.items[last];
-        self.color_r.items[index] = self.color_r.items[last];
-        self.color_g.items[index] = self.color_g.items[last];
-        self.color_b.items[index] = self.color_b.items[last];
-        self.color_a.items[index] = self.color_a.items[last];
-        self.depth_values.items[index] = self.depth_values.items[last];
-        self.marker_color_r.items[index] = self.marker_color_r.items[last];
-        self.marker_color_g.items[index] = self.marker_color_g.items[last];
-        self.marker_color_b.items[index] = self.marker_color_b.items[last];
-        self.marker_color_a.items[index] = self.marker_color_a.items[last];
-        self.marker_depth_values.items[index] = self.marker_depth_values.items[last];
-        self.marker_lengths.items[index] = self.marker_lengths.items[last];
-        self.marker_depths.items[index] = self.marker_depths.items[last];
-        self.marker_margins.items[index] = self.marker_margins.items[last];
-        self.popAll();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const PrimitiveVisualStore) ConstPrimitiveVisualSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .size_x = self.size_x.items,
-            .size_y = self.size_y.items,
-            .color_r = self.color_r.items,
-            .color_g = self.color_g.items,
-            .color_b = self.color_b.items,
-            .color_a = self.color_a.items,
-            .depth_values = self.depth_values.items,
-            .marker_color_r = self.marker_color_r.items,
-            .marker_color_g = self.marker_color_g.items,
-            .marker_color_b = self.marker_color_b.items,
-            .marker_color_a = self.marker_color_a.items,
-            .marker_depth_values = self.marker_depth_values.items,
-            .marker_lengths = self.marker_lengths.items,
-            .marker_depths = self.marker_depths.items,
-            .marker_margins = self.marker_margins.items,
+            .entities = s.items(.entity),
+            .size_x = s.items(.size_x),
+            .size_y = s.items(.size_y),
+            .color_r = s.items(.color_r),
+            .color_g = s.items(.color_g),
+            .color_b = s.items(.color_b),
+            .color_a = s.items(.color_a),
+            .depth_values = s.items(.depth_value),
+            .marker_color_r = s.items(.marker_color_r),
+            .marker_color_g = s.items(.marker_color_g),
+            .marker_color_b = s.items(.marker_color_b),
+            .marker_color_a = s.items(.marker_color_a),
+            .marker_depth_values = s.items(.marker_depth_value),
+            .marker_lengths = s.items(.marker_length),
+            .marker_depths = s.items(.marker_depth),
+            .marker_margins = s.items(.marker_margin),
         };
     }
 
     fn clearRetainingCapacity(self: *PrimitiveVisualStore) void {
-        self.entities.clearRetainingCapacity();
-        self.size_x.clearRetainingCapacity();
-        self.size_y.clearRetainingCapacity();
-        self.color_r.clearRetainingCapacity();
-        self.color_g.clearRetainingCapacity();
-        self.color_b.clearRetainingCapacity();
-        self.color_a.clearRetainingCapacity();
-        self.depth_values.clearRetainingCapacity();
-        self.marker_color_r.clearRetainingCapacity();
-        self.marker_color_g.clearRetainingCapacity();
-        self.marker_color_b.clearRetainingCapacity();
-        self.marker_color_a.clearRetainingCapacity();
-        self.marker_depth_values.clearRetainingCapacity();
-        self.marker_lengths.clearRetainingCapacity();
-        self.marker_depths.clearRetainingCapacity();
-        self.marker_margins.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *PrimitiveVisualStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.size_x.deinit(allocator);
-        self.size_y.deinit(allocator);
-        self.color_r.deinit(allocator);
-        self.color_g.deinit(allocator);
-        self.color_b.deinit(allocator);
-        self.color_a.deinit(allocator);
-        self.depth_values.deinit(allocator);
-        self.marker_color_r.deinit(allocator);
-        self.marker_color_g.deinit(allocator);
-        self.marker_color_b.deinit(allocator);
-        self.marker_color_a.deinit(allocator);
-        self.marker_depth_values.deinit(allocator);
-        self.marker_lengths.deinit(allocator);
-        self.marker_depths.deinit(allocator);
-        self.marker_margins.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *PrimitiveVisualStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *PrimitiveVisualStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.size_x.ensureTotalCapacity(allocator, capacity);
-        try self.size_y.ensureTotalCapacity(allocator, capacity);
-        try self.color_r.ensureTotalCapacity(allocator, capacity);
-        try self.color_g.ensureTotalCapacity(allocator, capacity);
-        try self.color_b.ensureTotalCapacity(allocator, capacity);
-        try self.color_a.ensureTotalCapacity(allocator, capacity);
-        try self.depth_values.ensureTotalCapacity(allocator, capacity);
-        try self.marker_color_r.ensureTotalCapacity(allocator, capacity);
-        try self.marker_color_g.ensureTotalCapacity(allocator, capacity);
-        try self.marker_color_b.ensureTotalCapacity(allocator, capacity);
-        try self.marker_color_a.ensureTotalCapacity(allocator, capacity);
-        try self.marker_depth_values.ensureTotalCapacity(allocator, capacity);
-        try self.marker_lengths.ensureTotalCapacity(allocator, capacity);
-        try self.marker_depths.ensureTotalCapacity(allocator, capacity);
-        try self.marker_margins.ensureTotalCapacity(allocator, capacity);
-    }
-
-    fn appendColumnsAssumeCapacity(self: *PrimitiveVisualStore, visual: PrimitiveVisual) void {
-        self.size_x.appendAssumeCapacity(visual.size.x);
-        self.size_y.appendAssumeCapacity(visual.size.y);
-        self.color_r.appendAssumeCapacity(visual.color.r);
-        self.color_g.appendAssumeCapacity(visual.color.g);
-        self.color_b.appendAssumeCapacity(visual.color.b);
-        self.color_a.appendAssumeCapacity(visual.color.a);
-        self.depth_values.appendAssumeCapacity(render_depth.worldZ(visual.depth));
-        self.marker_color_r.appendAssumeCapacity(visual.marker_color.r);
-        self.marker_color_g.appendAssumeCapacity(visual.marker_color.g);
-        self.marker_color_b.appendAssumeCapacity(visual.marker_color.b);
-        self.marker_color_a.appendAssumeCapacity(visual.marker_color.a);
-        self.marker_depth_values.appendAssumeCapacity(render_depth.worldZ(visual.marker_depth_band));
-        self.marker_lengths.appendAssumeCapacity(visual.marker_length);
-        self.marker_depths.appendAssumeCapacity(visual.marker_depth);
-        self.marker_margins.appendAssumeCapacity(visual.marker_margin);
-    }
-
-    fn popAll(self: *PrimitiveVisualStore) void {
-        _ = self.entities.pop();
-        _ = self.size_x.pop();
-        _ = self.size_y.pop();
-        _ = self.color_r.pop();
-        _ = self.color_g.pop();
-        _ = self.color_b.pop();
-        _ = self.color_a.pop();
-        _ = self.depth_values.pop();
-        _ = self.marker_color_r.pop();
-        _ = self.marker_color_g.pop();
-        _ = self.marker_color_b.pop();
-        _ = self.marker_color_a.pop();
-        _ = self.marker_depth_values.pop();
-        _ = self.marker_lengths.pop();
-        _ = self.marker_depths.pop();
-        _ = self.marker_margins.pop();
+        try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
 
 const AssetReferenceStore = struct {
-    // Persistent render identity is a stable asset ID. Loaded textures and
-    // prepared sprite records are renderer/cache concerns, not component data.
-    entities: std.ArrayList(EntityId) = .empty,
-    sprite_ids: std.ArrayList(SpriteAssetId) = .empty,
-    atlas_entry_ids: std.ArrayList(u16) = .empty,
+    rows: std.MultiArrayList(AssetReferenceRow) = .{},
+
+    fn len(self: *const AssetReferenceStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, asset_ref: AssetReference) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.sprite_ids.appendAssumeCapacity(asset_ref.sprite);
-        self.atlas_entry_ids.appendAssumeCapacity(asset_ref.atlas_entry_id);
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+        const index: u32 = @intCast(self.rows.len);
+        try self.rows.append(allocator, .{
+            .entity = entity,
+            .sprite = asset_ref.sprite,
+            .atlas_entry_id = asset_ref.atlas_entry_id,
+        });
         return index;
     }
 
+    fn set(self: *AssetReferenceStore, index: usize, asset_ref: AssetReference) void {
+        const s = self.rows.slice();
+        s.items(.sprite)[index] = asset_ref.sprite;
+        s.items(.atlas_entry_id)[index] = asset_ref.atlas_entry_id;
+    }
+
+    fn get(self: *const AssetReferenceStore, index: usize) AssetReference {
+        const s = self.rows.slice();
+        return .{
+            .sprite = s.items(.sprite)[index],
+            .atlas_entry_id = s.items(.atlas_entry_id)[index],
+        };
+    }
+
     fn removeAt(self: *AssetReferenceStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.sprite_ids.items[index] = self.sprite_ids.items[last];
-        self.atlas_entry_ids.items[index] = self.atlas_entry_ids.items[last];
-        _ = self.entities.pop();
-        _ = self.sprite_ids.pop();
-        _ = self.atlas_entry_ids.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const AssetReferenceStore) ConstAssetReferenceSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .sprite_ids = self.sprite_ids.items,
-            .atlas_entry_ids = self.atlas_entry_ids.items,
+            .entities = s.items(.entity),
+            .sprite_ids = s.items(.sprite),
+            .atlas_entry_ids = s.items(.atlas_entry_id),
         };
     }
 
     fn clearRetainingCapacity(self: *AssetReferenceStore) void {
-        self.entities.clearRetainingCapacity();
-        self.sprite_ids.clearRetainingCapacity();
-        self.atlas_entry_ids.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *AssetReferenceStore, allocator: std.mem.Allocator) void {
-        self.atlas_entry_ids.deinit(allocator);
-        self.entities.deinit(allocator);
-        self.sprite_ids.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.sprite_ids.ensureTotalCapacity(allocator, capacity);
-        try self.atlas_entry_ids.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
 
 const CollisionBoundsStore = struct {
-    // Bounds columns are aligned because collision and pathfinding both scan
-    // them in tight loops.
-    entities: std.ArrayList(EntityId) = .empty,
-    offset_x: HotF32List = .empty,
-    offset_y: HotF32List = .empty,
-    size_x: HotF32List = .empty,
-    size_y: HotF32List = .empty,
+    rows: std.MultiArrayList(CollisionBoundsRow) = .{},
+
+    fn len(self: *const CollisionBoundsStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *CollisionBoundsStore, allocator: std.mem.Allocator, entity: EntityId, bounds: CollisionBounds) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.offset_x.appendAssumeCapacity(bounds.offset.x);
-        self.offset_y.appendAssumeCapacity(bounds.offset.y);
-        self.size_x.appendAssumeCapacity(bounds.size.x);
-        self.size_y.appendAssumeCapacity(bounds.size.y);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .offset_x = bounds.offset.x,
+            .offset_y = bounds.offset.y,
+            .size_x = bounds.size.x,
+            .size_y = bounds.size.y,
+        });
         return index;
     }
 
     fn set(self: *CollisionBoundsStore, index: usize, bounds: CollisionBounds) void {
-        self.offset_x.items[index] = bounds.offset.x;
-        self.offset_y.items[index] = bounds.offset.y;
-        self.size_x.items[index] = bounds.size.x;
-        self.size_y.items[index] = bounds.size.y;
+        const s = self.rows.slice();
+        s.items(.offset_x)[index] = bounds.offset.x;
+        s.items(.offset_y)[index] = bounds.offset.y;
+        s.items(.size_x)[index] = bounds.size.x;
+        s.items(.size_y)[index] = bounds.size.y;
     }
 
     fn get(self: *const CollisionBoundsStore, index: usize) CollisionBounds {
+        const s = self.rows.slice();
         return .{
-            .offset = .{ .x = self.offset_x.items[index], .y = self.offset_y.items[index] },
-            .size = .{ .x = self.size_x.items[index], .y = self.size_y.items[index] },
+            .offset = .{ .x = s.items(.offset_x)[index], .y = s.items(.offset_y)[index] },
+            .size = .{ .x = s.items(.size_x)[index], .y = s.items(.size_y)[index] },
         };
     }
 
     fn removeAt(self: *CollisionBoundsStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.offset_x.items[index] = self.offset_x.items[last];
-        self.offset_y.items[index] = self.offset_y.items[last];
-        self.size_x.items[index] = self.size_x.items[last];
-        self.size_y.items[index] = self.size_y.items[last];
-        _ = self.entities.pop();
-        _ = self.offset_x.pop();
-        _ = self.offset_y.pop();
-        _ = self.size_x.pop();
-        _ = self.size_y.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const CollisionBoundsStore) ConstCollisionBoundsSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .offset_x = self.offset_x.items,
-            .offset_y = self.offset_y.items,
-            .size_x = self.size_x.items,
-            .size_y = self.size_y.items,
+            .entities = s.items(.entity),
+            .offset_x = s.items(.offset_x),
+            .offset_y = s.items(.offset_y),
+            .size_x = s.items(.size_x),
+            .size_y = s.items(.size_y),
         };
     }
 
     fn clearRetainingCapacity(self: *CollisionBoundsStore) void {
-        self.entities.clearRetainingCapacity();
-        self.offset_x.clearRetainingCapacity();
-        self.offset_y.clearRetainingCapacity();
-        self.size_x.clearRetainingCapacity();
-        self.size_y.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *CollisionBoundsStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.offset_x.deinit(allocator);
-        self.offset_y.deinit(allocator);
-        self.size_x.deinit(allocator);
-        self.size_y.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *CollisionBoundsStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *CollisionBoundsStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.offset_x.ensureTotalCapacity(allocator, capacity);
-        try self.offset_y.ensureTotalCapacity(allocator, capacity);
-        try self.size_x.ensureTotalCapacity(allocator, capacity);
-        try self.size_y.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
 
 const CollisionResponseStore = struct {
-    // Response rows describe collision policy and static/dynamic mobility; they
-    // intentionally do not point at collision-system runtime state.
-    entities: std.ArrayList(EntityId) = .empty,
-    modes: std.ArrayList(CollisionResponseMode) = .empty,
-    mobilities: std.ArrayList(CollisionResponseMobility) = .empty,
-    restitution: HotF32List = .empty,
+    rows: std.MultiArrayList(CollisionResponseRow) = .{},
+
+    fn len(self: *const CollisionResponseStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *CollisionResponseStore, allocator: std.mem.Allocator, entity: EntityId, response: CollisionResponse) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.modes.appendAssumeCapacity(response.mode);
-        self.mobilities.appendAssumeCapacity(response.mobility);
-        self.restitution.appendAssumeCapacity(response.restitution);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .mode = response.mode,
+            .mobility = response.mobility,
+            .restitution = response.restitution,
+        });
         return index;
     }
 
     fn set(self: *CollisionResponseStore, index: usize, response: CollisionResponse) void {
-        self.modes.items[index] = response.mode;
-        self.mobilities.items[index] = response.mobility;
-        self.restitution.items[index] = response.restitution;
+        const s = self.rows.slice();
+        s.items(.mode)[index] = response.mode;
+        s.items(.mobility)[index] = response.mobility;
+        s.items(.restitution)[index] = response.restitution;
     }
 
     fn get(self: *const CollisionResponseStore, index: usize) CollisionResponse {
+        const s = self.rows.slice();
         return .{
-            .mode = self.modes.items[index],
-            .mobility = self.mobilities.items[index],
-            .restitution = self.restitution.items[index],
+            .mode = s.items(.mode)[index],
+            .mobility = s.items(.mobility)[index],
+            .restitution = s.items(.restitution)[index],
         };
     }
 
     fn removeAt(self: *CollisionResponseStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.modes.items[index] = self.modes.items[last];
-        self.mobilities.items[index] = self.mobilities.items[last];
-        self.restitution.items[index] = self.restitution.items[last];
-        _ = self.entities.pop();
-        _ = self.modes.pop();
-        _ = self.mobilities.pop();
-        _ = self.restitution.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const CollisionResponseStore) ConstCollisionResponseSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .modes = self.modes.items,
-            .mobilities = self.mobilities.items,
-            .restitution = self.restitution.items,
+            .entities = s.items(.entity),
+            .modes = s.items(.mode),
+            .mobilities = s.items(.mobility),
+            .restitution = s.items(.restitution),
         };
     }
 
     fn clearRetainingCapacity(self: *CollisionResponseStore) void {
-        self.entities.clearRetainingCapacity();
-        self.modes.clearRetainingCapacity();
-        self.mobilities.clearRetainingCapacity();
-        self.restitution.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *CollisionResponseStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.modes.deinit(allocator);
-        self.mobilities.deinit(allocator);
-        self.restitution.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *CollisionResponseStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *CollisionResponseStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.modes.ensureTotalCapacity(allocator, capacity);
-        try self.mobilities.ensureTotalCapacity(allocator, capacity);
-        try self.restitution.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
 
 const AiAgentStore = struct {
-    // AI agent data stays small and persistent here. Per-step decisions are
-    // emitted through SimulationFrame streams instead of stored on the entity.
-    entities: std.ArrayList(EntityId) = .empty,
-    behaviors: std.ArrayList(AiBehavior) = .empty,
-    wander_amplitudes: HotF32List = .empty,
-    seek_weights: HotF32List = .empty,
+    rows: std.MultiArrayList(AiAgentRow) = .{},
+
+    fn len(self: *const AiAgentStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *AiAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: AiAgent) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAiAgentRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.behaviors.appendAssumeCapacity(agent.behavior);
-        self.wander_amplitudes.appendAssumeCapacity(agent.wander_amplitude);
-        self.seek_weights.appendAssumeCapacity(agent.seek_weight);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .behavior = agent.behavior,
+            .wander_amplitude = agent.wander_amplitude,
+            .seek_weight = agent.seek_weight,
+        });
         return index;
     }
 
     fn set(self: *AiAgentStore, index: usize, agent: AiAgent) void {
-        self.behaviors.items[index] = agent.behavior;
-        self.wander_amplitudes.items[index] = agent.wander_amplitude;
-        self.seek_weights.items[index] = agent.seek_weight;
+        const s = self.rows.slice();
+        s.items(.behavior)[index] = agent.behavior;
+        s.items(.wander_amplitude)[index] = agent.wander_amplitude;
+        s.items(.seek_weight)[index] = agent.seek_weight;
     }
 
     fn get(self: *const AiAgentStore, index: usize) AiAgent {
+        const s = self.rows.slice();
         return .{
-            .behavior = self.behaviors.items[index],
-            .wander_amplitude = self.wander_amplitudes.items[index],
-            .seek_weight = self.seek_weights.items[index],
+            .behavior = s.items(.behavior)[index],
+            .wander_amplitude = s.items(.wander_amplitude)[index],
+            .seek_weight = s.items(.seek_weight)[index],
         };
     }
 
     fn removeAt(self: *AiAgentStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.behaviors.items[index] = self.behaviors.items[last];
-        self.wander_amplitudes.items[index] = self.wander_amplitudes.items[last];
-        self.seek_weights.items[index] = self.seek_weights.items[last];
-        _ = self.entities.pop();
-        _ = self.behaviors.pop();
-        _ = self.wander_amplitudes.pop();
-        _ = self.seek_weights.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const AiAgentStore) ConstAiAgentSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .behaviors = self.behaviors.items,
-            .wander_amplitudes = self.wander_amplitudes.items,
-            .seek_weights = self.seek_weights.items,
+            .entities = s.items(.entity),
+            .behaviors = s.items(.behavior),
+            .wander_amplitudes = s.items(.wander_amplitude),
+            .seek_weights = s.items(.seek_weight),
         };
     }
 
     fn clearRetainingCapacity(self: *AiAgentStore) void {
-        self.entities.clearRetainingCapacity();
-        self.behaviors.clearRetainingCapacity();
-        self.wander_amplitudes.clearRetainingCapacity();
-        self.seek_weights.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *AiAgentStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.behaviors.deinit(allocator);
-        self.wander_amplitudes.deinit(allocator);
-        self.seek_weights.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *AiAgentStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *AiAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.behaviors.ensureTotalCapacity(allocator, capacity);
-        try self.wander_amplitudes.ensureTotalCapacity(allocator, capacity);
-        try self.seek_weights.ensureTotalCapacity(allocator, capacity);
+        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
 
 const SteeringAgentStore = struct {
-    // Steering configuration is persistent, while path cooldowns and local
-    // avoidance scratch live in SteeringSystem runtime rows.
-    entities: std.ArrayList(EntityId) = .empty,
-    agent_radii: HotF32List = .empty,
-    waypoint_tolerances: HotF32List = .empty,
-    avoidance_radii: HotF32List = .empty,
-    avoidance_weights: HotF32List = .empty,
-    max_neighbor_samples: std.ArrayList(u16) = .empty,
-    stuck_step_thresholds: std.ArrayList(u16) = .empty,
-    replan_cooldown_steps: std.ArrayList(u16) = .empty,
-    unavailable_backoff_steps: std.ArrayList(u16) = .empty,
+    rows: std.MultiArrayList(SteeringAgentRow) = .{},
+
+    fn len(self: *const SteeringAgentStore) usize {
+        return self.rows.len;
+    }
 
     fn append(self: *SteeringAgentStore, allocator: std.mem.Allocator, entity: EntityId, agent: SteeringAgent) !u32 {
-        if (self.entities.items.len >= std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
         try self.ensureCapacityForOne(allocator);
-        const index: u32 = @intCast(self.entities.items.len);
-        self.entities.appendAssumeCapacity(entity);
-        self.appendColumnsAssumeCapacity(agent);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .agent_radius = agent.agent_radius,
+            .waypoint_tolerance = agent.waypoint_tolerance,
+            .avoidance_radius = agent.avoidance_radius,
+            .avoidance_weight = agent.avoidance_weight,
+            .max_neighbor_samples = agent.max_neighbor_samples,
+            .stuck_step_threshold = agent.stuck_step_threshold,
+            .replan_cooldown_steps = agent.replan_cooldown_steps,
+            .unavailable_backoff_steps = agent.unavailable_backoff_steps,
+        });
         return index;
     }
 
     fn set(self: *SteeringAgentStore, index: usize, agent: SteeringAgent) void {
-        self.agent_radii.items[index] = agent.agent_radius;
-        self.waypoint_tolerances.items[index] = agent.waypoint_tolerance;
-        self.avoidance_radii.items[index] = agent.avoidance_radius;
-        self.avoidance_weights.items[index] = agent.avoidance_weight;
-        self.max_neighbor_samples.items[index] = agent.max_neighbor_samples;
-        self.stuck_step_thresholds.items[index] = agent.stuck_step_threshold;
-        self.replan_cooldown_steps.items[index] = agent.replan_cooldown_steps;
-        self.unavailable_backoff_steps.items[index] = agent.unavailable_backoff_steps;
+        const s = self.rows.slice();
+        s.items(.agent_radius)[index] = agent.agent_radius;
+        s.items(.waypoint_tolerance)[index] = agent.waypoint_tolerance;
+        s.items(.avoidance_radius)[index] = agent.avoidance_radius;
+        s.items(.avoidance_weight)[index] = agent.avoidance_weight;
+        s.items(.max_neighbor_samples)[index] = agent.max_neighbor_samples;
+        s.items(.stuck_step_threshold)[index] = agent.stuck_step_threshold;
+        s.items(.replan_cooldown_steps)[index] = agent.replan_cooldown_steps;
+        s.items(.unavailable_backoff_steps)[index] = agent.unavailable_backoff_steps;
     }
 
     fn get(self: *const SteeringAgentStore, index: usize) SteeringAgent {
+        const s = self.rows.slice();
         return .{
-            .agent_radius = self.agent_radii.items[index],
-            .waypoint_tolerance = self.waypoint_tolerances.items[index],
-            .avoidance_radius = self.avoidance_radii.items[index],
-            .avoidance_weight = self.avoidance_weights.items[index],
-            .max_neighbor_samples = self.max_neighbor_samples.items[index],
-            .stuck_step_threshold = self.stuck_step_thresholds.items[index],
-            .replan_cooldown_steps = self.replan_cooldown_steps.items[index],
-            .unavailable_backoff_steps = self.unavailable_backoff_steps.items[index],
+            .agent_radius = s.items(.agent_radius)[index],
+            .waypoint_tolerance = s.items(.waypoint_tolerance)[index],
+            .avoidance_radius = s.items(.avoidance_radius)[index],
+            .avoidance_weight = s.items(.avoidance_weight)[index],
+            .max_neighbor_samples = s.items(.max_neighbor_samples)[index],
+            .stuck_step_threshold = s.items(.stuck_step_threshold)[index],
+            .replan_cooldown_steps = s.items(.replan_cooldown_steps)[index],
+            .unavailable_backoff_steps = s.items(.unavailable_backoff_steps)[index],
         };
     }
 
     fn removeAt(self: *SteeringAgentStore, index: usize) ?EntityId {
-        const last = self.entities.items.len - 1;
-        const moved_entity = if (index != last) self.entities.items[last] else null;
-        self.entities.items[index] = self.entities.items[last];
-        self.agent_radii.items[index] = self.agent_radii.items[last];
-        self.waypoint_tolerances.items[index] = self.waypoint_tolerances.items[last];
-        self.avoidance_radii.items[index] = self.avoidance_radii.items[last];
-        self.avoidance_weights.items[index] = self.avoidance_weights.items[last];
-        self.max_neighbor_samples.items[index] = self.max_neighbor_samples.items[last];
-        self.stuck_step_thresholds.items[index] = self.stuck_step_thresholds.items[last];
-        self.replan_cooldown_steps.items[index] = self.replan_cooldown_steps.items[last];
-        self.unavailable_backoff_steps.items[index] = self.unavailable_backoff_steps.items[last];
-        _ = self.entities.pop();
-        _ = self.agent_radii.pop();
-        _ = self.waypoint_tolerances.pop();
-        _ = self.avoidance_radii.pop();
-        _ = self.avoidance_weights.pop();
-        _ = self.max_neighbor_samples.pop();
-        _ = self.stuck_step_thresholds.pop();
-        _ = self.replan_cooldown_steps.pop();
-        _ = self.unavailable_backoff_steps.pop();
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
         return moved_entity;
     }
 
     fn sliceConst(self: *const SteeringAgentStore) ConstSteeringAgentSlice {
+        const s = self.rows.slice();
         return .{
-            .entities = self.entities.items,
-            .agent_radii = self.agent_radii.items,
-            .waypoint_tolerances = self.waypoint_tolerances.items,
-            .avoidance_radii = self.avoidance_radii.items,
-            .avoidance_weights = self.avoidance_weights.items,
-            .max_neighbor_samples = self.max_neighbor_samples.items,
-            .stuck_step_thresholds = self.stuck_step_thresholds.items,
-            .replan_cooldown_steps = self.replan_cooldown_steps.items,
-            .unavailable_backoff_steps = self.unavailable_backoff_steps.items,
+            .entities = s.items(.entity),
+            .agent_radii = s.items(.agent_radius),
+            .waypoint_tolerances = s.items(.waypoint_tolerance),
+            .avoidance_radii = s.items(.avoidance_radius),
+            .avoidance_weights = s.items(.avoidance_weight),
+            .max_neighbor_samples = s.items(.max_neighbor_samples),
+            .stuck_step_thresholds = s.items(.stuck_step_threshold),
+            .replan_cooldown_steps = s.items(.replan_cooldown_steps),
+            .unavailable_backoff_steps = s.items(.unavailable_backoff_steps),
         };
     }
 
     fn clearRetainingCapacity(self: *SteeringAgentStore) void {
-        self.entities.clearRetainingCapacity();
-        self.agent_radii.clearRetainingCapacity();
-        self.waypoint_tolerances.clearRetainingCapacity();
-        self.avoidance_radii.clearRetainingCapacity();
-        self.avoidance_weights.clearRetainingCapacity();
-        self.max_neighbor_samples.clearRetainingCapacity();
-        self.stuck_step_thresholds.clearRetainingCapacity();
-        self.replan_cooldown_steps.clearRetainingCapacity();
-        self.unavailable_backoff_steps.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn deinit(self: *SteeringAgentStore, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.agent_radii.deinit(allocator);
-        self.waypoint_tolerances.deinit(allocator);
-        self.avoidance_radii.deinit(allocator);
-        self.avoidance_weights.deinit(allocator);
-        self.max_neighbor_samples.deinit(allocator);
-        self.stuck_step_thresholds.deinit(allocator);
-        self.replan_cooldown_steps.deinit(allocator);
-        self.unavailable_backoff_steps.deinit(allocator);
+        self.rows.deinit(allocator);
         self.* = .{};
     }
 
     fn ensureCapacityForOne(self: *SteeringAgentStore, allocator: std.mem.Allocator) !void {
-        try self.ensureCapacity(allocator, self.entities.items.len + 1);
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 
     fn ensureCapacity(self: *SteeringAgentStore, allocator: std.mem.Allocator, capacity: usize) !void {
-        try self.entities.ensureTotalCapacity(allocator, capacity);
-        try self.agent_radii.ensureTotalCapacity(allocator, capacity);
-        try self.waypoint_tolerances.ensureTotalCapacity(allocator, capacity);
-        try self.avoidance_radii.ensureTotalCapacity(allocator, capacity);
-        try self.avoidance_weights.ensureTotalCapacity(allocator, capacity);
-        try self.max_neighbor_samples.ensureTotalCapacity(allocator, capacity);
-        try self.stuck_step_thresholds.ensureTotalCapacity(allocator, capacity);
-        try self.replan_cooldown_steps.ensureTotalCapacity(allocator, capacity);
-        try self.unavailable_backoff_steps.ensureTotalCapacity(allocator, capacity);
-    }
-
-    fn appendColumnsAssumeCapacity(self: *SteeringAgentStore, agent: SteeringAgent) void {
-        self.agent_radii.appendAssumeCapacity(agent.agent_radius);
-        self.waypoint_tolerances.appendAssumeCapacity(agent.waypoint_tolerance);
-        self.avoidance_radii.appendAssumeCapacity(agent.avoidance_radius);
-        self.avoidance_weights.appendAssumeCapacity(agent.avoidance_weight);
-        self.max_neighbor_samples.appendAssumeCapacity(agent.max_neighbor_samples);
-        self.stuck_step_thresholds.appendAssumeCapacity(agent.stuck_step_threshold);
-        self.replan_cooldown_steps.appendAssumeCapacity(agent.replan_cooldown_steps);
-        self.unavailable_backoff_steps.appendAssumeCapacity(agent.unavailable_backoff_steps);
+        try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
-
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
@@ -2634,22 +2498,6 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.velocity_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
-}
-
-fn expectHotColumnPointersAligned(slice: ConstMovementBodySlice) !void {
-    try expectPointerAligned(slice.position_x.ptr);
-    try expectPointerAligned(slice.position_y.ptr);
-    try expectPointerAligned(slice.position_z.ptr);
-    try expectPointerAligned(slice.previous_x.ptr);
-    try expectPointerAligned(slice.previous_y.ptr);
-    try expectPointerAligned(slice.previous_z.ptr);
-    try expectPointerAligned(slice.velocity_x.ptr);
-    try expectPointerAligned(slice.velocity_y.ptr);
-    try expectPointerAligned(slice.speed.ptr);
-}
-
-fn expectPointerAligned(ptr: anytype) !void {
-    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(ptr) % hot_soa_column_alignment);
 }
 
 fn expectPrimitiveVisualColumnsAligned(slice: ConstPrimitiveVisualSlice) !void {
@@ -2675,25 +2523,18 @@ fn expectCollisionBoundsColumnsAligned(slice: ConstCollisionBoundsSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.offset_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.size_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.size_y.len);
-    try expectPointerAligned(slice.offset_x.ptr);
-    try expectPointerAligned(slice.offset_y.ptr);
-    try expectPointerAligned(slice.size_x.ptr);
-    try expectPointerAligned(slice.size_y.ptr);
 }
 
 fn expectCollisionResponseColumnsAligned(slice: ConstCollisionResponseSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.modes.len);
     try std.testing.expectEqual(slice.entities.len, slice.mobilities.len);
     try std.testing.expectEqual(slice.entities.len, slice.restitution.len);
-    try expectPointerAligned(slice.restitution.ptr);
 }
 
 fn expectAiAgentColumnsAligned(slice: ConstAiAgentSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.behaviors.len);
     try std.testing.expectEqual(slice.entities.len, slice.wander_amplitudes.len);
     try std.testing.expectEqual(slice.entities.len, slice.seek_weights.len);
-    try expectPointerAligned(slice.wander_amplitudes.ptr);
-    try expectPointerAligned(slice.seek_weights.ptr);
 }
 
 fn expectSteeringAgentColumnsAligned(slice: ConstSteeringAgentSlice) !void {
@@ -2705,10 +2546,6 @@ fn expectSteeringAgentColumnsAligned(slice: ConstSteeringAgentSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.stuck_step_thresholds.len);
     try std.testing.expectEqual(slice.entities.len, slice.replan_cooldown_steps.len);
     try std.testing.expectEqual(slice.entities.len, slice.unavailable_backoff_steps.len);
-    try expectPointerAligned(slice.agent_radii.ptr);
-    try expectPointerAligned(slice.waypoint_tolerances.ptr);
-    try expectPointerAligned(slice.avoidance_radii.ptr);
-    try expectPointerAligned(slice.avoidance_weights.ptr);
 }
 
 test "entity ids reject invalid values and match slots exactly" {
@@ -2954,7 +2791,7 @@ test "movement body columns can be loaded directly through simd helpers" {
     try std.testing.expectEqual([_]f32{ 61, 62, 63, 64 }, simd.toFloatArray(simd.loadFloat4(slice.speed[0..])));
 }
 
-test "movement hot columns keep explicit cache line alignment after growth" {
+test "movement hot store rounds capacity for cache-line range splitting" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
@@ -2965,9 +2802,10 @@ test "movement hot columns keep explicit cache line alignment after growth" {
 
     const slice = data.movementBodySliceConst();
     try expectMovementBodyColumnsAligned(slice);
-    try expectHotColumnPointersAligned(slice);
     try std.testing.expectEqual(@as(usize, 16), movement_range_alignment_items);
     try std.testing.expectEqual(@as(usize, 0), (movement_range_alignment_items * @sizeOf(f32)) % hot_soa_column_alignment);
+    try std.testing.expectEqual(@as(usize, movement_range_alignment_items * 3 + 1), slice.entities.len);
+    try std.testing.expectEqual(@as(usize, movement_range_alignment_items * 4), hotStoreCapacity(slice.entities.len));
 }
 
 test "simd range helpers cover movement body vector and scalar tail counts" {
@@ -3710,18 +3548,21 @@ test "entering a non-moving tier snaps interpolation history to position" {
     try data.setMovementBody(entity, .{ .position = .{ .x = 100, .y = 200 } });
     const di = data.movementBodyDenseIndex(entity).?;
     // Diverge previous from position, as a mid-flight integration would leave it.
-    data.movement_bodies.previous_x.items[di] = 10;
-    data.movement_bodies.previous_y.items[di] = 20;
+    var slice = data.movementBodySlice();
+    slice.previous_x[di] = 10;
+    slice.previous_y[di] = 20;
 
     // Non-moving tier snaps previous = position so render interpolation is static.
     try data.setSimulationTier(entity, .dormant);
-    try std.testing.expectEqual(@as(f32, 100), data.movement_bodies.previous_x.items[di]);
-    try std.testing.expectEqual(@as(f32, 200), data.movement_bodies.previous_y.items[di]);
+    const after_dormant = data.movementBodySliceConst();
+    try std.testing.expectEqual(@as(f32, 100), after_dormant.previous_x[di]);
+    try std.testing.expectEqual(@as(f32, 200), after_dormant.previous_y[di]);
 
     // A moving tier leaves the history untouched (movement will resync it).
-    data.movement_bodies.previous_x.items[di] = 10;
+    slice = data.movementBodySlice();
+    slice.previous_x[di] = 10;
     try data.setSimulationTier(entity, .cognition);
-    try std.testing.expectEqual(@as(f32, 10), data.movement_bodies.previous_x.items[di]);
+    try std.testing.expectEqual(@as(f32, 10), data.movementBodySliceConst().previous_x[di]);
 }
 
 fn testBody(base: f32) MovementBody {

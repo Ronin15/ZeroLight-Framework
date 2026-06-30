@@ -19,8 +19,8 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 /// no separate O(N) recompute. The formula mirrors `WorldSystem.chunkCoordForWorldPos`;
 /// movement takes the grid as plain scalars rather than importing the world.
 pub const ChunkGridParams = struct {
-    chunk_x: []align(data.hot_soa_column_alignment) i32,
-    chunk_y: []align(data.hot_soa_column_alignment) i32,
+    chunk_x: data.HotI32Slice,
+    chunk_y: data.HotI32Slice,
     tile_size: f32,
     chunk_size_tiles: u16,
     width: u16,

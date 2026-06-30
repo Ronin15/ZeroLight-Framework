@@ -18,13 +18,17 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 
 pub const hot_particle_column_alignment: usize = 64;
 pub const particle_range_alignment_items: usize = hot_particle_column_alignment / @sizeOf(f32);
 
-const HotF32List = std.ArrayListAligned(f32, .fromByteUnits(hot_particle_column_alignment));
-const HotF32Slice = []align(hot_particle_column_alignment) f32;
-const ConstHotF32Slice = []align(hot_particle_column_alignment) const f32;
+pub const HotF32Slice = []f32;
+pub const ConstHotF32Slice = []const f32;
+
+fn hotStoreCapacity(min_len: usize) usize {
+    return alignItemCount(min_len, particle_range_alignment_items);
+}
 
 pub const ParticleSystemConfig = struct {
     capacity: usize = 512,
@@ -149,37 +153,72 @@ pub const ConstParticleSlice = struct {
     }
 };
 
+const ParticleRow = struct {
+    position_x: f32,
+    position_y: f32,
+    previous_x: f32,
+    previous_y: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    acceleration_x: f32,
+    acceleration_y: f32,
+    age: f32,
+    lifetime: f32,
+    size: f32,
+    start_size: f32,
+    end_size: f32,
+    color_r: f32,
+    color_g: f32,
+    color_b: f32,
+    color_a: f32,
+    start_color_r: f32,
+    start_color_g: f32,
+    start_color_b: f32,
+    start_color_a: f32,
+    end_color_r: f32,
+    end_color_g: f32,
+    end_color_b: f32,
+    end_color_a: f32,
+    z: i32,
+};
+
+fn spawnToRow(spawn: ParticleSpawn) ParticleRow {
+    return .{
+        .position_x = spawn.position.x,
+        .position_y = spawn.position.y,
+        .previous_x = spawn.position.x,
+        .previous_y = spawn.position.y,
+        .velocity_x = spawn.velocity.x,
+        .velocity_y = spawn.velocity.y,
+        .acceleration_x = spawn.acceleration.x,
+        .acceleration_y = spawn.acceleration.y,
+        .age = 0,
+        .lifetime = spawn.lifetime,
+        .size = spawn.start_size,
+        .start_size = spawn.start_size,
+        .end_size = spawn.end_size,
+        .color_r = spawn.start_color.r,
+        .color_g = spawn.start_color.g,
+        .color_b = spawn.start_color.b,
+        .color_a = spawn.start_color.a,
+        .start_color_r = spawn.start_color.r,
+        .start_color_g = spawn.start_color.g,
+        .start_color_b = spawn.start_color.b,
+        .start_color_a = spawn.start_color.a,
+        .end_color_r = spawn.end_color.r,
+        .end_color_g = spawn.end_color.g,
+        .end_color_b = spawn.end_color.b,
+        .end_color_a = spawn.end_color.a,
+        .z = render_depth.worldZWithOffset(spawn.base_z, spawn.depth),
+    };
+}
+
 pub const ParticleSystem = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
     // Fixed-capacity SoA pool. Every active particle is a dense row across all
     // columns, and expired rows are removed by swap-compaction after update.
-    position_x: HotF32List = .empty,
-    position_y: HotF32List = .empty,
-    previous_x: HotF32List = .empty,
-    previous_y: HotF32List = .empty,
-    velocity_x: HotF32List = .empty,
-    velocity_y: HotF32List = .empty,
-    acceleration_x: HotF32List = .empty,
-    acceleration_y: HotF32List = .empty,
-    age: HotF32List = .empty,
-    lifetime: HotF32List = .empty,
-    size: HotF32List = .empty,
-    start_size: HotF32List = .empty,
-    end_size: HotF32List = .empty,
-    color_r: HotF32List = .empty,
-    color_g: HotF32List = .empty,
-    color_b: HotF32List = .empty,
-    color_a: HotF32List = .empty,
-    start_color_r: HotF32List = .empty,
-    start_color_g: HotF32List = .empty,
-    start_color_b: HotF32List = .empty,
-    start_color_a: HotF32List = .empty,
-    end_color_r: HotF32List = .empty,
-    end_color_g: HotF32List = .empty,
-    end_color_b: HotF32List = .empty,
-    end_color_a: HotF32List = .empty,
-    z: std.ArrayList(i32) = .empty,
+    rows: std.MultiArrayList(ParticleRow) = .{},
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator, system_config: ParticleSystemConfig) !ParticleSystem {
@@ -194,98 +233,75 @@ pub const ParticleSystem = struct {
     }
 
     pub fn deinit(self: *ParticleSystem) void {
-        self.position_x.deinit(self.allocator);
-        self.position_y.deinit(self.allocator);
-        self.previous_x.deinit(self.allocator);
-        self.previous_y.deinit(self.allocator);
-        self.velocity_x.deinit(self.allocator);
-        self.velocity_y.deinit(self.allocator);
-        self.acceleration_x.deinit(self.allocator);
-        self.acceleration_y.deinit(self.allocator);
-        self.age.deinit(self.allocator);
-        self.lifetime.deinit(self.allocator);
-        self.size.deinit(self.allocator);
-        self.start_size.deinit(self.allocator);
-        self.end_size.deinit(self.allocator);
-        self.color_r.deinit(self.allocator);
-        self.color_g.deinit(self.allocator);
-        self.color_b.deinit(self.allocator);
-        self.color_a.deinit(self.allocator);
-        self.start_color_r.deinit(self.allocator);
-        self.start_color_g.deinit(self.allocator);
-        self.start_color_b.deinit(self.allocator);
-        self.start_color_a.deinit(self.allocator);
-        self.end_color_r.deinit(self.allocator);
-        self.end_color_g.deinit(self.allocator);
-        self.end_color_b.deinit(self.allocator);
-        self.end_color_a.deinit(self.allocator);
-        self.z.deinit(self.allocator);
+        self.rows.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn activeCount(self: *const ParticleSystem) usize {
-        return self.position_x.items.len;
+        return self.rows.len;
     }
 
     pub fn slice(self: *ParticleSystem) ParticleSlice {
+        const s = self.rows.slice();
         return .{
-            .position_x = self.position_x.items,
-            .position_y = self.position_y.items,
-            .previous_x = self.previous_x.items,
-            .previous_y = self.previous_y.items,
-            .velocity_x = self.velocity_x.items,
-            .velocity_y = self.velocity_y.items,
-            .acceleration_x = self.acceleration_x.items,
-            .acceleration_y = self.acceleration_y.items,
-            .age = self.age.items,
-            .lifetime = self.lifetime.items,
-            .size = self.size.items,
-            .start_size = self.start_size.items,
-            .end_size = self.end_size.items,
-            .color_r = self.color_r.items,
-            .color_g = self.color_g.items,
-            .color_b = self.color_b.items,
-            .color_a = self.color_a.items,
-            .start_color_r = self.start_color_r.items,
-            .start_color_g = self.start_color_g.items,
-            .start_color_b = self.start_color_b.items,
-            .start_color_a = self.start_color_a.items,
-            .end_color_r = self.end_color_r.items,
-            .end_color_g = self.end_color_g.items,
-            .end_color_b = self.end_color_b.items,
-            .end_color_a = self.end_color_a.items,
-            .z = self.z.items,
+            .position_x = s.items(.position_x),
+            .position_y = s.items(.position_y),
+            .previous_x = s.items(.previous_x),
+            .previous_y = s.items(.previous_y),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
+            .acceleration_x = s.items(.acceleration_x),
+            .acceleration_y = s.items(.acceleration_y),
+            .age = s.items(.age),
+            .lifetime = s.items(.lifetime),
+            .size = s.items(.size),
+            .start_size = s.items(.start_size),
+            .end_size = s.items(.end_size),
+            .color_r = s.items(.color_r),
+            .color_g = s.items(.color_g),
+            .color_b = s.items(.color_b),
+            .color_a = s.items(.color_a),
+            .start_color_r = s.items(.start_color_r),
+            .start_color_g = s.items(.start_color_g),
+            .start_color_b = s.items(.start_color_b),
+            .start_color_a = s.items(.start_color_a),
+            .end_color_r = s.items(.end_color_r),
+            .end_color_g = s.items(.end_color_g),
+            .end_color_b = s.items(.end_color_b),
+            .end_color_a = s.items(.end_color_a),
+            .z = s.items(.z),
         };
     }
 
     pub fn sliceConst(self: *const ParticleSystem) ConstParticleSlice {
+        const s = self.rows.slice();
         return .{
-            .position_x = self.position_x.items,
-            .position_y = self.position_y.items,
-            .previous_x = self.previous_x.items,
-            .previous_y = self.previous_y.items,
-            .velocity_x = self.velocity_x.items,
-            .velocity_y = self.velocity_y.items,
-            .acceleration_x = self.acceleration_x.items,
-            .acceleration_y = self.acceleration_y.items,
-            .age = self.age.items,
-            .lifetime = self.lifetime.items,
-            .size = self.size.items,
-            .start_size = self.start_size.items,
-            .end_size = self.end_size.items,
-            .color_r = self.color_r.items,
-            .color_g = self.color_g.items,
-            .color_b = self.color_b.items,
-            .color_a = self.color_a.items,
-            .start_color_r = self.start_color_r.items,
-            .start_color_g = self.start_color_g.items,
-            .start_color_b = self.start_color_b.items,
-            .start_color_a = self.start_color_a.items,
-            .end_color_r = self.end_color_r.items,
-            .end_color_g = self.end_color_g.items,
-            .end_color_b = self.end_color_b.items,
-            .end_color_a = self.end_color_a.items,
-            .z = self.z.items,
+            .position_x = s.items(.position_x),
+            .position_y = s.items(.position_y),
+            .previous_x = s.items(.previous_x),
+            .previous_y = s.items(.previous_y),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
+            .acceleration_x = s.items(.acceleration_x),
+            .acceleration_y = s.items(.acceleration_y),
+            .age = s.items(.age),
+            .lifetime = s.items(.lifetime),
+            .size = s.items(.size),
+            .start_size = s.items(.start_size),
+            .end_size = s.items(.end_size),
+            .color_r = s.items(.color_r),
+            .color_g = s.items(.color_g),
+            .color_b = s.items(.color_b),
+            .color_a = s.items(.color_a),
+            .start_color_r = s.items(.start_color_r),
+            .start_color_g = s.items(.start_color_g),
+            .start_color_b = s.items(.start_color_b),
+            .start_color_a = s.items(.start_color_a),
+            .end_color_r = s.items(.end_color_r),
+            .end_color_g = s.items(.end_color_g),
+            .end_color_b = s.items(.end_color_b),
+            .end_color_a = s.items(.end_color_a),
+            .z = s.items(.z),
         };
     }
 
@@ -295,32 +311,7 @@ pub const ParticleSystem = struct {
         if (self.activeCount() >= self.capacity) return false;
         if (spawn.lifetime <= 0) return false;
 
-        self.position_x.appendAssumeCapacity(spawn.position.x);
-        self.position_y.appendAssumeCapacity(spawn.position.y);
-        self.previous_x.appendAssumeCapacity(spawn.position.x);
-        self.previous_y.appendAssumeCapacity(spawn.position.y);
-        self.velocity_x.appendAssumeCapacity(spawn.velocity.x);
-        self.velocity_y.appendAssumeCapacity(spawn.velocity.y);
-        self.acceleration_x.appendAssumeCapacity(spawn.acceleration.x);
-        self.acceleration_y.appendAssumeCapacity(spawn.acceleration.y);
-        self.age.appendAssumeCapacity(0);
-        self.lifetime.appendAssumeCapacity(spawn.lifetime);
-        self.size.appendAssumeCapacity(spawn.start_size);
-        self.start_size.appendAssumeCapacity(spawn.start_size);
-        self.end_size.appendAssumeCapacity(spawn.end_size);
-        self.color_r.appendAssumeCapacity(spawn.start_color.r);
-        self.color_g.appendAssumeCapacity(spawn.start_color.g);
-        self.color_b.appendAssumeCapacity(spawn.start_color.b);
-        self.color_a.appendAssumeCapacity(spawn.start_color.a);
-        self.start_color_r.appendAssumeCapacity(spawn.start_color.r);
-        self.start_color_g.appendAssumeCapacity(spawn.start_color.g);
-        self.start_color_b.appendAssumeCapacity(spawn.start_color.b);
-        self.start_color_a.appendAssumeCapacity(spawn.start_color.a);
-        self.end_color_r.appendAssumeCapacity(spawn.end_color.r);
-        self.end_color_g.appendAssumeCapacity(spawn.end_color.g);
-        self.end_color_b.appendAssumeCapacity(spawn.end_color.b);
-        self.end_color_a.appendAssumeCapacity(spawn.end_color.a);
-        self.z.appendAssumeCapacity(render_depth.worldZWithOffset(spawn.base_z, spawn.depth));
+        self.rows.appendAssumeCapacity(spawnToRow(spawn));
         return true;
     }
 
@@ -408,149 +399,39 @@ pub const ParticleSystem = struct {
     }
 
     pub fn syncPreviousPositions(self: *ParticleSystem) void {
-        for (0..self.activeCount()) |index| {
-            self.previous_x.items[index] = self.position_x.items[index];
-            self.previous_y.items[index] = self.position_y.items[index];
+        var slice_data = self.slice();
+        for (0..slice_data.len()) |index| {
+            slice_data.previous_x[index] = slice_data.position_x[index];
+            slice_data.previous_y[index] = slice_data.position_y[index];
         }
     }
 
     pub fn clearRetainingCapacity(self: *ParticleSystem) void {
-        self.position_x.clearRetainingCapacity();
-        self.position_y.clearRetainingCapacity();
-        self.previous_x.clearRetainingCapacity();
-        self.previous_y.clearRetainingCapacity();
-        self.velocity_x.clearRetainingCapacity();
-        self.velocity_y.clearRetainingCapacity();
-        self.acceleration_x.clearRetainingCapacity();
-        self.acceleration_y.clearRetainingCapacity();
-        self.age.clearRetainingCapacity();
-        self.lifetime.clearRetainingCapacity();
-        self.size.clearRetainingCapacity();
-        self.start_size.clearRetainingCapacity();
-        self.end_size.clearRetainingCapacity();
-        self.color_r.clearRetainingCapacity();
-        self.color_g.clearRetainingCapacity();
-        self.color_b.clearRetainingCapacity();
-        self.color_a.clearRetainingCapacity();
-        self.start_color_r.clearRetainingCapacity();
-        self.start_color_g.clearRetainingCapacity();
-        self.start_color_b.clearRetainingCapacity();
-        self.start_color_a.clearRetainingCapacity();
-        self.end_color_r.clearRetainingCapacity();
-        self.end_color_g.clearRetainingCapacity();
-        self.end_color_b.clearRetainingCapacity();
-        self.end_color_a.clearRetainingCapacity();
-        self.z.clearRetainingCapacity();
+        self.rows.clearRetainingCapacity();
     }
 
     fn reserveStorage(self: *ParticleSystem, capacity: usize) !void {
-        try self.position_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.position_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.previous_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.previous_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.velocity_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.velocity_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.acceleration_x.ensureTotalCapacity(self.allocator, capacity);
-        try self.acceleration_y.ensureTotalCapacity(self.allocator, capacity);
-        try self.age.ensureTotalCapacity(self.allocator, capacity);
-        try self.lifetime.ensureTotalCapacity(self.allocator, capacity);
-        try self.size.ensureTotalCapacity(self.allocator, capacity);
-        try self.start_size.ensureTotalCapacity(self.allocator, capacity);
-        try self.end_size.ensureTotalCapacity(self.allocator, capacity);
-        try self.color_r.ensureTotalCapacity(self.allocator, capacity);
-        try self.color_g.ensureTotalCapacity(self.allocator, capacity);
-        try self.color_b.ensureTotalCapacity(self.allocator, capacity);
-        try self.color_a.ensureTotalCapacity(self.allocator, capacity);
-        try self.start_color_r.ensureTotalCapacity(self.allocator, capacity);
-        try self.start_color_g.ensureTotalCapacity(self.allocator, capacity);
-        try self.start_color_b.ensureTotalCapacity(self.allocator, capacity);
-        try self.start_color_a.ensureTotalCapacity(self.allocator, capacity);
-        try self.end_color_r.ensureTotalCapacity(self.allocator, capacity);
-        try self.end_color_g.ensureTotalCapacity(self.allocator, capacity);
-        try self.end_color_b.ensureTotalCapacity(self.allocator, capacity);
-        try self.end_color_a.ensureTotalCapacity(self.allocator, capacity);
-        try self.z.ensureTotalCapacity(self.allocator, capacity);
+        try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
     }
 
     fn removeExpiredSwap(self: *ParticleSystem) usize {
         // Swap removal is intentionally unordered. Render ordering comes from
-        // Storage order is stable for emission, while the owning state decides
-        // which render phase submits particles.
+        // storage order for emission, while the owning state decides which
+        // render phase submits particles.
         var removed: usize = 0;
         var index: usize = 0;
-        while (index < self.activeCount()) {
-            if (self.age.items[index] < self.lifetime.items[index]) {
+        const row_slice = self.rows.slice();
+        const ages = row_slice.items(.age);
+        const lifetimes = row_slice.items(.lifetime);
+        while (index < self.rows.len) {
+            if (ages[index] < lifetimes[index]) {
                 index += 1;
                 continue;
             }
-            self.swapRemove(index);
+            self.rows.swapRemove(index);
             removed += 1;
         }
         return removed;
-    }
-
-    fn swapRemove(self: *ParticleSystem, index: usize) void {
-        const last = self.activeCount() - 1;
-        if (index != last) self.copyRow(index, last);
-        self.popAll();
-    }
-
-    fn copyRow(self: *ParticleSystem, dst: usize, src: usize) void {
-        self.position_x.items[dst] = self.position_x.items[src];
-        self.position_y.items[dst] = self.position_y.items[src];
-        self.previous_x.items[dst] = self.previous_x.items[src];
-        self.previous_y.items[dst] = self.previous_y.items[src];
-        self.velocity_x.items[dst] = self.velocity_x.items[src];
-        self.velocity_y.items[dst] = self.velocity_y.items[src];
-        self.acceleration_x.items[dst] = self.acceleration_x.items[src];
-        self.acceleration_y.items[dst] = self.acceleration_y.items[src];
-        self.age.items[dst] = self.age.items[src];
-        self.lifetime.items[dst] = self.lifetime.items[src];
-        self.size.items[dst] = self.size.items[src];
-        self.start_size.items[dst] = self.start_size.items[src];
-        self.end_size.items[dst] = self.end_size.items[src];
-        self.color_r.items[dst] = self.color_r.items[src];
-        self.color_g.items[dst] = self.color_g.items[src];
-        self.color_b.items[dst] = self.color_b.items[src];
-        self.color_a.items[dst] = self.color_a.items[src];
-        self.start_color_r.items[dst] = self.start_color_r.items[src];
-        self.start_color_g.items[dst] = self.start_color_g.items[src];
-        self.start_color_b.items[dst] = self.start_color_b.items[src];
-        self.start_color_a.items[dst] = self.start_color_a.items[src];
-        self.end_color_r.items[dst] = self.end_color_r.items[src];
-        self.end_color_g.items[dst] = self.end_color_g.items[src];
-        self.end_color_b.items[dst] = self.end_color_b.items[src];
-        self.end_color_a.items[dst] = self.end_color_a.items[src];
-        self.z.items[dst] = self.z.items[src];
-    }
-
-    fn popAll(self: *ParticleSystem) void {
-        _ = self.position_x.pop();
-        _ = self.position_y.pop();
-        _ = self.previous_x.pop();
-        _ = self.previous_y.pop();
-        _ = self.velocity_x.pop();
-        _ = self.velocity_y.pop();
-        _ = self.acceleration_x.pop();
-        _ = self.acceleration_y.pop();
-        _ = self.age.pop();
-        _ = self.lifetime.pop();
-        _ = self.size.pop();
-        _ = self.start_size.pop();
-        _ = self.end_size.pop();
-        _ = self.color_r.pop();
-        _ = self.color_g.pop();
-        _ = self.color_b.pop();
-        _ = self.color_a.pop();
-        _ = self.start_color_r.pop();
-        _ = self.start_color_g.pop();
-        _ = self.start_color_b.pop();
-        _ = self.start_color_a.pop();
-        _ = self.end_color_r.pop();
-        _ = self.end_color_g.pop();
-        _ = self.end_color_b.pop();
-        _ = self.end_color_a.pop();
-        _ = self.z.pop();
     }
 };
 
