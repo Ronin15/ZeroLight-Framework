@@ -535,13 +535,19 @@ pub const WorldSystem = struct {
         const chunk_visible = self.chunks.items(.visible);
         var index: usize = 0;
         const vectorized_end = simd.vectorizedEnd(count);
+        const one = simd.splatInt4(1);
+        const zero = simd.splatInt4(0);
         while (index < vectorized_end) : (index += simd.lane_count) {
             const cx = simd.loadInt4(chunk_x[index..]);
             const cy = simd.loadInt4(chunk_y[index..]);
-            const visible = simd.greaterThanInt4(cx, min_x) & simd.lessThanInt4(cx, max_x) &
-                simd.greaterThanInt4(cy, min_y) & simd.lessThanInt4(cy, max_y);
+            // i32 select chain avoids bool-vector `&` and lane stores (LLVM -ODebug DWARF bug).
+            var vis = one;
+            vis = simd.selectInt4(simd.greaterThanInt4(cx, min_x), vis, zero);
+            vis = simd.selectInt4(simd.lessThanInt4(cx, max_x), vis, zero);
+            vis = simd.selectInt4(simd.greaterThanInt4(cy, min_y), vis, zero);
+            vis = simd.selectInt4(simd.lessThanInt4(cy, max_y), vis, zero);
             inline for (0..simd.lane_count) |lane| {
-                chunk_visible[index + lane] = visible[lane];
+                chunk_visible[index + lane] = vis[lane] != 0;
             }
         }
         while (index < count) : (index += 1) {
