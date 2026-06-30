@@ -6,7 +6,7 @@ Range: `main..world`
 
 Base: `c132a5e` (`Merge pull request #6 from Ronin15/world_and_assets`)
 
-Tip: `c68856a` (`linux compile crash fix LLVM -0Debug DWARF bug`)
+Tip: `0d25c04` (`full linux compile debug fix.`)
 
 ## Summary
 
@@ -325,3 +325,4 @@ work, but several follow-ups remain visible in the roadmap and review notes:
 - `277728e` review summary
 - `9bd0fb0` gpu review fixes
 - `c68856a` linux compile crash fix LLVM -0Debug DWARF bug
+- `0d25c04` full linux compile debug fix.
