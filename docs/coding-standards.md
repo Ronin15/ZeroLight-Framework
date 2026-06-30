@@ -225,6 +225,13 @@ routing, state policy flow, transition ordering, resource ID validation,
 viewport math, descriptor validation, asset path validation, timing decisions,
 and pure gameplay/data contracts. Keep display/GPU checks in `gpu-smoke`.
 
+Unit tests must never build production-scale worlds. Do not call
+`initProcedural`, `initProceduralFromMeta`, `initProceduralWithRuntimeAssets`,
+or loading/gameplay paths that construct the full procedural world in
+`zig build test`. Use minimal hand-built `WorldSystem` fixtures, small demo
+patches, or pure contract checks instead; full world build and throughput
+validation belong in `zig build bench`.
+
 Production contracts must expose runtime concepts only. Do not add test-only
 enum tags, union payloads, marker fields, fake stages, fixture hooks, service
 shortcuts, or test-only paths to production APIs. Tests should use private

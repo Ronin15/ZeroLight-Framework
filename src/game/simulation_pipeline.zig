@@ -41,6 +41,7 @@ const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
+const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
 
 /// Construction policy for the state-owned simulation pipeline.
@@ -55,6 +56,8 @@ pub const SimulationPipelineConfig = struct {
     pathfinding: PathfindingCapacity = .{},
     nav_cell_size: f32 = 32.0,
     navigation_world: ?*const WorldSystem = null,
+    /// When set, the one-time static nav build fans mask/abstract work across levels.
+    nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
 };
 
@@ -123,7 +126,7 @@ pub const SimulationPipeline = struct {
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
-        try pathfinding.rebuildStaticNavGridWithWorld(data, config.navigation_world, bounds_width, bounds_height, config.nav_cell_size);
+        try pathfinding.rebuildStaticNavGridWithWorld(data, config.navigation_world, bounds_width, bounds_height, config.nav_cell_size, config.nav_build_thread_system);
         var collision = CollisionSystem.init(allocator);
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
@@ -177,7 +180,7 @@ pub const SimulationPipeline = struct {
         bounds_width: f32,
         bounds_height: f32,
     ) !void {
-        try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size);
+        try self.pathfinding.rebuildStaticNavGridWithWorld(data, world, bounds_width, bounds_height, self.nav_cell_size, null);
     }
 
     /// Clears the pathfinding system's dirty nav-cell buffer. Call once before a step's
@@ -368,6 +371,7 @@ pub const SimulationPipeline = struct {
         // entities stay on the surface (level 0, fully walkable) this slice, so the
         // gate is player-only by design — see docs/simulation-tiers-and-pipeline.md.
         gatePlayerToWalkableTiles(context.world, data, context.player.*);
+        gateNpcEntitiesToWalkableTiles(context.world, data);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
 
         // Collision also gates on tier only (no chunk filter): off-screen entities
@@ -384,10 +388,12 @@ pub const SimulationPipeline = struct {
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
 
         // After movement/collision settle the player's position, update their plane:
-        // fall into a hole or follow a ramp on cell entry. Player-only; mutates the
+        // follow a ramp on cell entry, fall one level per step when standing over a
+        // hole. Player-only; mutates the
         // borrowed `Player.current_level` and snaps the body, then the dig reaction's
         // tile change re-masks navigation post-commit.
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
+        applyNpcPlaneTraversal(context.world, data);
 
         // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
         // kinematic/dormant by its cube distance from the visible region, applied
@@ -487,6 +493,75 @@ fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void
 /// tile wide; sampling the four AABB corners (with an epsilon so a flush right/bottom
 /// edge stays in the covered cell) is exact for the sub-tile motion this produces.
 /// Allocation-free, single entity, scalar.
+fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
+    const ai_slice = data.aiAgentSliceConst();
+    for (ai_slice.entities) |entity| {
+        const level = data.worldLevelConst(entity) orelse 0;
+        if (level == 0) continue;
+        const body = data.movementBodyPtr(entity) orelse continue;
+        const visual = data.primitiveVisualConst(entity) orelse continue;
+        const w = visual.size.x;
+        const h = visual.size.y;
+        const pre_x = body.previous_x.*;
+        const pre_y = body.previous_y.*;
+        const post_x = body.position_x.*;
+        const post_y = body.position_y.*;
+
+        var resolved_x = post_x;
+        if (rectOverlapsSolidTile(world, level, post_x, pre_y, w, h)) resolved_x = pre_x;
+        var resolved_y = post_y;
+        if (rectOverlapsSolidTile(world, level, resolved_x, post_y, w, h)) resolved_y = pre_y;
+
+        if (resolved_x != post_x) body.velocity_x.* = 0;
+        if (resolved_y != post_y) body.velocity_y.* = 0;
+        body.position_x.* = resolved_x;
+        body.position_y.* = resolved_y;
+    }
+}
+
+/// Updates NPC planes after movement using cell-entry guards from previous to
+/// current body centers. Mirrors player ramp/fall traversal without dig carving.
+fn applyNpcPlaneTraversal(world: *const WorldSystem, data: *DataSystem) void {
+    const ai_slice = data.aiAgentSliceConst();
+    for (ai_slice.entities) |entity| {
+        const level = data.worldLevelConst(entity) orelse continue;
+        const body = data.movementBodyPtr(entity) orelse continue;
+        const visual = data.primitiveVisualConst(entity) orelse continue;
+        const prev_center_x = body.previous_x.* + visual.size.x * 0.5;
+        const prev_center_y = body.previous_y.* + visual.size.y * 0.5;
+        const center_x = body.position_x.* + visual.size.x * 0.5;
+        const center_y = body.position_y.* + visual.size.y * 0.5;
+        const prev_cell = world.cellContaining(prev_center_x, prev_center_y) orelse continue;
+        const cell = world.cellContaining(center_x, center_y) orelse continue;
+        if (prev_cell.x == cell.x and prev_cell.y == cell.y) continue;
+
+        const cell_coord = CellCoord{ .x = cell.x, .y = cell.y };
+        if (world.rampLinkOtherLevel(level, cell_coord)) |other| {
+            setEntityWorldLevel(world, data, entity, other, cell_coord);
+            continue;
+        }
+        const below: usize = @as(usize, level) + 1;
+        if (below < world.levelCount() and world.denseFloorIsEmpty(level, cell.x, cell.y)) {
+            setEntityWorldLevel(world, data, entity, @intCast(below), cell_coord);
+        }
+    }
+}
+
+fn setEntityWorldLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId, level: u16, cell: CellCoord) void {
+    data.setWorldLevel(entity, level) catch return;
+    const body = data.movementBodyPtr(entity) orelse return;
+    const z = world.levelBaseZ(level);
+    body.position_z.* = z;
+    body.previous_z.* = z;
+    if (level == 0) return;
+    const snap_x = @as(f32, @floatFromInt(cell.x)) * world.tile_size;
+    const snap_y = @as(f32, @floatFromInt(cell.y)) * world.tile_size;
+    body.position_x.* = snap_x;
+    body.position_y.* = snap_y;
+    body.previous_x.* = snap_x;
+    body.previous_y.* = snap_y;
+}
+
 fn gatePlayerToWalkableTiles(world: *const WorldSystem, data: *DataSystem, player: Player) void {
     if (player.current_level == 0) return;
     const body = data.movementBodyPtr(player.entity) orelse return;

@@ -24,17 +24,8 @@ comptime {
     _ = @import("app/state.zig");
     _ = @import("app/thread_system.zig");
     _ = @import("app/time_loop.zig");
-    _ = @import("benchmarks/ai.zig");
-    _ = @import("benchmarks/collision.zig");
-    _ = @import("benchmarks/collision_response.zig");
+    // Benchmark workloads and production world builds run via `zig build bench` only.
     _ = @import("benchmarks/suite.zig");
-    _ = @import("benchmarks/movement.zig");
-    _ = @import("benchmarks/particles.zig");
-    _ = @import("benchmarks/pathfinding.zig");
-    _ = @import("benchmarks/render_prep.zig");
-    _ = @import("benchmarks/render_game_prep.zig");
-    _ = @import("benchmarks/scope.zig");
-    _ = @import("benchmarks/steering.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");

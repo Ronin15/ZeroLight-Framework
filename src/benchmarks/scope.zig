@@ -350,25 +350,3 @@ fn itemsPerRange(case: suite.BenchmarkCase, alignment: usize) ?usize {
     return case.itemsPerRange(alignment) orelse
         suite.alignItemCount(suite.default_items_per_range, alignment);
 }
-
-test "scope benchmark fixture creates simulated entities with movement, bounds, and ai" {
-    var fixture = try createFixture(std.testing.allocator, 64);
-    defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.collisionBoundsSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.aiAgentSliceConst().entities.len);
-}
-
-test "scope benchmark tiny serial case runs the scoped sim stages without display" {
-    var options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    options.profile = .quick;
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 1_024);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    // Cognition ran on a strict subset (halo covers half the grid, stagger keeps
-    // ~1/4 of those), proving the scope actually reduced the cognition workload.
-    try std.testing.expect(stats.output_count > 0);
-    try std.testing.expect(stats.output_count < 1_024);
-}

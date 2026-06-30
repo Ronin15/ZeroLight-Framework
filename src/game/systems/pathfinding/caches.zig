@@ -648,9 +648,99 @@ fn stitchedWaypointAt(grid: *const NavGrid, stitched: []const StitchedCell, leve
     return grid.cellCenter(stitched[next].cell);
 }
 
+// Level of the forward cell paired with stitchedWaypointAt. When the matched index
+// sits at a LevelLink (successor cell on a different level), returns that destination
+// level; otherwise returns the agent's current run level.
+fn stitchedNextCellLevel(stitched: []const StitchedCell, level: u16, j: usize) u16 {
+    if (j + 1 < stitched.len and stitched[j + 1].level != level) {
+        return stitched[j + 1].level;
+    }
+    return level;
+}
+
+// Per-agent next-cell level against a stitched corridor. Mirrors waypointFromStitched's
+// index matching so next_cell_level stays consistent with next_waypoint.
+pub fn nextCellLevelFromStitched(graph: *const NavGraph, stitched: []const StitchedCell, start_level: u16, start_index: usize, hint: ?*u32) ?u16 {
+    const start_grid = graph.grid(start_level) orelse return null;
+    if (hint) |h| {
+        const from = @min(@as(usize, h.*), stitched.len -| 1);
+        const to = @min(from + waypoint_hint_window, stitched.len);
+        for (from..to) |j| {
+            if (stitched[j].level == start_level and stitched[j].cell == start_index) {
+                if (hint) |hint_ptr| hint_ptr.* = @intCast(j);
+                return stitchedNextCellLevel(stitched, start_level, j);
+            }
+        }
+    }
+    var i: usize = 0;
+    var nearest_index: usize = 0;
+    var best_dist: i64 = std.math.maxInt(i64);
+    var found_run = false;
+    const start_x: i32 = @intCast(start_index % start_grid.width);
+    const start_y: i32 = @intCast(start_index / start_grid.width);
+    while (i < stitched.len) {
+        if (stitched[i].level != start_level) {
+            i += 1;
+            continue;
+        }
+        const run_begin = i;
+        while (i < stitched.len and stitched[i].level == start_level) : (i += 1) {}
+        const run_end = i;
+        for (run_begin..run_end) |j| {
+            if (stitched[j].cell == start_index) {
+                if (hint) |hint_ptr| hint_ptr.* = @intCast(j);
+                return stitchedNextCellLevel(stitched, start_level, j);
+            }
+            const cx: i32 = @intCast(stitched[j].cell % start_grid.width);
+            const cy: i32 = @intCast(stitched[j].cell / start_grid.width);
+            const ddx: i64 = cx - start_x;
+            const ddy: i64 = cy - start_y;
+            const dist = ddx * ddx + ddy * ddy;
+            if (dist < best_dist) {
+                best_dist = dist;
+                nearest_index = j;
+                found_run = true;
+            }
+        }
+    }
+    if (!found_run) return null;
+    if (hint) |hint_ptr| hint_ptr.* = @intCast(nearest_index);
+    return stitchedNextCellLevel(stitched, start_level, nearest_index);
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
+
+test "pathfinding stitched next cell level reports destination floor at link crossing" {
+    var graph = try makeTestGraph(std.testing.allocator, 20, 20);
+    defer graph.levels.deinit(std.testing.allocator);
+    try graph.levels.append(std.testing.allocator, NavGrid{ .width = 20, .height = 20, .cell_size = 1 });
+
+    const stitched = [_]StitchedCell{
+        .{ .level = 0, .cell = 10 },
+        .{ .level = 0, .cell = 11 },
+        .{ .level = 0, .cell = 12 },
+        .{ .level = 1, .cell = 2 },
+        .{ .level = 1, .cell = 3 },
+    };
+
+    // Approaching the link endpoint: next step stays on level 0.
+    try std.testing.expectEqual(
+        @as(u16, 0),
+        nextCellLevelFromStitched(&graph, &stitched, 0, 11, null).?,
+    );
+    // On the link cell: successor crosses to level 1.
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        nextCellLevelFromStitched(&graph, &stitched, 0, 12, null).?,
+    );
+    // After crossing, movement on level 1 stays on level 1.
+    try std.testing.expectEqual(
+        @as(u16, 1),
+        nextCellLevelFromStitched(&graph, &stitched, 1, 2, null).?,
+    );
+}
 
 test "pathfinding waypoint hint matches full scan and recovers from a stale hint" {
     const grid = NavGrid{ .width = 100, .height = 1, .cell_size = 1 };

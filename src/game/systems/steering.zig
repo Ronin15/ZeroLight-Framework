@@ -39,6 +39,10 @@ fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, steering_range_alignment_items);
 }
 
+fn entityWorldLevel(data: *const DataSystem, entity: EntityId) u16 {
+    return data.worldLevelConst(entity) orelse 0;
+}
+
 const invalid_index = std.math.maxInt(usize);
 const min_spatial_cell_size: f32 = 1.0;
 const max_agent_candidate_checks: u16 = 64;
@@ -215,7 +219,7 @@ pub const SteeringSystem = struct {
         config: SteeringConfig,
     ) !SteeringStats {
         var stats = try self.prepareUpdate(data, frame, pathfinding, config);
-        try self.writePathRequests(frame, stats.path_request_count);
+        try self.writePathRequests(data, frame, stats.path_request_count);
         stats.batch = try self.writeMovementIntentsThreaded(frame, thread_system, config);
         self.finishStats(&stats);
         return stats;
@@ -229,7 +233,7 @@ pub const SteeringSystem = struct {
         config: SteeringConfig,
     ) !SteeringStats {
         var stats = try self.prepareUpdate(data, frame, pathfinding, config);
-        try self.writePathRequests(frame, stats.path_request_count);
+        try self.writePathRequests(data, frame, stats.path_request_count);
         stats.batch = try self.writeMovementIntentsSerial(frame);
         self.finishStats(&stats);
         return stats;
@@ -495,7 +499,7 @@ pub const SteeringSystem = struct {
                 .y = movement.previous_y[selected.movement_index],
             };
             const runtime = try self.runtimeRowForSelected(selected);
-            const path_dir = self.directionFromPathStatus(pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
+            const path_dir = self.directionFromPathStatus(data, pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
             const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
             const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
 
@@ -516,13 +520,7 @@ pub const SteeringSystem = struct {
         stats.path_request_count = request_count;
     }
 
-    fn writePathRequests(self: *SteeringSystem, frame: *SimulationFrame, request_count: usize) !void {
-        // Agents have no per-entity level column yet, so the start level is the
-        // single-level default. This is load-bearing: NPCs are confined to the
-        // fully-walkable surface (level 0), which is why they can never enter the
-        // solid-dirt underground and need no tile-collision gating. A per-entity
-        // lookup replaces this only when autonomous NPC descent lands.
-        const agent_start_level: u16 = 0;
+    fn writePathRequests(self: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, request_count: usize) !void {
         const request_range_base = try frame.path_requests.appendRangeCounts(1);
         frame.path_requests.addCount(request_range_base, request_count);
         try frame.path_requests.prefixAppendedRanges(request_range_base);
@@ -532,14 +530,12 @@ pub const SteeringSystem = struct {
         const work = self.selectedWorkSliceConst();
         for (self.selected.items, 0..) |selected, index| {
             if (!selected.emit_path_request) continue;
+            const start_level = entityWorldLevel(data, selected.entity);
             request_writer.write(PathRequest{
                 .entity = selected.entity,
                 .agent_class = selected.intent.agent_class,
                 .kind = selected.intent.kind,
-                // No per-entity level store exists yet, so the agent's start level
-                // is the single-level default (0). When real multi-level placement
-                // lands, source this from a per-entity level column.
-                .start_level = agent_start_level,
+                .start_level = start_level,
                 .goal_level = selected.intent.goal_level,
                 .start = .{ .x = work.start_x[index], .y = work.start_y[index] },
                 .goal = selected.intent.goal,
@@ -594,6 +590,7 @@ pub const SteeringSystem = struct {
 
     fn directionFromPathStatus(
         self: *SteeringSystem,
+        data: *const DataSystem,
         pathfinding: *const PathfindingSystem,
         selected: *SelectedIntent,
         start: math.Vec2,
@@ -605,9 +602,9 @@ pub const SteeringSystem = struct {
         _ = self;
         // Missing paths request work, pending paths hold direction, unavailable
         // paths enter backoff, and available paths steer toward the next waypoint.
-        // Single-level default start level (0).
+        const start_level = entityWorldLevel(data, selected.entity);
         const goal_distance = distance(start, selected.intent.goal);
-        const view = pathfinding.statusForWorld(0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
+        const view = pathfinding.statusForWorld(start_level, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
         switch (view.status) {
             .available => {
                 stats.path_available_count += 1;
@@ -1339,11 +1336,9 @@ test "steering requests missing paths then follows available path results" {
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }
 
-test "steering pins NPC path requests to the surface plane" {
-    // Load-bearing confinement: NPCs have no per-entity plane, so every path request
-    // they emit must stay on level 0 (the fully-walkable surface). This guards against
-    // a future accidental wire of the player's plane into the goal level, which would
-    // make NPCs request underground paths they cannot walk and pile at the ramp mouth.
+test "steering sources path request start level from entity world level" {
+    // Default surface NPCs without an explicit world_level component still emit
+    // start_level 0. Underground placement uses setWorldLevel before steering runs.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });

@@ -184,7 +184,9 @@ Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).
 Dense floor submit uses a per-layer full-world quad inside the 23B window (GPU
-clips; not camera-chunk culled). NPC per-level cull (Slice 25E) is separate.
+clips; not camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
+as the gameplay/nav/render authority; `setWorldLevel` syncs `scope.level` for
+cube LOD. Player floor policy stays on `Player.current_level` for digging.
 See `docs/rendering-assets-shaders.md` and slices 23B/24B in
 `docs/framework-implementation-slices.md`.
 

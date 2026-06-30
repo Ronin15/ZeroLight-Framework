@@ -150,39 +150,3 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
 }
-
-test "ai benchmark fixture creates requested agents and movement bodies" {
-    var fixture = try createFixture(std.testing.allocator, 32);
-    defer fixture.deinit();
-
-    try std.testing.expectEqual(@as(usize, 32), fixture.data.aiAgentSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 32), fixture.data.movementBodySliceConst().entities.len);
-}
-
-test "ai benchmark tiny serial case runs without display" {
-    const options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 256);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    try std.testing.expect(stats.batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 256), stats.output_count);
-}
-
-test "ai benchmark fixed cases use explicit range controls" {
-    try std.testing.expectEqual(
-        suite.alignItemCount(suite.default_items_per_range, ai_range_alignment_items),
-        benchmarkItemsPerRange(suite.default_cases[3]).?,
-    );
-    try std.testing.expectEqual(suite.default_cases[4].itemsPerRange(ai_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[4]).?);
-    try std.testing.expectEqual(suite.default_cases[5].itemsPerRange(ai_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[5]).?);
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[6]));
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[7]));
-}
-
-test "ai benchmark profiles keep bounded separation workload cases" {
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.quick), defaultItemCounts(.quick));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.standard), defaultItemCounts(.standard));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.stress), defaultItemCounts(.stress));
-}

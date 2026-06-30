@@ -174,6 +174,10 @@ pub const PathStatus = enum {
 pub const PathView = struct {
     status: PathStatus = .missing,
     next_waypoint: math.Vec2 = .{},
+    // Level of the grid cell the agent should step toward next. Matches start_level
+    // while the path stays on one floor; at a LevelLink crossing (stitched j+1 on a
+    // different level) this is the destination floor so movement can commit a transition.
+    next_cell_level: u16 = 0,
     path_len: usize = 0,
 };
 

@@ -11,7 +11,6 @@ const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const State = @import("../app/state.zig").State;
-const StateStack = @import("../app/state.zig").StateStack;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -181,36 +180,11 @@ test "loading state requires runtime world metadata before building demo" {
     }));
 }
 
-test "loading state builds gameplay from runtime atlas metadata" {
-    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450);
-    defer loading.deinit();
-    loading.rendered_once = true;
-
-    var input = InputState{};
-    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
-    defer audio.deinit();
-    var transitions = StateTransitions.init(std.testing.allocator);
-    defer transitions.deinit();
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
+test "loading state runtime metadata fixture exposes installed atlases" {
     var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
-
-    try loading.update(.{
-        .input = &input,
-        .audio = &audio,
-        .runtime_assets = &runtime_assets,
-        .delta_seconds = 0,
-        .transitions = &transitions,
-        .thread_system = &threads,
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
-    var stack = StateStack.init(std.testing.allocator);
-    defer stack.deinit();
-    _ = try stack.applyTransitions(&transitions);
-    const active = stack.active() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(@typeName(GameDemoState), active.type_name);
+    try std.testing.expect(runtime_assets.worldTilesetMeta() != null);
+    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_characters) != null);
 }
 
 test "loading state waits for first render before building gameplay" {

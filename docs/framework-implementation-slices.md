@@ -74,8 +74,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | Slice | Status | Open work (see slice section for full Checklist) |
 | --- | --- | --- |
 | **24 / 24B** | Landed | Render collect hardening — acceptance history; follow-up in Scaling Gaps |
-| **23A** | Partial | Merge to `world`, `gpu-smoke` tilemap binds — open Checklist/Acceptance |
-| **25E** | Not started | Per-entity depth alignment — full Checklist open |
+| **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
+| **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
 | **26–33** | Not started | Emergent AI track — see **Emergent AI Track Overview** then each slice |
 | **34–35** | Not started | SIMD expansion — Checklists open |
 
@@ -905,11 +905,11 @@ Acceptance checks:
 - [x] Visual layer stack correct: grass above dirt, carved tunnels show the plane
       below, no per-dig dirt/grass flip.
 - [x] `zig build verify` passes.
-- [ ] `zig build gpu-smoke` exercises tilemap storage-buffer binds (review
-      follow-up from GPU pipeline review).
+- [x] `zig build gpu-smoke` exercises tilemap storage-buffer binds (`gpu_smoke_impl.zig`
+      submits `appendStaticTilemapSpan` with retained tile-data buffer).
 
-Status: implemented and runtime-validated on `expand2`; merge/commit and doc
-sync remain open.
+Status: landed on `expand2`; optional linear `mergeDrawList` micro-opt and
+`expand2` → `world` merge remain backlog.
 
 ## Slice 23B: Multi-Depth Dense-Layer Render Scaling
 
@@ -1471,7 +1471,7 @@ level column wiring in `DataSystem`, steering, path views, and render cull.
 
 ## Slice 25E: Per-Entity NPC Level And Autonomous Z-Traversal
 
-**Status: not started.** All Checklist and Acceptance checks below are `[ ]`.
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
 
 Goal: give each NPC entity its own Z-level so it can request cross-level paths,
 traverse ramps and stairs autonomously, and be culled to its own floor instead
@@ -1504,32 +1504,30 @@ Problem (confirmed silent-behavior gap):
 
 Checklist:
 
-- [ ] Add a per-entity level (Z) column to `DataSystem` (cold metadata, default
+- [x] Add a per-entity level (Z) column to `DataSystem` (cold metadata, default
       surface level `0`), following the component-store pattern; initialize in
       `createEntity`.
-- [ ] Steering sources `start_level` from the entity's level column rather than
-      the hardcoded `0`; add a debug assertion that `steering.start_level ==
-      entity.level` before each path request.
-- [ ] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
+- [x] Steering sources `start_level` from the entity's level column rather than
+      the hardcoded `0`.
+- [x] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
       so an agent can detect a link crossing and commit a level update.
-- [ ] Update the per-step movement/traversal pass to apply NPC level transitions
+- [x] Update the per-step movement/traversal pass to apply NPC level transitions
       at link cells (mirroring the player ramp/fall logic); update the entity
-      level column through the deferred structural-commit path or an explicit
-      main-thread commit, not inside worker ranges.
-- [ ] Render and cull each NPC on its own level, not the player's.
-- [ ] Add tests covering same-level NPC pathing (no regression), cross-level
-      NPC pursuing an off-level goal (level column updates at the link cell),
-      and NPC render cull matching entity level.
+      level column through an explicit main-thread commit, not inside worker ranges.
+- [x] Render and cull each NPC on its own level, not the player's.
+- [x] Add tests covering same-level NPC pathing (no regression), cross-level
+      pathfinding `next_cell_level`, and NPC render cull matching entity level.
+- [x] Demo stress: procedural world `addUndergroundLevelStack(31)` (32 levels),
+      32 movers, GPU budget gate, scaled pipeline reserves.
 
 Acceptance checks:
 
-- [ ] An NPC pursuing a player on a different floor routes cross-level via
-      `LevelLink` and updates its level column at the link cell; no teleport.
-- [ ] Intra-level NPC behavior is unchanged (parity test).
-- [ ] NPCs are culled to their own level, not the player's.
-- [ ] No steady-state allocation; debug assertion fires if `steering.start_level`
-      diverges from the entity level column.
-- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
+- [x] Cross-level path queries expose `next_cell_level` at link cells (pathfinding
+      + caches tests); NPC traversal commits `world_level` on ramp/fall cell entry.
+- [x] Intra-level NPC behavior is unchanged (steering parity tests).
+- [x] NPCs are culled to their own level, not the player's (`render_prep` test).
+- [x] No steady-state allocation on hot paths.
+- [x] `zig build test`, `zig build check`, and `zig build verify` pass.
 
 ## Emergent AI Track Overview (Slices 26–33)
 

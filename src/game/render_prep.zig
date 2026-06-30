@@ -27,6 +27,7 @@ const manifest = @import("../assets/manifest.zig");
 const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const ConstParticleSlice = @import("systems/particle.zig").ConstParticleSlice;
@@ -449,6 +450,10 @@ pub fn collectDynamicRecords(
     // before the deferred slot resolve in renderCollectIndicesForMovement.
     for (movement.entities, 0..) |entity, movement_index| {
         const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
+        if (!is_player) {
+            const entity_level = scene.data.worldLevelConst(entity) orelse 0;
+            if (entity_level != scene.player_level) continue;
+        }
         if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
         if (!movement.has_primitive_visual[movement_index]) continue;
 
@@ -734,571 +739,142 @@ fn sortRecordIndexLessThan(records: []const DynamicRenderRecord, lhs_index: usiz
     return lhs.sequence < rhs.sequence;
 }
 
-const ScenePrepFixture = struct {
-    data: DataSystem,
-    particles: ParticleSystem,
-    world: WorldSystem,
-    scene_prep: DynamicScenePrep,
-    player_entity: EntityId,
-    actor_entity: EntityId,
-    obstacle_entity: EntityId,
-    bounds_width: f32,
-    bounds_height: f32,
-
-    fn deinit(self: *ScenePrepFixture) void {
-        self.scene_prep.deinit();
-        self.particles.deinit();
-        self.world.deinit();
-        self.data.deinit();
-        self.* = undefined;
-    }
-
-    fn scene(self: *ScenePrepFixture, overscan_chunks: u16) GameplayScene {
-        return .{
-            .data = &self.data,
-            .world = &self.world,
-            .player_entity = self.player_entity,
-            .player_level = 0,
-            .particles = &self.particles,
-            .overscan_chunks = overscan_chunks,
-        };
-    }
-
-    fn fullBoundsVisible(self: *const ScenePrepFixture) VisibleWorldRect {
-        return .{
-            .min_x = 0,
-            .min_y = 0,
-            .max_x = self.bounds_width,
-            .max_y = self.bounds_height,
-        };
-    }
-
-    fn collect(self: *ScenePrepFixture, visible: VisibleWorldRect, interpolation_alpha: f32) !void {
-        try self.collectWithOverscan(visible, interpolation_alpha, 0);
-    }
-
-    fn collectWithOverscan(
-        self: *ScenePrepFixture,
-        visible: VisibleWorldRect,
-        interpolation_alpha: f32,
-        overscan_chunks: u16,
-    ) !void {
-        var runtime_assets = RuntimeAssets.init();
-        try collectDynamicRecords(
-            &self.scene_prep,
-            self.scene(overscan_chunks),
-            visible,
-            &runtime_assets,
-            interpolation_alpha,
-        );
-    }
-};
-
-fn initScenePrepFixture(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !ScenePrepFixture {
-    var data = DataSystem.init(allocator);
-    errdefer data.deinit();
-
-    const player_entity = try spawnPlayerEntity(&data);
-    const actor_entity = try spawnActorEntity(&data, .{ .x = 80, .y = 80 }, .actor);
-    const obstacle_entity = try spawnActorEntity(&data, .{ .x = 462, .y = 215 }, .obstacle);
-
-    var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
-    errdefer particles.deinit();
-
-    const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, bounds_width, bounds_height);
-    errdefer world.deinit();
-    world.adoptTilesetMeta(meta);
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = bounds_width, .h = bounds_height }, 0);
-
-    var scene_prep = DynamicScenePrep.init(allocator);
-    errdefer scene_prep.deinit();
-    try ensureScenePrepCapacity(&scene_prep, .{
-        .data = &data,
-        .world = &world,
-        .player_entity = player_entity,
-        .player_level = 0,
-        .particles = &particles,
-        .overscan_chunks = 0,
-    });
-
+fn testScopeColumns(chunk_x: []const i32, chunk_y: []const i32, tier: []const SimulationTier) ConstScopeColumnsSlice {
     return .{
-        .data = data,
-        .particles = particles,
-        .world = world,
-        .scene_prep = scene_prep,
-        .player_entity = player_entity,
-        .actor_entity = actor_entity,
-        .obstacle_entity = obstacle_entity,
-        .bounds_width = bounds_width,
-        .bounds_height = bounds_height,
+        .entities = &.{},
+        .tier = tier,
+        .chunk_x = chunk_x,
+        .chunk_y = chunk_y,
+        .level = &.{},
+        .stagger_phase = &.{},
+        .always_active = &.{},
     };
 }
 
-fn spawnActorEntity(data: *DataSystem, position: math.Vec2, depth: WorldDepth) !EntityId {
-    const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
-    try data.setMovementBody(entity, .{
-        .position = position,
-        .previous_position = position,
-        .velocity = .{},
-        .speed = 0,
-    });
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 24, .y = 24 },
-        .color = .{ .r = 0.5, .g = 0.6, .b = 0.7, .a = 1 },
-        .depth = depth,
-        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-        .marker_depth_band = .marker,
-        .marker_length = 0,
-        .marker_depth = 0,
-        .marker_margin = 0,
-    });
-    return entity;
+test "render collect chunk gate rejects rows when visibility window is unset" {
+    var chunk_x = [_]i32{0};
+    var chunk_y = [_]i32{0};
+    var tier = [_]SimulationTier{.cognition};
+    const scope = testScopeColumns(&chunk_x, &chunk_y, &tier);
+    try std.testing.expect(!entityVisibleForRenderCollect(0, scope, null));
 }
 
-fn spawnPlayerEntity(data: *DataSystem) !EntityId {
-    const entity = try data.createEntity();
-    errdefer _ = data.destroyEntity(entity);
-    try data.setMovementBody(entity, .{
-        .position = .{ .x = 400, .y = 225 },
-        .previous_position = .{ .x = 400, .y = 225 },
-        .velocity = .{},
-        .speed = 120,
-    });
-    try data.setFacing(entity, .{ .direction = .down });
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 32, .y = 32 },
-        .color = .{ .r = 1.0, .g = 0.8, .b = 0.36, .a = 1.0 },
-        .depth = .actor,
-        .marker_color = .{ .r = 0.8, .g = 0.56, .b = 0.22, .a = 1.0 },
-        .marker_depth_band = .actor,
-        .marker_length = 12,
-        .marker_depth = 6,
-        .marker_margin = 4,
-    });
-    return entity;
-}
-
-fn drawMatchesEntityPosition(draw: PreparedDraw, x: f32, y: f32) bool {
-    const dest = switch (draw) {
-        .sprite => |sprite| sprite.dest,
-        .rect => |rect| rect.rect,
+test "render collect chunk gate uses scope chunk columns only" {
+    var chunk_x = [_]i32{ 0, 4 };
+    var chunk_y = [_]i32{ 0, 4 };
+    var tier = [_]SimulationTier{ .dormant, .cognition };
+    const scope = testScopeColumns(&chunk_x, &chunk_y, &tier);
+    const region = ActiveRegion{
+        .min = .{ .x = 0, .y = 0 },
+        .max_exclusive = .{ .x = 1, .y = 1 },
     };
-    return dest.x == x and dest.y == y;
+    try std.testing.expect(entityVisibleForRenderCollect(0, scope, region));
+    try std.testing.expect(!entityVisibleForRenderCollect(1, scope, region));
 }
 
-fn drawMatchesPlayerMarker(draw: PreparedDraw) bool {
-    return switch (draw) {
-        .rect => |rect| rect.rect.w == 12 or rect.rect.h == 12,
-        .sprite => false,
+test "render collect chunk gate ignores simulation tier" {
+    var chunk_x = [_]i32{ 0, 0 };
+    var chunk_y = [_]i32{ 0, 0 };
+    var dormant = [_]SimulationTier{.dormant};
+    var cognition = [_]SimulationTier{.cognition};
+    const dormant_scope = testScopeColumns(&chunk_x, &chunk_y, &dormant);
+    const cognition_scope = testScopeColumns(&chunk_x, &chunk_y, &cognition);
+    const region = ActiveRegion{
+        .min = .{ .x = 0, .y = 0 },
+        .max_exclusive = .{ .x = 1, .y = 1 },
     };
+    try std.testing.expect(entityVisibleForRenderCollect(0, dormant_scope, region));
+    try std.testing.expect(entityVisibleForRenderCollect(0, cognition_scope, region));
 }
 
-fn drawMatchesParticleCenter(draw: PreparedDraw, x: f32, y: f32) bool {
-    const center = switch (draw) {
-        .rect => |rect| math.Vec2{
-            .x = rect.rect.x + rect.rect.w * 0.5,
-            .y = rect.rect.y + rect.rect.h * 0.5,
-        },
-        .sprite => |sprite| math.Vec2{
-            .x = sprite.dest.x + sprite.dest.w * 0.5,
-            .y = sprite.dest.y + sprite.dest.h * 0.5,
-        },
+test "render collect record sort orders depth then sequence" {
+    const unit_rect = Rect{ .x = 0, .y = 0, .w = 1, .h = 1 };
+    const unit_color = Color{ .r = 1, .g = 1, .b = 1, .a = 1 };
+    const records = [_]DynamicRenderRecord{
+        .{ .depth = 10, .sequence = 2, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } },
+        .{ .depth = 5, .sequence = 9, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(5) } } },
+        .{ .depth = 10, .sequence = 1, .draw = .{ .rect = .{ .rect = unit_rect, .color = unit_color, .order = .world(10) } } },
     };
-    return center.x == x and center.y == y;
+    try std.testing.expect(sortRecordIndexLessThan(&records, 1, 0));
+    try std.testing.expect(sortRecordIndexLessThan(&records, 2, 0));
+    try std.testing.expect(!sortRecordIndexLessThan(&records, 2, 1));
 }
 
-test "dynamic scene prep preserves mixed world z order" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    const high_obstacle = fixture.data.movementBodyPtr(fixture.obstacle_entity).?;
-    high_obstacle.position_z.* = 20;
-    high_obstacle.previous_z.* = 20;
-    const low_actor = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    low_actor.position_z.* = -20;
-    low_actor.previous_z.* = -20;
-
-    const low_actor_order = worldOrder(-20, .actor);
-    const high_obstacle_order = worldOrder(20, .obstacle);
-    try fixture.collect(fixture.fullBoundsVisible(), 1.0);
-    var low_actor_seen = false;
-    var high_obstacle_seen = false;
-    var low_actor_index: usize = 0;
-    var high_obstacle_index: usize = 0;
-    for (fixture.scene_prep.sortedRecordIndices(), 0..) |record_index, sorted_index| {
-        const depth = fixture.scene_prep.records.items[record_index].draw.depth();
-        if (depth == low_actor_order.depth and !low_actor_seen) {
-            low_actor_seen = true;
-            low_actor_index = sorted_index;
-        }
-        if (depth == high_obstacle_order.depth and !high_obstacle_seen) {
-            high_obstacle_seen = true;
-            high_obstacle_index = sorted_index;
-        }
-    }
-
-    try std.testing.expect(low_actor_order.depth < high_obstacle_order.depth);
-    try std.testing.expect(low_actor_seen);
-    try std.testing.expect(high_obstacle_seen);
-    try std.testing.expect(low_actor_index < high_obstacle_index);
-}
-
-test "dynamic scene prep includes particles in z order" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    try std.testing.expect(fixture.particles.emit(.{
-        .base_z = 50,
-        .depth = .effect,
-        .start_size = 4,
-    }));
-    try std.testing.expect(fixture.particles.emit(.{
-        .base_z = -50,
-        .depth = .effect,
-        .start_size = 4,
-    }));
-
-    try fixture.collect(fixture.fullBoundsVisible(), 1.0);
-    var previous_depth: i32 = std.math.minInt(i32);
-    var particle_count: usize = 0;
-    for (fixture.scene_prep.depth_spans.items) |span| {
-        try std.testing.expect(previous_depth <= span.depth);
-        previous_depth = span.depth;
-    }
-    const effect_depth_50 = worldOrder(50, .effect).depth;
-    const effect_depth_neg_50 = worldOrder(-50, .effect).depth;
-    for (fixture.scene_prep.records.items) |record| {
-        const depth = record.draw.depth();
-        if (depth == effect_depth_50 or depth == effect_depth_neg_50) particle_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), particle_count);
-}
-
-test "dynamic scene prep culls entities outside the visible chunk region before draw prep" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    const actor_chunk: i32 = 40;
-    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
-        .chunk = .{ .x = actor_chunk, .y = actor_chunk },
-    });
-    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    actor_body.position_x.* = 80;
-    actor_body.position_y.* = 80;
-    actor_body.previous_x.* = 80;
-    actor_body.previous_y.* = 80;
-
-    const obstacle_body = fixture.data.movementBodyPtr(fixture.obstacle_entity).?;
-    const obstacle_x = obstacle_body.position_x.*;
-    const obstacle_y = obstacle_body.position_y.*;
-    try fixture.data.setSimulationMetadata(fixture.obstacle_entity, .{
-        .chunk = .{ .x = 0, .y = 0 },
-    });
-
-    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 160, .h = 160 }, 0);
-
-    try fixture.collect(.{
-        .min_x = 0,
-        .min_y = 0,
-        .max_x = 800,
-        .max_y = 450,
-    }, 1.0);
-
-    var offscreen_actor_seen = false;
-    var onscreen_obstacle_seen = false;
-    for (fixture.scene_prep.records.items) |record| {
-        const draw = record.draw;
-        if (drawMatchesEntityPosition(draw, 80, 80)) offscreen_actor_seen = true;
-        if (drawMatchesEntityPosition(draw, obstacle_x, obstacle_y)) onscreen_obstacle_seen = true;
-    }
-
-    try std.testing.expect(!offscreen_actor_seen);
-    try std.testing.expect(onscreen_obstacle_seen);
-}
-
-test "dynamic scene prep skips collect when visibility window is unset" {
+test "dynamic record capacity counts visuals player marker and particles" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
 
-    const player_entity = try spawnPlayerEntity(&data);
-    _ = try spawnActorEntity(&data, .{ .x = 80, .y = 80 }, .actor);
-
-    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 512 });
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 4 });
     defer particles.deinit();
+    try std.testing.expect(particles.emit(.{ .start_size = 4 }));
 
-    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    const meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(std.testing.allocator, &meta, 800, 450);
-    defer world.deinit();
-    world.adoptTilesetMeta(meta);
-
-    var scene_prep = DynamicScenePrep.init(std.testing.allocator);
-    defer scene_prep.deinit();
-    try ensureScenePrepCapacity(&scene_prep, .{
-        .data = &data,
-        .world = &world,
-        .player_entity = player_entity,
-        .player_level = 0,
-        .particles = &particles,
-        .overscan_chunks = 0,
-    });
-
-    try std.testing.expect(world.visibleChunkRegion() == null);
-
-    var runtime_assets = RuntimeAssets.init();
-    try collectDynamicRecords(&scene_prep, .{
-        .data = &data,
-        .world = &world,
-        .player_entity = player_entity,
-        .player_level = 0,
-        .particles = &particles,
-        .overscan_chunks = 0,
-    }, .{
-        .min_x = 0,
-        .min_y = 0,
-        .max_x = 800,
-        .max_y = 450,
-    }, &runtime_assets, 1.0);
-
-    try std.testing.expectEqual(@as(usize, 0), scene_prep.records.items.len);
-}
-
-test "dynamic scene prep honors production overscan chunk margin" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    const chunk_pixels = @as(f32, @floatFromInt(fixture.world.chunk_size_tiles)) * fixture.world.tile_size;
-    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    const actor_x = chunk_pixels + 8;
-    const actor_y = 8;
-    actor_body.position_x.* = actor_x;
-    actor_body.position_y.* = actor_y;
-    actor_body.previous_x.* = actor_x;
-    actor_body.previous_y.* = actor_y;
-    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
-        .chunk = .{ .x = 1, .y = 0 },
-    });
-
-    const camera_rect = Rect{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels };
-    const visible = VisibleWorldRect.fromCameraRect(
-        camera_rect,
-        1,
-        fixture.world.chunk_size_tiles,
-        fixture.world.tile_size,
-    );
-
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, 0);
-    try fixture.collectWithOverscan(visible, 1.0, 0);
-    var actor_seen_without_chunk_overscan = false;
-    for (fixture.scene_prep.records.items) |record| {
-        if (drawMatchesEntityPosition(record.draw, actor_x, actor_y)) actor_seen_without_chunk_overscan = true;
-    }
-    try std.testing.expect(!actor_seen_without_chunk_overscan);
-
-    fixture.world.setVisibleChunksForWorldRect(camera_rect, 1);
-    try fixture.collectWithOverscan(visible, 1.0, 1);
-    var actor_seen_with_chunk_overscan = false;
-    for (fixture.scene_prep.records.items) |record| {
-        if (drawMatchesEntityPosition(record.draw, actor_x, actor_y)) actor_seen_with_chunk_overscan = true;
-    }
-    try std.testing.expect(actor_seen_with_chunk_overscan);
-}
-
-test "dynamic scene prep does not gate render on simulation tier" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    try fixture.data.setSimulationTier(fixture.actor_entity, .dormant);
-    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    actor_body.position_x.* = 80;
-    actor_body.position_y.* = 80;
-    actor_body.previous_x.* = 80;
-    actor_body.previous_y.* = 80;
-
-    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 800, .h = 450 }, 0);
-
-    try fixture.collect(fixture.fullBoundsVisible(), 1.0);
-
-    var dormant_actor_seen = false;
-    for (fixture.scene_prep.records.items) |record| {
-        if (drawMatchesEntityPosition(record.draw, 80, 80)) dormant_actor_seen = true;
-    }
-
-    try std.testing.expect(dormant_actor_seen);
-}
-
-test "dynamic scene prep culls cognition tier entities off-screen" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    try fixture.data.setSimulationTier(fixture.actor_entity, .cognition);
-    const actor_chunk: i32 = 40;
-    try fixture.data.setSimulationMetadata(fixture.actor_entity, .{
-        .chunk = .{ .x = actor_chunk, .y = actor_chunk },
-    });
-    const actor_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    actor_body.position_x.* = 80;
-    actor_body.position_y.* = 80;
-    actor_body.previous_x.* = 80;
-    actor_body.previous_y.* = 80;
-
-    fixture.world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 160, .h = 160 }, 0);
-
-    try fixture.collect(.{
-        .min_x = 0,
-        .min_y = 0,
-        .max_x = 160,
-        .max_y = 160,
-    }, 1.0);
-
-    var cognition_actor_seen = false;
-    for (fixture.scene_prep.records.items) |record| {
-        if (drawMatchesEntityPosition(record.draw, 80, 80)) cognition_actor_seen = true;
-    }
-
-    try std.testing.expect(!cognition_actor_seen);
-}
-
-test "dynamic scene prep culls entities and particles outside the visible rect" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    const offscreen_body = fixture.data.movementBodyPtr(fixture.actor_entity).?;
-    offscreen_body.position_x.* = 5000;
-    offscreen_body.position_y.* = 5000;
-    offscreen_body.previous_x.* = 5000;
-    offscreen_body.previous_y.* = 5000;
-
-    const onscreen_body = fixture.data.movementBodyPtr(fixture.obstacle_entity).?;
-    const onscreen_x = onscreen_body.position_x.*;
-    const onscreen_y = onscreen_body.position_y.*;
-
-    const player_body = fixture.data.movementBodyPtr(fixture.player_entity).?;
-    player_body.position_x.* = 9000;
-    player_body.position_y.* = 9000;
-    player_body.previous_x.* = 9000;
-    player_body.previous_y.* = 9000;
-
-    try std.testing.expect(fixture.particles.emit(.{
-        .position = .{ .x = 5000, .y = 5000 },
-        .base_z = 0,
-        .depth = .effect,
-        .start_size = 4,
-    }));
-    try std.testing.expect(fixture.particles.emit(.{
-        .position = .{ .x = onscreen_x, .y = onscreen_y },
-        .base_z = 0,
-        .depth = .effect,
-        .start_size = 4,
-    }));
-
-    const visible = VisibleWorldRect{
-        .min_x = 0,
-        .min_y = 0,
-        .max_x = 800,
-        .max_y = 450,
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
     };
-    try fixture.collect(visible, 1.0);
-
-    var offscreen_actor_seen = false;
-    var onscreen_obstacle_seen = false;
-    var player_body_seen = false;
-    var player_marker_seen = false;
-    var offscreen_particle_seen = false;
-    var onscreen_particle_seen = false;
-    for (fixture.scene_prep.records.items) |record| {
-        const draw = record.draw;
-        if (drawMatchesEntityPosition(draw, 5000, 5000)) offscreen_actor_seen = true;
-        if (drawMatchesEntityPosition(draw, onscreen_x, onscreen_y)) onscreen_obstacle_seen = true;
-        if (drawMatchesEntityPosition(draw, 9000, 9000)) player_body_seen = true;
-        if (drawMatchesPlayerMarker(draw)) player_marker_seen = true;
-        if (drawMatchesParticleCenter(draw, 5000, 5000)) offscreen_particle_seen = true;
-        if (drawMatchesParticleCenter(draw, onscreen_x, onscreen_y)) onscreen_particle_seen = true;
-    }
-
-    try std.testing.expect(!offscreen_actor_seen);
-    try std.testing.expect(onscreen_obstacle_seen);
-    try std.testing.expect(!player_body_seen);
-    try std.testing.expect(!player_marker_seen);
-    try std.testing.expect(!offscreen_particle_seen);
-    try std.testing.expect(onscreen_particle_seen);
-}
-
-test "sprite command capacity tracks visual entity growth" {
-    const created_visual_count = 528;
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
-
-    for (0..created_visual_count) |index| {
-        const x: f32 = @floatFromInt(index % 64);
-        const y: f32 = @floatFromInt(index / 64);
-        const entity = try fixture.data.createEntity();
-        try fixture.data.setMovementBody(entity, .{
-            .position = .{ .x = x, .y = y },
-            .previous_position = .{ .x = x, .y = y },
-        });
-        try fixture.data.setPrimitiveVisual(entity, .{
-            .size = .{ .x = 1, .y = 1 },
-            .color = .{ .r = 0.5, .g = 0.6, .b = 0.7, .a = 1 },
-            .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        });
-    }
-
-    try std.testing.expect(fixture.particles.emit(.{
-        .position = .{ .x = 10, .y = 10 },
-        .start_size = 4,
-        .start_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-    }));
+    defer world.deinit();
+    const player_entity = try EntityId.init(0, 1);
 
     try std.testing.expectEqual(
-        fixture.world.reserveRenderRecords() +
-            fixture.data.primitiveVisualSliceConst().entities.len +
-            1 +
-            fixture.particles.activeCount() +
-            Renderer.kStackedStateUiHeadroom,
-        spriteCommandCapacity(fixture.scene(0)),
+        @as(usize, 3),
+        dynamicRecordCapacity(.{
+            .data = &data,
+            .world = &world,
+            .player_entity = player_entity,
+            .player_level = 0,
+            .particles = &particles,
+            .overscan_chunks = 0,
+        }),
     );
 }
 
-test "layered sparse and dynamic walk preserves nondecreasing render order" {
-    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
-    defer fixture.deinit();
+test "sprite command capacity sums sparse reserve visuals player and ui headroom" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
 
-    try fixture.collect(fixture.fullBoundsVisible(), 0.5);
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 4 });
+    defer particles.deinit();
+    try std.testing.expect(particles.emit(.{ .start_size = 4 }));
 
-    var last_order: ?RenderOrder = null;
-    var sparse_depth = fixture.world.firstVisibleSparseDepth();
-    var dynamic_span_index: usize = 0;
-    var dynamic_depth = nextDynamicDepth(&fixture.scene_prep, &dynamic_span_index);
-    while (sparse_depth != null or dynamic_depth != null) {
-        if (sparse_depth) |depth| {
-            if (dynamic_depth == null or depth <= dynamic_depth.?) {
-                const order = RenderOrder.world(depth);
-                if (last_order) |previous| {
-                    try std.testing.expect(previous.lessOrEqual(order));
-                }
-                last_order = order;
-                sparse_depth = fixture.world.nextVisibleSparseDepthAfter(depth);
-                continue;
-            }
-        }
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+        .visible_sparse_count = 3,
+    };
+    defer world.deinit();
+    const player_entity = try EntityId.init(0, 1);
 
-        const dynamic_range = fixture.scene_prep.depth_spans.items[dynamic_span_index - 1];
-        const sorted_indices = fixture.scene_prep.sort_indices.items;
-        const records = fixture.scene_prep.records.items;
-        for (sorted_indices[dynamic_range.start..dynamic_range.end]) |record_index| {
-            const order = records[record_index].draw.renderOrder();
-            if (last_order) |previous| {
-                try std.testing.expect(previous.lessOrEqual(order));
-            }
-            last_order = order;
-        }
-        dynamic_depth = nextDynamicDepth(&fixture.scene_prep, &dynamic_span_index);
-    }
-    try std.testing.expect(last_order != null);
+    try std.testing.expectEqual(
+        @as(usize, 3) + 1 + 1 + 1 + Renderer.kStackedStateUiHeadroom,
+        spriteCommandCapacity(.{
+            .data = &data,
+            .world = &world,
+            .player_entity = player_entity,
+            .player_level = 0,
+            .particles = &particles,
+            .overscan_chunks = 0,
+        }),
+    );
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {

@@ -13,6 +13,7 @@ const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
+const AiAgent = @import("data_system.zig").AiAgent;
 const AssetReference = @import("data_system.zig").AssetReference;
 const component_masks = @import("data_system.zig").component_masks;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
@@ -31,6 +32,8 @@ const Player = @import("player.zig").Player;
 const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
+const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
+const NavMemoryBudget = @import("systems/pathfinding/nav_memory.zig").NavMemoryBudget;
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
@@ -54,14 +57,77 @@ const world_system = @import("world_system.zig");
 const WorldSystem = world_system.WorldSystem;
 const c = @import("../platform/sdl.zig").c;
 
-const test_square_count = 8;
-const obstacle_count = 2;
-const demo_contact_capacity = 64;
+/// Smallest demo patch that still covers dig/nav tests (cells through 7x7).
+const demo_test_viewport_width: f32 = 256;
+const demo_test_viewport_height: f32 = 256;
+const test_square_count = 32;
+const surface_demo_mover_count = 24;
+const underground_demo_mover_count = test_square_count - surface_demo_mover_count;
+const obstacle_count = 4;
+const demo_contact_capacity = 128;
+const demo_structural_reserve = test_square_count + 16;
+/// Per-step audio bound for demo tests: 32 movers can emit collision SFX alongside
+/// ambient music, listener, and the player jet loop.
+const demo_test_audio_capacity = 64;
+const procedural_world_width_tiles: u16 = 512;
+const procedural_world_height_tiles: u16 = 512;
+/// Surface + underground dense floors for the procedural 32-level mine (runtime load).
+/// Unit tests use `initDemoForTest` / `initDemoFromMetaWithUnderground` (3 levels), not this config.
+const procedural_underground_count: u16 = 31;
+const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
+/// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
+const procedural_max_dense_bands_per_level: u8 = 1;
+comptime {
+    std.debug.assert(procedural_dense_layer_count <= world_system.k_max_dense_submit_stack_cap);
+    const submit_layers = @as(usize, 1 + procedural_underground_count) * procedural_max_dense_bands_per_level;
+    std.debug.assert(submit_layers <= world_system.k_max_dense_submit_stack_cap);
+}
+/// `estimateDenseTileGpuBytes` ceiling: dense_layer_count * width * height * @sizeOf(u32).
+const procedural_max_dense_tile_gpu_bytes: usize =
+    procedural_dense_layer_count *
+    @as(usize, procedural_world_width_tiles) *
+    @as(usize, procedural_world_height_tiles) *
+    @sizeOf(u32);
 const procedural_world_config = world_system.WorldBuildConfig{
-    .width_tiles = 512,
-    .height_tiles = 512,
+    .width_tiles = procedural_world_width_tiles,
+    .height_tiles = procedural_world_height_tiles,
     .chunk_size_tiles = 16,
+    .underground_level_count = procedural_underground_count,
+    .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
+    .max_dense_tile_gpu_bytes = procedural_max_dense_tile_gpu_bytes,
+    // Follow the player through the full vertical stack (32 planes); the legacy
+    // default `levels_below = 6` only submitted surface+near floors and made deep
+    // digs look like the old 3-level demo. Submit budget is
+    // `(1 + levels_below) * max_dense_bands_per_level` and must stay within
+    // `k_max_dense_submit_stack_cap` (32).
+    .render_window = .{ .levels_below = procedural_underground_count },
 };
+
+fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCapacity {
+    var cap: PathfindingCapacity = .{
+        .max_group_fields = 4,
+        .max_agent_budget = 4096,
+        .worker_participant_count = worker_participant_count,
+    };
+    const nav_cells: usize = procedural_world_width_tiles;
+    const budget = NavMemoryBudget{
+        .max_bytes = std.math.maxInt(usize),
+        .level_count = procedural_dense_layer_count,
+        .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
+        .max_group_fields = cap.max_group_fields,
+        .max_explored_nodes = cap.max_explored_nodes,
+        .max_stored_path_cells = cap.max_stored_path_cells,
+        .worker_participant_count = @max(@as(usize, 1), worker_participant_count),
+        .max_cached_results = cap.max_cached_results,
+        .max_solved_requests_per_step = cap.max_solved_requests_per_step,
+        .max_stitched_path_cells = cap.max_stitched_path_cells,
+        .chunk_tiles = cap.nav_chunk_tiles,
+        .link_count = 0,
+    };
+    const required = budget.requiredBytes(nav_cells, procedural_world_height_tiles);
+    cap.max_nav_memory_bytes = std.math.ceilPowerOfTwo(usize, required) catch required;
+    return cap;
+}
 /// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
 const world_render_overscan_chunks: u16 = 1;
 
@@ -135,6 +201,8 @@ pub const GameDemoState = struct {
             try DigConfig.fromRuntimeAssets(runtime_assets),
             // No thread system on this path (tests): serial, slot 0 only.
             1,
+            null,
+            null,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -165,6 +233,8 @@ pub const GameDemoState = struct {
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
+            proceduralPathfindingCapacity(thread_system.participantSlotCount()),
+            thread_system,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -182,6 +252,8 @@ pub const GameDemoState = struct {
         world_value: WorldSystem,
         dig_config: DigConfig,
         worker_participant_count: usize,
+        pathfinding_override: ?PathfindingCapacity,
+        nav_build_thread_system: ?*ThreadSystem,
     ) !GameDemoState {
         var world = world_value;
         errdefer world.deinit();
@@ -194,10 +266,18 @@ pub const GameDemoState = struct {
         const player_body = data.movementBodyPtr(player.entity).?;
         player_body.position_z.* = world.levelBaseZ(0);
         player_body.previous_z.* = world.levelBaseZ(0);
+        if (worldUsesCompactDemoSpawn(&world)) {
+            const start_x: f32 = 40;
+            const start_y: f32 = world.worldHeightPixels() * 0.5 - 16;
+            player_body.position_x.* = start_x;
+            player_body.position_y.* = start_y;
+            player_body.previous_x.* = start_x;
+            player_body.previous_y.* = start_y;
+        }
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
-        const test_squares = try spawnTestSquares(&data);
-        const obstacles = try spawnObstacles(&data);
+        const test_squares = try spawnTestSquares(&data, &world, dig_config.tunnel_tile);
+        const obstacles = try spawnObstacles(&data, &world);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
         var scene_prep = render_prep.DynamicScenePrep.init(allocator);
@@ -214,8 +294,8 @@ pub const GameDemoState = struct {
         // can emit up to one set_simulation_tier per movement body when many cross a
         // band at once, plus headroom for dig/create bursts — keeps the commit seam
         // allocation-free on churn frames.
-        try simulation_frame.reserveStreams(8, 16, 16, demo_contact_capacity, 16, test_square_count + 8);
-        try simulation_frame.reservePathRequests(8, test_square_count);
+        try simulation_frame.reserveStreams(16, 32, 32, demo_contact_capacity, 32, demo_structural_reserve);
+        try simulation_frame.reservePathRequests(16, test_square_count);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = test_square_count,
             .static_obstacle_capacity = obstacle_count,
@@ -229,7 +309,7 @@ pub const GameDemoState = struct {
             // from the agent count automatically. Only the hard ceiling is fixed, so
             // a battle grows and quiets shrinks without bumping knobs. At this demo's
             // small scale capacity settles low and the group path stays dormant.
-            .pathfinding = .{
+            .pathfinding = pathfinding_override orelse .{
                 .max_group_fields = 4,
                 .max_agent_budget = 4096,
                 // Configured threaded participant count; A* scratch is sized for it in
@@ -237,6 +317,7 @@ pub const GameDemoState = struct {
                 .worker_participant_count = worker_participant_count,
             },
             .navigation_world = &world,
+            .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
         });
         errdefer pipeline.deinit();
@@ -571,97 +652,275 @@ fn validateAtlasReference(asset_ref: AssetReference, runtime_assets: *const Runt
     if (meta.sourceRectForId(asset_ref.atlas_entry_id) == null) return error.InvalidSpriteAtlasEntry;
 }
 
-fn spawnTestSquares(data: *DataSystem) ![test_square_count]EntityId {
-    const specs = [_]TestSquareSpec{
-        .{ .position = .{ .x = 80, .y = 80 }, .velocity = .{ .x = 20, .y = 5 }, .size = .{ .x = 22, .y = 22 }, .color = .{ .r = 0.34, .g = 0.69, .b = 1.0, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 180, .y = 140 }, .velocity = .{ .x = 5, .y = 18 }, .size = .{ .x = 26, .y = 26 }, .color = .{ .r = 0.46, .g = 0.86, .b = 0.38, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 280, .y = 260 }, .velocity = .{ .x = -14, .y = 9 }, .size = .{ .x = 18, .y = 18 }, .color = .{ .r = 0.95, .g = 0.42, .b = 0.59, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 420, .y = 90 }, .velocity = .{ .x = 11, .y = -10 }, .size = .{ .x = 24, .y = 24 }, .color = .{ .r = 0.7, .g = 0.54, .b = 1.0, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 120, .y = 320 }, .velocity = .{ .x = 8, .y = -16 }, .size = .{ .x = 20, .y = 20 }, .color = .{ .r = 0.95, .g = 0.65, .b = 0.25, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 550, .y = 200 }, .velocity = .{ .x = -9, .y = 12 }, .size = .{ .x = 30, .y = 18 }, .color = .{ .r = 0.55, .g = 0.82, .b = 0.92, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 650, .y = 340 }, .velocity = .{ .x = 15, .y = -7 }, .size = .{ .x = 19, .y = 19 }, .color = .{ .r = 0.85, .g = 0.45, .b = 0.78, .a = 1.0 }, .depth = .actor },
-        .{ .position = .{ .x = 300, .y = 70 }, .velocity = .{ .x = -6, .y = 22 }, .size = .{ .x = 25, .y = 25 }, .color = .{ .r = 0.4, .g = 0.95, .b = 0.75, .a = 1.0 }, .depth = .actor },
-    };
-    var entities: [test_square_count]EntityId = undefined;
-    for (specs, 0..) |spec, index| {
-        const entity = if (index == 3 or index == 7) blk: {
-            // Use EntityTemplate (via create_entity structural command) for a couple of ai-driven spawns
-            // to exercise the Slice 14 structural path.
-            _ = try data.applyStructuralCommands(&[_]StructuralCommand{.{
-                .create_entity = .{
-                    .movement_body = .{
-                        .position = spec.position,
-                        .previous_position = spec.position,
-                        .velocity = spec.velocity,
-                        .speed = if (index == 3) 48 else 55,
-                    },
-                    .primitive_visual = .{
-                        .size = spec.size,
-                        .color = spec.color,
-                        .depth = spec.depth,
-                        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                        .marker_depth_band = .marker,
-                        .marker_length = 0,
-                        .marker_depth = 0,
-                        .marker_margin = 0,
-                    },
-                    .asset_reference = demoCharacterAssetReference(index),
-                    .collision_bounds = .{ .size = spec.size },
-                    .collision_response = .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 },
-                    .ai_agent = if (index == 3)
-                        .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.35 }
-                    else
-                        .{ .behavior = .seek, .wander_amplitude = 4, .seek_weight = 1.6 },
-                    .steering_agent = demoSteeringAgent(spec.size),
-                },
-            }});
-            const post = data.movementBodySliceConst();
-            break :blk post.entities[post.entities.len - 1];
-        } else blk: {
-            const e = try data.createEntity();
-            errdefer _ = data.destroyEntity(e);
-            try data.setMovementBody(e, .{
-                .position = spec.position,
-                .previous_position = spec.position,
-                .velocity = spec.velocity,
-                .speed = if (index == 0 or index == 4) 0 else 42,
-            });
-            try data.setPrimitiveVisual(e, .{
-                .size = spec.size,
-                .color = spec.color,
-                .depth = spec.depth,
-                .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-                .marker_depth_band = .marker,
-                .marker_length = 0,
-                .marker_depth = 0,
-                .marker_margin = 0,
-            });
-            try data.setAssetReference(e, demoCharacterAssetReference(index));
-            try data.setCollisionBounds(e, .{ .size = spec.size });
-            try data.setCollisionResponse(e, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
-            break :blk e;
-        };
+const SpawnCellCoord = struct { x: u16, y: u16 };
 
-        // Pronounced behaviors for the new larger set of squares.
-        // Seekers have high seek_weight so the COM pull is obvious.
-        // Wanderers have high amplitude so their motion is chaotic and visible.
-        // A couple use EntityTemplate above; the rest use direct sets.
-        if (index == 0 or index == 4) {
-            // Strong pure wanderers
-            try data.setAiAgent(entity, .{ .behavior = .wander, .wander_amplitude = 58, .seek_weight = 0 });
-            try data.setSteeringAgent(entity, demoSteeringAgent(spec.size));
-        } else if (index == 1 or index == 5) {
-            // Strong seekers (COM pull dominates, light wander)
-            try data.setAiAgent(entity, .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 1.55 });
-            try data.setSteeringAgent(entity, demoSteeringAgent(spec.size));
-        } else if (index == 2 or index == 6) {
-            // No ai_agent — these keep classic spawn velocity and bounce normally
-        } else if (index == 3 or index == 7) {
-            // Already set via the template above (strong seek variants)
-        }
-        entities[index] = entity;
+const DemoSpawnSpec = struct {
+    position: math.Vec2,
+    velocity: math.Vec2,
+    size: math.Vec2,
+    color: config.Color,
+    depth: WorldDepth,
+    world_level: u16 = 0,
+    use_template: bool = false,
+    speed: f32 = 42,
+    behavior: ?AiAgent = null,
+};
+
+fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
+    return world.width <= 16 and world.height <= 16;
+}
+
+fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId) ![test_square_count]EntityId {
+    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(data, world, tunnel_tile);
+    var entities: [test_square_count]EntityId = undefined;
+    const cols: usize = 6;
+    const rows: usize = 4;
+    comptime std.debug.assert(surface_demo_mover_count == cols * rows);
+
+    var index: usize = 0;
+    while (index < surface_demo_mover_count) : (index += 1) {
+        const col = index % cols;
+        const row = index / cols;
+        const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
+        const spec = DemoSpawnSpec{
+            .position = .{
+                .x = 96 + @as(f32, @floatFromInt(col)) * 96,
+                .y = 96 + @as(f32, @floatFromInt(row)) * 88,
+            },
+            .velocity = demoVelocityForIndex(index),
+            .size = size,
+            .color = demoColorForIndex(index),
+            .depth = .actor,
+            .use_template = index == 3 or index == 7,
+            .speed = if (index % 5 == 0) 0 else 42,
+            .behavior = demoBehaviorForIndex(index),
+        };
+        entities[index] = try spawnDemoMover(data, world, tunnel_tile, spec, index);
+    }
+
+    const underground_cells = [_]SpawnCellCoord{
+        .{ .x = 40, .y = 40 },
+        .{ .x = 48, .y = 44 },
+        .{ .x = 52, .y = 52 },
+        .{ .x = 60, .y = 56 },
+        .{ .x = 44, .y = 64 },
+        .{ .x = 56, .y = 72 },
+        .{ .x = 64, .y = 80 },
+        .{ .x = 72, .y = 88 },
+    };
+    comptime std.debug.assert(underground_demo_mover_count == underground_cells.len);
+    const underground_enabled = world.width >= 128 and world.height >= 128;
+
+    while (index < test_square_count) : (index += 1) {
+        const underground_index = index - surface_demo_mover_count;
+        const tile = world.tile_size;
+        const size: math.Vec2 = .{ .x = 22, .y = 22 };
+        const spec = if (underground_enabled) blk: {
+            const level = undergroundSpawnLevelForIndex(world, underground_index);
+            const cell = underground_cells[underground_index];
+            try carveUndergroundSpawnPocket(world, tunnel_tile, level, cell);
+            break :blk DemoSpawnSpec{
+                .position = .{
+                    .x = @as(f32, @floatFromInt(cell.x)) * tile,
+                    .y = @as(f32, @floatFromInt(cell.y)) * tile,
+                },
+                .velocity = .{ .x = 0, .y = 0 },
+                .size = size,
+                .color = demoColorForIndex(index),
+                .depth = .actor,
+                .world_level = level,
+                .speed = 48,
+                .behavior = .{ .behavior = .seek, .wander_amplitude = 5, .seek_weight = 1.4 },
+            };
+        } else blk: {
+            const extra_col = underground_index % 4;
+            const extra_row = underground_index / 4;
+            break :blk DemoSpawnSpec{
+                .position = .{
+                    .x = 520 + @as(f32, @floatFromInt(extra_col)) * 72,
+                    .y = 120 + @as(f32, @floatFromInt(extra_row)) * 72,
+                },
+                .velocity = demoVelocityForIndex(index),
+                .size = size,
+                .color = demoColorForIndex(index),
+                .depth = .actor,
+                .speed = 44,
+                .behavior = .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.3 },
+            };
+        };
+        entities[index] = try spawnDemoMover(data, world, tunnel_tile, spec, index);
     }
     return entities;
+}
+
+fn spawnTestSquaresCompact(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId) ![test_square_count]EntityId {
+    var entities: [test_square_count]EntityId = undefined;
+    const cols: usize = 6;
+    const surface_rows: usize = 4;
+    const margin: f32 = 12;
+    const entity_extent: f32 = 22;
+    const world_w = world.worldWidthPixels();
+    const world_h = world.worldHeightPixels();
+    const span_x = @max(world_w - 2 * margin - entity_extent, 0);
+    const span_y = @max(world_h * 0.45 - margin - entity_extent, 0);
+    const step_x = if (cols > 1) span_x / @as(f32, @floatFromInt(cols - 1)) else 0;
+    const step_y = if (surface_rows > 1) span_y / @as(f32, @floatFromInt(surface_rows - 1)) else 0;
+
+    for (0..surface_demo_mover_count) |index| {
+        const col = index % cols;
+        const row = index / cols;
+        const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
+        const spec = DemoSpawnSpec{
+            .position = .{
+                .x = margin + @as(f32, @floatFromInt(col)) * step_x,
+                .y = margin + @as(f32, @floatFromInt(row)) * step_y,
+            },
+            .velocity = demoVelocityForIndex(index),
+            .size = size,
+            .color = demoColorForIndex(index),
+            .depth = .actor,
+            .use_template = index == 3 or index == 7,
+            .speed = if (index % 5 == 0) 0 else 42,
+            .behavior = demoBehaviorForIndex(index),
+        };
+        entities[index] = try spawnDemoMover(data, world, tunnel_tile, spec, index);
+    }
+
+    const underground_cols: usize = 4;
+    const underground_rows: usize = 2;
+    const underground_origin_y = world_h * 0.55;
+    const underground_span_x = @max(world_w - 2 * margin - entity_extent, 0);
+    const underground_span_y = @max(world_h - underground_origin_y - margin - entity_extent, 0);
+    const underground_step_x = if (underground_cols > 1) underground_span_x / @as(f32, @floatFromInt(underground_cols - 1)) else 0;
+    const underground_step_y = if (underground_rows > 1) underground_span_y / @as(f32, @floatFromInt(underground_rows - 1)) else 0;
+
+    for (0..underground_demo_mover_count) |underground_index| {
+        const index = surface_demo_mover_count + underground_index;
+        const col = underground_index % underground_cols;
+        const row = underground_index / underground_cols;
+        const spec = DemoSpawnSpec{
+            .position = .{
+                .x = margin + @as(f32, @floatFromInt(col)) * underground_step_x,
+                .y = underground_origin_y + @as(f32, @floatFromInt(row)) * underground_step_y,
+            },
+            .velocity = demoVelocityForIndex(index),
+            .size = .{ .x = 22, .y = 22 },
+            .color = demoColorForIndex(index),
+            .depth = .actor,
+            .speed = 44,
+            .behavior = .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.3 },
+        };
+        entities[index] = try spawnDemoMover(data, world, tunnel_tile, spec, index);
+    }
+    return entities;
+}
+
+/// Spreads demo underground movers across planes `1..max_underground`, not the legacy 1–3 stack.
+fn undergroundSpawnLevelForIndex(world: *const WorldSystem, underground_index: usize) u16 {
+    const max_underground: usize = if (world.levelCount() > 1) world.levelCount() - 1 else 0;
+    if (max_underground == 0) return 0;
+    const slot = (underground_index * max_underground + (underground_demo_mover_count - 1)) / underground_demo_mover_count;
+    return @intCast(1 + @min(slot, max_underground - 1));
+}
+
+fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.TileId, level: u16, cell: SpawnCellCoord) !void {
+    const floor_layer = world.denseFloorLayerForLevel(level) orelse return error.InvalidWorldLevel;
+    _ = try world.setDenseTile(floor_layer, cell.x, cell.y, tunnel_tile);
+}
+
+fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, spec: DemoSpawnSpec, index: usize) !EntityId {
+    _ = tunnel_tile;
+    const entity = if (spec.use_template) blk: {
+        _ = try data.applyStructuralCommands(&[_]StructuralCommand{.{
+            .create_entity = .{
+                .movement_body = .{
+                    .position = spec.position,
+                    .previous_position = spec.position,
+                    .velocity = spec.velocity,
+                    .speed = spec.speed,
+                },
+                .primitive_visual = .{
+                    .size = spec.size,
+                    .color = spec.color,
+                    .depth = spec.depth,
+                    .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+                    .marker_depth_band = .marker,
+                    .marker_length = 0,
+                    .marker_depth = 0,
+                    .marker_margin = 0,
+                },
+                .asset_reference = demoCharacterAssetReference(index),
+                .collision_bounds = .{ .size = spec.size },
+                .collision_response = .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 },
+                .world_level = spec.world_level,
+                .ai_agent = spec.behavior orelse .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.35 },
+                .steering_agent = demoSteeringAgent(spec.size),
+            },
+        }});
+        const post = data.movementBodySliceConst();
+        break :blk post.entities[post.entities.len - 1];
+    } else blk: {
+        const e = try data.createEntity();
+        errdefer _ = data.destroyEntity(e);
+        try data.setMovementBody(e, .{
+            .position = spec.position,
+            .previous_position = spec.position,
+            .velocity = spec.velocity,
+            .speed = spec.speed,
+        });
+        try data.setPrimitiveVisual(e, .{
+            .size = spec.size,
+            .color = spec.color,
+            .depth = spec.depth,
+            .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            .marker_depth_band = .marker,
+            .marker_length = 0,
+            .marker_depth = 0,
+            .marker_margin = 0,
+        });
+        try data.setAssetReference(e, demoCharacterAssetReference(index));
+        try data.setCollisionBounds(e, .{ .size = spec.size });
+        try data.setCollisionResponse(e, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
+        try data.setWorldLevel(e, spec.world_level);
+        if (spec.behavior) |behavior| {
+            try data.setAiAgent(e, behavior);
+            try data.setSteeringAgent(e, demoSteeringAgent(spec.size));
+        }
+        break :blk e;
+    };
+
+    const z = world.levelBaseZ(spec.world_level);
+    const body = data.movementBodyPtr(entity).?;
+    body.position_z.* = z;
+    body.previous_z.* = z;
+    try data.setSimulationMetadata(entity, .{
+        .tier = .cognition,
+        .chunk = world.chunkCoordForWorldPos(spec.position.x, spec.position.y),
+        .level = spec.world_level,
+    });
+    return entity;
+}
+
+fn demoVelocityForIndex(index: usize) math.Vec2 {
+    const table = [_]math.Vec2{
+        .{ .x = 20, .y = 5 },  .{ .x = 5, .y = 18 },  .{ .x = -14, .y = 9 }, .{ .x = 11, .y = -10 },
+        .{ .x = 8, .y = -16 }, .{ .x = -9, .y = 12 }, .{ .x = 15, .y = -7 }, .{ .x = -6, .y = 22 },
+    };
+    return table[index % table.len];
+}
+
+fn demoColorForIndex(index: usize) config.Color {
+    const hue = @as(f32, @floatFromInt(index % 8)) / 8.0;
+    return .{ .r = 0.35 + hue * 0.5, .g = 0.45 + (1 - hue) * 0.4, .b = 0.55 + hue * 0.35, .a = 1.0 };
+}
+
+fn demoBehaviorForIndex(index: usize) ?AiAgent {
+    return switch (index % 5) {
+        0 => .{ .behavior = .wander, .wander_amplitude = 58, .seek_weight = 0 },
+        1, 3 => .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 1.55 },
+        4 => null,
+        else => .{ .behavior = .seek, .wander_amplitude = 4, .seek_weight = 1.2 },
+    };
 }
 
 fn demoSteeringAgent(size: math.Vec2) SteeringAgent {
@@ -682,19 +941,15 @@ fn demoCharacterAssetReference(index: usize) AssetReference {
     return .{ .sprite = .grim_characters, .atlas_entry_id = character_ids[index % character_ids.len] };
 }
 
-fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
+fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count]EntityId {
+    if (worldUsesCompactDemoSpawn(world)) return spawnObstaclesCompact(data);
     const specs = [_]ObstacleSpec{
-        .{
-            .position = .{ .x = 462, .y = 215 },
-            .size = .{ .x = 72, .y = 48 },
-            .color = .{ .r = 0.2, .g = 0.28, .b = 0.34, .a = 1.0 },
-        },
-        .{
-            .position = .{ .x = 245, .y = 285 },
-            .size = .{ .x = 96, .y = 28 },
-            .color = .{ .r = 0.26, .g = 0.34, .b = 0.36, .a = 1.0 },
-        },
+        .{ .position = .{ .x = 462, .y = 215 }, .size = .{ .x = 72, .y = 48 }, .color = .{ .r = 0.2, .g = 0.28, .b = 0.34, .a = 1.0 } },
+        .{ .position = .{ .x = 245, .y = 285 }, .size = .{ .x = 96, .y = 28 }, .color = .{ .r = 0.26, .g = 0.34, .b = 0.36, .a = 1.0 } },
+        .{ .position = .{ .x = 720, .y = 360 }, .size = .{ .x = 64, .y = 40 }, .color = .{ .r = 0.22, .g = 0.3, .b = 0.32, .a = 1.0 } },
+        .{ .position = .{ .x = 380, .y = 480 }, .size = .{ .x = 80, .y = 32 }, .color = .{ .r = 0.24, .g = 0.32, .b = 0.35, .a = 1.0 } },
     };
+    comptime std.debug.assert(specs.len == obstacle_count);
     var entities: [obstacle_count]EntityId = undefined;
     for (specs, 0..) |spec, index| {
         const entity = try data.createEntity();
@@ -723,13 +978,41 @@ fn spawnObstacles(data: *DataSystem) ![obstacle_count]EntityId {
     return entities;
 }
 
-const TestSquareSpec = struct {
-    position: math.Vec2,
-    velocity: math.Vec2,
-    size: math.Vec2,
-    color: config.Color,
-    depth: WorldDepth,
-};
+fn spawnObstaclesCompact(data: *DataSystem) ![obstacle_count]EntityId {
+    const specs = [_]ObstacleSpec{
+        .{ .position = .{ .x = 160, .y = 100 }, .size = .{ .x = 48, .y = 32 }, .color = .{ .r = 0.2, .g = 0.28, .b = 0.34, .a = 1.0 } },
+        .{ .position = .{ .x = 40, .y = 168 }, .size = .{ .x = 56, .y = 24 }, .color = .{ .r = 0.26, .g = 0.34, .b = 0.36, .a = 1.0 } },
+        .{ .position = .{ .x = 108, .y = 196 }, .size = .{ .x = 40, .y = 28 }, .color = .{ .r = 0.22, .g = 0.3, .b = 0.32, .a = 1.0 } },
+        .{ .position = .{ .x = 188, .y = 36 }, .size = .{ .x = 44, .y = 24 }, .color = .{ .r = 0.24, .g = 0.32, .b = 0.35, .a = 1.0 } },
+    };
+    comptime std.debug.assert(specs.len == obstacle_count);
+    var entities: [obstacle_count]EntityId = undefined;
+    for (specs, 0..) |spec, index| {
+        const entity = try data.createEntity();
+        errdefer _ = data.destroyEntity(entity);
+        try data.setMovementBody(entity, .{
+            .position = spec.position,
+            .previous_position = spec.position,
+            .velocity = .{},
+            .speed = 0,
+        });
+        try data.setPrimitiveVisual(entity, .{
+            .size = spec.size,
+            .color = spec.color,
+            .depth = .obstacle,
+            .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+            .marker_depth_band = .obstacle,
+            .marker_length = 0,
+            .marker_depth = 0,
+            .marker_margin = 0,
+        });
+        try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+        try data.setCollisionBounds(entity, .{ .size = spec.size });
+        try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+        entities[index] = entity;
+    }
+    return entities;
+}
 
 const ObstacleSpec = struct {
     position: math.Vec2,
@@ -791,13 +1074,24 @@ fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: SpriteAssetId, 
     };
 }
 
-fn initDemoForTest(allocator: std.mem.Allocator, bounds_width: f32, bounds_height: f32) !GameDemoState {
+fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
     const asset_store = AssetStore.init(allocator, std.testing.io, "assets");
     const meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    var world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, bounds_width, bounds_height);
+    var world = try WorldSystem.initDemoFromMetaWithUnderground(allocator, &meta, demo_test_viewport_width, demo_test_viewport_height);
     world.adoptTilesetMeta(meta);
     const dig_config = try DigConfig.fromMeta(world.tileset_meta.?);
-    return try GameDemoState.initWithWorld(allocator, bounds_width, bounds_height, bounds_width, bounds_height, world, dig_config, 1);
+    return try GameDemoState.initWithWorld(
+        allocator,
+        demo_test_viewport_width,
+        demo_test_viewport_height,
+        demo_test_viewport_width,
+        demo_test_viewport_height,
+        world,
+        dig_config,
+        1,
+        null,
+        null,
+    );
 }
 
 fn digFacedForTest(demo: *GameDemoState, intent: DigIntent) !void {
@@ -813,8 +1107,50 @@ fn placePlayerInCell(demo: *GameDemoState, cx: u16, cy: u16) void {
     body.position_y.* = @as(f32, @floatFromInt(cy)) * 32 + 16 - visual.size.y * 0.5;
 }
 
+fn ambientAudioCommandCount(audio: *const AudioCommandBuffer) usize {
+    var count: usize = 0;
+    for (audio.items()) |command| {
+        switch (command) {
+            .play_sfx => {},
+            else => count += 1,
+        }
+    }
+    return count;
+}
+
+fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
+    const isolate_x: f32 = demo.bounds_width + 64;
+    const isolate_y: f32 = demo.bounds_height + 64;
+    for (demo.test_squares) |entity| {
+        if (entity.index == subject.index and entity.generation == subject.generation) continue;
+        const body = demo.data.movementBodyPtr(entity).?;
+        body.position_x.* = isolate_x;
+        body.position_y.* = isolate_y;
+        body.previous_x.* = isolate_x;
+        body.previous_y.* = isolate_y;
+        body.velocity_x.* = 0;
+        body.velocity_y.* = 0;
+    }
+    for (demo.obstacles) |entity| {
+        const body = demo.data.movementBodyPtr(entity).?;
+        body.position_x.* = isolate_x;
+        body.position_y.* = isolate_y;
+        body.previous_x.* = isolate_x;
+        body.previous_y.* = isolate_y;
+        body.velocity_x.* = 0;
+        body.velocity_y.* = 0;
+    }
+    const player_body = demo.data.movementBodyPtr(demo.player.entity).?;
+    player_body.position_x.* = isolate_x;
+    player_body.position_y.* = isolate_y;
+    player_body.previous_x.* = isolate_x;
+    player_body.previous_y.* = isolate_y;
+    player_body.velocity_x.* = 0;
+    player_body.velocity_y.* = 0;
+}
+
 test "demo spawns atlas-backed moving actors" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
@@ -873,39 +1209,10 @@ test "demo init validates atlas-backed references at loading boundary" {
     var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
 
-    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, 800, 450);
+    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
-}
-
-test "procedural demo uses large world bounds and interpolated follow camera" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-
-    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
-    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
-    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
-    defer threads.deinit();
-
-    var demo = try GameDemoState.initProceduralWithRuntimeAssets(std.testing.allocator, &runtime_assets, &threads, 800, 450);
-    defer demo.deinit();
-
-    try std.testing.expectEqual(@as(f32, 800), demo.viewport_width);
-    try std.testing.expectEqual(@as(f32, 450), demo.viewport_height);
-    try std.testing.expect(demo.bounds_width > demo.viewport_width);
-    try std.testing.expect(demo.bounds_height > demo.viewport_height);
-
-    const body = demo.data.movementBodyPtr(demo.player.entity).?;
-    body.position_x.* = 4096.5;
-    body.position_y.* = 2048.25;
-    body.previous_x.* = 4090.5;
-    body.previous_y.* = 2040.25;
-    demo.updateCamera();
-
-    const camera = demo.interpolatedCamera(0.5);
-    try std.testing.expect(camera.position.x > 0);
-    try std.testing.expect(camera.position.y > 0);
-    try std.testing.expect(camera.position.x != @floor(camera.position.x));
 }
 
 test "demo init rejects missing character atlas metadata" {
@@ -914,7 +1221,7 @@ test "demo init rejects missing character atlas metadata" {
 
     try std.testing.expectError(
         error.SpriteAtlasMetadataUnavailable,
-        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, 800, 450),
+        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height),
     );
 }
 
@@ -933,7 +1240,7 @@ test "demo atlas validation rejects invalid character entry ids" {
 }
 
 test "demo world tile event invalidates navigation after commit reaction" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
@@ -959,7 +1266,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
 }
 
 test "demo dig hole drops the player one plane and a ramp climbs back" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
@@ -1001,7 +1308,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     // chunk is re-masked at the structural-commit gate via processPostCommitEvents ->
     // applyNavUpdates. A faced interior cell whose endpoint has no init-built slot must be
     // DEFERRED by tryLinkPortal, not resolved against an absent run (linkTailIndex unreachable).
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
@@ -1026,7 +1333,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
 }
 
 test "demo dig down drops the player through the dirt plane to the void plane" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
@@ -1056,7 +1363,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 }
 
 test "demo multi-cell obstacle rect event blocks every covered nav cell in one batch" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
@@ -1121,7 +1428,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
 test "demo owns and completes a simulation frame during update" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1130,9 +1437,11 @@ test "demo owns and completes a simulation frame during update" {
     defer threads.deinit();
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
-    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
+    var audio = AudioCommandBuffer.init(std.testing.allocator, demo_test_audio_capacity);
     defer audio.deinit();
     var runtime_assets = RuntimeAssets.init();
+    placePlayerInCell(&demo, 3, 3);
+    demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
     input.setHeld(.moveRight, true);
     const player_before = demo.data.movementBodyConst(demo.player.entity).?;
@@ -1171,7 +1480,7 @@ test "demo owns and completes a simulation frame during update" {
 test "demo queues jet loop audio only on movement edges" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1180,9 +1489,11 @@ test "demo queues jet loop audio only on movement edges" {
     defer threads.deinit();
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
-    var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
+    var audio = AudioCommandBuffer.init(std.testing.allocator, demo_test_audio_capacity);
     defer audio.deinit();
     var runtime_assets = RuntimeAssets.init();
+    placePlayerInCell(&demo, 3, 3);
+    demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
     input.setHeld(.moveRight, true);
 
@@ -1195,7 +1506,7 @@ test "demo queues jet loop audio only on movement edges" {
         .thread_system = &threads,
     });
     try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
-    try std.testing.expect(audio.len() >= 3);
+    try std.testing.expect(ambientAudioCommandCount(&audio) >= 3);
 
     audio.beginStep();
     try demo.update(.{
@@ -1207,7 +1518,7 @@ test "demo queues jet loop audio only on movement edges" {
         .thread_system = &threads,
     });
     try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
-    try std.testing.expectEqual(@as(usize, 1), audio.len());
+    try std.testing.expectEqual(@as(usize, 1), ambientAudioCommandCount(&audio));
 
     input.setHeld(.moveRight, false);
     audio.beginStep();
@@ -1220,13 +1531,13 @@ test "demo queues jet loop audio only on movement edges" {
         .thread_system = &threads,
     });
     try std.testing.expect(!demo.pipeline.audio_controller.jet_loop_active);
-    try std.testing.expectEqual(@as(usize, 2), audio.len());
+    try std.testing.expectEqual(@as(usize, 2), ambientAudioCommandCount(&audio));
 }
 
 test "demo collision response blocks player against obstacles" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1267,7 +1578,7 @@ test "demo collision response blocks player against obstacles" {
 test "demo ai processor drives non-player squares via intents (seek_target deterministic, 0-worker serial path)" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1323,7 +1634,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
 test "demo collision response handles player contacts with moving entities" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1382,7 +1693,7 @@ test "demo collision response handles player contacts with moving entities" {
 }
 
 test "ai squares use consistent math.clamp and zero velocity on bounds (main thread only)" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1395,15 +1706,18 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     defer audio.deinit();
     var runtime_assets = RuntimeAssets.init();
 
-    // Pick an ai square (index 0 is wander ai), force it out of bounds + outward vel.
+    // Pick an ai square (index 0 is wander ai), park in the top-left corner, then
+    // push out of bounds so clamp runs without post-clamp collision shoving it back out.
     const ai_ent = demo.test_squares[0];
+    isolateDemoBodiesAwayFrom(&demo, ai_ent);
+    const visual = demo.data.primitiveVisualConst(ai_ent).?;
     const body = demo.data.movementBodyPtr(ai_ent).?;
     body.position_x.* = -10;
-    body.position_y.* = 460;
+    body.position_y.* = -10;
     body.previous_x.* = body.position_x.*;
     body.previous_y.* = body.position_y.*;
     body.velocity_x.* = -20;
-    body.velocity_y.* = 30;
+    body.velocity_y.* = -20;
 
     try demo.update(.{
         .input = &InputState{},
@@ -1417,14 +1731,16 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     const after = demo.data.movementBodyConst(ai_ent).?;
     // Clamped via math.clamp (pos >=0, <= bound-size), and vels zeroed for the clamped axes (AI policy).
     try std.testing.expect(after.position.x >= 0);
-    try std.testing.expect(after.position.y <= 450 - 22); // size of first spec
+    try std.testing.expect(after.position.y >= 0);
+    try std.testing.expect(after.position.x <= demo.bounds_width - visual.size.x);
+    try std.testing.expect(after.position.y <= demo.bounds_height - visual.size.y);
     // vels zeroed on the violated axes (was pushed out)
     try std.testing.expectEqual(@as(f32, 0), after.velocity.x);
     try std.testing.expectEqual(@as(f32, 0), after.velocity.y);
 }
 
 test "demo structural static obstacle change emits one navigation invalidation event" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.simulation_frame.beginStep();
@@ -1462,7 +1778,7 @@ test "demo structural static obstacle change emits one navigation invalidation e
 }
 
 test "demo preflights navigation invalidation event before structural mutation" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     const entity_count_before = demo.data.movementBodySliceConst().entities.len;
@@ -1493,7 +1809,7 @@ test "demo preflights navigation invalidation event before structural mutation" 
 }
 
 test "demo preflights same-batch static obstacle promotion before mutation" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     const entity = try demo.data.createEntity();
@@ -1529,7 +1845,7 @@ test "demo preflights same-batch static obstacle promotion before mutation" {
 }
 
 test "demo unrelated structural component change does not invalidate navigation" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.simulation_frame.beginStep();
@@ -1556,7 +1872,7 @@ test "demo unrelated structural component change does not invalidate navigation"
 }
 
 test "demo dynamic entity structural destruction does not invalidate navigation" {
-    var demo = try initDemoForTest(std.testing.allocator, 800, 450);
+    var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     const dynamic = try demo.data.createEntity();

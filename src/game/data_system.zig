@@ -66,6 +66,7 @@ pub const Component = enum(u5) {
     collision_response,
     ai_agent,
     steering_agent,
+    world_level,
 };
 
 pub const ComponentMask = u32;
@@ -79,6 +80,7 @@ pub const component_masks = struct {
     pub const collision_response = componentMask(.collision_response);
     pub const ai_agent = componentMask(.ai_agent);
     pub const steering_agent = componentMask(.steering_agent);
+    pub const world_level = componentMask(.world_level);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -359,6 +361,16 @@ pub const ConstSteeringAgentSlice = struct {
     unavailable_backoff_steps: []const u16,
 };
 
+pub const WorldLevelCommand = struct {
+    entity: EntityId,
+    level: u16,
+};
+
+pub const ConstWorldLevelSlice = struct {
+    entities: []const EntityId,
+    levels: []const u16,
+};
+
 /// Component bundle consumed by create_entity during structural commits. Each
 /// optional payload still goes through normal validation and change reporting.
 pub const EntityTemplate = struct {
@@ -370,6 +382,7 @@ pub const EntityTemplate = struct {
     collision_response: ?CollisionResponse = null,
     ai_agent: ?AiAgent = null,
     steering_agent: ?SteeringAgent = null,
+    world_level: ?u16 = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -411,6 +424,7 @@ pub const StructuralCommand = union(enum) {
     set_collision_response: CollisionResponseCommand,
     set_ai_agent: AiAgentCommand,
     set_steering_agent: SteeringAgentCommand,
+    set_world_level: WorldLevelCommand,
     set_simulation_tier: SimulationTierCommand,
 };
 
@@ -460,6 +474,7 @@ const StructuralCapacityNeeds = struct {
     collision_responses: usize,
     ai_agents: usize,
     steering_agents: usize,
+    world_levels: usize,
 
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
@@ -472,6 +487,7 @@ const StructuralCapacityNeeds = struct {
             .collision_responses = data.collision_responses.len(),
             .ai_agents = data.ai_agents.len(),
             .steering_agents = data.steering_agents.len(),
+            .world_levels = data.world_levels.len(),
         };
     }
 
@@ -485,6 +501,7 @@ const StructuralCapacityNeeds = struct {
         if (self.collision_responses > std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
         if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
         if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+        if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
     }
 };
 
@@ -526,6 +543,7 @@ const StructuralCapacityProjection = struct {
         if (template.collision_response != null) try self.addComponent(.collision_response);
         if (template.ai_agent != null) try self.addComponent(.ai_agent);
         if (template.steering_agent != null) try self.addComponent(.steering_agent);
+        if (template.world_level != null) try self.addComponent(.world_level);
     }
 
     fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
@@ -551,6 +569,7 @@ const StructuralCapacityProjection = struct {
             .collision_response => &self.current.collision_responses,
             .ai_agent => &self.current.ai_agents,
             .steering_agent => &self.current.steering_agents,
+            .world_level => &self.current.world_levels,
         };
     }
 
@@ -564,6 +583,7 @@ const StructuralCapacityProjection = struct {
             .collision_response => &self.required.collision_responses,
             .ai_agent => &self.required.ai_agents,
             .steering_agent => &self.required.steering_agents,
+            .world_level => &self.required.world_levels,
         };
     }
 };
@@ -666,6 +686,7 @@ fn templateComponentCount(template: EntityTemplate) usize {
     if (template.collision_response != null) count += 1;
     if (template.ai_agent != null) count += 1;
     if (template.steering_agent != null) count += 1;
+    if (template.world_level != null) count += 1;
     return count;
 }
 
@@ -689,12 +710,14 @@ pub const DataSystem = struct {
     collision_responses: CollisionResponseStore = .{},
     ai_agents: AiAgentStore = .{},
     steering_agents: SteeringAgentStore = .{},
+    world_levels: WorldLevelStore = .{},
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DataSystem) void {
+        self.world_levels.deinit(self.allocator);
         self.steering_agents.deinit(self.allocator);
         self.ai_agents.deinit(self.allocator);
         self.collision_responses.deinit(self.allocator);
@@ -743,6 +766,7 @@ pub const DataSystem = struct {
         if (slot.collision_response_index) |dense_index| self.removeCollisionResponseAt(@intCast(dense_index));
         if (slot.ai_agent_index) |dense_index| self.removeAiAgentAt(@intCast(dense_index));
         if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
+        if (slot.world_level_index) |dense_index| self.removeWorldLevelAt(@intCast(dense_index));
 
         // tier_counts is decremented in removeMovementBodyAt (called above) since
         // the tier now lives on the dense movement-body scope row, not the slot.
@@ -759,6 +783,7 @@ pub const DataSystem = struct {
         retired_slot.collision_response_index = null;
         retired_slot.ai_agent_index = null;
         retired_slot.steering_agent_index = null;
+        retired_slot.world_level_index = null;
         self.first_free_slot = index;
         self.free_slot_count += 1;
         return true;
@@ -880,6 +905,7 @@ pub const DataSystem = struct {
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
+        self.world_levels.clearRetainingCapacity();
         self.steering_agents.clearRetainingCapacity();
         self.ai_agents.clearRetainingCapacity();
         self.asset_refs.clearRetainingCapacity();
@@ -905,6 +931,7 @@ pub const DataSystem = struct {
             slot.collision_response_index = null;
             slot.ai_agent_index = null;
             slot.steering_agent_index = null;
+            slot.world_level_index = null;
             self.first_free_slot = @intCast(index);
         }
     }
@@ -1183,6 +1210,42 @@ pub const DataSystem = struct {
         return self.steering_agents.sliceConst();
     }
 
+    pub fn setWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.world_level_index) |index| {
+            self.world_levels.set(@intCast(index), level);
+        } else {
+            const dense_index = try self.world_levels.append(self.allocator, id, level);
+            slot.world_level_index = dense_index;
+            slot.addComponent(.world_level);
+        }
+        try self.syncScopeLevelFromWorldLevel(id, level);
+    }
+
+    pub fn worldLevelConst(self: *const DataSystem, id: EntityId) ?u16 {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.world_level_index orelse return null;
+        return self.world_levels.get(@intCast(dense_index));
+    }
+
+    pub fn worldLevelPtr(self: *DataSystem, id: EntityId) ?*u16 {
+        const slot = self.resolveSlot(id) orelse return null;
+        const dense_index = slot.world_level_index orelse return null;
+        return self.world_levels.levelPtr(@intCast(dense_index));
+    }
+
+    pub fn worldLevelSliceConst(self: *const DataSystem) ConstWorldLevelSlice {
+        return self.world_levels.sliceConst();
+    }
+
+    fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
+        const metadata = self.simulationMetadata(id) orelse return;
+        if (metadata.level == level) return;
+        var updated = metadata;
+        updated.level = level;
+        try self.setSimulationMetadata(id, updated);
+    }
+
     pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
         var sink = NullStructuralChangeSink{};
         return try self.applyStructuralCommandsWithChangeSink(commands, &sink);
@@ -1323,6 +1386,16 @@ pub const DataSystem = struct {
                     stats.components_set += 1;
                     self.recordComponentChange(change_sink, set.entity, .steering_agent, was_static_navigation_obstacle);
                 },
+                .set_world_level => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                    try self.setWorldLevel(set.entity, set.level);
+                    stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .world_level, was_static_navigation_obstacle);
+                },
                 .set_simulation_tier => |set| {
                     // Skip stale IDs and live entities without a movement body
                     // (tier exists only on simulated rows) — same upsert tolerance
@@ -1384,6 +1457,7 @@ pub const DataSystem = struct {
                 .set_collision_response => |set| try self.preflightSetComponent(set.entity, .collision_response, scratch, &projection, &structural_event_count),
                 .set_ai_agent => |set| try self.preflightSetComponent(set.entity, .ai_agent, scratch, &projection, &structural_event_count),
                 .set_steering_agent => |set| try self.preflightSetComponent(set.entity, .steering_agent, scratch, &projection, &structural_event_count),
+                .set_world_level => |set| try self.preflightSetComponent(set.entity, .world_level, scratch, &projection, &structural_event_count),
                 .set_simulation_tier => {},
             }
         }
@@ -1425,6 +1499,7 @@ pub const DataSystem = struct {
         try self.collision_responses.ensureCapacity(self.allocator, plan.capacity_needs.collision_responses);
         try self.ai_agents.ensureCapacity(self.allocator, plan.capacity_needs.ai_agents);
         try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
+        try self.world_levels.ensureCapacity(self.allocator, plan.capacity_needs.world_levels);
     }
 
     pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -1485,6 +1560,7 @@ pub const DataSystem = struct {
         }
         if (template.ai_agent != null) self.recordComponentChange(change_sink, entity, .ai_agent, was_static_navigation_obstacle);
         if (template.steering_agent != null) self.recordComponentChange(change_sink, entity, .steering_agent, was_static_navigation_obstacle);
+        if (template.world_level != null) self.recordComponentChange(change_sink, entity, .world_level, was_static_navigation_obstacle);
     }
 
     fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
@@ -1528,6 +1604,10 @@ pub const DataSystem = struct {
         }
         if (template.steering_agent) |agent| {
             try self.setSteeringAgent(entity, agent);
+            components_set += 1;
+        }
+        if (template.world_level) |level| {
+            try self.setWorldLevel(entity, level);
             components_set += 1;
         }
         return components_set;
@@ -1601,6 +1681,11 @@ pub const DataSystem = struct {
         const moved = self.steering_agents.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].steering_agent_index = @intCast(index);
     }
+
+    fn removeWorldLevelAt(self: *DataSystem, index: usize) void {
+        const moved = self.world_levels.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].world_level_index = @intCast(index);
+    }
 };
 
 const EntitySlot = struct {
@@ -1618,6 +1703,7 @@ const EntitySlot = struct {
     collision_response_index: ?u32 = null,
     ai_agent_index: ?u32 = null,
     steering_agent_index: ?u32 = null,
+    world_level_index: ?u32 = null,
 
     fn addComponent(self: *EntitySlot, component: Component) void {
         self.component_mask |= componentMask(component);
@@ -1779,6 +1865,11 @@ const SteeringAgentRow = struct {
     stuck_step_threshold: u16,
     replan_cooldown_steps: u16,
     unavailable_backoff_steps: u16,
+};
+
+const WorldLevelRow = struct {
+    entity: EntityId,
+    level: u16,
 };
 
 const MovementBodyStore = struct {
@@ -2542,6 +2633,71 @@ const SteeringAgentStore = struct {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
+
+const WorldLevelStore = struct {
+    rows: std.MultiArrayList(WorldLevelRow) = .{},
+
+    fn len(self: *const WorldLevelStore) usize {
+        return self.rows.len;
+    }
+
+    fn append(self: *WorldLevelStore, allocator: std.mem.Allocator, entity: EntityId, level: u16) !u32 {
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
+        try self.ensureCapacityForOne(allocator);
+        const index: u32 = @intCast(self.rows.len);
+        self.rows.appendAssumeCapacity(.{
+            .entity = entity,
+            .level = level,
+        });
+        return index;
+    }
+
+    fn set(self: *WorldLevelStore, index: usize, level: u16) void {
+        self.rows.slice().items(.level)[index] = level;
+    }
+
+    fn get(self: *const WorldLevelStore, index: usize) u16 {
+        return self.rows.slice().items(.level)[index];
+    }
+
+    fn levelPtr(self: *WorldLevelStore, index: usize) *u16 {
+        return &self.rows.slice().items(.level)[index];
+    }
+
+    fn removeAt(self: *WorldLevelStore, index: usize) ?EntityId {
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
+        return moved_entity;
+    }
+
+    fn sliceConst(self: *const WorldLevelStore) ConstWorldLevelSlice {
+        const s = self.rows.slice();
+        return .{
+            .entities = s.items(.entity),
+            .levels = s.items(.level),
+        };
+    }
+
+    fn clearRetainingCapacity(self: *WorldLevelStore) void {
+        self.rows.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *WorldLevelStore, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureCapacityForOne(self: *WorldLevelStore, allocator: std.mem.Allocator) !void {
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+    }
+
+    fn ensureCapacity(self: *WorldLevelStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.rows.ensureTotalCapacity(allocator, capacity);
+    }
+};
+
 fn nextGeneration(generation: u32) u32 {
     const next = generation +% 1;
     return if (next == 0) 1 else next;
@@ -2606,6 +2762,104 @@ fn expectSteeringAgentColumnsAligned(slice: ConstSteeringAgentSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.stuck_step_thresholds.len);
     try std.testing.expectEqual(slice.entities.len, slice.replan_cooldown_steps.len);
     try std.testing.expectEqual(slice.entities.len, slice.unavailable_backoff_steps.len);
+}
+
+fn expectWorldLevelColumnsAligned(slice: ConstWorldLevelSlice) !void {
+    try std.testing.expectEqual(slice.entities.len, slice.levels.len);
+}
+
+test "world level round-trips through set get ptr and dense slice" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+
+    try data.setWorldLevel(first, 0);
+    try data.setWorldLevel(second, 7);
+    try data.setWorldLevel(third, 42);
+    try data.setWorldLevel(first, 3);
+
+    try std.testing.expectEqual(@as(?u16, 3), data.worldLevelConst(first));
+    try std.testing.expectEqual(@as(?u16, 7), data.worldLevelConst(second));
+    try std.testing.expectEqual(@as(?u16, 42), data.worldLevelConst(third));
+    try std.testing.expect(data.hasComponents(first, component_masks.world_level));
+    try std.testing.expect(data.hasComponents(second, component_masks.world_level));
+    try std.testing.expect(!data.hasComponents(third, component_masks.movement_body));
+
+    const level_ptr = data.worldLevelPtr(second).?;
+    try std.testing.expectEqual(@as(u16, 7), level_ptr.*);
+    level_ptr.* = 11;
+    try std.testing.expectEqual(@as(u16, 11), data.worldLevelConst(second));
+
+    const slice = data.worldLevelSliceConst();
+    try expectWorldLevelColumnsAligned(slice);
+    try std.testing.expectEqual(@as(usize, 3), slice.entities.len);
+    try std.testing.expectEqual(@as(u16, 3), slice.levels[0]);
+    try std.testing.expectEqual(@as(u16, 11), slice.levels[1]);
+    try std.testing.expectEqual(@as(u16, 42), slice.levels[2]);
+}
+
+test "world level via EntityTemplate defaults surface level and mask queries" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(1),
+            .world_level = 0,
+        } },
+        .{ .create_entity = .{
+            .movement_body = testBody(2),
+            .world_level = 9,
+        } },
+        .{ .set_world_level = .{ .entity = .invalid, .level = 1 } },
+    };
+    const stats = try data.applyStructuralCommands(commands[0..2]);
+    try std.testing.expectEqual(@as(usize, 2), stats.created);
+    try std.testing.expectEqual(@as(usize, 4), stats.components_set);
+
+    const surface = data.movementBodySliceConst().entities[0];
+    const deep = data.movementBodySliceConst().entities[1];
+    try std.testing.expect(data.hasComponents(surface, component_masks.world_level | component_masks.movement_body));
+    try std.testing.expectEqual(@as(u16, 0), data.worldLevelConst(surface).?);
+    try std.testing.expectEqual(@as(u16, 9), data.worldLevelConst(deep).?);
+}
+
+test "setWorldLevel syncs simulation scope metadata level when movement body exists" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{});
+    try data.setSimulationMetadata(entity, .{
+        .tier = .locomotion,
+        .chunk = .{ .x = 2, .y = -1 },
+        .level = 0,
+        .stagger_phase = 2,
+    });
+    try data.setWorldLevel(entity, 5);
+
+    try std.testing.expectEqual(@as(u16, 5), data.worldLevelConst(entity).?);
+    try std.testing.expectEqual(EntitySimulationMetadata{
+        .tier = .locomotion,
+        .chunk = .{ .x = 2, .y = -1 },
+        .level = 5,
+        .stagger_phase = 2,
+    }, data.simulationMetadata(entity).?);
+    try std.testing.expectEqual(@as(u16, 5), data.scopeColumnsSliceConst().level[0]);
+
+    try data.setWorldLevel(entity, 5);
+    try std.testing.expectEqual(EntitySimulationMetadata{
+        .tier = .locomotion,
+        .chunk = .{ .x = 2, .y = -1 },
+        .level = 5,
+        .stagger_phase = 2,
+    }, data.simulationMetadata(entity).?);
+
+    try data.setWorldLevel(entity, 8);
+    try std.testing.expectEqual(@as(u16, 8), data.scopeColumnsSliceConst().level[0]);
 }
 
 test "entity ids reject invalid values and match slots exactly" {

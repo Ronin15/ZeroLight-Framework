@@ -75,10 +75,14 @@ collision, so every downstream stage and the camera see the gated position. It
 stops the player from moving into movement-blocking tiles on their current plane
 (the mining mechanic: underground dirt is solid until dug) by resolving X then Y
 against the pre-move position, which yields wall-sliding. It is player-only by
-design: AI agents have no per-entity plane and stay on the fully-walkable surface
-(level 0), where the gate is a no-op, so they cannot enter the solid underground.
-Autonomous NPC descent — a per-entity plane column plus an all-bodies traversal
-and gate — is a deliberately separate, deferred slice.
+design on level 0 (the surface is fully walkable and the gate is a no-op there).
+
+NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement
+and collision settle, `applyNpcPlaneTraversal` mirrors the player ramp/fall
+cell-entry policy and commits level changes on the main thread. Off-surface NPCs
+are gated by `gateNpcEntitiesToWalkableTiles` against solid tiles on their current
+plane before entity collision runs. Steering and pathfinding read each entity's
+`world_level` for `start_level` and `next_cell_level` at link crossings.
 
 ## Range Output Streams
 
