@@ -257,9 +257,7 @@ pub const SpriteBatch = struct {
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
         if (self.frame_reserved) {
-            if (comptime builtin.mode == .Debug) {
-                std.debug.assert(self.commands.items.len < self.commands.capacity);
-            }
+            if (self.commands.items.len >= self.commands.capacity) return error.SpriteCommandOverflow;
             self.commands.appendAssumeCapacity(.{ .sprite = sprite });
         } else {
             try self.commands.append(self.allocator, .{ .sprite = sprite });

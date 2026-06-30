@@ -35,17 +35,20 @@ const PreparedBatchUpload = struct {
 
 /// Validates pixels, uploads to new GPU textures, and submits one command buffer
 /// with one copy pass over all regions. Caller owns each `UploadedTexture.texture`
-/// until registered/released.
+/// until registered/released. The returned slice is always allocator-owned (including
+/// empty batches) and must be freed by the caller. Transfer buffer is single-use per
+/// call; all `SDL_UploadToGPUTexture` calls pass `cycle=false`.
 pub fn uploadTexturesBatch(
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     items: []const BatchUploadItem,
 ) ![]UploadedTexture {
-    if (items.len == 0) return &.{};
+    if (items.len == 0) return try allocator.alloc(UploadedTexture, 0);
 
     const prepared = try allocator.alloc(PreparedBatchUpload, items.len);
     defer allocator.free(prepared);
-    errdefer for (prepared) |entry| {
+    var prepared_count: usize = 0;
+    errdefer for (prepared[0..prepared_count]) |entry| {
         c.SDL_ReleaseGPUTexture(device, entry.texture);
     };
 
@@ -80,6 +83,7 @@ pub fn uploadTexturesBatch(
             .required_len = required_len,
             .pixels_per_row = pixels_per_row,
         };
+        prepared_count += 1;
         total_transfer_bytes = std.math.add(usize, total_transfer_bytes, required_len) catch return error.TextureUploadTooLarge;
     }
 
@@ -238,4 +242,11 @@ test "texture upload sizing rejects SDL u32 overflow" {
 
 test "required pixel bytes uses pitch times height" {
     try std.testing.expectEqual(@as(usize, 24), try requiredPixelBytes(2, 12));
+}
+
+test "texture batch empty result is allocator owned" {
+    const allocator = std.testing.allocator;
+    const uploaded = try uploadTexturesBatch(allocator, @ptrFromInt(1), &.{});
+    defer allocator.free(uploaded);
+    try std.testing.expectEqual(@as(usize, 0), uploaded.len);
 }

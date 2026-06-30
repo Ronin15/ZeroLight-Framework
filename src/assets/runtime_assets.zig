@@ -278,6 +278,7 @@ pub const RuntimeAssets = struct {
         }
     }
 
+    /// Test-only single-sprite preload; production startup uses `preloadSpritesBatch`.
     fn preloadSprite(
         self: *RuntimeAssets,
         _: AssetStore,

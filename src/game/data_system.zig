@@ -2788,6 +2788,32 @@ test "component masks track entity membership for system queries" {
     try std.testing.expect(!data.hasComponents(entity, component_masks.movement_body));
 }
 
+test "render entity component indices resolve movement asset and facing slots" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+
+    const movement_only = data.renderEntityComponentIndices(entity).?;
+    try std.testing.expectEqual(@as(usize, 0), movement_only.movement_body);
+    try std.testing.expect(movement_only.asset_ref == null);
+    try std.testing.expect(movement_only.facing == null);
+
+    try data.setFacing(entity, .{ .direction = .down });
+    const with_facing = data.renderEntityComponentIndices(entity).?;
+    try std.testing.expect(with_facing.facing != null);
+    try std.testing.expect(with_facing.asset_ref == null);
+
+    try data.setAssetReference(entity, .{ .sprite = .demo_tile });
+    const full = data.renderEntityComponentIndices(entity).?;
+    try std.testing.expect(full.asset_ref != null);
+    try std.testing.expect(full.facing != null);
+    try std.testing.expectEqual(with_facing.movement_body, full.movement_body);
+
+    try std.testing.expect(data.renderEntityComponentIndices(EntityId.invalid) == null);
+}
+
 test "movement body columns can be loaded directly through simd helpers" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

@@ -131,10 +131,13 @@ pub const AssetCache = struct {
         texture_ids: []const TextureId,
     ) ![]TextureLease {
         if (inserts.len != texture_ids.len) return error.InvalidStartupTextureBatch;
-        if (inserts.len == 0) return &.{};
+        if (inserts.len == 0) return try self.allocator.alloc(TextureLease, 0);
 
         const leases = try self.allocator.alloc(TextureLease, inserts.len);
         errdefer self.allocator.free(leases);
+
+        var inserted_count: usize = 0;
+        errdefer self.rollbackStartupTextureInserts(inserts[0..inserted_count]);
 
         for (inserts, texture_ids, leases) |insert, texture, *lease| {
             try assets.validateRelativePath(insert.relative_path);
@@ -160,28 +163,37 @@ pub const AssetCache = struct {
                 .id = texture,
                 .owner_id = self.owner_id,
             };
+            inserted_count += 1;
             log.debug("loaded cached texture \"{s}\"", .{owned_path});
         }
 
         return leases;
     }
 
-    /// Decodes and uploads startup textures in one GPU command-buffer batch.
+    /// Uploads pre-decoded startup textures in one backend batch, then inserts
+    /// them into the cache transactionally.
     pub fn uploadStartupTexturesBatch(
         self: *AssetCache,
         backend_context: *anyopaque,
         inserts: []const StartupTextureInsert,
     ) ![]TextureLease {
-        if (inserts.len == 0) return &.{};
+        if (inserts.len == 0) return try self.allocator.alloc(TextureLease, 0);
 
         const images = try self.allocator.alloc(image.LoadedImage, inserts.len);
         defer self.allocator.free(images);
         for (inserts, images) |insert, *out| out.* = insert.image;
 
         const texture_ids = try self.backend.upload_images_batch(backend_context, self.allocator, images);
-        defer self.allocator.free(texture_ids);
+        errdefer {
+            for (texture_ids) |texture| {
+                self.backend.destroy_texture(backend_context, texture);
+            }
+            self.allocator.free(texture_ids);
+        }
 
-        return try self.insertStartupTexturesBatch(backend_context, inserts, texture_ids);
+        const leases = try self.insertStartupTexturesBatch(backend_context, inserts, texture_ids);
+        self.allocator.free(texture_ids);
+        return leases;
     }
 
     pub fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
@@ -216,6 +228,17 @@ pub const AssetCache = struct {
 
         self.retireLeaseSlot(handle.index, slot);
         self.releaseCachedTextureWithContext(backend_context, path, texture);
+    }
+
+    fn rollbackStartupTextureInserts(self: *AssetCache, inserts: []const StartupTextureInsert) void {
+        var index = inserts.len;
+        while (index > 0) {
+            index -= 1;
+            const relative_path = inserts[index].relative_path;
+            if (self.entries.fetchRemove(relative_path)) |removed| {
+                self.allocator.free(removed.value.path);
+            }
+        }
     }
 
     fn releaseCachedTextureWithContext(
@@ -448,6 +471,18 @@ const FakeBackend = struct {
     }
 };
 
+var test_startup_pixels = [_]u8{255} ** 4;
+
+fn testStartupImage() image.LoadedImage {
+    return .{
+        .allocator = std.testing.allocator,
+        .pixels = test_startup_pixels[0..],
+        .width = 1,
+        .height = 1,
+        .pitch = 4,
+    };
+}
+
 fn testCache(allocator: std.mem.Allocator) AssetCache {
     return AssetCache.initWithBackend(
         allocator,
@@ -477,6 +512,10 @@ pub const testing = if (builtin.is_test) struct {
 
     pub fn entryCount(cache: *const AssetCache) usize {
         return cache.entries.count();
+    }
+
+    pub fn batchUploadCount(fake: *const Backend) u32 {
+        return fake.batch_upload_count;
     }
 } else struct {};
 
@@ -624,6 +663,70 @@ test "texture upload failures leave no cached entry" {
     try std.testing.expectError(error.FakeUploadFailed, cache.acquireTextureWithContext(&fake, "test/cache_probe.png"));
     try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+}
+
+test "startup texture batch insert rejects mismatch duplicate and empty success" {
+    const allocator = std.testing.allocator;
+    var fake = FakeBackend{};
+    var cache = testCache(allocator);
+    defer cache.deinitWithContext(&fake);
+
+    const empty = try cache.insertStartupTexturesBatch(&fake, &.{}, &.{});
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const texture_a = try TextureId.init(0, 1);
+    const texture_b = try TextureId.init(1, 1);
+    const inserts = [_]StartupTextureInsert{
+        .{ .relative_path = "sprites/batch_a.png", .image = testStartupImage() },
+        .{ .relative_path = "sprites/batch_b.png", .image = testStartupImage() },
+    };
+    const leases = try cache.insertStartupTexturesBatch(&fake, &inserts, &.{ texture_a, texture_b });
+    defer allocator.free(leases);
+    try std.testing.expectEqual(@as(usize, 2), leases.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+
+    try std.testing.expectError(
+        error.InvalidStartupTextureBatch,
+        cache.insertStartupTexturesBatch(&fake, &inserts, &.{texture_a}),
+    );
+
+    const duplicate_inserts = [_]StartupTextureInsert{
+        .{ .relative_path = "sprites/batch_a.png", .image = testStartupImage() },
+        .{ .relative_path = "sprites/batch_c.png", .image = testStartupImage() },
+    };
+    try std.testing.expectError(
+        error.DuplicateStartupTexture,
+        cache.insertStartupTexturesBatch(&fake, &duplicate_inserts, &.{ texture_a, texture_b }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+}
+
+test "startup texture batch upload uses one backend batch and rolls back partial insert" {
+    const allocator = std.testing.allocator;
+    var fake = FakeBackend{};
+    var cache = testCache(allocator);
+    defer cache.deinitWithContext(&fake);
+
+    const inserts = [_]StartupTextureInsert{
+        .{ .relative_path = "sprites/upload_a.png", .image = testStartupImage() },
+        .{ .relative_path = "sprites/upload_a.png", .image = testStartupImage() },
+    };
+    try std.testing.expectError(error.DuplicateStartupTexture, cache.uploadStartupTexturesBatch(&fake, &inserts));
+    try std.testing.expectEqual(@as(u32, 1), fake.batch_upload_count);
+    try std.testing.expectEqual(@as(u32, 2), fake.destroy_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+
+    const good_inserts = [_]StartupTextureInsert{
+        .{ .relative_path = "sprites/upload_b.png", .image = testStartupImage() },
+        .{ .relative_path = "sprites/upload_c.png", .image = testStartupImage() },
+    };
+    const leases = try cache.uploadStartupTexturesBatch(&fake, &good_inserts);
+    defer allocator.free(leases);
+    defer for (leases) |*lease| cache.releaseTextureWithContext(&fake, lease);
+    try std.testing.expectEqual(@as(u32, 2), fake.batch_upload_count);
+    try std.testing.expectEqual(@as(usize, 2), leases.len);
+    try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
 }
 
 test "cache deinit destroys remaining live textures" {

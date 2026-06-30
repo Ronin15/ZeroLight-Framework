@@ -42,6 +42,13 @@ pub const PreparedDraw = union(enum) {
             .rect => |rect| rect.order.depth,
         };
     }
+
+    pub fn renderOrder(self: PreparedDraw) RenderOrder {
+        return switch (self) {
+            .sprite => |sprite| sprite.order,
+            .rect => |rect| rect.order,
+        };
+    }
 };
 
 pub const RectDraw = struct {
@@ -191,7 +198,7 @@ fn preparePrimitiveVisualSoA(
     render_y: f32,
     asset_ref: AssetReference,
     runtime_assets: *const RuntimeAssets,
-) ?PreparedDraw {
+) PreparedDraw {
     const dest = Rect{
         .x = render_x,
         .y = render_y,
@@ -365,6 +372,9 @@ pub fn dynamicRecordCapacity(scene: GameplayScene) usize {
     return visual_count + player_marker_count + scene.particles.activeCount();
 }
 
+/// Peak gameplay sprite commands for the demo state. Stacked UI headroom covers
+/// pause/menu rects submitted after gameplay enqueue; `Engine` adds
+/// `Renderer.kOverlayCommandHeadroom` for the debug overlay afterward.
 pub fn spriteCommandCapacity(scene: GameplayScene) usize {
     const visual_count = scene.data.primitiveVisualSliceConst().entities.len;
     const player_marker_count: usize = 1;
@@ -372,7 +382,7 @@ pub fn spriteCommandCapacity(scene: GameplayScene) usize {
         visual_count +
         player_marker_count +
         scene.particles.activeCount() +
-        Renderer.kOverlayCommandHeadroom;
+        Renderer.kStackedStateUiHeadroom;
 }
 
 pub fn ensureScenePrepCapacity(prep: *DynamicScenePrep, scene: GameplayScene) !void {
@@ -396,7 +406,7 @@ pub fn submitGameplayFrame(
         scene.world.tile_size,
     );
     try collectDynamicRecords(prep, scene, visible, runtime_assets, interpolation_alpha);
-    try submitLayeredWorld(scene, prep, renderer, runtime_assets, interpolation_alpha);
+    try submitLayeredWorld(scene, prep, renderer, runtime_assets);
 }
 
 pub fn collectDynamicRecords(
@@ -449,7 +459,7 @@ pub fn collectDynamicRecords(
                 render_y,
                 asset_ref,
                 runtime_assets,
-            ) orelse continue;
+            );
             prep.appendAssumeCapacity(.{ .depth = prepared.depth(), .draw = prepared });
         } else {
             const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
@@ -517,9 +527,7 @@ fn submitLayeredWorld(
     prep: *DynamicScenePrep,
     renderer: *Renderer,
     runtime_assets: *const RuntimeAssets,
-    interpolation_alpha: f32,
 ) !void {
-    _ = interpolation_alpha;
     try scene.world.ensureRenderDepthIndex();
     try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level);
     try scene.world.flushDenseTileEdits(renderer);
@@ -638,19 +646,6 @@ fn prepareParticleAt(particles: ConstParticleSlice, index: usize, render_x: f32,
         },
         .order = RenderOrder.world(particles.z[index]),
     } };
-}
-
-fn markerRect(position: math.Vec2, facing: Facing, visual: PrimitiveVisual) Rect {
-    return markerRectAt(
-        position.x,
-        position.y,
-        facing,
-        visual.size.x,
-        visual.size.y,
-        visual.marker_length,
-        visual.marker_depth,
-        visual.marker_margin,
-    );
 }
 
 fn markerRectAt(
@@ -1074,13 +1069,58 @@ test "sprite command capacity tracks visual entity growth" {
         });
     }
 
+    try std.testing.expect(fixture.particles.emit(.{
+        .position = .{ .x = 10, .y = 10 },
+        .start_size = 4,
+        .start_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    }));
+
     try std.testing.expectEqual(
         fixture.world.reserveRenderRecords() +
             fixture.data.primitiveVisualSliceConst().entities.len +
             1 +
-            Renderer.kOverlayCommandHeadroom,
+            fixture.particles.activeCount() +
+            Renderer.kStackedStateUiHeadroom,
         spriteCommandCapacity(fixture.scene()),
     );
+}
+
+test "layered sparse and dynamic walk preserves nondecreasing render order" {
+    var fixture = try initScenePrepFixture(std.testing.allocator, 800, 450);
+    defer fixture.deinit();
+
+    try fixture.collect(fixture.fullBoundsVisible(), 0.5);
+
+    var last_order: ?RenderOrder = null;
+    var sparse_depth = fixture.world.firstVisibleSparseDepth();
+    var dynamic_span_index: usize = 0;
+    var dynamic_depth = nextDynamicDepth(&fixture.scene_prep, &dynamic_span_index);
+    while (sparse_depth != null or dynamic_depth != null) {
+        if (sparse_depth) |depth| {
+            if (dynamic_depth == null or depth <= dynamic_depth.?) {
+                const order = RenderOrder.world(depth);
+                if (last_order) |previous| {
+                    try std.testing.expect(previous.lessOrEqual(order));
+                }
+                last_order = order;
+                sparse_depth = fixture.world.nextVisibleSparseDepthAfter(depth);
+                continue;
+            }
+        }
+
+        const dynamic_range = fixture.scene_prep.depth_spans.items[dynamic_span_index - 1];
+        const sorted_indices = fixture.scene_prep.sort_indices.items;
+        const records = fixture.scene_prep.records.items;
+        for (sorted_indices[dynamic_range.start..dynamic_range.end]) |record_index| {
+            const order = records[record_index].draw.renderOrder();
+            if (last_order) |previous| {
+                try std.testing.expect(previous.lessOrEqual(order));
+            }
+            last_order = order;
+        }
+        dynamic_depth = nextDynamicDepth(&fixture.scene_prep, &dynamic_span_index);
+    }
+    try std.testing.expect(last_order != null);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {

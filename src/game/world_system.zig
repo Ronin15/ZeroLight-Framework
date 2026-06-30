@@ -49,6 +49,7 @@ pub const default_chunk_size_tiles: u16 = 8;
 // lower plane's bands never sort above a higher plane's. Levels descend by this
 // step: level 0 (surface) is highest, deeper levels lower.
 pub const level_z_step: i32 = 16;
+const k_max_dense_submit_layers: usize = 16;
 
 pub const TileFlags = packed struct(u8) {
     walkable: bool = false,
@@ -610,14 +611,26 @@ pub const WorldSystem = struct {
         }
 
         const layer_count = self.denseLayerCount();
-        try renderer.reserveStaticGeometry(layer_count * 6, layer_count);
-        renderer.beginStaticGeometry();
-        const world_w = self.worldWidthPixels();
-        const world_h = self.worldHeightPixels();
+        var submit_layers: [k_max_dense_submit_layers]usize = undefined;
+        var submit_count: usize = 0;
         for (0..layer_count) |layer_index| {
             // Skip floors above the player's plane (a lower level index draws on
             // top), so the player and the level they stand on are not occluded.
             if (self.denseLayerLevel(layer_index) < active_level) continue;
+            if (submit_count >= k_max_dense_submit_layers) return error.TooManyDenseLayers;
+            submit_layers[submit_count] = layer_index;
+            submit_count += 1;
+        }
+        // Back-to-front: deepest plane first so each higher floor composites on top.
+        // Storage index order is surface-first (not ascending depth); sorting here
+        // keeps the linear `mergeDrawList` path correct and makes tunnel carves
+        // visible on the player's plane instead of showing the level below.
+        std.mem.sort(usize, submit_layers[0..submit_count], self, denseLayerIndexLessThan);
+        try renderer.reserveStaticGeometry(submit_count * 6, submit_count);
+        renderer.beginStaticGeometry();
+        const world_w = self.worldWidthPixels();
+        const world_h = self.worldHeightPixels();
+        for (submit_layers[0..submit_count]) |layer_index| {
             // Only the world-space corners (position) are consumed by the tilemap
             // shader; the source/uv are ignored, so the source rect is a placeholder.
             var pos: [6]Position = undefined;
@@ -1143,6 +1156,8 @@ pub const WorldSystem = struct {
         });
     }
 
+    /// Borrows `meta` for `sourceRect` lookups. Production paths keep metadata
+    /// alive via `RuntimeAssets`; standalone tests must call `adoptTilesetMeta`.
     fn buildCatalog(self: *WorldSystem, meta: *const WorldTilesetMeta) !void {
         self.tileset_meta = meta;
         const count = catalogCapacity(meta);
@@ -1376,6 +1391,10 @@ pub const WorldSystem = struct {
             dense.items(.base_z)[layer_index],
             dense.items(.depth_band)[layer_index],
         ));
+    }
+
+    fn denseLayerIndexLessThan(self: *const WorldSystem, a: usize, b: usize) bool {
+        return self.denseLayerOrder(a).depth < self.denseLayerOrder(b).depth;
     }
 
     fn chunkMatchesLayer(self: *const WorldSystem, chunk_index: usize, layer_index: usize) bool {
@@ -2029,6 +2048,38 @@ test "underground demo levels are solid dirt until a cell is dug walkable" {
     const floor1 = world.denseFloorLayerForLevel(1).?;
     _ = try world.setDenseTile(floor1, 2, 2, cave_0);
     try std.testing.expect(!world.levelBlocksMovement(1, 2, 2));
+}
+
+test "dense layer submit order sorts back to front by render depth" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var indices: [3]usize = .{ 0, 1, 2 };
+    std.mem.sort(usize, &indices, &world, WorldSystem.denseLayerIndexLessThan);
+    try std.testing.expectEqual(@as(i32, -34), world.denseLayerOrder(indices[0]).depth);
+    try std.testing.expectEqual(@as(i32, -18), world.denseLayerOrder(indices[1]).depth);
+    try std.testing.expectEqual(@as(i32, -2), world.denseLayerOrder(indices[2]).depth);
+}
+
+test "underground dense layers append in storage order not ascending render depth" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    try std.testing.expectEqual(@as(usize, 3), world.denseLayerCount());
+    const grass_depth = world.denseLayerOrder(0).depth;
+    const dirt_depth = world.denseLayerOrder(1).depth;
+    const dirt_dark_depth = world.denseLayerOrder(2).depth;
+    // Back-to-front draw order: dirt_dark, dirt, grass (grass on top).
+    try std.testing.expect(dirt_dark_depth < dirt_depth and dirt_depth < grass_depth);
+    // `submitStaticDenseGeometry` walks dense_layer index order (surface first):
+    // depths descend with index, so a linear merge must not assume ascending input.
+    try std.testing.expect(grass_depth > dirt_depth and dirt_depth > dirt_dark_depth);
 }
 
 test "level link store round-trips and validates inputs" {

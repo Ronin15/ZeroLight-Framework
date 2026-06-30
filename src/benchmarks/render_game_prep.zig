@@ -328,6 +328,8 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 }
 
 fn collectProductionDynamicRecords(fixture: *Fixture) !void {
+    // Full-world visibility is an upper-bound ceiling for entity_collect_ns, not
+    // the production camera/chunk/AABB cull path.
     setBenchCollectChunkVisibility(fixture);
     const visible = benchCollectVisibleRect(fixture.world_width_px, fixture.world_height_px);
     try render_prep.collectDynamicRecords(
@@ -513,7 +515,8 @@ fn initFixture(fixture: *Fixture, allocator: std.mem.Allocator, io: std.Io, item
 
 fn realisticStaticGroups(tile_texture: sprite_batch.TextureId) [static_group_count]sprite_batch.DrawGroup {
     var groups: [static_group_count]sprite_batch.DrawGroup = undefined;
-    const tilemap_depths = [_]i32{ -4, 0, 4 };
+    // Demo underground stack in `submitStaticDenseGeometry` append order (unsorted).
+    const tilemap_depths = [_]i32{ -2, -18, -34 };
     for (tilemap_depths, 0..) |depth, index| {
         groups[index] = .{
             .source = .static,

@@ -131,8 +131,13 @@ fn releaseVertexStreams(device: *c.SDL_GPUDevice, streams: VertexStreams) void {
 
 pub const Renderer = struct {
     /// Headroom reserved for debug-overlay sprite commands submitted after
-    /// game-state render enqueue (FPS prefix + digit glyphs).
+    /// game-state render enqueue (FPS prefix + digit glyphs). `Engine` adds this
+    /// on top of gameplay reservation after all stacked states render.
     pub const kOverlayCommandHeadroom: usize = 16;
+
+    /// Headroom for stacked-state UI rects/text submitted after gameplay enqueue
+    /// (pause panel, menus) before the debug overlay reserve in `Engine`.
+    pub const kStackedStateUiHeadroom: usize = 32;
 
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
@@ -532,7 +537,6 @@ pub const Renderer = struct {
         if (upload_static) {
             try self.stageStaticVertices();
         }
-        try self.stagePendingTileEdits();
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
         const command_buffer = frame.command_buffer;
@@ -782,7 +786,7 @@ pub const Renderer = struct {
     /// Uploads decoded startup images in one GPU command buffer. Caller owns the
     /// returned slice until each `TextureId` is destroyed.
     pub fn createTexturesFromPixelsBatch(self: *Renderer, images: []const LoadedImage) ![]TextureId {
-        if (images.len == 0) return &.{};
+        if (images.len == 0) return try self.allocator.alloc(TextureId, 0);
 
         const items = try self.allocator.alloc(gpu_texture.BatchUploadItem, images.len);
         defer self.allocator.free(items);
@@ -800,8 +804,13 @@ pub const Renderer = struct {
 
         const ids = try self.allocator.alloc(TextureId, images.len);
         errdefer self.allocator.free(ids);
+        var registered_count: usize = 0;
+        errdefer for (ids[0..registered_count]) |id| {
+            self.destroyTexture(id);
+        };
         for (uploaded, ids) |texture, *id| {
             id.* = try self.registerTexture(texture, false);
+            registered_count += 1;
         }
         return ids;
     }
@@ -830,8 +839,9 @@ pub const Renderer = struct {
     /// skipped. The scratch list resolves handles to buffers and is grow-only.
     pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
         if (edits.len == 0) return;
-        self.tile_edit_scratch.clearRetainingCapacity();
-        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, edits.len);
+        // Grow-only append: pending edits are held until the post-acquire copy pass
+        // runs so a skipped swapchain frame does not drop dig updates.
+        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, self.tile_edit_scratch.items.len + edits.len);
         for (edits) |edit| {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
             const element_count = self.tileDataCount(edit.buffer);
@@ -881,19 +891,6 @@ pub const Renderer = struct {
         }
         self.tile_edit_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
         self.tile_edit_transfer_byte_size = required_bytes;
-    }
-
-    fn stagePendingTileEdits(self: *Renderer) !void {
-        if (!self.tile_edits_pending or self.tile_edit_scratch.items.len == 0) return;
-        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-        try self.ensureTileEditTransfer(required_bytes);
-        const transfer = self.tile_edit_transfer.?;
-        try gpu_buffer.stageStorageRegions(
-            self.device,
-            transfer,
-            self.tile_edit_transfer_byte_size,
-            self.tile_edit_scratch.items,
-        );
     }
 
     fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
@@ -1034,6 +1031,9 @@ pub const Renderer = struct {
     fn ensureFrameBatchCapacity(self: *Renderer) !void {
         const command_count = self.batch.commands.items.len;
         if (command_count == 0) return;
+        if (comptime @import("builtin").mode == .Debug) {
+            std.debug.assert(command_count <= self.command_high_water);
+        }
         if (command_count <= self.command_high_water) return;
 
         const needed_vertices = try std.math.mul(usize, command_count, 6);
@@ -1087,16 +1087,18 @@ pub const Renderer = struct {
         var copy_pass_scope = try gpu_buffer.CopyPassScope.begin(command_buffer);
         defer copy_pass_scope.end();
 
+        // `cycle=true` applies only to ring-buffered vertex streams. Tile-data
+        // storage edits are excluded — they target retained per-layer buffers.
         var uploads_remaining: usize = 0;
         if (work.dynamic) uploads_remaining += 3;
         if (work.static_vertices) uploads_remaining += 3;
-        if (work.tile_edits) uploads_remaining += self.tile_edit_scratch.items.len;
 
         if (work.dynamic) {
             const streams = self.vertex_streams;
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.position_transfer,
+                streams.position_bytes,
                 streams.position,
                 streams.position_bytes,
                 std.mem.sliceAsBytes(self.batch.positions.items),
@@ -1105,6 +1107,7 @@ pub const Renderer = struct {
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.uv_transfer,
+                streams.uv_bytes,
                 streams.uv,
                 streams.uv_bytes,
                 std.mem.sliceAsBytes(self.batch.uvs.items),
@@ -1113,6 +1116,7 @@ pub const Renderer = struct {
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.color_transfer,
+                streams.color_bytes,
                 streams.color,
                 streams.color_bytes,
                 std.mem.sliceAsBytes(self.batch.colors.items),
@@ -1125,6 +1129,7 @@ pub const Renderer = struct {
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.position_transfer,
+                streams.position_bytes,
                 streams.position,
                 streams.position_bytes,
                 std.mem.sliceAsBytes(self.static_positions.items),
@@ -1133,6 +1138,7 @@ pub const Renderer = struct {
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.uv_transfer,
+                streams.uv_bytes,
                 streams.uv,
                 streams.uv_bytes,
                 std.mem.sliceAsBytes(self.static_uvs.items),
@@ -1141,6 +1147,7 @@ pub const Renderer = struct {
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
                 streams.color_transfer,
+                streams.color_bytes,
                 streams.color,
                 streams.color_bytes,
                 std.mem.sliceAsBytes(self.static_colors.items),
@@ -1149,12 +1156,22 @@ pub const Renderer = struct {
         }
 
         if (work.tile_edits) {
+            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+            try self.ensureTileEditTransfer(required_bytes);
             const transfer = self.tile_edit_transfer.?;
+            // Stage immediately before the copy, after swapchain acquire (matches
+            // the working `world` branch timing for dig cell uploads).
+            try gpu_buffer.stageStorageRegions(
+                self.device,
+                transfer,
+                self.tile_edit_transfer_byte_size,
+                self.tile_edit_scratch.items,
+            );
             try gpu_buffer.recordStorageRegionsInPass(
                 copy_pass_scope.pass,
                 transfer,
+                self.tile_edit_transfer_byte_size,
                 self.tile_edit_scratch.items,
-                uploadsRemainingCycle(&uploads_remaining, self.tile_edit_scratch.items.len),
             );
             self.tile_edits_pending = false;
             self.tile_edit_scratch.clearRetainingCapacity();
@@ -1244,8 +1261,7 @@ fn coalesceDrawList(items: []DrawGroup) usize {
 }
 
 // Builds the per-frame unified draw list from retained static spans and dynamic
-// groups. Both inputs must already be nondecreasing by render order; the merge
-// is a linear two-pointer walk, then coalesce.
+// groups: append (static first), stable-sort by order, then coalesce.
 pub fn mergeDrawList(
     out: *std.ArrayListUnmanaged(DrawGroup),
     allocator: std.mem.Allocator,
@@ -1253,32 +1269,13 @@ pub fn mergeDrawList(
     dynamic_groups: []const DrawGroup,
 ) !void {
     out.clearRetainingCapacity();
-    const total = static_groups.len + dynamic_groups.len;
-    try out.ensureTotalCapacity(allocator, total);
-
-    var static_index: usize = 0;
-    var dynamic_index: usize = 0;
-    while (static_index < static_groups.len and dynamic_index < dynamic_groups.len) {
-        const static_group = static_groups[static_index];
-        const dynamic_group = dynamic_groups[dynamic_index];
-        if (drawGroupOrderLessThan({}, static_group, dynamic_group)) {
-            out.appendAssumeCapacity(static_group);
-            static_index += 1;
-        } else if (drawGroupOrderLessThan({}, dynamic_group, static_group)) {
-            out.appendAssumeCapacity(dynamic_group);
-            dynamic_index += 1;
-        } else {
-            // Equal order: static before dynamic (world/dense under sparse/entities).
-            out.appendAssumeCapacity(static_group);
-            static_index += 1;
-        }
-    }
-    while (static_index < static_groups.len) : (static_index += 1) {
-        out.appendAssumeCapacity(static_groups[static_index]);
-    }
-    while (dynamic_index < dynamic_groups.len) : (dynamic_index += 1) {
-        out.appendAssumeCapacity(dynamic_groups[dynamic_index]);
-    }
+    try out.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
+    out.appendSliceAssumeCapacity(static_groups);
+    out.appendSliceAssumeCapacity(dynamic_groups);
+    // Stability is load-bearing: static groups are appended first so that at equal
+    // order they draw before dynamic (world/dense under sparse/entities). Do not
+    // swap to an unstable sort without restoring that tie-break another way.
+    std.mem.sort(DrawGroup, out.items, {}, drawGroupOrderLessThan);
     out.items.len = coalesceDrawList(out.items);
 }
 
@@ -1749,6 +1746,34 @@ test "draw list keeps non-contiguous spans separate" {
     try mergeDrawList(&list, allocator, &static_groups, &.{});
 
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "mergeDrawList sorts unsorted underground dense layers back to front" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // `submitStaticDenseGeometry` appends in dense-layer index order (surface
+    // grass first), which is not ascending by render depth. The merge must sort
+    // so dirt_dark draws first and grass last.
+    var grass = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6);
+    grass.material = .tilemap;
+    var dirt = testDrawGroup(.static, 0, .world, RenderOrder.world(-18), 6, 6);
+    dirt.material = .tilemap;
+    var dirt_dark = testDrawGroup(.static, 0, .world, RenderOrder.world(-34), 12, 6);
+    dirt_dark.material = .tilemap;
+    const static_groups = [_]DrawGroup{ grass, dirt, dirt_dark };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(-1), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(@as(usize, 4), list.items.len);
+    try std.testing.expectEqual(@as(i32, -34), list.items[0].order.depth);
+    try std.testing.expectEqual(@as(i32, -18), list.items[1].order.depth);
+    try std.testing.expectEqual(@as(i32, -2), list.items[2].order.depth);
+    try std.testing.expectEqual(@as(i32, -1), list.items[3].order.depth);
 }
 
 test "tilemap layer quads interleave with dynamic groups by render order" {
