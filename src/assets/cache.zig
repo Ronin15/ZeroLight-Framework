@@ -88,7 +88,6 @@ pub const AssetCache = struct {
         errdefer if (!entry_inserted) self.allocator.free(owned_path);
 
         var loaded_image = image.loadPng(self.assets, owned_path) catch |err| {
-            log.warn("texture asset unavailable \"{s}\": {}", .{ owned_path, err });
             return err;
         };
         defer loaded_image.deinit();
