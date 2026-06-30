@@ -39,7 +39,8 @@ init/reserve/warmup, and treat performance-sensitive runtime behavior as correct
 - `src/app/` — engine coordination, state stack, input routing, pause policy, timing,
   frame pacing, audio service, thread system.
 - `src/render/` — SDL_GPU renderer, camera, resources, text, debug overlay.
-- `src/game/` — game/demo states, gameplay behavior, `DataSystem`, ECS-style processors.
+- `src/game/` — game/demo states, `WorldSystem`, `DataSystem`, `SimulationPipeline`,
+  pipeline-owned controllers, and SoA processors (including `pathfinding/`).
 - `src/platform/` — SDL/platform helpers, GPU smoke implementation.
 - `src/assets/` — runtime path resolution, installed asset loading, typed manifest,
   `RuntimeAssets` catalog.
@@ -71,7 +72,7 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
    partially initialized resources.
 9. Persist gameplay/render-prep data by stable asset IDs (`SpriteAssetId`, `AudioAssetId`),
    not string paths, live renderer/SDL/audio handles, or prepared draw records. Convert
-   stable IDs to renderer texture IDs at the render-prep/queue boundary, not in `DataSystem`.
+   stable IDs to renderer texture IDs at the render-prep boundary, not in `DataSystem`.
    Keep asset paths relative and traversal-safe.
 10. Log only through `src/core/logging.zig` scoped loggers, never raw `std.log`/`std.debug.print`;
     `warn` for recovered degradation, `err` for real failures; pure helpers/validation stay

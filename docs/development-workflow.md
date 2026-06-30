@@ -93,6 +93,10 @@ On Windows, the shader pipeline is GLSL to SPIR-V with `glslc`, SPIR-V to HLSL
 with `spirv-cross --hlsl --shader-model 60`, and HLSL to DXIL with `dxc` using
 `vs_6_0` or `ps_6_0` targets. Installed Windows shader files end in `.dxil`.
 
+On native **Linux GNU** targets, `build.zig` forces LLVM and LLD for the game,
+benchmark, test, and GPU-smoke executables. This is a temporary Debug-build
+workaround; other targets use Zig's default backend selection.
+
 ## Windows SDL Packages
 
 The pinned Windows SDL packages are declared in `build.zig.zon` and fetched by
@@ -194,8 +198,9 @@ generated-output rules live in `docs/coding-standards.md`.
 
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
 transient particle rows, AI agents, steering agents, dense collision bodies,
-sparse collision bodies, collision-response contacts, and renderer sprite CPU
-prep, plus pathfinding open-list, common-goal, cached-result, and hard-fallback
+sparse collision bodies, collision-response contacts, scoped simulation gathers,
+incremental nav rebuilds, and renderer sprite CPU prep, plus pathfinding
+open-list, common-goal, cached-result, hard-fallback, and production-scale nav
 workloads. The default run exercises one serial baseline, fixed-worker, fixed
 small-range, fixed large-range, and adaptive cases so the full processor flow can
 be checked for regressions.
@@ -298,9 +303,15 @@ zig build bench -- --group steering --details
 zig build bench -- --group render-prep --details
 zig build bench -- --group pathfinding-hard-fallback --details
 zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
+zig build bench -- --group nav-update-scattered --details
+zig build bench -- --group nav-update-multichunk --details
+zig build bench -- --group scope --details
 zig build -Doptimize=ReleaseFast bench -- --group pathfinding-hard-fallback-budget --items 2000 --fallback-budget 128 --case thread-adaptive-tuned-range --details
 zig build bench -- --details
 ```
+
+For scripted benchmark capture with timestamped output under `benchmark_outputs/`,
+use `tools/bench_run.py` (see [tools/README.md](../tools/README.md)).
 
 ## GPU Smoke
 

@@ -8,8 +8,10 @@ ZeroLight-Framework is a 2D game framework built on **Zig 0.16** and
 **SDL3 / SDL_GPU**. It runs a thin executable timing layer over a fixed-step
 **60Hz** simulation, a state stack with policy-driven input routing, and
 atlas-backed runtime assets addressed by stable IDs. Gameplay is data-oriented:
-dense **SoA** stores for entities and world data, with multithreaded and
-SIMD-aware processors for movement, AI, steering, collision, and particles.
+dense **SoA** stores for entities and world data (`DataSystem`, `WorldSystem`),
+with a state-owned `SimulationPipeline`, scoped simulation tiers, and
+multithreaded/SIMD processors for movement, AI, steering, collision,
+pathfinding, and particles.
 
 ## Source Of Truth (`docs/`)
 
@@ -23,11 +25,12 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
 - `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — live roadmap (Slice 8 hardening,
-  frontier slices 18+, priorities, suggested order); settled slices 0–7 and
+- `docs/framework-implementation-slices.md` — live frontier roadmap (Slice 8
+  hardening, slices 22+, priorities, suggested order); settled slices 0–7 and
   9–17 are in `docs/framework-implementation-slices-archive.md`.
-- `docs/changelogs/` — per-phase feature changelog summaries.
-- `docs/reviews/` — module deep-dive reviews (e.g. pathfinder).
+- `docs/changelogs/` — per-branch feature changelog summaries (latest:
+  `docs/changelogs/world.md`).
+- `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
 
 ## Module Ownership (`src/`)
 
@@ -56,7 +59,8 @@ boundaries just to make a local change easier.
   `PathfindingSystem` owns nav-invalidation classification and the post-commit nav
   reaction; the state only invokes it via the pipeline.
 - `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
-  GPU smoke probe. `src/benchmarks/` — CPU gameplay/render-prep benchmarks.
+  GPU smoke probe. `src/benchmarks/` — CPU gameplay, pathfinding, nav-update,
+  scope, and render-prep benchmarks.
 
 ## Working Rules
 

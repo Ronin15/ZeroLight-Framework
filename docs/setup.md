@@ -75,3 +75,7 @@ SDL3 development files, SDL3_ttf development files, `glslc`, Vulkan loader and
 headers, SDL3_mixer development files, and a Vulkan-capable driver.
 
 SDL_GPU should select Vulkan when the build provides installed SPIR-V shaders.
+
+Native Linux GNU builds force LLVM and LLD through `build.zig` as a temporary
+Debug-build workaround. Other targets use Zig's default backend selection. See
+[development workflow](development-workflow.md) for build-option details.

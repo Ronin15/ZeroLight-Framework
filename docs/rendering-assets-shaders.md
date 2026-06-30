@@ -40,8 +40,10 @@ To add a new GPU material (shader + pipeline):
 4. Create `src/render/gpu/{name}_pipeline.zig` with a material descriptor
    struct that uses `shader_paths.vertex("{name}", "spv")` etc. for paths and
    `sprite_pipeline.selectShaderSet` (or `shaderSetForFormat`) for format
-   selection. List resource counts (sampler, storage buffer, uniform buffer
-   counts) — no SDL_GPU handles or game-state references cross this boundary.
+   selection. Use `tilemap_pipeline.zig` as the reference when the material
+   needs storage buffers or a different vertex layout. List resource counts
+   (sampler, storage buffer, uniform buffer counts) — no SDL_GPU handles or
+   game-state references cross this boundary.
 5. Add a `*c.SDL_GPUGraphicsPipeline` field to `Renderer` in
    `src/render/renderer.zig`.
 6. Call `create{Name}Pipeline()` in `Renderer.init()`.
@@ -53,11 +55,12 @@ into game code.
 
 ## Sprite Rendering
 
-Sprites and colored rectangles flow through an explicit render-prep queue when
-multiple producers can interleave world, effect, UI, or debug records. The queue
-sorts transient draw records by `RenderOrder`: world z first, then UI, then
-debug. `SpriteBatch` remains a strict ordered-stream consumer: it streams the
-per-frame **dynamic** vertex data (entities, particles, UI, sparse tiles) and
+Sprites and colored rectangles flow through explicit ordered render-prep phases.
+Game states and helpers submit draw records in nondecreasing `RenderOrder`:
+world z first, then UI, then debug. Multiple producers (entities, particles,
+sparse tiles, UI, debug) each own a phase or pass that preserves that order
+before records reach `Renderer`/`SpriteBatch`. `SpriteBatch` remains a strict
+ordered-stream consumer: it streams the per-frame **dynamic** vertex data and
 submits by texture and coordinate-presentation groups. Vertices are stored
 **SoA**: three per-attribute columns (`position`, `uv`, `color`) emitted into
 three GPU vertex buffers, not one interleaved struct. Texture ownership is
