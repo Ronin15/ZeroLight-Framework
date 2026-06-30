@@ -655,10 +655,6 @@ fn scanTierPolicy(
     const cog = simd.splatInt4(@intCast(cognition_halo_chunks));
     const loco = simd.splatInt4(@intCast(locomotion_halo_chunks));
     const kin = simd.splatInt4(@intCast(kinematic_halo_chunks));
-    const tier_cognition = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.cognition)));
-    const tier_locomotion = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.locomotion)));
-    const tier_kinematic = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.kinematic)));
-    const tier_dormant = simd.splatInt4(@intCast(@intFromEnum(SimulationTier.dormant)));
 
     var i = start;
     const vend = start + simd.vectorizedEnd(end - start);
@@ -679,15 +675,15 @@ fn scanTierPolicy(
         const level_delta = simd.subInt4(lv, region_level);
         const level_abs = simd.maxInt4(level_delta, simd.subInt4(zero, level_delta));
         const distance = simd.maxInt4(chebyshev, simd.mulInt4(level_abs, penalty_per));
-        // Band ladder: start nearest, demote one band per crossed threshold. Since
-        // the halos are monotonic, the farthest crossed threshold wins per lane.
-        var tier = tier_cognition;
-        tier = simd.selectInt4(simd.greaterThanInt4(distance, cog), tier_locomotion, tier);
-        tier = simd.selectInt4(simd.greaterThanInt4(distance, loco), tier_kinematic, tier);
-        tier = simd.selectInt4(simd.greaterThanInt4(distance, kin), tier_dormant, tier);
+        const over_cog = simd.subInt4(distance, cog);
+        const over_loco = simd.subInt4(distance, loco);
+        const over_kin = simd.subInt4(distance, kin);
         inline for (0..simd.lane_count) |lane| {
             const idx = i + lane;
-            const correct_tier: SimulationTier = @enumFromInt(tier[lane]);
+            var correct_tier: SimulationTier = .cognition;
+            if (over_cog[lane] > 0) correct_tier = .locomotion;
+            if (over_loco[lane] > 0) correct_tier = .kinematic;
+            if (over_kin[lane] > 0) correct_tier = .dormant;
             if (!scope.always_active[idx] and scope.tier[idx] != correct_tier) {
                 out.appendAssumeCapacity(.{ .set_simulation_tier = .{ .entity = scope.entities[idx], .tier = correct_tier } });
             }

@@ -522,32 +522,29 @@ pub const WorldSystem = struct {
         // Visibility is a half-open box test over the chunk-coord columns, four
         // chunks at a time: `c >= min` becomes `c > min-1` and `c <= max` becomes
         // `c < max+1` so it maps onto the greater/less helpers, and the per-axis
-        // masks AND together. Chunk visibility still crops sparse tiles, but no
-        // longer drives dense rendering: each dense layer is one full-world tilemap
-        // quad, so a pan uploads nothing.
-        const min_x = simd.splatInt4(@as(i32, min_chunk_x) - 1);
-        const max_x = simd.splatInt4(@as(i32, max_chunk_x) + 1);
-        const min_y = simd.splatInt4(@as(i32, min_chunk_y) - 1);
-        const max_y = simd.splatInt4(@as(i32, max_chunk_y) + 1);
+        // margins must all be non-negative. Chunk visibility still crops sparse
+        // tiles, but no longer drives dense rendering: each dense layer is one
+        // full-world tilemap quad, so a pan uploads nothing.
+        const min_x = simd.splatInt4(@as(i32, min_chunk_x));
+        const max_x = simd.splatInt4(@as(i32, max_chunk_x));
+        const min_y = simd.splatInt4(@as(i32, min_chunk_y));
+        const max_y = simd.splatInt4(@as(i32, max_chunk_y));
         const count = self.chunks.len;
         const chunk_x = self.chunks.items(.x);
         const chunk_y = self.chunks.items(.y);
         const chunk_visible = self.chunks.items(.visible);
         var index: usize = 0;
         const vectorized_end = simd.vectorizedEnd(count);
-        const one = simd.splatInt4(1);
-        const zero = simd.splatInt4(0);
         while (index < vectorized_end) : (index += simd.lane_count) {
             const cx = simd.loadInt4(chunk_x[index..]);
             const cy = simd.loadInt4(chunk_y[index..]);
-            // i32 select chain avoids bool-vector `&` and lane stores (LLVM -ODebug DWARF bug).
-            var vis = one;
-            vis = simd.selectInt4(simd.greaterThanInt4(cx, min_x), vis, zero);
-            vis = simd.selectInt4(simd.lessThanInt4(cx, max_x), vis, zero);
-            vis = simd.selectInt4(simd.greaterThanInt4(cy, min_y), vis, zero);
-            vis = simd.selectInt4(simd.lessThanInt4(cy, max_y), vis, zero);
+            const dx_low = simd.subInt4(cx, min_x);
+            const dx_high = simd.subInt4(max_x, cx);
+            const dy_low = simd.subInt4(cy, min_y);
+            const dy_high = simd.subInt4(max_y, cy);
+            const margin = simd.minInt4(simd.minInt4(dx_low, dx_high), simd.minInt4(dy_low, dy_high));
             inline for (0..simd.lane_count) |lane| {
-                chunk_visible[index + lane] = vis[lane] != 0;
+                chunk_visible[index + lane] = margin[lane] >= 0;
             }
         }
         while (index < count) : (index += 1) {
