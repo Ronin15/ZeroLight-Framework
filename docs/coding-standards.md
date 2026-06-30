@@ -64,9 +64,9 @@ sharing writable cache lines in hot SoA columns.
 Prefer `std.MultiArrayList` when several columns grow, shrink, append, or
 swap-remove **together** as one logical row. This is the default for persistent
 `DataSystem` component stores, state-owned dense pools (for example
-`ParticleSystem`), and per-step gather/scratch buffers built by parallel
-`appendAssumeCapacity` across matching lengths (collision proxies, AI gather
-rows, steering selected-work columns, collision-response intent rows).
+`ParticleSystem`), and per-step gather/scratch buffers built across matching
+lengths (collision proxies, AI gather rows, steering selected-work columns,
+collision-response intent rows).
 
 Pattern:
 
@@ -78,8 +78,10 @@ Pattern:
 - Reserve with `rows.ensureTotalCapacity(allocator, hotStoreCapacity(n))` where
   hot threading/SIMD ranges need item alignment (`alignItemCount` from
   `thread_system.zig`).
-- Emit or gather with one `rows.appendAssumeCapacity(row)` (or `set`) per row,
-  not N separate column appends.
+- Cold emit/setup (particles, world build, one-off row inserts) may use
+  `rows.appendAssumeCapacity(row)` after `ensureTotalCapacity`.
+- Hot gather loops must **not** call `rows.appendAssumeCapacity(row)` per row;
+  use the fast-append helper instead (see below).
 - Compact with `rows.swapRemove(index)` when unordered removal is acceptable.
 
 Do **not** migrate to MAL when the layout is intentionally different:
@@ -97,7 +99,26 @@ Hot-path rules for MAL (mandatory):
 - Call `rows.slice()` **once** per stage or function, then reuse column slices
   (`const ages = s.items(.age)`). Never call `rows.items(.field)` inside a loop;
   each call rebuilds slice pointers and has caused large regressions in Debug
-  and Release.
+  and Release. Single-index cold accessors should still call `rows.slice()` once
+  in the helper rather than `rows.items(.field)` directly.
+- Hot gather append pattern (mandatory in per-step gather loops):
+
+```zig
+fn appendMalRow(
+    rows: *std.MultiArrayList(Row),
+    row_slice: *std.MultiArrayList(Row).Slice,
+    row: Row,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+```
+
+  Capture `var row_slice = rows.slice()` once before the gather loop and pass
+  `&row_slice` into the helper. `MAL.appendAssumeCapacity` internally calls
+  `set()`/`slice()` per row and has measured ~45% Debug regressions on gather
+  paths; `addOneAssumeCapacity` + `set` avoids that overhead.
 - Publish hot float column types as plain `[]f32` / `[]const f32`. Do not
   require `[]align(64) f32` on MAL column slices; MAL does not guarantee
   64-byte column bases. Range alignment (16 items) is for threading chunk

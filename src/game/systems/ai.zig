@@ -765,6 +765,49 @@ fn serialBatch(count: usize) BatchStats {
     return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
 }
 
+fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !void {
+    const count = rows.len;
+    const s = rows.slice();
+    try std.testing.expectEqual(count, s.items(.entity).len);
+    try std.testing.expectEqual(count, s.items(.pos_x).len);
+    try std.testing.expectEqual(count, s.items(.pos_y).len);
+    try std.testing.expectEqual(count, s.items(.behavior).len);
+    try std.testing.expectEqual(count, s.items(.wander_amplitude).len);
+    try std.testing.expectEqual(count, s.items(.seek_weight).len);
+    try std.testing.expectEqual(count, s.items(.sep_x).len);
+    try std.testing.expectEqual(count, s.items(.sep_y).len);
+    try std.testing.expectEqual(count, s.items(.separation_neighbor_count).len);
+    try std.testing.expectEqual(count, s.items(.separation_candidate_count).len);
+}
+
+test "ai gather rows keep MAL columns compact after gather" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 10, .y = 20 }, .previous_position = .{ .x = 10, .y = 20 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    const e1 = try data.createEntity();
+    try data.setMovementBody(e1, .{ .position = .{ .x = 30, .y = 40 }, .previous_position = .{ .x = 30, .y = 40 }, .velocity = .{}, .speed = 35 });
+    try data.setAiAgent(e1, .{ .behavior = .wander, .wander_amplitude = 8, .seek_weight = 0.5 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    frame.beginStep();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+        .intent_seed = 0xabc,
+        .seek_target = .{ .x = 100, .y = 100 },
+    });
+
+    try expectAiGatherColumnsAligned(&ai_sys.rows);
+    try std.testing.expectEqual(@as(usize, 2), ai_sys.rows.len);
+    frame.phase = .finished;
+}
+
 test "ai processor emits deterministic NavigationIntent for same seed" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();

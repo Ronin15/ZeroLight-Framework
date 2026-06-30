@@ -1271,6 +1271,39 @@ fn sumU16(values: []const u16) usize {
     return total;
 }
 
+fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapshotRow)) !void {
+    const count = rows.len;
+    const s = rows.slice();
+    try std.testing.expectEqual(count, s.items(.entity).len);
+    try std.testing.expectEqual(count, s.items(.x).len);
+    try std.testing.expectEqual(count, s.items(.y).len);
+    try std.testing.expectEqual(count, s.items(.radius).len);
+}
+
+test "steering agent snapshot rows keep MAL columns compact after gather" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    _ = try addSteeredEntity(&data, .{ .x = 32, .y = 16 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+
+    try expectAgentSnapshotColumnsAligned(&steering.agent_snapshot_rows);
+    try std.testing.expectEqual(@as(usize, 2), steering.agent_snapshot_rows.len);
+}
+
 test "steering requests missing paths then follows available path results" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

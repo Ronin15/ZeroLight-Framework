@@ -182,6 +182,16 @@ const ParticleRow = struct {
     z: i32,
 };
 
+fn appendParticleRow(
+    rows: *std.MultiArrayList(ParticleRow),
+    row_slice: *std.MultiArrayList(ParticleRow).Slice,
+    row: ParticleRow,
+) void {
+    _ = rows.addOneAssumeCapacity();
+    row_slice.len = rows.len;
+    row_slice.set(rows.len - 1, row);
+}
+
 fn spawnToRow(spawn: ParticleSpawn) ParticleRow {
     return .{
         .position_x = spawn.position.x,
@@ -311,7 +321,8 @@ pub const ParticleSystem = struct {
         if (self.activeCount() >= self.capacity) return false;
         if (spawn.lifetime <= 0) return false;
 
-        self.rows.appendAssumeCapacity(spawnToRow(spawn));
+        var row_slice = self.rows.slice();
+        appendParticleRow(&self.rows, &row_slice, spawnToRow(spawn));
         return true;
     }
 

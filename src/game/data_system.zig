@@ -1801,7 +1801,7 @@ const MovementBodyStore = struct {
     }
 
     fn tierAt(self: *const MovementBodyStore, index: usize) SimulationTier {
-        return self.rows.items(.tier)[index];
+        return self.rows.slice().items(.tier)[index];
     }
 
     fn scopeMetadataAt(self: *const MovementBodyStore, index: usize) EntitySimulationMetadata {
@@ -1947,7 +1947,7 @@ const FacingStore = struct {
     }
 
     fn directionAt(self: *const FacingStore, index: usize) Facing {
-        return self.rows.items(.direction)[index];
+        return self.rows.slice().items(.direction)[index];
     }
 
     fn removeAt(self: *FacingStore, index: usize) ?EntityId {
