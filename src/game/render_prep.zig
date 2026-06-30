@@ -389,6 +389,21 @@ pub fn ensureScenePrepCapacity(prep: *DynamicScenePrep, scene: GameplayScene) !v
     try prep.ensureCapacity(dynamicRecordCapacity(scene));
 }
 
+/// Peak retained static tilemap geometry for the world's dense render window.
+/// Grow-only; safe to call each gameplay frame before dense layer submit.
+pub fn staticGeometryCapacity(scene: GameplayScene) struct { vertex_capacity: usize, span_capacity: usize } {
+    const span_capacity = scene.world.maxDenseSubmitLayerCount();
+    return .{
+        .vertex_capacity = span_capacity * 6,
+        .span_capacity = span_capacity,
+    };
+}
+
+pub fn ensureStaticGeometryCapacity(scene: GameplayScene, renderer: *Renderer) !void {
+    const capacity = staticGeometryCapacity(scene);
+    try renderer.reserveStaticGeometry(capacity.vertex_capacity, capacity.span_capacity);
+}
+
 /// Collects visible dynamic draws, then merges sparse world layers and dynamic
 /// spans by world z before submitting ordered commands to `Renderer`.
 pub fn submitGameplayFrame(
@@ -399,6 +414,7 @@ pub fn submitGameplayFrame(
     interpolation_alpha: f32,
     camera_rect: Rect,
 ) !void {
+    try ensureStaticGeometryCapacity(scene, renderer);
     const visible = VisibleWorldRect.fromCameraRect(
         camera_rect,
         scene.overscan_chunks,

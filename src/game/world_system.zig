@@ -49,7 +49,10 @@ pub const default_chunk_size_tiles: u16 = 8;
 // lower plane's bands never sort above a higher plane's. Levels descend by this
 // step: level 0 (surface) is highest, deeper levels lower.
 pub const level_z_step: i32 = 16;
-const k_max_dense_submit_layers: usize = 16;
+/// Stack cap for dense submit collection. Sized above the default window
+/// (8 level indices × 2 bands). Build-time validation keeps real worlds inside
+/// `maxDenseSubmitLayerCount`; overflow here is a defensive submit-time guard.
+pub const k_max_dense_submit_stack_cap: usize = 32;
 
 pub const TileFlags = packed struct(u8) {
     walkable: bool = false,
@@ -58,11 +61,57 @@ pub const TileFlags = packed struct(u8) {
     reserved: u5 = 0,
 };
 
+/// Vertical dense-floor render visibility policy. Affects static tilemap submit
+/// and draw count only; all authored dense layers still retain GPU tile-data
+/// buffers. Re-submit fires when `dense_quads_dirty`, `active_level`, or this
+/// window changes.
+pub const DenseLayerRenderWindow = struct {
+    /// Inclusive count of world levels below `active_level` to submit.
+    levels_below: u16 = 6,
+    /// Optional: when underground (`active_level > 0`), also submit one level
+    /// above the player. Off by default — whole-layer tilemaps cannot do per-cell
+    /// shaft cull, so enabling this redraws the full ceiling plane and breaks the
+    /// render slice following the player down. Hole see-through from the surface
+    /// uses `levels_below` while `active_level == 0`.
+    ceiling_when_underground: bool = false,
+
+    pub fn maxLevelSpan(self: DenseLayerRenderWindow) u16 {
+        var span: u16 = 1 + self.levels_below;
+        if (self.ceiling_when_underground) span += 1;
+        return span;
+    }
+
+    pub fn maxSubmitLayers(self: DenseLayerRenderWindow, max_dense_bands_per_level: u8) usize {
+        return @as(usize, self.maxLevelSpan()) * @as(usize, max_dense_bands_per_level);
+    }
+
+    pub fn levelInWindow(
+        self: DenseLayerRenderWindow,
+        active_level: u16,
+        world_level: u16,
+        max_world_level: u16,
+    ) bool {
+        if (self.ceiling_when_underground and active_level > 0 and world_level == active_level - 1) {
+            return true;
+        }
+        if (world_level < active_level) return false;
+        const deep_limit = @min(
+            @as(u32, active_level) +% @as(u32, self.levels_below),
+            @as(u32, max_world_level),
+        );
+        return @as(u32, world_level) <= deep_limit;
+    }
+};
+
 pub const WorldBuildConfig = struct {
     width_tiles: u16 = 512,
     height_tiles: u16 = 512,
     chunk_size_tiles: u16 = 16,
     seed: u64 = 0x51d1_ea5e_2026_0624,
+    max_dense_bands_per_level: u8 = 2,
+    /// Zero disables the load-time GPU tile-buffer budget gate.
+    max_dense_tile_gpu_bytes: usize = 0,
+    render_window: DenseLayerRenderWindow = .{},
 };
 
 // Stable tile-cell coordinate used by persistent world facts (e.g. LevelLink).
@@ -268,10 +317,14 @@ pub const WorldSystem = struct {
     // old vertex cache this never flips on a pan — the quads are full-world and the
     // camera lives in the shader, so panning uploads nothing.
     dense_quads_dirty: bool = true,
-    // The plane the dense geometry was last submitted for. Floors above the active
-    // plane are skipped so descending reveals the player's level; a change forces a
+    // Last dense static submit anchor and window fingerprint. A change forces a
     // re-submit even without a structural edit. Sentinel forces the first submit.
     submitted_active_level: u16 = std.math.maxInt(u16),
+    submitted_window: DenseLayerRenderWindow = .{},
+    render_window: DenseLayerRenderWindow = .{},
+    max_dense_bands_per_level: u8 = 2,
+    max_dense_tile_gpu_bytes: usize = 0,
+    dense_bands_per_level: std.ArrayList(u8) = .empty,
 
     pub fn initDemo(
         allocator: std.mem.Allocator,
@@ -283,6 +336,7 @@ pub const WorldSystem = struct {
         var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
         errdefer world.deinit();
         try world.addUndergroundLevels(meta);
+        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -296,6 +350,7 @@ pub const WorldSystem = struct {
         var world = try initProceduralFromMeta(allocator, meta, config, thread_system);
         errdefer world.deinit();
         try world.addUndergroundLevels(meta);
+        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -312,6 +367,9 @@ pub const WorldSystem = struct {
             .tile_size = meta.tileSize(),
             .chunk_size_tiles = @max(config.chunk_size_tiles, 1),
             .atlas_texture = atlasTextureDesc(meta),
+            .render_window = config.render_window,
+            .max_dense_bands_per_level = config.max_dense_bands_per_level,
+            .max_dense_tile_gpu_bytes = config.max_dense_tile_gpu_bytes,
         };
         errdefer world.deinit();
 
@@ -427,6 +485,7 @@ pub const WorldSystem = struct {
         var world = try initDemoFromMeta(allocator, meta, bounds_width, bounds_height);
         errdefer world.deinit();
         try world.addUndergroundLevels(meta);
+        try world.validateDenseRenderBudget();
         return world;
     }
 
@@ -443,6 +502,7 @@ pub const WorldSystem = struct {
         self.dense_layer_tile_buffers.deinit(self.allocator);
         self.dense_tile_ids.deinit(self.allocator);
         self.dense_layers.deinit(self.allocator);
+        self.dense_bands_per_level.deinit(self.allocator);
 
         self.level_links.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
@@ -460,6 +520,30 @@ pub const WorldSystem = struct {
     /// dynamic sprite batch, so only visible sparse tiles count here.
     pub fn reserveRenderRecords(self: *const WorldSystem) usize {
         return self.visible_sparse_count;
+    }
+
+    /// Upper bound on dense tilemap static groups submitted in one frame for the
+    /// configured render window and per-level band cap.
+    pub fn maxDenseSubmitLayerCount(self: *const WorldSystem) usize {
+        return self.render_window.maxSubmitLayers(self.max_dense_bands_per_level);
+    }
+
+    pub fn estimateDenseTileGpuBytes(self: *const WorldSystem) usize {
+        return self.denseLayerCount() * self.cellCount() * @sizeOf(u32);
+    }
+
+    pub fn validateDenseRenderBudget(self: *const WorldSystem) error{ DenseLayerWindowExceeded, DenseTileGpuBudgetExceeded }!void {
+        if (self.maxDenseSubmitLayerCount() > k_max_dense_submit_stack_cap) {
+            return error.DenseLayerWindowExceeded;
+        }
+        for (self.dense_bands_per_level.items) |band_count| {
+            if (band_count > self.max_dense_bands_per_level) {
+                return error.DenseLayerWindowExceeded;
+            }
+        }
+        if (self.max_dense_tile_gpu_bytes > 0 and self.estimateDenseTileGpuBytes() > self.max_dense_tile_gpu_bytes) {
+            return error.DenseTileGpuBudgetExceeded;
+        }
     }
 
     pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
@@ -596,10 +680,12 @@ pub const WorldSystem = struct {
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
         try self.uploadDenseLayerBuffers(renderer);
-        // Re-submit on a structural change OR when the visible plane changed: floors
-        // above the player's plane are skipped so they don't occlude the level the
-        // player stands on (the render slice follows the player down).
-        if (!self.dense_quads_dirty and active_level == self.submitted_active_level) return;
+        // Re-submit on a structural change OR when the player's active level (or
+        // window) changed: floors above the player's plane are skipped so the
+        // dense render slice follows the player down through level transitions.
+        if (!self.dense_quads_dirty and
+            active_level == self.submitted_active_level and
+            windowsEqual(self.render_window, self.submitted_window)) return;
 
         // The tilemap atlas params are baked from the world atlas dimensions at init;
         // the bound runtime texture must match. Safe-build only, and only on a
@@ -610,23 +696,9 @@ pub const WorldSystem = struct {
             }
         }
 
-        const layer_count = self.denseLayerCount();
-        var submit_layers: [k_max_dense_submit_layers]usize = undefined;
-        var submit_count: usize = 0;
-        for (0..layer_count) |layer_index| {
-            // Skip floors above the player's plane (a lower level index draws on
-            // top), so the player and the level they stand on are not occluded.
-            if (self.denseLayerLevel(layer_index) < active_level) continue;
-            if (submit_count >= k_max_dense_submit_layers) return error.TooManyDenseLayers;
-            submit_layers[submit_count] = layer_index;
-            submit_count += 1;
-        }
-        // Back-to-front: deepest plane first so each higher floor composites on top.
-        // Storage index order is surface-first (not ascending depth); sorting here
-        // keeps the linear `mergeDrawList` path correct and makes tunnel carves
-        // visible on the player's plane instead of showing the level below.
-        std.mem.sort(usize, submit_layers[0..submit_count], self, denseLayerIndexLessThan);
-        try renderer.reserveStaticGeometry(submit_count * 6, submit_count);
+        var submit_layers: [k_max_dense_submit_stack_cap]usize = undefined;
+        const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
+        std.debug.assert(submit_count <= self.maxDenseSubmitLayerCount());
         renderer.beginStaticGeometry();
         const world_w = self.worldWidthPixels();
         const world_h = self.worldHeightPixels();
@@ -650,6 +722,30 @@ pub const WorldSystem = struct {
         }
         self.dense_quads_dirty = false;
         self.submitted_active_level = active_level;
+        self.submitted_window = self.render_window;
+    }
+
+    fn collectDenseSubmitLayers(
+        self: *const WorldSystem,
+        active_level: u16,
+        out: []usize,
+    ) error{TooManyDenseLayers}!usize {
+        const max_world_level: u16 = if (self.levelCount() == 0)
+            0
+        else
+            @intCast(self.levelCount() - 1);
+        var submit_count: usize = 0;
+        const layer_count = self.denseLayerCount();
+        for (0..layer_count) |layer_index| {
+            const world_level = self.denseLayerLevel(layer_index);
+            if (!self.render_window.levelInWindow(active_level, world_level, max_world_level)) continue;
+            if (submit_count >= out.len) return error.TooManyDenseLayers;
+            out[submit_count] = layer_index;
+            submit_count += 1;
+        }
+        // Back-to-front: deepest plane first so each higher floor composites on top.
+        std.mem.sort(usize, out[0..submit_count], self, denseLayerIndexLessThan);
+        return submit_count;
     }
 
     /// Flushes queued per-cell tile edits (digs/builds) to the GPU in one batched
@@ -1040,6 +1136,7 @@ pub const WorldSystem = struct {
     pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
+        try self.trackDenseBandForLevel(level_index);
         const layer_index = self.dense_layers.len;
         try self.dense_layers.ensureTotalCapacity(self.allocator, layer_index + 1);
         try self.dense_tile_ids.ensureUnusedCapacity(self.allocator, self.cellCount());
@@ -1393,6 +1490,17 @@ pub const WorldSystem = struct {
         ));
     }
 
+    fn trackDenseBandForLevel(self: *WorldSystem, level_index: u16) error{ DenseLayerWindowExceeded, OutOfMemory }!void {
+        const slot = @as(usize, level_index) + 1;
+        try self.dense_bands_per_level.ensureTotalCapacity(self.allocator, slot);
+        while (self.dense_bands_per_level.items.len < slot) {
+            self.dense_bands_per_level.appendAssumeCapacity(0);
+        }
+        const next = self.dense_bands_per_level.items[level_index] +% 1;
+        if (next == 0 or next > self.max_dense_bands_per_level) return error.DenseLayerWindowExceeded;
+        self.dense_bands_per_level.items[level_index] = next;
+    }
+
     fn denseLayerIndexLessThan(self: *const WorldSystem, a: usize, b: usize) bool {
         return self.denseLayerOrder(a).depth < self.denseLayerOrder(b).depth;
     }
@@ -1506,6 +1614,10 @@ fn proceduralGroundTile(build: ProceduralBuildContext, x: u16, y: u16) TileId {
     // `dirt` is a solid underground material now; the surface accent is grass_patchy.
     if ((h & 7) == 0) return build.ids.grass_patchy;
     return build.ids.grass;
+}
+
+fn windowsEqual(a: DenseLayerRenderWindow, b: DenseLayerRenderWindow) bool {
+    return a.levels_below == b.levels_below and a.ceiling_when_underground == b.ceiling_when_underground;
 }
 
 fn atlasTextureDesc(meta: *const WorldTilesetMeta) TextureDesc {
@@ -2292,4 +2404,191 @@ test "chunkCoordForWorldPos clamps out-of-range and non-finite positions" {
     try std.testing.expectEqual(ChunkCoord{ .x = 3, .y = 3 }, world.chunkCoordForWorldPos(1.0e9, 1.0e9));
     // Non-finite inputs are guarded by the shared saturating helper.
     try std.testing.expectEqual(ChunkCoord{ .x = 3, .y = 0 }, world.chunkCoordForWorldPos(std.math.inf(f32), std.math.nan(f32)));
+}
+
+test "dense render window includes six levels below surface play" {
+    const window: DenseLayerRenderWindow = .{};
+    const max_level: u16 = 31;
+    try std.testing.expect(window.levelInWindow(0, 0, max_level));
+    try std.testing.expect(window.levelInWindow(0, 6, max_level));
+    try std.testing.expect(!window.levelInWindow(0, 7, max_level));
+}
+
+test "dense render window skips floors above the player underground" {
+    const window: DenseLayerRenderWindow = .{};
+    const max_level: u16 = 50;
+    try std.testing.expect(!window.levelInWindow(20, 0, max_level));
+    try std.testing.expect(!window.levelInWindow(20, 19, max_level));
+    try std.testing.expect(window.levelInWindow(20, 20, max_level));
+    try std.testing.expect(window.levelInWindow(20, 26, max_level));
+    try std.testing.expect(!window.levelInWindow(20, 27, max_level));
+}
+
+test "dense render window optional ceiling band is opt-in" {
+    const window: DenseLayerRenderWindow = .{ .ceiling_when_underground = true };
+    const max_level: u16 = 50;
+    try std.testing.expect(window.levelInWindow(20, 19, max_level));
+    try std.testing.expect(!window.levelInWindow(20, 18, max_level));
+}
+
+test "collectDenseSubmitLayers caps surface play to render window" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..32) |level_index| {
+        const level = try world.addLevel(@intCast(@as(i32, @intCast(level_index)) * level_z_step));
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 7), count);
+    for (layers[0..count]) |layer_index| {
+        const level = world.denseLayerLevel(layer_index);
+        try std.testing.expect(level <= 6);
+    }
+    for (1..count) |sorted_index| {
+        try std.testing.expect(
+            world.denseLayerOrder(layers[sorted_index - 1]).depth <
+                world.denseLayerOrder(layers[sorted_index]).depth,
+        );
+    }
+}
+
+test "collectDenseSubmitLayers deep play follows player level not surface" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..50) |level_index| {
+        const level = try world.addLevel(@intCast(@as(i32, @intCast(level_index)) * level_z_step));
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(20, &layers);
+    try std.testing.expectEqual(@as(usize, 7), count);
+    for (layers[0..count]) |layer_index| {
+        const level = world.denseLayerLevel(layer_index);
+        try std.testing.expect(level >= 20 and level <= 26);
+    }
+}
+
+test "collectDenseSubmitLayers shifts with player level transitions" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const surface_count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 3), surface_count);
+    var saw_surface = false;
+    for (layers[0..surface_count]) |layer_index| {
+        if (world.denseLayerLevel(layer_index) == 0) saw_surface = true;
+    }
+    try std.testing.expect(saw_surface);
+
+    const dirt_count = try world.collectDenseSubmitLayers(1, &layers);
+    try std.testing.expectEqual(@as(usize, 2), dirt_count);
+    for (layers[0..dirt_count]) |layer_index| {
+        try std.testing.expect(world.denseLayerLevel(layer_index) >= 1);
+    }
+
+    const void_count = try world.collectDenseSubmitLayers(2, &layers);
+    try std.testing.expectEqual(@as(usize, 1), void_count);
+    try std.testing.expectEqual(@as(u16, 2), world.denseLayerLevel(layers[0]));
+}
+
+test "collectDenseSubmitLayers includes every band on an in-window level" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const level = try world.addLevel(0);
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    _ = try world.addDenseLayer(level, 0, .obstacle, grass);
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "addDenseLayer rejects bands beyond configured per-level cap" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .max_dense_bands_per_level = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const level = try world.addLevel(0);
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    _ = try world.addDenseLayer(level, 0, .obstacle, grass);
+    try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
+}
+
+test "validateDenseRenderBudget rejects oversized render window stack cap" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = 32,
+        .chunk_size_tiles = 2,
+        .render_window = .{ .levels_below = 20, .ceiling_when_underground = true },
+        .max_dense_bands_per_level = 2,
+    };
+    defer world.deinit();
+    try std.testing.expectError(error.DenseLayerWindowExceeded, world.validateDenseRenderBudget());
+}
+
+test "validateDenseRenderBudget rejects dense tile gpu budget overrun" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .max_dense_tile_gpu_bytes = 1,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const level = try world.addLevel(0);
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    try std.testing.expectError(error.DenseTileGpuBudgetExceeded, world.validateDenseRenderBudget());
 }

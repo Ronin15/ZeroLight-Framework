@@ -70,11 +70,12 @@ adding broad abstraction.
   world depth count or merging the efficiency branch. Correctness fixes there
   (dense-layer depth order, retained tile-storage `cycle=false`, batched copy
   pass) are prerequisites for any multi-level scale work.
-- Land **Slice 23B** (multi-depth dense-layer render scaling) before building
-  ~120 depth levels or expanding entity stress counts. Surface play currently
-  submits every dense layer at or below the player (`active_level` cull only
-  skips floors above); demo cap `k_max_dense_submit_layers = 16` blocks even the
-  first expansion pass.
+- **Slice 23B** (multi-depth dense-layer render scaling) is landed: dense floor
+  submit is bounded by `DenseLayerRenderWindow` (default six levels below the
+  player; floors above `active_level` are skipped so the slice follows level
+  transitions). Raise world depth count or entity
+  stress counts only after `validateDenseRenderBudget` passes at the target
+  `WorldBuildConfig`.
 - Land NPC Z-level traversal (Slice 25E) before multi-floor emergent scenarios.
   The four touch-points are identified; schedule them as acceptance-checked work
   so the defect is caught in isolation rather than discovered mid-AI-track as a
@@ -896,20 +897,43 @@ Recommended policy (default unless gameplay disproves it):
   is level-count × cell count); culling affects **draw/submit** only unless a
   later slice adds buffer residency policy.
 
+Current foundation (landed):
+
+- `DenseLayerRenderWindow` in `world_system.zig`: default `levels_below = 6`,
+  `ceiling_when_underground = false` (render slice follows `player_level` /
+  `active_level`; surface hole see-through uses the below window at level 0).
+  Optional `ceiling_when_underground` redraws one level above when enabled.
+  `levelInWindow` gates submit;
+  `maxSubmitLayers` sizes the window from per-level dense-band cap.
+- `maxDenseSubmitLayerCount`, `validateDenseRenderBudget`, and
+  `collectDenseSubmitLayers` replace the demo-only 16-layer hard cap;
+  `k_max_dense_submit_stack_cap = 32` is a defensive submit-time guard.
+  `WorldBuildConfig.render_window` and optional `max_dense_tile_gpu_bytes`
+  fail loud at world build (`initDemo` / `initProcedural`).
+- `submitStaticDenseGeometry` collects only in-window layers, sorts
+  back-to-front, and re-submits on `dense_quads_dirty`, `active_level`, or
+  window change. `GameplayScene.player_level` drives the handoff.
+- `render_prep.ensureStaticGeometryCapacity` reserves static geometry from
+  `WorldSystem.maxDenseSubmitLayerCount()` at the start of `submitGameplayFrame`
+  (grow-only; allocation-free after the first reserve).
+- `render-game-prep` dense 8/16/32 surface (`player_level = 0`) and deep
+  (`player_level = 40`) benchmark groups; unit tests cover window caps, player
+  level transitions, per-band inclusion, and depth order.
+
 Checklist:
 
-- [ ] Define `DenseLayerRenderWindow` policy (min/max level offset, hole/ceiling
+- [x] Define `DenseLayerRenderWindow` policy (min/max level offset, hole/ceiling
       exception rules) and document it beside `submitStaticDenseGeometry`.
-- [ ] Replace demo-only `k_max_dense_submit_layers = 16` with window-derived cap
+- [x] Replace demo-only `k_max_dense_submit_layers = 16` with window-derived cap
       (or explicit world-build budget) and fail loud at world build if exceeded.
-- [ ] Wire window into `submitStaticDenseGeometry` and
+- [x] Wire window into `submitStaticDenseGeometry` and
       `GameplayScene.player_level` / camera-level handoff.
-- [ ] Reserve renderer static-group high-water from window + sparse overhead.
-- [ ] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
+- [x] Reserve renderer static-group high-water from window + sparse overhead.
+- [x] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
       `player_level` 0 vs mid-depth; record `mergeDrawList` and submit cost.
-- [ ] Add unit tests: surface window caps submit count; deep play submits only
+- [x] Add unit tests: surface window caps submit count; deep play submits only
       the near stack; depth order preserved within the window.
-- [ ] Profile GPU memory budget for target level count × world size; document
+- [x] Profile GPU memory budget for target level count × world size; document
       ceiling in `WorldBuildConfig` or load-time gate.
 - [ ] Optional: restore linear `mergeDrawList` after window sort guarantees
       static order.
@@ -922,16 +946,17 @@ Deferred (separate slice if window is insufficient):
 
 Acceptance checks:
 
-- [ ] World build with ≥32 dense levels succeeds; surface play stays within the
+- [x] World build with ≥32 dense levels succeeds; surface play stays within the
       configured draw and submit budget.
-- [ ] Digging through a vertical stack at depth 0..N shows correct planes in the
+- [x] Digging through a vertical stack at depth 0..N shows correct planes in the
       window; no 23A regressions (depth order, `cycle=false`).
-- [ ] `zig build bench -- --group render-game-prep` reports stable prep cost at
+- [x] `zig build bench -- --group render-game-prep` reports stable prep cost at
       configured window sizes.
-- [ ] `zig build verify` passes.
+- [x] `zig build verify` passes.
 
-Status: planned; schedule before `addUndergroundLevels`-style expansion to ~120
-levels or large entity stress scenes.
+Status: implemented and runtime-validated; window policy documented in
+`docs/rendering-assets-shaders.md`. Optional linear `mergeDrawList` micro-opt
+remains open.
 
 ## Slice 24: Scoped Simulation Tiers And Chunk Policy
 
@@ -1918,8 +1943,9 @@ extraction, Slice 23 atlas-backed world rendering, and Slice 24 scoped
 simulation tiers are in place for the current structural, navigation, and
 world/chunk visibility foundation. Slice 23A (GPU tilemap hardening) is
 implemented on `expand2` and should merge before raising world depth count.
-Slice 23B (dense-layer render window for ~120 levels) is the next render-scale
-gate before large underground world build or entity stress expansion. Slice 25E
+Slice 23B (dense-layer render window for ~120 levels) is implemented; large
+underground world build and entity stress expansion may proceed when
+`validateDenseRenderBudget` passes at the target config. Slice 25E
 lands per-entity NPC Z-level before multi-floor emergent scenarios;
 it is a gameplay-side correctness gap (four NPC touch-points in `DataSystem`,
 `steering`, `PathView`, and render cull) on top of the fully correct Slice 25

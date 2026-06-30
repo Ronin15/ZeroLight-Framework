@@ -165,10 +165,40 @@ shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — 
 tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
 layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
 with dynamic entities, so an actor in a dug pit renders between the floor below and
-walls above. `WorldSystem.submitStaticDenseGeometry` takes the player's active level and skips
-the floors above it (re-submitting only when the plane changes), so descending
-reveals the plane the player stands on instead of leaving it buried under the
-surface.
+walls above. `WorldSystem.submitStaticDenseGeometry` takes `GameplayScene.player_level`
+as `active_level` and submits only dense layers inside the configured
+`DenseLayerRenderWindow` (re-submitting on `dense_quads_dirty`, plane change, or
+window change).
+
+### Dense render window policy (Slice 23B)
+
+Vertical scale is a **submit/draw** policy problem, not a per-tile vertex or
+full-buffer residency problem. Every authored dense layer still gets a retained
+GPU tile-data storage buffer at load (`uploadDenseLayerBuffers`); memory scales
+with total level count × cell count. The render window bounds how many of those
+layers become static tilemap draw groups each frame.
+
+Default `DenseLayerRenderWindow` (`world_system.zig`):
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `levels_below` | `6` | Submit `active_level` through `active_level + 6` (inclusive). |
+| `ceiling_when_underground` | `false` | Opt-in only: redraws the full ceiling plane and breaks player-level follow. Surface hole see-through uses `levels_below` while `active_level == 0`. |
+
+`collectDenseSubmitLayers` filters by `levelInWindow`, then sorts back-to-front
+before append. `maxDenseSubmitLayerCount` derives the cap from the window and
+`max_dense_bands_per_level`; `validateDenseRenderBudget` fails at world build if
+the window exceeds `k_max_dense_submit_stack_cap` or optional
+`WorldBuildConfig.max_dense_tile_gpu_bytes`. `render_prep.ensureStaticGeometryCapacity`
+warms renderer static-geometry reservation from `maxDenseSubmitLayerCount()` at
+the start of each `submitGameplayFrame` (grow-only after the first reserve).
+
+**Sparse/dense boundary:** chunk visibility (`setVisibleChunksForWorldRect`)
+still culls sparse tiles and sizes dynamic sparse prep (`reserveRenderRecords`);
+it no longer drives dense floor submit. Each in-window dense layer is one
+full-world quad regardless of camera pan — panning uploads nothing. Sparse
+overlays and dense floors interleave in the merged draw list by `RenderOrder`;
+NPC per-level entity cull (Slice 25E) is separate from this floor window.
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 

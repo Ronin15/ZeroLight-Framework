@@ -632,6 +632,11 @@ fn printGroupReport(group: BenchmarkGroup, results: []const CaseResult, options:
     printValidationSummary(group.name, baseline, best, fixed_auto, adaptive, results);
 }
 
+fn isRenderGamePrepGroup(group_name: []const u8) bool {
+    return std.mem.eql(u8, group_name, "render-game-prep") or
+        std.mem.startsWith(u8, group_name, "render-game-prep-");
+}
+
 fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
@@ -643,7 +648,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, group_name, "pathfinding-hard-fallback")) return "hard fallback path requests";
     if (std.mem.eql(u8, group_name, "steering")) return "steering agents";
     if (std.mem.eql(u8, group_name, "render-prep")) return "draw commands";
-    if (std.mem.eql(u8, group_name, "render-game-prep")) return "render entities";
+    if (isRenderGamePrepGroup(group_name)) return "render entities";
     if (std.mem.eql(u8, group_name, "collision")) return "collision bodies";
     if (std.mem.eql(u8, group_name, "collision-sparse")) return "collision bodies";
     if (std.mem.startsWith(u8, group_name, "collision-response")) return "contacts";
@@ -734,7 +739,7 @@ fn printValidationSummary(
     results: []const CaseResult,
 ) void {
     const is_render_prep = std.mem.eql(u8, group_name, "render-prep");
-    const is_render_game_prep = std.mem.eql(u8, group_name, "render-game-prep");
+    const is_render_game_prep = isRenderGamePrepGroup(group_name);
     // Keep the summary terse and action-oriented: it should call out unusual
     // scheduler behavior or workload counters without pretending to choose
     // runtime tuning policy from one benchmark run.
@@ -838,7 +843,7 @@ fn printValidationSummary(
                     .{ formatDuration(phases.ordered_submit_ns), formatDuration(phases.snapshot_ns), formatDuration(phases.vertex_emit_ns), formatDuration(phases.draw_group_ns) },
                 );
             }
-        } else if (std.mem.eql(u8, group_name, "render-game-prep")) {
+        } else if (isRenderGamePrepGroup(group_name)) {
             const render_game_prep_focus = adaptive orelse best;
             const focus_label = if (adaptive != null) "production_adaptive" else "render_game_prep_focus";
             std.debug.print(
@@ -1079,7 +1084,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         }
         return std.fmt.bufPrint(buffer, "vertices={} sprites={} skipped={} groups={}", .{ stats.candidate_pairs, stats.output_count, stats.deferred_count, stats.sample_count }) catch "workload";
     }
-    if (std.mem.eql(u8, group_name, "render-game-prep")) {
+    if (isRenderGamePrepGroup(group_name)) {
         if (stats.render_game_prep_phases) |phases| {
             return std.fmt.bufPrint(
                 buffer,

@@ -42,6 +42,12 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     nav_update.multichunk_group,
     render_prep.group,
     render_game_prep.group,
+    render_game_prep.dense_8_surface_group,
+    render_game_prep.dense_8_deep_group,
+    render_game_prep.dense_16_surface_group,
+    render_game_prep.dense_16_deep_group,
+    render_game_prep.dense_32_surface_group,
+    render_game_prep.dense_32_deep_group,
     scope.group,
     steering.group,
 };

@@ -175,9 +175,13 @@ Dense world floors use retained per-layer tile-data storage buffers (Slice 23A):
 partial dig uploads always use `cycle=false`; vertex ring buffers alone use
 `cycle=true` on the final upload in a batched copy pass. Multi-level compositing
 requires back-to-front dense-layer depth order at submit and in `mergeDrawList`.
-Scaling to many depth levels (~120) is a render-window policy problem (Slice
-23B), not a per-tile vertex problem — see
-`docs/framework-implementation-slices.md` slices 23A/23B.
+Dense floor submit uses a vertical render window (`DenseLayerRenderWindow`:
+six levels below the player, skipping floors above `active_level` so the slice
+follows player level transitions) so draw count
+stays bounded at the surface; all authored layers still retain GPU tile-data
+buffers (Slice 23B). Sparse tiles cull by camera chunk visibility separately.
+See `docs/rendering-assets-shaders.md` and slice 23B in
+`docs/framework-implementation-slices.md`.
 
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
