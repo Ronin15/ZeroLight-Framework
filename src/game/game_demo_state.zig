@@ -1025,14 +1025,13 @@ const ObstacleSpec = struct {
 };
 
 fn runtimeAssetsWithWorldTexture() !RuntimeAssets {
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
     return runtime_assets;
 }
 
 fn runtimeAssetsWithWorldMetadataForTest() !RuntimeAssets {
     var runtime_assets = try runtimeAssetsWithWorldTexture();
-    runtime_assets.allocator = std.testing.allocator;
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     runtime_assets.atlas_meta[manifest.spriteIndex(.world_tileset)] = .{
         .world_tileset = try world_tileset_meta.load(
@@ -1479,7 +1478,7 @@ test "demo owns and completes a simulation frame during update" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, demo_test_audio_capacity);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
@@ -1531,7 +1530,7 @@ test "demo queues jet loop audio only on movement edges" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, demo_test_audio_capacity);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
@@ -1588,7 +1587,7 @@ test "demo collision response blocks player against obstacles" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     const obstacle = demo.obstacles[0];
     const obstacle_body = demo.data.movementBodyConst(obstacle).?;
@@ -1629,7 +1628,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     // Record pre positions for sample ai squares (ai on 0=wander/1=seek/3=template-seek per 8-square spawn mix with pronounced behaviors; ai on 4/5/7 also).
     const ai0 = demo.test_squares[0];
@@ -1685,7 +1684,7 @@ test "demo collision response handles player contacts with moving entities" {
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     const square = demo.test_squares[0];
     for (demo.test_squares[1..], 0..) |other, index| {
@@ -1744,7 +1743,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
     defer transitions.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     // Pick an ai square (index 0 is wander ai), park in the top-left corner, then
     // push out of bounds so clamp runs without post-clamp collision shoving it back out.

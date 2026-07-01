@@ -535,7 +535,7 @@ fn initFixture(
         .world = undefined,
         .scene_prep = render_prep.DynamicScenePrep.init(allocator),
         .player_entity = undefined,
-        .runtime_assets = RuntimeAssets.init(),
+        .runtime_assets = RuntimeAssets.init(allocator),
         .static_groups = undefined,
         .static_group_count = 0,
         .player_level = fixture_config.player_level,

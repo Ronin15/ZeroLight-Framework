@@ -49,24 +49,23 @@ const AtlasMetaSlot = union(enum) {
 };
 
 pub const RuntimeAssets = struct {
-    allocator: std.mem.Allocator = undefined,
+    allocator: std.mem.Allocator,
     sprite_slots: [manifest.sprite_asset_count]SpriteSlot = initSpriteSlots(),
     audio_status: [manifest.audio_asset_count]AssetStatus = initAudioStatus(),
     atlas_meta: [manifest.sprite_asset_count]?AtlasMetaSlot = initAtlasMetaSlots(),
 
-    pub fn init() RuntimeAssets {
-        return .{};
+    pub fn init(allocator: std.mem.Allocator) RuntimeAssets {
+        return .{ .allocator = allocator };
     }
 
     pub fn preload(
         self: *RuntimeAssets,
-        allocator: std.mem.Allocator,
         asset_store: AssetStore,
         cache: *AssetCache,
         renderer: *Renderer,
         audio: *AudioService,
     ) !void {
-        return self.preloadWithBackend(allocator, asset_store, cache, @ptrCast(renderer), audio);
+        return self.preloadWithBackend(asset_store, cache, @ptrCast(renderer), audio);
     }
 
     pub fn deinit(self: *RuntimeAssets, cache: *AssetCache, renderer: *Renderer) void {
@@ -79,13 +78,11 @@ pub const RuntimeAssets = struct {
     /// must match the `TextureBackend` the cache was created with.
     fn preloadWithBackend(
         self: *RuntimeAssets,
-        allocator: std.mem.Allocator,
         asset_store: AssetStore,
         cache: *AssetCache,
         backend_context: *anyopaque,
         audio: *AudioService,
     ) !void {
-        self.allocator = allocator;
         errdefer self.deinitWithBackend(cache, backend_context);
 
         try self.preloadSpritesBatch(asset_store, cache, backend_context, &manifest.sprite_assets, .{});
@@ -374,7 +371,7 @@ fn sourceRect(value: ?manifest.SourceRect) ?Rect {
 }
 
 test "runtime asset catalog starts with unloaded status" {
-    const runtime_assets = RuntimeAssets.init();
+    const runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.spriteStatus(.demo_tile));
     try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.audioStatus(.demo_music));
@@ -382,7 +379,7 @@ test "runtime asset catalog starts with unloaded status" {
 
 test "missing startup sprite marks id unavailable without requiring renderer access" {
     const cache_testing = @import("cache.zig").testing;
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = cache_testing.Backend{};
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
@@ -399,7 +396,7 @@ test "missing startup sprite marks id unavailable without requiring renderer acc
 
 test "missing required startup sprite fails preload" {
     const cache_testing = @import("cache.zig").testing;
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var fake = cache_testing.Backend{};
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
@@ -426,7 +423,7 @@ test "runtime assets deinit releases preloaded sprites exactly once" {
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
     try preloadWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &audio);
 
@@ -460,7 +457,7 @@ test "startup preload attempts every registered sprite id" {
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     try preloadWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &audio);
@@ -478,7 +475,7 @@ test "runtime asset sprite replacement keeps one live cache retain" {
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
     defer cache_testing.deinitCache(&cache, &fake);
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     const spec = manifest.SpriteAssetSpec{
@@ -501,7 +498,7 @@ test "runtime asset missing sprite replacement releases the previous lease" {
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
     defer cache_testing.deinitCache(&cache, &fake);
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     try preloadSpriteWithTestBackend(&runtime_assets, asset_store, &cache, &fake, .{
@@ -527,7 +524,7 @@ test "sprite catalog rollback releases leases acquired before a later error" {
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
     defer cache_testing.deinitCache(&cache, &fake);
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     const specs = [_]manifest.SpriteAssetSpec{
         .{
@@ -559,8 +556,7 @@ test "preloadSpritesBatch fails when a required sprite is missing mid-batch" {
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
     defer cache_testing.deinitCache(&cache, &fake);
 
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     const specs = [_]manifest.SpriteAssetSpec{
@@ -590,8 +586,7 @@ test "preloadSpritesBatch marks an optional sprite unavailable without failing t
     var cache = cache_testing.initCache(std.testing.allocator, asset_store);
     defer cache_testing.deinitCache(&cache, &fake);
 
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     const specs = [_]manifest.SpriteAssetSpec{
@@ -611,8 +606,7 @@ test "preloadSpritesBatch marks an optional sprite unavailable without failing t
 
 test "startup metadata load requires world tileset texture" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .unavailable };
 
     try std.testing.expectError(
@@ -625,8 +619,7 @@ test "startup metadata load requires world tileset texture" {
 
 test "startup metadata load parses optional atlases with unavailable textures" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitAtlasMetaSlots(&runtime_assets.atlas_meta);
 
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
@@ -642,8 +635,7 @@ test "startup metadata load parses optional atlases with unavailable textures" {
 
 test "metadata load fails when sidecar is missing" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     var spec = manifest.spriteSpec(.world_tileset);
     spec.metadata_path = "sprites/missing_world_tileset.json";
@@ -654,8 +646,7 @@ test "metadata load fails when sidecar is missing" {
 
 test "metadata load fails when kind is declared without a sidecar path" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
 
@@ -668,8 +659,7 @@ test "metadata load fails when kind is declared without a sidecar path" {
 
 test "metadata load rejects manifest kind mismatches at runtime" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
 
@@ -682,8 +672,7 @@ test "metadata load rejects manifest kind mismatches at runtime" {
 
 test "startup metadata load parses installed atlases when present" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitAtlasMetaSlots(&runtime_assets.atlas_meta);
 
     const atlas_sprite_ids = [_]SpriteAssetId{ .world_tileset, .grim_characters, .grim_items };
@@ -715,7 +704,7 @@ test "startup preload loads atlas metadata when installed atlases are available"
     var audio = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     defer audio.deinit();
 
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
 
     try preloadWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &audio);
@@ -754,7 +743,7 @@ fn preloadWithTestBackend(
     fake: *FakeBackend,
     audio: *AudioService,
 ) !void {
-    return runtime_assets.preloadWithBackend(std.testing.allocator, asset_store, cache, @ptrCast(fake), audio);
+    return runtime_assets.preloadWithBackend(asset_store, cache, @ptrCast(fake), audio);
 }
 
 fn deinitWithTestBackend(runtime_assets: *RuntimeAssets, cache: *AssetCache, fake: *FakeBackend) void {

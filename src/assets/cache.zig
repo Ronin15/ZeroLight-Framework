@@ -135,6 +135,11 @@ pub const AssetCache = struct {
         var inserted_count: usize = 0;
         errdefer self.rollbackStartupTextureInserts(inserts[0..inserted_count], leases[0..inserted_count]);
 
+        // The batch size is known upfront, so reserve capacity once instead of
+        // letting the map and lease-slot list regrow incrementally per insert.
+        try self.entries.ensureUnusedCapacity(self.allocator, @intCast(inserts.len));
+        try self.lease_slots.ensureUnusedCapacity(self.allocator, inserts.len);
+
         for (inserts, texture_ids, leases) |insert, texture, *lease| {
             try assets.validateRelativePath(insert.relative_path);
             if (self.entries.contains(insert.relative_path)) return error.DuplicateStartupTexture;

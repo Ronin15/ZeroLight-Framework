@@ -61,6 +61,17 @@ Release builds use the same pinned Zig package cache as Debug builds. They do
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
+**Packaged builds ship `ReleaseFast`.** That mode strips the debug assert
+backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
+bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
+discipline rules for the `FailingAllocator` proof-test coverage this requires
+before hot-path code can rely on it safely. Before cutting a ReleaseFast
+release candidate, run an extended soak session in `--release=safe` (not just
+`zig build test`) across realistic-to-extreme entity counts and spawn/despawn
+churn. A clean multi-hour ReleaseSafe run is the actual release gate:
+ReleaseFast itself will not report a capacity or bounds violation if one
+exists, it will just corrupt memory silently.
+
 ## Build Options
 
 Customize app metadata at build time:

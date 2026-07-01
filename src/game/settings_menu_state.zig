@@ -245,7 +245,7 @@ test "settings volumes clamp and emit gain commands" {
 
     var audio = AudioCommandBuffer.init(std.testing.allocator, 16);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     var input = InputState{};
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();

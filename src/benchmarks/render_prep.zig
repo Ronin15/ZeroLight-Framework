@@ -213,32 +213,6 @@ fn u128ToU64Saturated(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
 }
 
-fn snapshotCommands(
-    snapshot: *sprite_batch.SpriteBatch.CommandList,
-    allocator: std.mem.Allocator,
-    commands: anytype,
-) !void {
-    snapshot.clearRetainingCapacity();
-    try snapshot.ensureTotalCapacity(allocator, commands.len);
-    snapshot.items.len = commands.len;
-    @memcpy(snapshot.items, commands);
-}
-
-fn restoreCommands(batch: *sprite_batch.SpriteBatch, commands: anytype) void {
-    std.debug.assert(batch.commands.capacity >= commands.len);
-    batch.commands.clearRetainingCapacity();
-    batch.commands.items.len = commands.len;
-    @memcpy(batch.commands.items, commands);
-    batch.last_order = if (commands.len == 0) null else commands[commands.len - 1].sprite.order;
-}
-
-fn fillCommands(batch: *sprite_batch.SpriteBatch, count: usize) !void {
-    batch.setCamera(.{ .position = .{ .x = 320, .y = 180 }, .zoom = 1.25 });
-    for (0..count) |index| {
-        try batch.drawSprite(benchmarkSprite(index, orderedBenchmarkOrder(index, count)));
-    }
-}
-
 fn submitOrderedCommandsOnce(batch: *sprite_batch.SpriteBatch, count: usize) !void {
     batch.commands.clearRetainingCapacity();
     batch.last_order = null;

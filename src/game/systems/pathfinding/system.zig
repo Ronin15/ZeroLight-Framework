@@ -3029,6 +3029,80 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     system.allocator = original;
 }
 
+test "pathfinding threaded incremental nav update is allocation-free at steady state" {
+    // The serial-path allocation-free tests above (and applyNavUpdates itself, which always
+    // passes thread_system=null) only prove the INLINE remask/patch scratch (slot 0) is reused
+    // without allocating. Only applyBufferedNavUpdates/reactToPostCommitNavEvents with a real
+    // ThreadSystem drive patchChunkJob/remaskChunkJob, which index a PER-WORKER
+    // ChunkPatchScratch/ChunkRemaskScratch slot (nav_graph.zig's patch_scratch/remask_scratch,
+    // sized at rebuild). That fan-out path had zero allocation coverage. Mirrors "incremental
+    // nav update forced-parallel remask and patch match a serial full rebuild" in nav_graph.zig
+    // (five edits in five distinct chunks, adaptive=false/items_per_range=1 to force both stages
+    // off the inline path) but under a failing allocator on both system.allocator and
+    // system.graph.allocator, matching the steady-state test above.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+    // Force the parallel schedule rather than letting the tuner keep the small batch inline.
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    // The failing allocator must cover BOTH the system AND the nav graph (which holds its own
+    // captured allocator copy): every per-worker patch/remask scratch slot, plus every
+    // graph-rebuild buffer, flows through graph.allocator, so swapping only system.allocator
+    // would let a graph allocation slip through undetected.
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
+    // set and the patch dirty set exceed one chunk and actually fan out across workers.
+    const cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    for (cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
+
+    // Both stages must have actually threaded, not fallen back to the inline slot-0 path —
+    // otherwise this would silently retest the already-covered serial path.
+    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+
+    for (cells) |cell| {
+        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = cell.x, .y = cell.y }));
+    }
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
 test "pathfinding incremental update expands beyond init high-water mark with bounded growth" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

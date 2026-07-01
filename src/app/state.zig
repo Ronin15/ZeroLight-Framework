@@ -902,7 +902,7 @@ test "modal state blocks updates below and pass-through state allows them" {
     defer threads.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 
@@ -1179,7 +1179,7 @@ test "opaque state render policy hides states below it" {
     defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     _ = try stack.replaceGameplay(TestingState, .{ .render_count = &bottom_count });
     _ = try stack.pushOpaque(TestingState, .{ .render_count = &opaque_count });
@@ -1236,7 +1236,7 @@ test "transition requests apply after dispatch and preserve FIFO order" {
     defer threads.deinit();
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     _ = try stack.replaceGameplay(TestingState, .{ .id = 1, .render_order = &render_order });
     try transitions.pushModal(TestingState, .{ .id = 2, .render_order = &render_order });
@@ -1287,7 +1287,7 @@ test "queued transition from update waits until applyTransitions" {
     defer threads.deinit();
     var audio = AudioCommandBuffer.init(std.testing.allocator, 8);
     defer audio.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     var stack = StateStack.init(std.testing.allocator);
     defer stack.deinit();
 

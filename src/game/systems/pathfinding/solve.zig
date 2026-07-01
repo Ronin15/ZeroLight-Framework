@@ -47,6 +47,9 @@ pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: Wo
     const system = job.system;
     // scratch_slots is never resized during the parallel region (only in applyDerivedCapacity,
     // which runs in beginUpdate before parallelForWithOptions), so this pointer stays valid.
+    // Guards the reserve-before-dispatch invariant: applyDerivedCapacity sized scratch_slots to
+    // the participant count the caller asserted against before dispatching this batch.
+    std.debug.assert(worker_id.index < system.scratch_slots.items.len);
     const scratch = &system.scratch_slots.items[worker_id.index];
     for (range.start..range.end) |fallback_index| {
         const pending_index = system.fallback_indices.items[fallback_index];

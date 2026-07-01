@@ -170,7 +170,7 @@ test "loading state requires runtime world metadata before building demo" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     try std.testing.expectError(error.WorldTilesetMetadataUnavailable, loading.update(.{
         .input = &input,
         .audio = &audio,
@@ -234,7 +234,7 @@ test "loading state waits for first render before building gameplay" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     try loading.update(.{
         .input = &input,
@@ -250,8 +250,7 @@ test "loading state waits for first render before building gameplay" {
 }
 
 fn runtimeAssetsWithDemoMetadataForTest() !RuntimeAssets {
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     runtime_assets.atlas_meta[manifest.spriteIndex(.world_tileset)] = .{

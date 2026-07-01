@@ -788,7 +788,7 @@ fn deinitAtlasMetadataForTest(runtime_assets: *RuntimeAssets, id: manifest.Sprit
 }
 
 test "atlas-backed asset reference falls back to null source rect without metadata" {
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
     const asset_ref = AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
     const sprite = runtime_assets.sprite(asset_ref.sprite).?;
@@ -797,8 +797,7 @@ test "atlas-backed asset reference falls back to null source rect without metada
 }
 
 test "atlas-backed asset reference uses metadata source rect when available" {
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
     try setSpriteAtlasMetadataForTest(&runtime_assets, .grim_characters);
     defer deinitAtlasMetadataForTest(&runtime_assets, .grim_characters);

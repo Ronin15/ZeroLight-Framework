@@ -223,6 +223,9 @@ const NavPatchJob = struct {
 
 fn patchChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *NavPatchJob = @ptrCast(@alignCast(context));
+    // Guards the reserve-before-dispatch invariant: patch_scratch was sized to the
+    // participant count that patchDirtyChunks checked before dispatching this batch.
+    std.debug.assert(worker_id.index < job.graph.patch_scratch.items.len);
     const scratch = &job.graph.patch_scratch.items[worker_id.index];
     for (range.start..range.end) |i| {
         const overflowed = job.graph.patchChunk(job.level, job.world, job.chunks[i], scratch) catch {
@@ -251,6 +254,9 @@ const NavRemaskJob = struct {
 fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *NavRemaskJob = @ptrCast(@alignCast(context));
     const level_grid = &job.graph.levels.items[job.level];
+    // Guards the reserve-before-dispatch invariant: remask_scratch was sized to the
+    // participant count that remaskChangedChunks checked before dispatching this batch.
+    std.debug.assert(worker_id.index < job.graph.remask_scratch.items.len);
     const scratch = &job.graph.remask_scratch.items[worker_id.index];
     for (range.start..range.end) |i| {
         scratch.blocked_delta += level_grid.remaskChunkFromWorld(job.chunks[i], job.data, job.world);

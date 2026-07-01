@@ -199,6 +199,9 @@ pub const AudioService = struct {
     backend_context: *anyopaque,
     owns_backend_context: bool = false,
     entries: std.StringHashMapUnmanaged(AudioEntry) = .empty,
+    // Memoized load failures; never evicted. Safe only because every caller of
+    // loadAudio/preloadAudio sources `relative_path` from the fixed audio
+    // manifest (bounded set) — do not feed this arbitrary/runtime-generated paths.
     failed_paths: std.StringHashMapUnmanaged(void) = .empty,
     audio_assets: [manifest.audio_asset_count]AudioAssetSlot = initAudioAssetSlots(),
     sfx_tracks: std.ArrayList(TrackSlot) = .empty,
@@ -309,6 +312,9 @@ pub const AudioService = struct {
         self.* = undefined;
     }
 
+    /// `relative_path` must come from the fixed audio manifest — failures are
+    /// memoized in `failed_paths` and never evicted, so unbounded/arbitrary
+    /// runtime-generated paths would leak.
     pub fn preloadAudio(
         self: *AudioService,
         id: AudioAssetId,
@@ -606,6 +612,8 @@ pub const AudioService = struct {
         return slot.handle;
     }
 
+    /// Same manifest-only contract as `preloadAudio`: `relative_path` must be
+    /// one of the fixed manifest entries, since `failed_paths` never evicts.
     fn loadAudio(self: *AudioService, relative_path: []const u8, predecode: bool) !?BackendHandle {
         try assets.validateRelativePath(relative_path);
         if (self.entries.get(relative_path)) |entry| {

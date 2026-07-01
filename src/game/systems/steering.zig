@@ -484,6 +484,9 @@ pub const SteeringSystem = struct {
         // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
         try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(count));
+        // At most one new runtime row is created per selected intent, so reserve
+        // the worst case once, upfront, instead of growing inside the loop below.
+        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + count);
         try resetIndexScratch(&self.runtime_index_by_steering, self.allocator, steering.entities.len);
         for (self.runtime_rows.items, 0..) |row, runtime_index| {
             const steering_index = data.steeringAgentDenseIndex(row.entity) orelse continue;
@@ -498,7 +501,7 @@ pub const SteeringSystem = struct {
                 .x = movement.previous_x[selected.movement_index],
                 .y = movement.previous_y[selected.movement_index],
             };
-            const runtime = try self.runtimeRowForSelected(selected);
+            const runtime = self.runtimeRowForSelected(selected);
             const path_dir = self.directionFromPathStatus(data, pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
             const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
             const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
@@ -684,10 +687,11 @@ pub const SteeringSystem = struct {
         }
     }
 
-    fn runtimeRowForSelected(self: *SteeringSystem, selected: *const SelectedIntent) !*RuntimeRow {
+    fn runtimeRowForSelected(self: *SteeringSystem, selected: *const SelectedIntent) *RuntimeRow {
+        // Capacity for up to one new row per selected intent is reserved once,
+        // upfront, by the caller (prepareSelectedDirections).
         const existing_index = self.runtime_index_by_steering.items[selected.steering_index];
         if (existing_index != invalid_index) return &self.runtime_rows.items[existing_index];
-        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + 1);
         self.runtime_index_by_steering.items[selected.steering_index] = self.runtime_rows.items.len;
         self.runtime_rows.appendAssumeCapacity(.{ .entity = selected.entity });
         return &self.runtime_rows.items[self.runtime_rows.items.len - 1];
