@@ -88,7 +88,7 @@ pub const RuntimeAssets = struct {
         self.allocator = allocator;
         errdefer self.deinitWithBackend(cache, backend_context);
 
-        try self.preloadSpritesBatch(asset_store, cache, backend_context, .{});
+        try self.preloadSpritesBatch(asset_store, cache, backend_context, &manifest.sprite_assets, .{});
         try self.loadAtlasMetadata(asset_store, .{});
         for (manifest.audio_assets) |spec| {
             const available = try audio.preloadAudio(spec.id, spec.path, spec.kind, spec.predecode);
@@ -197,6 +197,7 @@ pub const RuntimeAssets = struct {
         asset_store: AssetStore,
         cache: *AssetCache,
         backend_context: *anyopaque,
+        specs: []const manifest.SpriteAssetSpec,
         options: PreloadOptions,
     ) !void {
         const PendingStartupSprite = struct {
@@ -221,9 +222,9 @@ pub const RuntimeAssets = struct {
             }
         }
 
-        try pending.ensureTotalCapacity(self.allocator, manifest.sprite_assets.len);
+        try pending.ensureTotalCapacity(self.allocator, specs.len);
 
-        for (manifest.sprite_assets) |spec| {
+        for (specs) |spec| {
             const index = manifest.spriteIndex(spec.id);
             try @import("assets.zig").validateRelativePath(spec.path);
 
@@ -551,6 +552,63 @@ test "sprite catalog rollback releases leases acquired before a later error" {
     try std.testing.expectEqual(@as(usize, 0), cache_testing.entryCount(&cache));
 }
 
+test "preloadSpritesBatch fails when a required sprite is missing mid-batch" {
+    const cache_testing = @import("cache.zig").testing;
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var fake = cache_testing.Backend{};
+    var cache = cache_testing.initCache(std.testing.allocator, asset_store);
+    defer cache_testing.deinitCache(&cache, &fake);
+
+    var runtime_assets = RuntimeAssets.init();
+    runtime_assets.allocator = std.testing.allocator;
+    defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
+
+    const specs = [_]manifest.SpriteAssetSpec{
+        .{ .id = .demo_tile, .path = "sprites/demo_tile.png" },
+        .{ .id = .world_tileset, .path = "missing/world_tileset.png" },
+    };
+
+    try std.testing.expectError(
+        error.RequiredStartupSpriteUnavailable,
+        preloadSpritesBatchWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &specs, .{ .log_unavailable = false }),
+    );
+
+    // Required-missing bails out of the manifest scan before any upload/insert, so
+    // the whole batch (including the sprite that scanned successfully first) is
+    // abandoned rather than partially committed.
+    try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.spriteStatus(.demo_tile));
+    try std.testing.expectEqual(AssetStatus.not_loaded, runtime_assets.spriteStatus(.world_tileset));
+    try std.testing.expect(runtime_assets.sprite(.demo_tile) == null);
+    try std.testing.expectEqual(@as(u32, 0), cache_testing.uploadCount(&fake));
+    try std.testing.expectEqual(@as(usize, 0), cache_testing.entryCount(&cache));
+}
+
+test "preloadSpritesBatch marks an optional sprite unavailable without failing the batch" {
+    const cache_testing = @import("cache.zig").testing;
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var fake = cache_testing.Backend{};
+    var cache = cache_testing.initCache(std.testing.allocator, asset_store);
+    defer cache_testing.deinitCache(&cache, &fake);
+
+    var runtime_assets = RuntimeAssets.init();
+    runtime_assets.allocator = std.testing.allocator;
+    defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
+
+    const specs = [_]manifest.SpriteAssetSpec{
+        .{ .id = .demo_tile, .path = "sprites/demo_tile.png" },
+        .{ .id = .grim_characters, .path = "missing/nope.png" },
+    };
+
+    try preloadSpritesBatchWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &specs, .{ .log_unavailable = false });
+
+    try std.testing.expectEqual(AssetStatus.available, runtime_assets.spriteStatus(.demo_tile));
+    try std.testing.expect(runtime_assets.sprite(.demo_tile) != null);
+    try std.testing.expectEqual(AssetStatus.unavailable, runtime_assets.spriteStatus(.grim_characters));
+    try std.testing.expect(runtime_assets.sprite(.grim_characters) == null);
+    try std.testing.expectEqual(@as(u32, 1), cache_testing.uploadCount(&fake));
+    try std.testing.expectEqual(@as(usize, 1), cache_testing.entryCount(&cache));
+}
+
 test "startup metadata load requires world tileset texture" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var runtime_assets = RuntimeAssets.init();
@@ -712,4 +770,15 @@ fn preloadSpriteWithTestBackend(
     options: PreloadOptions,
 ) !void {
     return runtime_assets.preloadSprite(asset_store, cache, @ptrCast(fake), spec, options);
+}
+
+fn preloadSpritesBatchWithTestBackend(
+    runtime_assets: *RuntimeAssets,
+    asset_store: AssetStore,
+    cache: *AssetCache,
+    fake: *FakeBackend,
+    specs: []const manifest.SpriteAssetSpec,
+    options: PreloadOptions,
+) !void {
+    return runtime_assets.preloadSpritesBatch(asset_store, cache, @ptrCast(fake), specs, options);
 }

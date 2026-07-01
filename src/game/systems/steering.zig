@@ -1364,6 +1364,16 @@ test "steering sources path request start level from entity world level" {
     try std.testing.expectEqual(@as(usize, 1), requests.len);
     try std.testing.expectEqual(@as(u16, 0), requests[0].start_level);
     try std.testing.expectEqual(@as(u16, 0), requests[0].goal_level);
+
+    // entityWorldLevel is the sole source of a path request's start_level (see
+    // writePathRequests above); this is the direct regression guard that a
+    // future edit can't quietly hardcode it back to 0. Exercised directly
+    // rather than through another full updateSerial step, since a second step
+    // for the same agent would hit the replan cooldown the first request just
+    // armed and never re-request regardless of level.
+    try std.testing.expectEqual(@as(u16, 0), entityWorldLevel(&data, agent));
+    try data.setWorldLevel(agent, 2);
+    try std.testing.expectEqual(@as(u16, 2), entityWorldLevel(&data, agent));
 }
 
 test "steering missing path requests respect replan cooldown" {

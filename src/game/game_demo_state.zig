@@ -1215,6 +1215,37 @@ test "demo init validates atlas-backed references at loading boundary" {
     try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
 }
 
+test "procedural demo uses large world bounds and interpolated follow camera" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+
+    var demo = try GameDemoState.initProceduralWithRuntimeAssets(std.testing.allocator, &runtime_assets, &threads, demo_test_viewport_width, demo_test_viewport_height);
+    defer demo.deinit();
+
+    try std.testing.expectEqual(demo_test_viewport_width, demo.viewport_width);
+    try std.testing.expectEqual(demo_test_viewport_height, demo.viewport_height);
+    try std.testing.expect(demo.bounds_width > demo.viewport_width);
+    try std.testing.expect(demo.bounds_height > demo.viewport_height);
+
+    const body = demo.data.movementBodyPtr(demo.player.entity).?;
+    body.position_x.* = 4096.5;
+    body.position_y.* = 2048.25;
+    body.previous_x.* = 4090.5;
+    body.previous_y.* = 2040.25;
+    demo.updateCamera();
+
+    // Player off-center of a large world so the camera clamp doesn't saturate at 0
+    // and the sub-pixel lerp between previous/current camera positions is visible.
+    const camera = demo.interpolatedCamera(0.5);
+    try std.testing.expect(camera.position.x > 0);
+    try std.testing.expect(camera.position.y > 0);
+    try std.testing.expect(camera.position.x != @floor(camera.position.x));
+}
+
 test "demo init rejects missing character atlas metadata" {
     var runtime_assets = try runtimeAssetsWithWorldMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);

@@ -476,7 +476,7 @@ pub const NavGraph = struct {
         const prepared_level_count = self.levels.items.len;
         if (world) |world_system| {
             if (thread_system) |threads| {
-                if (prepared_level_count > 1 and participant_count <= self.patch_scratch.items.len) {
+                if (prepared_level_count > 1) {
                     var mask_job = NavLevelMaskJob{ .graph = self, .world = world };
                     _ = threads.parallelForWithOptions(prepared_level_count, &mask_job, navLevelMaskJob, .{
                         .items_per_range = 1,
@@ -1072,7 +1072,9 @@ pub const NavGraph = struct {
         @memset(lg.chunk_order_len.items, 0);
         @memset(lg.chunk_label_len.items, 0);
         lg.edge_scratch.clearRetainingCapacity();
-        // One patch-scratch slot per worker during threaded init builds; serial callers use 0.
+        // scratch_slot reserves room for a future threaded caller to give each
+        // worker its own patch-scratch slot; the only caller today is serial and
+        // always passes 0.
         const scratch = &self.patch_scratch.items[scratch_slot % self.patch_scratch.items.len];
         const chunk_count = self.chunkCount();
         var chunk: u32 = 0;
@@ -1656,6 +1658,43 @@ test "incremental nav update remask matches the composed world mask across level
     try rebuilt.reserve(abstractCapacity());
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "threaded initial nav build matches a serial build across levels" {
+    // navLevelMaskJob (the threaded per-level world-mask/component-build fan-out
+    // in NavGraph.rebuild) only fires when the initial build is given both a real
+    // ThreadSystem and more than one level. Every other rebuildStaticNavGridWithWorld
+    // call in this file passes thread_system=null, so without this test that path
+    // has zero coverage: a serial/threaded divergence there would ship undetected.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+    try std.testing.expect(world.levelCount() > 1);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+
+    var threaded = PathfindingSystem.init(std.testing.allocator);
+    defer threaded.deinit();
+    try threaded.reserve(cap);
+    try threaded.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, &threads);
+
+    var serial = PathfindingSystem.init(std.testing.allocator);
+    defer serial.deinit();
+    try serial.reserve(cap);
+    try serial.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+
+    try expectGraphsEquivalent(&threaded.graph, &serial.graph);
 }
 
 test "whole-level dirty re-derives the level from the world and matches a full rebuild" {

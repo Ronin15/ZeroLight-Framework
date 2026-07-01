@@ -13,8 +13,6 @@ const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisua
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const AssetReference = @import("data_system.zig").AssetReference;
-const MovementBody = @import("data_system.zig").MovementBody;
-const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const Rect = @import("../render/renderer.zig").Rect;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
@@ -92,71 +90,6 @@ pub fn submitPreparedDraw(renderer: *Renderer, draw: PreparedDraw) !void {
         .sprite => |sprite| try renderer.submitOrderedSprite(sprite),
         .rect => |rect| try renderer.submitOrderedRectInSpace(rect.rect, rect.color, rect.order, .world),
     }
-}
-
-pub fn submitEntity(
-    renderer: *Renderer,
-    data: *const DataSystem,
-    entity: EntityId,
-    runtime_assets: *const RuntimeAssets,
-    interpolation_alpha: f32,
-) !void {
-    const draw = prepareEntity(data, entity, runtime_assets, interpolation_alpha) orelse return;
-    try submitPreparedDraw(renderer, draw);
-}
-
-pub fn prepareEntity(
-    data: *const DataSystem,
-    entity: EntityId,
-    runtime_assets: *const RuntimeAssets,
-    interpolation_alpha: f32,
-) ?PreparedDraw {
-    const body = data.movementBodyConst(entity) orelse return null;
-    const visual = data.primitiveVisualConst(entity) orelse return null;
-    return preparePrimitiveVisual(
-        body,
-        visual,
-        data.assetReferenceConst(entity),
-        runtime_assets,
-        interpolation_alpha,
-    );
-}
-
-pub fn preparePrimitiveVisual(
-    body: MovementBody,
-    visual: PrimitiveVisual,
-    asset_ref: ?AssetReference,
-    runtime_assets: *const RuntimeAssets,
-    interpolation_alpha: f32,
-) ?PreparedDraw {
-    const render_position = math.lerpVec2(body.previous_position, body.position, interpolation_alpha);
-    const dest = Rect{
-        .x = render_position.x,
-        .y = render_position.y,
-        .w = visual.size.x,
-        .h = visual.size.y,
-    };
-    const order = worldOrder(body.position_z, visual.depth);
-
-    if (asset_ref) |ref| {
-        if (runtime_assets.sprite(ref.sprite)) |sprite| {
-            const source = sourceRectForAsset(runtime_assets, ref, sprite.source_rect) orelse if (ref.hasAtlasEntry())
-                null
-            else
-                sprite.source_rect;
-            if (!ref.hasAtlasEntry() or source != null) {
-                return .{ .sprite = .{
-                    .texture = sprite.texture,
-                    .source = source,
-                    .dest = dest,
-                    .tint = visual.color,
-                    .order = order,
-                } };
-            }
-        }
-    }
-
-    return .{ .rect = .{ .rect = dest, .color = visual.color, .order = order } };
 }
 
 fn assetReferenceAt(assets: ConstAssetReferenceSlice, index: usize) AssetReference {
@@ -526,24 +459,8 @@ pub fn collectDynamicRecords(
         const particle_size = particles.size[index];
         const half_size = particle_size * 0.5;
         if (!visible.overlapsAabb(render_x - half_size, render_y - half_size, particle_size, particle_size)) continue;
-        prep.appendAssumeCapacity(.{
-            .depth = particles.z[index],
-            .draw = .{ .rect = .{
-                .rect = .{
-                    .x = render_x - half_size,
-                    .y = render_y - half_size,
-                    .w = particle_size,
-                    .h = particle_size,
-                },
-                .color = .{
-                    .r = particles.color_r[index],
-                    .g = particles.color_g[index],
-                    .b = particles.color_b[index],
-                    .a = particles.color_a[index],
-                },
-                .order = RenderOrder.world(particles.z[index]),
-            } },
-        });
+        const draw = prepareParticleAt(particles, index, render_x, render_y) orelse continue;
+        prep.appendAssumeCapacity(.{ .depth = draw.depth(), .draw = draw });
     }
     prep.finalizeDepthBuckets();
 }
@@ -587,33 +504,6 @@ fn nextDynamicDepth(prep: *const DynamicScenePrep, span_index: *usize) ?i32 {
     return depth;
 }
 
-pub fn preparePlayerMarker(data: *const DataSystem, entity: EntityId, interpolation_alpha: f32) ?PreparedDraw {
-    const indices = data.renderEntityComponentIndices(entity) orelse return null;
-    const visual_index = data.primitiveVisualDenseIndex(entity) orelse return null;
-    const facing_index = indices.facing orelse return null;
-    const movement = data.movementBodySliceConst();
-    const movement_index = indices.movement_body;
-    const render_x = math.lerp(
-        movement.previous_x[movement_index],
-        movement.position_x[movement_index],
-        interpolation_alpha,
-    );
-    const render_y = math.lerp(
-        movement.previous_y[movement_index],
-        movement.position_y[movement_index],
-        interpolation_alpha,
-    );
-    return preparePlayerMarkerSoA(
-        movement,
-        data.primitiveVisualSliceConst(),
-        movement_index,
-        visual_index,
-        data.facingSliceConst().directions[facing_index],
-        render_x,
-        render_y,
-    );
-}
-
 fn preparePlayerMarkerSoA(
     movement: ConstMovementBodySlice,
     visuals: ConstPrimitiveVisualSlice,
@@ -644,13 +534,6 @@ fn preparePlayerMarkerSoA(
         },
         .order = marker_order,
     } };
-}
-
-pub fn prepareParticle(particles: ConstParticleSlice, index: usize, interpolation_alpha: f32) ?PreparedDraw {
-    if (index >= particles.len() or !particles.renderable(index)) return null;
-    const render_x = math.lerp(particles.previous_x[index], particles.position_x[index], interpolation_alpha);
-    const render_y = math.lerp(particles.previous_y[index], particles.position_y[index], interpolation_alpha);
-    return prepareParticleAt(particles, index, render_x, render_y);
 }
 
 fn prepareParticleAt(particles: ConstParticleSlice, index: usize, render_x: f32, render_y: f32) ?PreparedDraw {
@@ -904,50 +787,25 @@ fn deinitAtlasMetadataForTest(runtime_assets: *RuntimeAssets, id: manifest.Sprit
     runtime_assets.atlas_meta[index] = null;
 }
 
-test "atlas-backed entity falls back to primitive rect without metadata" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, .{ .position = .{}, .previous_position = .{} });
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 32, .y = 48 },
-        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-    });
-    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
+test "atlas-backed asset reference falls back to null source rect without metadata" {
     var runtime_assets = RuntimeAssets.init();
     setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
+    const asset_ref = AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
+    const sprite = runtime_assets.sprite(asset_ref.sprite).?;
 
-    const draw = prepareEntity(&data, entity, &runtime_assets, 1.0) orelse return error.TestExpectedEqual;
-    switch (draw) {
-        .rect => {},
-        .sprite => return error.TestExpectedEqual,
-    }
+    try std.testing.expect(sourceRectForAsset(&runtime_assets, asset_ref, sprite.source_rect) == null);
 }
 
-test "atlas-backed entity uses metadata source rect when available" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const entity = try data.createEntity();
-    try data.setMovementBody(entity, .{ .position = .{}, .previous_position = .{} });
-    try data.setPrimitiveVisual(entity, .{
-        .size = .{ .x = 32, .y = 48 },
-        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
-    });
-    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
+test "atlas-backed asset reference uses metadata source rect when available" {
     var runtime_assets = RuntimeAssets.init();
     runtime_assets.allocator = std.testing.allocator;
     setSpriteAvailableForTest(&runtime_assets, .grim_characters, try TextureId.init(1, 1));
     try setSpriteAtlasMetadataForTest(&runtime_assets, .grim_characters);
     defer deinitAtlasMetadataForTest(&runtime_assets, .grim_characters);
+    const asset_ref = AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
+    const sprite = runtime_assets.sprite(asset_ref.sprite).?;
 
-    const draw = prepareEntity(&data, entity, &runtime_assets, 1.0) orelse return error.TestExpectedEqual;
-    const sprite = switch (draw) {
-        .sprite => |sprite| sprite,
-        .rect => return error.TestExpectedEqual,
-    };
-    const source = sprite.source orelse return error.TestExpectedEqual;
+    const source = sourceRectForAsset(&runtime_assets, asset_ref, sprite.source_rect) orelse return error.TestExpectedEqual;
     const expected = runtime_assets.spriteAtlasMeta(.grim_characters).?.sourceRectForId(0) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected.x, source.x);
     try std.testing.expectEqual(expected.y, source.y);

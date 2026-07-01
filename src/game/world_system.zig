@@ -260,6 +260,13 @@ pub const WorldSystem = struct {
     owned_tileset_meta: ?WorldTilesetMeta = null,
     catalog_valid: std.ArrayList(bool) = .empty,
     catalog_flags: std.ArrayList(TileFlags) = .empty,
+    // O(1) source-rect cache, indexed like catalog_valid/catalog_flags. Avoids a
+    // per-tile hash-map lookup into tileset_meta on the per-frame sparse-tile
+    // render path.
+    catalog_source_x: std.ArrayList(f32) = .empty,
+    catalog_source_y: std.ArrayList(f32) = .empty,
+    catalog_source_w: std.ArrayList(f32) = .empty,
+    catalog_source_h: std.ArrayList(f32) = .empty,
 
     level_base_z: std.ArrayList(i32) = .empty,
     level_links: std.ArrayList(LevelLink) = .empty,
@@ -513,6 +520,10 @@ pub const WorldSystem = struct {
         self.level_links.deinit(self.allocator);
         self.level_base_z.deinit(self.allocator);
 
+        self.catalog_source_h.deinit(self.allocator);
+        self.catalog_source_w.deinit(self.allocator);
+        self.catalog_source_y.deinit(self.allocator);
+        self.catalog_source_x.deinit(self.allocator);
         self.catalog_flags.deinit(self.allocator);
         self.catalog_valid.deinit(self.allocator);
         if (self.owned_tileset_meta) |*meta| meta.deinit();
@@ -1297,9 +1308,17 @@ pub const WorldSystem = struct {
         const count = catalogCapacity(meta);
         try self.catalog_valid.ensureTotalCapacity(self.allocator, count);
         try self.catalog_flags.ensureTotalCapacity(self.allocator, count);
+        try self.catalog_source_x.ensureTotalCapacity(self.allocator, count);
+        try self.catalog_source_y.ensureTotalCapacity(self.allocator, count);
+        try self.catalog_source_w.ensureTotalCapacity(self.allocator, count);
+        try self.catalog_source_h.ensureTotalCapacity(self.allocator, count);
         for (0..count) |_| {
             self.catalog_valid.appendAssumeCapacity(false);
             self.catalog_flags.appendAssumeCapacity(.{});
+            self.catalog_source_x.appendAssumeCapacity(0);
+            self.catalog_source_y.appendAssumeCapacity(0);
+            self.catalog_source_w.appendAssumeCapacity(0);
+            self.catalog_source_h.appendAssumeCapacity(0);
         }
 
         for (0..meta.tileCount()) |index| {
@@ -1311,6 +1330,10 @@ pub const WorldSystem = struct {
                 .blocks_movement = tile.properties.blocks_movement,
                 .blocks_vision = tile.properties.blocks_vision,
             };
+            self.catalog_source_x.items[tile_index] = tile.x;
+            self.catalog_source_y.items[tile_index] = tile.y;
+            self.catalog_source_w.items[tile_index] = tile.width;
+            self.catalog_source_h.items[tile_index] = tile.height;
         }
     }
 
@@ -1425,13 +1448,11 @@ pub const WorldSystem = struct {
     fn sourceRect(self: *const WorldSystem, tile_id: TileId) ?Rect {
         const index: usize = tile_id;
         if (index >= self.catalog_valid.items.len or !self.catalog_valid.items[index]) return null;
-        const meta = self.tileset_meta orelse return null;
-        const rect = meta.sourceRectForId(tile_id) orelse return null;
         return .{
-            .x = rect.x,
-            .y = rect.y,
-            .w = rect.w,
-            .h = rect.h,
+            .x = self.catalog_source_x.items[index],
+            .y = self.catalog_source_y.items[index],
+            .w = self.catalog_source_w.items[index],
+            .h = self.catalog_source_h.items[index],
         };
     }
 

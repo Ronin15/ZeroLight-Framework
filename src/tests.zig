@@ -24,8 +24,14 @@ comptime {
     _ = @import("app/state.zig");
     _ = @import("app/thread_system.zig");
     _ = @import("app/time_loop.zig");
-    // Benchmark workloads and production world builds run via `zig build bench` only.
+    // Benchmark workloads and production world builds run via `zig build bench` only;
+    // benchmarks/pathfinding.zig and benchmarks/render_game_prep.zig are exceptions
+    // because their fixtures carry correctness invariants (hard-fallback service
+    // ceiling; expectedBenchCollectedRecords) that a benchmark run alone won't
+    // reliably catch a regression in.
     _ = @import("benchmarks/suite.zig");
+    _ = @import("benchmarks/pathfinding.zig");
+    _ = @import("benchmarks/render_game_prep.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/simd.zig");

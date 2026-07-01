@@ -10,10 +10,7 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
-const Renderer = @import("../render/renderer.zig").Renderer;
-const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const render_depth = @import("render_depth.zig");
-const render_prep = @import("render_prep.zig");
 
 pub const Player = struct {
     entity: EntityId = EntityId.invalid,
@@ -83,24 +80,6 @@ pub const Player = struct {
             0,
             bounds_height - visual.size.y,
         );
-    }
-
-    pub fn submitBodyRender(self: Player, data: *const DataSystem, runtime_assets: *const RuntimeAssets, renderer: *Renderer, interpolation_alpha: f32) !void {
-        const body = data.movementBodyConst(self.entity) orelse return error.MissingPlayerMovementBody;
-        const visual = data.primitiveVisualConst(self.entity) orelse return error.MissingPlayerVisual;
-        const draw = render_prep.preparePrimitiveVisual(
-            body,
-            visual,
-            data.assetReferenceConst(self.entity),
-            runtime_assets,
-            interpolation_alpha,
-        ) orelse return error.MissingPlayerVisual;
-        try render_prep.submitPreparedDraw(renderer, draw);
-    }
-
-    pub fn submitMarkerRender(self: Player, data: *const DataSystem, renderer: *Renderer, interpolation_alpha: f32) !void {
-        const draw = render_prep.preparePlayerMarker(data, self.entity, interpolation_alpha) orelse return error.MissingPlayerMovementBody;
-        try render_prep.submitPreparedDraw(renderer, draw);
     }
 
     pub fn onPause(self: Player, data: *DataSystem) void {

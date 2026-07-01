@@ -15,6 +15,8 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
+const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
 const AudioController = @import("audio_controller.zig").AudioController;
@@ -387,13 +389,13 @@ pub const SimulationPipeline = struct {
         const collision_response_stats = try self.collision_response.update(data, frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
 
-        // After movement/collision settle the player's position, update their plane:
-        // follow a ramp on cell entry, fall one level per step when standing over a
-        // hole. Player-only; mutates the
-        // borrowed `Player.current_level` and snaps the body, then the dig reaction's
-        // tile change re-masks navigation post-commit.
+        // After movement/collision settle positions, update planes: follow a ramp
+        // on cell entry, fall one level per step when standing over a hole. Both
+        // the player and NPCs route through `DigController.applyEntityPlaneTraversal`
+        // so falls carve their landing cell identically; a fall's tile change
+        // re-masks navigation post-commit.
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
-        applyNpcPlaneTraversal(context.world, data);
+        try applyNpcPlaneTraversal(&self.dig, context.world, data, frame);
 
         // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
         // kinematic/dormant by its cube distance from the visible region, applied
@@ -486,42 +488,50 @@ fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void
     }
 }
 
-/// Stops the player from moving into solid world tiles on their current plane.
-/// No-op on level 0 (the surface is fully walkable and pre-existing decos/water are
-/// intentionally pass-through there). Resolves X then Y independently against the
-/// pre-move position so a diagonal push into a wall slides along it. The body is one
-/// tile wide; sampling the four AABB corners (with an epsilon so a flush right/bottom
+/// Stops one body from moving into solid world tiles on `level`. No-op on level 0
+/// (the surface is fully walkable and pre-existing decos/water are intentionally
+/// pass-through there). Resolves X then Y independently against the pre-move
+/// position so a diagonal push into a wall slides along it. The body is one tile
+/// wide; sampling the four AABB corners (with an epsilon so a flush right/bottom
 /// edge stays in the covered cell) is exact for the sub-tile motion this produces.
-/// Allocation-free, single entity, scalar.
+/// Allocation-free, single entity, scalar. Shared by the player and NPC gates.
+fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: MovementBodyPtr, visual: PrimitiveVisual) void {
+    if (level == 0) return;
+    const w = visual.size.x;
+    const h = visual.size.y;
+    const pre_x = body.previous_x.*;
+    const pre_y = body.previous_y.*;
+    const post_x = body.position_x.*;
+    const post_y = body.position_y.*;
+
+    var resolved_x = post_x;
+    if (rectOverlapsSolidTile(world, level, post_x, pre_y, w, h)) resolved_x = pre_x;
+    var resolved_y = post_y;
+    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, w, h)) resolved_y = pre_y;
+
+    if (resolved_x != post_x) body.velocity_x.* = 0;
+    if (resolved_y != post_y) body.velocity_y.* = 0;
+    body.position_x.* = resolved_x;
+    body.position_y.* = resolved_y;
+}
+
 fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
     const ai_slice = data.aiAgentSliceConst();
     for (ai_slice.entities) |entity| {
         const level = data.worldLevelConst(entity) orelse 0;
-        if (level == 0) continue;
         const body = data.movementBodyPtr(entity) orelse continue;
         const visual = data.primitiveVisualConst(entity) orelse continue;
-        const w = visual.size.x;
-        const h = visual.size.y;
-        const pre_x = body.previous_x.*;
-        const pre_y = body.previous_y.*;
-        const post_x = body.position_x.*;
-        const post_y = body.position_y.*;
-
-        var resolved_x = post_x;
-        if (rectOverlapsSolidTile(world, level, post_x, pre_y, w, h)) resolved_x = pre_x;
-        var resolved_y = post_y;
-        if (rectOverlapsSolidTile(world, level, resolved_x, post_y, w, h)) resolved_y = pre_y;
-
-        if (resolved_x != post_x) body.velocity_x.* = 0;
-        if (resolved_y != post_y) body.velocity_y.* = 0;
-        body.position_x.* = resolved_x;
-        body.position_y.* = resolved_y;
+        gateBodyToWalkableTiles(world, level, body, visual);
     }
 }
 
-/// Updates NPC planes after movement using cell-entry guards from previous to
-/// current body centers. Mirrors player ramp/fall traversal without dig carving.
-fn applyNpcPlaneTraversal(world: *const WorldSystem, data: *DataSystem) void {
+/// Updates NPC planes after movement using per-entity cell-entry guards derived
+/// from previous vs. current body centers (no stored `last_cell` needed, unlike
+/// the player, since the movement body already tracks both positions). Delegates
+/// the actual ramp/fall/carve/snap logic to `DigController.applyEntityPlaneTraversal`
+/// so NPCs get the same landing-cell carve as the player instead of a hand-rolled
+/// copy that could (and did) drift out of sync.
+fn applyNpcPlaneTraversal(dig: *DigController, world: *WorldSystem, data: *DataSystem, frame: *SimulationFrame) !void {
     const ai_slice = data.aiAgentSliceConst();
     for (ai_slice.entities) |entity| {
         const level = data.worldLevelConst(entity) orelse continue;
@@ -535,53 +545,14 @@ fn applyNpcPlaneTraversal(world: *const WorldSystem, data: *DataSystem) void {
         const cell = world.cellContaining(center_x, center_y) orelse continue;
         if (prev_cell.x == cell.x and prev_cell.y == cell.y) continue;
 
-        const cell_coord = CellCoord{ .x = cell.x, .y = cell.y };
-        if (world.rampLinkOtherLevel(level, cell_coord)) |other| {
-            setEntityWorldLevel(world, data, entity, other, cell_coord);
-            continue;
-        }
-        const below: usize = @as(usize, level) + 1;
-        if (below < world.levelCount() and world.denseFloorIsEmpty(level, cell.x, cell.y)) {
-            setEntityWorldLevel(world, data, entity, @intCast(below), cell_coord);
-        }
+        _ = try dig.applyEntityPlaneTraversal(world, data, frame, entity, level, CellCoord{ .x = cell.x, .y = cell.y });
     }
 }
 
-fn setEntityWorldLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId, level: u16, cell: CellCoord) void {
-    data.setWorldLevel(entity, level) catch return;
-    const body = data.movementBodyPtr(entity) orelse return;
-    const z = world.levelBaseZ(level);
-    body.position_z.* = z;
-    body.previous_z.* = z;
-    if (level == 0) return;
-    const snap_x = @as(f32, @floatFromInt(cell.x)) * world.tile_size;
-    const snap_y = @as(f32, @floatFromInt(cell.y)) * world.tile_size;
-    body.position_x.* = snap_x;
-    body.position_y.* = snap_y;
-    body.previous_x.* = snap_x;
-    body.previous_y.* = snap_y;
-}
-
 fn gatePlayerToWalkableTiles(world: *const WorldSystem, data: *DataSystem, player: Player) void {
-    if (player.current_level == 0) return;
     const body = data.movementBodyPtr(player.entity) orelse return;
     const visual = data.primitiveVisualConst(player.entity) orelse return;
-    const w = visual.size.x;
-    const h = visual.size.y;
-    const pre_x = body.previous_x.*;
-    const pre_y = body.previous_y.*;
-    const post_x = body.position_x.*;
-    const post_y = body.position_y.*;
-
-    var resolved_x = post_x;
-    if (rectOverlapsSolidTile(world, player.current_level, post_x, pre_y, w, h)) resolved_x = pre_x;
-    var resolved_y = post_y;
-    if (rectOverlapsSolidTile(world, player.current_level, resolved_x, post_y, w, h)) resolved_y = pre_y;
-
-    if (resolved_x != post_x) body.velocity_x.* = 0;
-    if (resolved_y != post_y) body.velocity_y.* = 0;
-    body.position_x.* = resolved_x;
-    body.position_y.* = resolved_y;
+    gateBodyToWalkableTiles(world, player.current_level, body, visual);
 }
 
 /// Whether an axis-aligned body rect overlaps any movement-blocking tile on `level`.

@@ -625,6 +625,37 @@ fn renderOrdersEqual(lhs: RenderOrder, rhs: RenderOrder) bool {
     return lhs.domain == rhs.domain and lhs.depth == rhs.depth;
 }
 
+fn spriteCommandsEqual(lhs: []const SpriteCommand, rhs: []const SpriteCommand) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        const a = left.sprite;
+        const b = right.sprite;
+        if (a.order.domain != b.order.domain or a.order.depth != b.order.depth) return false;
+        if (!a.texture.matches(b.texture.index, b.texture.generation)) return false;
+        if (!rectEqualForTest(a.dest, b.dest)) return false;
+        if (!optionalRectEqualForTest(a.source, b.source)) return false;
+        if (!colorEqualForTest(a.tint, b.tint)) return false;
+        if (a.origin.x != b.origin.x or a.origin.y != b.origin.y) return false;
+        if (a.rotation != b.rotation) return false;
+        if (a.coordinate_space != b.coordinate_space) return false;
+    }
+    return true;
+}
+
+fn rectEqualForTest(a: Rect, b: Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+fn optionalRectEqualForTest(a: ?Rect, b: ?Rect) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return rectEqualForTest(a.?, b.?);
+}
+
+fn colorEqualForTest(a: config.Color, b: config.Color) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}
+
 fn testTextureId(index: u32, generation: u32) TextureId {
     return TextureId.init(index, generation) catch unreachable;
 }
@@ -811,6 +842,49 @@ test "batch builder preserves ordered submission stream" {
     try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
     try std.testing.expectEqual(@as(f32, 30), batch.positions.items[12][0]);
+}
+
+test "sprite batch build consumes the ordered command stream read-only" {
+    // SpriteBatch consumes an already-ordered submission stream; it is not a
+    // compatibility sorter and must never rewrite any geometry/material field of
+    // the commands it just read while building vertices/draw groups from them.
+    const allocator = std.testing.allocator;
+    const slots = [_]TestTextureSlot{
+        .{ .id = testTextureId(0, 1), .desc = .{ .width = 64, .height = 64 } },
+        .{ .id = testTextureId(1, 1), .desc = .{ .width = 128, .height = 32 } },
+        .{ .id = testTextureId(2, 1), .desc = .{ .width = 32, .height = 128 } },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = try initBatchTest(allocator, &table);
+    defer batch.deinit();
+
+    try batch.drawSprite(.{
+        .texture = testTextureId(0, 1),
+        .dest = .{ .x = 1, .y = 2, .w = 3, .h = 4 },
+        .source = .{ .x = 5, .y = 6, .w = 7, .h = 8 },
+        .tint = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 },
+        .origin = .{ .x = 0.5, .y = 0.5 },
+        .rotation = 1.25,
+        .order = RenderOrder.world(0),
+    });
+    try batch.drawSprite(.{
+        .texture = testTextureId(1, 1),
+        .dest = .{ .x = 10, .y = 20, .w = 30, .h = 40 },
+        .order = RenderOrder.world(1),
+    });
+    try batch.drawSprite(.{
+        .texture = testTextureId(2, 1),
+        .dest = .{ .x = 100, .y = 200, .w = 300, .h = 400 },
+        .order = RenderOrder.world(1),
+    });
+
+    var snapshot = SpriteBatch.CommandList.empty;
+    defer snapshot.deinit(allocator);
+    try snapshot.appendSlice(allocator, batch.commands.items);
+
+    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
+
+    try std.testing.expect(spriteCommandsEqual(snapshot.items, batch.commands.items));
 }
 
 test "batch builder splits a same-texture run on render order change" {

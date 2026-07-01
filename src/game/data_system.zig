@@ -955,6 +955,12 @@ pub const DataSystem = struct {
         slot.addComponent(.movement_body);
         // The new scope row defaults to .cognition (see MovementBodyStore.append).
         self.tier_counts[@intFromEnum(SimulationTier.cognition)] += 1;
+        // A primitive-visual row may already exist for this entity (e.g. movement
+        // body re-added after being destroyed while the visual persisted) — sync
+        // the new row's flag so render collect doesn't skip it.
+        if (slot.primitive_visual_index != null) {
+            self.movement_bodies.setHasPrimitiveVisual(@intCast(dense_index), true);
+        }
     }
 
     pub fn movementBodyPtr(self: *DataSystem, id: EntityId) ?MovementBodyPtr {
@@ -3139,6 +3145,25 @@ test "render collect indices resolve drawable rows from movement dense index" {
     _ = data.destroyEntity(entity);
     try std.testing.expect(data.renderCollectIndicesForMovement(0) == null);
     try std.testing.expect(data.movementBodySliceConst().entities.len == 1);
+}
+
+test "setMovementBody syncs has_primitive_visual when the visual row already exists" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Primitive visual set before movement body — the reverse of the usual
+    // template order. setMovementBody must still pick up the existing visual
+    // row rather than leaving the new movement row's has_primitive_visual false.
+    const entity = try data.createEntity();
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setMovementBody(entity, testBody(1));
+
+    try std.testing.expect(data.movementBodySliceConst().has_primitive_visual[0]);
+    try std.testing.expect(data.renderCollectIndicesForMovement(0) != null);
 }
 
 test "movement body columns can be loaded directly through simd helpers" {

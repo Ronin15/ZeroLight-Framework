@@ -19,6 +19,7 @@ const std = @import("std");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
 const DataSystem = @import("data_system.zig").DataSystem;
+const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
 const WorldSystem = @import("world_system.zig").WorldSystem;
@@ -158,10 +159,12 @@ pub const DigController = struct {
 
     /// Updates the player's plane after movement. On entering a new cell: follow a
     /// ramp link to its other plane, else fall one level if standing over a hole
-    /// with a level below. The cell-entry guard prevents ramp oscillation and caps
-    /// a hole to a single one-level drop. Player-only by design: NPCs have no
-    /// per-entity plane and stay on the surface, so they never fall or take ramps
-    /// (autonomous NPC descent is a separate, deferred slice).
+    /// with a level below (see `applyEntityPlaneTraversal`). The cell-entry guard
+    /// (`player_last_cell`) prevents ramp oscillation and caps a hole to a single
+    /// one-level drop. NPCs share the same underlying traversal via
+    /// `applyEntityPlaneTraversal`, called directly by `simulation_pipeline` with
+    /// their own per-entity cell-entry guard (derived from previous/current body
+    /// position rather than a single stored `last_cell`).
     pub fn applyPlaneTraversal(self: *DigController, world: *WorldSystem, data: *DataSystem, player: *Player, frame: *SimulationFrame) !void {
         const body = data.movementBodyConst(player.entity) orelse return;
         const visual = data.primitiveVisualConst(player.entity) orelse return;
@@ -175,21 +178,43 @@ pub const DigController = struct {
         }
         self.player_last_cell = cell;
 
-        if (world.rampLinkOtherLevel(player.current_level, cell)) |other| {
-            setPlayerLevel(world, data, player, other, cell);
-            return;
+        if (try self.applyEntityPlaneTraversal(world, data, frame, player.entity, player.current_level, cell)) |new_level| {
+            player.current_level = new_level;
         }
-        const below: usize = @as(usize, player.current_level) + 1;
-        if (below < world.levelCount() and
-            world.denseFloorIsEmpty(player.current_level, cell.x, cell.y))
-        {
+    }
+
+    /// Entity-generic plane traversal for one cell-entry event: follows a ramp
+    /// link to its other plane, else falls one level if `cell` is a hole with a
+    /// level below. Falling carves the landing cell walkable first — underground
+    /// planes default to solid dirt, and landing embedded in it would have the
+    /// tile gate shove the entity straight back out, a permanent soft-lock.
+    /// Returns the entity's new level, or null if `cell` triggered no transition.
+    /// Shared by the player (`applyPlaneTraversal`, which layers its own
+    /// cell-entry dedup) and NPCs (`simulation_pipeline.applyNpcPlaneTraversal`).
+    pub fn applyEntityPlaneTraversal(
+        self: *const DigController,
+        world: *WorldSystem,
+        data: *DataSystem,
+        frame: *SimulationFrame,
+        entity: EntityId,
+        level: u16,
+        cell: CellCoord,
+    ) !?u16 {
+        if (world.rampLinkOtherLevel(level, cell)) |other| {
+            try setEntityLevel(world, data, entity, other, cell);
+            return other;
+        }
+        const below: usize = @as(usize, level) + 1;
+        if (below < world.levelCount() and world.denseFloorIsEmpty(level, cell.x, cell.y)) {
             const below_level: u16 = @intCast(below);
             // The plane below is solid dirt; carve the landing cell walkable so the
-            // player never lands embedded in rock (else the tile gate would shove
-            // them straight back out). Carve before the snap so the cell is open.
+            // entity never lands embedded in rock (else the tile gate would shove
+            // it straight back out). Carve before the snap so the cell is open.
             try self.carveLandingCell(world, frame, below_level, cell);
-            setPlayerLevel(world, data, player, below_level, cell);
+            try setEntityLevel(world, data, entity, below_level, cell);
+            return below_level;
         }
+        return null;
     }
 
     /// Carves a fall's landing cell to the walkable tunnel tile and queues the tile
@@ -205,16 +230,15 @@ pub const DigController = struct {
     }
 };
 
-/// Moves the player onto a plane: tracks the level and snaps the body's render z
+/// Moves an entity onto a plane: tracks the level and snaps the body's render z
 /// (and its previous, since z is not interpolated) to that plane's base. When
 /// descending into a solid lower plane, also snaps x/y flush onto `cell` so the
 /// one-tile-sized body sits inside the carved pocket rather than straddling the
 /// solid neighbors the tile gate would otherwise shove it out of. Level 0 is fully
 /// open, so no x/y snap there.
-fn setPlayerLevel(world: *const WorldSystem, data: *DataSystem, player: *Player, level: u16, cell: CellCoord) void {
-    player.current_level = level;
-    data.setWorldLevel(player.entity, level) catch {};
-    const body = data.movementBodyPtr(player.entity) orelse return;
+fn setEntityLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId, level: u16, cell: CellCoord) !void {
+    try data.setWorldLevel(entity, level);
+    const body = data.movementBodyPtr(entity) orelse return;
     const z = world.levelBaseZ(level);
     body.position_z.* = z;
     body.previous_z.* = z;
@@ -431,6 +455,48 @@ test "dig controller is a no-op for none intent or an off-world target" {
     var off_frame = try runDig(&tw, dig, .hole);
     defer off_frame.deinit();
     try std.testing.expectEqual(@as(usize, 0), off_frame.events.mergedItems().len);
+}
+
+test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell before it falls" {
+    var tw = try TestWorld.init(.right, 0);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+
+    // Punch a fall-through hole in the surface floor, mirroring what a player's
+    // `.down` dig produces, without carving level 1's landing cell — it stays
+    // solid dirt by default, same as the underground-mining test above.
+    const floor0 = tw.world.denseFloorLayerForLevel(0).?;
+    _ = try tw.world.clearDenseTile(floor0, 4, 3);
+    const floor1 = tw.world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(tw.world.denseTileBlocksMovement(floor1, 4, 3));
+
+    const npc = try tw.data.createEntity();
+    try tw.data.setMovementBody(npc, .{});
+    try tw.data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    frame.beginStep();
+
+    const new_level = try dig.applyEntityPlaneTraversal(&tw.world, &tw.data, &frame, npc, 0, .{ .x = 4, .y = 3 });
+
+    try std.testing.expectEqual(@as(?u16, 1), new_level);
+    try std.testing.expectEqual(@as(?u16, 1), tw.data.worldLevelConst(npc));
+    // The landing cell was carved walkable instead of leaving the NPC embedded in
+    // solid dirt, which would have soft-locked it against the tile gate.
+    try std.testing.expectEqual(dig.tunnel_tile, tw.world.denseTile(floor1, 4, 3));
+    try std.testing.expect(!tw.world.denseTileBlocksMovement(floor1, 4, 3));
+
+    const body = tw.data.movementBodyConst(npc).?;
+    try std.testing.expectEqual(@as(f32, 4 * 32), body.position.x);
+    try std.testing.expectEqual(@as(f32, 3 * 32), body.position.y);
+
+    try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
 }
 
 test "dig controller captures intent once on the rising edge of a held key" {

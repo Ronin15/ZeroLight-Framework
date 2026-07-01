@@ -783,10 +783,11 @@ pub const Renderer = struct {
         return try self.createTextureFromPixelsInternal(pixels, width, height, pitch, false);
     }
 
-    /// Uploads decoded startup images in one GPU command buffer. Caller owns the
-    /// returned slice until each `TextureId` is destroyed.
-    pub fn createTexturesFromPixelsBatch(self: *Renderer, images: []const LoadedImage) ![]TextureId {
-        if (images.len == 0) return try self.allocator.alloc(TextureId, 0);
+    /// Uploads decoded startup images in one GPU command buffer. Returned slice
+    /// is allocated with `allocator` and owned by the caller until each
+    /// `TextureId` is destroyed.
+    pub fn createTexturesFromPixelsBatch(self: *Renderer, allocator: std.mem.Allocator, images: []const LoadedImage) ![]TextureId {
+        if (images.len == 0) return try allocator.alloc(TextureId, 0);
 
         const items = try self.allocator.alloc(gpu_texture.BatchUploadItem, images.len);
         defer self.allocator.free(items);
@@ -802,11 +803,14 @@ pub const Renderer = struct {
         const uploaded = try gpu_texture.uploadTexturesBatch(self.allocator, self.device, items);
         defer self.allocator.free(uploaded);
 
-        const ids = try self.allocator.alloc(TextureId, images.len);
-        errdefer self.allocator.free(ids);
+        const ids = try allocator.alloc(TextureId, images.len);
+        errdefer allocator.free(ids);
         var registered_count: usize = 0;
         errdefer for (ids[0..registered_count]) |id| {
             self.destroyTexture(id);
+        };
+        errdefer for (uploaded[registered_count..]) |texture| {
+            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
         };
         for (uploaded, ids) |texture, *id| {
             id.* = try self.registerTexture(texture, false);
@@ -1087,12 +1091,10 @@ pub const Renderer = struct {
         var copy_pass_scope = try gpu_buffer.CopyPassScope.begin(command_buffer);
         defer copy_pass_scope.end();
 
-        // `cycle=true` applies only to ring-buffered vertex streams. Tile-data
-        // storage edits are excluded — they target retained per-layer buffers.
-        var uploads_remaining: usize = 0;
-        if (work.dynamic) uploads_remaining += 3;
-        if (work.static_vertices) uploads_remaining += 3;
-
+        // Every vertex-stream upload below is a full-buffer rewrite, so each
+        // passes `cycle=true` independently of what else shares this pass.
+        // Tile-data storage edits are excluded — they target retained
+        // per-layer buffers with partial writes.
         if (work.dynamic) {
             const streams = self.vertex_streams;
             try gpu_buffer.recordVertexUploadInPass(
@@ -1102,7 +1104,7 @@ pub const Renderer = struct {
                 streams.position,
                 streams.position_bytes,
                 std.mem.sliceAsBytes(self.batch.positions.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
@@ -1111,7 +1113,7 @@ pub const Renderer = struct {
                 streams.uv,
                 streams.uv_bytes,
                 std.mem.sliceAsBytes(self.batch.uvs.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
@@ -1120,7 +1122,7 @@ pub const Renderer = struct {
                 streams.color,
                 streams.color_bytes,
                 std.mem.sliceAsBytes(self.batch.colors.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
         }
 
@@ -1133,7 +1135,7 @@ pub const Renderer = struct {
                 streams.position,
                 streams.position_bytes,
                 std.mem.sliceAsBytes(self.static_positions.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
@@ -1142,7 +1144,7 @@ pub const Renderer = struct {
                 streams.uv,
                 streams.uv_bytes,
                 std.mem.sliceAsBytes(self.static_uvs.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
             try gpu_buffer.recordVertexUploadInPass(
                 copy_pass_scope.pass,
@@ -1151,7 +1153,7 @@ pub const Renderer = struct {
                 streams.color,
                 streams.color_bytes,
                 std.mem.sliceAsBytes(self.static_colors.items),
-                uploadsRemainingCycle(&uploads_remaining, 1),
+                true,
             );
         }
 
@@ -1176,12 +1178,6 @@ pub const Renderer = struct {
             self.tile_edits_pending = false;
             self.tile_edit_scratch.clearRetainingCapacity();
         }
-    }
-
-    fn uploadsRemainingCycle(uploads_remaining: *usize, upload_count: usize) bool {
-        std.debug.assert(upload_count <= uploads_remaining.*);
-        uploads_remaining.* -= upload_count;
-        return uploads_remaining.* == 0;
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer

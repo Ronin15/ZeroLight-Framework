@@ -55,7 +55,12 @@ pub fn stageVertices(
 
 /// RAII wrapper for one SDL_GPU copy pass. Batch multiple uploads in a single
 /// pass via `recordVertexUploadInPass` / `recordStorageRegionsInPass`, then end
-/// once with `end`. Pass `cycle=true` only on the final upload in the pass.
+/// once with `end`. `cycle` is a per-destination-buffer decision, not a
+/// per-pass one: pass `cycle=true` on every full-buffer rewrite regardless of
+/// how many other uploads (to other buffers) share this pass, since skipping
+/// it lets a later in-flight frame overwrite data a still-in-flight draw is
+/// reading from that same buffer. Only a partial write into a retained buffer
+/// (e.g. tile-edit storage regions) should pass `cycle=false`.
 pub const CopyPassScope = struct {
     pass: *c.SDL_GPUCopyPass,
     open: bool = true,

@@ -772,3 +772,18 @@ fn textureId(index: u32, generation: u32) sprite_batch.TextureId {
 fn u128ToU64Saturated(value: u128) u64 {
     return if (value > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(value);
 }
+
+test "render game prep fixture collects the record count expectedBenchCollectedRecords predicts" {
+    // collectProductionDynamicRecords (called from runCaseWithConfig on every
+    // iteration) already asserts fixture.last_collected_records against
+    // expectedBenchCollectedRecords in Debug builds; this test's job is just to
+    // actually run that path serially, without a display, at a few small counts,
+    // so a fixture-shape drift fails a `zig build test` run rather than only
+    // being caught if and when someone happens to run `zig build bench` in Debug.
+    const options = suite.Options{ .warmup_iterations = 0, .iterations = 1 };
+    for ([_]usize{ 16, 64, 256 }) |count| {
+        const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
+        try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
+        try std.testing.expectEqual(count, stats.item_count);
+    }
+}

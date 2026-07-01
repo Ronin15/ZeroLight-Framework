@@ -87,9 +87,7 @@ pub const AssetCache = struct {
         var entry_inserted = false;
         errdefer if (!entry_inserted) self.allocator.free(owned_path);
 
-        var loaded_image = image.loadPng(self.assets, owned_path) catch |err| {
-            return err;
-        };
+        var loaded_image = try image.loadPng(self.assets, owned_path);
         defer loaded_image.deinit();
 
         const texture = try self.backend.upload_image(backend_context, loaded_image);
@@ -119,13 +117,12 @@ pub const AssetCache = struct {
         };
     }
 
-    /// Backend-context counterpart to `acquireTextureWithContext`; see its note
-    /// on matching the cache's `TextureBackend`.
     /// Inserts startup textures uploaded in one backend batch. Each path must be
-    /// unique and not already cached. Returned leases are owned by the caller.
+    /// unique and not already cached. Returned leases are owned by the caller. On
+    /// a partial failure, entries and lease slots for already-inserted items are
+    /// rolled back transactionally.
     pub fn insertStartupTexturesBatch(
         self: *AssetCache,
-        _: *anyopaque,
         inserts: []const StartupTextureInsert,
         texture_ids: []const TextureId,
     ) ![]TextureLease {
@@ -136,7 +133,7 @@ pub const AssetCache = struct {
         errdefer self.allocator.free(leases);
 
         var inserted_count: usize = 0;
-        errdefer self.rollbackStartupTextureInserts(inserts[0..inserted_count]);
+        errdefer self.rollbackStartupTextureInserts(inserts[0..inserted_count], leases[0..inserted_count]);
 
         for (inserts, texture_ids, leases) |insert, texture, *lease| {
             try assets.validateRelativePath(insert.relative_path);
@@ -190,11 +187,13 @@ pub const AssetCache = struct {
             self.allocator.free(texture_ids);
         }
 
-        const leases = try self.insertStartupTexturesBatch(backend_context, inserts, texture_ids);
+        const leases = try self.insertStartupTexturesBatch(inserts, texture_ids);
         self.allocator.free(texture_ids);
         return leases;
     }
 
+    /// Backend-context counterpart to `acquireTextureWithContext`; see its note
+    /// on matching the cache's `TextureBackend`.
     pub fn releaseTextureWithContext(self: *AssetCache, backend_context: *anyopaque, lease: *TextureLease) void {
         if (lease.owner_id != self.owner_id) return;
         const handle = lease.handle;
@@ -229,10 +228,13 @@ pub const AssetCache = struct {
         self.releaseCachedTextureWithContext(backend_context, path, texture);
     }
 
-    fn rollbackStartupTextureInserts(self: *AssetCache, inserts: []const StartupTextureInsert) void {
+    fn rollbackStartupTextureInserts(self: *AssetCache, inserts: []const StartupTextureInsert, leases: []const TextureLease) void {
         var index = inserts.len;
         while (index > 0) {
             index -= 1;
+            if (self.resolveLeaseSlot(leases[index].handle)) |slot| {
+                self.retireLeaseSlot(leases[index].handle.index, slot);
+            }
             const relative_path = inserts[index].relative_path;
             if (self.entries.fetchRemove(relative_path)) |removed| {
                 self.allocator.free(removed.value.path);
@@ -393,9 +395,8 @@ fn rendererUploadImage(context: *anyopaque, loaded_image: image.LoadedImage) !Te
 }
 
 fn rendererUploadImagesBatch(context: *anyopaque, allocator: std.mem.Allocator, images: []const image.LoadedImage) ![]TextureId {
-    _ = allocator;
     const renderer: *Renderer = @ptrCast(@alignCast(context));
-    return renderer.createTexturesFromPixelsBatch(images);
+    return renderer.createTexturesFromPixelsBatch(allocator, images);
 }
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {
@@ -670,7 +671,7 @@ test "startup texture batch insert rejects mismatch duplicate and empty success"
     var cache = testCache(allocator);
     defer cache.deinitWithContext(&fake);
 
-    const empty = try cache.insertStartupTexturesBatch(&fake, &.{}, &.{});
+    const empty = try cache.insertStartupTexturesBatch(&.{}, &.{});
     defer allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
 
@@ -680,14 +681,14 @@ test "startup texture batch insert rejects mismatch duplicate and empty success"
         .{ .relative_path = "sprites/batch_a.png", .image = testStartupImage() },
         .{ .relative_path = "sprites/batch_b.png", .image = testStartupImage() },
     };
-    const leases = try cache.insertStartupTexturesBatch(&fake, &inserts, &.{ texture_a, texture_b });
+    const leases = try cache.insertStartupTexturesBatch(&inserts, &.{ texture_a, texture_b });
     defer allocator.free(leases);
     try std.testing.expectEqual(@as(usize, 2), leases.len);
     try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
 
     try std.testing.expectError(
         error.InvalidStartupTextureBatch,
-        cache.insertStartupTexturesBatch(&fake, &inserts, &.{texture_a}),
+        cache.insertStartupTexturesBatch(&inserts, &.{texture_a}),
     );
 
     const duplicate_inserts = [_]StartupTextureInsert{
@@ -696,7 +697,7 @@ test "startup texture batch insert rejects mismatch duplicate and empty success"
     };
     try std.testing.expectError(
         error.DuplicateStartupTexture,
-        cache.insertStartupTexturesBatch(&fake, &duplicate_inserts, &.{ texture_a, texture_b }),
+        cache.insertStartupTexturesBatch(&duplicate_inserts, &.{ texture_a, texture_b }),
     );
     try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
 }
@@ -715,6 +716,10 @@ test "startup texture batch upload uses one backend batch and rolls back partial
     try std.testing.expectEqual(@as(u32, 1), fake.batch_upload_count);
     try std.testing.expectEqual(@as(u32, 2), fake.destroy_count);
     try std.testing.expectEqual(@as(usize, 0), cache.entries.count());
+    // The first insert succeeded before the duplicate failed the batch: its lease
+    // slot must be retired and returned to the free list, not leaked.
+    try std.testing.expectEqual(@as(usize, 1), cache.lease_slots.items.len);
+    try std.testing.expectEqual(@as(?u32, 0), cache.first_free_lease_slot);
 
     const good_inserts = [_]StartupTextureInsert{
         .{ .relative_path = "sprites/upload_b.png", .image = testStartupImage() },
@@ -726,6 +731,11 @@ test "startup texture batch upload uses one backend batch and rolls back partial
     try std.testing.expectEqual(@as(u32, 2), fake.batch_upload_count);
     try std.testing.expectEqual(@as(usize, 2), leases.len);
     try std.testing.expectEqual(@as(usize, 2), cache.entries.count());
+    // The retired slot from the failed batch is reused, not leaked: total slot
+    // count grows by exactly one (the second lease), and the first lease reuses
+    // index 0 rather than allocating a fresh slot.
+    try std.testing.expectEqual(@as(u32, 0), leases[0].handle.index);
+    try std.testing.expectEqual(@as(usize, 2), cache.lease_slots.items.len);
 }
 
 test "cache deinit destroys remaining live textures" {

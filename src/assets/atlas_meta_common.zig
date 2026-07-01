@@ -216,7 +216,7 @@ pub fn deinitAnimationTable(table: *std.StringHashMap(TileAnimation), allocator:
     table.deinit();
 }
 
-test "readJsonAsset copies into caller allocator" {
+test "readJsonAsset reads and parses into caller allocator" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     const JsonRoot = struct {
         version: u32,
