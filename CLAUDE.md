@@ -51,8 +51,9 @@ boundaries just to make a local change easier.
   boundary.
 - `src/assets/` — runtime asset catalog, safe path resolution, image decode,
   cache, `manifest.zig` (stable sprite/audio IDs), atlas metadata.
-- `src/game/` — gameplay: states/menus, `world_system.zig`, `data_system.zig`,
-  `simulation*.zig` (pipeline, scope), `player.zig`, pipeline-owned controllers
+- `src/game/` — gameplay: states/menus, `world_system.zig`, the `data_system/`
+  subpackage fronted by `data_system.zig`, `simulation*.zig` (pipeline, scope),
+  `player.zig`, pipeline-owned controllers
   `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
   and `systems/` (movement, ai, steering, collision, collision_response, particle,
   and the `pathfinding/` subpackage fronted by `pathfinding.zig`). The

@@ -39,8 +39,10 @@ game-specific behavior under `src/game/`.
 - `src/game/world_system.zig` owns state-local world/tile data in SoA stores
   for levels, dense layers, sparse tiles, catalog source rects, and chunk
   visibility.
-- `src/game/data_system.zig` owns state-local persistent entity data in dense
-  SoA stores for gameplay, collision, and render systems.
+- `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
+  movement, visual, collision, agents, faction_level, structural, system) and
+  owns state-local persistent entity data in dense SoA stores for gameplay,
+  collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
