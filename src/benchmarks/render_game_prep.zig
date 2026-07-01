@@ -215,12 +215,13 @@ fn runCaseWithConfig(
     };
     const table = TextureTable{ .slots = &slots };
 
-    var fixture = try allocator.create(Fixture);
+    const fixture = try allocator.create(Fixture);
+    errdefer allocator.destroy(fixture);
+    try initFixture(fixture, allocator, io, item_count, fixture_config);
     defer {
         fixture.deinit();
         allocator.destroy(fixture);
     }
-    try initFixture(fixture, allocator, io, item_count, fixture_config);
 
     const command_capacity = fixture.world.reserveRenderRecords() + fixture.dynamic_record_capacity;
     const vertex_capacity = command_capacity * 6;
@@ -544,8 +545,19 @@ fn initFixture(
         .dynamic_record_capacity = 0,
         .sparse_tile_count = sparse_tile_count,
     };
+    // `data`/`particles`/`scene_prep` are all validly constructed the instant the
+    // literal above finishes (a failing `try` inside the literal never reaches
+    // this point, and none of the fields evaluated before it own allocated
+    // memory), so each gets its own errdefer here rather than a blanket
+    // `fixture.deinit()`, which would run over `tileset_meta`/`world` while
+    // they are still `undefined` if a later step fails before those are built,
+    // and would double-deinit them if a step fails after their own narrow
+    // errdefers below are already registered.
+    errdefer fixture.data.deinit();
+    errdefer fixture.particles.deinit();
+    errdefer fixture.scene_prep.deinit();
+
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
-    errdefer fixture.deinit();
 
     const asset_store = AssetStore.init(allocator, io, "assets");
     fixture.tileset_meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
@@ -786,4 +798,36 @@ test "render game prep fixture collects the record count expectedBenchCollectedR
         try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
         try std.testing.expectEqual(count, stats.item_count);
     }
+}
+
+test "initFixture leaves no leak and no double-deinit on partial init failure (FailingAllocator)" {
+    // Calls initFixture directly rather than through runCaseWithConfig: that
+    // caller's own `defer { fixture.deinit(); ... }` runs unconditionally
+    // (even when `try initFixture(...)` returns an error), which would run a
+    // second deinit pass on top of whatever initFixture's own errdefers
+    // already cleaned up and mask exactly the bug this test targets. Driving
+    // initFixture directly with a stack-local Fixture keeps the two cleanup
+    // paths from ever compounding.
+    //
+    // Sweeps fail_index upward (matching the fail_index-sweep convention used
+    // by "simulation events drop diagnostic records when capacity cannot
+    // grow" in src/game/simulation.zig) until an allocation failure no longer
+    // occurs, so failure points both before and after tileset_meta/world are
+    // constructed get exercised: an early failure previously hit the blanket
+    // errdefer while those fields were still `undefined` (UB), and a later
+    // failure previously double-deinited them via the blanket errdefer plus
+    // their own narrow errdefers.
+    const item_count: usize = 8;
+    var fail_index: usize = 0;
+    while (fail_index < 4096) : (fail_index += 1) {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var fixture: Fixture = undefined;
+        if (initFixture(&fixture, failing_allocator.allocator(), std.testing.io, item_count, default_fixture_config)) |_| {
+            fixture.deinit();
+            return;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
+    return error.NondeterministicMemoryUsage;
 }

@@ -935,7 +935,7 @@ pub const Renderer = struct {
         pitch: usize,
         internal: bool,
     ) !TextureId {
-        const texture = try gpu_texture.uploadFromPixels(self.device, pixels, width, height, pitch);
+        const texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, texture.texture);
         return try self.registerTexture(texture, internal);
     }
@@ -951,7 +951,7 @@ pub const Renderer = struct {
         const slot = self.resolveTextureSlot(id) orelse return error.InvalidTexture;
         if (slot.internal) return error.InvalidTexture;
 
-        const next_texture = try gpu_texture.uploadFromPixels(self.device, pixels, width, height, pitch);
+        const next_texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
 
         c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);

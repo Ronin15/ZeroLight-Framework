@@ -2170,9 +2170,9 @@ const FacingStore = struct {
 
     fn append(self: *FacingStore, allocator: std.mem.Allocator, entity: EntityId, facing: FacingData) !u32 {
         if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFacingRows;
-        try self.ensureCapacity(allocator, self.rows.len + 1);
+        try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
-        try self.rows.append(allocator, .{
+        self.rows.appendAssumeCapacity(.{
             .entity = entity,
             .direction = facing.direction,
         });
@@ -2221,6 +2221,10 @@ const FacingStore = struct {
     fn ensureCapacity(self: *FacingStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, capacity);
     }
+
+    fn ensureCapacityForOne(self: *FacingStore, allocator: std.mem.Allocator) !void {
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+    }
 };
 
 const FactionStore = struct {
@@ -2232,9 +2236,9 @@ const FactionStore = struct {
 
     fn append(self: *FactionStore, allocator: std.mem.Allocator, entity: EntityId, entity_faction: Faction) !u32 {
         if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFactionRows;
-        try self.ensureCapacity(allocator, self.rows.len + 1);
+        try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
-        try self.rows.append(allocator, .{
+        self.rows.appendAssumeCapacity(.{
             .entity = entity,
             .faction = entity_faction,
         });
@@ -2277,6 +2281,10 @@ const FactionStore = struct {
 
     fn ensureCapacity(self: *FactionStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, capacity);
+    }
+
+    fn ensureCapacityForOne(self: *FactionStore, allocator: std.mem.Allocator) !void {
+        try self.ensureCapacity(allocator, self.rows.len + 1);
     }
 };
 

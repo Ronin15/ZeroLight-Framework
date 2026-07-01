@@ -167,13 +167,14 @@ pub fn uploadTexturesBatch(
 /// Validates pixels, uploads to a new GPU texture, and submits a one-shot command
 /// buffer. Caller owns `UploadedTexture.texture` until registered/released.
 pub fn uploadFromPixels(
+    allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     pixels: []const u8,
     width: u32,
     height: u32,
     pitch: usize,
 ) !UploadedTexture {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const uploaded = try uploadTexturesBatch(arena.allocator(), device, &.{.{
         .pixels = pixels,

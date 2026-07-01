@@ -138,11 +138,19 @@ pub const NavLevelGraph = struct {
 // writable state; the serial path uses slot 0. Both buffers are per-chunk transient,
 // cleared at the start of each patch. Distinct from NavLevelGraph.edge_scratch, which the
 // init full build reuses to accumulate a whole level's edges.
+// align(64) on `edges` forces @alignOf(ChunkPatchScratch)==64 and @sizeOf==64 (Zig rounds
+// struct size up to its alignment), so adjacent worker slots occupy separate cache lines
+// and workers patching chunks in parallel see no false sharing.
 const ChunkPatchScratch = struct {
-    edges: std.ArrayList(NavLevelGraph.EdgeScratch) = .empty,
+    edges: std.ArrayList(NavLevelGraph.EdgeScratch) align(64) = .empty,
     cursor: std.ArrayList(u32) = .empty,
     // Set when this chunk's edges overflowed its fixed window during compaction.
     overflow: bool = false,
+
+    comptime {
+        std.debug.assert(@sizeOf(ChunkPatchScratch) == 64);
+        std.debug.assert(@alignOf(ChunkPatchScratch) == 64);
+    }
 
     fn deinit(self: *ChunkPatchScratch, allocator: std.mem.Allocator) void {
         self.edges.deinit(allocator);
