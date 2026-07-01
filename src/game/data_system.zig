@@ -10,6 +10,7 @@ const std = @import("std");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const config = @import("../config.zig");
 const math = @import("../core/math.zig");
+const faction = @import("faction.zig");
 const render_depth = @import("render_depth.zig");
 const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
 const EntitySimulationMetadata = @import("simulation_scope.zig").EntitySimulationMetadata;
@@ -20,6 +21,7 @@ const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const alignItemCount = @import("../app/thread_system.zig").alignItemCount;
 const simd = @import("../core/simd.zig");
 const WorldDepth = render_depth.WorldDepth;
+pub const Faction = faction.Faction;
 
 pub const hot_soa_column_alignment: usize = 64;
 pub const movement_range_alignment_items: usize = hot_soa_column_alignment / @sizeOf(f32);
@@ -67,6 +69,7 @@ pub const Component = enum(u5) {
     ai_agent,
     steering_agent,
     world_level,
+    faction,
 };
 
 pub const ComponentMask = u32;
@@ -81,6 +84,7 @@ pub const component_masks = struct {
     pub const ai_agent = componentMask(.ai_agent);
     pub const steering_agent = componentMask(.steering_agent);
     pub const world_level = componentMask(.world_level);
+    pub const faction = componentMask(.faction);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -189,6 +193,11 @@ pub const FacingSlice = struct {
 pub const ConstFacingSlice = struct {
     entities: []const EntityId,
     directions: []const Facing,
+};
+
+pub const ConstFactionSlice = struct {
+    entities: []const EntityId,
+    factions: []const Faction,
 };
 
 /// Data-only primitive visual component. Render order and colors live here, but
@@ -383,6 +392,7 @@ pub const EntityTemplate = struct {
     ai_agent: ?AiAgent = null,
     steering_agent: ?SteeringAgent = null,
     world_level: ?u16 = null,
+    faction: ?Faction = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -410,6 +420,11 @@ pub const SimulationTierCommand = struct {
     tier: SimulationTier,
 };
 
+pub const FactionCommand = struct {
+    entity: EntityId,
+    faction: Faction,
+};
+
 /// Deferred structural work committed after processors finish. Commands carry
 /// stable entity IDs and component values only, never borrowed slices or service
 /// references from the frame that produced them.
@@ -426,6 +441,7 @@ pub const StructuralCommand = union(enum) {
     set_steering_agent: SteeringAgentCommand,
     set_world_level: WorldLevelCommand,
     set_simulation_tier: SimulationTierCommand,
+    set_faction: FactionCommand,
 };
 
 pub const StructuralCommitStats = struct {
@@ -475,6 +491,7 @@ const StructuralCapacityNeeds = struct {
     ai_agents: usize,
     steering_agents: usize,
     world_levels: usize,
+    factions: usize,
 
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
@@ -488,6 +505,7 @@ const StructuralCapacityNeeds = struct {
             .ai_agents = data.ai_agents.len(),
             .steering_agents = data.steering_agents.len(),
             .world_levels = data.world_levels.len(),
+            .factions = data.factions.len(),
         };
     }
 
@@ -502,6 +520,7 @@ const StructuralCapacityNeeds = struct {
         if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
         if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
         if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
+        if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
     }
 };
 
@@ -544,6 +563,7 @@ const StructuralCapacityProjection = struct {
         if (template.ai_agent != null) try self.addComponent(.ai_agent);
         if (template.steering_agent != null) try self.addComponent(.steering_agent);
         if (template.world_level != null) try self.addComponent(.world_level);
+        if (template.faction != null) try self.addComponent(.faction);
     }
 
     fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
@@ -570,6 +590,7 @@ const StructuralCapacityProjection = struct {
             .ai_agent => &self.current.ai_agents,
             .steering_agent => &self.current.steering_agents,
             .world_level => &self.current.world_levels,
+            .faction => &self.current.factions,
         };
     }
 
@@ -584,6 +605,7 @@ const StructuralCapacityProjection = struct {
             .ai_agent => &self.required.ai_agents,
             .steering_agent => &self.required.steering_agents,
             .world_level => &self.required.world_levels,
+            .faction => &self.required.factions,
         };
     }
 };
@@ -687,6 +709,7 @@ fn templateComponentCount(template: EntityTemplate) usize {
     if (template.ai_agent != null) count += 1;
     if (template.steering_agent != null) count += 1;
     if (template.world_level != null) count += 1;
+    if (template.faction != null) count += 1;
     return count;
 }
 
@@ -711,12 +734,14 @@ pub const DataSystem = struct {
     ai_agents: AiAgentStore = .{},
     steering_agents: SteeringAgentStore = .{},
     world_levels: WorldLevelStore = .{},
+    factions: FactionStore = .{},
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DataSystem) void {
+        self.factions.deinit(self.allocator);
         self.world_levels.deinit(self.allocator);
         self.steering_agents.deinit(self.allocator);
         self.ai_agents.deinit(self.allocator);
@@ -767,6 +792,7 @@ pub const DataSystem = struct {
         if (slot.ai_agent_index) |dense_index| self.removeAiAgentAt(@intCast(dense_index));
         if (slot.steering_agent_index) |dense_index| self.removeSteeringAgentAt(@intCast(dense_index));
         if (slot.world_level_index) |dense_index| self.removeWorldLevelAt(@intCast(dense_index));
+        if (slot.faction_index) |dense_index| self.removeFactionAt(@intCast(dense_index));
 
         // tier_counts is decremented in removeMovementBodyAt (called above) since
         // the tier now lives on the dense movement-body scope row, not the slot.
@@ -784,6 +810,7 @@ pub const DataSystem = struct {
         retired_slot.ai_agent_index = null;
         retired_slot.steering_agent_index = null;
         retired_slot.world_level_index = null;
+        retired_slot.faction_index = null;
         self.first_free_slot = index;
         self.free_slot_count += 1;
         return true;
@@ -905,6 +932,7 @@ pub const DataSystem = struct {
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
+        self.factions.clearRetainingCapacity();
         self.world_levels.clearRetainingCapacity();
         self.steering_agents.clearRetainingCapacity();
         self.ai_agents.clearRetainingCapacity();
@@ -932,6 +960,7 @@ pub const DataSystem = struct {
             slot.ai_agent_index = null;
             slot.steering_agent_index = null;
             slot.world_level_index = null;
+            slot.faction_index = null;
             self.first_free_slot = @intCast(index);
         }
     }
@@ -1244,6 +1273,34 @@ pub const DataSystem = struct {
         return self.world_levels.sliceConst();
     }
 
+    pub fn setFaction(self: *DataSystem, id: EntityId, entity_faction: Faction) !void {
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.faction_index) |index| {
+            self.factions.setFaction(@intCast(index), entity_faction);
+            return;
+        }
+
+        const dense_index = try self.factions.append(self.allocator, id, entity_faction);
+        slot.faction_index = dense_index;
+        slot.addComponent(.faction);
+    }
+
+    pub fn factionPtr(self: *DataSystem, id: EntityId) ?*Faction {
+        const slot = self.resolveSlot(id) orelse return null;
+        const dense_index = slot.faction_index orelse return null;
+        return self.factions.factionPtr(@intCast(dense_index));
+    }
+
+    pub fn factionConst(self: *const DataSystem, id: EntityId) ?Faction {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.faction_index orelse return null;
+        return self.factions.factionAt(@intCast(dense_index));
+    }
+
+    pub fn factionSliceConst(self: *const DataSystem) ConstFactionSlice {
+        return self.factions.sliceConst();
+    }
+
     fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
         const metadata = self.simulationMetadata(id) orelse return;
         if (metadata.level == level) return;
@@ -1413,6 +1470,16 @@ pub const DataSystem = struct {
                     try self.setSimulationTier(set.entity, set.tier);
                     // Tier is cold slot metadata — no component mask change, no structural event.
                 },
+                .set_faction => |set| {
+                    if (!self.isAlive(set.entity)) {
+                        stats.stale_skipped += 1;
+                        continue;
+                    }
+                    const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                    try self.setFaction(set.entity, set.faction);
+                    stats.components_set += 1;
+                    self.recordComponentChange(change_sink, set.entity, .faction, was_static_navigation_obstacle);
+                },
             }
         }
         return stats;
@@ -1464,6 +1531,7 @@ pub const DataSystem = struct {
                 .set_ai_agent => |set| try self.preflightSetComponent(set.entity, .ai_agent, scratch, &projection, &structural_event_count),
                 .set_steering_agent => |set| try self.preflightSetComponent(set.entity, .steering_agent, scratch, &projection, &structural_event_count),
                 .set_world_level => |set| try self.preflightSetComponent(set.entity, .world_level, scratch, &projection, &structural_event_count),
+                .set_faction => |set| try self.preflightSetComponent(set.entity, .faction, scratch, &projection, &structural_event_count),
                 .set_simulation_tier => {},
             }
         }
@@ -1506,6 +1574,7 @@ pub const DataSystem = struct {
         try self.ai_agents.ensureCapacity(self.allocator, plan.capacity_needs.ai_agents);
         try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
         try self.world_levels.ensureCapacity(self.allocator, plan.capacity_needs.world_levels);
+        try self.factions.ensureCapacity(self.allocator, plan.capacity_needs.factions);
     }
 
     pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -1567,6 +1636,7 @@ pub const DataSystem = struct {
         if (template.ai_agent != null) self.recordComponentChange(change_sink, entity, .ai_agent, was_static_navigation_obstacle);
         if (template.steering_agent != null) self.recordComponentChange(change_sink, entity, .steering_agent, was_static_navigation_obstacle);
         if (template.world_level != null) self.recordComponentChange(change_sink, entity, .world_level, was_static_navigation_obstacle);
+        if (template.faction != null) self.recordComponentChange(change_sink, entity, .faction, was_static_navigation_obstacle);
     }
 
     fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
@@ -1614,6 +1684,10 @@ pub const DataSystem = struct {
         }
         if (template.world_level) |level| {
             try self.setWorldLevel(entity, level);
+            components_set += 1;
+        }
+        if (template.faction) |entity_faction| {
+            try self.setFaction(entity, entity_faction);
             components_set += 1;
         }
         return components_set;
@@ -1692,6 +1766,11 @@ pub const DataSystem = struct {
         const moved = self.world_levels.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].world_level_index = @intCast(index);
     }
+
+    fn removeFactionAt(self: *DataSystem, index: usize) void {
+        const moved = self.factions.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].faction_index = @intCast(index);
+    }
 };
 
 const EntitySlot = struct {
@@ -1710,6 +1789,7 @@ const EntitySlot = struct {
     ai_agent_index: ?u32 = null,
     steering_agent_index: ?u32 = null,
     world_level_index: ?u32 = null,
+    faction_index: ?u32 = null,
 
     fn addComponent(self: *EntitySlot, component: Component) void {
         self.component_mask |= componentMask(component);
@@ -1812,6 +1892,11 @@ const MovementBodyRow = struct {
 const FacingRow = struct {
     entity: EntityId,
     direction: Facing,
+};
+
+const FactionRow = struct {
+    entity: EntityId,
+    faction: Faction,
 };
 
 const PrimitiveVisualRow = struct {
@@ -2134,6 +2219,63 @@ const FacingStore = struct {
     }
 
     fn ensureCapacity(self: *FacingStore, allocator: std.mem.Allocator, capacity: usize) !void {
+        try self.rows.ensureTotalCapacity(allocator, capacity);
+    }
+};
+
+const FactionStore = struct {
+    rows: std.MultiArrayList(FactionRow) = .{},
+
+    fn len(self: *const FactionStore) usize {
+        return self.rows.len;
+    }
+
+    fn append(self: *FactionStore, allocator: std.mem.Allocator, entity: EntityId, entity_faction: Faction) !u32 {
+        if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyFactionRows;
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+        const index: u32 = @intCast(self.rows.len);
+        try self.rows.append(allocator, .{
+            .entity = entity,
+            .faction = entity_faction,
+        });
+        return index;
+    }
+
+    fn setFaction(self: *FactionStore, index: usize, entity_faction: Faction) void {
+        self.rows.slice().items(.faction)[index] = entity_faction;
+    }
+
+    fn factionPtr(self: *FactionStore, index: usize) *Faction {
+        return &self.rows.slice().items(.faction)[index];
+    }
+
+    fn factionAt(self: *const FactionStore, index: usize) Faction {
+        return self.rows.slice().items(.faction)[index];
+    }
+
+    fn removeAt(self: *FactionStore, index: usize) ?EntityId {
+        const s = self.rows.slice();
+        const last = self.rows.len - 1;
+        const moved_entity = if (index != last) s.items(.entity)[last] else null;
+        self.rows.swapRemove(index);
+        return moved_entity;
+    }
+
+    fn sliceConst(self: *const FactionStore) ConstFactionSlice {
+        const s = self.rows.slice();
+        return .{ .entities = s.items(.entity), .factions = s.items(.faction) };
+    }
+
+    fn clearRetainingCapacity(self: *FactionStore) void {
+        self.rows.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *FactionStore, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+        self.* = .{};
+    }
+
+    fn ensureCapacity(self: *FactionStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
@@ -3423,17 +3565,19 @@ test "structural commands apply entity creation and component changes in order" 
         .{ .set_collision_response = .{ .entity = existing, .response = testResponse(.bounce, .dynamic, 0.8) } },
         .{ .set_ai_agent = .{ .entity = existing, .agent = .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 0.75 } } },
         .{ .set_steering_agent = .{ .entity = existing, .agent = testSteeringAgent(2) } },
+        .{ .set_faction = .{ .entity = existing, .faction = .hostile } },
     };
 
     const stats = try data.applyStructuralCommands(&commands);
 
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 0), stats.destroyed);
-    try std.testing.expectEqual(@as(usize, 13), stats.components_set);
+    try std.testing.expectEqual(@as(usize, 14), stats.components_set);
     try std.testing.expectEqual(@as(usize, 0), stats.stale_skipped);
     try std.testing.expectEqual(@as(usize, 2), data.movementBodySliceConst().entities.len);
     try std.testing.expectEqual(@as(f32, 3), data.movementBodyConst(existing).?.position.x);
     try std.testing.expectEqual(Facing.right, data.facingConst(existing).?.direction);
+    try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(existing));
     try std.testing.expectEqual(@as(f32, 8), data.collisionBoundsConst(existing).?.size.x);
     try std.testing.expectEqual(CollisionResponseMode.bounce, data.collisionResponseConst(existing).?.mode);
     const ai_slice = data.aiAgentSliceConst();
@@ -3459,6 +3603,7 @@ test "structural commands skip stale entities and preserve deterministic command
 
     const commands = [_]StructuralCommand{
         .{ .set_movement_body = .{ .entity = stale, .body = testBody(99) } },
+        .{ .set_faction = .{ .entity = stale, .faction = .hostile } },
         .{ .set_movement_body = .{ .entity = replacement, .body = testBody(4) } },
         .{ .set_movement_body = .{ .entity = replacement, .body = testBody(5) } },
         .{ .destroy_entity = stale },
@@ -3469,8 +3614,9 @@ test "structural commands skip stale entities and preserve deterministic command
     try std.testing.expectEqual(@as(usize, 0), stats.created);
     try std.testing.expectEqual(@as(usize, 0), stats.destroyed);
     try std.testing.expectEqual(@as(usize, 2), stats.components_set);
-    try std.testing.expectEqual(@as(usize, 2), stats.stale_skipped);
+    try std.testing.expectEqual(@as(usize, 3), stats.stale_skipped);
     try std.testing.expectEqual(@as(f32, 5), data.movementBodyConst(replacement).?.position.x);
+    try std.testing.expectEqual(@as(?Faction, null), data.factionConst(stale));
 }
 
 test "ai agent component stores dense columns, supports template create and set/get, rejects invalid, compacts on destroy" {
@@ -3958,6 +4104,104 @@ test "entering a non-moving tier snaps interpolation history to position" {
     slice.previous_x[di] = 10;
     try data.setSimulationTier(entity, .cognition);
     try std.testing.expectEqual(@as(f32, 10), data.movementBodySliceConst().previous_x[di]);
+}
+
+test "faction round-trips through set get ptr and dense slice" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+
+    try data.setFaction(first, .neutral);
+    try data.setFaction(second, .ally);
+    try data.setFaction(third, .hostile);
+    try data.setFaction(first, .player);
+
+    try std.testing.expectEqual(@as(?Faction, .player), data.factionConst(first));
+    try std.testing.expectEqual(@as(?Faction, .ally), data.factionConst(second));
+    try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(third));
+    try std.testing.expect(data.hasComponents(first, component_masks.faction));
+    try std.testing.expect(data.hasComponents(second, component_masks.faction));
+    try std.testing.expect(!data.hasComponents(third, component_masks.movement_body));
+
+    const faction_ptr = data.factionPtr(second).?;
+    try std.testing.expectEqual(Faction.ally, faction_ptr.*);
+    faction_ptr.* = .hostile;
+    try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(second));
+
+    const slice = data.factionSliceConst();
+    try std.testing.expectEqual(slice.entities.len, slice.factions.len);
+    try std.testing.expectEqual(@as(usize, 3), slice.entities.len);
+    try std.testing.expectEqual(Faction.player, slice.factions[0]);
+    try std.testing.expectEqual(Faction.hostile, slice.factions[1]);
+    try std.testing.expectEqual(Faction.hostile, slice.factions[2]);
+}
+
+test "faction via EntityTemplate in structural create and mask queries" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const commands = [_]StructuralCommand{
+        .{ .create_entity = .{
+            .movement_body = testBody(1),
+            .faction = .hostile,
+        } },
+    };
+    _ = try data.applyStructuralCommands(&commands);
+
+    const entity = data.movementBodySliceConst().entities[0];
+    try std.testing.expect(data.hasComponents(entity, component_masks.faction | component_masks.movement_body));
+    try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(entity));
+}
+
+test "faction store is columnar and compact after removal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setFaction(first, .player);
+    try data.setFaction(second, .ally);
+    try data.setFaction(third, .hostile);
+
+    try std.testing.expect(data.destroyEntity(second));
+
+    const slice = data.factionSliceConst();
+    try std.testing.expectEqual(slice.entities.len, slice.factions.len);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+    for (slice.entities, 0..) |entity, index| {
+        const expected: Faction = if (entity.matches(first.index, first.generation)) .player else .hostile;
+        try std.testing.expectEqual(expected, slice.factions[index]);
+    }
+
+    // The swap-remove moved `third` into `second`'s old dense slot; resolving
+    // it back through its EntitySlot proves removeFactionAt fixed up the
+    // slot's faction_index rather than just leaving the dense columns paired.
+    try std.testing.expectEqual(@as(?Faction, .hostile), data.factionConst(third));
+}
+
+test "faction survives entity destruction and reuse with generational correctness" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const original = try data.createEntity();
+    try data.setFaction(original, .hostile);
+    try std.testing.expect(data.destroyEntity(original));
+
+    // Stale ID no longer resolves once the slot's generation advances.
+    try std.testing.expectEqual(@as(?Faction, null), data.factionConst(original));
+
+    const reused = try data.createEntity();
+    try std.testing.expectEqual(original.index, reused.index);
+    try std.testing.expect(reused.generation != original.generation);
+    try std.testing.expectEqual(@as(?Faction, null), data.factionConst(reused));
+
+    try data.setFaction(reused, .ally);
+    try std.testing.expectEqual(@as(?Faction, .ally), data.factionConst(reused));
+    try std.testing.expectEqual(@as(?Faction, null), data.factionConst(original));
 }
 
 fn testBody(base: f32) MovementBody {

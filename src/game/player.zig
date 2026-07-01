@@ -9,6 +9,7 @@ const std = @import("std");
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
+const Faction = @import("data_system.zig").Faction;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const render_depth = @import("render_depth.zig");
 
@@ -40,6 +41,7 @@ pub const Player = struct {
         try data.setFacing(entity, .{ .direction = .down });
         try data.setPrimitiveVisual(entity, playerVisual());
         try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
+        try data.setFaction(entity, .player);
 
         return .{ .entity = entity };
     }

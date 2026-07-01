@@ -22,6 +22,7 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const EntityId = @import("data_system.zig").EntityId;
 const EntityTemplate = @import("data_system.zig").EntityTemplate;
+const Faction = @import("data_system.zig").Faction;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
@@ -664,6 +665,7 @@ const DemoSpawnSpec = struct {
     use_template: bool = false,
     speed: f32 = 42,
     behavior: ?AiAgent = null,
+    faction: Faction = .hostile,
 };
 
 fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
@@ -855,6 +857,7 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_sys
                 .world_level = spec.world_level,
                 .ai_agent = spec.behavior orelse .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.35 },
                 .steering_agent = demoSteeringAgent(spec.size),
+                .faction = spec.faction,
             },
         }});
         const post = data.movementBodySliceConst();
@@ -882,6 +885,7 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_sys
         try data.setCollisionBounds(e, .{ .size = spec.size });
         try data.setCollisionResponse(e, .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 });
         try data.setWorldLevel(e, spec.world_level);
+        try data.setFaction(e, spec.faction);
         if (spec.behavior) |behavior| {
             try data.setAiAgent(e, behavior);
             try data.setSteeringAgent(e, demoSteeringAgent(spec.size));

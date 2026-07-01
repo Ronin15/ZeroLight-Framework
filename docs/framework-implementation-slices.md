@@ -1576,6 +1576,8 @@ Shared design contracts for the whole track:
 
 ## Slice 26: Entity Faction And Classification Model
 
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
+
 Goal: give entities a classification so perception and behavior can distinguish
 threat / ally / neutral. No team or faction concept exists anywhere today; it is
 a hard prerequisite for perception (Slice 29) and behavior arbitration
@@ -1590,21 +1592,21 @@ Current foundation:
 
 Checklist:
 
-- [ ] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
+- [x] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
       faction id per entity, following the full component-store pattern.
-- [ ] Add a fixed faction-relationship matrix (enum × enum → stance:
+- [x] Add a fixed faction-relationship matrix (enum × enum → stance:
       hostile / neutral / friendly), const-evaluated, scalar/enum only, no
       per-frame allocation and no hash lookup on hot paths.
-- [ ] Expose a stance query usable from processor hot paths (`stance(a, b)`)
+- [x] Expose a stance query usable from processor hot paths (`stance(a, b)`)
       that compiles to a table index, not a map lookup.
-- [ ] Add to `EntityTemplate` and demo spawns so actors can be tagged.
+- [x] Add to `EntityTemplate` and demo spawns so actors can be tagged.
 
 Acceptance checks:
 
-- [ ] Stance lookups are allocation-free and branch-light on hot paths.
-- [ ] Faction assignment round-trips through structural commands and survives
+- [x] Stance lookups are allocation-free and branch-light on hot paths.
+- [x] Faction assignment round-trips through structural commands and survives
       entity destruction/reuse with generational correctness.
-- [ ] `zig build test` covers stance symmetry/asymmetry and template wiring.
+- [x] `zig build test` covers stance symmetry/asymmetry and template wiring.
 
 ## Slice 27: Deterministic Per-Entity RNG Facility
 
