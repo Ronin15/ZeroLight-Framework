@@ -605,6 +605,12 @@ fn initFixture(
             .depth = benchmarkEntityDepth(index),
             .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         });
+        // Slice 25E render-prep culls non-player entities to their own world
+        // level; deep-window fixtures (player_level > 0) must place entities
+        // on that same level or collectDynamicRecords drops them all.
+        if (fixture_config.player_level != 0) {
+            try fixture.data.setWorldLevel(entity, fixture_config.player_level);
+        }
     }
 
     const active_particles = @min(particle_capacity, @max(item_count / 16, 1));
@@ -792,11 +798,18 @@ test "render game prep fixture collects the record count expectedBenchCollectedR
     // actually run that path serially, without a display, at a few small counts,
     // so a fixture-shape drift fails a `zig build test` run rather than only
     // being caught if and when someone happens to run `zig build bench` in Debug.
+    // Covers a surface case (player_level 0) and a deep case (player_level
+    // bench_mid_player_level) so entity-level-cull drift in either is caught
+    // here rather than only surfacing as an assert crash under `zig build bench`.
     const options = suite.Options{ .warmup_iterations = 0, .iterations = 1 };
     for ([_]usize{ 16, 64, 256 }) |count| {
         const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
         try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
         try std.testing.expectEqual(count, stats.item_count);
+
+        const deep_stats = try runDense8DeepCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
+        try std.testing.expectEqual(suite.RunStatus.measured, deep_stats.status);
+        try std.testing.expectEqual(count, deep_stats.item_count);
     }
 }
 
