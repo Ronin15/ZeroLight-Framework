@@ -213,6 +213,7 @@ pub const DigController = struct {
 /// open, so no x/y snap there.
 fn setPlayerLevel(world: *const WorldSystem, data: *DataSystem, player: *Player, level: u16, cell: CellCoord) void {
     player.current_level = level;
+    data.setWorldLevel(player.entity, level) catch {};
     const body = data.movementBodyPtr(player.entity) orelse return;
     const z = world.levelBaseZ(level);
     body.position_z.* = z;

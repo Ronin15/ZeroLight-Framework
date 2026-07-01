@@ -1357,6 +1357,11 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
     try std.testing.expectEqual(@as(u16, 2), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(2), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
+    // Regression: the player's scope metadata level (read by the LOD tier demotion
+    // in queueTierChanges) must track current_level, or descending far enough
+    // stages the player out of the movement tier via a phantom level_delta.
+    try std.testing.expectEqual(@as(u16, 2), demo.data.simulationMetadata(demo.player.entity).?.level);
+
     // The void-plane landing cell is carved walkable so the player is not buried.
     const floor2 = demo.world.denseFloorLayerForLevel(2).?;
     try std.testing.expect(!demo.world.denseTileBlocksMovement(floor2, 5, 3));
