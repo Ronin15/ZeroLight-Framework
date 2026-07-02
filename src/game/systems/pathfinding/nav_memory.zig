@@ -153,7 +153,11 @@ pub fn autoSizedMaxNavMemoryBytes(capacity: types.PathfindingCapacity, level_cou
         .link_count = 0,
     };
     const required = budget.requiredBytes(width, height);
-    return std.math.ceilPowerOfTwo(usize, required) catch required;
+    // ceilPowerOfTwo asserts its input is non-zero before it can reach the
+    // error.Overflow path, so a degenerate zero-sized capacity/world would
+    // panic here rather than fall back through `catch`.
+    const safe_required = @max(required, 1);
+    return std.math.ceilPowerOfTwo(usize, safe_required) catch safe_required;
 }
 
 // ----------------------------------------------------------------------------
@@ -213,4 +217,20 @@ test "nav memory budget passes a large but sparse world" {
     // not merely always-failing — it admits large sparse worlds while rejecting overflowed ones.
     const budget = testBudget(1 << 30);
     try budget.check(1024, 1024);
+}
+
+test "autoSizedMaxNavMemoryBytes returns a sane floor for degenerate zero-sized capacity" {
+    // width/height and every capacity term that feeds requiredBytes are zero, so
+    // required == 0. ceilPowerOfTwo asserts on a zero input before it can return
+    // error.Overflow, so this must not panic and must still return a usable floor.
+    const capacity = types.PathfindingCapacity{
+        .max_group_fields = 0,
+        .max_cached_results = 0,
+        .max_solved_requests_per_step = 0,
+        .max_explored_nodes = 0,
+        .max_stored_path_cells = 0,
+        .max_stitched_path_cells = 0,
+    };
+    const result = autoSizedMaxNavMemoryBytes(capacity, 1, 0, 0);
+    try std.testing.expect(result >= 1);
 }

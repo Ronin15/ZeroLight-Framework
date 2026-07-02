@@ -234,7 +234,8 @@ work, but several follow-ups remain visible in the roadmap and review notes:
   storage, batched copy pass) is implemented on `expand2` and should merge
   before raising world depth count.
 - Slice 23B multi-depth dense-layer render scaling (~120 levels, vertical
-  submit window) is planned before large underground world build.
+  submit window) is implemented on `expand2` and should merge before large
+  underground world build.
 - Slice 25E NPC autonomous z-traversal remains a separate acceptance-checked
   slice before multi-floor emergent scenarios depend on it (entity level/cull;
   separate from 23B floor render window).

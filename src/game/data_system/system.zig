@@ -355,6 +355,12 @@ pub const DataSystem = struct {
         if (slot.primitive_visual_index != null) {
             self.movement_bodies.setHasPrimitiveVisual(@intCast(dense_index), true);
         }
+        // A world-level row may already exist (setWorldLevel called first) —
+        // sync it onto the new scope row.
+        if (slot.world_level_index) |world_level_index| {
+            const level = self.world_levels.get(@intCast(world_level_index));
+            try self.syncScopeLevelFromWorldLevel(id, level);
+        }
     }
 
     pub fn movementBodyPtr(self: *DataSystem, id: EntityId) ?MovementBodyPtr {
@@ -983,6 +989,20 @@ test "setWorldLevel syncs simulation scope metadata level when movement body exi
 
     try data.setWorldLevel(entity, 8);
     try std.testing.expectEqual(@as(u16, 8), data.scopeColumnsSliceConst().level[0]);
+}
+
+test "setMovementBody syncs scope metadata level when world level already exists" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setWorldLevel(entity, 7);
+    try std.testing.expectEqual(@as(u16, 7), data.worldLevelConst(entity).?);
+
+    try data.setMovementBody(entity, .{});
+
+    try std.testing.expectEqual(@as(u16, 7), data.worldLevelConst(entity).?);
+    try std.testing.expectEqual(@as(u16, 7), data.scopeColumnsSliceConst().level[0]);
 }
 
 test "entity generations reject stale ids after removal and reuse" {

@@ -139,6 +139,18 @@ pub const Renderer = struct {
     /// (pause panel, menus) before the debug overlay reserve in `Engine`.
     pub const kStackedStateUiHeadroom: usize = 32;
 
+    // `Engine`'s post-render top-up (`spriteCommandCount() + kOverlayCommandHeadroom`)
+    // reserves against the same grow-only `command_high_water` as the state's own
+    // upfront reserve, without the caller re-adding `kStackedStateUiHeadroom`. This
+    // stays allocation-free only because `std.ArrayList.ensureTotalCapacity`'s
+    // amortized growth on the state's reserve already covers the extra headroom,
+    // which requires stacked-UI headroom to be at least double the overlay headroom.
+    // See "engine overlay top-up after stacked UI fully consumes its headroom stays
+    // allocation-free" for the empirical proof this depends on too.
+    comptime {
+        std.debug.assert(kStackedStateUiHeadroom >= 2 * kOverlayCommandHeadroom);
+    }
+
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
@@ -1926,6 +1938,101 @@ test "reserve sprite commands is grow-only and enables allocation-free enqueue" 
         });
     }
     try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
+}
+
+// Traces the two-stage per-frame reserve: a state reserves
+// `gameplay_estimate + kStackedStateUiHeadroom` up front (mirrors
+// `render_prep.spriteCommandCapacity`), stacked UI then submits real sprites,
+// and `Engine.renderFrame` tops up with
+// `spriteCommandCount() + kOverlayCommandHeadroom` afterward — a second,
+// independent reservation against the same grow-only `command_high_water`.
+// This proves the top-up stays allocation-free even when stacked UI fully
+// consumes its 32-command headroom, because `ensureTotalCapacity`'s amortized
+// (~1.5x) growth on the state's up-front reserve already covers the extra
+// `kOverlayCommandHeadroom` (32 >= 2 * 16 today). If either constant shrinks
+// that margin, this test is the regression signal.
+test "engine overlay top-up after stacked UI fully consumes its headroom stays allocation-free" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    const white = TextureId.init(0, 1) catch unreachable;
+    var order: i32 = 0;
+
+    // Zero gameplay sprites isolates the headroom margin itself: with a
+    // nonzero gameplay count the amortized growth cushion is dominated by the
+    // gameplay term and would stay allocation-free even if the headroom
+    // constants no longer covered each other.
+    const gameplay_estimate: usize = 0;
+    // State's own upfront reservation (render_prep.spriteCommandCapacity's formula).
+    try renderer.reserveSpriteCommands(gameplay_estimate + Renderer.kStackedStateUiHeadroom);
+    const commands_capacity_after_state_reserve = renderer.batch.commands.capacity;
+    const draw_list_capacity_after_state_reserve = renderer.draw_list.capacity;
+
+    for (0..gameplay_estimate) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    // Worst-case stacked-UI usage: fully consumes the declared headroom.
+    for (0..Renderer.kStackedStateUiHeadroom) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+
+    // Block both the alloc and remap paths from the very first call so the
+    // engine's top-up reservation fails loudly if it needs any real growth.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_renderer_allocator = renderer.allocator;
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.allocator = failing.allocator();
+    renderer.batch.allocator = failing.allocator();
+    defer {
+        renderer.allocator = real_renderer_allocator;
+        renderer.batch.allocator = real_batch_allocator;
+    }
+
+    const overlay_target = renderer.spriteCommandCount() + Renderer.kOverlayCommandHeadroom;
+    // Sanity: this is genuinely a second, larger ask than the state's own
+    // reservation, not a no-op repeat of it.
+    try std.testing.expect(overlay_target > gameplay_estimate + Renderer.kStackedStateUiHeadroom);
+
+    try renderer.reserveSpriteCommands(overlay_target);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+    try std.testing.expectEqual(draw_list_capacity_after_state_reserve, renderer.draw_list.capacity);
+
+    // Debug overlay can then submit up to kOverlayCommandHeadroom more sprites
+    // without overflow or a capacity grow.
+    for (0..Renderer.kOverlayCommandHeadroom) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
 }
 
 test "linear merge matches stable sort for pre-sorted static and dynamic groups" {

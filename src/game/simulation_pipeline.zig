@@ -485,9 +485,9 @@ pub const SimulationPipeline = struct {
         try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
         // Gate the player against solid world tiles on their current plane (mining:
         // underground dirt is solid until dug). Runs after the bounds clamp and
-        // before entity collision so downstream stages see the gated position. AI
-        // entities stay on the surface (level 0, fully walkable) this slice, so the
-        // gate is player-only by design — see docs/simulation-tiers-and-pipeline.md.
+        // before entity collision so downstream stages see the gated position. NPCs
+        // are gated the same way right below, skipping only dormant-tier NPCs
+        // (they don't move this step, so gating them would be dead work).
         gatePlayerToWalkableTiles(context.world, data, context.player.*);
         gateNpcEntitiesToWalkableTiles(context.world, data);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
@@ -634,7 +634,13 @@ fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: Movement
 
 fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
     const ai_slice = data.aiAgentSliceConst();
+    const scope_columns = data.scopeColumnsSliceConst();
     for (ai_slice.entities) |entity| {
+        // Dormant NPCs never move this step (movement itself skips writing their
+        // position), so gating them against world tiles is dead work — skip.
+        if (data.movementBodyDenseIndex(entity)) |dense_index| {
+            if (!scope_columns.tier[dense_index].allowsMovement()) continue;
+        }
         const level = data.worldLevelConst(entity) orelse 0;
         const body = data.movementBodyPtr(entity) orelse continue;
         const visual = data.primitiveVisualConst(entity) orelse continue;
@@ -647,10 +653,15 @@ fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) 
 /// the player, since the movement body already tracks both positions). Delegates
 /// the actual ramp/fall/carve/snap logic to `DigController.applyEntityPlaneTraversal`
 /// so NPCs get the same landing-cell carve as the player instead of a hand-rolled
-/// copy that could (and did) drift out of sync.
+/// copy that could (and did) drift out of sync. Dormant-tier NPCs are skipped:
+/// movement never moves them this step, so they can't have entered a new cell.
 fn applyNpcPlaneTraversal(dig: *DigController, world: *WorldSystem, data: *DataSystem, frame: *SimulationFrame) !void {
     const ai_slice = data.aiAgentSliceConst();
+    const scope_columns = data.scopeColumnsSliceConst();
     for (ai_slice.entities) |entity| {
+        if (data.movementBodyDenseIndex(entity)) |dense_index| {
+            if (!scope_columns.tier[dense_index].allowsMovement()) continue;
+        }
         const level = data.worldLevelConst(entity) orelse continue;
         const body = data.movementBodyPtr(entity) orelse continue;
         const visual = data.primitiveVisualConst(entity) orelse continue;
@@ -924,4 +935,120 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     gatePlayerToWalkableTiles(&world, &data, player);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_x.*);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_y.*);
+}
+
+test "pipeline skips NPC plane traversal for dormant tier but still falls active-tier NPCs" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    // Punch two fall-through holes in the surface floor: one under the dormant
+    // NPC (should NOT fall — the tier gate must skip it), one under the
+    // active-tier NPC (should fall — unchanged pre-fix behavior).
+    const floor0 = world.denseFloorLayerForLevel(0).?;
+    _ = try world.clearDenseTile(floor0, 4, 3);
+    _ = try world.clearDenseTile(floor0, 6, 3);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    // Dormant NPC: straddles the hole cell boundary (previous cell (3,3), current
+    // cell (4,3)). Movement skips dormant entities entirely, so these manually-set
+    // positions survive the step unchanged — if plane traversal ran on it anyway
+    // (the bug), it would still detect the crossing and fall.
+    const dormant_npc = try data.createEntity();
+    try data.setMovementBody(dormant_npc, .{});
+    try data.setPrimitiveVisual(dormant_npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(dormant_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setWorldLevel(dormant_npc, 0);
+    // Tier must be set before overwriting position: setSimulationTier snaps
+    // previous=position for non-moving tiers, which would erase the crossing
+    // this test needs to prove the skip actually does something.
+    try data.setSimulationTier(dormant_npc, .dormant);
+    {
+        const body = data.movementBodyPtr(dormant_npc).?;
+        body.previous_x.* = 3 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 4 * 32;
+        body.position_y.* = 3 * 32;
+    }
+
+    // Active-tier (locomotion) NPC: velocity carries it from cell (5,3) into the
+    // hole cell (6,3) this step. Locomotion allows movement but not cognition, so
+    // it moves purely on the manually-set velocity below with no AI override.
+    const active_npc = try data.createEntity();
+    try data.setMovementBody(active_npc, .{});
+    try data.setPrimitiveVisual(active_npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(active_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setWorldLevel(active_npc, 0);
+    try data.setSimulationTier(active_npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(active_npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Dormant NPC never transitioned: the tier gate skipped it despite straddling
+    // the hole cell.
+    try std.testing.expectEqual(@as(?u16, 0), data.worldLevelConst(dormant_npc));
+    try std.testing.expectEqual(@as(f32, 4 * 32), data.movementBodyConst(dormant_npc).?.position.x);
+
+    // Active-tier NPC still falls exactly as before the fix: it crossed into the
+    // hole cell, landed on level 1, and its landing cell was carved walkable.
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(active_npc));
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
 }

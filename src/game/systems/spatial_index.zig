@@ -768,6 +768,36 @@ test "SpatialIndexSystem serial and threaded builds produce identical rows/entri
     }
 }
 
+test "assignCellsDense matches an independently computed scalar cellForPosition, including the non-multiple-of-4 scalar tail" {
+    // 25 is not a multiple of simd.lane_count (4): this exercises the
+    // vectorized block (24 rows) AND the scalar tail (1 row) in the same run.
+    // cell_size 30 (non-power-of-2) so a reciprocal-multiply implementation of
+    // the division would diverge from `divFloat4`'s true division and this
+    // test would catch it; a power-of-2 size like the 32 default cannot.
+    var fixture = try SpatialTestFixture.init(testing.allocator, 25);
+    defer fixture.deinit();
+    const ai_slice = fixture.data.aiAgentSliceConst();
+    const move_slice = fixture.data.movementBodySliceConst();
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{ .cell_size = 30.0 });
+    try testing.expectEqual(@as(usize, 25), stats.entity_count);
+
+    const rows = sys.rows.slice();
+    for (0..sys.rows.len) |i| {
+        // Recomputed from the entity's own known input position (the same
+        // formula SpatialTestFixture.init used to seed it), independent of
+        // anything read back from the system, so this checks ground truth
+        // rather than internal self-consistency.
+        const entity_index = rows.items(.entity)[i].index;
+        const expected_x = @as(f32, @floatFromInt(entity_index % 23)) * 7.0 - 40.0;
+        const expected_y = @as(f32, @floatFromInt(entity_index / 23)) * 5.0 - 20.0;
+        const expected_cell = cellForPosition(expected_x, expected_y, sys.cell_size);
+        try testing.expectEqual(expected_cell, rows.items(.cell)[i]);
+    }
+}
+
 test "SpatialIndexSystem builds correctly above a small reserved capacity" {
     var fixture = try SpatialTestFixture.init(testing.allocator, 40);
     defer fixture.deinit();

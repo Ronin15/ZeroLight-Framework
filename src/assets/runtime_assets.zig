@@ -201,6 +201,7 @@ pub const RuntimeAssets = struct {
             sprite_id: SpriteAssetId,
             relative_path: []const u8,
             image: image.LoadedImage,
+            source_rect: ?manifest.SourceRect,
         };
 
         var pending = std.ArrayList(PendingStartupSprite).empty;
@@ -247,6 +248,7 @@ pub const RuntimeAssets = struct {
                 .sprite_id = spec.id,
                 .relative_path = spec.path,
                 .image = loaded_image,
+                .source_rect = spec.source_rect,
             });
         }
 
@@ -266,52 +268,13 @@ pub const RuntimeAssets = struct {
 
         for (pending.items, leases) |entry, lease| {
             const index = manifest.spriteIndex(entry.sprite_id);
-            const spec = manifest.spriteSpec(entry.sprite_id);
             self.releaseSpriteSlot(cache, backend_context, index);
             self.sprite_slots[index] = .{
                 .status = .available,
                 .lease = lease,
-                .source_rect = sourceRect(spec.source_rect),
+                .source_rect = sourceRect(entry.source_rect),
             };
         }
-    }
-
-    /// Test-only single-sprite preload; production startup uses `preloadSpritesBatch`.
-    fn preloadSprite(
-        self: *RuntimeAssets,
-        _: AssetStore,
-        cache: *AssetCache,
-        backend_context: *anyopaque,
-        spec: manifest.SpriteAssetSpec,
-        options: PreloadOptions,
-    ) !void {
-        const index = manifest.spriteIndex(spec.id);
-
-        try @import("assets.zig").validateRelativePath(spec.path);
-
-        const lease = cache.acquireTextureWithContext(backend_context, spec.path) catch |err| switch (err) {
-            error.FileNotFound => {
-                if (isRequiredStartupSprite(spec.id)) {
-                    if (options.log_unavailable) {
-                        log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
-                    }
-                    return error.RequiredStartupSpriteUnavailable;
-                }
-                if (options.log_unavailable) {
-                    log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
-                }
-                self.releaseSpriteSlot(cache, backend_context, index);
-                self.sprite_slots[index].status = .unavailable;
-                return;
-            },
-            else => return err,
-        };
-        self.releaseSpriteSlot(cache, backend_context, index);
-        self.sprite_slots[index] = .{
-            .status = .available,
-            .lease = lease,
-            .source_rect = sourceRect(spec.source_rect),
-        };
     }
 
     fn releaseSpriteSlot(self: *RuntimeAssets, cache: *AssetCache, backend_context: *anyopaque, index: usize) void {
@@ -604,6 +567,32 @@ test "preloadSpritesBatch marks an optional sprite unavailable without failing t
     try std.testing.expectEqual(@as(usize, 1), cache_testing.entryCount(&cache));
 }
 
+test "preloadSpritesBatch keeps the caller-supplied source_rect override, not the canonical manifest one" {
+    const cache_testing = @import("cache.zig").testing;
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var fake = cache_testing.Backend{};
+    var cache = cache_testing.initCache(std.testing.allocator, asset_store);
+    defer cache_testing.deinitCache(&cache, &fake);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    defer deinitWithTestBackend(&runtime_assets, &cache, &fake);
+
+    try std.testing.expect(manifest.spriteSpec(.demo_tile).source_rect == null);
+
+    const override_rect = manifest.SourceRect{ .x = 1, .y = 2, .w = 3, .h = 4 };
+    const specs = [_]manifest.SpriteAssetSpec{
+        .{ .id = .demo_tile, .path = "sprites/demo_tile.png", .source_rect = override_rect },
+    };
+
+    try preloadSpritesBatchWithTestBackend(&runtime_assets, asset_store, &cache, &fake, &specs, .{});
+
+    const prepared = runtime_assets.sprite(.demo_tile) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(f32, 1), prepared.source_rect.?.x);
+    try std.testing.expectEqual(@as(f32, 2), prepared.source_rect.?.y);
+    try std.testing.expectEqual(@as(f32, 3), prepared.source_rect.?.w);
+    try std.testing.expectEqual(@as(f32, 4), prepared.source_rect.?.h);
+}
+
 test "startup metadata load requires world tileset texture" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
@@ -750,6 +739,45 @@ fn deinitWithTestBackend(runtime_assets: *RuntimeAssets, cache: *AssetCache, fak
     runtime_assets.deinitWithBackend(cache, @ptrCast(fake));
 }
 
+/// Test-only single-sprite preload exercising `AssetCache`'s single-item
+/// acquire/replace/dedup path; production startup uses `preloadSpritesBatch`.
+fn preloadSprite(
+    self: *RuntimeAssets,
+    _: AssetStore,
+    cache: *AssetCache,
+    backend_context: *anyopaque,
+    spec: manifest.SpriteAssetSpec,
+    options: PreloadOptions,
+) !void {
+    const index = manifest.spriteIndex(spec.id);
+
+    try @import("assets.zig").validateRelativePath(spec.path);
+
+    const lease = cache.acquireTextureWithContext(backend_context, spec.path) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (isRequiredStartupSprite(spec.id)) {
+                if (options.log_unavailable) {
+                    log.warn("required startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+                }
+                return error.RequiredStartupSpriteUnavailable;
+            }
+            if (options.log_unavailable) {
+                log.warn("startup sprite asset unavailable \"{s}\": {}", .{ spec.path, err });
+            }
+            self.releaseSpriteSlot(cache, backend_context, index);
+            self.sprite_slots[index].status = .unavailable;
+            return;
+        },
+        else => return err,
+    };
+    self.releaseSpriteSlot(cache, backend_context, index);
+    self.sprite_slots[index] = .{
+        .status = .available,
+        .lease = lease,
+        .source_rect = sourceRect(spec.source_rect),
+    };
+}
+
 fn preloadSpriteWithTestBackend(
     runtime_assets: *RuntimeAssets,
     asset_store: AssetStore,
@@ -758,7 +786,7 @@ fn preloadSpriteWithTestBackend(
     spec: manifest.SpriteAssetSpec,
     options: PreloadOptions,
 ) !void {
-    return runtime_assets.preloadSprite(asset_store, cache, @ptrCast(fake), spec, options);
+    return preloadSprite(runtime_assets, asset_store, cache, @ptrCast(fake), spec, options);
 }
 
 fn preloadSpritesBatchWithTestBackend(

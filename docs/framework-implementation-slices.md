@@ -1482,7 +1482,20 @@ level column wiring in `DataSystem`, steering, path views, and render cull.
 
 ## Slice 25E: Per-Entity NPC Level And Autonomous Z-Traversal
 
-**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
+**Status: landed**, with one superseded item. All Checklist and Acceptance
+checks below are `[x]` for the record, but `PathView.next_cell_level`
+(checklist items below referencing it) was later found to have zero
+production consumers — `steering.zig`'s `directionFromPathStatus`, the only
+real caller of `statusForWorld`/`statusForKeyAndStart`, never read it — and was
+removed as dead code. The actual NPC level-transition mechanism is, and always
+was, `DigController.applyEntityPlaneTraversal` (invoked from
+`SimulationPipeline.applyNpcPlaneTraversal`), which drives transitions from the
+entity's real physical-cell world geometry with no lag/latency gap. See
+`docs/coding-standards.md`/project convention: code is authoritative for doc
+drift, so this note replaces the earlier "landed" claim for the
+`next_cell_level` field specifically; the rest of the slice (per-entity level
+column, steering `start_level` sourcing, render cull by entity level) is
+unaffected and still landed as described.
 
 Goal: give each NPC entity its own Z-level so it can request cross-level paths,
 traverse ramps and stairs autonomously, and be culled to its own floor instead
@@ -1521,20 +1534,28 @@ Checklist:
 - [x] Steering sources `start_level` from the entity's level column rather than
       the hardcoded `0`.
 - [x] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
-      so an agent can detect a link crossing and commit a level update.
+      so an agent can detect a link crossing and commit a level update. (Later
+      removed: no production consumer ever read this field — see status note
+      above.)
 - [x] Update the per-step movement/traversal pass to apply NPC level transitions
       at link cells (mirroring the player ramp/fall logic); update the entity
-      level column through an explicit main-thread commit, not inside worker ranges.
+      level column through an explicit main-thread commit, not inside worker
+      ranges. (Landed via `DigController.applyEntityPlaneTraversal` driven by
+      physical-cell world geometry, not via the removed `next_cell_level`.)
 - [x] Render and cull each NPC on its own level, not the player's.
 - [x] Add tests covering same-level NPC pathing (no regression), cross-level
-      pathfinding `next_cell_level`, and NPC render cull matching entity level.
+      pathfinding, and NPC render cull matching entity level. (The
+      `next_cell_level`-specific assertions were removed alongside the field;
+      the remaining status/waypoint/render-cull assertions still cover this.)
 - [x] Demo stress: procedural world `addUndergroundLevelStack(31)` (32 levels),
       32 movers, GPU budget gate, scaled pipeline reserves.
 
 Acceptance checks:
 
-- [x] Cross-level path queries expose `next_cell_level` at link cells (pathfinding
-      + caches tests); NPC traversal commits `world_level` on ramp/fall cell entry.
+- [x] Cross-level path queries route through link cells correctly (pathfinding
+      + caches tests); NPC traversal commits `world_level` on ramp/fall cell
+      entry via `DigController.applyEntityPlaneTraversal`, not via
+      `next_cell_level` (removed — see status note above).
 - [x] Intra-level NPC behavior is unchanged (steering parity tests).
 - [x] NPCs are culled to their own level, not the player's (`render_prep` test).
 - [x] No steady-state allocation on hot paths.

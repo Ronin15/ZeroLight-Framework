@@ -1349,3 +1349,33 @@ test "draw sprite stays allocation-free after reserve" {
     try std.testing.expectEqual(capacity_before, batch.commands.capacity);
     try std.testing.expectEqual(command_capacity, batch.commands.items.len);
 }
+
+test "draw sprite returns overflow error once reserved capacity is exhausted" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    const command_capacity: usize = 8;
+    try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
+    batch.frame_reserved = true;
+    // ensureTotalCapacity may round up past the requested count, so fill to
+    // the real capacity rather than assuming it equals command_capacity.
+    const capacity_before = batch.commands.capacity;
+
+    const texture = TextureId.init(0, 1) catch unreachable;
+    for (0..capacity_before) |i| {
+        try batch.drawSprite(.{
+            .texture = texture,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    try std.testing.expectEqual(capacity_before, batch.commands.items.len);
+
+    const result = batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = @floatFromInt(capacity_before), .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(@intCast(capacity_before)),
+    });
+    try std.testing.expectError(error.SpriteCommandOverflow, result);
+}

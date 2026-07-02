@@ -203,7 +203,7 @@ pub fn createShader(
     storage_buffers: u32,
     uniform_buffers: u32,
 ) !*c.SDL_GPUShader {
-    const code = assets.readAlloc(path, max_shader_bytes) catch |err| {
+    const code = assets.readAlloc(path, max_shader_bytes, assets.allocator) catch |err| {
         log.err("failed to read shader asset \"{s}\": {}", .{ path, err });
         return err;
     };

@@ -22,7 +22,7 @@
 //! gap between that and N is the scope reduction. Note the timed window covers the
 //! whole scoped step (AI + collision + movement + gathers + tier policy), so it is
 //! not directly comparable to the AI-only `ai` group. The shared spatial index build
-//! (Slice 28) also runs every step here (AI separation queries it) but its own
+//! also runs every step here (AI separation queries it) but its own
 //! wall-clock cost is excluded from this reported window, same as the `ai` group —
 //! it has its own dedicated `spatial_index` bench group.
 
@@ -221,11 +221,11 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         const result = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
         const end_ns = suite.nowNs(io);
         const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
-        // The spatial-index build (Slice 28) is excluded from this group's
-        // reported timing, same as the `ai` bench group: it has its own
-        // dedicated `spatial_index` bench group, so this stays comparable to
-        // its pre-Slice-28 "AI + collision + movement + gathers + tier policy"
-        // baseline instead of conflating it with a new build cost.
+        // The spatial-index build is excluded from this group's reported
+        // timing, same as the `ai` bench group: it has its own dedicated
+        // `spatial_index` bench group, so this stays comparable to the
+        // "AI + collision + movement + gathers + tier policy" baseline
+        // instead of conflating it with a new build cost.
         const net_ns = if (elapsed_ns > result.excluded_ns) elapsed_ns - result.excluded_ns else 0;
         accumulator.record(net_ns, result.batch);
         active_cognition = result.active_cognition;

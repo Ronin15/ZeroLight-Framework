@@ -120,7 +120,10 @@ pub const AssetCache = struct {
     /// Inserts startup textures uploaded in one backend batch. Each path must be
     /// unique and not already cached. Returned leases are owned by the caller. On
     /// a partial failure, entries and lease slots for already-inserted items are
-    /// rolled back transactionally.
+    /// rolled back transactionally. This rollback only undoes cache bookkeeping
+    /// (map entries and lease slots) — it does not destroy the GPU textures
+    /// backing already-inserted entries. Destroying those textures on failure
+    /// remains the caller's responsibility.
     pub fn insertStartupTexturesBatch(
         self: *AssetCache,
         inserts: []const StartupTextureInsert,

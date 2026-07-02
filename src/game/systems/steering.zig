@@ -615,9 +615,12 @@ pub const SteeringSystem = struct {
             runtime.has_prev_dir = true;
             return target;
         }
-        const blended_x = runtime.prev_dir_x + (target.x - runtime.prev_dir_x) * steering_turn_smoothing;
-        const blended_y = runtime.prev_dir_y + (target.y - runtime.prev_dir_y) * steering_turn_smoothing;
-        const smoothed = math.normalizeOrDefaultFinite(blended_x, blended_y, 0.0001, target);
+        const blended = math.lerpVec2(
+            .{ .x = runtime.prev_dir_x, .y = runtime.prev_dir_y },
+            target,
+            steering_turn_smoothing,
+        );
+        const smoothed = math.normalizeOrDefaultFinite(blended.x, blended.y, 0.0001, target);
         runtime.prev_dir_x = smoothed.x;
         runtime.prev_dir_y = smoothed.y;
         return smoothed;

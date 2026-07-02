@@ -462,6 +462,7 @@ test "floorToI4 matches math.floorToI32 lane-for-lane, including NaN/inf/boundar
         std.math.inf(f32),                             -std.math.inf(f32),
         1.0e30,                                        -1.0e30,
         @as(f32, @floatFromInt(std.math.minInt(i32))), @as(f32, @floatFromInt(std.math.maxInt(i32))),
+        2.9999999,                                     -0.0001,
     };
     var i: usize = 0;
     while (i + lane_count <= cases.len) : (i += lane_count) {

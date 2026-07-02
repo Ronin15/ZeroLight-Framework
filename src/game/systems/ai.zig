@@ -181,6 +181,17 @@ pub const AiSystem = struct {
             return .{};
         }
 
+        // Population-domain contract with spatial_index.zig (see the module doc
+        // and `computeAiSeparationsSerial`): the shared index built for this step
+        // must have gathered the identical row count, since `computeBoundedSeparation`
+        // passes a gather row index into `queryNeighbors` as a self-index used only
+        // for self-exclusion (an equality compare against spatial's own row indices,
+        // which are always bounds-safe within spatial's own arrays) — a divergence
+        // here corrupts self-exclusion/separation-force correctness, not memory
+        // safety. Debug/ReleaseSafe-only guard (compiles out in ReleaseFast, like
+        // every std.debug.assert); O(1) count compare, not a per-row cost.
+        std.debug.assert(entity_count == spatial.pos_x.len);
+
         const system_config = normalizedConfig(config, self);
         self.resetSeparationScratch();
         const gathered = self.rows.slice();
@@ -415,6 +426,17 @@ pub const AiSystem = struct {
     }
 
     fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView) void {
+        // Population-domain contract with spatial_index.zig: the shared index
+        // built for this step must have gathered the identical row count, since
+        // `computeBoundedSeparation` passes a gather row index into `queryNeighbors`
+        // as a self-index used only for self-exclusion (an equality compare against
+        // spatial's own row indices, which are always bounds-safe within spatial's
+        // own arrays) — a divergence here corrupts self-exclusion/separation-force
+        // correctness, not memory safety. Debug/ReleaseSafe-only guard (compiles out
+        // in ReleaseFast, like every std.debug.assert); O(1) count compare (not
+        // per-row), guarding against a future silent divergence between the two
+        // independent gathers.
+        std.debug.assert(self.rows.len == spatial.pos_x.len);
         const gathered = self.rows.slice();
         var context = AiSeparationContext{
             .pos_x = gathered.items(.pos_x),

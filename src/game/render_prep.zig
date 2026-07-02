@@ -29,7 +29,6 @@ const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const ConstParticleSlice = @import("systems/particle.zig").ConstParticleSlice;
-const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 
 pub const PreparedDraw = union(enum) {
     sprite: Sprite,
@@ -480,6 +479,24 @@ pub fn collectDynamicRecords(
     prep.finalizeDepthBuckets();
 }
 
+/// Which stream the layered-world merge walk should drain next. Sparse tiles and
+/// dynamic records are each already ascending by depth; this decides the single
+/// next step so the merged output stays nondecreasing.
+const MergeSource = enum { sparse, dynamic };
+
+/// Pure tie-break for the sparse/dynamic depth merge: sparse wins ties (`depth <=
+/// dynamic_depth`), so tile floors composite under same-depth dynamic draws.
+/// Shared by `submitLayeredWorld` and covered directly by unit tests below since
+/// the caller needs a live `*Renderer` and can't run headlessly.
+fn mergeNextSource(sparse_depth: ?i32, dynamic_depth: ?i32) ?MergeSource {
+    if (sparse_depth) |depth| {
+        if (dynamic_depth == null or depth <= dynamic_depth.?) return .sparse;
+        return .dynamic;
+    }
+    if (dynamic_depth != null) return .dynamic;
+    return null;
+}
+
 fn submitLayeredWorld(
     scene: GameplayScene,
     prep: *DynamicScenePrep,
@@ -493,22 +510,23 @@ fn submitLayeredWorld(
     var sparse_depth = scene.world.firstVisibleSparseDepth();
     var dynamic_span_index: usize = 0;
     var dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
-    while (sparse_depth != null or dynamic_depth != null) {
-        if (sparse_depth) |depth| {
-            if (dynamic_depth == null or depth <= dynamic_depth.?) {
+    while (mergeNextSource(sparse_depth, dynamic_depth)) |source| {
+        switch (source) {
+            .sparse => {
+                const depth = sparse_depth.?;
                 try scene.world.submitVisibleSparseAtDepth(renderer, runtime_assets, depth);
                 sparse_depth = scene.world.nextVisibleSparseDepthAfter(depth);
-                continue;
-            }
+            },
+            .dynamic => {
+                const dynamic_range = prep.depth_spans.items[dynamic_span_index - 1];
+                const sorted_indices = prep.sort_indices.items;
+                const records = prep.records.items;
+                for (sorted_indices[dynamic_range.start..dynamic_range.end]) |record_index| {
+                    try submitPreparedDraw(renderer, records[record_index].draw);
+                }
+                dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
+            },
         }
-
-        const dynamic_range = prep.depth_spans.items[dynamic_span_index - 1];
-        const sorted_indices = prep.sort_indices.items;
-        const records = prep.records.items;
-        for (sorted_indices[dynamic_range.start..dynamic_range.end]) |record_index| {
-            try submitPreparedDraw(renderer, records[record_index].draw);
-        }
-        dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
     }
 }
 
@@ -698,6 +716,55 @@ test "render collect record sort orders depth then sequence" {
     try std.testing.expect(!sortRecordIndexLessThan(&records, 2, 1));
 }
 
+test "layered world merge picks sparse on tie and exhausts either stream" {
+    try std.testing.expectEqual(MergeSource.sparse, mergeNextSource(5, 5).?);
+    try std.testing.expectEqual(MergeSource.dynamic, mergeNextSource(6, 5).?);
+    try std.testing.expectEqual(MergeSource.sparse, mergeNextSource(5, null).?);
+    try std.testing.expectEqual(MergeSource.dynamic, mergeNextSource(null, 5).?);
+    try std.testing.expect(mergeNextSource(null, null) == null);
+}
+
+test "layered world merge interleaves a dynamic span between differing sparse depths and breaks ties toward sparse" {
+    // Sparse depths 0 and 10 bracket one dynamic span at depth 5 (interleave), and
+    // depth 5 also collides with a second dynamic span (tie: sparse must win).
+    const sparse_depths = [_]i32{ 0, 5, 10 };
+    const dynamic_depths = [_]i32{5};
+
+    var sparse_index: usize = 0;
+    var dynamic_index: usize = 0;
+    var sparse_depth: ?i32 = sparse_depths[0];
+    var dynamic_depth: ?i32 = dynamic_depths[0];
+
+    var emitted: [4]struct { source: MergeSource, depth: i32 } = undefined;
+    var emitted_count: usize = 0;
+
+    while (mergeNextSource(sparse_depth, dynamic_depth)) |source| {
+        emitted[emitted_count] = .{ .source = source, .depth = (if (source == .sparse) sparse_depth else dynamic_depth).? };
+        emitted_count += 1;
+        switch (source) {
+            .sparse => {
+                sparse_index += 1;
+                sparse_depth = if (sparse_index < sparse_depths.len) sparse_depths[sparse_index] else null;
+            },
+            .dynamic => {
+                dynamic_index += 1;
+                dynamic_depth = if (dynamic_index < dynamic_depths.len) dynamic_depths[dynamic_index] else null;
+            },
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 4), emitted_count);
+    try std.testing.expectEqual(MergeSource.sparse, emitted[0].source);
+    try std.testing.expectEqual(@as(i32, 0), emitted[0].depth);
+    // Tie at depth 5: sparse must be drained before the dynamic span at the same depth.
+    try std.testing.expectEqual(MergeSource.sparse, emitted[1].source);
+    try std.testing.expectEqual(@as(i32, 5), emitted[1].depth);
+    try std.testing.expectEqual(MergeSource.dynamic, emitted[2].source);
+    try std.testing.expectEqual(@as(i32, 5), emitted[2].depth);
+    try std.testing.expectEqual(MergeSource.sparse, emitted[3].source);
+    try std.testing.expectEqual(@as(i32, 10), emitted[3].depth);
+}
+
 test "dynamic record capacity counts visuals player marker and particles" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -773,6 +840,107 @@ test "sprite command capacity sums sparse reserve visuals player and ui headroom
             .overscan_chunks = 0,
         }),
     );
+}
+
+test "collect dynamic records after structural growth stays within reserve and allocates only on warmup" {
+    const created_visual_count = 528;
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // One entity is the player (exercises the player-marker append path); the
+    // rest are plain background visuals grown well past initial capacity.
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setFacing(player_entity, .{ .direction = .down });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_length = 1,
+        .marker_depth = 1,
+        .marker_margin = 0,
+    });
+
+    for (1..created_visual_count) |index| {
+        const x: f32 = @floatFromInt(index % 64);
+        const y: f32 = @floatFromInt(index / 64);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = y },
+            .previous_position = .{ .x = x, .y = y },
+        });
+        try data.setPrimitiveVisual(entity, .{
+            .size = .{ .x = 1, .y = 1 },
+            .color = .{ .r = 0.5, .g = 0.6, .b = 0.7, .a = 1 },
+            .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+        });
+    }
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 4 });
+    defer particles.deinit();
+    try std.testing.expect(particles.emit(.{ .position = .{ .x = 10, .y = 10 }, .start_size = 4 }));
+
+    // A minimal world with real chunk geometry (via addLevel), not the demo
+    // tileset-backed init, so the render-collect chunk gate sees a live region
+    // without pulling in asset loading.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 2048, .h = 2048 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = 0, .min_y = 0, .max_x = 2048, .max_y = 2048 };
+
+    // The capacity formulas track the live grown population, not a stale snapshot.
+    try std.testing.expectEqual(
+        data.primitiveVisualSliceConst().entities.len + 1 + particles.activeCount(),
+        dynamicRecordCapacity(scene),
+    );
+    try std.testing.expectEqual(
+        world.reserveRenderRecords() + data.primitiveVisualSliceConst().entities.len + 1 +
+            particles.activeCount() + Renderer.kStackedStateUiHeadroom,
+        spriteCommandCapacity(scene),
+    );
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+
+    // Warmup with the real allocator: grows records/sort_indices/depth_spans to
+    // dynamicRecordCapacity once, exercising every entity, the player marker, and
+    // the particle through collectDynamicRecords' appendAssumeCapacity calls.
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+    const expected_record_count: usize = created_visual_count + 1 + 1; // visuals + player marker + particle
+    try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
+
+    const original_allocator = prep.allocator;
+    // Block resize_fail_index too, not just fail_index: ArrayList.ensureTotalCapacityPrecise
+    // tries allocator.remap() before falling back to a fresh alloc, and a successful remap
+    // (e.g. mremap on Linux) bumps resize_index without incrementing .allocations — leaving
+    // fail_index-only blocking unable to catch a regression that needs to grow via remap.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    prep.allocator = failing.allocator();
+    defer prep.allocator = original_allocator;
+
+    // Re-running at the same grown population must not allocate: ensureScenePrepCapacity's
+    // reserve is already sized to match, so every append below is assumeCapacity-only.
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+    try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {

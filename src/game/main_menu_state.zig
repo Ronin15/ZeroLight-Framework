@@ -13,6 +13,7 @@ const UpdateContext = @import("../app/state.zig").UpdateContext;
 const state_policy = @import("../app/state.zig").state_policy;
 const inputFile = @import("../app/input.zig");
 const LoadingState = @import("loading_state.zig").LoadingState;
+const default_world_build_config = @import("game_demo_state.zig").default_world_build_config;
 const SettingsMenuState = @import("settings_menu_state.zig").SettingsMenuState;
 const RuntimeAudioSettings = @import("settings_menu_state.zig").RuntimeAudioSettings;
 const menu_view = @import("menu_view.zig");
@@ -150,7 +151,7 @@ pub const MainMenuState = struct {
                     self.allocator.destroy(loading_ptr);
                 };
 
-                loading_ptr.* = LoadingState.init(self.allocator, .game_demo, self.width, self.height);
+                loading_ptr.* = LoadingState.init(self.allocator, .game_demo, self.width, self.height, default_world_build_config);
                 initialized = true;
                 const state = State.fromOwnedPtr(LoadingState, loading_ptr);
                 owned_by_transition = true;

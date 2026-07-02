@@ -36,7 +36,6 @@ const KeySet = @import("caches.zig").KeySet;
 const GroupKeyMap = @import("caches.zig").GroupKeyMap;
 const waypointFromPath = @import("caches.zig").waypointFromPath;
 const waypointFromStitched = @import("caches.zig").waypointFromStitched;
-const nextCellLevelFromStitched = @import("caches.zig").nextCellLevelFromStitched;
 const solve = @import("solve.zig");
 const solveOne = solve.solveOne;
 const solveFallbackJob = solve.solveFallbackJob;
@@ -721,7 +720,7 @@ pub const PathfindingSystem = struct {
                 if (start_level == key.goal_level) {
                     if (self.graph.grid(key.goal_level)) |goal_grid| {
                         if (field.sample(goal_grid, start_index)) |waypoint| {
-                            return .{ .status = .available, .next_waypoint = waypoint, .next_cell_level = start_level, .path_len = 2 };
+                            return .{ .status = .available, .next_waypoint = waypoint, .path_len = 2 };
                         }
                     }
                     return .{ .status = .unavailable };
@@ -739,15 +738,12 @@ pub const PathfindingSystem = struct {
             if (result.stitched_len != 0) {
                 const stitched = self.completed.stitchedSlice(slot, result.stitched_len);
                 if (waypointFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint)) |waypoint| {
-                    // waypointFromStitched records the matched stitched index in waypoint_hint;
-                    // reuse it so next_cell_level pairs with the same path cell.
-                    const next_level = nextCellLevelFromStitched(&self.graph, stitched, start_level, start_index, waypoint_hint) orelse start_level;
-                    return .{ .status = .available, .next_waypoint = waypoint, .next_cell_level = next_level, .path_len = result.stitched_len };
+                    return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.stitched_len };
                 }
                 // Agent's level is not yet covered by the corridor (e.g. it has not
                 // reached the start-level run): steer toward the stored first cell.
                 if (path.len != 0) {
-                    return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .next_cell_level = result.path_level, .path_len = result.path_len };
+                    return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
                 }
                 return .{ .status = .unavailable };
             }
@@ -755,11 +751,11 @@ pub const PathfindingSystem = struct {
             // agent's current cell against the stored path.
             if (result.path_level == start_level) {
                 if (waypointFromPath(path_grid, path, start_index, waypoint_hint)) |waypoint| {
-                    return .{ .status = .available, .next_waypoint = waypoint, .next_cell_level = start_level, .path_len = result.path_len };
+                    return .{ .status = .available, .next_waypoint = waypoint, .path_len = result.path_len };
                 }
             }
             if (path.len != 0) {
-                return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .next_cell_level = result.path_level, .path_len = result.path_len };
+                return .{ .status = .available, .next_waypoint = path_grid.cellCenter(path[0]), .path_len = result.path_len };
             }
             return .{ .status = .unavailable };
         }
@@ -1311,7 +1307,6 @@ test "pathfinding individual solve produces deterministic available path and way
     try std.testing.expectEqual(PathStatus.available, view.status);
     try std.testing.expectEqual(@as(f32, 48), view.next_waypoint.x);
     try std.testing.expectEqual(@as(f32, 48), view.next_waypoint.y);
-    try std.testing.expectEqual(@as(u16, 0), view.next_cell_level);
     try std.testing.expect(view.path_len >= 2);
 }
 
@@ -1802,7 +1797,6 @@ test "pathfinding threaded solve matches serial solve" {
     try std.testing.expectEqual(serial_view.status, threaded_view.status);
     try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
     try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
-    try std.testing.expectEqual(serial_view.next_cell_level, threaded_view.next_cell_level);
 }
 
 test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
@@ -1861,7 +1855,6 @@ test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
         try std.testing.expectEqual(serial_view.status, threaded_view.status);
         try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
         try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
-        try std.testing.expectEqual(serial_view.next_cell_level, threaded_view.next_cell_level);
     }
 }
 
@@ -1937,13 +1930,10 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     // i.e. to the right/down of the start cell (0,0).
     try std.testing.expect(view.next_waypoint.x > 16);
     try std.testing.expect(view.next_waypoint.y > 16);
-    // Still on level 0 until the agent reaches the link cell.
-    try std.testing.expectEqual(@as(u16, 0), view.next_cell_level);
 
     const link_world = cellCenterWorld(.{ .x = 10, .y = 10 });
     const at_link = system.statusForWorld(0, link_world, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.available, at_link.status);
-    try std.testing.expectEqual(@as(u16, 1), at_link.next_cell_level);
 }
 
 test "pathfinding cross-level goal with no link is unavailable, not pending forever" {

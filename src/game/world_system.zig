@@ -4,10 +4,10 @@
 
 //! State-owned SoA world/tile storage and render preparation.
 //! Persistent world data stores stable tile IDs, level/chunk metadata, and
-//! gameplay tile flags. Atlas source rectangles borrow `tileset_meta` instead of
-//! duplicating rect columns when the caller keeps metadata alive (for example
-//! `RuntimeAssets.worldTilesetMeta()` for the engine lifetime). Renderer handles
-//! stay outside this owner.
+//! gameplay tile flags. Atlas source rectangles are resolved from `tileset_meta`
+//! once at build time and cached into per-tile `catalog_source_x/y/w/h` columns,
+//! so hot-path `sourceRect` lookups never re-touch tileset metadata at runtime.
+//! Renderer handles stay outside this owner.
 
 const std = @import("std");
 const math = @import("../core/math.zig");
@@ -480,10 +480,17 @@ pub const WorldSystem = struct {
 
     /// Transfers standalone tileset metadata ownership into this world so
     /// `sourceRect` lookups remain valid after the caller's local `meta` ends.
+    /// Does not cache a self-pointer: `WorldSystem` is moved by value; read
+    /// via `tilesetMeta()`.
     pub fn adoptTilesetMeta(self: *WorldSystem, meta: WorldTilesetMeta) void {
         if (self.owned_tileset_meta) |*owned| owned.deinit();
         self.owned_tileset_meta = meta;
-        self.tileset_meta = &self.owned_tileset_meta.?;
+    }
+
+    /// Resolves the tileset metadata to read, preferring an owned value (safe
+    /// across moves of `WorldSystem`) over a borrowed pointer set by `buildCatalog`.
+    pub fn tilesetMeta(self: *const WorldSystem) ?*const WorldTilesetMeta {
+        return if (self.owned_tileset_meta) |*m| m else self.tileset_meta;
     }
 
     /// Prefer `initDemo` with `RuntimeAssets` so tileset metadata is not parsed
@@ -2631,4 +2638,34 @@ test "validateDenseRenderBudget rejects dense tile gpu budget overrun" {
     const level = try world.addLevel(0);
     _ = try world.addDenseLayer(level, 0, .floor, grass);
     try std.testing.expectError(error.DenseTileGpuBudgetExceeded, world.validateDenseRenderBudget());
+}
+
+fn moveWorldByValue(world: WorldSystem) WorldSystem {
+    return world;
+}
+
+test "tilesetMeta resolves correctly after WorldSystem is moved by value" {
+    const meta = try testWorldMeta();
+    const expected_tile_size = meta.tileSize();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = expected_tile_size,
+        .chunk_size_tiles = 2,
+    };
+    world.adoptTilesetMeta(meta);
+
+    var moved = moveWorldByValue(world);
+    defer moved.deinit();
+
+    const resolved = moved.tilesetMeta() orelse return error.TestExpectedTilesetMeta;
+    try std.testing.expectEqual(expected_tile_size, resolved.tileSize());
+    // `world` (the pre-move original) stays alive for this whole test, so a
+    // value-only comparison would still pass against the pre-fix behavior of
+    // caching `&world.owned_tileset_meta` at adopt time: that stale pointer
+    // still reads correct bytes since `world` was never freed. Assert pointer
+    // identity against `moved`'s own field to actually discriminate the fix.
+    try std.testing.expect(resolved == &moved.owned_tileset_meta.?);
 }

@@ -276,10 +276,18 @@ and pure gameplay/data contracts. Keep display/GPU checks in `gpu-smoke`.
 
 Unit tests must never build production-scale worlds. Do not call
 `initProcedural`, `initProceduralFromMeta`, `initProceduralWithRuntimeAssets`,
-or loading/gameplay paths that construct the full procedural world in
-`zig build test`. Use minimal hand-built `WorldSystem` fixtures, small demo
-patches, or pure contract checks instead; full world build and throughput
-validation belong in `zig build bench`.
+or loading/gameplay paths that construct the full procedural world with a
+production-scale `WorldBuildConfig` (or equivalent) in `zig build test`. These
+entry points take an explicit world-size/level-count config, so a test may
+call them with a minimal config — at most 16x16 tiles and 1 underground level,
+matching the compact-fixture threshold `worldUsesCompactDemoSpawn` already
+uses elsewhere in this codebase — when it genuinely needs to exercise the real
+code path (e.g. state-transition wiring), rather than a hand-built
+`WorldSystem` fixture that would bypass that path — but never with the real
+production config or anything approaching it. Prefer minimal hand-built
+`WorldSystem` fixtures, small demo patches, or pure contract checks when the
+real procedural/loading path isn't itself under test; full world build and
+throughput validation belong in `zig build bench`.
 
 Production contracts must expose runtime concepts only. Do not add test-only
 enum tags, union payloads, marker fields, fake stages, fixture hooks, service

@@ -78,15 +78,19 @@ The player-vs-tile gate runs right after the bounds clamp and before entity
 collision, so every downstream stage and the camera see the gated position. It
 stops the player from moving into movement-blocking tiles on their current plane
 (the mining mechanic: underground dirt is solid until dug) by resolving X then Y
-against the pre-move position, which yields wall-sliding. It is player-only by
-design on level 0 (the surface is fully walkable and the gate is a no-op there).
+against the pre-move position, which yields wall-sliding. It is a no-op on
+level 0 (the surface is fully walkable there).
 
 NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement
 and collision settle, `applyNpcPlaneTraversal` mirrors the player ramp/fall
 cell-entry policy and commits level changes on the main thread. Off-surface NPCs
 are gated by `gateNpcEntitiesToWalkableTiles` against solid tiles on their current
-plane before entity collision runs. Steering and pathfinding read each entity's
-`world_level` for `start_level` and `next_cell_level` at link crossings.
+plane before entity collision runs; both NPC stages skip dormant-tier entities,
+since movement never moves them. Steering and pathfinding read each entity's
+`world_level` for `start_level`; level transitions at link crossings are
+committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
+by a path-view field (a `PathView.next_cell_level` field was tried and removed
+as an unused duplicate — see `docs/framework-implementation-slices.md` Slice 25E).
 
 ## Range Output Streams
 
