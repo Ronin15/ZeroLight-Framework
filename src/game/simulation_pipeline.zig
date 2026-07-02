@@ -316,6 +316,7 @@ pub const SimulationPipeline = struct {
         var ai_timer = StageTimer.start();
         const ai_stats = try self.ai.update(ai_slice, move_slice, data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
+            .step = self.scope.currentStep(),
             .seek_target = player_target,
             // Every demo agent seeks the moving player: the canonical shared goal.
             // Declaring group mode routes them through one managed flow field
@@ -644,6 +645,86 @@ test "pipeline updates full active player-only state through serial path" {
     try std.testing.expectEqual(@as(usize, 0), stats.ai.entity_count);
     try std.testing.expectEqual(@as(usize, 1), stats.movement.body_count);
     try std.testing.expectEqual(@as(usize, 0), frame.contacts.mergedItems().len);
+}
+
+test "pipeline resamples AI wander direction across fixed steps" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const wanderer = try data.createEntity();
+    try data.setMovementBody(wanderer, .{ .position = .{ .x = 10, .y = 10 }, .previous_position = .{ .x = 10, .y = 10 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(wanderer, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    // A bare WorldSystem never gets a visibility window set, so
+    // `cognitionActiveRegion()` returns null and the AI gather falls back to
+    // full-active with no stagger gating — the wanderer runs every step.
+    frame.beginStep();
+    const stats1 = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats1.ai.entity_count);
+    const step1 = frame.navigation_intents.mergedItems()[0];
+
+    // Wander direction holds steady for `wander_resample_period_steps` (300
+    // steps / 5s at 60Hz by default) before resampling, so cross a full
+    // epoch boundary here rather than checking single-step deltas.
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        frame.beginStep();
+        _ = try pipeline.update(.{
+            .data = &data,
+            .frame = &frame,
+            .world = &world,
+            .player = &player,
+            .thread_system = &threads,
+            .delta_seconds = 0.016,
+            .bounds_width = 800,
+            .bounds_height = 450,
+        });
+    }
+    const step_after_epoch = frame.navigation_intents.mergedItems()[0];
+
+    try std.testing.expect(step1.direct_direction_x != step_after_epoch.direct_direction_x or
+        step1.direct_direction_y != step_after_epoch.direct_direction_y);
 }
 
 test "pipeline syncs movement previous positions" {

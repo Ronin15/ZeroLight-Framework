@@ -34,6 +34,7 @@ comptime {
     _ = @import("benchmarks/render_game_prep.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
+    _ = @import("core/rng.zig");
     _ = @import("core/simd.zig");
     _ = @import("game/audio_controller.zig");
     _ = @import("game/data_system.zig");

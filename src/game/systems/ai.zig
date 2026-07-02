@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -73,6 +74,19 @@ const separation_cell_radius: i32 = 2;
 const max_separation_neighbors: u8 = 32;
 const max_separation_candidate_checks: u16 = 128;
 
+/// Distinguishes wander-direction draws from any future AI RNG consumer
+/// (appraisal noise, investigate-target selection) sharing the same
+/// (seed, entity_index, step) — see src/core/rng.zig's salt doc comment.
+const wander_rng_salt: u32 = 0;
+
+/// Default cadence (in fixed steps) at which a wandering entity's sampled
+/// direction changes: 300 steps == 5s at 60Hz. A fully independent random
+/// draw every AI-active step (every step keyed by `AiConfig.step` directly)
+/// looks like frantic jitter rather than wandering, so the raw step is
+/// quantized into coarser epochs before hashing — direction holds steady for
+/// one epoch, then jumps to a new (still per-entity-distinct) heading.
+const default_wander_resample_period_steps: u32 = 300;
+
 pub const AiConfig = struct {
     items_per_range: ?usize = null,
     separation_items_per_range: ?usize = null,
@@ -83,6 +97,16 @@ pub const AiConfig = struct {
     intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
+    /// Current fixed-step counter (see `SimulationScopeSystem.currentStep()`),
+    /// combined with `intent_seed` and each entity's dense index to key
+    /// `src/core/rng.zig` draws. Defaults to 0 for callers/tests that don't
+    /// care about step-to-step variation; production wiring passes the real
+    /// per-step counter from `SimulationPipeline`.
+    step: u32 = 0,
+    /// Cadence (in fixed steps) at which wander direction resamples; `step` is
+    /// quantized by this before hashing so direction holds steady for a
+    /// stretch instead of changing every AI-active step. Must be >= 1.
+    wander_resample_period_steps: u32 = default_wander_resample_period_steps,
     /// If provided, seekers head toward this position instead of the global center-of-mass
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
@@ -193,6 +217,7 @@ pub const AiSystem = struct {
         const target_y = target.y;
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
+        const wander_step = system_config.step / @max(system_config.wander_resample_period_steps, 1);
 
         var context = AiJobContext{
             .entities = gathered.items(.entity),
@@ -207,6 +232,7 @@ pub const AiSystem = struct {
             .target_x = target_x,
             .target_y = target_y,
             .seed = system_config.intent_seed,
+            .wander_step = wander_step,
             .nav_request_kind = system_config.nav_request_kind,
             .range_base = range_base,
         };
@@ -275,6 +301,7 @@ pub const AiSystem = struct {
         const target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
         const tx = target.x;
         const ty = target.y;
+        const wander_step = config.step / @max(config.wander_resample_period_steps, 1);
         for (range.start..range.end) |i| {
             const base_dir = decideDir(
                 behaviors[i],
@@ -286,6 +313,7 @@ pub const AiSystem = struct {
                 seek_weights[i],
                 config.intent_seed,
                 entities[i].index,
+                wander_step,
             );
             const sx = if (i < sep_x.len) sep_x[i] else 0;
             const sy = if (i < sep_y.len) sep_y[i] else 0;
@@ -418,6 +446,8 @@ const NormalizedAiConfig = struct {
     separation_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_seed: u64,
+    step: u32,
+    wander_resample_period_steps: u32,
     seek_target: ?math.Vec2,
     nav_request_kind: PathRequestKind,
     navigation_intents: ?*RangeOutputStream(NavigationIntent),
@@ -439,6 +469,8 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
         else
             null,
         .intent_seed = config.intent_seed,
+        .step = config.step,
+        .wander_resample_period_steps = config.wander_resample_period_steps,
         .seek_target = config.seek_target,
         .nav_request_kind = config.nav_request_kind,
         .navigation_intents = config.navigation_intents,
@@ -595,6 +627,7 @@ fn decideDir(
     seek_w: f32,
     seed: u64,
     key: u32,
+    wander_step: u32,
 ) AiDir {
     var dx: f32 = 0;
     var dy: f32 = 0;
@@ -612,7 +645,7 @@ fn decideDir(
     else
         @as(f32, 0.0);
     if (wander_strength > 0) {
-        const w = deterministicUnitDir(seed, key);
+        const w = rng.unitVec2(seed, key, wander_step, wander_rng_salt);
         dx += w.x * wander_strength;
         dy += w.y * wander_strength;
     }
@@ -640,19 +673,6 @@ fn priorityForBehavior(behavior: AiBehavior) i16 {
         .seek => 10,
         .wander => 0,
     };
-}
-
-fn deterministicUnitDir(seed: u64, key: u32) AiDir {
-    var h: u64 = seed ^ @as(u64, key) ^ 0x9e3779b97f4a7c15;
-    h ^= h >> 30;
-    h *%= 0xbf58476d1ce4e5b9;
-    h ^= h >> 27;
-    h *%= 0x94d049bb133111eb;
-    h ^= h >> 31;
-    const u = @as(f32, @floatFromInt(h & 0xffffffff)) / 4294967295.0;
-    const angle = u * 2.0 * std.math.pi;
-    const rotation = math.sinCos(angle);
-    return .{ .x = rotation.cos, .y = rotation.sin };
 }
 
 const AiSeparationContext = struct {
@@ -726,6 +746,9 @@ const AiJobContext = struct {
     target_x: f32,
     target_y: f32,
     seed: u64,
+    /// Pre-quantized wander epoch (`step / wander_resample_period_steps`,
+    /// computed once by the caller), not the raw fixed-step counter.
+    wander_step: u32,
     nav_request_kind: PathRequestKind,
     range_base: usize,
 };
@@ -744,6 +767,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.seek_weights[i],
             job.seed,
             job.entities[i].index,
+            job.wander_step,
         );
         const sep_x = if (i < job.sep_x.len) job.sep_x[i] else 0;
         const sep_y = if (i < job.sep_y.len) job.sep_y[i] else 0;
@@ -945,9 +969,9 @@ test "ai processor uses committed adaptive threaded profiles with default thread
 }
 
 test "wander amplitude scales steering perturbation against seek" {
-    const pure_seek = decideDir(.seek, 0, 0, 100, 0, 0, 1, 0x1234, 44);
-    const weak_wander = decideDir(.seek, 0, 0, 100, 0, 3, 1, 0x1234, 44);
-    const strong_wander = decideDir(.seek, 0, 0, 100, 0, 60, 1, 0x1234, 44);
+    const pure_seek = decideDir(.seek, 0, 0, 100, 0, 0, 1, 0x1234, 44, 0);
+    const weak_wander = decideDir(.seek, 0, 0, 100, 0, 3, 1, 0x1234, 44, 0);
+    const strong_wander = decideDir(.seek, 0, 0, 100, 0, 60, 1, 0x1234, 44, 0);
 
     try std.testing.expectEqual(@as(f32, 1), pure_seek.x);
     try std.testing.expectEqual(@as(f32, 0), pure_seek.y);
@@ -955,8 +979,103 @@ test "wander amplitude scales steering perturbation against seek" {
     try std.testing.expect(strong_wander.x != weak_wander.x or strong_wander.y != weak_wander.y);
 }
 
+test "ai wander direction resamples across steps but stays deterministic for a fixed step" {
+    // wander_resample_period_steps = 1 degenerates to raw-step keying so this
+    // test exercises the underlying (seed, entity_index, step) mechanism
+    // directly, independent of the resample-period smoothing tested below.
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    var frame_a = SimulationFrame.init(std.testing.allocator);
+    defer frame_a.deinit();
+    try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_a.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    const step5_first = frame_a.navigation_intents.mergedItems()[0];
+    frame_a.phase = .finished;
+
+    var frame_b = SimulationFrame.init(std.testing.allocator);
+    defer frame_b.deinit();
+    try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_b.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    const step5_second = frame_b.navigation_intents.mergedItems()[0];
+    frame_b.phase = .finished;
+
+    try std.testing.expectEqual(step5_first.direct_direction_x, step5_second.direct_direction_x);
+    try std.testing.expectEqual(step5_first.direct_direction_y, step5_second.direct_direction_y);
+
+    var frame_c = SimulationFrame.init(std.testing.allocator);
+    defer frame_c.deinit();
+    try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_c.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = 9, .wander_resample_period_steps = 1 });
+    const step9 = frame_c.navigation_intents.mergedItems()[0];
+    frame_c.phase = .finished;
+
+    try std.testing.expect(step5_first.direct_direction_x != step9.direct_direction_x or
+        step5_first.direct_direction_y != step9.direct_direction_y);
+}
+
+test "ai wander direction holds steady within a resample epoch then changes at the boundary" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    const period: u32 = 10;
+
+    var frame_a = SimulationFrame.init(std.testing.allocator);
+    defer frame_a.deinit();
+    try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_a.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 0, .wander_resample_period_steps = period });
+    const early = frame_a.navigation_intents.mergedItems()[0];
+    frame_a.phase = .finished;
+
+    var frame_b = SimulationFrame.init(std.testing.allocator);
+    defer frame_b.deinit();
+    try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_b.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = period - 1, .wander_resample_period_steps = period });
+    const still_within_epoch = frame_b.navigation_intents.mergedItems()[0];
+    frame_b.phase = .finished;
+
+    try std.testing.expectEqual(early.direct_direction_x, still_within_epoch.direct_direction_x);
+    try std.testing.expectEqual(early.direct_direction_y, still_within_epoch.direct_direction_y);
+
+    var frame_c = SimulationFrame.init(std.testing.allocator);
+    defer frame_c.deinit();
+    try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_c.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = period, .wander_resample_period_steps = period });
+    const next_epoch = frame_c.navigation_intents.mergedItems()[0];
+    frame_c.phase = .finished;
+
+    try std.testing.expect(early.direct_direction_x != next_epoch.direct_direction_x or
+        early.direct_direction_y != next_epoch.direct_direction_y);
+}
+
 test "ai direction normalization falls back for overflowed finite parameters" {
-    const dir = decideDir(.seek, 0, 0, 1, 0, std.math.floatMax(f32), std.math.floatMax(f32), 0x1234, 44);
+    const dir = decideDir(.seek, 0, 0, 1, 0, std.math.floatMax(f32), std.math.floatMax(f32), 0x1234, 44, 0);
     try std.testing.expect(std.math.isFinite(dir.x));
     try std.testing.expect(std.math.isFinite(dir.y));
 }
@@ -1110,7 +1229,7 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .seek_target = .{ .x = 300, .y = 200 } };
+    const cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .step = 7, .seek_target = .{ .x = 300, .y = 200 } };
     _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame, 0.016, cfg);
     const serial = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), serial.len);

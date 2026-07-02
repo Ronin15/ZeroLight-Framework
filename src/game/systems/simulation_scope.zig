@@ -164,6 +164,13 @@ pub const SimulationScopeSystem = struct {
         return @intCast(self.step_count % cognition_stagger_n);
     }
 
+    /// Current fixed-step counter (already advanced for this step). Feeds
+    /// src/core/rng.zig calls so per-entity noise resamples every step instead
+    /// of being keyed only by a static seed.
+    pub fn currentStep(self: *const SimulationScopeSystem) u32 {
+        return self.step_count;
+    }
+
     // Chunk maintenance is folded into the movement processor: it derives each
     // integrated body's chunk from its new position in the same pass (see
     // movement.ChunkGridParams), so there is no separate recompute pass here. The
