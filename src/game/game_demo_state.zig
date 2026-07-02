@@ -70,11 +70,11 @@ const demo_structural_reserve = test_square_count + 16;
 /// Per-step audio bound for demo tests: 32 movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop.
 const demo_test_audio_capacity = 64;
-const procedural_world_width_tiles: u16 = 512;
-const procedural_world_height_tiles: u16 = 512;
+const procedural_world_width_tiles: u16 = 256; //512
+const procedural_world_height_tiles: u16 = 256; //512
 /// Surface + underground dense floors for the procedural 32-level mine (runtime load).
 /// Unit tests use `initDemoForTest` / `initDemoFromMetaWithUnderground` (3 levels), not this config.
-const procedural_underground_count: u16 = 31;
+const procedural_underground_count: u16 = 31; //31
 const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
 /// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
 const procedural_max_dense_bands_per_level: u8 = 1;
