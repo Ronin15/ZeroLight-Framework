@@ -14,6 +14,7 @@ const pathfinding = @import("pathfinding.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
+const spatial_index = @import("spatial_index.zig");
 const steering = @import("steering.zig");
 const suite = @import("suite.zig");
 
@@ -49,6 +50,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     render_game_prep.dense_32_surface_group,
     render_game_prep.dense_32_deep_group,
     scope.group,
+    spatial_index.group,
     steering.group,
 };
 

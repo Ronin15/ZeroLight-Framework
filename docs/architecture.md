@@ -365,7 +365,9 @@ The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
-3. `SimulationPipeline` runs AI decision output, steering, and frame-delayed pathfinding.
+3. `SimulationPipeline` builds the shared `SpatialIndexSystem` from the
+   cognition-scoped population, then runs AI decision output (querying that
+   index for separation), steering, and frame-delayed pathfinding.
 4. `SimulationPipeline` applies merged AI movement intents.
 5. `SimulationPipeline` runs movement over dense `DataSystem` movement slices.
 6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
@@ -475,13 +477,20 @@ applies sparse movement writes deterministically on the main thread before
 structural commands commit.
 
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
-It receives const AiAgent + movement prior-position slices, builds a transient
-32-unit spatial grid, computes bounded local-separation samples, then emits
-threaded navigation intents through `SimulationFrame.navigation_intents`
-(count/prefix/write). Separation and intent emission have independent
-AdaptiveWorkTuner state and benchmark stats so each stage can remain inline or
-thread independently. Wander amplitude and seek prove non-player entities emit
-high-level goals from persistent data rather than hardcoded velocities.
+It receives const AiAgent + movement prior-position slices and a read-only
+`SpatialIndexView` from the pipeline-owned `SpatialIndexSystem`
+(`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
+index, built once from the same cognition-scoped population, that AI
+separation queries for bounded local-separation samples instead of building
+its own grid. `AiSystem` then emits threaded navigation intents through
+`SimulationFrame.navigation_intents` (count/prefix/write). Separation and
+intent emission have independent AdaptiveWorkTuner state and benchmark stats
+so each stage can remain inline or thread independently; the index build has
+its own separate tuner on `SpatialIndexSystem`. Wander amplitude and seek
+prove non-player entities emit high-level goals from persistent data rather
+than hardcoded velocities. `CollisionSystem`'s sweep-and-prune broadphase (see
+above) is intentionally not ported onto this index — it is a different,
+already-tuned algorithm, not a duplicate grid build.
 
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
 component data, movement slices, static obstacle data, and frame-delayed

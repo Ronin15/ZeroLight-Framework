@@ -1296,11 +1296,16 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     try frame.reserveStreams(2, 0, 4, 0, 0, 0);
     frame.beginStep();
 
-    var ai_sys = ai.AiSystem.init(allocator);
-    defer ai_sys.deinit();
+    const spatial_index = @import("spatial_index.zig");
+    var spatial_sys = spatial_index.SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, &data, &frame, 0.016, .{ .scope_dense_indices = indices });
+    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = indices });
+
+    var ai_sys = ai.AiSystem.init(allocator);
+    defer ai_sys.deinit();
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .scope_dense_indices = indices });
 
     // Exactly one navigation intent, for the selected agent — steering downstream
     // inherits this scoping with no separate gather.

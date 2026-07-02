@@ -456,6 +456,7 @@ pub const GameDemoState = struct {
         nav_update_stats: NavUpdateStats,
     ) void {
         const scope_stats = pipeline_stats.scope.stats;
+        const spatial_index_stats = pipeline_stats.spatial_index;
         const ai_stats = pipeline_stats.ai;
         const steering_stats = pipeline_stats.steering;
         const pathfinding_stats = pipeline_stats.pathfinding;
@@ -475,6 +476,8 @@ pub const GameDemoState = struct {
         perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
         perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
         perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
+
+        perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));

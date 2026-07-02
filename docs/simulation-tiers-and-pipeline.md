@@ -61,13 +61,17 @@ passes the borrowed audio command buffer through the pipeline-owned
 `SimulationPipeline` opens each step with the backbone **scope pass** (stagger
 advance and the tier/halo/stagger gathers that select which entities enter each
 stage; chunk columns are derived in-pass by the movement processor, not a separate
-recompute), then owns AI navigation-intent production,
-steering/path status, pathfinding, sparse movement-intent application, movement,
-bounds clamp, player-vs-world-tile gating, collision detection, and collision
-response — AI, movement, and collision run scope-gated through a
-`scope_dense_indices` option. It closes with the **simulation-LOD tier policy**,
-which assigns each entity a cognition/locomotion/kinematic/dormant tier by cube
-distance and emits deferred `set_simulation_tier` commands at the commit seam. See
+recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
+from that same cognition-scoped population for AI separation queries, then owns
+AI navigation-intent production, steering/path status, pathfinding, sparse
+movement-intent application, movement, bounds clamp, player-vs-world-tile
+gating, collision detection, and collision response — AI, movement, and
+collision run scope-gated through a `scope_dense_indices` option. Collision
+broadphase keeps its own sweep-and-prune structure rather than consuming the
+spatial index (see `docs/architecture.md`). It closes with the
+**simulation-LOD tier policy**, which assigns each entity a
+cognition/locomotion/kinematic/dormant tier by cube distance and emits
+deferred `set_simulation_tier` commands at the commit seam. See
 `docs/architecture.md` for scope/tier ownership and the gating rules per stage.
 
 The player-vs-tile gate runs right after the bounds clamp and before entity

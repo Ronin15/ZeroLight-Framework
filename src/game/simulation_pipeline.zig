@@ -43,6 +43,8 @@ const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chunks;
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
+const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
+const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
 
@@ -86,6 +88,7 @@ pub const SimulationPipelineUpdateContext = struct {
 /// these counters without adding a separate timing path to gameplay code.
 pub const SimulationPipelineStats = struct {
     scope: SimulationScope = .{},
+    spatial_index: SpatialIndexStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
@@ -107,6 +110,10 @@ pub const SimulationPipeline = struct {
     /// Backbone scope system: recomputes chunks, gates AI/movement/collision by
     /// tier + camera cognition halo + stagger, and drives auto tier wake/sleep.
     scope: SimulationScopeSystem,
+    /// Shared per-step spatial index (Slice 28), built once from the same
+    /// cognition-scoped population the scope system selects for AI. AI
+    /// separation queries it read-only; future perception stages reuse it too.
+    spatial_index: SpatialIndexSystem,
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
@@ -137,6 +144,9 @@ pub const SimulationPipeline = struct {
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
         try scope.reserve(config.movement_body_capacity);
+        var spatial_index = SpatialIndexSystem.init(allocator);
+        errdefer spatial_index.deinit();
+        try spatial_index.reserve(config.movement_body_capacity);
 
         return .{
             .movement = MovementSystem.init(),
@@ -146,6 +156,7 @@ pub const SimulationPipeline = struct {
             .steering = steering,
             .pathfinding = pathfinding,
             .scope = scope,
+            .spatial_index = spatial_index,
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
@@ -155,6 +166,7 @@ pub const SimulationPipeline = struct {
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.spatial_index.deinit();
         self.scope.deinit();
         self.pathfinding.deinit();
         self.steering.deinit();
@@ -303,6 +315,16 @@ pub const SimulationPipeline = struct {
 
         const ai_slice = data.aiAgentSliceConst();
         const move_slice = data.movementBodySliceConst();
+
+        // Shared spatial index (Slice 28): built once from the same cognition-scoped
+        // population, from the same prior positions AI's own gather reads, so index
+        // row `i` and AiSystem row `i` refer to the same agent (see spatial_index.zig
+        // and ai.zig's cross-file population-domain contract). AI separation queries
+        // it read-only below; future perception stages will reuse it too.
+        var spatial_index_timer = StageTimer.start();
+        const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_indices });
+        spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
+
         // The player's plane is deliberately NOT propagated into the AI goal level:
         // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
         // Seeding the player's underground plane here would make them request
@@ -314,7 +336,7 @@ pub const SimulationPipeline = struct {
             math.Vec2{ .x = 400, .y = 225 };
 
         var ai_timer = StageTimer.start();
-        const ai_stats = try self.ai.update(ai_slice, move_slice, data, frame, context.thread_system, context.delta_seconds, .{
+        const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .step = self.scope.currentStep(),
             .seek_target = player_target,
@@ -419,6 +441,7 @@ pub const SimulationPipeline = struct {
 
         return .{
             .scope = scope,
+            .spatial_index = spatial_index_stats,
             .ai = ai_stats,
             .steering = steering_stats,
             .pathfinding = pathfinding_stats,
