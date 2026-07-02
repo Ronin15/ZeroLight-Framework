@@ -400,6 +400,20 @@ arbitration, and threaded final movement-intent emission. Only the steering
 stage writes final NPC `MovementIntent`s. Player movement remains direct input,
 and collision response still resolves after movement.
 
+**Hardening follow-up (post-Slice 27, no new slice number):** chasing a moving
+goal (the player) produced a visible NPC direction wiggle — a discrete flip in
+the chosen base direction (path-following vs. direct-fallback toggling while a
+goal-cell requantization is in flight, a fresh corridor replacing a stale
+waypoint, or a wander-epoch change) snapped the heading in one step instead of
+turning smoothly. `RuntimeRow` gained `prev_dir_x/y`/`has_prev_dir`, and
+`smoothBaseDirection` (steering.zig) blends the previous emitted direction
+toward the new target by `steering_turn_smoothing = 0.15` per fixed step
+(~10 steps to mostly converge at 60Hz) before it reaches
+`SelectedWorkRow.base_dir`. The first direction observed for a runtime row is
+used as-is (no startup lag). Benchmarked before/after on `zig build bench --
+group steering` at 128/512/1024 agents: no measurable regression (differences
+within normal run-to-run noise).
+
 ## Slice 20: Navigation Hardening And Hard-Path Budgets
 
 > Note (superseded core): Slice 25 supersedes the goal-field core and the
