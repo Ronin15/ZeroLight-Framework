@@ -1024,15 +1024,12 @@ Readiness: the foundation for this slice is fully present (Slices 22/23/21);
 what remains is wiring. The six checklist items below are the concrete gaps
 between the current full-active pipeline and real scoped behavior.
 
-Architecture assessment note (2026-06-28): confirmed that `allowsMovement`,
-`allowsCollision`, and `allowsCognition` predicates on `SimulationTier` are
-never consulted in `SimulationPipeline.update` — every entity, including dormant
-ones, pays full pipeline cost every step. This is the highest-leverage open item
-in the codebase: until it lands, entity population growth translates directly to
-frame cost with no graduated degradation, and every cognition-tier stage added by
-the AI track bakes in O(all entities) cost. Implement with a parallel
-`scanLiveTierCounts` parity check in debug builds to detect tier-count drift; gate
-the AI stage first and validate under stress before gating collision and movement.
+> Historical pre-implementation assessment (2026-06-28, superseded by the
+> **Status** below): at the time, `allowsMovement`/`allowsCollision`/
+> `allowsCognition` were confirmed never consulted in `SimulationPipeline.update`,
+> so every entity paid full pipeline cost every step regardless of tier. That gap
+> is closed — see **Status** and **Implementation decisions** below for the
+> landed `SimulationScopeSystem` gating.
 
 Current foundation (present — do not rebuild):
 
@@ -1046,10 +1043,10 @@ Current foundation (present — do not rebuild):
   per-stage `SimulationScopeStats` (`simulation_scope.zig`).
 - `WorldSystem` maintains `chunk_visible[]`, chunk coordinate columns, and
   `setVisibleChunksForWorldRect` / `chunkCoordForCell` (`world_system.zig`).
-- The pipeline still runs full-active: `SimulationPipeline.update` builds
-  `SimulationScope.fullActive(...)` and dispatches every stage over the full
-  component slices — scoped filtering is intentionally deferred to this slice
-  (`simulation_pipeline.zig`).
+- (Pre-implementation state, now superseded by **Status** below) the pipeline
+  used to run full-active unconditionally: `SimulationPipeline.update` built
+  `SimulationScope.fullActive(...)` and dispatched every stage over the full
+  component slices.
 
 Status: implemented (2026-06-28). The backbone owner is
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`), a pipeline-owned
@@ -1550,8 +1547,10 @@ Sequencing rationale:
 Shared design contracts for the whole track:
 
 - Each new per-entity concept follows the existing component-store pattern in
-  `data_system.zig`: `Component` enum tag, component mask, `EntityTemplate`
-  field, `StructuralCommand` variant, `StructuralCapacityNeeds` capacity, an SoA
+  the `data_system/` subpackage (fronted by `data_system.zig`; `Component`,
+  `EntityTemplate`, and related types now live in `data_system/types.zig`):
+  `Component` enum tag, component mask, `EntityTemplate` field,
+  `StructuralCommand` variant, `StructuralCapacityNeeds` capacity, an SoA
   `*Store` (modeled on `AiAgentStore`), a `Const*Slice`, an `EntitySlot` index,
   and public set/get/slice + validation helpers.
 - Each new per-step computation is a parallel processor stage modeled on
