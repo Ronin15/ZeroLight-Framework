@@ -215,7 +215,20 @@ pub const NavUpdateStats = struct {
     // per-chunk edge window, forcing a loud full abstract-graph rebuild with more
     // slack (a genuine topology blow-up); else 0.
     edge_cap_fallback: usize = 0,
+
+    pub fn recordTo(self: NavUpdateStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.nav_dirty_chunks, metric(self.dirty_chunks));
+        perf.recordMetric(.nav_incremental_rebuilds, metric(self.incremental_rebuilds));
+        perf.recordMetric(.nav_full_relabel, metric(self.full_relabel));
+        perf.recordMetric(.nav_version_bumps, metric(self.version_bumps));
+        perf.recordMetric(.nav_chunks_patched, metric(self.chunks_patched));
+        perf.recordMetric(.nav_edge_cap_fallback, metric(self.edge_cap_fallback));
+    }
 };
+
+fn metric(value: usize) u64 {
+    return @intCast(value);
+}
 
 pub const GridCell = struct {
     x: i32,

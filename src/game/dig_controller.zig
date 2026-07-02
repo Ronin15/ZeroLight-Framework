@@ -239,9 +239,7 @@ pub const DigController = struct {
 fn setEntityLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId, level: u16, cell: CellCoord) !void {
     try data.setWorldLevel(entity, level);
     const body = data.movementBodyPtr(entity) orelse return;
-    const z = world.levelBaseZ(level);
-    body.position_z.* = z;
-    body.previous_z.* = z;
+    body.snapZ(world.levelBaseZ(level));
     if (level == 0) return;
     const snap_x = @as(f32, @floatFromInt(cell.x)) * world.tile_size;
     const snap_y = @as(f32, @floatFromInt(cell.y)) * world.tile_size;

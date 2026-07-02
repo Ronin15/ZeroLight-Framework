@@ -21,7 +21,6 @@ const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const DataSystem = @import("data_system.zig").DataSystem;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const EntityId = @import("data_system.zig").EntityId;
-const EntityTemplate = @import("data_system.zig").EntityTemplate;
 const Faction = @import("data_system.zig").Faction;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
@@ -30,18 +29,15 @@ const SteeringAgent = @import("data_system.zig").SteeringAgent;
 const simulation_scope = @import("simulation_scope.zig");
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
-const ParticleUpdateStats = @import("systems/particle.zig").ParticleUpdateStats;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
-const NavMemoryBudget = @import("systems/pathfinding/nav_memory.zig").NavMemoryBudget;
+const nav_memory = @import("systems/pathfinding/nav_memory.zig");
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
-const SimulationEventStats = @import("simulation.zig").SimulationEventStats;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
-const SimulationPipelineStats = @import("simulation_pipeline.zig").SimulationPipelineStats;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -110,23 +106,7 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCap
         .max_agent_budget = 4096,
         .worker_participant_count = worker_participant_count,
     };
-    const nav_cells: usize = procedural_world_width_tiles;
-    const budget = NavMemoryBudget{
-        .max_bytes = std.math.maxInt(usize),
-        .level_count = procedural_dense_layer_count,
-        .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
-        .max_group_fields = cap.max_group_fields,
-        .max_explored_nodes = cap.max_explored_nodes,
-        .max_stored_path_cells = cap.max_stored_path_cells,
-        .worker_participant_count = @max(@as(usize, 1), worker_participant_count),
-        .max_cached_results = cap.max_cached_results,
-        .max_solved_requests_per_step = cap.max_solved_requests_per_step,
-        .max_stitched_path_cells = cap.max_stitched_path_cells,
-        .chunk_tiles = cap.nav_chunk_tiles,
-        .link_count = 0,
-    };
-    const required = budget.requiredBytes(nav_cells, procedural_world_height_tiles);
-    cap.max_nav_memory_bytes = std.math.ceilPowerOfTwo(usize, required) catch required;
+    cap.max_nav_memory_bytes = nav_memory.autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles);
     return cap;
 }
 /// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
@@ -265,8 +245,7 @@ pub const GameDemoState = struct {
         try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
         // Player starts on the surface plane (level 0); sync render z to that plane.
         const player_body = data.movementBodyPtr(player.entity).?;
-        player_body.position_z.* = world.levelBaseZ(0);
-        player_body.previous_z.* = world.levelBaseZ(0);
+        player_body.snapZ(world.levelBaseZ(0));
         if (worldUsesCompactDemoSpawn(&world)) {
             const start_x: f32 = 40;
             const start_y: f32 = world.worldHeightPixels() * 0.5 - 16;
@@ -403,14 +382,11 @@ pub const GameDemoState = struct {
         self.simulation_frame.phase = .finished;
 
         if (comptime runtime_perf_log.enabled) {
-            recordRuntimePerfStats(
-                context.perf,
-                pipeline_stats,
-                particle_stats,
-                structural_stats,
-                self.simulation_frame.events.stats,
-                self.last_nav_update_stats,
-            );
+            pipeline_stats.recordTo(context.perf);
+            particle_stats.recordTo(context.perf);
+            structural_stats.recordTo(context.perf);
+            self.simulation_frame.events.stats.recordTo(context.perf);
+            self.last_nav_update_stats.recordTo(context.perf);
         }
     }
 
@@ -445,134 +421,6 @@ pub const GameDemoState = struct {
             .particles = &self.particles,
             .overscan_chunks = world_render_overscan_chunks,
         };
-    }
-
-    fn recordRuntimePerfStats(
-        perf: runtime_perf_log.Context,
-        pipeline_stats: SimulationPipelineStats,
-        particle_stats: ParticleUpdateStats,
-        structural_stats: StructuralCommitStats,
-        event_stats: SimulationEventStats,
-        nav_update_stats: NavUpdateStats,
-    ) void {
-        const scope_stats = pipeline_stats.scope.stats;
-        const spatial_index_stats = pipeline_stats.spatial_index;
-        const ai_stats = pipeline_stats.ai;
-        const steering_stats = pipeline_stats.steering;
-        const pathfinding_stats = pipeline_stats.pathfinding;
-        const movement_stats = pipeline_stats.movement;
-        const collision_stats = pipeline_stats.collision;
-        const collision_response_stats = pipeline_stats.collision_response;
-
-        perf.recordMetric(.scope_total_entities, metric(scope_stats.total_entities));
-        perf.recordMetric(.scope_dormant_entities, metric(scope_stats.dormant_entities));
-        perf.recordMetric(.scope_kinematic_entities, metric(scope_stats.kinematic_entities));
-        perf.recordMetric(.scope_locomotion_entities, metric(scope_stats.locomotion_entities));
-        perf.recordMetric(.scope_cognition_entities, metric(scope_stats.cognition_entities));
-        perf.recordMetric(.scope_movement_stage_entities, metric(scope_stats.movement_stage_entities));
-        perf.recordMetric(.scope_collision_stage_entities, metric(scope_stats.collision_stage_entities));
-        perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
-        perf.recordMetric(.scope_ai_stage_entities, metric(scope_stats.ai_stage_entities));
-        perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
-        perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
-        perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
-
-        perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
-
-        perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
-        perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
-        perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
-        perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.separation_candidate_checks));
-        perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.separation_neighbor_samples));
-        perf.recordBatch(.ai_separation, ai_stats.separation_batch);
-        perf.recordBatch(.ai_intent, ai_stats.intent_batch);
-
-        perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
-        perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
-        perf.recordMetric(.steering_movement_intents, metric(steering_stats.movement_intent_count));
-        perf.recordMetric(.steering_path_requests, metric(steering_stats.path_request_count));
-        perf.recordMetric(.steering_paths_available, metric(steering_stats.path_available_count));
-        perf.recordMetric(.steering_paths_pending, metric(steering_stats.path_pending_count));
-        perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.path_unavailable_count));
-        perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
-        perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
-        perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
-        perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.agent_neighbor_samples));
-        perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
-        perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
-        perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
-        perf.recordBatch(.steering, steering_stats.batch);
-
-        perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
-        perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
-        perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
-        perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
-        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
-        perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
-        perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
-        perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
-        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
-        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
-        perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
-        perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
-        perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
-        perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
-        perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
-        perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
-        perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
-        perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
-        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
-        perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
-        perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
-        perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
-        perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
-
-        perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
-        perf.recordBatch(.movement, movement_stats.batch);
-
-        perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
-        perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
-        perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
-        perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
-        if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
-        perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
-        perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
-
-        perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
-        perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
-        perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
-
-        perf.recordMetric(.particle_active_before, metric(particle_stats.active_before));
-        perf.recordMetric(.particle_active_after, metric(particle_stats.active_after));
-        perf.recordMetric(.particle_removed, metric(particle_stats.removed_count));
-        perf.recordBatch(.particles, particle_stats.batch);
-
-        perf.recordMetric(.structural_created, metric(structural_stats.created));
-        perf.recordMetric(.structural_destroyed, metric(structural_stats.destroyed));
-        perf.recordMetric(.structural_components_set, metric(structural_stats.components_set));
-        perf.recordMetric(.structural_stale_skipped, metric(structural_stats.stale_skipped));
-
-        perf.recordMetric(.simulation_events_total, metric(event_stats.total));
-        perf.recordMetric(.simulation_events_dropped, metric(event_stats.dropped));
-        perf.recordMetric(.simulation_events_entity_created, metric(event_stats.entity_created));
-        perf.recordMetric(.simulation_events_entity_destroyed, metric(event_stats.entity_destroyed));
-        perf.recordMetric(.simulation_events_component_changed, metric(event_stats.component_changed));
-        perf.recordMetric(.simulation_events_world_tile_changed, metric(event_stats.world_tile_changed));
-        perf.recordMetric(.simulation_events_world_obstacle_changed, metric(event_stats.world_obstacle_changed));
-        perf.recordMetric(.simulation_events_nav_region_invalidated, metric(event_stats.nav_region_invalidated));
-        perf.recordMetric(.simulation_events_structural_commit_stage, metric(event_stats.structural_commit_stage));
-        perf.recordMetric(.simulation_events_domain_reaction_stage, metric(event_stats.domain_reaction_stage));
-
-        perf.recordMetric(.nav_dirty_chunks, metric(nav_update_stats.dirty_chunks));
-        perf.recordMetric(.nav_incremental_rebuilds, metric(nav_update_stats.incremental_rebuilds));
-        perf.recordMetric(.nav_full_relabel, metric(nav_update_stats.full_relabel));
-        perf.recordMetric(.nav_version_bumps, metric(nav_update_stats.version_bumps));
-        perf.recordMetric(.nav_chunks_patched, metric(nav_update_stats.chunks_patched));
-        perf.recordMetric(.nav_edge_cap_fallback, metric(nav_update_stats.edge_cap_fallback));
-    }
-
-    fn metric(value: usize) u64 {
-        return @intCast(value);
     }
 
     pub fn onPause(self: *GameDemoState) void {
@@ -639,22 +487,9 @@ pub const GameDemoState = struct {
     }
 
     fn validateAtlasReferences(self: *const GameDemoState, runtime_assets: *const RuntimeAssets) !void {
-        try validateAtlasReferencesInData(&self.data, runtime_assets);
+        try render_prep.validateAtlasReferences(&self.data, runtime_assets);
     }
 };
-
-fn validateAtlasReferencesInData(data: *const DataSystem, runtime_assets: *const RuntimeAssets) !void {
-    const asset_refs = data.assetReferenceSliceConst();
-    for (asset_refs.sprite_ids, asset_refs.atlas_entry_ids) |sprite_id, atlas_entry_id| {
-        try validateAtlasReference(.{ .sprite = sprite_id, .atlas_entry_id = atlas_entry_id }, runtime_assets);
-    }
-}
-
-fn validateAtlasReference(asset_ref: AssetReference, runtime_assets: *const RuntimeAssets) !void {
-    if (!asset_ref.hasAtlasEntry()) return;
-    const meta = runtime_assets.spriteAtlasMeta(asset_ref.sprite) orelse return error.SpriteAtlasMetadataUnavailable;
-    if (meta.sourceRectForId(asset_ref.atlas_entry_id) == null) return error.InvalidSpriteAtlasEntry;
-}
 
 const SpawnCellCoord = struct { x: u16, y: u16 };
 
@@ -1259,20 +1094,6 @@ test "demo init rejects missing character atlas metadata" {
     try std.testing.expectError(
         error.SpriteAtlasMetadataUnavailable,
         GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height),
-    );
-}
-
-test "demo atlas validation rejects invalid character entry ids" {
-    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
-    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    const entity = try data.createEntity();
-    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 4096 });
-
-    try std.testing.expectError(
-        error.InvalidSpriteAtlasEntry,
-        validateAtlasReferencesInData(&data, &runtime_assets),
     );
 }
 

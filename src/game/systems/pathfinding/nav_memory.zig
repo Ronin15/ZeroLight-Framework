@@ -130,6 +130,32 @@ pub const NavMemoryBudget = struct {
     }
 };
 
+// group field per-cell: cost(u32) + flow(u8) + stamp(u32) + the Dial's
+// bucket-queue links bucket_next/bucket_prev(u32) + queued_stamp(u32).
+pub const default_group_field_bytes_per_cell: usize = @sizeOf(u32) + 1 + 4 * @sizeOf(u32);
+
+// Auto-sizes max_nav_memory_bytes to the next power of two above the required
+// bytes for the given capacity/world dimensions, so callers get a working
+// ceiling without hand-tuning it.
+pub fn autoSizedMaxNavMemoryBytes(capacity: types.PathfindingCapacity, level_count: usize, width: usize, height: usize) usize {
+    const budget = NavMemoryBudget{
+        .max_bytes = std.math.maxInt(usize),
+        .level_count = level_count,
+        .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
+        .max_group_fields = capacity.max_group_fields,
+        .max_explored_nodes = capacity.max_explored_nodes,
+        .max_stored_path_cells = capacity.max_stored_path_cells,
+        .worker_participant_count = @max(@as(usize, 1), capacity.worker_participant_count),
+        .max_cached_results = capacity.max_cached_results,
+        .max_solved_requests_per_step = capacity.max_solved_requests_per_step,
+        .max_stitched_path_cells = capacity.max_stitched_path_cells,
+        .chunk_tiles = capacity.nav_chunk_tiles,
+        .link_count = 0,
+    };
+    const required = budget.requiredBytes(width, height);
+    return std.math.ceilPowerOfTwo(usize, required) catch required;
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
@@ -158,7 +184,7 @@ fn testBudget(max_bytes: usize) NavMemoryBudget {
     return .{
         .max_bytes = max_bytes,
         .level_count = 1,
-        .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
+        .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
         .max_group_fields = 8,
         .max_explored_nodes = 4096,
         .max_stored_path_cells = 256,

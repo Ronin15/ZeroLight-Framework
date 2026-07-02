@@ -9,6 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../core/math.zig");
+const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const ParallelRange = @import("../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../app/thread_system.zig").WorkerId;
@@ -131,7 +132,24 @@ pub const SimulationEventStats = struct {
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
+
+    pub fn recordTo(self: SimulationEventStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.simulation_events_total, metric(self.total));
+        perf.recordMetric(.simulation_events_dropped, metric(self.dropped));
+        perf.recordMetric(.simulation_events_entity_created, metric(self.entity_created));
+        perf.recordMetric(.simulation_events_entity_destroyed, metric(self.entity_destroyed));
+        perf.recordMetric(.simulation_events_component_changed, metric(self.component_changed));
+        perf.recordMetric(.simulation_events_world_tile_changed, metric(self.world_tile_changed));
+        perf.recordMetric(.simulation_events_world_obstacle_changed, metric(self.world_obstacle_changed));
+        perf.recordMetric(.simulation_events_nav_region_invalidated, metric(self.nav_region_invalidated));
+        perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
+        perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
+    }
 };
+
+fn metric(value: usize) u64 {
+    return @intCast(value);
+}
 
 pub const SimulationEvents = struct {
     stream: RangeOutputStream(SimulationEvent),

@@ -95,7 +95,100 @@ pub const SimulationPipelineStats = struct {
     movement: MovementStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
+
+    pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
+        const scope_stats = self.scope.stats;
+        const spatial_index_stats = self.spatial_index;
+        const ai_stats = self.ai;
+        const steering_stats = self.steering;
+        const pathfinding_stats = self.pathfinding;
+        const movement_stats = self.movement;
+        const collision_stats = self.collision;
+        const collision_response_stats = self.collision_response;
+
+        perf.recordMetric(.scope_total_entities, metric(scope_stats.total_entities));
+        perf.recordMetric(.scope_dormant_entities, metric(scope_stats.dormant_entities));
+        perf.recordMetric(.scope_kinematic_entities, metric(scope_stats.kinematic_entities));
+        perf.recordMetric(.scope_locomotion_entities, metric(scope_stats.locomotion_entities));
+        perf.recordMetric(.scope_cognition_entities, metric(scope_stats.cognition_entities));
+        perf.recordMetric(.scope_movement_stage_entities, metric(scope_stats.movement_stage_entities));
+        perf.recordMetric(.scope_collision_stage_entities, metric(scope_stats.collision_stage_entities));
+        perf.recordMetric(.scope_collision_response_stage_entities, metric(scope_stats.collision_response_stage_entities));
+        perf.recordMetric(.scope_ai_stage_entities, metric(scope_stats.ai_stage_entities));
+        perf.recordMetric(.scope_steering_stage_entities, metric(scope_stats.steering_stage_entities));
+        perf.recordMetric(.scope_stagger_skips, metric(scope_stats.stagger_skips));
+        perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
+
+        perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
+
+        perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
+        perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
+        perf.recordMetric(.ai_navigation_intents, metric(ai_stats.navigation_intent_count));
+        perf.recordMetric(.ai_separation_candidate_checks, metric(ai_stats.separation_candidate_checks));
+        perf.recordMetric(.ai_separation_neighbor_samples, metric(ai_stats.separation_neighbor_samples));
+        perf.recordBatch(.ai_separation, ai_stats.separation_batch);
+        perf.recordBatch(.ai_intent, ai_stats.intent_batch);
+
+        perf.recordMetric(.steering_navigation_intents, metric(steering_stats.navigation_intent_count));
+        perf.recordMetric(.steering_selected_intents, metric(steering_stats.selected_intent_count));
+        perf.recordMetric(.steering_movement_intents, metric(steering_stats.movement_intent_count));
+        perf.recordMetric(.steering_path_requests, metric(steering_stats.path_request_count));
+        perf.recordMetric(.steering_paths_available, metric(steering_stats.path_available_count));
+        perf.recordMetric(.steering_paths_pending, metric(steering_stats.path_pending_count));
+        perf.recordMetric(.steering_paths_unavailable, metric(steering_stats.path_unavailable_count));
+        perf.recordMetric(.steering_replan_cooldowns, metric(steering_stats.replan_cooldown_count));
+        perf.recordMetric(.steering_unavailable_backoffs, metric(steering_stats.unavailable_backoff_count));
+        perf.recordMetric(.steering_stuck_replans, metric(steering_stats.stuck_replan_count));
+        perf.recordMetric(.steering_agent_neighbor_samples, metric(steering_stats.agent_neighbor_samples));
+        perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
+        perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
+        perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
+        perf.recordBatch(.steering, steering_stats.batch);
+
+        perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
+        perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
+        perf.recordMetric(.path_pending_requests, metric(pathfinding_stats.pending_requests));
+        perf.recordMetric(.path_solved_requests, metric(pathfinding_stats.solved_requests));
+        perf.recordMetric(.path_fallback_requests, metric(pathfinding_stats.fallback_requests));
+        perf.recordMetric(.path_available_results, metric(pathfinding_stats.available_results));
+        perf.recordMetric(.path_unavailable_results, metric(pathfinding_stats.unavailable_results));
+        perf.recordMetric(.path_dropped_requests, metric(pathfinding_stats.dropped_requests));
+        perf.recordMetric(.path_deferred_requests, metric(pathfinding_stats.deferred_requests));
+        perf.recordMetric(.path_fallback_deferred_requests, metric(pathfinding_stats.fallback_deferred_requests));
+        perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
+        perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
+        perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
+        perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
+        perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
+        perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
+        perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
+        perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
+        perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
+        perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
+        perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
+        perf.recordTiming(.pathfinding_solve, pathfinding_stats.solve_ns);
+        perf.recordTiming(.pathfinding_publish, pathfinding_stats.publish_ns);
+
+        perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
+        perf.recordBatch(.movement, movement_stats.batch);
+
+        perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
+        perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
+        perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
+        perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
+        if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
+        perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
+        perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
+
+        perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
+        perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
+        perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+    }
 };
+
+fn metric(value: usize) u64 {
+    return @intCast(value);
+}
 
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global

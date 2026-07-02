@@ -28,6 +28,7 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
+const default_group_field_bytes_per_cell = @import("nav_memory.zig").default_group_field_bytes_per_cell;
 const GroupField = @import("group_field.zig").GroupField;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const ResultCache = @import("caches.zig").ResultCache;
@@ -394,9 +395,7 @@ pub const PathfindingSystem = struct {
         const budget = NavMemoryBudget{
             .max_bytes = self.capacity.max_nav_memory_bytes,
             .level_count = level_count,
-            // group field per-cell: cost(u32) + flow(u8) + stamp(u32) + the Dial's
-            // bucket-queue links bucket_next/bucket_prev(u32) + queued_stamp(u32).
-            .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
+            .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
             .max_group_fields = self.capacity.max_group_fields,
             .max_explored_nodes = self.capacity.max_explored_nodes,
             .max_stored_path_cells = self.capacity.max_stored_path_cells,

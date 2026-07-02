@@ -12,6 +12,7 @@ const config = @import("../../config.zig");
 const math = @import("../../core/math.zig");
 const faction = @import("../faction.zig");
 const render_depth = @import("../render_depth.zig");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const WorldDepth = render_depth.WorldDepth;
@@ -112,6 +113,13 @@ pub const MovementBodyPtr = struct {
     velocity_x: *f32,
     velocity_y: *f32,
     speed: *f32,
+
+    // z is not interpolated: previous_z must always equal position_z when
+    // snapping a body onto a plane (level-change, spawn, fall, ramp).
+    pub fn snapZ(self: MovementBodyPtr, z: i32) void {
+        self.position_z.* = z;
+        self.previous_z.* = z;
+    }
 };
 
 /// Mutable dense movement columns. Entity order matches every movement column
@@ -443,7 +451,18 @@ pub const StructuralCommitStats = struct {
     destroyed: usize = 0,
     components_set: usize = 0,
     stale_skipped: usize = 0,
+
+    pub fn recordTo(self: StructuralCommitStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.structural_created, metric(self.created));
+        perf.recordMetric(.structural_destroyed, metric(self.destroyed));
+        perf.recordMetric(.structural_components_set, metric(self.components_set));
+        perf.recordMetric(.structural_stale_skipped, metric(self.stale_skipped));
+    }
 };
+
+fn metric(value: usize) u64 {
+    return @intCast(value);
+}
 
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,

@@ -187,6 +187,21 @@ fn rectFromManifest(source: manifest.SourceRect) Rect {
     };
 }
 
+// Init-time hard-error sibling of `sourceRectForAsset`'s render-time soft
+// fallback: every atlas-backed asset reference must resolve, or init fails loud.
+pub fn validateAtlasReferences(data: *const DataSystem, runtime_assets: *const RuntimeAssets) !void {
+    const asset_refs = data.assetReferenceSliceConst();
+    for (asset_refs.sprite_ids, asset_refs.atlas_entry_ids) |sprite_id, atlas_entry_id| {
+        try validateAtlasReference(.{ .sprite = sprite_id, .atlas_entry_id = atlas_entry_id }, runtime_assets);
+    }
+}
+
+fn validateAtlasReference(asset_ref: AssetReference, runtime_assets: *const RuntimeAssets) !void {
+    if (!asset_ref.hasAtlasEntry()) return;
+    const meta = runtime_assets.spriteAtlasMeta(asset_ref.sprite) orelse return error.SpriteAtlasMetadataUnavailable;
+    if (meta.sourceRectForId(asset_ref.atlas_entry_id) == null) return error.InvalidSpriteAtlasEntry;
+}
+
 pub fn worldOrder(base_z: i32, depth: WorldDepth) RenderOrder {
     return RenderOrder.world(render_depth.worldZWithOffset(base_z, depth));
 }
@@ -810,6 +825,21 @@ test "atlas-backed asset reference uses metadata source rect when available" {
     try std.testing.expectEqual(expected.y, source.y);
     try std.testing.expectEqual(expected.w, source.w);
     try std.testing.expectEqual(expected.h, source.h);
+}
+
+test "atlas reference validation rejects invalid character entry ids" {
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    try setSpriteAtlasMetadataForTest(&runtime_assets, .grim_characters);
+    defer deinitAtlasMetadataForTest(&runtime_assets, .grim_characters);
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const entity = try data.createEntity();
+    try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 4096 });
+
+    try std.testing.expectError(
+        error.InvalidSpriteAtlasEntry,
+        validateAtlasReferences(&data, &runtime_assets),
+    );
 }
 
 test "world render order combines entity z with depth band" {
