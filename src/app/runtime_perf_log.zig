@@ -141,6 +141,7 @@ pub const Timing = enum {
     // join), so comparing it against the matching batch_* avg_ms isolates the
     // serial/dispatch overhead that the batch counters never see. The
     // gameplay_* timers cover state-owned glue outside the pipeline.
+    pipeline_spatial_index,
     pipeline_ai,
     pipeline_steering,
     pipeline_pathfinding,
@@ -171,6 +172,7 @@ pub const Timing = enum {
 };
 
 pub const BatchStage = enum {
+    spatial_index_build,
     ai_separation,
     ai_intent,
     steering,
@@ -366,6 +368,7 @@ const EnabledRuntimePerfLog = struct {
                 millis(loading_build_timing.max_ns),
             },
         );
+        const pipeline_spatial_index_timing = self.timingValue(.pipeline_spatial_index);
         const pipeline_ai_timing = self.timingValue(.pipeline_ai);
         const pipeline_steering_timing = self.timingValue(.pipeline_steering);
         const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
@@ -375,9 +378,11 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         log.debug(
-            "perf {d:.1}s pipeline ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
             .{
                 elapsed_s,
+                millis(pipeline_spatial_index_timing.averageNs()),
+                millis(pipeline_spatial_index_timing.max_ns),
                 millis(pipeline_ai_timing.averageNs()),
                 millis(pipeline_ai_timing.max_ns),
                 millis(pipeline_steering_timing.averageNs()),

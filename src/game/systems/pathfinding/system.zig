@@ -28,6 +28,7 @@ const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
 const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
+const default_group_field_bytes_per_cell = @import("nav_memory.zig").default_group_field_bytes_per_cell;
 const GroupField = @import("group_field.zig").GroupField;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const ResultCache = @import("caches.zig").ResultCache;
@@ -373,7 +374,7 @@ pub const PathfindingSystem = struct {
     }
 
     pub fn rebuildStaticNavGrid(self: *PathfindingSystem, data: *const DataSystem, bounds_width: f32, bounds_height: f32, cell_size: f32) !void {
-        try self.rebuildStaticNavGridWithWorld(data, null, bounds_width, bounds_height, cell_size);
+        try self.rebuildStaticNavGridWithWorld(data, null, bounds_width, bounds_height, cell_size, null);
     }
 
     pub fn rebuildStaticNavGridWithWorld(
@@ -383,6 +384,7 @@ pub const PathfindingSystem = struct {
         bounds_width: f32,
         bounds_height: f32,
         cell_size: f32,
+        thread_system: ?*ThreadSystem,
     ) !void {
         if (self.scratch_slots.items.len == 0) {
             try self.reserve(self.capacity);
@@ -392,9 +394,7 @@ pub const PathfindingSystem = struct {
         const budget = NavMemoryBudget{
             .max_bytes = self.capacity.max_nav_memory_bytes,
             .level_count = level_count,
-            // group field per-cell: cost(u32) + flow(u8) + stamp(u32) + the Dial's
-            // bucket-queue links bucket_next/bucket_prev(u32) + queued_stamp(u32).
-            .group_field_bytes_per_cell = @sizeOf(u32) + 1 + 4 * @sizeOf(u32),
+            .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
             .max_group_fields = self.capacity.max_group_fields,
             .max_explored_nodes = self.capacity.max_explored_nodes,
             .max_stored_path_cells = self.capacity.max_stored_path_cells,
@@ -405,7 +405,7 @@ pub const PathfindingSystem = struct {
             .chunk_tiles = @max(@as(usize, 1), self.capacity.nav_chunk_tiles),
             .link_count = link_count,
         };
-        try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget);
+        try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget, thread_system);
         // The init per-level builds (inside rebuild) grow each level's portal/edge
         // buffers to their real size; clearRetainingCapacity keeps that high-water mark.
         // A later incremental applyNavUpdates within the high-water mark allocates nothing; a
@@ -1907,7 +1907,7 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     // Agent on level 0 wants a goal on level 1: must route across the link.
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -1930,6 +1930,10 @@ test "pathfinding cross-level link steers an off-level agent toward the start-le
     // i.e. to the right/down of the start cell (0,0).
     try std.testing.expect(view.next_waypoint.x > 16);
     try std.testing.expect(view.next_waypoint.y > 16);
+
+    const link_world = cellCenterWorld(.{ .x = 10, .y = 10 });
+    const at_link = system.statusForWorld(0, link_world, 1, .{ .x = 304, .y = 304 }, .default, null);
+    try std.testing.expectEqual(PathStatus.available, at_link.status);
 }
 
 test "pathfinding cross-level goal with no link is unavailable, not pending forever" {
@@ -1948,7 +1952,7 @@ test "pathfinding cross-level goal with no link is unavailable, not pending fore
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
@@ -1993,7 +1997,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &blocked_world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &blocked_world, 384, 384, 32, null);
     const blocked_version = system.graph.version;
 
     var blocked_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -2023,7 +2027,7 @@ test "pathfinding blocked link endpoint excludes the link until unblocked and re
         .traversal_cost = 5,
         .bidirectional = true,
     });
-    try system.rebuildStaticNavGridWithWorld(&data, &open_world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &open_world, 384, 384, 32, null);
     try std.testing.expect(system.graph.version != blocked_version);
 
     var open_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -2058,7 +2062,7 @@ test "pathfinding per-level obstacle independence: level 0 obstacle is absent on
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     // Cell (5,5) is blocked on level 0 but open on level 1.
     try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 5, .y = 5 }));
@@ -2119,7 +2123,7 @@ test "pathfinding multi-hop same-level corridor travels obstacle-free past a con
     var capacity = abstractCapacity();
     capacity.max_cached_results = 8;
     try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
     const link_near = GridCell{ .x = 7, .y = 8 };
     const link_far = GridCell{ .x = 9, .y = 8 };
@@ -2189,7 +2193,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     var one_system = PathfindingSystem.init(std.testing.allocator);
     defer one_system.deinit();
     try one_system.reserve(abstractCapacity());
-    try one_system.rebuildStaticNavGridWithWorld(&one_data, &one_world, 512, 512, 32);
+    try one_system.rebuildStaticNavGridWithWorld(&one_data, &one_world, 512, 512, 32, null);
     const one_level_start_portals = one_system.graph.levelLivePortalCount(0);
 
     var four_data = DataSystem.init(std.testing.allocator);
@@ -2205,7 +2209,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
     var four_system = PathfindingSystem.init(std.testing.allocator);
     defer four_system.deinit();
     try four_system.reserve(abstractCapacity());
-    try four_system.rebuildStaticNavGridWithWorld(&four_data, &four_world, 512, 512, 32);
+    try four_system.rebuildStaticNavGridWithWorld(&four_data, &four_world, 512, 512, 32, null);
     const four_level_start_portals = four_system.graph.levelLivePortalCount(0);
 
     try std.testing.expect(one_level_start_portals > 0);
@@ -2225,7 +2229,7 @@ test "pathfinding abstract seeding scans only the start level and stays within b
         var system = PathfindingSystem.init(std.testing.allocator);
         defer system.deinit();
         try system.reserve(abstractCapacity());
-        try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
 
         var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
         defer stream.deinit();
@@ -2263,7 +2267,7 @@ test "pathfinding cross-level group member falls back to an individual corridor"
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     const on_level = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
     const off_level = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
@@ -2344,7 +2348,7 @@ test "pathfinding directed link traverses one way only" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     // A -> B (0 -> 1) succeeds.
     var forward = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -2406,7 +2410,7 @@ test "pathfinding cross-level corridor stays obstacle-free on the destination le
     var capacity = abstractCapacity();
     capacity.max_cached_results = 8;
     try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
     const link0 = GridCell{ .x = 2, .y = 2 };
     const link1 = GridCell{ .x = 2, .y = 2 };
@@ -2486,7 +2490,7 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     // can reach the goal-level portal, even though a corridor exists.
     capacity.max_abstract_nodes = 1;
     try system.reserve(capacity);
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
     defer stream.deinit();
@@ -2524,7 +2528,7 @@ test "pathfinding chunk-local portal seeding scans only the start chunk's local 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     const grid = system.graph.grid(0).?;
     const left_cell = grid.indexForCell(.{ .x = 1, .y = 5 }).?;
@@ -2595,7 +2599,7 @@ test "pathfinding warmed cross-level abstract solve does not allocate" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -2676,7 +2680,7 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     const start = tileCenter(1, 5);
@@ -2751,7 +2755,7 @@ test "pathfinding incremental update disconnects a goal when the last gap is clo
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     const start = tileCenter(1, 5);
@@ -2784,7 +2788,7 @@ test "pathfinding incremental update retains a still-valid cached path when an o
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     const start = tileCenter(1, 5);
@@ -2822,7 +2826,7 @@ test "pathfinding incremental update blocking an off-path cell keeps the cached 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     const start = tileCenter(1, 5);
@@ -2865,7 +2869,7 @@ test "pathfinding incremental update leaves an unaffected second level untouched
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
 
     // Snapshot level 1's blocked count and component label of its obstacle cell.
     const level1_blocked_before = system.graph.grid(1).?.blocked_count;
@@ -2899,7 +2903,7 @@ test "pathfinding incremental update with no real change does no work" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const version_before = system.graph.version;
 
     // An empty edit batch is a no-op: no version bump, no counters.
@@ -2927,7 +2931,7 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
 
     // Mark far more dirty cells than the steady-path reserve (max_frame_requests = 8): a 24-cell
     // near block, then a 3-cell far block in the opposite-corner chunk LAST. A drop-on-cap would
@@ -2986,7 +2990,7 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const high_water = system.graph.totalPortals();
     try std.testing.expect(high_water > 0);
 
@@ -3009,6 +3013,80 @@ test "pathfinding incremental update is allocation-free at steady state (within 
     const open_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = opened.level, .x = opened.x, .y = opened.y }});
     try std.testing.expectEqual(@as(usize, 1), open_stats.incremental_rebuilds);
     try std.testing.expect(system.graph.totalPortals() <= high_water);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
+test "pathfinding threaded incremental nav update is allocation-free at steady state" {
+    // The serial-path allocation-free tests above (and applyNavUpdates itself, which always
+    // passes thread_system=null) only prove the INLINE remask/patch scratch (slot 0) is reused
+    // without allocating. Only applyBufferedNavUpdates/reactToPostCommitNavEvents with a real
+    // ThreadSystem drive patchChunkJob/remaskChunkJob, which index a PER-WORKER
+    // ChunkPatchScratch/ChunkRemaskScratch slot (nav_graph.zig's patch_scratch/remask_scratch,
+    // sized at rebuild). That fan-out path had zero allocation coverage. Mirrors "incremental
+    // nav update forced-parallel remask and patch match a serial full rebuild" in nav_graph.zig
+    // (five edits in five distinct chunks, adaptive=false/items_per_range=1 to force both stages
+    // off the inline path) but under a failing allocator on both system.allocator and
+    // system.graph.allocator, matching the steady-state test above.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+    // Force the parallel schedule rather than letting the tuner keep the small batch inline.
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    // The failing allocator must cover BOTH the system AND the nav graph (which holds its own
+    // captured allocator copy): every per-worker patch/remask scratch slot, plus every
+    // graph-rebuild buffer, flows through graph.allocator, so swapping only system.allocator
+    // would let a graph allocation slip through undetected.
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
+    // set and the patch dirty set exceed one chunk and actually fan out across workers.
+    const cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    for (cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
+
+    // Both stages must have actually threaded, not fallen back to the inline slot-0 path —
+    // otherwise this would silently retest the already-covered serial path.
+    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+
+    for (cells) |cell| {
+        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = cell.x, .y = cell.y }));
+    }
 
     system.graph.allocator = original;
     system.allocator = original;
@@ -3040,7 +3118,7 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     try std.testing.expectEqual(@as(usize, 0), system.graph.totalPortals());
 
     // Open a 6x6 block spanning chunk borders, creating new portals past the (zero)
@@ -3102,7 +3180,7 @@ test "pathfinding incremental update flips cross-level link liveness when the en
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(abstractCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
 
     // Blocked endpoint: the link is not live, so the cross-level goal is unavailable.

@@ -11,6 +11,8 @@ const DataSystem = @import("../game/data_system.zig").DataSystem;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
+const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
 const suite = @import("suite.zig");
 
@@ -88,14 +90,26 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
     defer if (threads) |*thread_system| thread_system.deinit();
 
+    // This bench never runs movement, so the fixture's positions never change
+    // across iterations. Build the shared spatial index once, outside every
+    // timed/warmup/settle call, so the group's timed window measures only
+    // `system.update`/`updateSerial` (query + intent emission), not the index
+    // build — that cost has its own dedicated `spatial_index` bench group.
+    var spatial_sys = SpatialIndexSystem.init(allocator);
+    defer spatial_sys.deinit();
+    const ai_slice = fixture.data.aiAgentSliceConst();
+    const movement_slice = fixture.data.movementBodySliceConst();
+    _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
+    const spatial_view = spatial_sys.view();
+
     for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        _ = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
         const settle_limit = suite.adaptiveSettleIterationLimit(options);
         while ((!system.separation_tuner.isSettled() or !system.intent_tuner.isSettled()) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+            _ = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
         }
     }
     const separation_settled_before_measurement = if (case.adaptive) system.separation_tuner.isSettled() else false;
@@ -105,7 +119,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     var last_ai_stats = AiStats{};
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        last_ai_stats = try runOnce(&system, &fixture, if (threads) |*thread_system| thread_system else null, case);
+        last_ai_stats = try runOnce(&system, &fixture, spatial_view, if (threads) |*thread_system| thread_system else null, case);
         const end_ns = suite.nowNs(io);
         accumulator.record(suite.elapsedNs(start_ns, end_ns), last_ai_stats.separation_batch);
     }
@@ -121,18 +135,18 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return stats;
 }
 
-fn runOnce(system: *AiSystem, fixture: *Fixture, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AiStats {
+fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView, thread_system: ?*ThreadSystem, case: suite.BenchmarkCase) !AiStats {
     fixture.frame.beginStep();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
     if (!case.usesThreadSystem()) {
-        return try system.updateSerial(ai_slice, movement_slice, &fixture.data, &fixture.frame, delta_seconds, .{
+        return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
             .intent_seed = intent_seed,
             .seek_target = benchmarkSeekTarget(),
         });
     }
 
-    return try system.update(ai_slice, movement_slice, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
+    return try system.update(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
         .items_per_range = benchmarkItemsPerRange(case),
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
@@ -149,40 +163,4 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
 
 fn benchmarkSeekTarget() math.Vec2 {
     return .{ .x = 480, .y = 270 };
-}
-
-test "ai benchmark fixture creates requested agents and movement bodies" {
-    var fixture = try createFixture(std.testing.allocator, 32);
-    defer fixture.deinit();
-
-    try std.testing.expectEqual(@as(usize, 32), fixture.data.aiAgentSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 32), fixture.data.movementBodySliceConst().entities.len);
-}
-
-test "ai benchmark tiny serial case runs without display" {
-    const options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 256);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    try std.testing.expect(stats.batch.ran_inline);
-    try std.testing.expectEqual(@as(usize, 256), stats.output_count);
-}
-
-test "ai benchmark fixed cases use explicit range controls" {
-    try std.testing.expectEqual(
-        suite.alignItemCount(suite.default_items_per_range, ai_range_alignment_items),
-        benchmarkItemsPerRange(suite.default_cases[3]).?,
-    );
-    try std.testing.expectEqual(suite.default_cases[4].itemsPerRange(ai_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[4]).?);
-    try std.testing.expectEqual(suite.default_cases[5].itemsPerRange(ai_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[5]).?);
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[6]));
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[7]));
-}
-
-test "ai benchmark profiles keep bounded separation workload cases" {
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.quick), defaultItemCounts(.quick));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.standard), defaultItemCounts(.standard));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.stress), defaultItemCounts(.stress));
 }

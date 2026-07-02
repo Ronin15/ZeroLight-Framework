@@ -36,10 +36,7 @@ pub fn readJsonAsset(
     max_bytes: usize,
     comptime T: type,
 ) !struct { bytes: []u8, parsed: std.json.Parsed(T) } {
-    const read = try asset_store.readAlloc(metadata_path, max_bytes);
-    defer asset_store.allocator.free(read);
-
-    const bytes = try allocator.dupe(u8, read);
+    const bytes = try asset_store.readAlloc(metadata_path, max_bytes, allocator);
     errdefer allocator.free(bytes);
 
     const parsed = try std.json.parseFromSlice(T, allocator, bytes, .{
@@ -216,7 +213,7 @@ pub fn deinitAnimationTable(table: *std.StringHashMap(TileAnimation), allocator:
     table.deinit();
 }
 
-test "readJsonAsset copies into caller allocator" {
+test "readJsonAsset reads and parses into caller allocator" {
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     const JsonRoot = struct {
         version: u32,

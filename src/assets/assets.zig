@@ -18,11 +18,16 @@ pub const AssetStore = struct {
         };
     }
 
-    pub fn readAlloc(self: AssetStore, relative_path: []const u8, max_bytes: usize) ![]u8 {
+    pub fn readAlloc(
+        self: AssetStore,
+        relative_path: []const u8,
+        max_bytes: usize,
+        target_allocator: std.mem.Allocator,
+    ) ![]u8 {
         const path = try self.resolveReadablePath(relative_path);
         defer self.allocator.free(path);
 
-        return std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(max_bytes));
+        return std.Io.Dir.cwd().readFileAlloc(self.io, path, target_allocator, .limited(max_bytes));
     }
 
     pub fn resolvePath(self: AssetStore, relative_path: []const u8) ![]u8 {
@@ -130,7 +135,7 @@ test "readAlloc enforces maximum byte limit" {
     const allocator = std.testing.allocator;
     const assets = AssetStore.init(allocator, std.testing.io, "assets");
 
-    try std.testing.expectError(error.StreamTooLong, assets.readAlloc("shaders/sprite.vert.glsl", 1));
+    try std.testing.expectError(error.StreamTooLong, assets.readAlloc("shaders/sprite.vert.glsl", 1, allocator));
 }
 
 test "readable asset falls back to exe-relative path when configured root is absent" {

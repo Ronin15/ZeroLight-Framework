@@ -39,10 +39,25 @@ fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, steering_range_alignment_items);
 }
 
+fn entityWorldLevel(data: *const DataSystem, entity: EntityId) u16 {
+    return data.worldLevelConst(entity) orelse 0;
+}
+
 const invalid_index = std.math.maxInt(usize);
 const min_spatial_cell_size: f32 = 1.0;
 const max_agent_candidate_checks: u16 = 64;
 const max_obstacle_candidate_checks: u16 = 64;
+
+/// Fraction of the way from the previous emitted direction toward the new
+/// target direction each fixed step. `base_dir` can flip discretely — the
+/// path/direct-fallback selection toggles while a goal-cell requantization is
+/// in flight, a fresh corridor solve replaces a stale waypoint, or a wander
+/// epoch changes — and without smoothing each flip snaps the heading in one
+/// step, which reads as a wiggle while chasing a moving goal. Blending softens
+/// any such flip into a turn over several steps (~10 steps to mostly converge
+/// at 60Hz) instead of an instant snap, while staying responsive enough not to
+/// lag behind a genuinely moving goal.
+const steering_turn_smoothing: f32 = 0.15;
 
 pub const SteeringConfig = struct {
     max_selected_intents: ?usize = null,
@@ -215,7 +230,7 @@ pub const SteeringSystem = struct {
         config: SteeringConfig,
     ) !SteeringStats {
         var stats = try self.prepareUpdate(data, frame, pathfinding, config);
-        try self.writePathRequests(frame, stats.path_request_count);
+        try self.writePathRequests(data, frame, stats.path_request_count);
         stats.batch = try self.writeMovementIntentsThreaded(frame, thread_system, config);
         self.finishStats(&stats);
         return stats;
@@ -229,7 +244,7 @@ pub const SteeringSystem = struct {
         config: SteeringConfig,
     ) !SteeringStats {
         var stats = try self.prepareUpdate(data, frame, pathfinding, config);
-        try self.writePathRequests(frame, stats.path_request_count);
+        try self.writePathRequests(data, frame, stats.path_request_count);
         stats.batch = try self.writeMovementIntentsSerial(frame);
         self.finishStats(&stats);
         return stats;
@@ -480,6 +495,9 @@ pub const SteeringSystem = struct {
         // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
         try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(count));
+        // At most one new runtime row is created per selected intent, so reserve
+        // the worst case once, upfront, instead of growing inside the loop below.
+        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + count);
         try resetIndexScratch(&self.runtime_index_by_steering, self.allocator, steering.entities.len);
         for (self.runtime_rows.items, 0..) |row, runtime_index| {
             const steering_index = data.steeringAgentDenseIndex(row.entity) orelse continue;
@@ -494,10 +512,11 @@ pub const SteeringSystem = struct {
                 .x = movement.previous_x[selected.movement_index],
                 .y = movement.previous_y[selected.movement_index],
             };
-            const runtime = try self.runtimeRowForSelected(selected);
-            const path_dir = self.directionFromPathStatus(pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
+            const runtime = self.runtimeRowForSelected(selected);
+            const path_dir = self.directionFromPathStatus(data, pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
             const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
-            const base_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
+            const target_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
+            const base_dir = smoothBaseDirection(runtime, target_dir);
 
             self.updateProgress(selected, runtime, path_dir.progress_distance, steering_agent, path_dir.status_allows_replan, stats, &request_count);
             appendMalRow(SelectedWorkRow, &self.selected_work_rows, &work_row_slice, .{
@@ -516,13 +535,7 @@ pub const SteeringSystem = struct {
         stats.path_request_count = request_count;
     }
 
-    fn writePathRequests(self: *SteeringSystem, frame: *SimulationFrame, request_count: usize) !void {
-        // Agents have no per-entity level column yet, so the start level is the
-        // single-level default. This is load-bearing: NPCs are confined to the
-        // fully-walkable surface (level 0), which is why they can never enter the
-        // solid-dirt underground and need no tile-collision gating. A per-entity
-        // lookup replaces this only when autonomous NPC descent lands.
-        const agent_start_level: u16 = 0;
+    fn writePathRequests(self: *SteeringSystem, data: *const DataSystem, frame: *SimulationFrame, request_count: usize) !void {
         const request_range_base = try frame.path_requests.appendRangeCounts(1);
         frame.path_requests.addCount(request_range_base, request_count);
         try frame.path_requests.prefixAppendedRanges(request_range_base);
@@ -532,14 +545,12 @@ pub const SteeringSystem = struct {
         const work = self.selectedWorkSliceConst();
         for (self.selected.items, 0..) |selected, index| {
             if (!selected.emit_path_request) continue;
+            const start_level = entityWorldLevel(data, selected.entity);
             request_writer.write(PathRequest{
                 .entity = selected.entity,
                 .agent_class = selected.intent.agent_class,
                 .kind = selected.intent.kind,
-                // No per-entity level store exists yet, so the agent's start level
-                // is the single-level default (0). When real multi-level placement
-                // lands, source this from a per-entity level column.
-                .start_level = agent_start_level,
+                .start_level = start_level,
                 .goal_level = selected.intent.goal_level,
                 .start = .{ .x = work.start_x[index], .y = work.start_y[index] },
                 .goal = selected.intent.goal,
@@ -592,8 +603,32 @@ pub const SteeringSystem = struct {
         return serialBatch(count);
     }
 
+    /// Blends `runtime.prev_dir` toward `target` by `steering_turn_smoothing`
+    /// and re-normalizes, so a discrete flip in the chosen target direction
+    /// (path/direct toggle, waypoint replan, wander epoch change) turns into a
+    /// bounded per-step turn instead of an instant snap. The first direction
+    /// seen for a runtime row is used as-is (no artificial startup lag).
+    fn smoothBaseDirection(runtime: *RuntimeRow, target: math.Vec2) math.Vec2 {
+        if (!runtime.has_prev_dir) {
+            runtime.prev_dir_x = target.x;
+            runtime.prev_dir_y = target.y;
+            runtime.has_prev_dir = true;
+            return target;
+        }
+        const blended = math.lerpVec2(
+            .{ .x = runtime.prev_dir_x, .y = runtime.prev_dir_y },
+            target,
+            steering_turn_smoothing,
+        );
+        const smoothed = math.normalizeOrDefaultFinite(blended.x, blended.y, 0.0001, target);
+        runtime.prev_dir_x = smoothed.x;
+        runtime.prev_dir_y = smoothed.y;
+        return smoothed;
+    }
+
     fn directionFromPathStatus(
         self: *SteeringSystem,
+        data: *const DataSystem,
         pathfinding: *const PathfindingSystem,
         selected: *SelectedIntent,
         start: math.Vec2,
@@ -605,9 +640,9 @@ pub const SteeringSystem = struct {
         _ = self;
         // Missing paths request work, pending paths hold direction, unavailable
         // paths enter backoff, and available paths steer toward the next waypoint.
-        // Single-level default start level (0).
+        const start_level = entityWorldLevel(data, selected.entity);
         const goal_distance = distance(start, selected.intent.goal);
-        const view = pathfinding.statusForWorld(0, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
+        const view = pathfinding.statusForWorld(start_level, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
         switch (view.status) {
             .available => {
                 stats.path_available_count += 1;
@@ -687,10 +722,11 @@ pub const SteeringSystem = struct {
         }
     }
 
-    fn runtimeRowForSelected(self: *SteeringSystem, selected: *const SelectedIntent) !*RuntimeRow {
+    fn runtimeRowForSelected(self: *SteeringSystem, selected: *const SelectedIntent) *RuntimeRow {
+        // Capacity for up to one new row per selected intent is reserved once,
+        // upfront, by the caller (prepareSelectedDirections).
         const existing_index = self.runtime_index_by_steering.items[selected.steering_index];
         if (existing_index != invalid_index) return &self.runtime_rows.items[existing_index];
-        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + 1);
         self.runtime_index_by_steering.items[selected.steering_index] = self.runtime_rows.items.len;
         self.runtime_rows.appendAssumeCapacity(.{ .entity = selected.entity });
         return &self.runtime_rows.items[self.runtime_rows.items.len - 1];
@@ -844,6 +880,11 @@ const RuntimeRow = struct {
     // its per-step waypoint derivation probes a small forward window instead of scanning
     // the whole shared path. A stale value (goal/path changed) only misses and falls back.
     waypoint_hint: u32 = 0,
+    // Last emitted (possibly smoothed) base direction, blended toward each new
+    // target direction in `smoothBaseDirection` instead of snapping to it.
+    prev_dir_x: f32 = 0,
+    prev_dir_y: f32 = 0,
+    has_prev_dir: bool = false,
 };
 
 const SteeringAgentView = struct {
@@ -1339,11 +1380,59 @@ test "steering requests missing paths then follows available path results" {
     try std.testing.expect(frame.intents.mergedItems()[0].movement.direction_x > 0);
 }
 
-test "steering pins NPC path requests to the surface plane" {
-    // Load-bearing confinement: NPCs have no per-entity plane, so every path request
-    // they emit must stay on level 0 (the fully-walkable surface). This guards against
-    // a future accidental wire of the player's plane into the goal level, which would
-    // make NPCs request underground paths they cannot walk and pile at the ramp mouth.
+test "steering smooths a discrete target-direction flip over several steps instead of snapping" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    // Never resolving path requests keeps status `.missing` for every step, so
+    // `direct_dir` (the raw target direction below) is what smoothing acts on.
+
+    // First observation for this runtime row is used as-is: no startup lag.
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 1, .direct_direction_y = 0 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const first = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), first.direction_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), first.direction_y, 0.001);
+
+    // Target direction flips a full 90 degrees to (0, 1). A hard snap would
+    // jump straight to direction_y == 1; smoothing should only partially turn.
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 0, .direct_direction_y = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const second = frame.intents.mergedItems()[0].movement;
+    try std.testing.expect(second.direction_y > 0.0);
+    try std.testing.expect(second.direction_y < 0.9);
+    try std.testing.expect(second.direction_x > 0.0);
+
+    // Repeated steps toward the same (0, 1) target converge close to it.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        frame.beginStep();
+        try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 999, .y = 999 }, .direct_direction_x = 0, .direct_direction_y = 1 });
+        _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    }
+    const converged = frame.intents.mergedItems()[0].movement;
+    try std.testing.expect(converged.direction_y > 0.95);
+}
+
+test "steering sources path request start level from entity world level" {
+    // Default surface NPCs without an explicit world_level component still emit
+    // start_level 0. Underground placement uses setWorldLevel before steering runs.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
@@ -1369,6 +1458,16 @@ test "steering pins NPC path requests to the surface plane" {
     try std.testing.expectEqual(@as(usize, 1), requests.len);
     try std.testing.expectEqual(@as(u16, 0), requests[0].start_level);
     try std.testing.expectEqual(@as(u16, 0), requests[0].goal_level);
+
+    // entityWorldLevel is the sole source of a path request's start_level (see
+    // writePathRequests above); this is the direct regression guard that a
+    // future edit can't quietly hardcode it back to 0. Exercised directly
+    // rather than through another full updateSerial step, since a second step
+    // for the same agent would hit the replan cooldown the first request just
+    // armed and never re-request regardless of level.
+    try std.testing.expectEqual(@as(u16, 0), entityWorldLevel(&data, agent));
+    try data.setWorldLevel(agent, 2);
+    try std.testing.expectEqual(@as(u16, 2), entityWorldLevel(&data, agent));
 }
 
 test "steering missing path requests respect replan cooldown" {

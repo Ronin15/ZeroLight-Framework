@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const AssetStore = @import("../assets/assets.zig").AssetStore;
+const LoadedImage = @import("../assets/image.zig").LoadedImage;
 const build_options = @import("build_options");
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
@@ -129,6 +130,27 @@ fn releaseVertexStreams(device: *c.SDL_GPUDevice, streams: VertexStreams) void {
 }
 
 pub const Renderer = struct {
+    /// Headroom reserved for debug-overlay sprite commands submitted after
+    /// game-state render enqueue (FPS prefix + digit glyphs). `Engine` adds this
+    /// on top of gameplay reservation after all stacked states render.
+    pub const kOverlayCommandHeadroom: usize = 16;
+
+    /// Headroom for stacked-state UI rects/text submitted after gameplay enqueue
+    /// (pause panel, menus) before the debug overlay reserve in `Engine`.
+    pub const kStackedStateUiHeadroom: usize = 32;
+
+    // `Engine`'s post-render top-up (`spriteCommandCount() + kOverlayCommandHeadroom`)
+    // reserves against the same grow-only `command_high_water` as the state's own
+    // upfront reserve, without the caller re-adding `kStackedStateUiHeadroom`. This
+    // stays allocation-free only because `std.ArrayList.ensureTotalCapacity`'s
+    // amortized growth on the state's reserve already covers the extra headroom,
+    // which requires stacked-UI headroom to be at least double the overlay headroom.
+    // See "engine overlay top-up after stacked UI fully consumes its headroom stays
+    // allocation-free" for the empirical proof this depends on too.
+    comptime {
+        std.debug.assert(kStackedStateUiHeadroom >= 2 * kOverlayCommandHeadroom);
+    }
+
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
@@ -182,6 +204,9 @@ pub const Renderer = struct {
     // their sum so the per-frame merge stays allocation-free.
     reserved_dynamic_groups: usize = 0,
     reserved_static_spans: usize = 0,
+    // Grow-only peaks observed by `reserveSpriteCommands` / draw-list reservation.
+    command_high_water: usize = 0,
+    draw_list_high_water: usize = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -302,11 +327,23 @@ pub const Renderer = struct {
     /// Setup-time and grow-only (never shrinks); call before relying on
     /// allocation-free render frames.
     pub fn reserveSpriteCommands(self: *Renderer, command_capacity: usize) !void {
-        const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
-        try self.reserveBatchStorage(command_capacity, vertex_capacity, command_capacity);
-        try self.ensureBatchCapacity(vertex_capacity);
-        self.reserved_dynamic_groups = command_capacity;
-        try self.ensureDrawListReservation();
+        if (command_capacity > self.command_high_water) {
+            const vertex_capacity = try std.math.mul(usize, command_capacity, 6);
+            try self.reserveBatchStorage(command_capacity, vertex_capacity, command_capacity);
+            // CPU-only test renderers leave `batch_capacity_vertices` at 0; GPU
+            // streams grow at `ensureFrameBatchCapacity` on the first real frame.
+            if (self.batch_capacity_vertices > 0) {
+                try self.ensureBatchCapacity(vertex_capacity);
+            }
+            self.command_high_water = command_capacity;
+            self.reserved_dynamic_groups = command_capacity;
+            try self.ensureDrawListReservation();
+        }
+        self.batch.frame_reserved = true;
+    }
+
+    pub fn spriteCommandCount(self: *const Renderer) usize {
+        return self.batch.commands.items.len;
     }
 
     pub fn submitOrderedRectInSpace(self: *Renderer, rect: Rect, color: config.Color, order: RenderOrder, coordinate_space: CoordinateSpace) !void {
@@ -350,7 +387,9 @@ pub const Renderer = struct {
     // the per-frame `mergeDrawList` never reallocates.
     fn ensureDrawListReservation(self: *Renderer) !void {
         const total = try std.math.add(usize, self.reserved_dynamic_groups, self.reserved_static_spans);
+        if (total <= self.draw_list_high_water) return;
         try self.draw_list.ensureTotalCapacity(self.allocator, total);
+        self.draw_list_high_water = total;
     }
 
     /// Appends one retained world-space quad that draws a whole dense layer via
@@ -519,19 +558,17 @@ pub const Renderer = struct {
             .height = frame.height,
         });
 
-        if (self.batch.positions.items.len > 0) {
-            self.recordVertexUpload(command_buffer) catch {
+        const upload_dynamic = self.batch.positions.items.len > 0;
+        const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
+        if (upload_dynamic or upload_static or upload_tile_edits) {
+            self.recordFrameCopyPass(command_buffer, .{
+                .dynamic = upload_dynamic,
+                .static_vertices = upload_static,
+                .tile_edits = upload_tile_edits,
+            }) catch {
                 return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
             };
         }
-        if (upload_static) {
-            self.recordStaticVertexUpload(command_buffer) catch {
-                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
-            };
-        }
-        self.recordPendingTileEdits(command_buffer) catch {
-            return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
-        };
         // The static buffer now holds current data on the GPU; reuse it until the
         // next change marks it dirty again.
         self.static_dirty = false;
@@ -758,6 +795,42 @@ pub const Renderer = struct {
         return try self.createTextureFromPixelsInternal(pixels, width, height, pitch, false);
     }
 
+    /// Uploads decoded startup images in one GPU command buffer. Returned slice
+    /// is allocated with `allocator` and owned by the caller until each
+    /// `TextureId` is destroyed.
+    pub fn createTexturesFromPixelsBatch(self: *Renderer, allocator: std.mem.Allocator, images: []const LoadedImage) ![]TextureId {
+        if (images.len == 0) return try allocator.alloc(TextureId, 0);
+
+        const items = try self.allocator.alloc(gpu_texture.BatchUploadItem, images.len);
+        defer self.allocator.free(items);
+        for (images, items) |image, *item| {
+            item.* = .{
+                .pixels = image.pixels,
+                .width = image.width,
+                .height = image.height,
+                .pitch = image.pitch,
+            };
+        }
+
+        const uploaded = try gpu_texture.uploadTexturesBatch(self.allocator, self.device, items);
+        defer self.allocator.free(uploaded);
+
+        const ids = try allocator.alloc(TextureId, images.len);
+        errdefer allocator.free(ids);
+        var registered_count: usize = 0;
+        errdefer for (ids[0..registered_count]) |id| {
+            self.destroyTexture(id);
+        };
+        errdefer for (uploaded[registered_count..]) |texture| {
+            c.SDL_ReleaseGPUTexture(self.device, texture.texture);
+        };
+        for (uploaded, ids) |texture, *id| {
+            id.* = try self.registerTexture(texture, false);
+            registered_count += 1;
+        }
+        return ids;
+    }
+
     /// Creates a renderer-owned tile-data storage buffer from a row-major tile
     /// array (one `u32` per cell) and returns its handle. `params` is the layer's
     /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
@@ -782,8 +855,9 @@ pub const Renderer = struct {
     /// skipped. The scratch list resolves handles to buffers and is grow-only.
     pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
         if (edits.len == 0) return;
-        self.tile_edit_scratch.clearRetainingCapacity();
-        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, edits.len);
+        // Grow-only append: pending edits are held until the post-acquire copy pass
+        // runs so a skipped swapchain frame does not drop dig updates.
+        try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, self.tile_edit_scratch.items.len + edits.len);
         for (edits) |edit| {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
             const element_count = self.tileDataCount(edit.buffer);
@@ -835,22 +909,6 @@ pub const Renderer = struct {
         self.tile_edit_transfer_byte_size = required_bytes;
     }
 
-    fn recordPendingTileEdits(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        if (!self.tile_edits_pending or self.tile_edit_scratch.items.len == 0) return;
-        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-        try self.ensureTileEditTransfer(required_bytes);
-        const transfer = self.tile_edit_transfer.?;
-        try gpu_buffer.stageStorageRegions(
-            self.device,
-            transfer,
-            self.tile_edit_transfer_byte_size,
-            self.tile_edit_scratch.items,
-        );
-        try gpu_buffer.recordStorageRegions(command_buffer, transfer, self.tile_edit_scratch.items);
-        self.tile_edits_pending = false;
-        self.tile_edit_scratch.clearRetainingCapacity();
-    }
-
     fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
         if (id == .invalid) return null;
         const index = @intFromEnum(id);
@@ -889,7 +947,7 @@ pub const Renderer = struct {
         pitch: usize,
         internal: bool,
     ) !TextureId {
-        const texture = try gpu_texture.uploadFromPixels(self.device, pixels, width, height, pitch);
+        const texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, texture.texture);
         return try self.registerTexture(texture, internal);
     }
@@ -905,7 +963,7 @@ pub const Renderer = struct {
         const slot = self.resolveTextureSlot(id) orelse return error.InvalidTexture;
         if (slot.internal) return error.InvalidTexture;
 
-        const next_texture = try gpu_texture.uploadFromPixels(self.device, pixels, width, height, pitch);
+        const next_texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
 
         c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
@@ -987,9 +1045,14 @@ pub const Renderer = struct {
     }
 
     fn ensureFrameBatchCapacity(self: *Renderer) !void {
-        const needed_vertices = try std.math.mul(usize, self.batch.commands.items.len, 6);
-        if (needed_vertices == 0) return;
+        const command_count = self.batch.commands.items.len;
+        if (command_count == 0) return;
+        if (comptime @import("builtin").mode == .Debug) {
+            std.debug.assert(command_count <= self.command_high_water);
+        }
+        if (command_count <= self.command_high_water) return;
 
+        const needed_vertices = try std.math.mul(usize, command_count, 6);
         try self.batch.ensureFrameStorage();
         try self.ensureBatchCapacity(needed_vertices);
     }
@@ -1026,11 +1089,107 @@ pub const Renderer = struct {
         try gpu_buffer.stageVertices(self.device, streams.color_transfer, streams.color_bytes, std.mem.sliceAsBytes(self.batch.colors.items));
     }
 
-    fn recordVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        const streams = self.vertex_streams;
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, streams.position_bytes, std.mem.sliceAsBytes(self.batch.positions.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, streams.uv_bytes, std.mem.sliceAsBytes(self.batch.uvs.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, streams.color_bytes, std.mem.sliceAsBytes(self.batch.colors.items));
+    const FrameCopyPassWork = struct {
+        dynamic: bool = false,
+        static_vertices: bool = false,
+        tile_edits: bool = false,
+    };
+
+    fn recordFrameCopyPass(
+        self: *Renderer,
+        command_buffer: *c.SDL_GPUCommandBuffer,
+        work: FrameCopyPassWork,
+    ) !void {
+        var copy_pass_scope = try gpu_buffer.CopyPassScope.begin(command_buffer);
+        defer copy_pass_scope.end();
+
+        // Every vertex-stream upload below is a full-buffer rewrite, so each
+        // passes `cycle=true` independently of what else shares this pass.
+        // Tile-data storage edits are excluded — they target retained
+        // per-layer buffers with partial writes.
+        if (work.dynamic) {
+            const streams = self.vertex_streams;
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.position_transfer,
+                streams.position_bytes,
+                streams.position,
+                streams.position_bytes,
+                std.mem.sliceAsBytes(self.batch.positions.items),
+                true,
+            );
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.uv_transfer,
+                streams.uv_bytes,
+                streams.uv,
+                streams.uv_bytes,
+                std.mem.sliceAsBytes(self.batch.uvs.items),
+                true,
+            );
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.color_transfer,
+                streams.color_bytes,
+                streams.color,
+                streams.color_bytes,
+                std.mem.sliceAsBytes(self.batch.colors.items),
+                true,
+            );
+        }
+
+        if (work.static_vertices) {
+            const streams = self.static_streams.?;
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.position_transfer,
+                streams.position_bytes,
+                streams.position,
+                streams.position_bytes,
+                std.mem.sliceAsBytes(self.static_positions.items),
+                true,
+            );
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.uv_transfer,
+                streams.uv_bytes,
+                streams.uv,
+                streams.uv_bytes,
+                std.mem.sliceAsBytes(self.static_uvs.items),
+                true,
+            );
+            try gpu_buffer.recordVertexUploadInPass(
+                copy_pass_scope.pass,
+                streams.color_transfer,
+                streams.color_bytes,
+                streams.color,
+                streams.color_bytes,
+                std.mem.sliceAsBytes(self.static_colors.items),
+                true,
+            );
+        }
+
+        if (work.tile_edits) {
+            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+            try self.ensureTileEditTransfer(required_bytes);
+            const transfer = self.tile_edit_transfer.?;
+            // Stage immediately before the copy, after swapchain acquire (matches
+            // the working `world` branch timing for dig cell uploads).
+            try gpu_buffer.stageStorageRegions(
+                self.device,
+                transfer,
+                self.tile_edit_transfer_byte_size,
+                self.tile_edit_scratch.items,
+            );
+            try gpu_buffer.recordStorageRegionsInPass(
+                copy_pass_scope.pass,
+                transfer,
+                self.tile_edit_transfer_byte_size,
+                self.tile_edit_scratch.items,
+            );
+            self.tile_edits_pending = false;
+            self.tile_edit_scratch.clearRetainingCapacity();
+        }
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer
@@ -1063,13 +1222,6 @@ pub const Renderer = struct {
         try gpu_buffer.stageVertices(self.device, streams.position_transfer, streams.position_bytes, std.mem.sliceAsBytes(self.static_positions.items));
         try gpu_buffer.stageVertices(self.device, streams.uv_transfer, streams.uv_bytes, std.mem.sliceAsBytes(self.static_uvs.items));
         try gpu_buffer.stageVertices(self.device, streams.color_transfer, streams.color_bytes, std.mem.sliceAsBytes(self.static_colors.items));
-    }
-
-    fn recordStaticVertexUpload(self: *Renderer, command_buffer: *c.SDL_GPUCommandBuffer) !void {
-        const streams = self.static_streams.?;
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.position_transfer, streams.position, streams.position_bytes, std.mem.sliceAsBytes(self.static_positions.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.uv_transfer, streams.uv, streams.uv_bytes, std.mem.sliceAsBytes(self.static_uvs.items));
-        try gpu_buffer.recordVertexUpload(command_buffer, streams.color_transfer, streams.color, streams.color_bytes, std.mem.sliceAsBytes(self.static_colors.items));
     }
 
     pub fn spritePrepStats(self: *const Renderer) SpritePrepStats {
@@ -1118,7 +1270,7 @@ fn coalesceDrawList(items: []DrawGroup) usize {
 
 // Builds the per-frame unified draw list from retained static spans and dynamic
 // groups: append (static first), stable-sort by order, then coalesce.
-fn mergeDrawList(
+pub fn mergeDrawList(
     out: *std.ArrayListUnmanaged(DrawGroup),
     allocator: std.mem.Allocator,
     static_groups: []const DrawGroup,
@@ -1604,6 +1756,34 @@ test "draw list keeps non-contiguous spans separate" {
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
 }
 
+test "mergeDrawList sorts unsorted underground dense layers back to front" {
+    const allocator = std.testing.allocator;
+    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer list.deinit(allocator);
+
+    // `submitStaticDenseGeometry` appends in dense-layer index order (surface
+    // grass first), which is not ascending by render depth. The merge must sort
+    // so dirt_dark draws first and grass last.
+    var grass = testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6);
+    grass.material = .tilemap;
+    var dirt = testDrawGroup(.static, 0, .world, RenderOrder.world(-18), 6, 6);
+    dirt.material = .tilemap;
+    var dirt_dark = testDrawGroup(.static, 0, .world, RenderOrder.world(-34), 12, 6);
+    dirt_dark.material = .tilemap;
+    const static_groups = [_]DrawGroup{ grass, dirt, dirt_dark };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(-1), 0, 6),
+    };
+
+    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+
+    try std.testing.expectEqual(@as(usize, 4), list.items.len);
+    try std.testing.expectEqual(@as(i32, -34), list.items[0].order.depth);
+    try std.testing.expectEqual(@as(i32, -18), list.items[1].order.depth);
+    try std.testing.expectEqual(@as(i32, -2), list.items[2].order.depth);
+    try std.testing.expectEqual(@as(i32, -1), list.items[3].order.depth);
+}
+
 test "tilemap layer quads interleave with dynamic groups by render order" {
     const allocator = std.testing.allocator;
     var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
@@ -1725,4 +1905,165 @@ test "renderer config rejects invalid frame latency" {
         .window_title = "test",
         .frames_in_flight = 4,
     }));
+}
+
+test "reserve sprite commands is grow-only and enables allocation-free enqueue" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    try renderer.reserveSpriteCommands(8);
+    const capacity_before = renderer.batch.commands.capacity;
+    try renderer.reserveSpriteCommands(4);
+    try std.testing.expect(renderer.batch.frame_reserved);
+    try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
+
+    const white = TextureId.init(0, 1) catch unreachable;
+    for (0..4) |i| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    try std.testing.expectEqual(capacity_before, renderer.batch.commands.capacity);
+}
+
+// Traces the two-stage per-frame reserve: a state reserves
+// `gameplay_estimate + kStackedStateUiHeadroom` up front (mirrors
+// `render_prep.spriteCommandCapacity`), stacked UI then submits real sprites,
+// and `Engine.renderFrame` tops up with
+// `spriteCommandCount() + kOverlayCommandHeadroom` afterward — a second,
+// independent reservation against the same grow-only `command_high_water`.
+// This proves the top-up stays allocation-free even when stacked UI fully
+// consumes its 32-command headroom, because `ensureTotalCapacity`'s amortized
+// (~1.5x) growth on the state's up-front reserve already covers the extra
+// `kOverlayCommandHeadroom` (32 >= 2 * 16 today). If either constant shrinks
+// that margin, this test is the regression signal.
+test "engine overlay top-up after stacked UI fully consumes its headroom stays allocation-free" {
+    const allocator = std.testing.allocator;
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.draw_list.deinit(allocator);
+
+    const white = TextureId.init(0, 1) catch unreachable;
+    var order: i32 = 0;
+
+    // Zero gameplay sprites isolates the headroom margin itself: with a
+    // nonzero gameplay count the amortized growth cushion is dominated by the
+    // gameplay term and would stay allocation-free even if the headroom
+    // constants no longer covered each other.
+    const gameplay_estimate: usize = 0;
+    // State's own upfront reservation (render_prep.spriteCommandCapacity's formula).
+    try renderer.reserveSpriteCommands(gameplay_estimate + Renderer.kStackedStateUiHeadroom);
+    const commands_capacity_after_state_reserve = renderer.batch.commands.capacity;
+    const draw_list_capacity_after_state_reserve = renderer.draw_list.capacity;
+
+    for (0..gameplay_estimate) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    // Worst-case stacked-UI usage: fully consumes the declared headroom.
+    for (0..Renderer.kStackedStateUiHeadroom) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+
+    // Block both the alloc and remap paths from the very first call so the
+    // engine's top-up reservation fails loudly if it needs any real growth.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_renderer_allocator = renderer.allocator;
+    const real_batch_allocator = renderer.batch.allocator;
+    renderer.allocator = failing.allocator();
+    renderer.batch.allocator = failing.allocator();
+    defer {
+        renderer.allocator = real_renderer_allocator;
+        renderer.batch.allocator = real_batch_allocator;
+    }
+
+    const overlay_target = renderer.spriteCommandCount() + Renderer.kOverlayCommandHeadroom;
+    // Sanity: this is genuinely a second, larger ask than the state's own
+    // reservation, not a no-op repeat of it.
+    try std.testing.expect(overlay_target > gameplay_estimate + Renderer.kStackedStateUiHeadroom);
+
+    try renderer.reserveSpriteCommands(overlay_target);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+    try std.testing.expectEqual(draw_list_capacity_after_state_reserve, renderer.draw_list.capacity);
+
+    // Debug overlay can then submit up to kOverlayCommandHeadroom more sprites
+    // without overflow or a capacity grow.
+    for (0..Renderer.kOverlayCommandHeadroom) |_| {
+        try renderer.submitOrderedSprite(.{
+            .texture = white,
+            .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(order),
+        });
+        order += 1;
+    }
+    try std.testing.expectEqual(commands_capacity_after_state_reserve, renderer.batch.commands.capacity);
+}
+
+test "linear merge matches stable sort for pre-sorted static and dynamic groups" {
+    const allocator = std.testing.allocator;
+    const static_groups = [_]DrawGroup{
+        testDrawGroup(.static, 0, .world, RenderOrder.world(-2), 0, 6),
+        testDrawGroup(.static, 0, .world, RenderOrder.world(1), 6, 6),
+    };
+    const dynamic_groups = [_]DrawGroup{
+        testDrawGroup(.dynamic, 1, .world, RenderOrder.world(0), 0, 6),
+        testDrawGroup(.dynamic, 1, .logical, RenderOrder.ui(.panel), 6, 6),
+    };
+
+    var linear: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer linear.deinit(allocator);
+    try mergeDrawList(&linear, allocator, &static_groups, &dynamic_groups);
+
+    var sorted: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    defer sorted.deinit(allocator);
+    try sorted.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
+    sorted.appendSliceAssumeCapacity(&static_groups);
+    sorted.appendSliceAssumeCapacity(&dynamic_groups);
+    std.mem.sort(DrawGroup, sorted.items, {}, drawGroupOrderLessThan);
+    sorted.items.len = coalesceDrawList(sorted.items);
+
+    try std.testing.expectEqual(sorted.items.len, linear.items.len);
+    for (sorted.items, linear.items) |expected, actual| {
+        try std.testing.expectEqual(expected.source, actual.source);
+        try std.testing.expectEqual(expected.order.domain, actual.order.domain);
+        try std.testing.expectEqual(expected.order.depth, actual.order.depth);
+        try std.testing.expectEqual(expected.first_vertex, actual.first_vertex);
+        try std.testing.expectEqual(expected.vertex_count, actual.vertex_count);
+    }
 }

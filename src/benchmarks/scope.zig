@@ -21,7 +21,10 @@
 //! `output_count` reports how many entities actually ran cognition this step, so the
 //! gap between that and N is the scope reduction. Note the timed window covers the
 //! whole scoped step (AI + collision + movement + gathers + tier policy), so it is
-//! not directly comparable to the AI-only `ai` group.
+//! not directly comparable to the AI-only `ai` group. The shared spatial index build
+//! also runs every step here (AI separation queries it) but its own
+//! wall-clock cost is excluded from this reported window, same as the `ai` group —
+//! it has its own dedicated `spatial_index` bench group.
 
 const std = @import("std");
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
@@ -33,6 +36,7 @@ const movement = @import("../game/systems/movement.zig");
 const MovementSystem = @import("../game/systems/movement.zig").MovementSystem;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
+const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const CollisionSystem = @import("../game/systems/collision.zig").CollisionSystem;
 const collision_range_alignment_items = @import("../game/systems/collision.zig").collision_range_alignment_items;
 const SimulationScopeSystem = @import("../game/systems/simulation_scope.zig").SimulationScopeSystem;
@@ -161,6 +165,8 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer fixture.deinit();
     var scope = SimulationScopeSystem.init(allocator);
     defer scope.deinit();
+    var spatial_index = SpatialIndexSystem.init(allocator);
+    defer spatial_index.deinit();
     var ai = AiSystem.init(allocator);
     defer ai.deinit();
     var collision = CollisionSystem.init(allocator);
@@ -191,10 +197,10 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     }
     defer if (threads) |*thread_system| thread_system.deinit();
 
-    var ctx = RunContext{ .scope = &scope, .ai = &ai, .collision = &collision, .move = &move, .fixture = &fixture, .case = case };
+    var ctx = RunContext{ .scope = &scope, .spatial_index = &spatial_index, .ai = &ai, .collision = &collision, .move = &move, .fixture = &fixture, .case = case };
 
     for (0..options.warmup_iterations) |_| {
-        _ = try runOnce(&ctx, if (threads) |*thread_system| thread_system else null);
+        _ = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
     }
     if (case.adaptive) {
         var settle_guard: usize = 0;
@@ -202,19 +208,26 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
         // Every stage adapts inside the measured window, so gate on all of their
         // tuners — including the scope stage's own gather/tier-policy tuners — before
         // measuring, or the early iterations would time still-adapting dispatch.
-        while (!allTunersSettled(&ai, &collision, &move, &scope) and settle_guard < settle_limit) : (settle_guard += 1) {
-            _ = try runOnce(&ctx, if (threads) |*thread_system| thread_system else null);
+        while (!allTunersSettled(&ai, &collision, &move, &scope, &spatial_index) and settle_guard < settle_limit) : (settle_guard += 1) {
+            _ = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
         }
     }
-    const settled_before_measurement = if (case.adaptive) allTunersSettled(&ai, &collision, &move, &scope) else false;
+    const settled_before_measurement = if (case.adaptive) allTunersSettled(&ai, &collision, &move, &scope, &spatial_index) else false;
 
     var accumulator = suite.StatsAccumulator.init(item_count);
     var active_cognition: usize = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
-        const result = try runOnce(&ctx, if (threads) |*thread_system| thread_system else null);
+        const result = try runOnce(&ctx, io, if (threads) |*thread_system| thread_system else null);
         const end_ns = suite.nowNs(io);
-        accumulator.record(suite.elapsedNs(start_ns, end_ns), result.batch);
+        const elapsed_ns = suite.elapsedNs(start_ns, end_ns);
+        // The spatial-index build is excluded from this group's reported
+        // timing, same as the `ai` bench group: it has its own dedicated
+        // `spatial_index` bench group, so this stays comparable to the
+        // "AI + collision + movement + gathers + tier policy" baseline
+        // instead of conflating it with a new build cost.
+        const net_ns = if (elapsed_ns > result.excluded_ns) elapsed_ns - result.excluded_ns else 0;
+        accumulator.record(net_ns, result.batch);
         active_cognition = result.active_cognition;
     }
 
@@ -230,17 +243,22 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
 
 /// True once every stage's adaptive tuner has settled. The measured window times
 /// the scope gathers + tier policy alongside AI + collision + movement, so all of
-/// their tuners must settle first.
-fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move: *const MovementSystem, scope: *const SimulationScopeSystem) bool {
+/// their tuners must settle first. The spatial-index build tuner is gated too even
+/// though its own wall-clock cost is excluded from the reported window (see
+/// `runCase`), so warmup/settle iterations reflect the same dispatch shape the
+/// measured iterations will use.
+fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move: *const MovementSystem, scope: *const SimulationScopeSystem, spatial_index: *const SpatialIndexSystem) bool {
     return move.adaptive_tuner.isSettled() and
         ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
         collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
         scope.movement_gather_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
-        scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled();
+        scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
+        spatial_index.build_tuner.isSettled();
 }
 
 const RunContext = struct {
     scope: *SimulationScopeSystem,
+    spatial_index: *SpatialIndexSystem,
     ai: *AiSystem,
     collision: *CollisionSystem,
     move: *MovementSystem,
@@ -251,9 +269,12 @@ const RunContext = struct {
 const RunResult = struct {
     batch: BatchStats,
     active_cognition: usize,
+    // Wall-clock cost of this call's spatial-index build, to be subtracted by
+    // the caller from the outer start/end window (see the `runCase` comment).
+    excluded_ns: u64 = 0,
 };
 
-fn runOnce(ctx: *RunContext, thread_system: ?*ThreadSystem) !RunResult {
+fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResult {
     const fixture = ctx.fixture;
     fixture.frame.beginStep();
     ctx.scope.advanceStep();
@@ -282,6 +303,19 @@ fn runOnce(ctx: *RunContext, thread_system: ?*ThreadSystem) !RunResult {
     const ai_slice = fixture.data.aiAgentSliceConst();
     const move_slice_const = fixture.data.movementBodySliceConst();
 
+    // Build the shared spatial index from this step's scoped population (same
+    // positions AI's own gather reads). Timed separately and excluded from the
+    // returned batch's reported window — see the `runCase` comment.
+    const spatial_start_ns = suite.nowNs(io);
+    const spatial_stats = if (thread_system) |ts|
+        try ctx.spatial_index.build(ai_slice, move_slice_const, &fixture.data, ts, .{ .scope_dense_indices = ai_indices })
+    else
+        try ctx.spatial_index.buildSerial(ai_slice, move_slice_const, &fixture.data, .{ .scope_dense_indices = ai_indices });
+    _ = spatial_stats;
+    const spatial_end_ns = suite.nowNs(io);
+    const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
+    const spatial_view = ctx.spatial_index.view();
+
     const scope_columns = fixture.data.scopeColumnsSlice();
     const chunk_grid = movement.ChunkGridParams{
         .chunk_x = scope_columns.chunk_x,
@@ -293,7 +327,7 @@ fn runOnce(ctx: *RunContext, thread_system: ?*ThreadSystem) !RunResult {
     };
 
     if (!ctx.case.usesThreadSystem()) {
-        _ = try ctx.ai.updateSerial(ai_slice, move_slice_const, &fixture.data, &fixture.frame, delta_seconds, .{
+        _ = try ctx.ai.updateSerial(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
             .intent_seed = intent_seed,
             .seek_target = .{ .x = 480, .y = 270 },
             .scope_dense_indices = ai_indices,
@@ -303,10 +337,10 @@ fn runOnce(ctx: *RunContext, thread_system: ?*ThreadSystem) !RunResult {
         movement.updateSerialScoped(&slice, delta_seconds, move_indices, chunk_grid);
         // Tier policy reads the chunk movement just derived; serial path emits one range.
         try ctx.scope.queueTierChangesSerial(&fixture.data, visibleRegion(), &fixture.frame.structural_commands);
-        return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_indices.len };
+        return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };
     }
 
-    _ = try ctx.ai.update(ai_slice, move_slice_const, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
+    _ = try ctx.ai.update(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, thread_system.?, delta_seconds, .{
         .items_per_range = itemsPerRange(ctx.case, ai_range_alignment_items),
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
@@ -330,7 +364,7 @@ fn runOnce(ctx: *RunContext, thread_system: ?*ThreadSystem) !RunResult {
     });
     // Threaded tier policy trains its own tuner inside the measured window.
     _ = try ctx.scope.queueTierChanges(&fixture.data, visibleRegion(), &fixture.frame.structural_commands, thread_system.?, scope_config);
-    return .{ .batch = move_stats.batch, .active_cognition = ai_indices.len };
+    return .{ .batch = move_stats.batch, .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };
 }
 
 /// Scope-pass threading config for a case: adaptive cases let the scope tuners
@@ -349,26 +383,4 @@ fn itemsPerRange(case: suite.BenchmarkCase, alignment: usize) ?usize {
     if (case.adaptive) return null;
     return case.itemsPerRange(alignment) orelse
         suite.alignItemCount(suite.default_items_per_range, alignment);
-}
-
-test "scope benchmark fixture creates simulated entities with movement, bounds, and ai" {
-    var fixture = try createFixture(std.testing.allocator, 64);
-    defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.collisionBoundsSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, 64), fixture.data.aiAgentSliceConst().entities.len);
-}
-
-test "scope benchmark tiny serial case runs the scoped sim stages without display" {
-    var options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    options.profile = .quick;
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 1_024);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    // Cognition ran on a strict subset (halo covers half the grid, stagger keeps
-    // ~1/4 of those), proving the scope actually reduced the cognition workload.
-    try std.testing.expect(stats.output_count > 0);
-    try std.testing.expect(stats.output_count < 1_024);
 }

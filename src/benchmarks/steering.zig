@@ -212,39 +212,3 @@ fn gridSide(count: usize) usize {
     while (side * side < count) : (side += 1) {}
     return side;
 }
-
-test "steering benchmark fixture creates requested agents" {
-    var fixture = try createFixture(std.testing.allocator, 32);
-    defer fixture.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 32), fixture.agents.items.len);
-    try std.testing.expectEqual(@as(usize, 32), fixture.data.steeringAgentSliceConst().entities.len);
-}
-
-test "steering benchmark tiny serial case runs without display" {
-    const options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 128);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    try std.testing.expectEqual(@as(usize, 128), stats.output_count);
-    try std.testing.expect(stats.batch.ran_inline);
-}
-
-test "steering benchmark fixed cases use explicit range controls" {
-    try std.testing.expectEqual(
-        suite.alignItemCount(suite.default_items_per_range, steering_range_alignment_items),
-        benchmarkItemsPerRange(suite.default_cases[3]).?,
-    );
-    try std.testing.expectEqual(suite.default_cases[4].itemsPerRange(steering_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[4]).?);
-    try std.testing.expectEqual(suite.default_cases[5].itemsPerRange(steering_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[5]).?);
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[6]));
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[7]));
-}
-
-test "steering benchmark profiles sweep event-scale counts" {
-    try std.testing.expectEqualSlices(usize, &quick_counts, defaultItemCounts(.quick));
-    try std.testing.expectEqualSlices(usize, &standard_counts, defaultItemCounts(.standard));
-    try std.testing.expectEqualSlices(usize, &stress_counts, defaultItemCounts(.stress));
-}

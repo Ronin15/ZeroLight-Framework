@@ -19,6 +19,7 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 
 pub const hot_particle_column_alignment: usize = 64;
 pub const particle_range_alignment_items: usize = hot_particle_column_alignment / @sizeOf(f32);
@@ -46,7 +47,18 @@ pub const ParticleUpdateStats = struct {
     active_after: usize = 0,
     removed_count: usize = 0,
     batch: BatchStats = .{},
+
+    pub fn recordTo(self: ParticleUpdateStats, perf: runtime_perf_log.Context) void {
+        perf.recordMetric(.particle_active_before, metric(self.active_before));
+        perf.recordMetric(.particle_active_after, metric(self.active_after));
+        perf.recordMetric(.particle_removed, metric(self.removed_count));
+        perf.recordBatch(.particles, self.batch);
+    }
 };
+
+fn metric(value: usize) u64 {
+    return @intCast(value);
+}
 
 pub const ParticleSpawn = struct {
     position: math.Vec2 = .{},

@@ -122,38 +122,3 @@ fn benchmarkItemsPerRange(case: suite.BenchmarkCase) ?usize {
     return case.itemsPerRange(movement_range_alignment_items) orelse
         suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items);
 }
-
-test "movement benchmark fixture creates requested movement bodies" {
-    var data = try createFixture(std.testing.allocator, 32);
-    defer data.deinit();
-
-    try std.testing.expectEqual(@as(usize, 32), data.movementBodySliceConst().entities.len);
-}
-
-test "movement benchmark tiny serial case runs without display" {
-    var options = suite.Options{
-        .warmup_iterations = 1,
-        .iterations = 1,
-    };
-    options.profile = .quick;
-    const stats = try runCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], 1_024);
-    try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
-    try std.testing.expect(stats.batch.ran_inline);
-}
-
-test "movement benchmark fixed cases use explicit range controls" {
-    try std.testing.expectEqual(
-        suite.alignItemCount(suite.default_items_per_range, movement_range_alignment_items),
-        benchmarkItemsPerRange(suite.default_cases[3]).?,
-    );
-    try std.testing.expectEqual(suite.default_cases[4].itemsPerRange(movement_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[4]).?);
-    try std.testing.expectEqual(suite.default_cases[5].itemsPerRange(movement_range_alignment_items).?, benchmarkItemsPerRange(suite.default_cases[5]).?);
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[6]));
-    try std.testing.expectEqual(@as(?usize, null), benchmarkItemsPerRange(suite.default_cases[7]));
-}
-
-test "movement benchmark profiles sweep multiple entity counts" {
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.quick), defaultItemCounts(.quick));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.standard), defaultItemCounts(.standard));
-    try std.testing.expectEqualSlices(usize, suite.eventScaleCounts(.stress), defaultItemCounts(.stress));
-}

@@ -215,6 +215,7 @@ pub const SpriteBatch = struct {
     uvs: std.ArrayList(Uv) = .empty,
     colors: std.ArrayList(VertexColor) = .empty,
     draw_groups: std.ArrayList(DrawGroup) = .empty,
+    frame_reserved: bool = false,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -244,6 +245,7 @@ pub const SpriteBatch = struct {
         self.colors.clearRetainingCapacity();
         self.draw_groups.clearRetainingCapacity();
         self.prepared_commands.clearRetainingCapacity();
+        self.frame_reserved = false;
         self.last_order = null;
         self.last_prep_stats = .{};
     }
@@ -254,7 +256,12 @@ pub const SpriteBatch = struct {
         }
         // Ordered submission keeps the renderer cheap: grouping can preserve
         // stream order instead of sorting every frame.
-        try self.commands.append(self.allocator, .{ .sprite = sprite });
+        if (self.frame_reserved) {
+            if (self.commands.items.len >= self.commands.capacity) return error.SpriteCommandOverflow;
+            self.commands.appendAssumeCapacity(.{ .sprite = sprite });
+        } else {
+            try self.commands.append(self.allocator, .{ .sprite = sprite });
+        }
         self.last_order = sprite.order;
     }
 
@@ -618,6 +625,37 @@ fn renderOrdersEqual(lhs: RenderOrder, rhs: RenderOrder) bool {
     return lhs.domain == rhs.domain and lhs.depth == rhs.depth;
 }
 
+fn spriteCommandsEqual(lhs: []const SpriteCommand, rhs: []const SpriteCommand) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        const a = left.sprite;
+        const b = right.sprite;
+        if (a.order.domain != b.order.domain or a.order.depth != b.order.depth) return false;
+        if (!a.texture.matches(b.texture.index, b.texture.generation)) return false;
+        if (!rectEqualForTest(a.dest, b.dest)) return false;
+        if (!optionalRectEqualForTest(a.source, b.source)) return false;
+        if (!colorEqualForTest(a.tint, b.tint)) return false;
+        if (a.origin.x != b.origin.x or a.origin.y != b.origin.y) return false;
+        if (a.rotation != b.rotation) return false;
+        if (a.coordinate_space != b.coordinate_space) return false;
+    }
+    return true;
+}
+
+fn rectEqualForTest(a: Rect, b: Rect) bool {
+    return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+}
+
+fn optionalRectEqualForTest(a: ?Rect, b: ?Rect) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return rectEqualForTest(a.?, b.?);
+}
+
+fn colorEqualForTest(a: config.Color, b: config.Color) bool {
+    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
+}
+
 fn testTextureId(index: u32, generation: u32) TextureId {
     return TextureId.init(index, generation) catch unreachable;
 }
@@ -804,6 +842,49 @@ test "batch builder preserves ordered submission stream" {
     try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
     try std.testing.expectEqual(@as(f32, 30), batch.positions.items[12][0]);
+}
+
+test "sprite batch build consumes the ordered command stream read-only" {
+    // SpriteBatch consumes an already-ordered submission stream; it is not a
+    // compatibility sorter and must never rewrite any geometry/material field of
+    // the commands it just read while building vertices/draw groups from them.
+    const allocator = std.testing.allocator;
+    const slots = [_]TestTextureSlot{
+        .{ .id = testTextureId(0, 1), .desc = .{ .width = 64, .height = 64 } },
+        .{ .id = testTextureId(1, 1), .desc = .{ .width = 128, .height = 32 } },
+        .{ .id = testTextureId(2, 1), .desc = .{ .width = 32, .height = 128 } },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = try initBatchTest(allocator, &table);
+    defer batch.deinit();
+
+    try batch.drawSprite(.{
+        .texture = testTextureId(0, 1),
+        .dest = .{ .x = 1, .y = 2, .w = 3, .h = 4 },
+        .source = .{ .x = 5, .y = 6, .w = 7, .h = 8 },
+        .tint = .{ .r = 0.1, .g = 0.2, .b = 0.3, .a = 0.4 },
+        .origin = .{ .x = 0.5, .y = 0.5 },
+        .rotation = 1.25,
+        .order = RenderOrder.world(0),
+    });
+    try batch.drawSprite(.{
+        .texture = testTextureId(1, 1),
+        .dest = .{ .x = 10, .y = 20, .w = 30, .h = 40 },
+        .order = RenderOrder.world(1),
+    });
+    try batch.drawSprite(.{
+        .texture = testTextureId(2, 1),
+        .dest = .{ .x = 100, .y = 200, .w = 300, .h = 400 },
+        .order = RenderOrder.world(1),
+    });
+
+    var snapshot = SpriteBatch.CommandList.empty;
+    defer snapshot.deinit(allocator);
+    try snapshot.appendSlice(allocator, batch.commands.items);
+
+    _ = batch.buildAssumeCapacity(table.resolver(), null, .{ .adaptive = false });
+
+    try std.testing.expect(spriteCommandsEqual(snapshot.items, batch.commands.items));
 }
 
 test "batch builder splits a same-texture run on render order change" {
@@ -1244,4 +1325,57 @@ fn expectEqualDrawGroups(expected: []const DrawGroup, actual: []const DrawGroup)
         try std.testing.expectEqual(lhs.first_vertex, rhs.first_vertex);
         try std.testing.expectEqual(lhs.vertex_count, rhs.vertex_count);
     }
+}
+
+test "draw sprite stays allocation-free after reserve" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    const command_capacity: usize = 8;
+    try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
+    batch.frame_reserved = true;
+    const capacity_before = batch.commands.capacity;
+
+    const texture = TextureId.init(0, 1) catch unreachable;
+    for (0..command_capacity) |i| {
+        try batch.drawSprite(.{
+            .texture = texture,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+
+    try std.testing.expectEqual(capacity_before, batch.commands.capacity);
+    try std.testing.expectEqual(command_capacity, batch.commands.items.len);
+}
+
+test "draw sprite returns overflow error once reserved capacity is exhausted" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    const command_capacity: usize = 8;
+    try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
+    batch.frame_reserved = true;
+    // ensureTotalCapacity may round up past the requested count, so fill to
+    // the real capacity rather than assuming it equals command_capacity.
+    const capacity_before = batch.commands.capacity;
+
+    const texture = TextureId.init(0, 1) catch unreachable;
+    for (0..capacity_before) |i| {
+        try batch.drawSprite(.{
+            .texture = texture,
+            .dest = .{ .x = @floatFromInt(i), .y = 0, .w = 1, .h = 1 },
+            .order = RenderOrder.world(@intCast(i)),
+        });
+    }
+    try std.testing.expectEqual(capacity_before, batch.commands.items.len);
+
+    const result = batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = @floatFromInt(capacity_before), .y = 0, .w = 1, .h = 1 },
+        .order = RenderOrder.world(@intCast(capacity_before)),
+    });
+    try std.testing.expectError(error.SpriteCommandOverflow, result);
 }

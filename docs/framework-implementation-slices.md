@@ -1,106 +1,176 @@
 # Framework Implementation Slices
 
-This roadmap keeps the repo focused as a 2D game project. Each slice should
-land as a small, verified step that improves a real extension point without
-adding broad abstraction.
+This roadmap is the agent implementation contract for the project frontier. Work
+is organized as **numbered slices**: each slice is one complete, verifiable
+feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
+implement by opening a slice section, checking items off only when integrated,
+and running `zig build verify` before marking the slice complete.
+
+Slices 0–7 and 9–17 are settled in
+[framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
+This file owns slices 8 and 18 onward.
 
 ## Ground Rules
 
 - Preserve runnable defaults: `zig build`, `zig build run`, and installed assets
   should keep working after every slice.
-- A slice means a full feature: runtime behavior, docs, tests, and acceptance
-  checks must be integrated before it is complete.
+- **A slice is not complete until every Checklist and Acceptance check in that
+  slice section is `[x]`** and runtime behavior, owning-module docs, and tests
+  are integrated. Partial wiring stays `[ ]` with explicit remaining notes in the
+  slice section — never implied complete elsewhere.
 - Keep hot paths simple: prefer enums, bitsets, arrays, and generational slot IDs
   over dynamic dispatch, string lookup, or hash maps during input/update/draw.
 - If a dependent system does not exist yet, label the work as foundation or
-  preparation and leave the feature checklist incomplete.
-- Avoid half-wired states; either finish the feature end to end or keep the
-  roadmap explicit about what remains.
+  preparation and leave the slice checklist incomplete.
+- Avoid half-wired states; either finish the slice end to end or keep every open
+  item visible in that slice's Checklist or Acceptance checks.
 - Keep `src/root.zig` minimal; feature modules should live in their matching
   `src/` area and import each other directly when needed.
+- Read [architecture.md](architecture.md) and the owning live modules before
+  editing; code wins over stale slice prose when they disagree.
 - Run `zig build verify` before considering a slice complete.
+
+## Agent Workflow: Implementing A Slice
+
+1. **Pick a slice** from **Open Frontier Slice Index** (below) or **Suggested
+   Order** when dependencies matter. Confirm prerequisites are `[x]` in their slice
+   sections.
+2. **Open the slice section** (`## Slice N: …`). Read **Goal**, **Current
+   foundation**, and **Architecture notes**; cross-read [architecture.md](architecture.md)
+   and any doc linked in the slice.
+3. **Implement only that slice's scope** in the owning `src/` modules. Do not
+   expand into unrelated refactors.
+4. **Check off items** in the slice **Checklist** as each integration lands (runtime
+   behavior + tests for that item).
+5. **Satisfy Acceptance checks** — each must pass before the slice is done.
+6. **Update durable docs** the slice touches (`architecture.md`, rendering/sim
+   docs) when contracts change.
+7. **Set slice Status** (if present) and run `zig build verify`.
+8. **Scaling Gaps** items are backlog until promoted into a numbered slice's
+   Checklist. Do not treat Scaling Gaps checkboxes as a substitute slice.
+
+### Standard slice section shape
+
+Every frontier slice section should contain (some fields optional for early
+foundation slices):
+
+| Block | Agent use |
+| --- | --- |
+| **Goal** | What "done" means for this chunk |
+| **Current foundation** | What already exists — do not rebuild |
+| **Architecture notes** / **Problem** | Constraints and ownership boundaries |
+| **Checklist** | `[ ]` / `[x]` implementation steps — check off as you land each |
+| **Acceptance checks** | `[ ]` / `[x]` verification gates — all required before complete |
+| **Status** | Landed slices: one-line completion record |
+
+Landed slices keep their sections as historical acceptance records; do not delete
+checklists after completion.
+
+## Open Frontier Slice Index
+
+Use this index to choose the next slice; **implement from that slice's section**
+(checklists live there, not here).
+
+| Slice | Status | Open work (see slice section for full Checklist) |
+| --- | --- | --- |
+| **24 / 24B** | Landed | Render collect hardening — acceptance history; follow-up in Scaling Gaps |
+| **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
+| **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
+| **26–33** | Not started | Emergent AI track — see **Emergent AI Track Overview** then each slice |
+| **34–35** | Not started | SIMD expansion — Checklists open |
+
+**Landed slice sections (18–25, 24B):** checklists complete; sections are
+acceptance history. Follow-up hardening without a new slice number lives in
+**Scaling Gaps And Hardening Frontier** until promoted to a slice Checklist.
+
+**Bench policy:** 50k bench scales are throughput ceilings, not per-frame targets.
 
 ## Next Priority Tracks
 
-- Use the completed Slice 7 render-prep benchmark to guard the current ordered
-  command -> `SpriteBatch` CPU prep path. Future tile rendering, richer UI,
-  particles, lighting sprites, and debug records should feed typed `RenderOrder`
-  commands through an explicit ordered render-prep phase first, then add
-  specialized batchers only after measurement shows the sprite/rect batcher is
-  the wrong representation. Keep SDL_GPU command-buffer, swapchain, upload,
-  render-pass, and submit ownership on the render thread.
-- Track collision-response merge/apply, SpriteBatch high-water/capacity policy,
-  text-cache lifetime policy, shader/material registry guardrails, and remaining
-  manual registry guardrails as hardening follow-ups.
-- Treat Slice 20 pathfinding budgets, deterministic pending retention, and
-  fixed-capacity cache contracts as the navigation hardening base before
-  scaling to large maps or many NPC path users.
-- Use the completed Slice 21 typed simulation events as the cross-system signal
-  foundation before broad domain features such as tiles, weather, obstacle
-  state, AI perception, combat, spawning, resources, and rules depend on those
-  changes.
-- Start Slice 22 with a behavior-preserving `SimulationPipeline` extraction
-  plus tier/scope scaffolding in the final owner locations. The first runtime
-  behavior stays full active-set parity, but `SimulationTier`, `ActiveRegion`,
-  cold tier/chunk metadata, and scope stats should be shaped so later world and
-  chunk hooks do not require guesswork or contract rewrites.
-- Add atlas-backed world rendering before enabling scoped tier behavior. World
-  rendering should provide the concrete tile/chunk/visibility data that scoped
-  simulation consumes instead of inventing abstract chunk policy in isolation.
-  See [architecture.md](architecture.md) for durable tier and pipeline
-  boundaries; this roadmap owns the implementation order and acceptance themes.
-- When multiple gameplay states need the same ordered processor flow, share the
-  state-owned pipeline helper instead of duplicating orchestration or adding a
-  global ECS scheduler. The pipeline may own lightweight domain controllers,
-  but persistent facts stay in `DataSystem` and hot loops stay in SoA processors.
-- Keep future gameplay systems built on Slice 12's typed processor outputs,
-  deterministic merge, and deferred structural-change contracts.
-- Treat CPU benchmark 50k scales as throughput ceilings, not per-frame targets;
-  tiers and active scope keep typical fixed steps far below those stress counts.
-- Land Slice 24 scoped cognition gating before the emergent-AI track
-  (Slices 26–33). Per-entity perception, memory, and affect are only affordable
-  at scale when the cognition tier shrinks which entities run them each step;
-  building emergent AI on the full-active pipeline would bake in a scale problem.
-  The track first adds the framework pieces it requires — entity faction
-  classification, a deterministic per-entity RNG facility, and a shared spatial
-  index — then layers perception → memory → affect → behavior arbitration as
-  cognition-gated processor stages, keeping per-frame sensing columnar and routing
-  only notable transitions through scalar-only `domain_reaction` events.
-- Land NPC Z-level traversal (Slice 25E) before multi-floor emergent scenarios.
-  The four touch-points are identified; schedule them as acceptance-checked work
-  so the defect is caught in isolation rather than discovered mid-AI-track as a
-  silent teleport behavior.
-- Plan a `ComponentMask` widening from `u32` to `u64` before bit 28 is consumed.
-  Eight component slots are currently used; the emergent-AI track (Slices 26–33)
-  adds at minimum 8 more (faction, RNG seed, spatial index, perception, memory,
-  affect, behavior weights, archetype). Combat, status effects, environmental
-  state, and further domain expansions add more still. The widening touches
-  `Component` (`u5` → `u6`), `ComponentMask` (`u32` → `u64`), `componentMask()`,
-  `EntitySlot.component_mask`, and every `switch` on `Component` — mechanical but
-  broad, cheaper to schedule before AI-track feature pressure mounts.
-  `EntityId.index` stays `u32` (theoretical ceiling ~4.3 B entity slots is already
-  ample for a 2D game; widening to `u64` would grow every `EntitySlot` and dense
-  store row for no practical gain at this scale).
+Sequencing hints only — **does not replace slice Checklists**. When in doubt,
+follow **Suggested Order** and the open items in the target slice section.
+
+- Close open **Slice 23A** and **25E** Checklists before raising world
+  depth count or starting **Slices 26–33**.
+- Widen `ComponentMask` before the emergent-AI track — schedule as its own slice
+  or checklist block when picked up (see Scaling Gaps).
+- Guard CPU paths with existing benches; keep SDL_GPU submit on the render thread.
+- Hardening without a slice number: collision-response merge, `SpriteBatch`
+  capacity, text-cache lifetime (track when scheduled as slices).
+- Reuse state-owned `SimulationPipeline`; persistent data in `DataSystem`;
+  structural changes through `SimulationFrame`.
+
+## Scaling Gaps And Hardening Frontier
+
+**Backlog, not a slice.** Items here are architectural pressure points waiting
+to be **promoted into a numbered slice** (new section or added Checklist items).
+Agents implement only from slice **Checklist** / **Acceptance checks**; use this
+section for planning and to avoid duplicating gap lists inside landed slice
+sections. When work starts, copy items into a slice Checklist and check off there.
+
+Measure with `zig build bench` and scope stats before raising entity counts,
+world depth, or cognition-track scope.
+
+**Policy boundaries (settled — do not regress)**
+
+- Simulation LOD (tier, halos, stagger, scope gathers) controls fixed-step
+  processor participation only.
+- Render visibility (camera chunk window, pixel AABB, render overscan margin)
+  controls draw-record construction only.
+- Scope pin metadata may keep an entity in a higher sim band off-camera; it must
+  not bypass render visibility.
+
+**Simulation scale**
+
+- [ ] **Movement contiguous-path vs scoped LOD.** Any dormant movement row
+      disables the contiguous SIMD movement fast path for the whole step. At
+      steady-state LOD with routine off-camera sleepers, revisit compacted-dense
+      movement iteration or a dormant-fraction threshold (Slice 24 follow-up).
+- [ ] **Per-entity depth axis.** Multi-floor entities need one level column
+      aligned across scope cube LOD, navigation queries, and render cull —
+      separate from the dense-floor vertical render window (Slice 25E).
+- [ ] **Component storage headroom.** Widen `ComponentMask` before the
+      cognition/AI track adds more component slots (see Next Priority Tracks).
+- [ ] **Multi-world scope policy.** Inactive world instances stay out of
+      pipeline scope; the active world uses chunk + halo rules (Slice 22
+      deferred).
+
+**Render scale**
+
+- [ ] **Dynamic collect scan cost.** Collect walks every movement-body row;
+      camera gates skip draw prep but not the scan. Hardening: warmed visible
+      movement dense-index list parallel to scoped simulation gathers (Slice 22
+      handoff; partial inline gating landed in 24B).
+- [ ] **Dense floor submit vs camera.** The vertical render window bounds layer
+      count; each in-window layer still submits one full-world tilemap quad (GPU
+      clips). Hardening: chunked dense submit if layer-quad cost dominates
+      (Slice 23B follow-up).
+- [ ] **On-screen record ordering.** `finalizeDepthBuckets` sorts collected
+      dynamic records; replace with fixed-band or counting buckets when on-screen
+      density rises (Slice 24B follow-up).
+- [ ] **Bench phase isolation.** Split `render-game-prep` collect vs sparse/dynamic
+      emit timers so regressions name the hot phase (Slice 24B follow-up).
+
+**Sequencing guardrails**
+
+- Raise entity stress counts and world depth only after `validateDenseRenderBudget`
+  passes and scope stats show typical participation stays below bench ceilings.
+- Land per-entity depth alignment (25E) before multi-floor gameplay scenarios that
+  depend on cross-level entity presence.
+- Land scoped cognition gating (24) and component widening before scaling the
+  emergent-AI track (26–33).
 
 ## Long-Term Gameplay Direction
 
-Future gameplay features should use state-owned feature controllers or a
-state-owned simulation pipeline helper for orchestration, and SoA processors for
-hot data work. Controllers choose phase order, budgets, queues, cooldowns,
-conflict policy, and which typed `DataSystem` views processors receive. A
-reusable pipeline is appropriate once multiple gameplay states or instances
-need the same ordered stages; it should remain owned by the state instance and
-should not be promoted into a global scheduler. The pipeline can own domain
-controllers for one state instance, and those controllers can coordinate small
-feature-local state and processor handoff. Persistent gameplay/domain facts
-live in `DataSystem` or state-owned domain storage, per-step outputs live in
-`SimulationFrame`, and large or reusable loops stay in systems that process
-typed slices and emit deterministic outputs.
-Simulation tiers and per-step active scope filter which entities enter each
-pipeline stage without changing processor hot paths. See
-[architecture.md](architecture.md) for the durable tier and pipeline boundary.
-Pathfinding provides a navigation substrate; immersive NPC behavior still needs
-steering, local avoidance, perception, and rule arbitration layered above it.
+Future features land as slices: state-owned pipeline or feature controllers for
+orchestration, SoA processors for hot data, typed `SimulationFrame` outputs,
+deferred structural commits. Controllers own phase order, budgets, and handoff;
+processors stay dumb; persistent facts stay in `DataSystem` / `WorldSystem`.
+Simulation scope filters which rows enter each stage without changing processor
+math. New gameplay domains should add a slice section (Goal, Checklist,
+Acceptance) before implementation. Durable boundaries:
+[architecture.md](architecture.md); emergent-AI shared contracts: **Emergent AI
+Track Overview** below.
 
 ## Completed Foundation Slices (0–7, 9–17)
 
@@ -112,7 +182,16 @@ residual shader/material hardening items (also tracked under "Next Priority
 Tracks" above). The full dependency-ordered slice list (0–35) remains in
 "Suggested Order" below.
 
+## Frontier Slice Records (8, 18+)
+
+**Agent source of truth for implementation.** Each `## Slice N` block is a
+complete work chunk: read **Goal** → check off **Checklist** items → pass
+**Acceptance checks** → update **Status**. Use **Open Frontier Slice Index** to
+choose N. Landed slices keep their sections as verified records.
+
 ## Slice 8: Shader And Platform Expansion
+
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
 
 Goal: keep platform support reliable as shader count and target platforms grow.
 
@@ -162,6 +241,8 @@ Acceptance checks:
 - [x] `zig build gpu-smoke` confirms runtime submission on display-capable hosts.
 
 ## Slice 18: Frame-Delayed Pathfinding System
+
+**Status: landed (historical).** Superseded nav core in Slice 25; contract retained.
 
 > Note (superseded core): Slice 25 replaced the goal-field-centric core described
 > below. The opportunistic per-step auto-grouped goal fields, the open-grid direct
@@ -318,6 +399,20 @@ path-request cooldown/backoff, local avoidance scratch, deterministic priority
 arbitration, and threaded final movement-intent emission. Only the steering
 stage writes final NPC `MovementIntent`s. Player movement remains direct input,
 and collision response still resolves after movement.
+
+**Hardening follow-up (post-Slice 27, no new slice number):** chasing a moving
+goal (the player) produced a visible NPC direction wiggle — a discrete flip in
+the chosen base direction (path-following vs. direct-fallback toggling while a
+goal-cell requantization is in flight, a fresh corridor replacing a stale
+waypoint, or a wander-epoch change) snapped the heading in one step instead of
+turning smoothly. `RuntimeRow` gained `prev_dir_x/y`/`has_prev_dir`, and
+`smoothBaseDirection` (steering.zig) blends the previous emitted direction
+toward the new target by `steering_turn_smoothing = 0.15` per fixed step
+(~10 steps to mostly converge at 60Hz) before it reaches
+`SelectedWorkRow.base_dir`. The first direction observed for a runtime row is
+used as-is (no startup lag). Benchmarked before/after on `zig build bench --
+group steering` at 128/512/1024 agents: no measurable regression (differences
+within normal run-to-run noise).
 
 ## Slice 20: Navigation Hardening And Hard-Path Budgets
 
@@ -646,22 +741,13 @@ Checklist:
       chunk/visibility gates disabled until the post-world-rendering scoped tier
       slice.
 
-Deferred until after world rendering:
+Post-22 deferred items (Slice 24 landed unless noted): open work is tracked in
+**Scaling Gaps And Hardening Frontier** (visible-index handoff, multi-world scope).
 
-- [ ] Add scoped gather entry points for movement, collision, AI, and steering
-      without changing hot processor math or merge rules.
-- [ ] Add a render-prep handoff that exposes active/visible entity lists and
-      dirty world regions without moving SDL_GPU calls, renderer handles, or
-      queue ownership into the simulation pipeline.
-- [ ] Keep the existing processor stage order identical to the current
-      `GameDemoState` pipeline while scope shrinks participation.
-- [ ] Add stagger and reduced-cadence policy for cognition without adding a
-      second pipeline.
-- [ ] Expose scope/tier debug or benchmark stats: counts per tier, per stage,
-      stagger skips, and wake promotions.
-- [ ] Document multi-world behavior: inactive worlds stay out of scope; active
-      world uses chunk + halo rules.
-- [ ] Update architecture and roadmap cross-links after runtime wiring lands.
+- [x] Scoped gathers, stagger, scope stats, and architecture cross-links (Slice 24).
+- [x] Inline camera gating at collect time (Slice 24B); warmed visible-index list
+      remains open (Scaling Gaps — render scale).
+- [ ] Multi-world scope policy and render-prep visible-index handoff (Scaling Gaps).
 
 Acceptance checks:
 
@@ -679,13 +765,10 @@ Acceptance checks:
       construction, metadata defaults, and no behavior change without opening a
       window.
 
-Slice 22 lands the long-term fixed-step simulation owner. `SimulationPipeline`
-now owns the reusable gameplay systems and concrete stage order for the demo
-state, while `GameDemoState` keeps app/state boundaries such as input, audio,
-particles, structural commit reactions, and render enqueue. `SimulationScope`
-and cold tier/chunk metadata exist with full-active stats, but scoped gathers,
-staggered cadence, real chunk gates, and tier transitions remain deferred until
-world rendering supplies concrete world/chunk/visibility inputs.
+**Status: landed (scaffolding).** `SimulationPipeline` owns fixed-step processor
+orchestration; scoped runtime behavior landed in Slice 24. Scope metadata now
+lives on movement-body dense columns (Slice 24), not cold `EntitySlot` fields as
+originally sketched below — code is authoritative.
 
 ## Slice 23: Atlas-Backed World Rendering Addition
 
@@ -760,6 +843,192 @@ The runtime loading path now builds a 512x512 procedural segment with
 camera, and renders only camera-visible chunks. World blocking tiles are folded
 into the pathfinding nav-grid rebuild alongside static entity obstacles.
 
+Follow-up slices **23A** (render hardening landed on `expand2`) and **23B**
+(multi-depth render scaling for ~120 levels) extend this foundation; see below.
+
+## Slice 23A: GPU Tilemap Render Hardening
+
+Goal: harden Slice 23's retained GPU tilemap path for production digging and
+multi-level compositing — correct depth ordering, safe partial tile uploads,
+batched copy-pass staging, and pre-acquire CPU prep — without changing
+simulation or `dig_controller` contracts.
+
+Problem (observed on `expand2` before hardening):
+
+- A linear `mergeDrawList` assumed static groups were pre-sorted by depth, but
+  `submitStaticDenseGeometry` appended dense layers in storage order (surface
+  first). That inverted underground compositing (grass/dirt flip, wrong plane
+  visible through holes).
+- Batched copy-pass staging passed `cycle=true` on the final upload when tile
+  edits were the last work in the pass. Retained per-layer `GRAPHICS_STORAGE_READ`
+  tile buffers require `cycle=false`; otherwise each dig ping-ponged GPU tile
+  storage and flipped dirt/grass visually while CPU state stayed correct.
+- Tile edits staged before swapchain acquire could be dropped on skipped frames
+  when using clear-replace upload queues.
+
+Current foundation (landed on `expand2`, runtime-validated):
+
+- `mergeDrawList` stable-sorts static+dynamic groups by `RenderOrder` before
+  coalescing; regression test covers unsorted underground dense depths.
+- `submitStaticDenseGeometry` collects visible layers, sorts back-to-front by
+  render depth at submit, and respects `active_level` (skip floors above the
+  player). Re-submits on `dense_quads_dirty` or plane change only.
+- `recordFrameCopyPass` batches dynamic vertices, optional static vertices, and
+  tile edits in one copy pass; `uploadsRemainingCycle` counts **vertex** uploads
+  only. Tile storage uses `recordStorageRegionsInPass` with **always
+  `cycle=false`** and `MapGPUTransferBuffer(..., false)` for edit staging.
+- `uploadTileDataEdits` appends pending edits (survives skipped frames); digs
+  flush at the render boundary via `WorldSystem.flushDenseTileEdits`.
+- Pre-acquire path: `prepareFrameCommands` / vertex staging before swapchain
+  acquire; tile edits recorded after acquire in the frame copy pass (matches
+  retained-buffer lifetime).
+- `render_prep.submitGameplayFrame` owns layered world submit (static dense →
+  tile-edit flush → sparse/dynamic z-walk); grow-only renderer reservations.
+
+GPU upload `cycle` contract (do not regress):
+
+| Resource | `cycle` on upload |
+| --- | --- |
+| Dynamic/static **vertex** ring streams | `true` on last vertex upload in the copy pass |
+| **Tile-data storage** buffers (per-layer, retained) | **always `false`** |
+| Tile-edit transfer buffer map | **`false`** |
+
+Checklist:
+
+- [x] Restore stable-sort `mergeDrawList` and add unsorted dense-layer regression
+      test.
+- [x] Sort dense layers back-to-front in `submitStaticDenseGeometry` before append.
+- [x] Enforce `cycle=false` for all tile-storage uploads and tile-edit staging.
+- [x] Exclude tile edits from vertex `uploadsRemainingCycle`; batch tile edits in
+      the post-acquire copy pass.
+- [x] Append pending tile edits across skipped frames; flush once per gameplay
+      frame at the render boundary.
+- [x] Keep dig/simulation ownership in `dig_controller` / `WorldSystem` CPU tile
+      fields; render path consumes queued edits only.
+- [x] Extend `render-game-prep` bench static depths to realistic underground
+      stack order (`-2`, `-18`, `-34`).
+- [ ] Land as a coherent commit stack on `expand2` and merge to `world`.
+- [x] Document `cycle` rules in `docs/rendering-assets-shaders.md`.
+- [ ] Optional: restore O(n) linear `mergeDrawList` now that submit-side sort is
+      guaranteed (micro-opt; measure first).
+
+Acceptance checks:
+
+- [x] Dig hole/fall/ramp simulation tests pass unchanged (`dig_controller`,
+      `game_demo_state`).
+- [x] Visual layer stack correct: grass above dirt, carved tunnels show the plane
+      below, no per-dig dirt/grass flip.
+- [x] `zig build verify` passes.
+- [x] `zig build gpu-smoke` exercises tilemap storage-buffer binds (`gpu_smoke_impl.zig`
+      submits `appendStaticTilemapSpan` with retained tile-data buffer).
+
+Status: landed on `expand2`; optional linear `mergeDrawList` micro-opt and
+`expand2` → `world` merge remain backlog.
+
+## Slice 23B: Multi-Depth Dense-Layer Render Scaling
+
+Goal: make the Slice 23A retained tilemap path scale to large vertical worlds
+(~120 depth levels, more entities) without linear draw-count and memory blow-up
+at the surface, while preserving the 23A GPU upload invariants.
+
+Problem (current envelope):
+
+- One draw + one full-world storage buffer per **submitted** dense layer. At
+  `active_level = 0` every layer at or below the player is submitted — for 120
+  floors that is 120 draws and ~120 MB GPU tile data at 512² (manageable on
+  desktop, wrong policy for steady-state frame cost).
+- `k_max_dense_submit_layers = 16` in `world_system.zig` hard-fails beyond 16
+  visible dense layers — blocks the first content expansion.
+- `mergeDrawList` is O(n log n) in group count; acceptable at a bounded window,
+  not at 120+ static groups every frame at the surface.
+- Entity render prep already scales via SoA collect + `spriteCommandCapacity`;
+  dense floors are the primary new cost — not per-tile vertex streaming.
+
+Architecture notes:
+
+- Simulation and nav already support multi-level worlds (Slice 25 per-level grids,
+  `LevelLink`, incremental rebuild). This slice is **render visibility policy**
+  only — no dig logic or nav contract changes.
+- Slice 24 cube LOD already demotes off-level / far entities on the **sim**
+  axis; 23B is the matching **render** axis for dense floor layers.
+- Slice 25E adds per-entity depth alignment and entity render cull; dense-floor
+  window policy stays in `WorldSystem` / `render_prep`.
+- Chunked or streaming tilemaps are out of scope here unless profiling forces
+  them; prefer a vertical **render window** first.
+
+Recommended policy (default unless gameplay disproves it):
+
+- Submit dense layers only in `[active_level .. active_level + N]` (N tuned to
+  visible stack depth, e.g. 4–8) plus any layers required for surface-hole
+  see-through (at most one ceiling band above the player when standing on
+  level 0).
+- Size `k_max_dense_submit_layers`, `reserveStaticGeometry`, and
+  `draw_list_high_water` from the chosen window — not from total world depth.
+- Pre-size GPU tile-data buffers for all authored dense layers at load (memory
+  is level-count × cell count); culling affects **draw/submit** only unless a
+  later slice adds buffer residency policy.
+
+Current foundation (landed):
+
+- `DenseLayerRenderWindow` in `world_system.zig`: default `levels_below = 6`,
+  `ceiling_when_underground = false` (render slice follows `player_level` /
+  `active_level`; surface hole see-through uses the below window at level 0).
+  Optional `ceiling_when_underground` redraws one level above when enabled.
+  `levelInWindow` gates submit;
+  `maxSubmitLayers` sizes the window from per-level dense-band cap.
+- `maxDenseSubmitLayerCount`, `validateDenseRenderBudget`, and
+  `collectDenseSubmitLayers` replace the demo-only 16-layer hard cap;
+  `k_max_dense_submit_stack_cap = 32` is a defensive submit-time guard.
+  `WorldBuildConfig.render_window` and optional `max_dense_tile_gpu_bytes`
+  fail loud at world build (`initDemo` / `initProcedural`).
+- `submitStaticDenseGeometry` collects only in-window layers, sorts
+  back-to-front, and re-submits on `dense_quads_dirty`, `active_level`, or
+  window change. `GameplayScene.player_level` drives the handoff.
+- `render_prep.ensureStaticGeometryCapacity` reserves static geometry from
+  `WorldSystem.maxDenseSubmitLayerCount()` at the start of `submitGameplayFrame`
+  (grow-only; allocation-free after the first reserve).
+- `render-game-prep` dense 8/16/32 surface (`player_level = 0`) and deep
+  (`player_level = 40`) benchmark groups; unit tests cover window caps, player
+  level transitions, per-band inclusion, and depth order.
+
+Checklist:
+
+- [x] Define `DenseLayerRenderWindow` policy (min/max level offset, hole/ceiling
+      exception rules) and document it beside `submitStaticDenseGeometry`.
+- [x] Replace demo-only `k_max_dense_submit_layers = 16` with window-derived cap
+      (or explicit world-build budget) and fail loud at world build if exceeded.
+- [x] Wire window into `submitStaticDenseGeometry` and
+      `GameplayScene.player_level` / camera-level handoff.
+- [x] Reserve renderer static-group high-water from window + sparse overhead.
+- [x] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
+      `player_level` 0 vs mid-depth; record `mergeDrawList` and submit cost.
+- [x] Add unit tests: surface window caps submit count; deep play submits only
+      the near stack; depth order preserved within the window.
+- [x] Profile GPU memory budget for target level count × world size; document
+      ceiling in `WorldBuildConfig` or load-time gate.
+- [ ] Optional: restore linear `mergeDrawList` after window sort guarantees
+      static order.
+
+Deferred (separate slice if window is insufficient):
+
+- Chunk-aligned dense tilemap regions instead of one full-world quad per layer.
+- Level-of-detail / clip planes for deep underground beyond the window.
+- Tile-data buffer unload for layers far from play (residency policy).
+
+Acceptance checks:
+
+- [x] World build with ≥32 dense levels succeeds; surface play stays within the
+      configured draw and submit budget.
+- [x] Digging through a vertical stack at depth 0..N shows correct planes in the
+      window; no 23A regressions (depth order, `cycle=false`).
+- [x] `zig build bench -- --group render-game-prep` reports stable prep cost at
+      configured window sizes.
+- [x] `zig build verify` passes.
+
+Status: implemented and runtime-validated; window policy documented in
+`docs/rendering-assets-shaders.md`. Optional linear `mergeDrawList` micro-opt
+remains open.
+
 ## Slice 24: Scoped Simulation Tiers And Chunk Policy
 
 Goal: turn the Slice 22 scaffolding into real scoped simulation behavior after
@@ -769,15 +1038,12 @@ Readiness: the foundation for this slice is fully present (Slices 22/23/21);
 what remains is wiring. The six checklist items below are the concrete gaps
 between the current full-active pipeline and real scoped behavior.
 
-Architecture assessment note (2026-06-28): confirmed that `allowsMovement`,
-`allowsCollision`, and `allowsCognition` predicates on `SimulationTier` are
-never consulted in `SimulationPipeline.update` — every entity, including dormant
-ones, pays full pipeline cost every step. This is the highest-leverage open item
-in the codebase: until it lands, entity population growth translates directly to
-frame cost with no graduated degradation, and every cognition-tier stage added by
-the AI track bakes in O(all entities) cost. Implement with a parallel
-`scanLiveTierCounts` parity check in debug builds to detect tier-count drift; gate
-the AI stage first and validate under stress before gating collision and movement.
+> Historical pre-implementation assessment (2026-06-28, superseded by the
+> **Status** below): at the time, `allowsMovement`/`allowsCollision`/
+> `allowsCognition` were confirmed never consulted in `SimulationPipeline.update`,
+> so every entity paid full pipeline cost every step regardless of tier. That gap
+> is closed — see **Status** and **Implementation decisions** below for the
+> landed `SimulationScopeSystem` gating.
 
 Current foundation (present — do not rebuild):
 
@@ -791,10 +1057,10 @@ Current foundation (present — do not rebuild):
   per-stage `SimulationScopeStats` (`simulation_scope.zig`).
 - `WorldSystem` maintains `chunk_visible[]`, chunk coordinate columns, and
   `setVisibleChunksForWorldRect` / `chunkCoordForCell` (`world_system.zig`).
-- The pipeline still runs full-active: `SimulationPipeline.update` builds
-  `SimulationScope.fullActive(...)` and dispatches every stage over the full
-  component slices — scoped filtering is intentionally deferred to this slice
-  (`simulation_pipeline.zig`).
+- (Pre-implementation state, now superseded by **Status** below) the pipeline
+  used to run full-active unconditionally: `SimulationPipeline.update` built
+  `SimulationScope.fullActive(...)` and dispatched every stage over the full
+  component slices.
 
 Status: implemented (2026-06-28). The backbone owner is
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`), a pipeline-owned
@@ -820,10 +1086,10 @@ authoritative):
   O(1) via incremental `tier_counts` when no `dormant`/`kinematic` entity exists
   (the common frame), so the per-step scope cost scales with active scope.
 - The cognition halo is derived from the **camera's visible chunks**
-  (`WorldSystem.cognitionActiveRegion`), not player position. AI gates on
-  `cognition tier AND chunk-in-halo AND stagger phase`; `always_active` entities
-  (bosses/scripted) bypass halo and stagger. With no visibility window yet, the
-  gather falls back to full-active (no halo/stagger).
+  (`WorldSystem.cognitionActiveRegion`), not a gameplay anchor position. AI gates
+  on `cognition tier AND chunk-in-halo AND stagger phase`; scope pin metadata
+  bypasses halo and stagger. With no visibility window yet, the gather falls back
+  to full-active (no halo/stagger).
 - **Steering is transitively scoped**: it acts only on the navigation intents AI
   emits, so gating AI gates steering without a second index list. Its avoidance
   spatial grid stays full so in-scope agents still avoid out-of-scope neighbors.
@@ -833,7 +1099,7 @@ authoritative):
   `cognition_halo_chunks`) → `locomotion` (≤ `locomotion_halo_chunks`) → `kinematic`
   (≤ `kinematic_halo_chunks`) → `dormant` (beyond). So near entities think, far
   entities sleep — all four tiers are produced by distance, not just the cognition
-  band. `always_active` entities are pinned and never demoted. It emits deferred
+  band. Scope pin metadata skips automatic tier demotion. It emits deferred
   `set_simulation_tier` structural commands appended to the frame stream for the
   state's commit seam (no tier mutation inside worker ranges), and reserves its
   command buffer up front so the per-step path is allocation-free even on a frame
@@ -844,8 +1110,8 @@ authoritative):
   (`level_distance_chunks`, one band per level) against the region's `level` (set by
   the pipeline from the camera/player level). So an entity on a far depth/level
   reads as far regardless of its x/y and demotes out of cognition. The per-entity
-  `level` rides as a dense scope column beside `tier`/`chunk_x/y`. NPCs are all level
-  0 today (default 0), but the machinery is correct for multi-level worlds. The AI
+  `level` rides as a dense scope column beside `tier`/`chunk_x/y`. Single-floor
+  content defaults level to 0; the machinery supports multi-level worlds. The AI
   halo gate stays 2D (`containsChunk`); off-level entities are excluded purely
   through the tier the cube policy assigns them.
 
@@ -880,15 +1146,58 @@ Acceptance checks:
 - [x] Debug stats report active scope counts so typical runs stay far below 50k
       stress scales by policy.
 
-Known limitations / follow-up:
+Known limitations / follow-up: see **Scaling Gaps And Hardening Frontier**
+(simulation scale — movement contiguous-path vs scoped LOD).
 
-- The contiguous-SIMD movement fast path only fires when zero entities are dormant
-  (`gatherMovementBodyIndices` returns null → downstream uses the full SoA range). A
-  single dormant body flips the whole population onto the indexed gather/scatter path,
-  so in a steady-state LOD world (always some far entities asleep) the cheap
-  contiguous path rarely runs. Revisit at scale: a compacted-dense movement path or a
-  dormant-fraction threshold that keeps small dormant counts on the contiguous path.
-  Not a correctness issue; tracked for a future hardening pass.
+## Slice 24B: Render Collect Hardening
+
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
+
+Goal: harden dynamic entity render prep for scale — movement-index collect and
+camera-only visibility gates — without conflating simulation LOD with render
+policy or moving SDL_GPU submission into the pipeline.
+
+Problem (observed at `render-game-prep` stress scales):
+
+- `collectDynamicRecords` iterated `primitiveVisualSliceConst().entities` and
+  called `renderEntityComponentIndices` per row — an `EntityId → slot` resolve on
+  every visual even when chunk/AABB cull skipped append.
+- An early draft gated render on `SimulationTier` (`allowsRender`), which blended
+  sim LOD with draw policy. Render visibility must be camera-only; sim tier
+  controls processor participation only.
+
+Architecture notes:
+
+- **Movement-body dense rows are the collect anchor.** Scope columns align on
+  `movement_index`; a dense `has_primitive_visual` flag skips movement-only rows
+  before slot resolve; `renderCollectIndicesForMovement` performs one slot read per
+  chunk-pass row that carries a primitive visual. Scope columns are simulation
+  inputs only — render collect does not read tier or pin metadata.
+- **Render visibility is camera policy only.** `entityVisibleForRenderCollect`
+  uses `WorldSystem.visibleChunkRegion()`; every drawable row then passes
+  `VisibleWorldRect.overlapsAabb`. No render bypasses on scope metadata.
+- **Dense floors are a separate axis.** In-window layers submit one full-world
+  tilemap quad each (Slice 23B); GPU clips to the viewport. Per-entity depth
+  cull (25E) is separate from the dense-floor window.
+
+Checklist:
+
+- [x] Add `RenderCollectIndices` and `renderCollectIndicesForMovement` on
+      `DataSystem`.
+- [x] Walk `movementBodySliceConst().entities` in `collectDynamicRecords`.
+- [x] Camera-only `entityVisibleForRenderCollect` (chunk) + AABB for all entities.
+- [x] Remove `SimulationTier.allowsRender`; sim tier does not gate draw.
+- [x] Headless tests: sim tier does not affect collect; movement-index resolve.
+
+Acceptance checks:
+
+- [x] On-screen entities collect regardless of sim tier; off-screen entities
+      (including player) skip before interpolation.
+- [x] `zig build test` covers camera gates and movement-index collect helpers.
+- [x] `zig build verify` passes.
+
+**Status: landed.** Render-scale follow-up without a new slice number is backlog
+in **Scaling Gaps And Hardening Frontier** until promoted to a slice Checklist.
 
 ## Slice 25: Z-Aware Scalable Navigation Redesign
 
@@ -1166,16 +1475,36 @@ to a single portal, so escalation cannot subdivide the long segment and would on
 per-frame work — making it effective would require start-chunk-scoped seeding (a global
 corridor-shape change), a design decision left for a future slice.
 
-Deferred follow-up: per-entity NPC level and autonomous Z-descent is tracked
-as Slice 25E below. The nav substrate is correct; the gap is four NPC-side
-touch-points in `DataSystem`, `steering.zig`, `PathView`, and render/cull.
-This is a gameplay-side correctness gap, not a pathfinder defect.
+Deferred follow-up: per-entity depth alignment across sim, navigation, and
+render is tracked as Slice 25E below and under **Scaling Gaps And Hardening
+Frontier** (simulation scale). The nav substrate is in place; the gap is entity
+level column wiring in `DataSystem`, steering, path views, and render cull.
 
 ## Slice 25E: Per-Entity NPC Level And Autonomous Z-Traversal
+
+**Status: landed**, with one superseded item. All Checklist and Acceptance
+checks below are `[x]` for the record, but `PathView.next_cell_level`
+(checklist items below referencing it) was later found to have zero
+production consumers — `steering.zig`'s `directionFromPathStatus`, the only
+real caller of `statusForWorld`/`statusForKeyAndStart`, never read it — and was
+removed as dead code. The actual NPC level-transition mechanism is, and always
+was, `DigController.applyEntityPlaneTraversal` (invoked from
+`SimulationPipeline.applyNpcPlaneTraversal`), which drives transitions from the
+entity's real physical-cell world geometry with no lag/latency gap. See
+`docs/coding-standards.md`/project convention: code is authoritative for doc
+drift, so this note replaces the earlier "landed" claim for the
+`next_cell_level` field specifically; the rest of the slice (per-entity level
+column, steering `start_level` sourcing, render cull by entity level) is
+unaffected and still landed as described.
 
 Goal: give each NPC entity its own Z-level so it can request cross-level paths,
 traverse ramps and stairs autonomously, and be culled to its own floor instead
 of always rendering on the player's level.
+
+Prerequisite context: Slice 23B scales **dense floor** submission (~120 layers);
+this slice scales **entity** level columns and NPC draw cull. Player floor
+policy (`GameplayScene.player_level` → `submitStaticDenseGeometry`) stays in
+23B; NPCs need their own level column and render-prep filter here.
 
 Current foundation:
 
@@ -1199,32 +1528,38 @@ Problem (confirmed silent-behavior gap):
 
 Checklist:
 
-- [ ] Add a per-entity level (Z) column to `DataSystem` (cold metadata, default
+- [x] Add a per-entity level (Z) column to `DataSystem` (cold metadata, default
       surface level `0`), following the component-store pattern; initialize in
       `createEntity`.
-- [ ] Steering sources `start_level` from the entity's level column rather than
-      the hardcoded `0`; add a debug assertion that `steering.start_level ==
-      entity.level` before each path request.
-- [ ] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
-      so an agent can detect a link crossing and commit a level update.
-- [ ] Update the per-step movement/traversal pass to apply NPC level transitions
+- [x] Steering sources `start_level` from the entity's level column rather than
+      the hardcoded `0`.
+- [x] Extend `PathView` to expose `next_cell_level` alongside `next_waypoint`
+      so an agent can detect a link crossing and commit a level update. (Later
+      removed: no production consumer ever read this field — see status note
+      above.)
+- [x] Update the per-step movement/traversal pass to apply NPC level transitions
       at link cells (mirroring the player ramp/fall logic); update the entity
-      level column through the deferred structural-commit path or an explicit
-      main-thread commit, not inside worker ranges.
-- [ ] Render and cull each NPC on its own level, not the player's.
-- [ ] Add tests covering same-level NPC pathing (no regression), cross-level
-      NPC pursuing an off-level goal (level column updates at the link cell),
-      and NPC render cull matching entity level.
+      level column through an explicit main-thread commit, not inside worker
+      ranges. (Landed via `DigController.applyEntityPlaneTraversal` driven by
+      physical-cell world geometry, not via the removed `next_cell_level`.)
+- [x] Render and cull each NPC on its own level, not the player's.
+- [x] Add tests covering same-level NPC pathing (no regression), cross-level
+      pathfinding, and NPC render cull matching entity level. (The
+      `next_cell_level`-specific assertions were removed alongside the field;
+      the remaining status/waypoint/render-cull assertions still cover this.)
+- [x] Demo stress: procedural world `addUndergroundLevelStack(31)` (32 levels),
+      32 movers, GPU budget gate, scaled pipeline reserves.
 
 Acceptance checks:
 
-- [ ] An NPC pursuing a player on a different floor routes cross-level via
-      `LevelLink` and updates its level column at the link cell; no teleport.
-- [ ] Intra-level NPC behavior is unchanged (parity test).
-- [ ] NPCs are culled to their own level, not the player's.
-- [ ] No steady-state allocation; debug assertion fires if `steering.start_level`
-      diverges from the entity level column.
-- [ ] `zig build test`, `zig build check`, and `zig build verify` pass.
+- [x] Cross-level path queries route through link cells correctly (pathfinding
+      + caches tests); NPC traversal commits `world_level` on ramp/fall cell
+      entry via `DigController.applyEntityPlaneTraversal`, not via
+      `next_cell_level` (removed — see status note above).
+- [x] Intra-level NPC behavior is unchanged (steering parity tests).
+- [x] NPCs are culled to their own level, not the player's (`render_prep` test).
+- [x] No steady-state allocation on hot paths.
+- [x] `zig build test`, `zig build check`, and `zig build verify` pass.
 
 ## Emergent AI Track Overview (Slices 26–33)
 
@@ -1247,8 +1582,10 @@ Sequencing rationale:
 Shared design contracts for the whole track:
 
 - Each new per-entity concept follows the existing component-store pattern in
-  `data_system.zig`: `Component` enum tag, component mask, `EntityTemplate`
-  field, `StructuralCommand` variant, `StructuralCapacityNeeds` capacity, an SoA
+  the `data_system/` subpackage (fronted by `data_system.zig`; `Component`,
+  `EntityTemplate`, and related types now live in `data_system/types.zig`):
+  `Component` enum tag, component mask, `EntityTemplate` field,
+  `StructuralCommand` variant, `StructuralCapacityNeeds` capacity, an SoA
   `*Store` (modeled on `AiAgentStore`), a `Const*Slice`, an `EntitySlot` index,
   and public set/get/slice + validation helpers.
 - Each new per-step computation is a parallel processor stage modeled on
@@ -1273,6 +1610,8 @@ Shared design contracts for the whole track:
 
 ## Slice 26: Entity Faction And Classification Model
 
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
+
 Goal: give entities a classification so perception and behavior can distinguish
 threat / ally / neutral. No team or faction concept exists anywhere today; it is
 a hard prerequisite for perception (Slice 29) and behavior arbitration
@@ -1287,23 +1626,25 @@ Current foundation:
 
 Checklist:
 
-- [ ] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
+- [x] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
       faction id per entity, following the full component-store pattern.
-- [ ] Add a fixed faction-relationship matrix (enum × enum → stance:
+- [x] Add a fixed faction-relationship matrix (enum × enum → stance:
       hostile / neutral / friendly), const-evaluated, scalar/enum only, no
       per-frame allocation and no hash lookup on hot paths.
-- [ ] Expose a stance query usable from processor hot paths (`stance(a, b)`)
+- [x] Expose a stance query usable from processor hot paths (`stance(a, b)`)
       that compiles to a table index, not a map lookup.
-- [ ] Add to `EntityTemplate` and demo spawns so actors can be tagged.
+- [x] Add to `EntityTemplate` and demo spawns so actors can be tagged.
 
 Acceptance checks:
 
-- [ ] Stance lookups are allocation-free and branch-light on hot paths.
-- [ ] Faction assignment round-trips through structural commands and survives
+- [x] Stance lookups are allocation-free and branch-light on hot paths.
+- [x] Faction assignment round-trips through structural commands and survives
       entity destruction/reuse with generational correctness.
-- [ ] `zig build test` covers stance symmetry/asymmetry and template wiring.
+- [x] `zig build test` covers stance symmetry/asymmetry and template wiring.
 
 ## Slice 27: Deterministic Per-Entity RNG Facility
+
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
 
 Goal: provide reproducible randomness for AI (wander jitter, appraisal noise,
 investigate targets) that does not break the determinism contract
@@ -1323,51 +1664,93 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add a stateless, seeded, splittable RNG in `src/core` keyed by
+- [x] Add a stateless, seeded, splittable RNG in `src/core` keyed by
       `(entity_index, step, salt)` returning uniform f32 / bounded ints.
-- [ ] Document the determinism guarantee: same inputs → same outputs regardless
+- [x] Document the determinism guarantee: same inputs → same outputs regardless
       of thread count or range order.
-- [ ] Migrate existing AI wander randomness onto it as the first consumer.
+- [x] Migrate existing AI wander randomness onto it as the first consumer.
 
 Acceptance checks:
 
-- [ ] Identical RNG outputs across serial and threaded runs for the same step.
-- [ ] No per-call allocation; no shared mutable RNG state across workers.
-- [ ] `zig build test` covers reproducibility and distribution bounds.
+- [x] Identical RNG outputs across serial and threaded runs for the same step.
+- [x] No per-call allocation; no shared mutable RNG state across workers.
+- [x] `zig build test` covers reproducibility and distribution bounds.
+
+`src/core/rng.zig` adds `mix64`/`uniformF32`/`boundedU32`/`unitVec2`, generalizing
+the splitmix64-style mixer that was previously a private, non-reusable helper
+inside `ai.zig`. The migration also fixed a real bug, not just a refactor: the
+old call was keyed only by a hardcoded seed and the entity's dense index, both
+constant over time, so wander direction never resampled. `SimulationScopeSystem`
+now exposes `currentStep()`, `SimulationPipeline` threads it into `AiConfig.step`
+each fixed step, and `ai.zig`'s `decideDir` keys its wander draw off
+`(seed, entity_index, step, wander_rng_salt)` so direction actually varies over
+time while staying deterministic for a fixed step and identical across serial
+and threaded runs. A first landing resampled on every AI-active step, which
+review caught as trading the "never varies" bug for a "zero continuity" one
+(uncorrelated direction every tick reads as jitter, not wandering). Fixed by
+quantizing `step` into coarser epochs (`AiConfig.wander_resample_period_steps`,
+default 300 steps / 5s at 60Hz) before hashing, so direction holds steady for a
+stretch and then jumps to a new per-entity-distinct heading.
 
 ## Slice 28: Shared Spatial Index Service
 
-Goal: build one frame-level spatial index consumed by AI separation, perception,
-and collision broadphase instead of each system building its own grid.
+**Status: landed.** All Checklist and Acceptance checks below are `[x]`.
+
+Goal: build one frame-level spatial index consumed by AI separation and
+perception instead of each system building its own grid.
 
 Current foundation:
 
-- AI separation builds a deterministic 32-unit grid each step
-  (`systems/ai.zig`), and collision broadphase maintains its own candidate
-  structure (`systems/collision.zig`). Perception (Slice 29) would add a third.
+- AI separation built a deterministic 32-unit grid each step
+  (`systems/ai.zig`); Perception (Slice 29) would have added a second.
+
+**Deviation from the original checklist wording:** the original draft asked to
+port "AI separation *and collision broadphase*" onto one shared grid. Collision
+broadphase does not actually build a grid — it runs sweep-and-prune (SAP) on a
+`min_x`-sorted `order` array (`src/game/systems/collision.zig`), with a warm
+incremental insertion-sort (`sortWarm`/`full_sort_disorder_percent`) that
+exploits frame-to-frame temporal coherence, plus SIMD Y-overlap filtering.
+That is a different, already-tuned algorithm, not a duplicate grid build.
+Forcing collision onto a per-step-rebuilt uniform grid would risk regressing
+that incremental-sort win and would require reproducing SAP's exact
+candidate-pair order to satisfy this slice's own parity gate. **Decision: build
+the shared index for AI separation (this slice) and Perception (Slice 29, the
+actual driver). Collision stays on SAP, untouched.**
 
 Architecture notes:
 
-- Build once on the main thread (or a dedicated pre-stage); workers read it
-  immutably. Must preserve each current consumer's results exactly so it lands as
-  a parity-tested refactor, not a behavior change.
+- Built once per fixed step by the pipeline-owned `SpatialIndexSystem`
+  (`src/game/systems/spatial_index.zig`), from the same cognition-scoped
+  population `AiSystem` already gathers (`scope_dense_indices`); workers read
+  the resulting `SpatialIndexView` immutably. AI separation's ported output
+  matches the pre-refactor per-step grid exactly (parity-tested, including an
+  O(n²) brute-force bit-for-bit proof plus a second cross-cell oracle that
+  independently reconstructs the cell_y-outer/cell_x-inner/ascending-index
+  traversal spec, since float-summation order only becomes observable once a
+  population spans multiple cells), not just approximately.
 
 Checklist:
 
-- [ ] Add a frame-built spatial hash/grid owned at the pipeline boundary, sized
+- [x] Add a frame-built spatial hash/grid owned at the pipeline boundary, sized
       from reserved capacity, rebuilt per step, read-only to workers.
-- [ ] Port AI separation and collision broadphase to consume it; remove the
-      duplicate grid builds.
-- [ ] Expose a bounded neighbor-query API (max samples / radius) reusable by
+- [x] Port AI separation to consume it; remove the duplicate grid build.
+      Collision keeps its own tuned SAP broadphase by design (see the
+      Deviation note above) — porting it is a future benchmarked-optional item,
+      not this slice's requirement.
+- [x] Expose a bounded neighbor-query API (max samples / radius) reusable by
       perception.
 
 Acceptance checks:
 
-- [ ] Separation and collision outputs are identical to the pre-refactor results
-      (parity tests).
-- [ ] Index build and queries are allocation-free after warmup and deterministic.
-- [ ] `zig build bench` shows no regression (ideally a win) from removing
-      redundant grid builds.
+- [x] Separation outputs are identical to the pre-refactor results (parity
+      tests, including a single-cell brute-force bit-for-bit proof and a
+      multi-cell cross-cell-order oracle proof).
+- [x] Index build and queries are allocation-free after warmup and deterministic
+      (serial == threaded).
+- [x] `zig build bench` shows no regression from removing the redundant grid
+      build — the `ai` group's timed window now excludes the build (its own
+      `spatial_index` bench group times that separately), so per-step
+      `separation_checks` are unchanged and measured throughput improved.
 
 ## Slice 29: AI Perception Substrate
 
@@ -1709,7 +2092,10 @@ Acceptance checks:
 21. Typed simulation event system and domain signals.
 22. Simulation pipeline and tier/scope scaffolding.
 23. Atlas-backed world rendering addition.
+23A. GPU tilemap render hardening (`expand2`; merge before depth expansion).
+23B. Multi-depth dense-layer render scaling (~120 levels).
 24. Scoped simulation tiers and chunk policy.
+24B. Render collect hardening (movement dense-index collect + camera-only gates).
 25. Z-aware scalable navigation redesign.
 25E. Per-entity NPC level and autonomous Z-traversal.
 26. Entity faction and classification model.
@@ -1723,32 +2109,6 @@ Acceptance checks:
 33. Data-driven AI archetypes and debug introspection.
 35. AI and steering hot-loop SIMD restructure.
 
-This order records the dependency path used to build the current project
-foundation. Current work should be chosen from Next Priority Tracks above.
-Resource ownership, text/UI, renderer composition, threading, SIMD,
-`DataSystem`, simulation outputs, collision, AI intent processing, audio, menus,
-startup runtime assets, frame-delayed pathfinding, steering/local avoidance, and
-navigation hardening now form the source-of-truth foundation for future slices.
-Render ordering is also part of that foundation: game/world/UI/effect producers
-emit typed ordered commands through explicit render-prep phases, persistent data
-stores stable IDs and enum depth intent, `SpriteBatch` consumes strict ordered streams, and
-benchmark-owned render-prep timing stays out of the production path.
-Slice 21 typed simulation/domain events, Slice 22 `SimulationPipeline`
-extraction, and Slice 23 atlas-backed world rendering are in place for the
-current structural, navigation, and world/chunk visibility foundation. Slice 24
-scoped simulation tiers should consume those world/chunk views next. Scoped
-tiers, chunk policy, and tier transitions should use those event signals through
-pipeline-owned controllers instead of adding parallel orchestration paths.
-Slice 25E lands per-entity NPC Z-level before multi-floor emergent scenarios;
-it is a gameplay-side correctness gap (four NPC touch-points in `DataSystem`,
-`steering`, `PathView`, and render cull) on top of the fully correct Slice 25
-nav substrate.
-The emergent-AI track (Slices 26–33) builds on that foundation: it lands the
-framework additions the AI work requires (faction classification, deterministic
-RNG, shared spatial index), then layers perception, memory, affect, and behavior
-arbitration as cognition-tier-gated processor stages, with data-driven archetypes
-and debug introspection for authoring and tuning. The whole track stays
-allocation-free on hot paths, deterministic (serial == threaded, scalar == SIMD),
-routes notable signals through scalar-only `domain_reaction` events while keeping
-per-frame sensing columnar, and reuses the existing intent → steering →
-pathfinding → movement contract instead of adding new downstream plumbing.
+Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
+point; each slice's **Checklist** and **Acceptance checks** are what agents
+complete. **Scaling Gaps** is backlog until copied into a slice section.

@@ -330,6 +330,11 @@ pub const TextService = struct {
         return preparedFromEntry(self.resolveEntrySlot(entry_id).?);
     }
 
+    /// O(n) linear scan; callers must not invoke this on an unconditional
+    /// per-frame path. Its only caller, `loadFont`, is reached from one-time
+    /// init and dirty-checked call sites (see `FpsCounter.prepareForRender`'s
+    /// `font_size_changed` gate for the expected pattern), never unconditionally
+    /// per frame.
     fn findFont(self: *const TextService, desc: FontDesc) ?FontId {
         for (self.fonts.items, 0..) |slot, index| {
             if (!slot.alive) continue;
@@ -378,6 +383,9 @@ pub const TextService = struct {
         return slot;
     }
 
+    /// O(n) linear scan; callers must not invoke this on an unconditional
+    /// per-frame path — dirty-check first (see `FpsCounter.prepareForRender`'s
+    /// `texture_dirty`/`glyphsValid` gate for the expected pattern).
     fn findEntry(self: *const TextService, key: TextCacheKey) ?TextTextureId {
         for (self.entries.items, 0..) |slot, index| {
             if (!slot.alive) continue;

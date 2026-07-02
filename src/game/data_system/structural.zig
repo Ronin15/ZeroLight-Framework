@@ -1,0 +1,658 @@
+// Copyright (c) 2026 Hammer Forged Games
+// All rights reserved.
+// Licensed under the MIT License - see LICENSE file for details
+
+//! Deferred structural-command pipeline: capacity preflight (projects the
+//! command stream against current liveness/masks without touching real slots
+//! or dense stores), then command-order commit through DataSystem's already-
+//! pub accessor methods. Mirrors pathfinding/solve.zig's relationship to
+//! system.zig: these are free functions that borrow *DataSystem explicitly
+//! rather than living as DataSystem methods, keeping the wiring flat.
+
+const std = @import("std");
+const types = @import("types.zig");
+const EntityId = types.EntityId;
+const Component = types.Component;
+const ComponentMask = types.ComponentMask;
+const componentMask = types.componentMask;
+const EntityTemplate = types.EntityTemplate;
+const StructuralCommand = types.StructuralCommand;
+const StructuralCommitStats = types.StructuralCommitStats;
+const StructuralChange = types.StructuralChange;
+const DataSystem = @import("system.zig").DataSystem;
+const validateMovementBody = @import("movement.zig").validateMovementBody;
+const validatePrimitiveVisual = @import("visual.zig").validatePrimitiveVisual;
+const validateCollisionBounds = @import("collision.zig").validateCollisionBounds;
+const validateCollisionResponse = @import("collision.zig").validateCollisionResponse;
+const validateAiAgent = @import("agents.zig").validateAiAgent;
+const validateSteeringAgent = @import("agents.zig").validateSteeringAgent;
+
+pub const NullStructuralChangeSink = struct {
+    fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
+};
+
+pub const NullStructuralCommitPreparer = struct {
+    fn prepare(_: *NullStructuralCommitPreparer, _: usize) !void {}
+};
+
+const StructuralCapacityNeeds = struct {
+    // Preflight reserves every storage target before the commit loop. That
+    // keeps structural commits all-or-fail before DataSystem mutates.
+    slots: usize,
+    movement_bodies: usize,
+    facings: usize,
+    primitive_visuals: usize,
+    asset_refs: usize,
+    collision_bounds: usize,
+    collision_responses: usize,
+    ai_agents: usize,
+    steering_agents: usize,
+    world_levels: usize,
+    factions: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityNeeds {
+        return .{
+            .slots = data.slots.items.len,
+            .movement_bodies = data.movement_bodies.len(),
+            .facings = data.facings.len(),
+            .primitive_visuals = data.primitive_visuals.len(),
+            .asset_refs = data.asset_refs.len(),
+            .collision_bounds = data.collision_bounds.len(),
+            .collision_responses = data.collision_responses.len(),
+            .ai_agents = data.ai_agents.len(),
+            .steering_agents = data.steering_agents.len(),
+            .world_levels = data.world_levels.len(),
+            .factions = data.factions.len(),
+        };
+    }
+
+    fn validateLimits(self: StructuralCapacityNeeds) !void {
+        if (self.slots > std.math.maxInt(u32)) return error.TooManyEntities;
+        if (self.movement_bodies > std.math.maxInt(u32)) return error.TooManyMovementBodyRows;
+        if (self.facings > std.math.maxInt(u32)) return error.TooManyFacingRows;
+        if (self.primitive_visuals > std.math.maxInt(u32)) return error.TooManyPrimitiveVisualRows;
+        if (self.asset_refs > std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
+        if (self.collision_bounds > std.math.maxInt(u32)) return error.TooManyCollisionBoundsRows;
+        if (self.collision_responses > std.math.maxInt(u32)) return error.TooManyCollisionResponseRows;
+        if (self.ai_agents > std.math.maxInt(u32)) return error.TooManyAiAgentRows;
+        if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
+        if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
+        if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
+    }
+};
+
+const StructuralCapacityProjection = struct {
+    // Projection follows command-order creates, destroys, and first-time
+    // component additions without touching real slots or dense component stores.
+    current: StructuralCapacityNeeds,
+    required: StructuralCapacityNeeds,
+    free_slots: usize,
+
+    fn init(data: *const DataSystem) StructuralCapacityProjection {
+        const current = StructuralCapacityNeeds.init(data);
+        return .{
+            .current = current,
+            .required = current,
+            .free_slots = data.free_slot_count,
+        };
+    }
+
+    fn createSlot(self: *StructuralCapacityProjection) !void {
+        if (self.free_slots > 0) {
+            self.free_slots -= 1;
+            return;
+        }
+        self.current.slots = try addCapacity(self.current.slots, 1);
+        self.required.slots = @max(self.required.slots, self.current.slots);
+    }
+
+    fn destroySlot(self: *StructuralCapacityProjection) !void {
+        self.free_slots = try addCapacity(self.free_slots, 1);
+    }
+
+    fn addTemplate(self: *StructuralCapacityProjection, template: EntityTemplate) !void {
+        if (template.movement_body != null) try self.addComponent(.movement_body);
+        if (template.facing != null) try self.addComponent(.facing);
+        if (template.primitive_visual != null) try self.addComponent(.primitive_visual);
+        if (template.asset_reference != null) try self.addComponent(.asset_reference);
+        if (template.collision_bounds != null) try self.addComponent(.collision_bounds);
+        if (template.collision_response != null) try self.addComponent(.collision_response);
+        if (template.ai_agent != null) try self.addComponent(.ai_agent);
+        if (template.steering_agent != null) try self.addComponent(.steering_agent);
+        if (template.world_level != null) try self.addComponent(.world_level);
+        if (template.faction != null) try self.addComponent(.faction);
+    }
+
+    fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
+        const current = self.currentField(component);
+        const required = self.requiredField(component);
+        current.* = try addCapacity(current.*, 1);
+        required.* = @max(required.*, current.*);
+    }
+
+    fn removeComponent(self: *StructuralCapacityProjection, component: Component) void {
+        const current = self.currentField(component);
+        std.debug.assert(current.* > 0);
+        current.* -= 1;
+    }
+
+    fn currentField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.current.movement_bodies,
+            .facing => &self.current.facings,
+            .primitive_visual => &self.current.primitive_visuals,
+            .asset_reference => &self.current.asset_refs,
+            .collision_bounds => &self.current.collision_bounds,
+            .collision_response => &self.current.collision_responses,
+            .ai_agent => &self.current.ai_agents,
+            .steering_agent => &self.current.steering_agents,
+            .world_level => &self.current.world_levels,
+            .faction => &self.current.factions,
+        };
+    }
+
+    fn requiredField(self: *StructuralCapacityProjection, component: Component) *usize {
+        return switch (component) {
+            .movement_body => &self.required.movement_bodies,
+            .facing => &self.required.facings,
+            .primitive_visual => &self.required.primitive_visuals,
+            .asset_reference => &self.required.asset_refs,
+            .collision_bounds => &self.required.collision_bounds,
+            .collision_response => &self.required.collision_responses,
+            .ai_agent => &self.required.ai_agents,
+            .steering_agent => &self.required.steering_agents,
+            .world_level => &self.required.world_levels,
+            .faction => &self.required.factions,
+        };
+    }
+};
+
+fn addCapacity(value: usize, amount: usize) !usize {
+    return std.math.add(usize, value, amount);
+}
+
+// Module-pub (not facade-exported): system.zig's preflightStructuralCommands
+// wrapper needs to name this return type across the file boundary. Tests
+// never spell it directly (they use the inferred `try data.preflightStructuralCommands(...)`).
+pub const StructuralCommitPlan = struct {
+    // `structural_event_count` lets callers reserve their change sink before
+    // mutation so event publishing cannot fail halfway through commit.
+    command_count: usize,
+    capacity_needs: StructuralCapacityNeeds,
+    structural_event_count: usize,
+};
+
+const ProjectedEntityState = struct {
+    // Scratch copy of just the liveness and component membership needed for
+    // preflight. Dense row indices are irrelevant until the real commit pass.
+    alive: bool,
+    component_mask: ComponentMask,
+
+    fn init(data: *const DataSystem, entity: EntityId) ProjectedEntityState {
+        // resolveSlotConst is private to system.zig; isAlive+componentMaskFor are
+        // the equivalent already-pub accessors (same result, one extra lookup,
+        // off the movement/collision hot path).
+        if (!data.isAlive(entity)) return .{ .alive = false, .component_mask = 0 };
+        return .{
+            .alive = true,
+            .component_mask = data.componentMaskFor(entity),
+        };
+    }
+
+    fn hasComponent(self: ProjectedEntityState, component: Component) bool {
+        return (self.component_mask & componentMask(component)) != 0;
+    }
+
+    fn addComponent(self: *ProjectedEntityState, component: Component) void {
+        self.component_mask |= componentMask(component);
+    }
+
+    fn destroy(self: *ProjectedEntityState) void {
+        self.alive = false;
+        self.component_mask = 0;
+    }
+};
+
+/// Reusable scratch for prepared structural commits. Simulation pipelines keep
+/// this around to avoid per-step hash-map allocation churn.
+pub const StructuralPlanScratch = struct {
+    allocator: std.mem.Allocator,
+    projected_entities: std.AutoHashMapUnmanaged(u64, ProjectedEntityState) = .{},
+
+    pub fn init(allocator: std.mem.Allocator) StructuralPlanScratch {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *StructuralPlanScratch) void {
+        self.projected_entities.deinit(self.allocator);
+        self.projected_entities = .{};
+    }
+
+    pub fn clearRetainingCapacity(self: *StructuralPlanScratch) void {
+        self.projected_entities.clearRetainingCapacity();
+    }
+
+    fn projectedState(
+        self: *StructuralPlanScratch,
+        data: *const DataSystem,
+        entity: EntityId,
+    ) !*ProjectedEntityState {
+        const result = try self.projected_entities.getOrPut(self.allocator, structuralEntityKey(entity));
+        if (!result.found_existing) {
+            result.value_ptr.* = ProjectedEntityState.init(data, entity);
+        }
+        return result.value_ptr;
+    }
+};
+
+fn structuralEntityKey(entity: EntityId) u64 {
+    return (@as(u64, entity.index) << 32) | @as(u64, entity.generation);
+}
+
+fn removeProjectedComponents(component_mask: ComponentMask, projection: *StructuralCapacityProjection) void {
+    inline for (std.meta.fields(Component)) |field| {
+        const component: Component = @enumFromInt(field.value);
+        if ((component_mask & componentMask(component)) != 0) {
+            projection.removeComponent(component);
+        }
+    }
+}
+
+fn templateComponentCount(template: EntityTemplate) usize {
+    var count: usize = 0;
+    if (template.movement_body != null) count += 1;
+    if (template.facing != null) count += 1;
+    if (template.primitive_visual != null) count += 1;
+    if (template.asset_reference != null) count += 1;
+    if (template.collision_bounds != null) count += 1;
+    if (template.collision_response != null) count += 1;
+    if (template.ai_agent != null) count += 1;
+    if (template.steering_agent != null) count += 1;
+    if (template.world_level != null) count += 1;
+    if (template.faction != null) count += 1;
+    return count;
+}
+
+pub fn applyStructuralCommands(self: *DataSystem, commands: []const StructuralCommand) !StructuralCommitStats {
+    var sink = NullStructuralChangeSink{};
+    return try applyStructuralCommandsWithChangeSink(self, commands, &sink);
+}
+
+pub fn applyStructuralCommandsWithChangeSink(self: *DataSystem, commands: []const StructuralCommand, change_sink: anytype) !StructuralCommitStats {
+    var scratch = StructuralPlanScratch.init(self.allocator);
+    defer scratch.deinit();
+    var preparer = NullStructuralCommitPreparer{};
+    return try applyStructuralCommandsPrepared(self, commands, &scratch, &preparer, change_sink);
+}
+
+pub fn applyStructuralCommandsPrepared(
+    self: *DataSystem,
+    commands: []const StructuralCommand,
+    scratch: *StructuralPlanScratch,
+    preparer: anytype,
+    change_sink: anytype,
+) !StructuralCommitStats {
+    // Prepared commits split allocation/preparation from mutation so callers
+    // can reuse scratch and reserve their own event buffers ahead of time.
+    const plan = try preflightStructuralCommands(self, commands, scratch);
+    try preparer.prepare(plan.structural_event_count);
+    // No allocations or event-capacity failures should occur after this
+    // point; the commit loop can mutate DataSystem in command order.
+    return try commitStructuralCommands(self, commands, change_sink);
+}
+
+pub fn commitStructuralCommands(
+    self: *DataSystem,
+    commands: []const StructuralCommand,
+    change_sink: anytype,
+) !StructuralCommitStats {
+    // Commit preserves command order. Stale entity commands are skipped, but
+    // valid commands still produce deterministic component-change events.
+    var stats = StructuralCommitStats{};
+    for (commands) |command| {
+        switch (command) {
+            .create_entity => |template| {
+                const entity = try self.createEntity();
+                errdefer _ = self.destroyEntity(entity);
+                stats.components_set += try applyTemplateComponents(self, entity, template);
+                stats.created += 1;
+                change_sink.record(.{ .entity_created = entity });
+                recordTemplateComponentChanges(self, change_sink, entity, template);
+            },
+            .destroy_entity => |entity| {
+                const component_mask = self.componentMaskFor(entity);
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+                if (self.destroyEntity(entity)) {
+                    stats.destroyed += 1;
+                    change_sink.record(.{ .entity_destroyed = .{
+                        .entity = entity,
+                        .component_mask = component_mask,
+                        .was_static_navigation_obstacle = was_static_navigation_obstacle,
+                    } });
+                } else {
+                    stats.stale_skipped += 1;
+                }
+            },
+            .set_movement_body => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setMovementBody(set.entity, set.body);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .movement_body, was_static_navigation_obstacle);
+            },
+            .set_facing => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setFacing(set.entity, set.facing);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .facing, was_static_navigation_obstacle);
+            },
+            .set_primitive_visual => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setPrimitiveVisual(set.entity, set.visual);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .primitive_visual, was_static_navigation_obstacle);
+            },
+            .set_asset_reference => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setAssetReference(set.entity, set.asset_reference);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .asset_reference, was_static_navigation_obstacle);
+            },
+            .set_collision_bounds => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setCollisionBounds(set.entity, set.bounds);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .collision_bounds, was_static_navigation_obstacle);
+            },
+            .set_collision_response => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setCollisionResponse(set.entity, set.response);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .collision_response, was_static_navigation_obstacle);
+            },
+            .set_ai_agent => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setAiAgent(set.entity, set.agent);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .ai_agent, was_static_navigation_obstacle);
+            },
+            .set_steering_agent => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setSteeringAgent(set.entity, set.agent);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .steering_agent, was_static_navigation_obstacle);
+            },
+            .set_world_level => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setWorldLevel(set.entity, set.level);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .world_level, was_static_navigation_obstacle);
+            },
+            .set_simulation_tier => |set| {
+                // Skip stale IDs and live entities without a movement body
+                // (tier exists only on simulated rows) — same upsert tolerance
+                // as the sibling set_* commands, so neither aborts the batch.
+                if (!self.isAlive(set.entity) or self.movementBodyDenseIndex(set.entity) == null) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                try self.setSimulationTier(set.entity, set.tier);
+                // Tier is cold slot metadata — no component mask change, no structural event.
+            },
+            .set_faction => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setFaction(set.entity, set.faction);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .faction, was_static_navigation_obstacle);
+            },
+        }
+    }
+    return stats;
+}
+
+pub fn preflightStructuralCommands(
+    self: *DataSystem,
+    commands: []const StructuralCommand,
+    scratch: *StructuralPlanScratch,
+) !StructuralCommitPlan {
+    try validateStructuralCommands(commands);
+    scratch.clearRetainingCapacity();
+    if (commands.len == 0) {
+        return .{
+            .command_count = 0,
+            .capacity_needs = StructuralCapacityNeeds.init(self),
+            .structural_event_count = 0,
+        };
+    }
+    try scratch.projected_entities.ensureTotalCapacity(scratch.allocator, @intCast(commands.len));
+
+    var projection = StructuralCapacityProjection.init(self);
+    var structural_event_count: usize = 0;
+
+    // Preflight simulates the command stream against projected liveness and
+    // masks so capacity and event reservations match what commit will do.
+    for (commands) |command| {
+        switch (command) {
+            .create_entity => |template| {
+                try projection.createSlot();
+                try projection.addTemplate(template);
+                structural_event_count = try addCapacity(structural_event_count, 1 + templateComponentCount(template));
+            },
+            .destroy_entity => |entity| {
+                const state = try scratch.projectedState(self, entity);
+                if (state.alive) {
+                    structural_event_count = try addCapacity(structural_event_count, 1);
+                    try projection.destroySlot();
+                    removeProjectedComponents(state.component_mask, &projection);
+                    state.destroy();
+                }
+            },
+            .set_movement_body => |set| try preflightSetComponent(self, set.entity, .movement_body, scratch, &projection, &structural_event_count),
+            .set_facing => |set| try preflightSetComponent(self, set.entity, .facing, scratch, &projection, &structural_event_count),
+            .set_primitive_visual => |set| try preflightSetComponent(self, set.entity, .primitive_visual, scratch, &projection, &structural_event_count),
+            .set_asset_reference => |set| try preflightSetComponent(self, set.entity, .asset_reference, scratch, &projection, &structural_event_count),
+            .set_collision_bounds => |set| try preflightSetComponent(self, set.entity, .collision_bounds, scratch, &projection, &structural_event_count),
+            .set_collision_response => |set| try preflightSetComponent(self, set.entity, .collision_response, scratch, &projection, &structural_event_count),
+            .set_ai_agent => |set| try preflightSetComponent(self, set.entity, .ai_agent, scratch, &projection, &structural_event_count),
+            .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, &projection, &structural_event_count),
+            .set_world_level => |set| try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count),
+            .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
+            .set_simulation_tier => {},
+        }
+    }
+
+    try projection.required.validateLimits();
+    const plan = StructuralCommitPlan{
+        .command_count = commands.len,
+        .capacity_needs = projection.required,
+        .structural_event_count = structural_event_count,
+    };
+    try reserveStructuralPlanCapacity(self, plan);
+    return plan;
+}
+
+fn preflightSetComponent(
+    self: *DataSystem,
+    entity: EntityId,
+    component: Component,
+    scratch: *StructuralPlanScratch,
+    projection: *StructuralCapacityProjection,
+    structural_event_count: *usize,
+) !void {
+    const state = try scratch.projectedState(self, entity);
+    if (!state.alive) return;
+    structural_event_count.* = try addCapacity(structural_event_count.*, 1);
+    if (!state.hasComponent(component)) {
+        try projection.addComponent(component);
+        state.addComponent(component);
+    }
+}
+
+fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) !void {
+    try self.slots.ensureTotalCapacity(self.allocator, plan.capacity_needs.slots);
+    try self.movement_bodies.ensureCapacity(self.allocator, plan.capacity_needs.movement_bodies);
+    try self.facings.ensureCapacity(self.allocator, plan.capacity_needs.facings);
+    try self.primitive_visuals.ensureCapacity(self.allocator, plan.capacity_needs.primitive_visuals);
+    try self.asset_refs.ensureCapacity(self.allocator, plan.capacity_needs.asset_refs);
+    try self.collision_bounds.ensureCapacity(self.allocator, plan.capacity_needs.collision_bounds);
+    try self.collision_responses.ensureCapacity(self.allocator, plan.capacity_needs.collision_responses);
+    try self.ai_agents.ensureCapacity(self.allocator, plan.capacity_needs.ai_agents);
+    try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
+    try self.world_levels.ensureCapacity(self.allocator, plan.capacity_needs.world_levels);
+    try self.factions.ensureCapacity(self.allocator, plan.capacity_needs.factions);
+}
+
+pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
+    // Validate fallible payloads up front so the later command-order commit
+    // does not partially mutate before rejecting bad component data.
+    for (commands) |command| {
+        switch (command) {
+            .create_entity => |template| {
+                if (template.movement_body) |body| {
+                    try validateMovementBody(body);
+                }
+                if (template.primitive_visual) |visual| {
+                    try validatePrimitiveVisual(visual);
+                }
+                if (template.collision_bounds) |bounds| {
+                    try validateCollisionBounds(bounds);
+                }
+                if (template.collision_response) |response| {
+                    try validateCollisionResponse(response);
+                }
+                if (template.ai_agent) |agent| {
+                    try validateAiAgent(agent);
+                }
+                if (template.steering_agent) |agent| {
+                    try validateSteeringAgent(agent);
+                }
+            },
+            .set_movement_body => |set| try validateMovementBody(set.body),
+            .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
+            .set_collision_bounds => |set| try validateCollisionBounds(set.bounds),
+            .set_collision_response => |set| try validateCollisionResponse(set.response),
+            .set_ai_agent => |set| try validateAiAgent(set.agent),
+            .set_steering_agent => |set| try validateSteeringAgent(set.agent),
+            else => {},
+        }
+    }
+}
+
+fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype, entity: EntityId, template: EntityTemplate) void {
+    // Navigation-obstacle notifications compare before/after state across
+    // the component sequence because movement, bounds, and response together
+    // define whether pathfinding needs a grid rebuild.
+    var was_static_navigation_obstacle = false;
+    if (template.movement_body != null) {
+        recordComponentChange(self, change_sink, entity, .movement_body, was_static_navigation_obstacle);
+        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+    }
+    if (template.facing != null) recordComponentChange(self, change_sink, entity, .facing, was_static_navigation_obstacle);
+    if (template.primitive_visual != null) recordComponentChange(self, change_sink, entity, .primitive_visual, was_static_navigation_obstacle);
+    if (template.asset_reference != null) recordComponentChange(self, change_sink, entity, .asset_reference, was_static_navigation_obstacle);
+    if (template.collision_bounds != null) {
+        recordComponentChange(self, change_sink, entity, .collision_bounds, was_static_navigation_obstacle);
+        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+    }
+    if (template.collision_response != null) {
+        recordComponentChange(self, change_sink, entity, .collision_response, was_static_navigation_obstacle);
+        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+    }
+    if (template.ai_agent != null) recordComponentChange(self, change_sink, entity, .ai_agent, was_static_navigation_obstacle);
+    if (template.steering_agent != null) recordComponentChange(self, change_sink, entity, .steering_agent, was_static_navigation_obstacle);
+    if (template.world_level != null) recordComponentChange(self, change_sink, entity, .world_level, was_static_navigation_obstacle);
+    if (template.faction != null) recordComponentChange(self, change_sink, entity, .faction, was_static_navigation_obstacle);
+}
+
+fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
+    change_sink.record(.{ .component_changed = .{
+        .entity = entity,
+        .component = component,
+        .was_static_navigation_obstacle = was_static_navigation_obstacle,
+        .is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity),
+    } });
+}
+
+fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
+    var components_set: usize = 0;
+    if (template.movement_body) |body| {
+        try self.setMovementBody(entity, body);
+        components_set += 1;
+    }
+    if (template.facing) |facing| {
+        try self.setFacing(entity, facing);
+        components_set += 1;
+    }
+    if (template.primitive_visual) |visual| {
+        try self.setPrimitiveVisual(entity, visual);
+        components_set += 1;
+    }
+    if (template.asset_reference) |asset_ref| {
+        try self.setAssetReference(entity, asset_ref);
+        components_set += 1;
+    }
+    if (template.collision_bounds) |bounds| {
+        try self.setCollisionBounds(entity, bounds);
+        components_set += 1;
+    }
+    if (template.collision_response) |response| {
+        try self.setCollisionResponse(entity, response);
+        components_set += 1;
+    }
+    if (template.ai_agent) |agent| {
+        try self.setAiAgent(entity, agent);
+        components_set += 1;
+    }
+    if (template.steering_agent) |agent| {
+        try self.setSteeringAgent(entity, agent);
+        components_set += 1;
+    }
+    if (template.world_level) |level| {
+        try self.setWorldLevel(entity, level);
+        components_set += 1;
+    }
+    if (template.faction) |entity_faction| {
+        try self.setFaction(entity, entity_faction);
+        components_set += 1;
+    }
+    return components_set;
+}

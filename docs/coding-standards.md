@@ -36,6 +36,55 @@ Exceptions require an explicit owner, a measured and bounded cost, and a clear
 reason the allocation cannot move to initialization, loading, state transition,
 reserve/warmup, or another cold boundary.
 
+### Allocator discipline (mandatory, not advisory)
+
+Every `reserve`/`ensureTotalCapacity` + `assumeCapacity` (or
+`addOneAssumeCapacity`) pairing must ship with a `std.testing.FailingAllocator`
+(or `std.testing.failing_allocator`) regression test proving the warmed hot
+path allocates zero times. A doc comment or review claim of "allocation-free"
+is not sufficient proof by itself. This project ships **ReleaseFast**, which
+strips the debug assert backing `assumeCapacity`'s capacity check and disables
+bounds/overflow safety checks; an unproven reserve is a silent
+memory-corruption risk in the shipped binary, not a missed optimization. Add
+the proof test in the same change that adds the `assumeCapacity` call — do not
+defer it.
+
+When a collection is written from more than one thread, both of these must
+hold and be verifiable by reading the call site, not just asserted in a
+comment:
+
+1. Writes are partitioned into disjoint per-worker or per-range slots — never
+   a shared appendable collection written concurrently by more than one
+   worker.
+2. The matching `reserve`/`ensureTotalCapacity` call happens on the main
+   thread strictly before the threaded dispatch, sized from the same
+   selection/profile value the dispatch itself uses, so buffer size and
+   worker/range count cannot drift apart across a future edit.
+
+New threaded hot-path code should add a `std.debug.assert` at the top of the
+worker job comparing its `worker_id`/`range.index` against the buffer length
+captured at dispatch time, so a future refactor that breaks this ordering
+fails loudly in Debug/ReleaseSafe instead of silently in ReleaseFast.
+
+Allocators are owned explicitly: every allocating struct takes an
+`std.mem.Allocator` at `init` and stores it as a field, set immediately —
+never left `undefined` until a later call sets it. Do not reach for
+`std.heap.page_allocator`, `std.heap.c_allocator`, or a freshly constructed
+`GeneralPurposeAllocator` inside a function body, including on a cold path;
+thread the caller's allocator through instead. A local `ArenaAllocator`
+wrapping the passed-in allocator is fine for a function that needs several
+short-lived allocations it can free as one unit.
+
+Register `errdefer` narrowly, immediately after each field that owns memory
+is validly constructed. Never register a blanket `self.deinit()`-style
+`errdefer` before every owned field exists — it runs over `undefined` memory
+if an earlier step fails, and double-frees a field whose own narrow
+`errdefer` already fired if a later step fails. A caller that unconditionally
+`defer`s cleanup after allocating a container (e.g. `allocator.create(T)`)
+must register that full cleanup `defer` only after the fallible `init` call
+succeeds, with a narrower `errdefer` covering just the failure window before
+that.
+
 Avoid per-frame, per-event, per-draw, or per-processor-loop string lookup,
 hash-map dispatch, broad dynamic dispatch, callback chains, repeated descriptor
 validation, formatted logging, and resource churn unless the cost is measured,
@@ -224,6 +273,21 @@ Prefer focused tests for contracts that do not require opening a window: input
 routing, state policy flow, transition ordering, resource ID validation,
 viewport math, descriptor validation, asset path validation, timing decisions,
 and pure gameplay/data contracts. Keep display/GPU checks in `gpu-smoke`.
+
+Unit tests must never build production-scale worlds. Do not call
+`initProcedural`, `initProceduralFromMeta`, `initProceduralWithRuntimeAssets`,
+or loading/gameplay paths that construct the full procedural world with a
+production-scale `WorldBuildConfig` (or equivalent) in `zig build test`. These
+entry points take an explicit world-size/level-count config, so a test may
+call them with a minimal config — at most 16x16 tiles and 1 underground level,
+matching the compact-fixture threshold `worldUsesCompactDemoSpawn` already
+uses elsewhere in this codebase — when it genuinely needs to exercise the real
+code path (e.g. state-transition wiring), rather than a hand-built
+`WorldSystem` fixture that would bypass that path — but never with the real
+production config or anything approaching it. Prefer minimal hand-built
+`WorldSystem` fixtures, small demo patches, or pure contract checks when the
+real procedural/loading path isn't itself under test; full world build and
+throughput validation belong in `zig build bench`.
 
 Production contracts must expose runtime concepts only. Do not add test-only
 enum tags, union payloads, marker fields, fake stages, fixture hooks, service

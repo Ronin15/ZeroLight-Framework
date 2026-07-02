@@ -61,6 +61,17 @@ Release builds use the same pinned Zig package cache as Debug builds. They do
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
+**Packaged builds ship `ReleaseFast`.** That mode strips the debug assert
+backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
+bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
+discipline rules for the `FailingAllocator` proof-test coverage this requires
+before hot-path code can rely on it safely. Before cutting a ReleaseFast
+release candidate, run an extended soak session in `--release=safe` (not just
+`zig build test`) across realistic-to-extreme entity counts and spawn/despawn
+churn. A clean multi-hour ReleaseSafe run is the actual release gate:
+ReleaseFast itself will not report a capacity or bounds violation if one
+exists, it will just corrupt memory silently.
+
 ## Build Options
 
 Customize app metadata at build time:
@@ -231,6 +242,11 @@ render-owned adaptive tuner state. It is a CPU-only render-prep benchmark and
 does not open a window or submit SDL_GPU command buffers. Each measured
 iteration submits an already ordered sprite stream into the same `SpriteBatch`
 command storage, then snapshots, emits vertices, and builds draw groups.
+`render-game-prep` extends that coverage with production-shaped game render
+work: dynamic record collection and depth-bucket sparse/dynamic emit, sparse
+visible-tile submission through `WorldSystem`, realistic static+dynamic
+`mergeDrawList` group counts, and phase timings for entity_collect, merge,
+snapshot, and vertex_emit.
 Current production world rendering submits already ordered commands from
 explicit z-layer passes instead of a separate general ordering queue. The
 benchmark owns its phase timers around that shared path and reports ordered
@@ -301,6 +317,7 @@ zig build bench -- --group movement --items 65536 --details
 zig build bench -- --group ai --details
 zig build bench -- --group steering --details
 zig build bench -- --group render-prep --details
+zig build bench -- --group render-game-prep --details
 zig build bench -- --group pathfinding-hard-fallback --details
 zig build bench -- --group pathfinding-hard-fallback-budget --items 256 --details
 zig build bench -- --group nav-update-scattered --details

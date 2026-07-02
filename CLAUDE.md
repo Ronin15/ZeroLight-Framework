@@ -51,8 +51,9 @@ boundaries just to make a local change easier.
   boundary.
 - `src/assets/` — runtime asset catalog, safe path resolution, image decode,
   cache, `manifest.zig` (stable sprite/audio IDs), atlas metadata.
-- `src/game/` — gameplay: states/menus, `world_system.zig`, `data_system.zig`,
-  `simulation*.zig` (pipeline, scope), `player.zig`, pipeline-owned controllers
+- `src/game/` — gameplay: states/menus, `world_system.zig`, the `data_system/`
+  subpackage fronted by `data_system.zig`, `simulation*.zig` (pipeline, scope),
+  `player.zig`, pipeline-owned controllers
   `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
   and `systems/` (movement, ai, steering, collision, collision_response, particle,
   and the `pathfinding/` subpackage fronted by `pathfinding.zig`). The
@@ -69,9 +70,18 @@ boundaries just to make a local change easier.
 - Follow `docs/coding-standards.md`: `zig fmt`, lowerCamelCase functions/vars,
   PascalCase types, direct declaration imports, explicit error sets.
 - Treat performance as correctness on hot/frame-adjacent paths. Hot paths must
-  be **allocation-free after init/reserve/warmup**. Avoid per-frame string
-  lookups, hash-map dispatch, broad dynamic dispatch, formatted logging, and
-  resource churn unless the cost is measured, bounded, and isolated.
+  be **allocation-free after init/reserve/warmup**, and every such claim needs
+  a `std.testing.FailingAllocator` proof test, not just a comment — this
+  project ships **ReleaseFast**, which strips the assert backing
+  `assumeCapacity`, so an unproven reserve is a silent-corruption risk, not a
+  missed optimization. Avoid per-frame string lookups, hash-map dispatch,
+  broad dynamic dispatch, formatted logging, and resource churn unless the
+  cost is measured, bounded, and isolated.
+- Threaded writes into a shared buffer must be partitioned (disjoint
+  per-worker/per-range slots) and reserved before dispatch, never after or
+  during. Allocators are explicit fields set at `init`, never a global reached
+  for mid-function. See `docs/coding-standards.md` for the full
+  allocator-discipline rules.
 - Keep runtime asset paths relative and traversal-safe. Persist gameplay data by
   stable asset IDs (e.g. `SpriteAssetId`, `AudioAssetId`), not string paths,
   live renderer/SDL handles, or prepared draw records.
@@ -104,7 +114,9 @@ zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cach
 ```
 
 Default optimize mode is `Debug`. Use `--release=safe|fast|small` only for
-release candidates. Minimum toolchain is **Zig 0.16.0**.
+release candidates. **Packaged builds ship `ReleaseFast`** — see
+`docs/development-workflow.md` for the required pre-release ReleaseSafe
+soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 
 ## Claude Code Working Practices
 

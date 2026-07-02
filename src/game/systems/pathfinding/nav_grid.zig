@@ -240,6 +240,12 @@ pub const NavGrid = struct {
         if (@as(usize, self.level) >= world.levelCount()) return;
         for (0..world.denseLayerCount()) |layer_index| {
             if (world.denseLayerLevel(layer_index) != self.level) continue;
+            if (world.denseLayerUniformFillTile(layer_index) != null) {
+                if (!world.denseTileBlocksMovement(layer_index, 0, 0)) continue;
+                @memset(self.blocked.items, true);
+                self.blocked_count = self.cellCount();
+                continue;
+            }
             for (0..world.height) |y_usize| {
                 const y: u16 = @intCast(y_usize);
                 for (0..world.width) |x_usize| {
@@ -553,7 +559,7 @@ test "pathfinding nav grid blocked set matches per-level composed mask" {
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     try system.reserve(baselineCapacity());
-    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
 
     var expected_blocked: usize = 0;
     for (0..world.height) |y_usize| {

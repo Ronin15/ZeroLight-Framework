@@ -3,6 +3,7 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 const std = @import("std");
+const math = @import("math.zig");
 
 pub const lane_count: usize = 4;
 pub const Float4 = @Vector(lane_count, f32);
@@ -103,6 +104,30 @@ pub fn divInt4(lhs: Int4, rhs: Int4) Int4 {
         @divTrunc(lhs[2], rhs[2]),
         @divTrunc(lhs[3], rhs[3]),
     };
+}
+
+/// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
+/// saturating identically to the scalar form (NaN -> 0; at/below `minInt(i32)`
+/// -> `minInt(i32)`; at/above the f32 rounding of `maxInt(i32)` -> `maxInt(i32)`).
+/// Lanes needing saturation are replaced with a safe dummy value before the
+/// vector cast (Zig requires every lane in range for `@intFromFloat`) and then
+/// patched with the exact saturated constant, mirroring the scalar function's
+/// early-return branches instead of clamping into a castable subrange — the
+/// f32 grid spacing near `maxInt(i32)` (256 apart) makes "clamp to max minus
+/// one" silently round back to the unrepresentable boundary.
+pub fn floorToI4(values: Float4) Int4 {
+    const floored = @floor(values);
+    const is_nan = floored != floored;
+    const min_f = splatFloat4(@as(f32, @floatFromInt(std.math.minInt(i32))));
+    const max_f = splatFloat4(@as(f32, @floatFromInt(std.math.maxInt(i32))));
+    const at_or_below_min = floored <= min_f;
+    const at_or_above_max = floored >= max_f;
+    const needs_override = is_nan | at_or_below_min | at_or_above_max;
+    const cast_source = selectFloat4(needs_override, splatFloat4(0), floored);
+    const cast: Int4 = @intFromFloat(cast_source);
+    const with_max = selectInt4(at_or_above_max, splatInt4(std.math.maxInt(i32)), cast);
+    const with_min = selectInt4(at_or_below_min, splatInt4(std.math.minInt(i32)), with_max);
+    return selectInt4(is_nan, splatInt4(0), with_min);
 }
 
 pub fn minFloat4(lhs: Float4, rhs: Float4) Float4 {
@@ -426,6 +451,32 @@ test "normalize or zero matches scalar and zeroes short lanes" {
             try std.testing.expectApproxEqAbs(ys[lane] * inv, y_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
         }
+    }
+}
+
+test "floorToI4 matches math.floorToI32 lane-for-lane, including NaN/inf/boundary saturation" {
+    const cases = [_]f32{
+        0,                                             1.5,
+        -1.5,                                          3.7,
+        -3.2,                                          std.math.nan(f32),
+        std.math.inf(f32),                             -std.math.inf(f32),
+        1.0e30,                                        -1.0e30,
+        @as(f32, @floatFromInt(std.math.minInt(i32))), @as(f32, @floatFromInt(std.math.maxInt(i32))),
+        2.9999999,                                     -0.0001,
+    };
+    var i: usize = 0;
+    while (i + lane_count <= cases.len) : (i += lane_count) {
+        const vector = loadFloat4(cases[i..]);
+        const simd_result = toIntArray(floorToI4(vector));
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(math.floorToI32(cases[i + lane]), simd_result[lane]);
+        }
+    }
+    // Cover the tail values individually too (cases.len is not lane-aligned).
+    while (i < cases.len) : (i += 1) {
+        const vector = splatFloat4(cases[i]);
+        const simd_result = toIntArray(floorToI4(vector));
+        try std.testing.expectEqual(math.floorToI32(cases[i]), simd_result[0]);
     }
 }
 

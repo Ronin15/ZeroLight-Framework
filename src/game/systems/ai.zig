@@ -7,7 +7,11 @@
 //! pre-sizes NavigationIntent output ranges and uses staged parallelForWithOptions work.
 //! Deterministic via explicit seed in config. Wander + seek (player-targeted via AiConfig.seek_target) + local separation.
 //! Gather uses DataSystem dense-index lookup, so cost is bounded by live AI rows.
-//! Separation uses a deterministic 32-unit spatial grid and bounded neighbor samples.
+//! Separation queries the pipeline-owned `SpatialIndexSystem` (Slice 28) — the caller
+//! builds it once per step from the same scoped population and passes a read-only
+//! `SpatialIndexView` in; this module no longer owns a private grid. See
+//! `spatial_index.zig`'s module doc for the population-domain-equivalence contract
+//! this depends on and the determinism-critical cell-scan traversal order.
 //! decideDir pure base; applySeparationAndNormalize shared (no logic dup). Serial fallback + threaded identical.
 //! Serial/main-only clamp for AI squares (math.clamp consistent with player, vel zero for AI decision rate).
 //! Serial fallback, read-only workers, range aligned to ai_range_alignment_items, no hot alloc after init, direct SoA.
@@ -15,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -34,6 +39,9 @@ const NavigationIntent = @import("../simulation.zig").NavigationIntent;
 const PathRequestKind = @import("../simulation.zig").PathRequestKind;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
+const spatial_index = @import("spatial_index.zig");
+const SpatialIndexView = spatial_index.SpatialIndexView;
+const NeighborVisitResult = spatial_index.NeighborVisitResult;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -66,12 +74,28 @@ fn appendAiGatherRow(
     row_slice.set(rows.len - 1, row);
 }
 
+// Must match the `cell_size` the caller builds the shared `SpatialIndexSystem`
+// with for this population (`SimulationPipeline` passes the default).
 const grid_cell_size: f32 = 32.0;
 const separation_radius: f32 = 48.0;
-const separation_radius2: f32 = separation_radius * separation_radius;
-const separation_cell_radius: i32 = 2;
 const max_separation_neighbors: u8 = 32;
 const max_separation_candidate_checks: u16 = 128;
+// Precomputed once from the fixed separation radius/cell size (== 2, matching
+// the grid this replaced) — see `spatial_index.cellScanRadius`'s doc comment.
+const separation_cell_scan_radius: i32 = spatial_index.cellScanRadius(separation_radius, grid_cell_size);
+
+/// Distinguishes wander-direction draws from any future AI RNG consumer
+/// (appraisal noise, investigate-target selection) sharing the same
+/// (seed, entity_index, step) — see src/core/rng.zig's salt doc comment.
+const wander_rng_salt: u32 = 0;
+
+/// Default cadence (in fixed steps) at which a wandering entity's sampled
+/// direction changes: 300 steps == 5s at 60Hz. A fully independent random
+/// draw every AI-active step (every step keyed by `AiConfig.step` directly)
+/// looks like frantic jitter rather than wandering, so the raw step is
+/// quantized into coarser epochs before hashing — direction holds steady for
+/// one epoch, then jumps to a new (still per-entity-distinct) heading.
+const default_wander_resample_period_steps: u32 = 300;
 
 pub const AiConfig = struct {
     items_per_range: ?usize = null,
@@ -83,6 +107,16 @@ pub const AiConfig = struct {
     intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
+    /// Current fixed-step counter (see `SimulationScopeSystem.currentStep()`),
+    /// combined with `intent_seed` and each entity's dense index to key
+    /// `src/core/rng.zig` draws. Defaults to 0 for callers/tests that don't
+    /// care about step-to-step variation; production wiring passes the real
+    /// per-step counter from `SimulationPipeline`.
+    step: u32 = 0,
+    /// Cadence (in fixed steps) at which wander direction resamples; `step` is
+    /// quantized by this before hashing so direction holds steady for a
+    /// stretch instead of changing every AI-active step. Must be >= 1.
+    wander_resample_period_steps: u32 = default_wander_resample_period_steps,
     /// If provided, seekers head toward this position instead of the global center-of-mass
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
@@ -112,8 +146,6 @@ pub const AiSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
     rows: std.MultiArrayList(AiGatherRow) = .{},
-    cell_entries: std.ArrayList(CellEntry) = .empty,
-    cell_ranges: std.ArrayList(CellRange) = .empty,
     separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
@@ -126,8 +158,6 @@ pub const AiSystem = struct {
     }
 
     pub fn deinit(self: *AiSystem) void {
-        self.cell_ranges.deinit(self.allocator);
-        self.cell_entries.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
@@ -136,6 +166,7 @@ pub const AiSystem = struct {
         self: *AiSystem,
         ai_agents: ConstAiAgentSlice,
         movement: ConstMovementBodySlice,
+        spatial: SpatialIndexView,
         data: *const DataSystem,
         frame: *SimulationFrame,
         thread_system: *ThreadSystem,
@@ -150,8 +181,19 @@ pub const AiSystem = struct {
             return .{};
         }
 
+        // Population-domain contract with spatial_index.zig (see the module doc
+        // and `computeAiSeparationsSerial`): the shared index built for this step
+        // must have gathered the identical row count, since `computeBoundedSeparation`
+        // passes a gather row index into `queryNeighbors` as a self-index used only
+        // for self-exclusion (an equality compare against spatial's own row indices,
+        // which are always bounds-safe within spatial's own arrays) — a divergence
+        // here corrupts self-exclusion/separation-force correctness, not memory
+        // safety. Debug/ReleaseSafe-only guard (compiles out in ReleaseFast, like
+        // every std.debug.assert); O(1) count compare, not a per-row cost.
+        std.debug.assert(entity_count == spatial.pos_x.len);
+
         const system_config = normalizedConfig(config, self);
-        try self.buildSeparationGrid();
+        self.resetSeparationScratch();
         const gathered = self.rows.slice();
         const separation_selection = selectStageWork(
             thread_system,
@@ -168,8 +210,7 @@ pub const AiSystem = struct {
             .sep_y = gathered.items(.sep_y),
             .neighbor_counts = gathered.items(.separation_neighbor_count),
             .candidate_counts = gathered.items(.separation_candidate_count),
-            .cell_entries = self.cell_entries.items,
-            .cell_ranges = self.cell_ranges.items,
+            .spatial_index = spatial,
         };
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
             .max_worker_threads = separation_selection.worker_threads,
@@ -193,6 +234,7 @@ pub const AiSystem = struct {
         const target_y = target.y;
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
+        const wander_step = system_config.step / @max(system_config.wander_resample_period_steps, 1);
 
         var context = AiJobContext{
             .entities = gathered.items(.entity),
@@ -207,6 +249,7 @@ pub const AiSystem = struct {
             .target_x = target_x,
             .target_y = target_y,
             .seed = system_config.intent_seed,
+            .wander_step = wander_step,
             .nav_request_kind = system_config.nav_request_kind,
             .range_base = range_base,
         };
@@ -244,6 +287,7 @@ pub const AiSystem = struct {
         self: *AiSystem,
         ai_agents: ConstAiAgentSlice,
         movement: ConstMovementBodySlice,
+        spatial: SpatialIndexView,
         data: *const DataSystem,
         frame: *SimulationFrame,
         delta_seconds: f32,
@@ -253,8 +297,8 @@ pub const AiSystem = struct {
         try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
-        try self.buildSeparationGrid();
-        self.computeAiSeparationsSerial();
+        self.resetSeparationScratch();
+        self.computeAiSeparationsSerial(spatial);
         const gathered = self.rows.slice();
         const entities = gathered.items(.entity);
         const pos_x = gathered.items(.pos_x);
@@ -275,6 +319,7 @@ pub const AiSystem = struct {
         const target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
         const tx = target.x;
         const ty = target.y;
+        const wander_step = config.step / @max(config.wander_resample_period_steps, 1);
         for (range.start..range.end) |i| {
             const base_dir = decideDir(
                 behaviors[i],
@@ -286,6 +331,7 @@ pub const AiSystem = struct {
                 seek_weights[i],
                 config.intent_seed,
                 entities[i].index,
+                wander_step,
             );
             const sx = if (i < sep_x.len) sep_x[i] else 0;
             const sy = if (i < sep_y.len) sep_y[i] else 0;
@@ -316,6 +362,14 @@ pub const AiSystem = struct {
         };
     }
 
+    // Population-domain contract with `spatial_index.zig` (Slice 28): the shared
+    // `SpatialIndexSystem` the caller builds for this step walks the identical
+    // `scope_dense_indices` selection with the identical
+    // `movementBodyDenseIndex(entity) orelse continue` skip, in the same order —
+    // a deliberate duplicate gather, not shared code. That equivalence is what
+    // lets `computeBoundedSeparation` below use a spatial-index row index
+    // directly as this system's own row index with zero translation (see
+    // `spatial_index.zig`'s module doc and the cross-system contract test).
     fn gatherAiData(
         self: *AiSystem,
         ai_slice: ConstAiAgentSlice,
@@ -329,8 +383,6 @@ pub const AiSystem = struct {
         const n = if (scope_dense_indices) |idx| idx.len else ai_slice.entities.len;
         if (n == 0) return;
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(n));
-        try self.cell_entries.ensureTotalCapacity(self.allocator, n);
-        try self.cell_ranges.ensureTotalCapacity(self.allocator, n);
 
         // Preserve ai order for deterministic output. DataSystem rejects stale generations
         // and returns direct dense movement rows without transient high-water index tables.
@@ -359,41 +411,32 @@ pub const AiSystem = struct {
 
     fn clearWork(self: *AiSystem) void {
         self.rows.clearRetainingCapacity();
-        self.cell_entries.clearRetainingCapacity();
-        self.cell_ranges.clearRetainingCapacity();
     }
 
-    fn buildSeparationGrid(self: *AiSystem) !void {
-        const n = self.rows.len;
-        if (n == 0) return;
+    /// Zeroes this step's separation accumulator columns. No longer builds a
+    /// grid (the caller-supplied `SpatialIndexView` replaces it), so this is
+    /// infallible unlike the `buildSeparationGrid` it replaces.
+    fn resetSeparationScratch(self: *AiSystem) void {
+        if (self.rows.len == 0) return;
         const gathered = self.rows.slice();
-        const pos_x = gathered.items(.pos_x);
-        const pos_y = gathered.items(.pos_y);
         @memset(gathered.items(.sep_x), 0);
         @memset(gathered.items(.sep_y), 0);
         @memset(gathered.items(.separation_neighbor_count), 0);
         @memset(gathered.items(.separation_candidate_count), 0);
-
-        for (0..n) |index| {
-            self.cell_entries.appendAssumeCapacity(.{
-                .cell = cellForPosition(pos_x[index], pos_y[index]),
-                .index = index,
-            });
-        }
-        std.mem.sort(CellEntry, self.cell_entries.items, {}, cellEntryLessThan);
-
-        var entry_index: usize = 0;
-        while (entry_index < self.cell_entries.items.len) {
-            const cell = self.cell_entries.items[entry_index].cell;
-            const start = entry_index;
-            while (entry_index < self.cell_entries.items.len and cellsEqual(self.cell_entries.items[entry_index].cell, cell)) {
-                entry_index += 1;
-            }
-            self.cell_ranges.appendAssumeCapacity(.{ .cell = cell, .start = start, .end = entry_index });
-        }
     }
 
-    fn computeAiSeparationsSerial(self: *AiSystem) void {
+    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView) void {
+        // Population-domain contract with spatial_index.zig: the shared index
+        // built for this step must have gathered the identical row count, since
+        // `computeBoundedSeparation` passes a gather row index into `queryNeighbors`
+        // as a self-index used only for self-exclusion (an equality compare against
+        // spatial's own row indices, which are always bounds-safe within spatial's
+        // own arrays) — a divergence here corrupts self-exclusion/separation-force
+        // correctness, not memory safety. Debug/ReleaseSafe-only guard (compiles out
+        // in ReleaseFast, like every std.debug.assert); O(1) count compare (not
+        // per-row), guarding against a future silent divergence between the two
+        // independent gathers.
+        std.debug.assert(self.rows.len == spatial.pos_x.len);
         const gathered = self.rows.slice();
         var context = AiSeparationContext{
             .pos_x = gathered.items(.pos_x),
@@ -402,8 +445,7 @@ pub const AiSystem = struct {
             .sep_y = gathered.items(.sep_y),
             .neighbor_counts = gathered.items(.separation_neighbor_count),
             .candidate_counts = gathered.items(.separation_candidate_count),
-            .cell_entries = self.cell_entries.items,
-            .cell_ranges = self.cell_ranges.items,
+            .spatial_index = spatial,
         };
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
@@ -418,6 +460,8 @@ const NormalizedAiConfig = struct {
     separation_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_adaptive_tuner: ?*AdaptiveWorkTuner,
     intent_seed: u64,
+    step: u32,
+    wander_resample_period_steps: u32,
     seek_target: ?math.Vec2,
     nav_request_kind: PathRequestKind,
     navigation_intents: ?*RangeOutputStream(NavigationIntent),
@@ -439,27 +483,13 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
         else
             null,
         .intent_seed = config.intent_seed,
+        .step = config.step,
+        .wander_resample_period_steps = config.wander_resample_period_steps,
         .seek_target = config.seek_target,
         .nav_request_kind = config.nav_request_kind,
         .navigation_intents = config.navigation_intents,
     };
 }
-
-const GridCell = struct {
-    x: i32,
-    y: i32,
-};
-
-const CellEntry = struct {
-    cell: GridCell,
-    index: usize,
-};
-
-const CellRange = struct {
-    cell: GridCell,
-    start: usize,
-    end: usize,
-};
 
 const StageWorkSelection = struct {
     profile: AdaptiveWorkProfile,
@@ -520,43 +550,6 @@ fn selectStageWork(
     };
 }
 
-fn cellForPosition(x: f32, y: f32) GridCell {
-    return .{
-        .x = math.floorToI32(x / grid_cell_size),
-        .y = math.floorToI32(y / grid_cell_size),
-    };
-}
-
-fn cellsEqual(lhs: GridCell, rhs: GridCell) bool {
-    return lhs.x == rhs.x and lhs.y == rhs.y;
-}
-
-fn cellLessThan(lhs: GridCell, rhs: GridCell) bool {
-    if (lhs.y != rhs.y) return lhs.y < rhs.y;
-    return lhs.x < rhs.x;
-}
-
-fn cellEntryLessThan(_: void, lhs: CellEntry, rhs: CellEntry) bool {
-    if (!cellsEqual(lhs.cell, rhs.cell)) return cellLessThan(lhs.cell, rhs.cell);
-    return lhs.index < rhs.index;
-}
-
-fn findCellRange(ranges: []const CellRange, cell: GridCell) ?CellRange {
-    var low: usize = 0;
-    var high: usize = ranges.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        const mid_cell = ranges[mid].cell;
-        if (cellsEqual(mid_cell, cell)) return ranges[mid];
-        if (cellLessThan(mid_cell, cell)) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    return null;
-}
-
 fn sumU8(values: []const u8) usize {
     var total: usize = 0;
     for (values) |value| total += value;
@@ -595,6 +588,7 @@ fn decideDir(
     seek_w: f32,
     seed: u64,
     key: u32,
+    wander_step: u32,
 ) AiDir {
     var dx: f32 = 0;
     var dy: f32 = 0;
@@ -612,7 +606,7 @@ fn decideDir(
     else
         @as(f32, 0.0);
     if (wander_strength > 0) {
-        const w = deterministicUnitDir(seed, key);
+        const w = rng.unitVec2(seed, key, wander_step, wander_rng_salt);
         dx += w.x * wander_strength;
         dy += w.y * wander_strength;
     }
@@ -642,19 +636,6 @@ fn priorityForBehavior(behavior: AiBehavior) i16 {
     };
 }
 
-fn deterministicUnitDir(seed: u64, key: u32) AiDir {
-    var h: u64 = seed ^ @as(u64, key) ^ 0x9e3779b97f4a7c15;
-    h ^= h >> 30;
-    h *%= 0xbf58476d1ce4e5b9;
-    h ^= h >> 27;
-    h *%= 0x94d049bb133111eb;
-    h ^= h >> 31;
-    const u = @as(f32, @floatFromInt(h & 0xffffffff)) / 4294967295.0;
-    const angle = u * 2.0 * std.math.pi;
-    const rotation = math.sinCos(angle);
-    return .{ .x = rotation.cos, .y = rotation.sin };
-}
-
 const AiSeparationContext = struct {
     pos_x: []const f32,
     pos_y: []const f32,
@@ -662,8 +643,7 @@ const AiSeparationContext = struct {
     sep_y: []f32,
     neighbor_counts: []u8,
     candidate_counts: []u16,
-    cell_entries: []const CellEntry,
-    cell_ranges: []const CellRange,
+    spatial_index: SpatialIndexView,
 };
 
 fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -684,33 +664,47 @@ const SeparationResult = struct {
     candidate_count: u16 = 0,
 };
 
-fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
-    const own_cell = cellForPosition(job.pos_x[index], job.pos_y[index]);
-    var result = SeparationResult{};
-    var cell_y = own_cell.y - separation_cell_radius;
-    while (cell_y <= own_cell.y + separation_cell_radius) : (cell_y += 1) {
-        var cell_x = own_cell.x - separation_cell_radius;
-        while (cell_x <= own_cell.x + separation_cell_radius) : (cell_x += 1) {
-            const range = findCellRange(job.cell_ranges, .{ .x = cell_x, .y = cell_y }) orelse continue;
-            for (job.cell_entries[range.start..range.end]) |entry| {
-                if (entry.index == index) continue;
-                if (result.candidate_count >= max_separation_candidate_checks) return result;
-                result.candidate_count += 1;
+/// Accumulates the bounded local-separation contribution for one row via the
+/// shared spatial index. The near-zero `dist2 > 0.1` guard stays here (an
+/// AI-specific "avoid degenerate normalize" concern, not a generic spatial
+/// one); the radius prefilter and candidate-check bookkeeping live in
+/// `SpatialIndexView.queryNeighbors` and must match its documented semantics
+/// exactly for this to stay a pure port (see the brute-force parity test).
+const SeparationAccumulator = struct {
+    x: f32 = 0,
+    y: f32 = 0,
+    neighbor_count: u8 = 0,
+};
 
-                const dx = job.pos_x[index] - job.pos_x[entry.index];
-                const dy = job.pos_y[index] - job.pos_y[entry.index];
-                const dist2 = dx * dx + dy * dy;
-                if (dist2 > 0.1 and dist2 < separation_radius2) {
-                    const dir = math.normalizeOrZeroFinite(dx, dy, 0);
-                    result.x += dir.x;
-                    result.y += dir.y;
-                    result.neighbor_count += 1;
-                    if (result.neighbor_count >= max_separation_neighbors) return result;
-                }
-            }
-        }
+fn separationNeighborVisit(context: *anyopaque, _: usize, dx: f32, dy: f32, dist2: f32) NeighborVisitResult {
+    const acc: *SeparationAccumulator = @ptrCast(@alignCast(context));
+    if (dist2 > 0.1) {
+        const dir = math.normalizeOrZeroFinite(dx, dy, 0);
+        acc.x += dir.x;
+        acc.y += dir.y;
+        acc.neighbor_count += 1;
+        if (acc.neighbor_count >= max_separation_neighbors) return .stop;
     }
-    return result;
+    return .keep_going;
+}
+
+fn computeBoundedSeparation(job: *const AiSeparationContext, index: usize) SeparationResult {
+    var acc = SeparationAccumulator{};
+    const stats = job.spatial_index.queryNeighbors(
+        job.pos_x[index],
+        job.pos_y[index],
+        index,
+        separation_cell_scan_radius,
+        .{ .radius = separation_radius, .max_candidate_checks = max_separation_candidate_checks },
+        &acc,
+        separationNeighborVisit,
+    );
+    return .{
+        .x = acc.x,
+        .y = acc.y,
+        .neighbor_count = acc.neighbor_count,
+        .candidate_count = stats.candidate_checks,
+    };
 }
 
 const AiJobContext = struct {
@@ -726,6 +720,9 @@ const AiJobContext = struct {
     target_x: f32,
     target_y: f32,
     seed: u64,
+    /// Pre-quantized wander epoch (`step / wander_resample_period_steps`,
+    /// computed once by the caller), not the raw fixed-step counter.
+    wander_step: u32,
     nav_request_kind: PathRequestKind,
     range_base: usize,
 };
@@ -744,6 +741,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.seek_weights[i],
             job.seed,
             job.entities[i].index,
+            job.wander_step,
         );
         const sep_x = if (i < job.sep_x.len) job.sep_x[i] else 0;
         const sep_y = if (i < job.sep_y.len) job.sep_y[i] else 0;
@@ -763,6 +761,24 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
 
 fn serialBatch(count: usize) BatchStats {
     return .{ .ran_inline = true, .item_count = count, .range_count = 1, .items_per_range = count };
+}
+
+const SpatialIndexSystem = spatial_index.SpatialIndexSystem;
+
+/// Test-only helper: builds a `SpatialIndexSystem` from the same fixture an
+/// `AiSystem` test call is about to consume, serially (the AI call sites under
+/// test do not themselves exercise index-build threading — that is covered by
+/// `spatial_index.zig`'s own serial/threaded parity tests). Callers own the
+/// returned system's lifetime and pass `.view()` into `AiSystem.update`/`updateSerial`.
+fn testSpatialIndex(
+    ai_slice: ConstAiAgentSlice,
+    movement_slice: ConstMovementBodySlice,
+    data: *const DataSystem,
+) !SpatialIndexSystem {
+    var sys = SpatialIndexSystem.init(std.testing.allocator);
+    errdefer sys.deinit();
+    _ = try sys.buildSerial(ai_slice, movement_slice, data, .{});
+    return sys;
 }
 
 fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !void {
@@ -796,9 +812,12 @@ test "ai gather rows keep MAL columns compact after gather" {
     try frame.reserveStreams(2, 0, 4, 0, 0, 0);
     frame.beginStep();
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 0xabc,
         .seek_target = .{ .x = 100, .y = 100 },
     });
@@ -826,11 +845,16 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
     defer frame.deinit();
     try frame.reserveStreams(2, 0, 4, 0, 0, 0);
 
+    // Positions are static for the whole test, so one spatial index build serves
+    // every AI call below.
+    var spatial_sys = try testSpatialIndex(ai_slice, movement_slice, &data);
+    defer spatial_sys.deinit();
+
     // Serial path with seed
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, &data, &frame, 0.016, .{ .intent_seed = 0x12345678 });
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0x12345678 });
     const serial_intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), serial_intents.len);
     try std.testing.expectEqual(e0.index, serial_intents[0].entity.index); // order by append in gather (stable)
@@ -840,7 +864,7 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
     frame.beginStep();
     var threads0 = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads0.deinit();
-    _ = try ai_sys.update(ai_slice, movement_slice, &data, &frame, &threads0, 0.016, .{ .intent_seed = 0x12345678, .max_worker_threads = 0 });
+    _ = try ai_sys.update(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, &threads0, 0.016, .{ .intent_seed = 0x12345678, .max_worker_threads = 0 });
     const t0_intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial_intents.len, t0_intents.len);
     try std.testing.expectEqual(serial_intents[0].direct_direction_x, t0_intents[0].direct_direction_x);
@@ -849,7 +873,7 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
 
     // Different seed produces different (or at least reproducible other) dirs
     frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, &data, &frame, 0.016, .{ .intent_seed = 0xdeadbeef });
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 0xdeadbeef });
     const other = frame.navigation_intents.mergedItems();
     // Not strictly required different but for coverage; allow equal only if degenerate
     _ = other;
@@ -879,9 +903,12 @@ test "ai processor appends navigation intents without clearing existing stream o
     prior_writer.finish();
     frame.navigation_intents.finishWrite();
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{ .intent_seed = 2 });
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
 
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
@@ -934,7 +961,10 @@ test "ai processor uses committed adaptive threaded profiles with default thread
 
     var intent_tuner = separation_tuner;
 
-    const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, &threads, 0.016, .{
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{
         .separation_adaptive_tuner = &separation_tuner,
         .intent_adaptive_tuner = &intent_tuner,
         .intent_seed = 3,
@@ -945,9 +975,9 @@ test "ai processor uses committed adaptive threaded profiles with default thread
 }
 
 test "wander amplitude scales steering perturbation against seek" {
-    const pure_seek = decideDir(.seek, 0, 0, 100, 0, 0, 1, 0x1234, 44);
-    const weak_wander = decideDir(.seek, 0, 0, 100, 0, 3, 1, 0x1234, 44);
-    const strong_wander = decideDir(.seek, 0, 0, 100, 0, 60, 1, 0x1234, 44);
+    const pure_seek = decideDir(.seek, 0, 0, 100, 0, 0, 1, 0x1234, 44, 0);
+    const weak_wander = decideDir(.seek, 0, 0, 100, 0, 3, 1, 0x1234, 44, 0);
+    const strong_wander = decideDir(.seek, 0, 0, 100, 0, 60, 1, 0x1234, 44, 0);
 
     try std.testing.expectEqual(@as(f32, 1), pure_seek.x);
     try std.testing.expectEqual(@as(f32, 0), pure_seek.y);
@@ -955,8 +985,111 @@ test "wander amplitude scales steering perturbation against seek" {
     try std.testing.expect(strong_wander.x != weak_wander.x or strong_wander.y != weak_wander.y);
 }
 
+test "ai wander direction resamples across steps but stays deterministic for a fixed step" {
+    // wander_resample_period_steps = 1 degenerates to raw-step keying so this
+    // test exercises the underlying (seed, entity_index, step) mechanism
+    // directly, independent of the resample-period smoothing tested below.
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    // Position never changes across this test's frames, so one spatial index
+    // build serves every call below.
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var frame_a = SimulationFrame.init(std.testing.allocator);
+    defer frame_a.deinit();
+    try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_a.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    const step5_first = frame_a.navigation_intents.mergedItems()[0];
+    frame_a.phase = .finished;
+
+    var frame_b = SimulationFrame.init(std.testing.allocator);
+    defer frame_b.deinit();
+    try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_b.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = 5, .wander_resample_period_steps = 1 });
+    const step5_second = frame_b.navigation_intents.mergedItems()[0];
+    frame_b.phase = .finished;
+
+    try std.testing.expectEqual(step5_first.direct_direction_x, step5_second.direct_direction_x);
+    try std.testing.expectEqual(step5_first.direct_direction_y, step5_second.direct_direction_y);
+
+    var frame_c = SimulationFrame.init(std.testing.allocator);
+    defer frame_c.deinit();
+    try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_c.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = 9, .wander_resample_period_steps = 1 });
+    const step9 = frame_c.navigation_intents.mergedItems()[0];
+    frame_c.phase = .finished;
+
+    try std.testing.expect(step5_first.direct_direction_x != step9.direct_direction_x or
+        step5_first.direct_direction_y != step9.direct_direction_y);
+}
+
+test "ai wander direction holds steady within a resample epoch then changes at the boundary" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    // Position never changes across this test's frames, so one spatial index
+    // build serves every call below.
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const period: u32 = 10;
+
+    var frame_a = SimulationFrame.init(std.testing.allocator);
+    defer frame_a.deinit();
+    try frame_a.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_a.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_a, 0.016, .{ .intent_seed = 0x1234abcd, .step = 0, .wander_resample_period_steps = period });
+    const early = frame_a.navigation_intents.mergedItems()[0];
+    frame_a.phase = .finished;
+
+    var frame_b = SimulationFrame.init(std.testing.allocator);
+    defer frame_b.deinit();
+    try frame_b.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_b.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_b, 0.016, .{ .intent_seed = 0x1234abcd, .step = period - 1, .wander_resample_period_steps = period });
+    const still_within_epoch = frame_b.navigation_intents.mergedItems()[0];
+    frame_b.phase = .finished;
+
+    try std.testing.expectEqual(early.direct_direction_x, still_within_epoch.direct_direction_x);
+    try std.testing.expectEqual(early.direct_direction_y, still_within_epoch.direct_direction_y);
+
+    var frame_c = SimulationFrame.init(std.testing.allocator);
+    defer frame_c.deinit();
+    try frame_c.reserveStreams(1, 0, 3, 0, 0, 0);
+    frame_c.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame_c, 0.016, .{ .intent_seed = 0x1234abcd, .step = period, .wander_resample_period_steps = period });
+    const next_epoch = frame_c.navigation_intents.mergedItems()[0];
+    frame_c.phase = .finished;
+
+    try std.testing.expect(early.direct_direction_x != next_epoch.direct_direction_x or
+        early.direct_direction_y != next_epoch.direct_direction_y);
+}
+
 test "ai direction normalization falls back for overflowed finite parameters" {
-    const dir = decideDir(.seek, 0, 0, 1, 0, std.math.floatMax(f32), std.math.floatMax(f32), 0x1234, 44);
+    const dir = decideDir(.seek, 0, 0, 1, 0, std.math.floatMax(f32), std.math.floatMax(f32), 0x1234, 44, 0);
     try std.testing.expect(std.math.isFinite(dir.x));
     try std.testing.expect(std.math.isFinite(dir.y));
 }
@@ -977,6 +1110,11 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
+    // Built on the real testing allocator, unaffected by the frame's failing
+    // allocator below — this test proves AiSystem's own warmed emit path, not
+    // the spatial index's (that is `spatial_index.zig`'s own FailingAllocator test).
+    var spatial_sys = try testSpatialIndex(ai_slice, movement_slice, &data);
+    defer spatial_sys.deinit();
 
     const original = frame.allocator;
     const original_navigation_allocator = frame.navigation_intents.allocator;
@@ -990,7 +1128,7 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
 
     frame.beginStep();
     // Should reuse reserved; no alloc in hot emit path.
-    _ = try ai_sys.updateSerial(ai_slice, movement_slice, &data, &frame, 0.016, .{ .intent_seed = 1 });
+    _ = try ai_sys.updateSerial(ai_slice, movement_slice, spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
     try std.testing.expect(frame.navigation_intents.mergedItems().len == 1);
     frame.phase = .finished;
 }
@@ -1010,10 +1148,17 @@ test "ai sparse high entity index does not allocate during warmed gather" {
     defer frame.deinit();
     try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
+    // Built on the real testing allocator throughout — this test proves AiSystem's
+    // own warmed-gather allocation-free-ness, not the spatial index's (covered
+    // separately by `spatial_index.zig`'s own FailingAllocator test), so the
+    // index stays off the ai_sys/frame failing-allocator swap below.
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{ .intent_seed = 1 });
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 1 });
     frame.phase = .finished;
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -1030,7 +1175,7 @@ test "ai sparse high entity index does not allocate during warmed gather" {
     }
 
     frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{ .intent_seed = 2 });
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{ .intent_seed = 2 });
     try std.testing.expectEqual(@as(usize, 1), frame.navigation_intents.mergedItems().len);
     frame.phase = .finished;
 }
@@ -1064,11 +1209,14 @@ test "ai gather direct table and separation blend produce correct order + dirs (
     defer frame.deinit();
     try frame.reserveStreams(1, 0, 4, 0, 0, 0);
 
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     // Use explicit seek_target (not COM) + seed; gather must pick prior pos for exactly the 3 ai in ai order.
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame, 0.016, .{
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 0xaaa,
         .seek_target = .{ .x = 200, .y = 150 },
     });
@@ -1107,11 +1255,14 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
     defer frame.deinit();
     try frame.reserveStreams(1, 0, 3, 0, 0, 0);
 
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
     frame.beginStep();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    const cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .seek_target = .{ .x = 300, .y = 200 } };
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, &data, &frame, 0.016, cfg);
+    const cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .step = 7, .seek_target = .{ .x = 300, .y = 200 } };
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
     const serial = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), serial.len);
     frame.phase = .finished;
@@ -1119,7 +1270,7 @@ test "ai serial and threaded (0 workers) produce identical intents with separati
     frame.beginStep();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    _ = try ai_sys.update(ai_slice, move_slice, &data, &frame, &threads, 0.016, cfg);
+    _ = try ai_sys.update(ai_slice, move_slice, spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
     const thr = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, thr.len);
     try std.testing.expectEqual(serial[0].direct_direction_x, thr[0].direct_direction_x);
@@ -1166,20 +1317,23 @@ test "ai serial and real threaded workers produce identical navigation intents" 
         .seek_target = .{ .x = 300, .y = 200 },
     };
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(8, 0, 128, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &serial_frame, 0.016, cfg);
+    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &serial_frame, 0.016, cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
 
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
     try threaded_frame.reserveStreams(8, 0, 128, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &threaded_frame, &threads, 0.016, cfg);
+    _ = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &threaded_frame, &threads, 0.016, cfg);
     const threaded = threaded_frame.navigation_intents.mergedItems();
 
     try std.testing.expectEqual(serial.len, threaded.len);
@@ -1219,10 +1373,13 @@ test "ai spatial separation caps dense neighbor samples" {
     defer frame.deinit();
     try frame.reserveStreams(8, 0, count, 0, 0, 0);
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .seek_target = .{ .x = 100, .y = 100 },
     });
@@ -1267,10 +1424,13 @@ test "ai spatial separation handles negative grid coordinates" {
     defer frame.deinit();
     try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     frame.beginStep();
-    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data, &frame, 0.016, .{
+    const stats = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, .{
         .intent_seed = 1,
         .seek_target = .{ .x = 0, .y = 0 },
     });
@@ -1278,4 +1438,257 @@ test "ai spatial separation handles negative grid coordinates" {
     try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 2), stats.separation_candidate_checks);
     try std.testing.expectEqual(@as(usize, 2), stats.separation_neighbor_samples);
+}
+
+test "spatial index and AiSystem gather agree on row-index population order even with a mid-population skip" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Five ai agents; the third has no movement body, so both gathers must
+    // skip it via the identical `movementBodyDenseIndex(entity) orelse continue`
+    // predicate (see the cross-file contract comment on `gatherAiData`).
+    var expected_entities: [4]EntityId = undefined;
+    var expected_count: usize = 0;
+    for (0..5) |i| {
+        const entity = try data.createEntity();
+        try data.setAiAgent(entity, .{ .behavior = .wander });
+        if (i == 2) continue; // no movement body: forces the real skip
+        const position = math.Vec2{ .x = @floatFromInt(i * 10), .y = @floatFromInt(i * 5) };
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 20 });
+        expected_entities[expected_count] = entity;
+        expected_count += 1;
+    }
+
+    const ai_slice = data.aiAgentSliceConst();
+    const movement_slice = data.movementBodySliceConst();
+
+    var spatial_sys = SpatialIndexSystem.init(std.testing.allocator);
+    defer spatial_sys.deinit();
+    const spatial_stats = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{});
+    try std.testing.expectEqual(@as(usize, 4), spatial_stats.entity_count);
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
+
+    const ai_entities = ai_sys.rows.slice().items(.entity);
+    const spatial_entities = spatial_sys.rows.slice().items(.entity);
+    try std.testing.expectEqual(ai_entities.len, spatial_entities.len);
+    for (0..expected_count) |i| {
+        try std.testing.expectEqual(expected_entities[i].index, ai_entities[i].index);
+        try std.testing.expectEqual(ai_entities[i].index, spatial_entities[i].index);
+        try std.testing.expectEqual(ai_entities[i].generation, spatial_entities[i].generation);
+    }
+}
+
+/// O(n^2) reference reproducing `computeBoundedSeparation`'s documented
+/// semantics directly (no spatial partitioning): ascending-index scan, self
+/// skipped without counting, candidate-stop checked before increment, radius
+/// prefilter strict `<`, near-zero guard `dist2 > 0.1`, neighbor cap checked
+/// after accumulating. See the parity test below for why an ascending-index
+/// scan matches the real spatially-partitioned traversal bit-for-bit here.
+fn bruteForceSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
+    var result = SeparationResult{};
+    for (0..pos_x.len) |j| {
+        if (j == index) continue;
+        if (result.candidate_count >= max_separation_candidate_checks) break;
+        result.candidate_count += 1;
+
+        const dx = pos_x[index] - pos_x[j];
+        const dy = pos_y[index] - pos_y[j];
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 > 0.1 and dist2 < separation_radius * separation_radius) {
+            const dir = math.normalizeOrZeroFinite(dx, dy, 0);
+            result.x += dir.x;
+            result.y += dir.y;
+            result.neighbor_count += 1;
+            if (result.neighbor_count >= max_separation_neighbors) break;
+        }
+    }
+    return result;
+}
+
+test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-for-bit" {
+    // Regression-locks the scan-radius decision the determinism proof below
+    // depends on: cellScanRadius(48, 32) must stay 2, matching the fixed grid
+    // this replaced (separation_cell_radius was hardcoded to 2).
+    comptime std.debug.assert(separation_cell_scan_radius == 2);
+
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x51ab_dead);
+    const rand = prng.random();
+    const count = 32;
+    // Every agent lands inside the single grid cell (0,0) (well under the
+    // 32-unit cell size), so the shared index's cell-scan visits exactly one
+    // range in ascending stored (== population) order — identical to the
+    // brute-force reference's plain ascending-index loop above. That equality
+    // of traversal order is what makes this a bit-exact proof of parity
+    // instead of an approximate one; see the module doc's determinism note.
+    for (0..count) |_| {
+        const entity = try data.createEntity();
+        const position = math.Vec2{ .x = rand.float(f32) * 20.0, .y = rand.float(f32) * 20.0 };
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 20 });
+        try data.setAiAgent(entity, .{ .behavior = .wander });
+    }
+
+    const ai_slice = data.aiAgentSliceConst();
+    const movement_slice = data.movementBodySliceConst();
+
+    var spatial_sys = try testSpatialIndex(ai_slice, movement_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
+
+    const gathered = ai_sys.rows.slice();
+    const pos_x = gathered.items(.pos_x);
+    const pos_y = gathered.items(.pos_y);
+
+    const context = AiSeparationContext{
+        .pos_x = pos_x,
+        .pos_y = pos_y,
+        .sep_x = gathered.items(.sep_x),
+        .sep_y = gathered.items(.sep_y),
+        .neighbor_counts = gathered.items(.separation_neighbor_count),
+        .candidate_counts = gathered.items(.separation_candidate_count),
+        .spatial_index = spatial_sys.view(),
+    };
+
+    for (0..count) |i| {
+        const ported = computeBoundedSeparation(&context, i);
+        const reference = bruteForceSeparation(pos_x, pos_y, i);
+        try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
+        try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
+        try std.testing.expectEqual(reference.x, ported.x);
+        try std.testing.expectEqual(reference.y, ported.y);
+    }
+}
+
+/// Cell-scan-ordered reference: unlike `bruteForceSeparation` above (a plain
+/// ascending-index scan), this independently reconstructs the cell_y-outer,
+/// cell_x-inner, ascending-stored-index-within-cell traversal spec from raw
+/// positions (no call into `spatial_index.zig`/`cellForPosition`), so it can
+/// validate cross-cell floating-point summation order rather than just a
+/// single populated cell where any loop nesting degenerates to the same
+/// ascending-index walk.
+fn cellScanOrderedSeparation(pos_x: []const f32, pos_y: []const f32, index: usize) SeparationResult {
+    const cellOf = struct {
+        fn compute(x: f32, y: f32) [2]i32 {
+            return .{
+                @as(i32, @intFromFloat(@floor(x / grid_cell_size))),
+                @as(i32, @intFromFloat(@floor(y / grid_cell_size))),
+            };
+        }
+    }.compute;
+    const own_cell = cellOf(pos_x[index], pos_y[index]);
+    var result = SeparationResult{};
+    var cell_y = own_cell[1] - separation_cell_scan_radius;
+    while (cell_y <= own_cell[1] + separation_cell_scan_radius) : (cell_y += 1) {
+        var cell_x = own_cell[0] - separation_cell_scan_radius;
+        while (cell_x <= own_cell[0] + separation_cell_scan_radius) : (cell_x += 1) {
+            // A plain forward scan filtered to exactly this (cell_x, cell_y)
+            // already visits matching agents in ascending index order.
+            for (0..pos_x.len) |j| {
+                if (j == index) continue;
+                const j_cell = cellOf(pos_x[j], pos_y[j]);
+                if (j_cell[0] != cell_x or j_cell[1] != cell_y) continue;
+                if (result.candidate_count >= max_separation_candidate_checks) return result;
+                result.candidate_count += 1;
+
+                const dx = pos_x[index] - pos_x[j];
+                const dy = pos_y[index] - pos_y[j];
+                const dist2 = dx * dx + dy * dy;
+                if (dist2 > 0.1 and dist2 < separation_radius * separation_radius) {
+                    const dir = math.normalizeOrZeroFinite(dx, dy, 0);
+                    result.x += dir.x;
+                    result.y += dir.y;
+                    result.neighbor_count += 1;
+                    if (result.neighbor_count >= max_separation_neighbors) return result;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across multiple cells" {
+    // The brute-force test above proves parity only where it's vacuous for
+    // traversal order (one populated cell). This spreads agents across many
+    // cells so a silently flipped scan order (e.g. x-outer instead of
+    // y-outer) or a non-ascending within-cell walk would actually break
+    // bit-exact float-summation parity and fail this test.
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x5eed_c311);
+    const rand = prng.random();
+    const count = 80;
+    for (0..count) |_| {
+        const entity = try data.createEntity();
+        const position = math.Vec2{ .x = rand.float(f32) * 220.0, .y = rand.float(f32) * 220.0 };
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 20 });
+        try data.setAiAgent(entity, .{ .behavior = .wander });
+    }
+
+    const ai_slice = data.aiAgentSliceConst();
+    const movement_slice = data.movementBodySliceConst();
+
+    var spatial_sys = try testSpatialIndex(ai_slice, movement_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
+
+    const gathered = ai_sys.rows.slice();
+    const pos_x = gathered.items(.pos_x);
+    const pos_y = gathered.items(.pos_y);
+
+    // Fail loud if the fixture regresses to a near-single-cell spread, which
+    // would silently make this test as weak as the one above.
+    var min_cell_x: i32 = std.math.maxInt(i32);
+    var max_cell_x: i32 = std.math.minInt(i32);
+    var min_cell_y: i32 = std.math.maxInt(i32);
+    var max_cell_y: i32 = std.math.minInt(i32);
+    for (0..count) |i| {
+        const cx: i32 = @intFromFloat(@floor(pos_x[i] / grid_cell_size));
+        const cy: i32 = @intFromFloat(@floor(pos_y[i] / grid_cell_size));
+        min_cell_x = @min(min_cell_x, cx);
+        max_cell_x = @max(max_cell_x, cx);
+        min_cell_y = @min(min_cell_y, cy);
+        max_cell_y = @max(max_cell_y, cy);
+    }
+    try std.testing.expect(max_cell_x - min_cell_x >= 3);
+    try std.testing.expect(max_cell_y - min_cell_y >= 3);
+
+    const context = AiSeparationContext{
+        .pos_x = pos_x,
+        .pos_y = pos_y,
+        .sep_x = gathered.items(.sep_x),
+        .sep_y = gathered.items(.sep_y),
+        .neighbor_counts = gathered.items(.separation_neighbor_count),
+        .candidate_counts = gathered.items(.separation_candidate_count),
+        .spatial_index = spatial_sys.view(),
+    };
+
+    // Fail loud if no agent ever accumulates >= 2 neighbors: with fewer than
+    // two summed `dir` terms, float-summation order can't actually differ,
+    // making the bit-exact assertions below vacuous.
+    var max_neighbor_count: u8 = 0;
+    for (0..count) |i| {
+        const ported = computeBoundedSeparation(&context, i);
+        const reference = cellScanOrderedSeparation(pos_x, pos_y, i);
+        try std.testing.expectEqual(reference.candidate_count, ported.candidate_count);
+        try std.testing.expectEqual(reference.neighbor_count, ported.neighbor_count);
+        try std.testing.expectEqual(reference.x, ported.x);
+        try std.testing.expectEqual(reference.y, ported.y);
+        max_neighbor_count = @max(max_neighbor_count, reference.neighbor_count);
+    }
+    try std.testing.expect(max_neighbor_count >= 2);
 }

@@ -61,24 +61,36 @@ passes the borrowed audio command buffer through the pipeline-owned
 `SimulationPipeline` opens each step with the backbone **scope pass** (stagger
 advance and the tier/halo/stagger gathers that select which entities enter each
 stage; chunk columns are derived in-pass by the movement processor, not a separate
-recompute), then owns AI navigation-intent production,
-steering/path status, pathfinding, sparse movement-intent application, movement,
-bounds clamp, player-vs-world-tile gating, collision detection, and collision
-response — AI, movement, and collision run scope-gated through a
-`scope_dense_indices` option. It closes with the **simulation-LOD tier policy**,
-which assigns each entity a cognition/locomotion/kinematic/dormant tier by cube
-distance and emits deferred `set_simulation_tier` commands at the commit seam. See
+recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
+from that same cognition-scoped population for AI separation queries, then owns
+AI navigation-intent production, steering/path status, pathfinding, sparse
+movement-intent application, movement, bounds clamp, player-vs-world-tile
+gating, collision detection, and collision response — AI, movement, and
+collision run scope-gated through a `scope_dense_indices` option. Collision
+broadphase keeps its own sweep-and-prune structure rather than consuming the
+spatial index (see `docs/architecture.md`). It closes with the
+**simulation-LOD tier policy**, which assigns each entity a
+cognition/locomotion/kinematic/dormant tier by cube distance and emits
+deferred `set_simulation_tier` commands at the commit seam. See
 `docs/architecture.md` for scope/tier ownership and the gating rules per stage.
 
 The player-vs-tile gate runs right after the bounds clamp and before entity
 collision, so every downstream stage and the camera see the gated position. It
 stops the player from moving into movement-blocking tiles on their current plane
 (the mining mechanic: underground dirt is solid until dug) by resolving X then Y
-against the pre-move position, which yields wall-sliding. It is player-only by
-design: AI agents have no per-entity plane and stay on the fully-walkable surface
-(level 0), where the gate is a no-op, so they cannot enter the solid underground.
-Autonomous NPC descent — a per-entity plane column plus an all-bodies traversal
-and gate — is a deliberately separate, deferred slice.
+against the pre-move position, which yields wall-sliding. It is a no-op on
+level 0 (the surface is fully walkable there).
+
+NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement
+and collision settle, `applyNpcPlaneTraversal` mirrors the player ramp/fall
+cell-entry policy and commits level changes on the main thread. Off-surface NPCs
+are gated by `gateNpcEntitiesToWalkableTiles` against solid tiles on their current
+plane before entity collision runs; both NPC stages skip dormant-tier entities,
+since movement never moves them. Steering and pathfinding read each entity's
+`world_level` for `start_level`; level transitions at link crossings are
+committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
+by a path-view field (a `PathView.next_cell_level` field was tried and removed
+as an unused duplicate — see `docs/framework-implementation-slices.md` Slice 25E).
 
 ## Range Output Streams
 

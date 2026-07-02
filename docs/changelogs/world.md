@@ -230,8 +230,15 @@ work, but several follow-ups remain visible in the roadmap and review notes:
 
 - Slice 8 still has residual shader/material registry hardening tracked in the
   live roadmap.
+- Slice 23A GPU tilemap render hardening (depth order, `cycle=false` tile
+  storage, batched copy pass) is implemented on `expand2` and should merge
+  before raising world depth count.
+- Slice 23B multi-depth dense-layer render scaling (~120 levels, vertical
+  submit window) is implemented on `expand2` and should merge before large
+  underground world build.
 - Slice 25E NPC autonomous z-traversal remains a separate acceptance-checked
-  slice before multi-floor emergent scenarios depend on it.
+  slice before multi-floor emergent scenarios depend on it (entity level/cull;
+  separate from 23B floor render window).
 - Dormant-entity movement fast-path behavior should be revisited so indexed
   gather/scatter is not triggered by a single far-away dormant body.
 - Dig/pathfinding interaction around ramps and rebuild churn was tuned heavily

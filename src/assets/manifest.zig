@@ -74,6 +74,16 @@ pub const sprite_assets = [_]SpriteAssetSpec{
     },
 };
 
+comptime {
+    for (sprite_assets, 0..) |spec, i| {
+        for (sprite_assets[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, spec.path, other.path)) {
+                @compileError("duplicate sprite asset path: " ++ spec.path);
+            }
+        }
+    }
+}
+
 pub const AtlasManifestMismatch = error{
     AtlasManifestMismatch,
     MissingMetadataPath,

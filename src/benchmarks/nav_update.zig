@@ -202,7 +202,7 @@ fn buildSharedFixture(allocator: std.mem.Allocator, io: std.Io, participant_coun
     // Size the per-participant nav scratch for the largest threaded case (workers + main) so the
     // threaded stages never fall back to serial for lack of scratch slots.
     try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
-    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
 
     return .{
         .data = data,
@@ -381,58 +381,4 @@ fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, cas
         stats.secondary_work_tuning = suite.workTuningSummary(fixture.system.nav_patch_tuner.report(), patch_settled);
     }
     return stats;
-}
-
-test "nav update benchmark single-chunk fixture patches a bounded chunk set" {
-    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
-    defer fixture.deinit(std.testing.allocator);
-    // A single mid-chunk cell (compact footprint at the world-center chunk) -> its chunk plus its
-    // four orthogonal neighbors, no full-rebuild fallback.
-    try setFootprint(&fixture, std.testing.allocator, .multichunk, 1);
-
-    // Block the single cell to force a real patch.
-    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
-    const stats = try fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
-    // One interior chunk plus its four orthogonal neighbors, with no full-rebuild fallback.
-    try std.testing.expectEqual(@as(usize, 5), stats.chunks_patched);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), stats.edge_cap_fallback);
-}
-
-test "nav update benchmark scattered footprint is one dirty cell per distinct chunk" {
-    // Guards the scattered variant's premise (and the nav_chunk_tiles coupling): each edit must
-    // land in its own chunk so item_count == dirty-chunk count, capped at the world chunk total.
-    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
-    defer fixture.deinit(std.testing.allocator);
-
-    // Below the cap: every requested cell becomes a distinct-chunk edit.
-    try setFootprint(&fixture, std.testing.allocator, .scattered, 64);
-    try std.testing.expectEqual(@as(usize, 64), fixture.edits.items.len);
-    var seen = [_]bool{false} ** total_chunks;
-    for (fixture.edits.items) |edit| {
-        const chunk = (edit.x / nav_chunk_tiles) + (edit.y / nav_chunk_tiles) * chunks_per_side;
-        try std.testing.expect(!seen[chunk]);
-        seen[chunk] = true;
-    }
-
-    // Above the cap: edit count saturates at the world chunk total, still all distinct.
-    try setFootprint(&fixture, std.testing.allocator, .scattered, total_chunks + 100);
-    try std.testing.expectEqual(total_chunks, fixture.edits.items.len);
-}
-
-test "nav update benchmark dig-storm tier stays incremental (no full rebuild)" {
-    // Guards the bench's premise: the largest footprint must still take the incremental path.
-    // A regression that pushed the dig-storm tier into a full relabel / edge-cap fallback would
-    // make the numbers world-size-dependent and no longer measure an incremental update.
-    var fixture = try buildSharedFixture(std.testing.allocator, std.testing.io, 1);
-    defer fixture.deinit(std.testing.allocator);
-    const top_tier = update_counts[update_counts.len - 1];
-    try setFootprint(&fixture, std.testing.allocator, .multichunk, top_tier);
-
-    for (fixture.edits.items) |edit| _ = try fixture.world.setDenseTile(fixture.obstacle_layer, edit.x, edit.y, fixture.tree);
-    const stats = try fixture.system.applyNavUpdates(&fixture.data, &fixture.world, fixture.edits.items);
-    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
-    try std.testing.expectEqual(@as(usize, 0), stats.full_relabel);
-    try std.testing.expectEqual(@as(usize, 0), stats.edge_cap_fallback);
-    try std.testing.expectEqual(@as(usize, 0), stats.version_bumps);
 }

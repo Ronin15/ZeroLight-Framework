@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const GameDemoState = @import("game_demo_state.zig").GameDemoState;
+const WorldBuildConfig = @import("world_system.zig").WorldBuildConfig;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const RenderContext = @import("../app/state.zig").RenderContext;
@@ -43,19 +44,27 @@ pub const LoadingState = struct {
     target: LoadTarget,
     width: f32,
     height: f32,
+    world_build_config: WorldBuildConfig,
     phase: LoadingPhase = .pending,
     title_text: PreparedText = .invalid,
     status_text: PreparedText = .invalid,
     text_dirty: bool = true,
     rendered_once: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, target: LoadTarget, width: f32, height: f32) LoadingState {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        target: LoadTarget,
+        width: f32,
+        height: f32,
+        world_build_config: WorldBuildConfig,
+    ) LoadingState {
         log.debug("loading state initialized target={s} bounds={}x{}", .{ @tagName(target), width, height });
         return .{
             .allocator = allocator,
             .target = target,
             .width = width,
             .height = height,
+            .world_build_config = world_build_config,
         };
     }
 
@@ -129,6 +138,7 @@ pub const LoadingState = struct {
         game_ptr.* = try GameDemoState.initProceduralWithRuntimeAssets(
             self.allocator,
             context.runtime_assets,
+            self.world_build_config,
             context.thread_system,
             self.width,
             self.height,
@@ -158,8 +168,18 @@ fn elapsedNs(start_ns: u64, end_ns: u64) u64 {
     return if (end_ns > start_ns) end_ns - start_ns else 0;
 }
 
+// Minimal world build config for tests: keeps `loadGameDemo` on its real
+// `initProceduralWithRuntimeAssets` path without building a production-scale
+// (256x256, 31-underground-level) world under `zig build test`.
+const test_world_build_config = WorldBuildConfig{
+    .width_tiles = 8,
+    .height_tiles = 8,
+    .chunk_size_tiles = 8,
+    .underground_level_count = 0,
+};
+
 test "loading state requires runtime world metadata before building demo" {
-    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450);
+    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450, test_world_build_config);
     defer loading.deinit();
     loading.rendered_once = true;
 
@@ -170,7 +190,7 @@ test "loading state requires runtime world metadata before building demo" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     try std.testing.expectError(error.WorldTilesetMetadataUnavailable, loading.update(.{
         .input = &input,
         .audio = &audio,
@@ -181,8 +201,15 @@ test "loading state requires runtime world metadata before building demo" {
     }));
 }
 
+test "loading state runtime metadata fixture exposes installed atlases" {
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
+    defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
+    try std.testing.expect(runtime_assets.worldTilesetMeta() != null);
+    try std.testing.expect(runtime_assets.spriteAtlasMeta(.grim_characters) != null);
+}
+
 test "loading state builds gameplay from runtime atlas metadata" {
-    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450);
+    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450, test_world_build_config);
     defer loading.deinit();
     loading.rendered_once = true;
 
@@ -193,9 +220,12 @@ test "loading state builds gameplay from runtime atlas metadata" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = try runtimeAssetsWithWorldMetadataForTest();
+    var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
 
+    // Drives the real LoadingState -> GameDemoState transition end to end (not
+    // just the fixture setup above), so a break in initProceduralWithRuntimeAssets
+    // or the transition wiring itself fails this test instead of shipping silently.
     try loading.update(.{
         .input = &input,
         .audio = &audio,
@@ -214,7 +244,7 @@ test "loading state builds gameplay from runtime atlas metadata" {
 }
 
 test "loading state waits for first render before building gameplay" {
-    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450);
+    var loading = LoadingState.init(std.testing.allocator, .game_demo, 800, 450, test_world_build_config);
     defer loading.deinit();
 
     var input = InputState{};
@@ -224,7 +254,7 @@ test "loading state waits for first render before building gameplay" {
     defer transitions.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var runtime_assets = RuntimeAssets.init();
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
     try loading.update(.{
         .input = &input,
@@ -239,9 +269,8 @@ test "loading state waits for first render before building gameplay" {
     try std.testing.expectEqual(LoadingPhase.pending, loading.phase);
 }
 
-fn runtimeAssetsWithWorldMetadataForTest() !RuntimeAssets {
-    var runtime_assets = RuntimeAssets.init();
-    runtime_assets.allocator = std.testing.allocator;
+fn runtimeAssetsWithDemoMetadataForTest() !RuntimeAssets {
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     runtime_assets.sprite_slots[manifest.spriteIndex(.world_tileset)] = .{ .status = .available };
     const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
     runtime_assets.atlas_meta[manifest.spriteIndex(.world_tileset)] = .{

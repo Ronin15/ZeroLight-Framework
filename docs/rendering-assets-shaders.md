@@ -165,10 +165,91 @@ shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — 
 tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
 layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
 with dynamic entities, so an actor in a dug pit renders between the floor below and
-walls above. `WorldSystem.submitStaticDenseGeometry` takes the player's active level and skips
-the floors above it (re-submitting only when the plane changes), so descending
-reveals the plane the player stands on instead of leaving it buried under the
-surface.
+walls above. `WorldSystem.submitStaticDenseGeometry` takes `GameplayScene.player_level`
+as `active_level` and submits only dense layers inside the configured
+`DenseLayerRenderWindow` (re-submitting on `dense_quads_dirty`, plane change, or
+window change).
+
+### Dense render window policy (Slice 23B)
+
+Vertical scale is a **submit/draw** policy problem, not a per-tile vertex or
+full-buffer residency problem. Every authored dense layer still gets a retained
+GPU tile-data storage buffer at load (`uploadDenseLayerBuffers`); memory scales
+with total level count × cell count. The render window bounds how many of those
+layers become static tilemap draw groups each frame.
+
+Default `DenseLayerRenderWindow` (`world_system.zig`):
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `levels_below` | `6` | Submit `active_level` through `active_level + 6` (inclusive). |
+| `ceiling_when_underground` | `false` | Opt-in only: redraws the full ceiling plane and breaks player-level follow. Surface hole see-through uses `levels_below` while `active_level == 0`. |
+
+`collectDenseSubmitLayers` filters by `levelInWindow`, then sorts back-to-front
+before append. `maxDenseSubmitLayerCount` derives the cap from the window and
+`max_dense_bands_per_level`; `validateDenseRenderBudget` fails at world build if
+the window exceeds `k_max_dense_submit_stack_cap` or optional
+`WorldBuildConfig.max_dense_tile_gpu_bytes`. `render_prep.ensureStaticGeometryCapacity`
+warms renderer static-geometry reservation from `maxDenseSubmitLayerCount()` at
+the start of each `submitGameplayFrame` (grow-only after the first reserve).
+
+**Sparse/dense boundary:** chunk visibility (`setVisibleChunksForWorldRect`)
+still culls sparse tiles and sizes dynamic sparse prep (`reserveRenderRecords`);
+it no longer drives dense floor submit. Each in-window dense layer is one
+full-world quad regardless of camera pan — panning uploads nothing. Sparse
+overlays and dense floors interleave in the merged draw list by `RenderOrder`;
+Per-entity depth cull (Slice 25E) is separate from this floor window.
+
+### Dynamic entity collect (Slice 24B)
+
+`render_prep.collectDynamicRecords` walks `movementBodySliceConst()` — not the
+primitive-visual entity list. Chunk columns align on `movement_index` for the
+camera chunk gate; scope tier and pin metadata are not read during collect.
+Drawable rows are gated by a dense `has_primitive_visual` column on the movement
+store (movement-only bodies skip slot resolve). Indices for drawable rows come
+from `DataSystem.renderCollectIndicesForMovement` (one slot read per chunk-pass
+row that carries a primitive visual).
+
+Gates before interpolation and `PreparedDraw` construction (in order):
+
+1. **Chunk** — `WorldSystem.visibleChunkRegion()` (camera window; unset skips all
+   rows). Uses `scope.chunk_x/y` from the movement-body scope columns — updated
+   during the movement integration pass. Entities teleported via `setMovementBody`
+   or rendered before the first movement tick may retain default `(0,0)` chunk
+   coords until movement runs; pixel AABB is the second gate.
+2. **Camera AABB** — `VisibleWorldRect.overlapsAabb` on the lerped footprint
+   (camera rect + `overscan_chunks` margin). Demo runtime uses
+   `world_render_overscan_chunks = 1` in `game_demo_state.zig`.
+
+**Simulation tier is not consulted.** Slice 24 LOD (`dormant`/`kinematic`/etc.)
+controls fixed-step processor participation only. Render visibility is camera
+policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
+row does not. Do not add `allowsRender`-style predicates on `SimulationTier`.
+
+**Dense floors (separate cost model):** in-window dense layers still submit one
+full-world tilemap quad per layer (Slice 23B window). GPU clips to the viewport;
+submit/draw count is per-layer, not per visible tile. Chunked dense submit is a
+future optimization if profiling requires it.
+
+A pre-built visible movement dense-index list (parallel to scoped simulation
+gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
+`docs/framework-implementation-slices.md`.
+
+### Tile storage upload `cycle` policy (Slice 23A)
+
+Retained per-layer tile-data storage buffers are **not** ring-buffered. Partial
+dig uploads must never pass `cycle=true` to `SDL_UploadToGPUBuffer` or map the
+tile-edit transfer buffer with `cycle=true` — doing so ping-pongs GPU storage and
+flips visible tiles while CPU state stays correct.
+
+| Resource | `cycle` on upload / map |
+| --- | --- |
+| Dynamic/static **vertex** streams (per-frame ring) | `true` on the last **vertex** upload in the copy pass |
+| **Tile-data storage** buffers (per dense layer, retained) | **always `false`** |
+| Tile-edit transfer buffer (`stageStorageRegions`) | **`false`** |
+
+Tile edits are excluded from the vertex upload `cycle` counter; they are batched
+in the post-acquire copy pass via `recordStorageRegionsInPass`.
 
 Digging authors two kinds of tile edit. A *hole* clears the cell to
 `invalid_tile_id`, which the tilemap fragment shader discards (see-through to the

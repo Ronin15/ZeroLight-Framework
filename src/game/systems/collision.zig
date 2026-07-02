@@ -473,13 +473,23 @@ pub const CollisionSystem = struct {
             const buffer = &slot.buffer;
             if (buffer.pairs.capacity != 0) continue;
             const range_len = rangeLenForIndex(sorted_count, selection.items_per_range, range_index);
-            const estimated_capacity = if (range_len > std.math.maxInt(usize) / 4)
-                std.math.maxInt(usize)
-            else
-                range_len * 4;
-            const target_capacity = @min(sorted_count, @max(simd.lane_count, estimated_capacity));
+            const target_capacity = estimateBroadphasePairCapacity(sorted_count, range_len);
             try buffer.pairs.ensureTotalCapacity(self.allocator, target_capacity);
         }
+    }
+
+    /// Shared broadphase pair-capacity heuristic: roughly four candidate pairs
+    /// per swept item in the range, bounded below by one SIMD lane group and
+    /// above by the total sorted item count. Used both to pre-size the
+    /// per-range scratch buffers for the threaded broadphase and to pre-size
+    /// `candidate_pairs` for the serial SIMD broadphase, so both paths stay
+    /// allocation-free in steady state under the same estimate.
+    fn estimateBroadphasePairCapacity(sorted_count: usize, range_len: usize) usize {
+        const estimated_capacity = if (range_len > std.math.maxInt(usize) / 4)
+            std.math.maxInt(usize)
+        else
+            range_len * 4;
+        return @min(sorted_count, @max(simd.lane_count, estimated_capacity));
     }
 
     fn growBroadphaseRangeBuffersIfNeeded(self: *CollisionSystem, range_count: usize) !bool {
@@ -565,6 +575,10 @@ pub const CollisionSystem = struct {
         var stats = BroadphaseStats{};
         const proxies = self.sliceConst();
         const sorted_count = self.order.items.len;
+        try self.candidate_pairs.ensureTotalCapacity(
+            self.allocator,
+            estimateBroadphasePairCapacity(sorted_count, sorted_count),
+        );
         for (0..sorted_count) |sorted_index| {
             const proxy_index = self.order.items[sorted_index];
             const proxy_max_x = proxies.max_x[proxy_index];
@@ -657,6 +671,9 @@ const BroadphaseJobContext = struct {
 
 fn broadphaseCandidatesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *BroadphaseJobContext = @ptrCast(@alignCast(context));
+    // Guards the reserve-before-dispatch invariant: prepareBroadphaseRangeBuffers must
+    // have sized broadphase_ranges to at least this dispatch's range count.
+    std.debug.assert(range.index < job.system.broadphase_ranges.items.len);
     writeBroadphaseRangeCandidatesSimd(job.system, range);
 }
 
@@ -710,6 +727,9 @@ const NarrowphaseJobContext = struct {
 
 fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *NarrowphaseJobContext = @ptrCast(@alignCast(context));
+    // Guards the reserve-before-dispatch invariant: prepareNarrowphaseRangeBuffers must
+    // have sized narrowphase_ranges to at least this dispatch's range count.
+    std.debug.assert(range.index < job.system.narrowphase_ranges.items.len);
     writeNarrowphaseContactsSimd(job.system, range);
 }
 
