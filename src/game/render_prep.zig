@@ -5,11 +5,14 @@
 const std = @import("std");
 const Color = @import("../config.zig").Color;
 const math = @import("../core/math.zig");
+const simd = @import("../core/simd.zig");
 const DataSystem = @import("data_system.zig").DataSystem;
 const ConstAssetReferenceSlice = @import("data_system.zig").ConstAssetReferenceSlice;
 const ConstMovementBodySlice = @import("data_system.zig").ConstMovementBodySlice;
 const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisualSlice;
+const ConstFacingSlice = @import("data_system.zig").ConstFacingSlice;
+const RenderCollectIndices = @import("data_system.zig").RenderCollectIndices;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const AssetReference = @import("data_system.zig").AssetReference;
@@ -373,6 +376,15 @@ pub fn submitGameplayFrame(
     try submitLayeredWorld(scene, prep, renderer, runtime_assets);
 }
 
+/// One scalar-filtered entity awaiting batched interpolation. Buffered by
+/// `collectDynamicRecords` up to `simd.lane_count` at a time before the lerp
+/// is vectorized; see the packed-SoA-scratch idiom on `simd.gatherFloat4`.
+const EntityLerpCandidate = struct {
+    movement_index: usize,
+    collect_indices: RenderCollectIndices,
+    is_player: bool,
+};
+
 pub fn collectDynamicRecords(
     prep: *DynamicScenePrep,
     scene: GameplayScene,
@@ -392,6 +404,12 @@ pub fn collectDynamicRecords(
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
+
+    // Packed-SoA-scratch idiom (see simd.gatherFloat4 doc): buffer scalar-filtered
+    // candidates, then batch-lerp lane_count at a time once the buffer fills.
+    var entity_candidates: [simd.lane_count]EntityLerpCandidate = undefined;
+    var entity_candidate_count: usize = 0;
+
     // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
     // align with movement_index; has_primitive_visual skips movement-only rows
     // before the deferred slot resolve in renderCollectIndicesForMovement.
@@ -405,78 +423,220 @@ pub fn collectDynamicRecords(
         if (!movement.has_primitive_visual[movement_index]) continue;
 
         const collect_indices = scene.data.renderCollectIndicesForMovement(movement_index) orelse continue;
-        const visual_index = collect_indices.visual_index;
 
+        entity_candidates[entity_candidate_count] = .{
+            .movement_index = movement_index,
+            .collect_indices = collect_indices,
+            .is_player = is_player,
+        };
+        entity_candidate_count += 1;
+        if (entity_candidate_count == simd.lane_count) {
+            flushEntityLerpBatch(
+                prep,
+                movement,
+                visuals,
+                assets,
+                facings,
+                visible,
+                runtime_assets,
+                entity_candidates,
+                interpolation_alpha,
+            );
+            entity_candidate_count = 0;
+        }
+    }
+    // Tail: fewer than lane_count buffered candidates remain; finish them with
+    // the plain scalar lerp rather than padding a partial group into a vector call.
+    for (entity_candidates[0..entity_candidate_count]) |candidate| {
         const render_x = math.lerp(
-            movement.previous_x[movement_index],
-            movement.position_x[movement_index],
+            movement.previous_x[candidate.movement_index],
+            movement.position_x[candidate.movement_index],
             interpolation_alpha,
         );
         const render_y = math.lerp(
-            movement.previous_y[movement_index],
-            movement.position_y[movement_index],
+            movement.previous_y[candidate.movement_index],
+            movement.position_y[candidate.movement_index],
             interpolation_alpha,
         );
-        const size_x = visuals.size_x[visual_index];
-        const size_y = visuals.size_y[visual_index];
-        if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) continue;
+        finishEntityRecord(prep, movement, visuals, assets, facings, visible, runtime_assets, candidate, render_x, render_y);
+    }
 
-        if (collect_indices.asset_ref_index) |asset_index| {
-            const asset_ref = assetReferenceAt(assets, asset_index);
-            const prepared = preparePrimitiveVisualSoA(
+    const particles = scene.particles.sliceConst();
+    var particle_candidates: [simd.lane_count]usize = undefined;
+    var particle_candidate_count: usize = 0;
+    for (0..particles.len()) |index| {
+        if (!particles.renderable(index)) continue;
+
+        particle_candidates[particle_candidate_count] = index;
+        particle_candidate_count += 1;
+        if (particle_candidate_count == simd.lane_count) {
+            flushParticleLerpBatch(prep, particles, visible, particle_candidates, interpolation_alpha);
+            particle_candidate_count = 0;
+        }
+    }
+    for (particle_candidates[0..particle_candidate_count]) |index| {
+        const render_x = math.lerp(particles.previous_x[index], particles.position_x[index], interpolation_alpha);
+        const render_y = math.lerp(particles.previous_y[index], particles.position_y[index], interpolation_alpha);
+        finishParticleRecord(prep, particles, visible, index, render_x, render_y);
+    }
+    prep.finalizeDepthBuckets();
+}
+
+/// Gathers the buffered candidates' previous/current positions, batch-lerps
+/// via `simd.lerpVec2Float4`, then finishes each lane through the same
+/// `finishEntityRecord` body the scalar tail uses.
+fn flushEntityLerpBatch(
+    prep: *DynamicScenePrep,
+    movement: ConstMovementBodySlice,
+    visuals: ConstPrimitiveVisualSlice,
+    assets: ConstAssetReferenceSlice,
+    facings: ConstFacingSlice,
+    visible: VisibleWorldRect,
+    runtime_assets: *const RuntimeAssets,
+    candidates: [simd.lane_count]EntityLerpCandidate,
+    interpolation_alpha: f32,
+) void {
+    var movement_indices: [simd.lane_count]usize = undefined;
+    inline for (0..simd.lane_count) |lane| {
+        movement_indices[lane] = candidates[lane].movement_index;
+    }
+
+    const previous_x = simd.gatherFloat4(movement.previous_x, movement_indices);
+    const position_x = simd.gatherFloat4(movement.position_x, movement_indices);
+    const previous_y = simd.gatherFloat4(movement.previous_y, movement_indices);
+    const position_y = simd.gatherFloat4(movement.position_y, movement_indices);
+    const lerped = simd.lerpVec2Float4(
+        .{ .x = previous_x, .y = previous_y },
+        .{ .x = position_x, .y = position_y },
+        simd.splatFloat4(interpolation_alpha),
+    );
+    const render_x = simd.toFloatArray(lerped.x);
+    const render_y = simd.toFloatArray(lerped.y);
+
+    inline for (0..simd.lane_count) |lane| {
+        finishEntityRecord(
+            prep,
+            movement,
+            visuals,
+            assets,
+            facings,
+            visible,
+            runtime_assets,
+            candidates[lane],
+            render_x[lane],
+            render_y[lane],
+        );
+    }
+}
+
+/// AABB cull + build + append (+ optional player marker) for one already-lerped
+/// entity candidate. Shared by the batched-lane path and the scalar tail so the
+/// two paths cannot diverge.
+fn finishEntityRecord(
+    prep: *DynamicScenePrep,
+    movement: ConstMovementBodySlice,
+    visuals: ConstPrimitiveVisualSlice,
+    assets: ConstAssetReferenceSlice,
+    facings: ConstFacingSlice,
+    visible: VisibleWorldRect,
+    runtime_assets: *const RuntimeAssets,
+    candidate: EntityLerpCandidate,
+    render_x: f32,
+    render_y: f32,
+) void {
+    const movement_index = candidate.movement_index;
+    const collect_indices = candidate.collect_indices;
+    const visual_index = collect_indices.visual_index;
+    const size_x = visuals.size_x[visual_index];
+    const size_y = visuals.size_y[visual_index];
+    if (!visible.overlapsAabb(render_x, render_y, size_x, size_y)) return;
+
+    if (collect_indices.asset_ref_index) |asset_index| {
+        const asset_ref = assetReferenceAt(assets, asset_index);
+        const prepared = preparePrimitiveVisualSoA(
+            movement,
+            visuals,
+            movement_index,
+            visual_index,
+            render_x,
+            render_y,
+            asset_ref,
+            runtime_assets,
+        );
+        prep.appendAssumeCapacity(.{ .depth = prepared.depth(), .draw = prepared });
+    } else {
+        const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
+        const record_depth = render_depth.worldZWithOffset(movement.position_z[movement_index], depth_band);
+        prep.appendAssumeCapacity(.{
+            .depth = record_depth,
+            .draw = preparePrimitiveVisualRectSoA(
+                visuals,
+                visual_index,
+                render_x,
+                render_y,
+                record_depth,
+            ),
+        });
+    }
+    if (candidate.is_player) {
+        if (collect_indices.facing_index) |facing_index| {
+            if (preparePlayerMarkerSoA(
                 movement,
                 visuals,
                 movement_index,
                 visual_index,
+                facings.directions[facing_index],
                 render_x,
                 render_y,
-                asset_ref,
-                runtime_assets,
-            );
-            prep.appendAssumeCapacity(.{ .depth = prepared.depth(), .draw = prepared });
-        } else {
-            const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
-            const record_depth = render_depth.worldZWithOffset(movement.position_z[movement_index], depth_band);
-            prep.appendAssumeCapacity(.{
-                .depth = record_depth,
-                .draw = preparePrimitiveVisualRectSoA(
-                    visuals,
-                    visual_index,
-                    render_x,
-                    render_y,
-                    record_depth,
-                ),
-            });
-        }
-        if (is_player) {
-            if (collect_indices.facing_index) |facing_index| {
-                if (preparePlayerMarkerSoA(
-                    movement,
-                    visuals,
-                    movement_index,
-                    visual_index,
-                    facings.directions[facing_index],
-                    render_x,
-                    render_y,
-                )) |marker| {
-                    prep.appendAssumeCapacity(.{ .depth = marker.depth(), .draw = marker });
-                }
+            )) |marker| {
+                prep.appendAssumeCapacity(.{ .depth = marker.depth(), .draw = marker });
             }
         }
     }
+}
 
-    const particles = scene.particles.sliceConst();
-    for (0..particles.len()) |index| {
-        if (!particles.renderable(index)) continue;
-        const render_x = math.lerp(particles.previous_x[index], particles.position_x[index], interpolation_alpha);
-        const render_y = math.lerp(particles.previous_y[index], particles.position_y[index], interpolation_alpha);
-        const particle_size = particles.size[index];
-        const half_size = particle_size * 0.5;
-        if (!visible.overlapsAabb(render_x - half_size, render_y - half_size, particle_size, particle_size)) continue;
-        const draw = prepareParticleAt(particles, index, render_x, render_y) orelse continue;
-        prep.appendAssumeCapacity(.{ .depth = draw.depth(), .draw = draw });
+/// Gathers the buffered particle indices' previous/current positions,
+/// batch-lerps via `simd.lerpVec2Float4`, then finishes each lane through the
+/// same `finishParticleRecord` body the scalar tail uses.
+fn flushParticleLerpBatch(
+    prep: *DynamicScenePrep,
+    particles: ConstParticleSlice,
+    visible: VisibleWorldRect,
+    indices: [simd.lane_count]usize,
+    interpolation_alpha: f32,
+) void {
+    const previous_x = simd.gatherFloat4(particles.previous_x, indices);
+    const position_x = simd.gatherFloat4(particles.position_x, indices);
+    const previous_y = simd.gatherFloat4(particles.previous_y, indices);
+    const position_y = simd.gatherFloat4(particles.position_y, indices);
+    const lerped = simd.lerpVec2Float4(
+        .{ .x = previous_x, .y = previous_y },
+        .{ .x = position_x, .y = position_y },
+        simd.splatFloat4(interpolation_alpha),
+    );
+    const render_x = simd.toFloatArray(lerped.x);
+    const render_y = simd.toFloatArray(lerped.y);
+
+    inline for (0..simd.lane_count) |lane| {
+        finishParticleRecord(prep, particles, visible, indices[lane], render_x[lane], render_y[lane]);
     }
-    prep.finalizeDepthBuckets();
+}
+
+/// AABB cull + build + append for one already-lerped particle. Shared by the
+/// batched-lane path and the scalar tail so the two paths cannot diverge.
+fn finishParticleRecord(
+    prep: *DynamicScenePrep,
+    particles: ConstParticleSlice,
+    visible: VisibleWorldRect,
+    index: usize,
+    render_x: f32,
+    render_y: f32,
+) void {
+    const particle_size = particles.size[index];
+    const half_size = particle_size * 0.5;
+    if (!visible.overlapsAabb(render_x - half_size, render_y - half_size, particle_size, particle_size)) return;
+    const draw = prepareParticleAt(particles, index, render_x, render_y) orelse return;
+    prep.appendAssumeCapacity(.{ .depth = draw.depth(), .draw = draw });
 }
 
 /// Which stream the layered-world merge walk should drain next. Sparse tiles and
@@ -941,6 +1101,274 @@ test "collect dynamic records after structural growth stays within reserve and a
     try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+fn renderPrepTestPosition(movement_index: usize) math.Vec2 {
+    const index_f: f32 = @floatFromInt(movement_index);
+    return .{ .x = 10 * index_f + 3, .y = 7 * index_f + 11 };
+}
+
+fn renderPrepTestPreviousPosition(movement_index: usize) math.Vec2 {
+    const index_f: f32 = @floatFromInt(movement_index);
+    return .{ .x = 10 * index_f, .y = 7 * index_f };
+}
+
+test "collectDynamicRecords batches entity lerp in lane groups and preserves scalar discovery order" {
+    // Eleven movement rows, in creation (== dense) order:
+    //   0 background (pass), 1 wrong level (fail), 2 chunk-culled (fail),
+    //   3 background (pass), 4 no primitive visual (fail, natural),
+    //   5 player (pass, mid-stream), 6 background (pass)  -> completes a
+    //   full lane_count(4) batch: [0, 3, 5, 6],
+    //   7 has_primitive_visual forced true with no visual row (fail: slot
+    //   resolve returns null from renderCollectIndicesForMovement),
+    //   8, 9, 10 background (pass) -> scalar tail of 3.
+    // Total passing candidates = 7, not a multiple of simd.lane_count, so both
+    // a full batched group and the scalar tail execute.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const background_visual = @import("data_system.zig").PrimitiveVisual{
+        .size = .{ .x = 4, .y = 4 },
+        .color = .{ .r = 0.2, .g = 0.3, .b = 0.4, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    };
+
+    const entity0 = try data.createEntity();
+    try data.setMovementBody(entity0, .{
+        .position = renderPrepTestPosition(0),
+        .previous_position = renderPrepTestPreviousPosition(0),
+    });
+    try data.setPrimitiveVisual(entity0, background_visual);
+
+    const entity1_wrong_level = try data.createEntity();
+    try data.setMovementBody(entity1_wrong_level, .{
+        .position = renderPrepTestPosition(1),
+        .previous_position = renderPrepTestPreviousPosition(1),
+    });
+    try data.setPrimitiveVisual(entity1_wrong_level, background_visual);
+    try data.setWorldLevel(entity1_wrong_level, 5);
+
+    const entity2_chunk_culled = try data.createEntity();
+    try data.setMovementBody(entity2_chunk_culled, .{
+        .position = renderPrepTestPosition(2),
+        .previous_position = renderPrepTestPreviousPosition(2),
+    });
+    try data.setPrimitiveVisual(entity2_chunk_culled, background_visual);
+
+    const entity3 = try data.createEntity();
+    try data.setMovementBody(entity3, .{
+        .position = renderPrepTestPosition(3),
+        .previous_position = renderPrepTestPreviousPosition(3),
+    });
+    try data.setPrimitiveVisual(entity3, background_visual);
+
+    const entity4_no_visual = try data.createEntity();
+    try data.setMovementBody(entity4_no_visual, .{
+        .position = renderPrepTestPosition(4),
+        .previous_position = renderPrepTestPreviousPosition(4),
+    });
+    // Intentionally no setPrimitiveVisual: has_primitive_visual stays false.
+
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{
+        .position = renderPrepTestPosition(5),
+        .previous_position = renderPrepTestPreviousPosition(5),
+    });
+    try data.setFacing(player_entity, .{ .direction = .down });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 4, .y = 4 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_length = 1,
+        .marker_depth = 1,
+        .marker_margin = 0,
+    });
+
+    const entity6 = try data.createEntity();
+    try data.setMovementBody(entity6, .{
+        .position = renderPrepTestPosition(6),
+        .previous_position = renderPrepTestPreviousPosition(6),
+    });
+    try data.setPrimitiveVisual(entity6, background_visual);
+
+    const entity7_null_indices = try data.createEntity();
+    try data.setMovementBody(entity7_null_indices, .{
+        .position = renderPrepTestPosition(7),
+        .previous_position = renderPrepTestPreviousPosition(7),
+    });
+    // Intentionally no setPrimitiveVisual, then desync the dense flag: exercises
+    // the `renderCollectIndicesForMovement(...) orelse continue` defensive path.
+    data.movementBodySlice().has_primitive_visual[7] = true;
+
+    const entity8 = try data.createEntity();
+    try data.setMovementBody(entity8, .{
+        .position = renderPrepTestPosition(8),
+        .previous_position = renderPrepTestPreviousPosition(8),
+    });
+    try data.setPrimitiveVisual(entity8, background_visual);
+
+    const entity9 = try data.createEntity();
+    try data.setMovementBody(entity9, .{
+        .position = renderPrepTestPosition(9),
+        .previous_position = renderPrepTestPreviousPosition(9),
+    });
+    try data.setPrimitiveVisual(entity9, background_visual);
+
+    const entity10 = try data.createEntity();
+    try data.setMovementBody(entity10, .{
+        .position = renderPrepTestPosition(10),
+        .previous_position = renderPrepTestPreviousPosition(10),
+    });
+    try data.setPrimitiveVisual(entity10, background_visual);
+
+    // Chunk-cull row 2 only: everything else defaults to chunk (0, 0), which is
+    // inside the visible region set up below.
+    var scope = data.scopeColumnsSlice();
+    scope.chunk_x[2] = 100;
+    scope.chunk_y[2] = 100;
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    // Smallest possible world: 1x1 tiles still yields exactly one chunk
+    // (chunksX/Y is ceilDiv(width, chunk_size_tiles)), which is all the chunk
+    // gate needs — no reason to build out a larger tile grid for this test.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 32, .h = 32 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = 0, .min_y = 0, .max_x = 256, .max_y = 256 };
+    const interpolation_alpha: f32 = 0.37;
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, interpolation_alpha);
+
+    const records = prep.orderedRecords();
+    // 7 passing background/player rows + 1 player marker; the 4 filtered rows
+    // (wrong level, chunk-culled, no visual, desynced-null-indices) contribute
+    // nothing and must not have consumed a lane slot.
+    try std.testing.expectEqual(@as(usize, 8), records.len);
+
+    // Discovery order must be reproduced exactly: [0, 3, player, player-marker,
+    // 6, 8, 9, 10]. Sequence equals append order (== array index) here since
+    // nothing before this point in the run has appended any record.
+    const expected_movement_index = [_]usize{ 0, 3, 5, 5, 6, 8, 9, 10 };
+    for (records, 0..) |record, slot| {
+        try std.testing.expectEqual(slot, record.sequence);
+        const is_marker = slot == 3;
+        try std.testing.expectEqual(@as(i32, if (is_marker) 2 else 0), record.depth);
+
+        const movement_index = expected_movement_index[slot];
+        const expected_render_x = math.lerp(
+            renderPrepTestPreviousPosition(movement_index).x,
+            renderPrepTestPosition(movement_index).x,
+            interpolation_alpha,
+        );
+        const expected_render_y = math.lerp(
+            renderPrepTestPreviousPosition(movement_index).y,
+            renderPrepTestPosition(movement_index).y,
+            interpolation_alpha,
+        );
+
+        if (is_marker) {
+            const expected_marker_rect = markerRectAt(expected_render_x, expected_render_y, .down, 4, 4, 1, 1, 0);
+            const marker_rect = record.draw.rect.rect;
+            try std.testing.expectEqual(expected_marker_rect.x, marker_rect.x);
+            try std.testing.expectEqual(expected_marker_rect.y, marker_rect.y);
+        } else {
+            const rect = record.draw.rect.rect;
+            try std.testing.expectEqual(expected_render_x, rect.x);
+            try std.testing.expectEqual(expected_render_y, rect.y);
+        }
+    }
+}
+
+test "collectDynamicRecords batches particle lerp in lane groups and preserves discovery order" {
+    // No entities: the movement loop is a no-op, so this isolates the particle
+    // batch/tail flush path with the smallest possible fixture (1x1 world, no
+    // levels/chunks needed since nothing consults them).
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const particle_count = 6; // one full lane_count(4) batch + a 2-item tail
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = particle_count });
+    defer particles.deinit();
+    for (0..particle_count) |i| {
+        const position = renderPrepTestPosition(i);
+        try std.testing.expect(particles.emit(.{ .position = position, .start_size = 4 }));
+    }
+    // Spawn sets previous == position; desync them so the batch/tail lerp is
+    // non-trivial and a lane mixup would show up as a wrong rendered position.
+    var mutable_particles = particles.slice();
+    for (0..particle_count) |i| {
+        const previous = renderPrepTestPreviousPosition(i);
+        mutable_particles.previous_x[i] = previous.x;
+        mutable_particles.previous_y[i] = previous.y;
+    }
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    const player_entity = try EntityId.init(0, 1);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = 0, .min_y = 0, .max_x = 256, .max_y = 256 };
+    const interpolation_alpha: f32 = 0.6;
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, interpolation_alpha);
+
+    const records = prep.orderedRecords();
+    try std.testing.expectEqual(@as(usize, particle_count), records.len);
+
+    const half_size: f32 = 4 * 0.5;
+    for (records, 0..) |record, index| {
+        try std.testing.expectEqual(index, record.sequence);
+        const expected_render_x = math.lerp(
+            renderPrepTestPreviousPosition(index).x,
+            renderPrepTestPosition(index).x,
+            interpolation_alpha,
+        );
+        const expected_render_y = math.lerp(
+            renderPrepTestPreviousPosition(index).y,
+            renderPrepTestPosition(index).y,
+            interpolation_alpha,
+        );
+        const rect = record.draw.rect.rect;
+        try std.testing.expectEqual(expected_render_x - half_size, rect.x);
+        try std.testing.expectEqual(expected_render_y - half_size, rect.y);
+    }
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {

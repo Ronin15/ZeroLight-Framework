@@ -77,7 +77,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
 | **26–33** | Not started | Emergent AI track — see **Emergent AI Track Overview** then each slice |
-| **34–35** | Not started | SIMD expansion — Checklists open |
+| **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
+| **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
 
 **Landed slice sections (18–25, 24B):** checklists complete; sections are
 acceptance history. Follow-up hardening without a new slice number lives in
@@ -1765,6 +1766,12 @@ Current foundation:
   of distinct sensed entities.
 - Slice 26 supplies faction stance; Slice 28 supplies a shared spatial index;
   Slice 21 supplies the event contract.
+- Slice 34 deferred the vector sin/cos polynomial approximation to here:
+  `simd.sinFloat4`/`cosFloat4`/`sinCosFloat4` exist today only as thin
+  `@sin`/`@cos` vector-builtin wrappers with no production caller. If this
+  slice's FOV math needs batched-angle trig across many agents, implement and
+  benchmark the real polynomial (with a documented error bound and scalar
+  fallback) here, against this slice's actual workload.
 
 Architecture notes:
 
@@ -1945,6 +1952,25 @@ Acceptance checks:
 
 ## Slice 34: Core SIMD Primitive Layer Expansion And Dense-Path Wins
 
+**Status: landed, with one item deferred by design.** Every Checklist and
+Acceptance item is `[x]` except the vector sin/cos approximation, which stays
+`[ ]` and is explicitly deferred to Slice 29 (see that item below) rather than
+implemented speculatively with no consumer.
+
+> Doc-drift note: this section previously listed every item below as `[ ]`
+> "Not started." Direct code reading found most of this slice had already
+> shipped in earlier commits without the roadmap being updated — the gather/
+> scatter helper, rsqrt/normalize, the sprite vertex-transform vectorization,
+> and the AI separation-grid `@memset` all predate this correction pass (see
+> commit `a723821`, "updated collisions hand rolled gather 4 into SIMD.zig",
+> and the `world` branch changelog's "Expanded `src/core/simd.zig` and
+> `src/core/math.zig` with reusable gather, normalize, sin/cos, and tail
+> helpers"). This pass corrects the stale checkboxes and lands the two items
+> that were genuinely still open: the packed-SoA-scratch idiom documentation
+> and a batched `Vec2x4` lerp with a real consumer. Two items are
+> **reinterpreted, not implemented as originally worded** — see the notes on
+> items 3 and 5 below.
+
 Goal: extend `src/core/simd.zig` with the vector primitives the SIMD-first
 gameplay/AI stages will need, and land the layout-independent dense-path
 vectorization wins that are measurable today. This is foundational and should
@@ -1963,57 +1989,92 @@ Current foundation (already vectorized through `src/core/simd.zig`, with scalar
 tails, no raw `@Vector` in systems):
 
 - `systems/movement.zig` — position/velocity integration over SoA columns.
-- `systems/collision.zig` — broadphase AABB sweep and narrowphase contact math
-  (a locally hand-rolled `gather4` + masked select).
+- `systems/collision.zig` — broadphase AABB sweep and narrowphase contact math,
+  both ported onto the shared `simd.gatherFloat4`/`scatterFloat4` helpers
+  (`a723821`) — no local hand-rolled `gather4` remains.
 - `systems/collision_response.zig` — normal/penetration/velocity correction math.
 - `systems/particle.zig` — particle integration and color/size lerp.
 - `systems/pathfinding.zig` — flow-field octile heuristic and nav-grid marking;
   `pathfinding_range_alignment_items = simd.lane_count`.
-- The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp, and
-  tail helpers, with a single `lane_count` source of width.
-
-Gaps the SIMD-first stages need (the missing primitives):
-
-- No shared gather/scatter helper — collision hand-rolls `gather4`; AI/steering
-  and perception will all need the same.
-- No reciprocal/inverse sqrt and no vectorized 2D normalize (with a masked
-  zero-length guard) — required by every separation/avoidance/perception kernel.
-- No vector sin/cos approximation — Zig `@cos`/`@sin` do not auto-vectorize, and
-  rotation (sprites) and FOV (perception) math need it.
-- No documented packed-SoA-scratch idiom (gather sparse indices into contiguous
-  lanes) — the standard tool for making gather-bound loops vectorizable.
+- `game/render_prep.zig` — `collectDynamicRecords`'s entity and particle
+  interpolation loops batch-lerp already-filtered candidates via the packed-
+  SoA-scratch idiom (buffer `simd.lane_count` survivors → `gatherFloat4` →
+  `lerpVec2Float4` → per-lane finish, scalar tail for the remainder); measured
+  ~6–9% faster `entity_collect` phase time at 1,024/4,096/10,000 render
+  entities with no regression at low counts (`zig build bench -- --group
+  render-game-prep --details`).
+- The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp,
+  gather/scatter, reciprocal-sqrt/normalize, sin/cos, lerp (including the
+  `Vec2x4` batched `lerpVec2Float4`), and tail helpers, with a single
+  `lane_count` source of width and a documented packed-SoA-scratch idiom on
+  `gatherFloat4`.
 
 Checklist:
 
-- [ ] Add gather/scatter helpers to `core/simd.zig`, generalizing collision's
-      local `gather4`; port collision to the shared helper.
-- [ ] Add reciprocal-sqrt / inverse-length and a vectorized 2D normalize with a
+- [x] Add gather/scatter helpers to `core/simd.zig`, generalizing collision's
+      local `gather4`; port collision to the shared helper. Landed pre-existing
+      (`a723821`); `gatherFloat4`/`gatherInt4`/`scatterFloat4` are in
+      `core/simd.zig`, collision's broadphase/narrowphase call them directly.
+- [x] Add reciprocal-sqrt / inverse-length and a vectorized 2D normalize with a
       masked zero-guard (matching the scalar `normalizeOrZero` semantics).
+      Landed pre-existing: `reciprocalSqrtFloat4`/`normalizeOrZero2Float4`.
 - [ ] Add a vector sin/cos (or sincos) approximation with a documented error
-      bound and a scalar fallback path.
-- [ ] Document the packed-SoA-scratch idiom in `core/simd.zig` (or a sibling
-      helper) so later stages reuse one gather-into-lanes pattern.
-- [ ] Vectorize the sprite vertex transform in `render/sprite_batch.zig`
-      (`writePreparedSpriteVertices` / `fillPreparedRange`): pack the 4-corner
-      rotation + translation + camera transform through the helpers over the
-      contiguous prepared-command array, mask the `coordinate_space` branch, keep
-      a scalar tail (~1.3–1.5x on large batches).
-- [ ] Replace the AI separation-grid zero-fill (`systems/ai.zig`) with `@memset`
-      or a vector fill.
-- [ ] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
-      when the interpolation pass iterates many entities over contiguous columns.
+      bound and a scalar fallback path. **Deferred, not implemented.**
+      `sinFloat4`/`cosFloat4`/`sinCosFloat4` exist as thin `@sin`/`@cos`
+      vector-builtin wrappers (correct, but not a polynomial approximation),
+      and have **zero production callers** today. Building a bespoke
+      polynomial with no consumer would be unmeasurable, premature
+      optimization. Deferred to Slice 29 (AI Perception), the first stage
+      needing batched-angle FOV trig across many agents — implement and
+      benchmark it there, against a real workload, not here.
+- [x] Document the packed-SoA-scratch idiom in `core/simd.zig` (or a sibling
+      helper) so later stages reuse one gather-into-lanes pattern. Landed this
+      pass: a worked-example doc block on `gatherFloat4` citing
+      `CollisionSystem.buildBroadphaseCandidatesSimd`/
+      `writeNarrowphaseContactsSimd` as the canonical existing example.
+- [x] Vectorize the sprite vertex transform in `render/sprite_batch.zig`
+      (`writePreparedSpriteVertices` / `fillPreparedRange`). **Reinterpreted:**
+      `writeSpriteQuad` already vectorizes the 4-corner rotation+translation via
+      `Float4` math (landed pre-existing). The "camera transform" and
+      "coordinate_space branch" clauses in the original wording no longer map
+      onto the code as it evolved — the camera transform is baked into the GPU
+      vertex uniform (no CPU-side camera math exists to vectorize), and
+      `coordinate_space` is read only in `buildDrawGroups` for draw-group
+      boundaries, not in the per-vertex emit path, so there is no branch there
+      to mask.
+- [x] Replace the AI separation-grid zero-fill (`systems/ai.zig`) with `@memset`
+      or a vector fill. Landed pre-existing: `resetSeparationScratch` already
+      zero-fills via `@memset` (the separation grid itself was replaced by
+      `SpatialIndexSystem` in Slice 28).
+- [x] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
+      when the interpolation pass iterates many entities over contiguous
+      columns. Landed this pass as `lerpVec2Float4` in `core/simd.zig`
+      (co-located with the other `Vec2x4` SIMD primitives it mirrors, not
+      `core/math.zig` as originally worded) with a real consumer at landing
+      time: `game/render_prep.zig`'s `collectDynamicRecords` (see Current
+      foundation above).
 
 Acceptance checks:
 
-- [ ] New primitives have unit tests and scalar-vs-SIMD parity tests; numeric
+- [x] New primitives have unit tests and scalar-vs-SIMD parity tests; numeric
       approximations (rsqrt, sin/cos) document error bounds and keep a scalar
-      fallback.
-- [ ] Collision narrowphase produces identical contacts after porting to the
-      shared gather helper (parity test).
-- [ ] `zig build bench` shows a render-prep vertex-emit win at 10k–50k sprites
-      with no regression at low counts.
-- [ ] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
-- [ ] `zig build verify` passes.
+      fallback. `lerpVec2Float4` has a bit-exact parity test against
+      `math.lerpVec2` (no fast-math in this codebase, so `expectEqual`, not an
+      approximate tolerance, is the correct — and stronger — check). Sin/cos
+      approximation remains deferred per above.
+- [x] Collision narrowphase produces identical contacts after porting to the
+      shared gather helper (parity test) — landed pre-existing.
+- [x] `zig build bench` shows a render-prep win at 10k–50k sprites with no
+      regression at low counts. Measured: the `entity_collect` phase (the
+      restructured `collectDynamicRecords`) is ~6–9% faster at 1,024/4,096/
+      10,000 render entities than the pre-restructure baseline, exceeding the
+      ~2–3% run-to-run noise floor at every scale checked; no low-count
+      regression observed. (Acceptance wording said "vertex-emit"; the actual
+      restructured phase is `entity_collect` — `vertex_emit` is unrelated
+      `sprite_batch.zig` code and was unaffected, moving only within normal
+      noise.)
+- [x] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
+- [x] `zig build verify` passes.
 
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 

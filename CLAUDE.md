@@ -92,6 +92,15 @@ boundaries just to make a local change easier.
 - Treat implementation slices as full features: runtime behavior, docs, tests,
   and acceptance checks all integrated before marking complete.
 - Never edit generated output: `zig-out/` and `.zig-cache/`.
+- **Tests only: keep `WorldSystem`/`DataSystem` test fixtures at the smallest
+  size that still exercises the behavior under test** — do not build out a
+  full/large game world per test. `chunksX`/`chunksY` is `ceilDiv(width,
+  chunk_size_tiles)`, so a `1x1` (or otherwise minimal) `WorldSystem` still
+  yields exactly one real chunk, enough for chunk-gate/visibility tests
+  without a bigger tile grid. Reserve a larger populated world for the one
+  test that specifically needs structural growth/capacity behavior at scale
+  (e.g. a `FailingAllocator` reserve-proof test). Fast, small fixtures keep
+  `zig build test` fast as the suite grows.
 
 ## Build & Validation Commands
 
