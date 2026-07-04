@@ -1952,10 +1952,12 @@ Acceptance checks:
 
 ## Slice 34: Core SIMD Primitive Layer Expansion And Dense-Path Wins
 
-**Status: landed, with one item deferred by design.** Every Checklist and
-Acceptance item is `[x]` except the vector sin/cos approximation, which stays
-`[ ]` and is explicitly deferred to Slice 29 (see that item below) rather than
-implemented speculatively with no consumer.
+**Status: landed, with two items deferred/reverted by evidence.** The gather/
+scatter, rsqrt/normalize, sprite-transform, and AI-memset items were already
+shipped pre-existing. The packed-SoA-scratch idiom doc landed. The batched
+`lerpVec2Float4` primitive landed (correct, tested) but its `render_prep.zig`
+consumer was **built, benchmarked, and reverted** — see item 6 below. The
+sin/cos polynomial stays deferred to Slice 29.
 
 > Doc-drift note: this section previously listed every item below as `[ ]`
 > "Not started." Direct code reading found most of this slice had already
@@ -1965,11 +1967,13 @@ implemented speculatively with no consumer.
 > commit `a723821`, "updated collisions hand rolled gather 4 into SIMD.zig",
 > and the `world` branch changelog's "Expanded `src/core/simd.zig` and
 > `src/core/math.zig` with reusable gather, normalize, sin/cos, and tail
-> helpers"). This pass corrects the stale checkboxes and lands the two items
-> that were genuinely still open: the packed-SoA-scratch idiom documentation
-> and a batched `Vec2x4` lerp with a real consumer. Two items are
-> **reinterpreted, not implemented as originally worded** — see the notes on
-> items 3 and 5 below.
+> helpers"). This pass corrects the stale checkboxes and lands the packed-
+> SoA-scratch idiom documentation. It also attempted the batched-lerp item
+> (item 6) with a `render_prep.zig` consumer, measured it rigorously, found no
+> real win, and reverted the consumer — see item 6 for the full account,
+> including a caution about benchmark methodology worth reading before trying
+> this again. Two items are **reinterpreted, not implemented as originally
+> worded** — see the notes on items 3 and 5 below.
 
 Goal: extend `src/core/simd.zig` with the vector primitives the SIMD-first
 gameplay/AI stages will need, and land the layout-independent dense-path
@@ -1996,13 +2000,9 @@ tails, no raw `@Vector` in systems):
 - `systems/particle.zig` — particle integration and color/size lerp.
 - `systems/pathfinding.zig` — flow-field octile heuristic and nav-grid marking;
   `pathfinding_range_alignment_items = simd.lane_count`.
-- `game/render_prep.zig` — `collectDynamicRecords`'s entity and particle
-  interpolation loops batch-lerp already-filtered candidates via the packed-
-  SoA-scratch idiom (buffer `simd.lane_count` survivors → `gatherFloat4` →
-  `lerpVec2Float4` → per-lane finish, scalar tail for the remainder); measured
-  ~6–9% faster `entity_collect` phase time at 1,024/4,096/10,000 render
-  entities with no regression at low counts (`zig build bench -- --group
-  render-game-prep --details`).
+- `game/render_prep.zig`'s `collectDynamicRecords` interpolation loops remain
+  scalar `math.lerp` per entity/particle — a batched version was built and
+  reverted; see item 6 below for why.
 - The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp,
   gather/scatter, reciprocal-sqrt/normalize, sin/cos, lerp (including the
   `Vec2x4` batched `lerpVec2Float4`), and tail helpers, with a single
@@ -2048,11 +2048,54 @@ Checklist:
       `SpatialIndexSystem` in Slice 28).
 - [x] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
       when the interpolation pass iterates many entities over contiguous
-      columns. Landed this pass as `lerpVec2Float4` in `core/simd.zig`
-      (co-located with the other `Vec2x4` SIMD primitives it mirrors, not
-      `core/math.zig` as originally worded) with a real consumer at landing
-      time: `game/render_prep.zig`'s `collectDynamicRecords` (see Current
-      foundation above).
+      columns. **Primitive landed, consumer reverted.** `lerpVec2Float4`
+      landed in `core/simd.zig` (co-located with the other `Vec2x4` SIMD
+      primitives it mirrors, not `core/math.zig` as originally worded) — it is
+      correct and bit-exact parity-tested, and stays, currently without a
+      production caller (same situation as `sinCosFloat4`, item 3).
+      `game/render_prep.zig`'s `collectDynamicRecords` was restructured to
+      consume it (buffer `simd.lane_count` already-scalar-filtered candidates
+      → `gatherFloat4` → `lerpVec2Float4` → per-lane finish, scalar tail for
+      the remainder) and initially reported as a ~6–9% `entity_collect` win.
+      That result did not reproduce and the consumer was reverted:
+      - The original comparison was against a stale `benchmark_outputs/`
+        file from a non-adjacent ancestor commit, 9 commits and 226 unrelated
+        `render_prep.zig` lines removed from the true parent — the true
+        unmodified parent commit, measured in isolation, was itself ~2–6%
+        faster than that stale baseline at every scale, which alone accounts
+        for most of the falsely-reported win. Lesson: a benchmark file's age
+        isn't the issue (that's what `benchmark_outputs/` history is for);
+        comparing against a **non-adjacent commit with unrelated changes in
+        the exact function under test** is.
+      - The first "real" comparison also ran under the default `Debug`
+        optimize mode, where per-element safety checks can dominate and mask
+        (or invert) whatever a vectorized change would show under the
+        `ReleaseFast` mode this project actually ships.
+      - A corrected, controlled comparison (`git worktree` at the true parent
+        commit, 8 repeated runs per side, both `Debug` and `--release=fast`)
+        found **no reliable win at any scale, and a real ~5–15% regression at
+        two of three scales under `--release=fast`** — confirmed
+        independently by a `zig-review-specialist` review that reproduced the
+        regression before the corrected comparison above was even run.
+      - Root cause: `collectDynamicRecords`'s interpolation loop is
+        memory-bound and dominated by non-vectorizable branchy work (asset-
+        reference resolution, AABB cull, draw-record construction) — the two
+        float lerps being batched were never the bottleneck. The batching
+        overhead (scattered-index gather lowers to scalar loads + vector
+        inserts, not a hardware gather; per-lane extract to feed the still-
+        scalar finish work; stack-buffer bookkeeping; a by-value 4-candidate
+        struct array passed to a non-trivially-sized function that may not
+        fully inline) cost more than the ~24 scalar flops it replaced could
+        ever save. This is a poor fit for the packed-SoA-scratch idiom
+        compared to collision.zig's canonical use (compare/select-bound over
+        many candidates, not memory/branch-bound over a few).
+      Before retrying this consumer, either (a) profile first to confirm
+      `collectDynamicRecords` is actually a hot path at real gameplay scale
+      (not bench-fixture scale), or (b) extend the batch to vectorize the
+      AABB cull alongside the lerp (gather `visual_index`-indexed
+      `size_x`/`size_y`, compute the overlap mask in-lane) so the vectorized
+      portion amortizes its own gather/extract cost over more work — both
+      unverified, next-step ideas, not requirements.
 
 Acceptance checks:
 
@@ -2065,14 +2108,14 @@ Acceptance checks:
 - [x] Collision narrowphase produces identical contacts after porting to the
       shared gather helper (parity test) — landed pre-existing.
 - [x] `zig build bench` shows a render-prep win at 10k–50k sprites with no
-      regression at low counts. Measured: the `entity_collect` phase (the
-      restructured `collectDynamicRecords`) is ~6–9% faster at 1,024/4,096/
-      10,000 render entities than the pre-restructure baseline, exceeding the
-      ~2–3% run-to-run noise floor at every scale checked; no low-count
-      regression observed. (Acceptance wording said "vertex-emit"; the actual
-      restructured phase is `entity_collect` — `vertex_emit` is unrelated
-      `sprite_batch.zig` code and was unaffected, moving only within normal
-      noise.)
+      regression at low counts. **Not satisfied by `render_prep.zig`'s
+      interpolation loop** — see item 6's full account: a controlled
+      before/after comparison found no reliable win and a real regression at
+      two of three scales, so that consumer was reverted rather than kept
+      against this acceptance bar. The primitive-layer items (gather/scatter,
+      rsqrt/normalize, sprite-transform vectorization) that this check was
+      originally written against were already landed pre-existing and are
+      unaffected by the revert.
 - [x] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
 - [x] `zig build verify` passes.
 
