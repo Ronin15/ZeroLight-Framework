@@ -309,6 +309,13 @@ pub const WorldSystem = struct {
     // as an out-of-range level: an empty slice).
     sparse_level_tiles: std.ArrayList(std.ArrayList(u32)) = .empty,
 
+    // Finer sibling of sparse_level_tiles: outer by level_index, middle by the
+    // level-local chunk index (chunkY*chunksX+chunkX, see
+    // `localChunkIndexForCell`), inner the sparse_tiles indices in that chunk.
+    // Same eager-maintenance contract as sparse_level_tiles (see above) —
+    // maintained by `addSparseTile` only, never removed from or resorted.
+    sparse_level_chunk_tiles: std.ArrayList(std.ArrayList(std.ArrayList(u32))) = .empty,
+
     // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
     // set changes (tracked by render_index_dirty), never per frame. render_depths
     // is the sorted distinct set of dense+sparse depths; sparse_render_order holds
@@ -541,6 +548,11 @@ pub const WorldSystem = struct {
         self.sparse_tiles.deinit(self.allocator);
         for (self.sparse_level_tiles.items) |*bucket| bucket.deinit(self.allocator);
         self.sparse_level_tiles.deinit(self.allocator);
+        for (self.sparse_level_chunk_tiles.items) |*level_chunks| {
+            for (level_chunks.items) |*bucket| bucket.deinit(self.allocator);
+            level_chunks.deinit(self.allocator);
+        }
+        self.sparse_level_chunk_tiles.deinit(self.allocator);
 
         self.dense_tile_edits.deinit(self.allocator);
         self.dense_layer_tile_buffers.deinit(self.allocator);
@@ -1019,11 +1031,31 @@ pub const WorldSystem = struct {
         return self.sparse_level_tiles.items[level_index].items;
     }
 
-    // Appends `sparse_index` to `level_index`'s bucket in `sparse_level_tiles`,
-    // growing the outer list with empty buckets up to `level_index` first if
-    // needed. Called once per `addSparseTile` call, right after the tile is
-    // appended to `sparse_tiles`.
-    fn addSparseLevelIndexEntry(self: *WorldSystem, level_index: u16, sparse_index: u32) !void {
+    /// Indices into `sparse_tiles` for every sparse tile in `chunk_index` (a
+    /// level-local chunk offset, `chunkY*chunksX+chunkX` — see
+    /// `localChunkIndexForCell`) on `level_index`, in no particular order.
+    /// Empty for an out-of-range level or chunk. Backed by
+    /// `sparse_level_chunk_tiles`, maintained the same way as
+    /// `sparse_level_tiles` (see that field's comment) so this is always
+    /// current with no rebuild step. Finer-grained than
+    /// `sparseTileIndicesForLevel` for consumers that only need one chunk's
+    /// worth of sparse tiles.
+    pub fn sparseTileIndicesForChunk(self: *const WorldSystem, level_index: u16, chunk_index: u32) []const u32 {
+        if (level_index >= self.sparse_level_chunk_tiles.items.len) return &.{};
+        const level_chunks = self.sparse_level_chunk_tiles.items[level_index].items;
+        if (chunk_index >= level_chunks.len) return &.{};
+        return level_chunks[chunk_index].items;
+    }
+
+    // Reserves capacity for one more entry in level_index's sparse_level_tiles
+    // bucket, growing the outer list with empty buckets up to level_index
+    // first if needed. Mutates no already-committed data — only capacity.
+    // Paired with commitSparseLevelIndexEntry so addSparseTile can reserve
+    // every sparse structure before committing to any of them (see
+    // addSparseTile): either every reservation for a tile succeeds and every
+    // commit is then guaranteed to succeed, or the whole call fails with
+    // nothing observably changed.
+    fn reserveSparseLevelIndexEntry(self: *WorldSystem, level_index: u16) !void {
         const needed_buckets = @as(usize, level_index) + 1;
         if (self.sparse_level_tiles.items.len < needed_buckets) {
             try self.sparse_level_tiles.ensureTotalCapacity(self.allocator, needed_buckets);
@@ -1031,9 +1063,47 @@ pub const WorldSystem = struct {
                 self.sparse_level_tiles.appendAssumeCapacity(.empty);
             }
         }
-        var bucket = &self.sparse_level_tiles.items[level_index];
+        const bucket = &self.sparse_level_tiles.items[level_index];
         try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
-        bucket.appendAssumeCapacity(sparse_index);
+    }
+
+    // Infallible append into level_index's sparse_level_tiles bucket. Call
+    // only after reserveSparseLevelIndexEntry(level_index) has succeeded.
+    fn commitSparseLevelIndexEntry(self: *WorldSystem, level_index: u16, sparse_index: u32) void {
+        self.sparse_level_tiles.items[level_index].appendAssumeCapacity(sparse_index);
+    }
+
+    // Reserves capacity for one more entry in (level_index, chunk_index)'s
+    // sparse_level_chunk_tiles bucket: grows the outer per-level list, then
+    // that level's per-chunk list to chunkCountPerLevel() buckets on first
+    // touch, then the target chunk's bucket. Mutates no already-committed
+    // data — only capacity and empty placeholder buckets. See
+    // reserveSparseLevelIndexEntry for why this is split from its commit.
+    fn reserveSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32) !void {
+        const needed_levels = @as(usize, level_index) + 1;
+        if (self.sparse_level_chunk_tiles.items.len < needed_levels) {
+            try self.sparse_level_chunk_tiles.ensureTotalCapacity(self.allocator, needed_levels);
+            while (self.sparse_level_chunk_tiles.items.len < needed_levels) {
+                self.sparse_level_chunk_tiles.appendAssumeCapacity(.empty);
+            }
+        }
+        const level_chunks = &self.sparse_level_chunk_tiles.items[level_index];
+        const needed_chunks = self.chunkCountPerLevel();
+        if (level_chunks.items.len < needed_chunks) {
+            try level_chunks.ensureTotalCapacity(self.allocator, needed_chunks);
+            while (level_chunks.items.len < needed_chunks) {
+                level_chunks.appendAssumeCapacity(.empty);
+            }
+        }
+        const bucket = &level_chunks.items[chunk_index];
+        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
+    }
+
+    // Infallible append into (level_index, chunk_index)'s
+    // sparse_level_chunk_tiles bucket. Call only after
+    // reserveSparseChunkIndexEntry(level_index, chunk_index) has succeeded.
+    fn commitSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32, sparse_index: u32) void {
+        self.sparse_level_chunk_tiles.items[level_index].items[chunk_index].appendAssumeCapacity(sparse_index);
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {
@@ -1289,9 +1359,21 @@ pub const WorldSystem = struct {
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const cell = self.cellIndex(x, y);
         const chunk_index = try self.sparseChunkIndexForCell(level_index, x, y);
+        const local_chunk_index = self.localChunkIndexForCell(x, y);
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
+
+        // Reserve capacity in sparse_tiles, sparse_level_tiles, and
+        // sparse_level_chunk_tiles before committing to any of them: an OOM
+        // partway through would otherwise leave a tile in one structure but
+        // invisible to the level/chunk lookups the other two back (nav
+        // rebuild, perception's blocked cache). Either all three reservations
+        // succeed and the three appends below are then infallible, or the
+        // call fails here with none of the three structures changed.
         try self.sparse_tiles.ensureTotalCapacity(self.allocator, self.sparse_tiles.len + 1);
+        try self.reserveSparseLevelIndexEntry(level_index);
+        try self.reserveSparseChunkIndexEntry(level_index, local_chunk_index);
+
         const new_index: u32 = @intCast(self.sparse_tiles.len);
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
@@ -1301,7 +1383,8 @@ pub const WorldSystem = struct {
             .depth_value = world_z,
             .flags = flags,
         });
-        try self.addSparseLevelIndexEntry(level_index, new_index);
+        self.commitSparseLevelIndexEntry(level_index, new_index);
+        self.commitSparseChunkIndexEntry(level_index, local_chunk_index, new_index);
         self.render_index_dirty = true;
         // The sparse set changed, so the cached visible-sparse count must refresh.
         self.visibility_window_valid = false;
@@ -1648,20 +1731,36 @@ pub const WorldSystem = struct {
     fn sparseChunkIndexForCell(self: *const WorldSystem, level_index: u16, x: u16, y: u16) !u32 {
         const chunks_x = self.chunksX();
         const chunks_y = self.chunksY();
-        const chunk_x = x / self.chunk_size_tiles;
-        const chunk_y = y / self.chunk_size_tiles;
+        const local_chunk_index = self.localChunkIndexForCell(x, y);
         const level_offset = @as(usize, level_index) * @as(usize, chunks_x) * @as(usize, chunks_y);
-        const chunk_offset = @as(usize, chunk_y) * @as(usize, chunks_x) + @as(usize, chunk_x);
-        const index = level_offset + chunk_offset;
+        const index = level_offset + @as(usize, local_chunk_index);
         if (index > std.math.maxInt(u32)) return error.WorldChunkOverflow;
         return @intCast(index);
     }
 
-    fn chunksX(self: *const WorldSystem) u16 {
+    // Flat level-local chunk offset for a cell (chunkY*chunksX+chunkX),
+    // identical for every level since width/height/chunk_size_tiles are
+    // world-wide, not per-level. Backs sparse_level_chunk_tiles' middle
+    // dimension; sparseChunkIndexForCell adds the level offset on top of this
+    // for the world-global chunk_index stored on each SparseTileRow.
+    fn localChunkIndexForCell(self: *const WorldSystem, x: u16, y: u16) u32 {
+        const chunks_x = self.chunksX();
+        const chunk_x = x / self.chunk_size_tiles;
+        const chunk_y = y / self.chunk_size_tiles;
+        return @as(u32, chunk_y) * @as(u32, chunks_x) + @as(u32, chunk_x);
+    }
+
+    /// Level-local chunk grid width (world-wide, identical for every level —
+    /// see `localChunkIndexForCell`). Exposed for callers (e.g. perception's
+    /// LOS-blocked cache patch path) that need to bound a dirty rect to the
+    /// overlapping `sparseTileIndicesForChunk` range without duplicating this
+    /// grid-shape arithmetic.
+    pub fn chunksX(self: *const WorldSystem) u16 {
         return ceilDiv(self.width, self.chunk_size_tiles);
     }
 
-    fn chunksY(self: *const WorldSystem) u16 {
+    /// Level-local chunk grid height. See `chunksX`.
+    pub fn chunksY(self: *const WorldSystem) u16 {
         return ceilDiv(self.height, self.chunk_size_tiles);
     }
 
@@ -2274,6 +2373,124 @@ test "sparseTileIndicesForLevel returns exactly this level's sparse tile indices
     try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level2));
     // An out-of-range level.
     try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(99));
+}
+
+test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of sparseTileIndicesForLevel" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // 4x4 tiles, chunk_size_tiles=2 -> 2x2 chunk grid; level-local chunk
+    // offset = chunkY*2+chunkX, so (0,0)->0 (1,0)->1 (0,1)->2 (1,1)->3.
+    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle); // level0 chunk0
+    _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // level0 chunk0
+    _ = try world.addSparseTile(level0, 3, 0, deco, 0, .obstacle); // level0 chunk1
+    _ = try world.addSparseTile(level0, 1, 3, deco, 0, .obstacle); // level0 chunk2
+    // level1 > 0 so its global chunk_index (level_index*chunkCountPerLevel +
+    // local) differs from the level-local one this index is keyed by,
+    // proving the two are not conflated.
+    _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // level1 chunk3
+    _ = try world.addSparseTile(level1, 0, 1, deco, 0, .obstacle); // level1 chunk0
+
+    const chunks_x: u32 = 2;
+    for ([_]u16{ level0, level1 }) |level| {
+        const level_indices = world.sparseTileIndicesForLevel(level);
+        var chunk: u32 = 0;
+        while (chunk < 4) : (chunk += 1) {
+            var expected: std.ArrayList(u32) = .empty;
+            defer expected.deinit(std.testing.allocator);
+            for (level_indices) |sparse_index| {
+                const cell = world.sparseTileCellCoord(sparse_index);
+                const cell_chunk = @as(u32, cell.y / 2) * chunks_x + @as(u32, cell.x / 2);
+                if (cell_chunk == chunk) try expected.append(std.testing.allocator, sparse_index);
+            }
+            try expectSparseIndexSetEqual(expected.items, world.sparseTileIndicesForChunk(level, chunk));
+        }
+    }
+
+    // Out-of-range level and out-of-range chunk both return empty, matching
+    // sparseTileIndicesForLevel's out-of-range contract.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(99, 0));
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 99));
+}
+
+test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_chunk_tiles before committing any of them (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level0 = try world.addLevel(0);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Case 1: sparse_tiles' own reservation fails on the very first
+    // addSparseTile call ever, before sparse_level_tiles or
+    // sparse_level_chunk_tiles have any entries to compare against.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 0, 0, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level0));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 0));
+    }
+
+    // Warm up with one real insert (level0, chunk0) so the next two cases can
+    // isolate a single fresh reservation each, with every other structure
+    // already carrying spare capacity from this insert.
+    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle); // sparse index 0
+    try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+
+    // Case 2: a new level's sparse_level_tiles bucket needs its first-ever
+    // reservation. sparse_tiles has spare capacity from the warm-up insert
+    // and needs no allocation for this call.
+    const level1 = try world.addLevel(10);
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level1, 0, 0, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level1));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level1, 0));
+    }
+
+    // Case 3: a new chunk bucket on the already-warmed level0 needs its
+    // first-ever reservation. sparse_tiles and level0's sparse_level_tiles
+    // bucket both have spare capacity and need no allocation for this call.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        // Cell (3,3) is level-local chunk 3 (chunkY=1*2+chunkX=1), untouched
+        // by the level0/chunk0 warm-up insert above.
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 3, 3, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{0}, world.sparseTileIndicesForLevel(level0));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 3));
+    }
 }
 
 test "levelBlocksMovement scopes sparse obstacles to their own level at the same cell" {

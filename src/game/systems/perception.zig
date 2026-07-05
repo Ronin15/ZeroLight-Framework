@@ -52,9 +52,11 @@
 //! nearest-candidate sort (irreducibly small/branchy, does not scale with
 //! population), and the bounded LOS raycast (early-exit, one scattered cell
 //! lookup per sample). The per-sample blocked test itself is an O(1) read
-//! into `LevelBlockedSlot`'s per-level bitmap cache (`level_blocked`, built by
-//! `ensureLevelBlockedCachesForObservers`/`ensureLevelBlockedCache` at most
-//! once per distinct observer level per step), not
+//! into `LevelBlockedSlot`'s per-level bitmap cache (`level_blocked`, brought
+//! current for a distinct observer level at most once per step by
+//! `ensureLevelBlockedCachesForObservers`/`ensureLevelBlockedCache` — a skip,
+//! a scoped patch, or a full rebuild, whichever `reactToPostCommitPerceptionEvents`'s
+//! dirty tracking says is cheapest, see `LevelBlockedSlot`'s doc comment), not
 //! `WorldSystem.levelBlocksMovement`'s own per-call linear scan over the
 //! world's sparse tiles — see `LevelBlockedSlot`'s doc comment for why this is
 //! a bespoke cache rather than a reuse of `pathfinding/nav_grid.zig`'s
@@ -94,6 +96,7 @@ const movement_range_alignment_items = @import("../data_system.zig").movement_ra
 const WorldSystem = @import("../world_system.zig").WorldSystem;
 const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
+const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
@@ -304,16 +307,58 @@ fn serialBatch(count: usize) BatchStats {
 // below and gets populated the first time its level is touched.
 const invalid_build_step: u64 = std.math.maxInt(u64);
 
+// A pending edit to one level's blocked bitmap, awaiting the next
+// `ensureLevelBlockedCache` call that actually touches that level (see
+// `LevelBlockedSlot.pending_dirty`). Cell-rect shape mirrors
+// `WorldObstacleChangedEvent` (min inclusive, max exclusive) rather than
+// `pathfinding/nav_grid.zig`'s `NavCellEdit`/chunk-grid dirty model — this
+// cache works in raw world tiles, not nav cells/chunks, and reusing that
+// type would couple this file to nav's chunk-grid shape for no benefit (the
+// chunk grid is only consulted transiently, at patch time, to scope the
+// sparse-tile rescan — see `PerceptionSystem.patchLevelBlockedCache`).
+const DirtyRect = struct {
+    min_x: u16,
+    min_y: u16,
+    max_x_exclusive: u16,
+    max_y_exclusive: u16,
+};
+
+// Above this fraction of a level's total cell count, accumulated dirty area
+// makes the scoped patch path (a memset + rescan per pending rect, plus a
+// chunk-scoped sparse walk per rect) costlier than one dense full pass over
+// the whole level, so `ensureLevelBlockedCache` falls back to a full rebuild
+// instead — same spirit as `pathfinding/nav_graph.zig`'s
+// `full_relabel_level_threshold` (there: a count of affected *levels*; here:
+// a fraction of one level's *cells*, the finer unit this cache works in).
+// `pending_dirty`'s rects are summed without deduplicating overlap, so this
+// is a conservative (over-)estimate of actual dirty coverage — cheap to
+// compute and safe to fall back early on.
+const full_rebuild_dirty_area_numerator: u64 = 1;
+const full_rebuild_dirty_area_denominator: u64 = 4; // 25%
+
+fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_count: usize) bool {
+    var area: u64 = 0;
+    for (pending_dirty) |rect| {
+        const width = if (rect.max_x_exclusive > rect.min_x) rect.max_x_exclusive - rect.min_x else 0;
+        const height = if (rect.max_y_exclusive > rect.min_y) rect.max_y_exclusive - rect.min_y else 0;
+        area += @as(u64, width) * @as(u64, height);
+    }
+    return area * full_rebuild_dirty_area_denominator > @as(u64, cell_count) * full_rebuild_dirty_area_numerator;
+}
+
 // One level's O(1) LOS-blocked lookup cache: a raw world-tile-granularity
-// bitmap (`blocked[y * width + x]`), rebuilt at most once per distinct level
-// per step (see `PerceptionSystem.ensureLevelBlockedCache`). This exists
-// solely to answer `hasLineOfSight`'s per-sample question in O(1) instead of
-// `WorldSystem.levelBlocksMovement`'s per-call linear scan over every sparse
-// tile in the world (see the module doc's LOS-cost note and
-// `src/benchmarks/perception.zig`'s `perception`/`perception-los-dense` split
-// that proved the cost). Deliberately NOT a reuse of
-// `pathfinding/nav_grid.zig`'s `NavGrid`: that grid's blocked mask is world
-// obstacles OR (level 0 only) DataSystem static collision bodies — a
+// bitmap (`blocked[y * width + x]`), kept current for a distinct level at
+// most once per step (see `PerceptionSystem.ensureLevelBlockedCache`) via a
+// skip (nothing changed), a scoped patch (a bounded set of edits since the
+// last build), or a full rebuild (first build, or an invalid/never-built
+// level, or accumulated dirty area over `full_rebuild_dirty_area_numerator`/
+// `_denominator`). This exists solely to answer `hasLineOfSight`'s per-sample
+// question in O(1) instead of `WorldSystem.levelBlocksMovement`'s per-call
+// linear scan over every sparse tile in the world (see the module doc's
+// LOS-cost note and `src/benchmarks/perception.zig`'s `perception`/
+// `perception-los-dense` split that proved the cost). Deliberately NOT a
+// reuse of `pathfinding/nav_grid.zig`'s `NavGrid`: that grid's blocked mask is
+// world obstacles OR (level 0 only) DataSystem static collision bodies — a
 // different, broader set than `levelBlocksMovement`'s world-tiles-only
 // contract — and its `cell_size` is only incidentally equal to
 // `WorldSystem.tile_size` (two independently-set literals, not an enforced
@@ -325,9 +370,11 @@ const invalid_build_step: u64 = std.math.maxInt(u64);
 // `levelBlocksMovement` — see the parity test.
 const LevelBlockedSlot = struct {
     // `invalid_build_step` until the first build; thereafter the
-    // `PerceptionSystem.step_counter` value as of the last (re)build. A step
-    // counter mismatch (a new step ran since) triggers a rebuild before the
-    // slot is read again.
+    // `PerceptionSystem.step_counter` value as of the last build/patch. A
+    // step-counter mismatch (a new step ran since) revisits the slot the next
+    // time its level is touched — see `pending_dirty` for what that revisit
+    // actually does (skip/patch/rebuild), which is no longer "always
+    // rebuild" the way a bare step-counter mismatch alone would imply.
     built_step: u64 = invalid_build_step,
     // False for a level index that did not exist in `WorldSystem` at build
     // time (`level_index >= world.levelCount()`), matching
@@ -338,8 +385,21 @@ const LevelBlockedSlot = struct {
     width: u16 = 0,
     height: u16 = 0,
     blocked: std.ArrayList(bool) = .empty,
+    // Edits recorded by `PerceptionSystem.reactToPostCommitPerceptionEvents`
+    // since this slot was last built/patched, awaiting the next
+    // `ensureLevelBlockedCache` call that actually touches this level. Unlike
+    // `PathfindingSystem.nav_dirty_edits` (drained once per step regardless of
+    // whether nav ran that step), this can persist across MULTIPLE untouched
+    // steps: a level with no observer this step is never asked to rebuild, so
+    // edits on it simply accumulate until an observer next looks at it. Grows
+    // rather than drops on append (same must-not-silently-lose-an-edit
+    // contract as `nav_dirty_edits`) so a burst of edits between two observer
+    // visits is never forgotten; cleared only after a build/patch actually
+    // consumes it.
+    pending_dirty: std.ArrayList(DirtyRect) = .empty,
 
     fn deinit(self: *LevelBlockedSlot, allocator: std.mem.Allocator) void {
+        self.pending_dirty.deinit(allocator);
         self.blocked.deinit(allocator);
         self.* = undefined;
     }
@@ -375,9 +435,16 @@ pub const PerceptionSystem = struct {
     // step, via `ensureLevelBlockedCache`.
     level_blocked: std.ArrayList(LevelBlockedSlot) = .empty,
     // Monotonic step marker: incremented once per `update`/`updateSerial`
-    // call. A level's cached bitmap is reused for every LOS sample within the
-    // same step and rebuilt lazily the first time that level is touched in a
-    // later step.
+    // call that has at least one observer (a zero-observer step returns
+    // early and does not increment it). A level's cached bitmap is reused
+    // for every LOS sample within the same step; the first time a level is
+    // touched in a LATER step, `ensureLevelBlockedCache` sees the step-counter
+    // mismatch and decides what to do with the slot's `pending_dirty` list —
+    // skip (empty: nothing changed since the last build/patch), a scoped
+    // patch (a bounded set of edits), or a full rebuild (first build, or
+    // dirty area over the full-rebuild threshold). A step-counter mismatch by
+    // itself no longer implies "stale, must fully rescan" — only
+    // `pending_dirty` being non-empty does.
     step_counter: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
@@ -560,6 +627,53 @@ pub const PerceptionSystem = struct {
         for (levels) |level| try self.ensureLevelBlockedCache(world, level);
     }
 
+    // Grows `level_blocked` on demand up to `level + 1` slots (never shrinks,
+    // never drops an already-built slot), returning the slot for `level`.
+    // Shared by `ensureLevelBlockedCache` (which then reads/writes the slot's
+    // bitmap) and `reactToPostCommitPerceptionEvents` (which only ever
+    // appends to `pending_dirty`) so a level touched only by a dirty-marking
+    // event before its first observer visit still gets a slot to record
+    // against.
+    fn levelBlockedSlot(self: *PerceptionSystem, level: u16) !*LevelBlockedSlot {
+        if (@as(usize, level) >= self.level_blocked.items.len) {
+            const new_len = @as(usize, level) + 1;
+            try self.level_blocked.ensureTotalCapacity(self.allocator, new_len);
+            while (self.level_blocked.items.len < new_len) self.level_blocked.appendAssumeCapacity(.{});
+        }
+        return &self.level_blocked.items[level];
+    }
+
+    // Brings one level's LOS-blocked bitmap current for this step: a no-op
+    // when the slot is already built for the current `step_counter`;
+    // otherwise a skip (nothing changed since the last build/patch — the
+    // headline case this incremental design exists for, see the module doc),
+    // a scoped patch (`patchLevelBlockedCache`), or a full rebuild
+    // (`rebuildLevelBlockedCache`) — first build, or accumulated dirty area
+    // over the full-rebuild threshold. Any stale `pending_dirty` recorded
+    // before a level's first-ever build is discarded rather than patched
+    // against: the full rebuild below already reflects the current world
+    // state directly, so replaying pre-first-build edits on top would be
+    // redundant at best.
+    fn ensureLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
+        const slot = try self.levelBlockedSlot(level);
+        if (slot.built_step == self.step_counter) return;
+
+        const first_build = slot.built_step == invalid_build_step;
+        const cell_count = @as(usize, world.width) * @as(usize, world.height);
+        if (first_build) {
+            try self.rebuildLevelBlockedCache(world, level, slot, cell_count);
+        } else if (slot.pending_dirty.items.len == 0) {
+            // Nothing changed since the last build/patch: reuse it as-is.
+        } else if (dirtyAreaExceedsFullRebuildThreshold(slot.pending_dirty.items, cell_count)) {
+            try self.rebuildLevelBlockedCache(world, level, slot, cell_count);
+        } else {
+            patchLevelBlockedCache(world, level, slot);
+        }
+
+        slot.built_step = self.step_counter;
+        slot.pending_dirty.clearRetainingCapacity();
+    }
+
     // Rebuilds one level's LOS-blocked bitmap from `world`'s dense bands and
     // sparse obstacles, mirroring `nav_grid.zig`'s `markWorldObstacles` shape
     // (uniform-fill fast path, then a per-dense-layer cell scan, then a
@@ -568,20 +682,11 @@ pub const PerceptionSystem = struct {
     // but at raw world-tile granularity — no nav-cell rect rasterization — so
     // the result is a direct, provable stand-in for
     // `WorldSystem.levelBlocksMovement` (see `LevelBlockedSlot`'s doc comment
-    // and the parity test). A no-op when the slot is already built for the
-    // current `step_counter`. `blocked`'s backing storage is grown once and
+    // and the parity test). `blocked`'s backing storage is grown once and
     // reused across steps (never deinit/re-init between steps); only its
-    // contents are refreshed.
-    fn ensureLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
-        if (@as(usize, level) >= self.level_blocked.items.len) {
-            const new_len = @as(usize, level) + 1;
-            try self.level_blocked.ensureTotalCapacity(self.allocator, new_len);
-            while (self.level_blocked.items.len < new_len) self.level_blocked.appendAssumeCapacity(.{});
-        }
-        const slot = &self.level_blocked.items[level];
-        if (slot.built_step == self.step_counter) return;
-
-        const cell_count = @as(usize, world.width) * @as(usize, world.height);
+    // contents are refreshed. Caller (`ensureLevelBlockedCache`) stamps
+    // `built_step`/clears `pending_dirty` afterward.
+    fn rebuildLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot, cell_count: usize) !void {
         try slot.blocked.ensureTotalCapacity(self.allocator, cell_count);
         slot.blocked.items.len = cell_count;
         slot.width = world.width;
@@ -593,10 +698,7 @@ pub const PerceptionSystem = struct {
         // but mark the slot invalid, so `lookupLevelBlocked` returns blocked
         // without ever reading `blocked`'s (unpopulated) contents.
         slot.valid = @as(usize, level) < world.levelCount();
-        if (!slot.valid) {
-            slot.built_step = self.step_counter;
-            return;
-        }
+        if (!slot.valid) return;
 
         for (0..world.denseLayerCount()) |layer_index| {
             if (world.denseLayerLevel(layer_index) != level) continue;
@@ -618,8 +720,53 @@ pub const PerceptionSystem = struct {
             const cell = world.sparseTileCellCoord(sparse_index);
             slot.blocked.items[@as(usize, cell.y) * @as(usize, world.width) + @as(usize, cell.x)] = true;
         }
+    }
 
-        slot.built_step = self.step_counter;
+    // Records one committed structural event's blocked-cache impact for the
+    // next `ensureLevelBlockedCache` call on its level: this system's own
+    // narrower sibling of `PathfindingSystem.reactToPostCommitNavEvents`.
+    // Only `.world_tile_changed` (a single-cell rect, and only when the
+    // movement-blocking flag actually flipped) and `.world_obstacle_changed`
+    // (the event's own already-multi-cell rect) are localizable to this
+    // cache's world-tiles-only contract (see the module doc); every other
+    // structural event (entity/component changes, which this cache never
+    // reads) is irrelevant and ignored. Unlike nav's `eventInvalidatesNavigation`,
+    // there is no non-localizable whole-level fallback case here. Purely
+    // internal bookkeeping: nothing currently reacts to "perception's cache
+    // changed," so this emits no event of its own — simpler than nav's
+    // reaction, which does emit `nav_region_invalidated`.
+    pub fn reactToPostCommitPerceptionEvents(self: *PerceptionSystem, frame: *SimulationFrame, world: *const WorldSystem) !void {
+        for (frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            switch (event.payload) {
+                .world_tile_changed => |changed| {
+                    if (changed.old_blocks_movement == changed.new_blocks_movement) continue;
+                    if (changed.level >= world.levelCount()) continue;
+                    try self.markLevelDirty(changed.level, .{
+                        .min_x = changed.x,
+                        .min_y = changed.y,
+                        .max_x_exclusive = changed.x +| 1,
+                        .max_y_exclusive = changed.y +| 1,
+                    });
+                },
+                .world_obstacle_changed => |changed| {
+                    if (changed.level >= world.levelCount()) continue;
+                    try self.markLevelDirty(changed.level, .{
+                        .min_x = changed.min_x,
+                        .min_y = changed.min_y,
+                        .max_x_exclusive = changed.max_x_exclusive,
+                        .max_y_exclusive = changed.max_y_exclusive,
+                    });
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn markLevelDirty(self: *PerceptionSystem, level: u16, rect: DirtyRect) !void {
+        const slot = try self.levelBlockedSlot(level);
+        try slot.pending_dirty.ensureTotalCapacity(self.allocator, slot.pending_dirty.items.len + 1);
+        slot.pending_dirty.appendAssumeCapacity(rect);
     }
 
     // Population-domain contract with spatial_index.zig/ai.zig (see module
@@ -839,6 +986,107 @@ const PerceptionEventMergeResult = struct {
     lost: usize,
     dropped: usize,
 };
+
+fn clampRectToLevel(rect: DirtyRect, width: u16, height: u16) DirtyRect {
+    return .{
+        .min_x = @min(rect.min_x, width),
+        .min_y = @min(rect.min_y, height),
+        .max_x_exclusive = @min(rect.max_x_exclusive, width),
+        .max_y_exclusive = @min(rect.max_y_exclusive, height),
+    };
+}
+
+const ChunkRange = struct { min_x: u16, min_y: u16, max_x: u16, max_y: u16 };
+
+// The level-local chunk range a (clamped) rect overlaps, clamped to
+// `[0, chunks_x - 1] x [0, chunks_y - 1]` — mirrors
+// `WorldSystem.localChunkIndexForCell`'s per-cell chunk math, computed once
+// for the whole rect instead of per cell. Callers combine `min_y..max_y` and
+// `min_x..max_x` with `chunks_x` the same way `localChunkIndexForCell` does
+// (`chunk_y * chunks_x + chunk_x`) to reach `sparseTileIndicesForChunk`.
+fn chunkRangeForRect(rect: DirtyRect, chunk_size_tiles: u16, chunks_x: u16, chunks_y: u16) ChunkRange {
+    const chunk_size = @max(chunk_size_tiles, 1);
+    const max_chunk_x = if (chunks_x == 0) 0 else chunks_x - 1;
+    const max_chunk_y = if (chunks_y == 0) 0 else chunks_y - 1;
+    const max_x_inclusive_cell: u16 = if (rect.max_x_exclusive == 0) 0 else rect.max_x_exclusive - 1;
+    const max_y_inclusive_cell: u16 = if (rect.max_y_exclusive == 0) 0 else rect.max_y_exclusive - 1;
+    return .{
+        .min_x = @min(rect.min_x / chunk_size, max_chunk_x),
+        .min_y = @min(rect.min_y / chunk_size, max_chunk_y),
+        .max_x = @min(max_x_inclusive_cell / chunk_size, max_chunk_x),
+        .max_y = @min(max_y_inclusive_cell / chunk_size, max_chunk_y),
+    };
+}
+
+// Patches only the cells covered by `slot.pending_dirty`, in place, instead of
+// rescanning the whole level (see `LevelBlockedSlot`'s doc comment and
+// `ensureLevelBlockedCache`'s decision tree). A bit can flip either direction
+// (a dig can unblock a cell, not just block one), so each rect's cell range is
+// `@memset` false first, then rescanned: per relevant dense layer, bounded to
+// the rect instead of the whole level; and per sparse tile, but only within
+// the rect's overlapping level-local chunks (`WorldSystem.sparseTileIndicesForChunk`
+// via `chunkRangeForRect`) rather than every sparse tile on the level — the
+// candidate set is bounded by chunk population, not level population, which
+// is the real complexity-class win on the sparse side. Takes no allocator and
+// grows nothing: `slot.blocked`'s backing storage is already sized to
+// `slot.width * slot.height` by an earlier full build (a slot only reaches
+// this function post-first-build — see `ensureLevelBlockedCache`), and
+// `slot.width`/`height` cannot have changed since (levels never resize after
+// creation). An invalid slot (fail-closed, `blocked` never populated) has
+// nothing to patch and is left as-is.
+fn patchLevelBlockedCache(world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot) void {
+    if (!slot.valid) return;
+    const chunks_x = world.chunksX();
+    const chunks_y = world.chunksY();
+
+    for (slot.pending_dirty.items) |raw_rect| {
+        const rect = clampRectToLevel(raw_rect, slot.width, slot.height);
+        if (rect.min_x >= rect.max_x_exclusive or rect.min_y >= rect.max_y_exclusive) continue;
+
+        var y = rect.min_y;
+        while (y < rect.max_y_exclusive) : (y += 1) {
+            const row_offset = @as(usize, y) * @as(usize, slot.width);
+            @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], false);
+        }
+
+        for (0..world.denseLayerCount()) |layer_index| {
+            if (world.denseLayerLevel(layer_index) != level) continue;
+            if (world.denseLayerUniformFillTile(layer_index) != null) {
+                if (!world.denseTileBlocksMovement(layer_index, 0, 0)) continue;
+                var yy = rect.min_y;
+                while (yy < rect.max_y_exclusive) : (yy += 1) {
+                    const row_offset = @as(usize, yy) * @as(usize, slot.width);
+                    @memset(slot.blocked.items[row_offset + rect.min_x .. row_offset + rect.max_x_exclusive], true);
+                }
+                continue;
+            }
+            var yy = rect.min_y;
+            while (yy < rect.max_y_exclusive) : (yy += 1) {
+                var xx = rect.min_x;
+                while (xx < rect.max_x_exclusive) : (xx += 1) {
+                    if (!world.denseTileBlocksMovement(layer_index, xx, yy)) continue;
+                    slot.blocked.items[@as(usize, yy) * @as(usize, slot.width) + @as(usize, xx)] = true;
+                }
+            }
+        }
+
+        const chunk_range = chunkRangeForRect(rect, world.chunk_size_tiles, chunks_x, chunks_y);
+        var cy = chunk_range.min_y;
+        while (cy <= chunk_range.max_y) : (cy += 1) {
+            var cx = chunk_range.min_x;
+            while (cx <= chunk_range.max_x) : (cx += 1) {
+                const local_chunk_index: u32 = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
+                for (world.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
+                    if (!world.sparseTileBlocksMovement(sparse_index)) continue;
+                    const cell = world.sparseTileCellCoord(sparse_index);
+                    if (cell.x < rect.min_x or cell.x >= rect.max_x_exclusive) continue;
+                    if (cell.y < rect.min_y or cell.y >= rect.max_y_exclusive) continue;
+                    slot.blocked.items[@as(usize, cell.y) * @as(usize, slot.width) + @as(usize, cell.x)] = true;
+                }
+            }
+        }
+    }
+}
 
 fn computeFacingScalar(vx: f32, vy: f32, prev_facing: math.Vec2) math.Vec2 {
     const speed2 = vx * vx + vy * vy;
@@ -1195,10 +1443,10 @@ fn emitTransitionsForRange(job: *PerceptionJobContext, range: ParallelRange) voi
 /// `prev`/`final` equal (including both invalid) never reaches here — the
 /// caller's `unchanged` check already filtered that out.
 fn emitTransition(buffer: *PerceptionEventRangeBuffer, observer: EntityId, prev: EntityId, final: EntityId) void {
-    if (prev.generation != 0) {
+    if (prev.isValid()) {
         buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_lost = .{ .observer = observer, .target = prev } } });
     }
-    if (final.generation != 0) {
+    if (final.isValid()) {
         buffer.appendAssumeCapacity(.{ .stage = .domain_reaction, .payload = .{ .entity_perceived = .{ .observer = observer, .target = final } } });
     }
 }
@@ -1668,6 +1916,339 @@ test "LevelBlockedSlot cache lookup matches WorldSystem.levelBlocksMovement exac
     }
 }
 
+// Shared parity check for the dirty-tracked patch/skip/fallback tests below:
+// a fresh `PerceptionSystem`'s first (always full-rebuild) build against the
+// same `world`/`level` state is the ground truth every patched result must
+// match bit-for-bit.
+fn expectLevelBlockedMatchesFreshRebuild(sys: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
+    var fresh = PerceptionSystem.init(testing.allocator);
+    defer fresh.deinit();
+    try fresh.ensureLevelBlockedCache(world, level);
+
+    var y: u16 = 0;
+    while (y < world.height) : (y += 1) {
+        var x: u16 = 0;
+        while (x < world.width) : (x += 1) {
+            const expected = lookupLevelBlocked(fresh.level_blocked.items, level, x, y);
+            const actual = lookupLevelBlocked(sys.level_blocked.items, level, x, y);
+            try testing.expectEqual(expected, actual);
+        }
+    }
+}
+
+test "patch: single dense-tile flip (open->blocked and blocked->open) matches a fresh full rebuild" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
+
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+
+    // Open -> blocked.
+    const changed = (try world.setDenseTile(layer, 2, 2, tree)) orelse return error.TestExpectedEqual;
+    try testing.expect(changed.old_blocks_movement != changed.new_blocks_movement);
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0); // patch
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+
+    // Blocked -> open: proves the patch memsets false first rather than only
+    // ever setting bits true.
+    frame.events.clearRetainingCapacity();
+    const changed_back = (try world.setDenseTile(layer, 2, 2, grass)) orelse return error.TestExpectedEqual;
+    try testing.expect(changed_back.old_blocks_movement != changed_back.new_blocks_movement);
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed_back } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0); // patch
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+}
+
+test "patch: single sparse-tile add matches a fresh full rebuild" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world, 0); // first build
+
+    const changed = (try world.addSparseTile(0, 5, 5, tree, 0, .obstacle)) orelse return error.TestExpectedEqual;
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = changed } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0); // patch
+
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 5, 5));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+}
+
+test "patch: a sparse tile's blocking removal (simulated -- WorldSystem has no removal API) matches a fresh full rebuild of the post-removal world" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+
+    // "Before": a real sparse blocking tile at (6, 6).
+    var world_before = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world_before.deinit();
+    _ = try world_before.addSparseTile(0, 6, 6, tree, 0, .obstacle);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world_before, 0); // first build: (6,6) blocked
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 6, 6));
+
+    // "After": sparse tiles are append-only (`addSparseTile`'s doc comment on
+    // `sparse_level_tiles` -- never removed, never reassigned), so there is no
+    // API call that un-blocks (6,6) on `world_before`. This builds the
+    // post-removal world state directly instead, and marks the cell dirty
+    // against it -- proving the patch path correctly clears a bit (not just
+    // sets one) when the causing world state genuinely no longer blocks.
+    var world_after = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world_after.deinit();
+
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
+        .level = 0,
+        .min_x = 6,
+        .min_y = 6,
+        .max_x_exclusive = 7,
+        .max_y_exclusive = 7,
+    } } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world_after);
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world_after, 0); // patch against the post-removal world
+
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 6, 6));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world_after, 0);
+}
+
+test "patch: a multi-cell world_obstacle_changed rect matches a fresh full rebuild" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
+
+    const min_x: u16 = 2;
+    const min_y: u16 = 2;
+    const max_x_exclusive: u16 = 6;
+    const max_y_exclusive: u16 = 6;
+    var yy: u16 = min_y;
+    while (yy < max_y_exclusive) : (yy += 1) {
+        var xx: u16 = min_x;
+        while (xx < max_x_exclusive) : (xx += 1) {
+            _ = try world.setDenseTile(layer, xx, yy, tree);
+        }
+    }
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
+        .level = 0,
+        .min_x = min_x,
+        .min_y = min_y,
+        .max_x_exclusive = max_x_exclusive,
+        .max_y_exclusive = max_y_exclusive,
+    } } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0); // patch
+
+    yy = min_y;
+    while (yy < max_y_exclusive) : (yy += 1) {
+        var xx: u16 = min_x;
+        while (xx < max_x_exclusive) : (xx += 1) {
+            try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, xx, yy));
+        }
+    }
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+}
+
+test "patch: dirty rects accumulated across several untouched steps still patch correctly once the level is finally touched" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world, 0); // first build
+
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+
+    // Three edits, each its own reactToPostCommitPerceptionEvents call with no
+    // intervening ensureLevelBlockedCache -- simulates three simulation steps
+    // where no observer looked at this level in between, so pending_dirty
+    // accumulates across all three rather than being drained per step (the
+    // key behavioral difference from `PathfindingSystem.nav_dirty_edits`).
+    const cells = [_][2]u16{ .{ 1, 1 }, .{ 2, 2 }, .{ 3, 3 } };
+    for (cells) |c| {
+        frame.events.clearRetainingCapacity();
+        const changed = (try world.setDenseTile(layer, c[0], c[1], tree)) orelse return error.TestExpectedEqual;
+        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+        try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    }
+    try testing.expectEqual(@as(usize, 3), sys.level_blocked.items[0].pending_dirty.items.len);
+
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0); // one patch call applies all 3 accumulated rects
+
+    for (cells) |c| try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, c[0], c[1]));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
+}
+
+test "patch: dirty rects recorded before a level's first build are discarded, not replayed as a patch" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    // A second blocking cell OUTSIDE the dirty rect below, already part of the
+    // world before this level's first build ever runs: only a real full scan
+    // (not a naive "patch just the dirty rect on first build" shortcut) would
+    // pick this up.
+    _ = try world.setDenseTile(layer, 9, 9, tree) orelse return error.TestExpectedEqual;
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+
+    // Mark a cell dirty BEFORE this level has ever been built -- no observer
+    // has looked at level 0 yet, so `level_blocked` has no slot for it at all
+    // (`markLevelDirty`/`levelBlockedSlot` grow one on demand).
+    const changed = (try world.setDenseTile(layer, 4, 4, tree)) orelse return error.TestExpectedEqual;
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    try testing.expectEqual(@as(usize, 1), sys.level_blocked.items[0].pending_dirty.items.len);
+
+    try sys.ensureLevelBlockedCache(&world, 0); // first-ever build: must reflect the whole world directly
+
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 4, 4));
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 9, 9));
+    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+}
+
+test "patch: accumulated dirty area over the full-rebuild threshold falls back to a full rebuild" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    const tile_size = meta.tileSize();
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, tile_size * 16, tile_size * 16);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.ensureLevelBlockedCache(&world, 0); // first build: obstacle layer all-open
+
+    // A 9x9 rect (81 of 256 cells, ~31.6%) is over the 25% threshold, so the
+    // next ensureLevelBlockedCache call must fall back to a full rebuild
+    // rather than patch just this rect.
+    var yy: u16 = 0;
+    while (yy < 9) : (yy += 1) {
+        var xx: u16 = 0;
+        while (xx < 9) : (xx += 1) {
+            _ = try world.setDenseTile(layer, xx, yy, tree);
+        }
+    }
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
+        .level = 0,
+        .min_x = 0,
+        .min_y = 0,
+        .max_x_exclusive = 9,
+        .max_y_exclusive = 9,
+    } } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+
+    // An edit NEVER reported as dirty, far outside the reported rect: only a
+    // genuine full rebuild (not a per-rect patch, which would never look at
+    // this cell) picks this up too.
+    _ = try world.setDenseTile(layer, 15, 0, tree) orelse return error.TestExpectedEqual;
+
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0);
+
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 4, 4));
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 15, 0));
+    try expectLevelBlockedMatchesFreshRebuild(&sys, &world, 0);
+    try testing.expectEqual(@as(usize, 0), sys.level_blocked.items[0].pending_dirty.items.len);
+}
+
 test "player-candidate detection: hostile player within vision/FOV becomes nearest_threat" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -1935,10 +2516,11 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     }
 
     // The second run's ensureLevelBlockedCache call sees a step_counter
-    // mismatch (a new step ran) and rebuilds level 0's bitmap contents, but
-    // must not grow `level_blocked` or its `blocked` backing storage — this
-    // proves the rebuild-every-touched-step design stays allocation-free,
-    // not just the initial reserve.
+    // mismatch (a new step ran) but no pending dirty rects (nothing called
+    // reactToPostCommitPerceptionEvents between the two runs), so it takes
+    // the skip branch rather than rebuilding — proving that path allocates
+    // nothing either. The dedicated patch-path FailingAllocator test below
+    // covers the case where a dirty rect actually is pending.
     const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
 }
@@ -2011,4 +2593,74 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
     try testing.expectEqual(@as(usize, 40), stats.observer_count);
     try testing.expect(stats.batch.range_count > 1);
+}
+
+test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation after warmup (FailingAllocator)" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    _ = try addObserver(&data, 0, 0, 10, 0, .player, .{});
+    _ = try addAgent(&data, 10, 0, 0, 0, .hostile);
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    // A real asset-backed tileset (same pattern as the LOS/parity tests
+    // above): the patch path's dense-layer rescan needs a real "blocks
+    // movement" tile, not a hand-poked `minimalWorld`.
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+    var frame = SimulationFrame.init(testing.allocator);
+    defer frame.deinit();
+
+    // Warm up: a full serial run sizes every scratch buffer (including
+    // `level_blocked`'s bitmap) to steady state, then several one-cell-edit
+    // patch cycles plateau `pending_dirty`'s capacity for level 0.
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    var cell_x: u16 = 20;
+    for (0..3) |_| {
+        frame.events.clearRetainingCapacity();
+        const changed = (try world.setDenseTile(layer, cell_x, 20, tree)) orelse return error.TestExpectedEqual;
+        try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+        try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+        _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+        cell_x += 1;
+    }
+    try testing.expect(sys.level_blocked.items[0].valid);
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const original_system_allocator = sys.allocator;
+    const original_events_allocator = events.stream.allocator;
+    sys.allocator = failing.allocator();
+    events.stream.allocator = failing.allocator();
+    defer {
+        sys.allocator = original_system_allocator;
+        events.stream.allocator = original_events_allocator;
+    }
+
+    // One more same-shape edit (`pending_dirty`'s capacity already plateaued
+    // above, and `frame.events` keeps its own real allocator, since only
+    // `sys`'s dirty-tracking/cache allocations are under test here), then the
+    // update whose `ensureLevelBlockedCache` call must patch (not skip, not
+    // rebuild) without allocating.
+    frame.events.clearRetainingCapacity();
+    const changed = (try world.setDenseTile(layer, cell_x, 20, tree)) orelse return error.TestExpectedEqual;
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+    try sys.reactToPostCommitPerceptionEvents(&frame, &world);
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    try testing.expectEqual(@as(usize, 1), stats.observer_count);
 }

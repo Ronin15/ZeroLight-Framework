@@ -499,6 +499,7 @@ pub const GameDemoState = struct {
         const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
+        try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
         try render_prep.ensureScenePrepCapacity(&self.scene_prep, self.gameplayScene());
         return stats;
     }
@@ -1207,6 +1208,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
     });
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1278,6 +1280,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     // The link still climbs planes via the world tier (independent of the abstract graph).
     placePlayerInCell(&demo, 5, 3);
@@ -1358,6 +1361,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
     });
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     // The incremental update ran; a pure incremental dig keeps nav_version stable
     // (caches are scope-evicted, not version-invalidated), so no version bump.

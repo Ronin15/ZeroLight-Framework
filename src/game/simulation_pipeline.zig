@@ -353,6 +353,20 @@ pub const SimulationPipeline = struct {
         return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
     }
 
+    /// Orchestrates the post-commit perception-cache reaction by delegating to
+    /// the cache-owning `PerceptionSystem`, which records localized dirty
+    /// rects for its LOS-blocked bitmap cache from the same committed events
+    /// `reactToPostCommitNavEvents` reacts to — a fully independent side
+    /// effect on disjoint state, so call order between the two does not
+    /// matter.
+    pub fn reactToPostCommitPerceptionEvents(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        world: *const WorldSystem,
+    ) !void {
+        return self.perception.reactToPostCommitPerceptionEvents(frame, world);
+    }
+
     /// Whether any pending structural command may invalidate navigation once
     /// applied. Delegates to `PathfindingSystem`; used for the pre-commit event
     /// capacity preflight.

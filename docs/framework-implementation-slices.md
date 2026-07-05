@@ -1818,10 +1818,12 @@ confined to. `PerceptionSystem` therefore owns its own cache, matching
 `levelBlocksMovement`'s exact contract with zero cross-grid coordinate or
 occlusion-set risk, proven by a dedicated parity test
 (dense-blocked/sparse-blocked/open/out-of-range-level/out-of-range-cell, all
-compared directly against `levelBlocksMovement`). The cache rebuilds fully
-every step for every level touched that step (no nav-invalidation-event-driven
-cross-step reuse) — a deliberate scope decision, not an oversight; see the
-residual note below.
+compared directly against `levelBlocksMovement`). The cache originally
+rebuilt fully every step for every level touched that step (no
+nav-invalidation-event-driven cross-step reuse) — a deliberate scope decision
+at the time, not an oversight; see the residual note below, and the
+incremental dirty-tracking fix that later replaced this (superseding the
+residual note) further down this section.
 
 Before/after (`--profile quick`, same methodology as this slice's original
 risk-confirmation run), 10,000 agents, serial-direct: `perception` 33.60ms →
@@ -1845,11 +1847,13 @@ many agents or LOS samples run that step), not a per-sample or per-agent cost.
 The realistic `perception` fixture shows no regression at all. Cross-step
 caching (invalidating the bitmap only on an actual world-tile change, the same
 way `PathfindingSystem` already reacts to nav-invalidation events) would
-close this residual entirely but was deliberately deferred — it would touch
-the nav-invalidation event contract for a gap that only appears in a
-fixture engineered specifically to be an unrealistic sparse-tile-density
+close this residual entirely but was deliberately deferred at the time — it
+would touch the nav-invalidation event contract for a gap that only appears
+in a fixture engineered specifically to be an unrealistic sparse-tile-density
 torture test, not in any representative world density this project's other
-benchmarks use.
+benchmarks use. **This deferral is now superseded** — see "Incremental
+dirty-tracked LOS-blocked cache" below, which implements exactly this and
+closes the residual.
 
 **Shared per-level sparse-tile index (root-cause fix behind the residual):**
 after the LOS cost-risk fix above, a review pass found the *same*
@@ -1965,14 +1969,112 @@ hardcoded-value assertions are the load-bearing proof underneath it.
 construction — reading the per-level index adds no new allocation risk on top
 of `PerceptionSystem`'s existing `FailingAllocator` steady-state proof, which
 already drives `ensureLevelBlockedCache`'s rebuild end to end. `sparse_level_tiles`
-is mutated only inside `addSparseTile`, a main-thread structural edit; the
-threaded nav-remask and perception phases only ever read it, so this adds no
-new concurrent-access hazard. One accepted gap: `addSparseLevelIndexEntry`
-runs after `sparse_tiles.appendAssumeCapacity`, so an allocation failure in
-the index update would leave a tile present in `sparse_tiles` but absent from
-`sparse_level_tiles`. `WorldSystem`'s existing sparse-tile append has the same
-OOM-is-fatal posture (no rollback on the `sparse_tiles` append either), so
-this is accepted as consistent with that posture, not a new hazard.
+and its chunk-bucketed sibling `sparse_level_chunk_tiles` (see
+`sparseTileIndicesForChunk`) are mutated only inside `addSparseTile`, a
+main-thread structural edit; the threaded nav-remask and perception phases
+only ever read them, so this adds no new concurrent-access hazard.
+`addSparseTile` now reserves capacity in `sparse_tiles`, `sparse_level_tiles`,
+and `sparse_level_chunk_tiles` up front (`reserveSparseLevelIndexEntry`,
+`reserveSparseChunkIndexEntry`) before appending to any of them
+(`commitSparseLevelIndexEntry`, `commitSparseChunkIndexEntry`), closing the
+gap that used to exist here: an allocation failure partway through can no
+longer leave a tile present in one structure but absent from the other two.
+A `FailingAllocator` test drives a failure at each of the three reservation
+steps and asserts all three structures are unchanged afterward.
+
+**Incremental dirty-tracked LOS-blocked cache (closes the residual above):**
+`ensureLevelBlockedCache` originally keyed staleness only on
+`PerceptionSystem.step_counter` — since that counter is unique per step, every
+distinct level touched by an observer paid a full rebuild every single step,
+regardless of whether the world actually changed since the last build. This
+is now replaced with NavGraph-style incremental patching, mirroring
+`PathfindingSystem`'s post-commit nav reaction but deliberately narrower:
+
+- `LevelBlockedSlot` gains `pending_dirty: std.ArrayList(DirtyRect)`, a plain
+  min-inclusive/max-exclusive rect list (not `NavGrid`'s chunk-grid
+  `NavCellEdit` — reusing that would couple this file to nav's chunk-grid
+  shape for no benefit; the chunk grid is only consulted transiently, at
+  patch time, to scope the sparse-tile rescan). It grows rather than drops on
+  append (same must-not-lose-an-edit contract as
+  `PathfindingSystem.nav_dirty_edits`) and, unlike that per-step-drained
+  buffer, can persist across MULTIPLE untouched steps: a level with no
+  observer this step is never asked to rebuild, so edits on it simply
+  accumulate until an observer next looks at it.
+- `PerceptionSystem.reactToPostCommitPerceptionEvents(frame, world)` — a new
+  pipeline-level reaction (`SimulationPipeline.reactToPostCommitPerceptionEvents`,
+  called alongside `reactToPostCommitNavEvents` at every one of its call
+  sites; the two are fully independent side effects on disjoint state, so
+  call order does not matter) — filters `frame.events.mergedItems()` to
+  exactly `.world_tile_changed` (single-cell rect, only when the
+  movement-blocking flag actually flipped) and `.world_obstacle_changed` (the
+  event's own already-multi-cell rect), pushing a `DirtyRect` into the
+  relevant level's `pending_dirty`. This is deliberately narrower than
+  `PathfindingSystem.eventInvalidatesNavigation`: no other event variant is
+  read, and there is no non-localizable whole-level fallback case (unlike
+  nav's fallback for entity-obstacle toggles, which this cache never needs to
+  react to, since it only ever reads world tiles). No event is emitted in
+  return — nothing currently reacts to "perception's cache changed."
+- `ensureLevelBlockedCache`'s decision tree, after the existing "already built
+  this exact step" short-circuit: first-ever build for a level runs the full
+  rebuild unchanged (discarding any `pending_dirty` recorded before that first
+  build, rather than replaying it as a patch — the fresh rebuild already
+  reflects current world state directly); an already-built slot with an empty
+  `pending_dirty` SKIPS the rescan entirely (the headline fix — this case
+  never used to happen, since staleness was keyed only on the step counter,
+  not on whether anything changed); an already-built slot with a bounded
+  amount of pending dirty area PATCHES only the affected cells (`@memset`
+  false first per rect, since a bit can go blocked→unblocked and not just the
+  reverse, then rescans only that rect per relevant dense layer and only the
+  sparse tiles in the rect's overlapping level-local chunks via
+  `WorldSystem.sparseTileIndicesForChunk`, bounding the sparse-side candidate
+  set by chunk population instead of level population); an already-built slot
+  whose accumulated dirty area exceeds a quarter of the level's total cells
+  falls back to a full rebuild instead (patch overhead — a memset, rescan,
+  and chunk walk per pending rect — starts to rival one dense full pass well
+  before "half the level changed"; the 25% constant mirrors the spirit of
+  `nav_graph.zig`'s `full_relabel_level_threshold`, which caps affected
+  *levels* rather than a fraction of one level's *cells*, the finer unit this
+  cache actually works in). `WorldSystem.chunksX`/`chunksY` (the level-local
+  chunk grid shape, previously private) are now `pub` so this patch-time
+  chunk-range computation can live in `perception.zig` without duplicating
+  `localChunkIndexForCell`'s per-cell arithmetic.
+- Proof: parity tests compare a patched/skipped/fallback-rebuilt result
+  bit-for-bit against a fresh full rebuild of the same post-edit world state,
+  covering a single dense-tile flip (both directions), a single sparse-tile
+  add, a simulated sparse-tile blocking removal (two independently built
+  `WorldSystem`s, since sparse tiles are append-only with no removal API — see
+  `sparse_level_tiles`'s doc comment), a multi-cell `world_obstacle_changed`
+  rect, dirty rects accumulated across several untouched steps before the
+  level is next touched, an edit recorded before a level's first-ever build
+  (discarded, not replayed), and the full-rebuild-threshold fallback path. A
+  dedicated `FailingAllocator` test proves the steady-state patch path (and
+  the dirty-rect bookkeeping that feeds it) allocates nothing once
+  `pending_dirty`'s capacity has plateaued. The existing serial/threaded
+  parity test continues to pass unchanged (the skip/patch/rebuild decision
+  still happens entirely on the main thread, before any worker dispatch, same
+  as the old unconditional rebuild).
+- Measured effect (`--profile quick`): two new benchmark groups,
+  `perception-cache-full-rebuild` and `perception-cache-patch`, isolate the
+  cache-maintenance cost itself by reporting one synthetic structural-commit
+  event per iteration (a whole-level rect vs. a single-cell rect) against
+  `perception`'s own representative-density fixture, so `sensed_count`/
+  `los_checks`/`nearest_threat_found_count` stay identical between the two and
+  only wall-clock cost differs — serial-direct: 1,024 agents 3.58ms
+  (full-rebuild-forced) vs 2.25ms (patch), 4,096 agents 11.74ms vs 10.75ms,
+  10,000 agents 29.10ms vs 26.61ms; best-threaded: 1,024 agents 1.97ms vs
+  0.65ms, 4,096 agents 3.85ms vs 2.41ms, 10,000 agents 7.58ms vs 6.10ms — a
+  roughly flat ~1.3–1.5ms gap across a ~10x population range, confirming the
+  gap really is the once-per-step cache-maintenance cost and not a per-agent
+  cost. More directly, this fix also re-closes the `perception`/
+  `perception-los-dense` residual documented above, since neither of those
+  fixtures' positions ever change across iterations and neither calls
+  `reactToPostCommitPerceptionEvents`, so every measured step after the first
+  now skips instead of rebuilding: re-measured at 10,000 agents,
+  `perception` 26.92ms serial / 6.09ms best-threaded, `perception-los-dense`
+  27.31ms serial / 6.11ms best-threaded — a ~0.4ms/~0.02ms gap, down from the
+  1.67ms/1.85ms gap recorded right after the shared-index fix and the
+  original 3.76ms/3.25ms gap before any of this slice's LOS-cost work. See
+  `src/benchmarks/perception.zig`'s module doc for the full write-up.
 
 Goal: let agents sense other entities (and later sounds) within vision/hearing
 limits, writing per-frame sensed state to columns and emitting only acquisition/
@@ -2032,14 +2134,19 @@ Acceptance checks:
 - [x] `zig build test` covers range/FOV/LOS gating, transition events, and
       serial/threaded parity.
 - [x] `hasLineOfSight`'s per-sample blocked test is O(1) (`level_blocked`'s
-      per-level bitmap cache, built at most once per distinct observer level
-      per step), proven behavior-identical to `WorldSystem.levelBlocksMovement`
-      by a dedicated parity test, and proven allocation-free after warmup by
-      dedicated `FailingAllocator` assertions (serial and threaded). The
-      `perception-los-dense` benchmark confirms the fix in practice: 10,000
-      agents best-threaded went from 25.81ms (over the 16.67ms/60Hz budget) to
-      9.64ms; see this slice's LOS cost-risk fix note above for the full
-      before/after and the honestly-reported residual gap.
+      per-level bitmap cache, kept current for a distinct observer level at
+      most once per step via a skip/patch/rebuild decision — see "Incremental
+      dirty-tracked LOS-blocked cache" above), proven behavior-identical to
+      `WorldSystem.levelBlocksMovement` by dedicated parity tests (including
+      patch-vs-fresh-rebuild parity across every dirty-tracking case), and
+      proven allocation-free after warmup by dedicated `FailingAllocator`
+      assertions (serial, threaded, and the dirty-tracked patch path). The
+      `perception-los-dense` benchmark confirms the original fix in practice:
+      10,000 agents best-threaded went from 25.81ms (over the 16.67ms/60Hz
+      budget) to 9.64ms; the incremental dirty-tracking fix further closed
+      the once-per-step cache-rebuild residual that fix left behind (see
+      above for the full before/after and the honestly-reported numbers at
+      each stage).
 
 ## Slice 30: AI Memory And Scope-Aware AI State Policy
 
