@@ -26,6 +26,7 @@ const validateCollisionBounds = @import("collision.zig").validateCollisionBounds
 const validateCollisionResponse = @import("collision.zig").validateCollisionResponse;
 const validateAiAgent = @import("agents.zig").validateAiAgent;
 const validateSteeringAgent = @import("agents.zig").validateSteeringAgent;
+const validateAiPerception = @import("perception.zig").validateAiPerception;
 
 pub const NullStructuralChangeSink = struct {
     fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
@@ -49,6 +50,7 @@ const StructuralCapacityNeeds = struct {
     steering_agents: usize,
     world_levels: usize,
     factions: usize,
+    ai_perceptions: usize,
 
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
@@ -63,6 +65,7 @@ const StructuralCapacityNeeds = struct {
             .steering_agents = data.steering_agents.len(),
             .world_levels = data.world_levels.len(),
             .factions = data.factions.len(),
+            .ai_perceptions = data.ai_perceptions.len(),
         };
     }
 
@@ -78,6 +81,7 @@ const StructuralCapacityNeeds = struct {
         if (self.steering_agents > std.math.maxInt(u32)) return error.TooManySteeringAgentRows;
         if (self.world_levels > std.math.maxInt(u32)) return error.TooManyWorldLevelRows;
         if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
+        if (self.ai_perceptions > std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
     }
 };
 
@@ -121,6 +125,7 @@ const StructuralCapacityProjection = struct {
         if (template.steering_agent != null) try self.addComponent(.steering_agent);
         if (template.world_level != null) try self.addComponent(.world_level);
         if (template.faction != null) try self.addComponent(.faction);
+        if (template.ai_perception != null) try self.addComponent(.ai_perception);
     }
 
     fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
@@ -148,6 +153,7 @@ const StructuralCapacityProjection = struct {
             .steering_agent => &self.current.steering_agents,
             .world_level => &self.current.world_levels,
             .faction => &self.current.factions,
+            .ai_perception => &self.current.ai_perceptions,
         };
     }
 
@@ -163,6 +169,7 @@ const StructuralCapacityProjection = struct {
             .steering_agent => &self.required.steering_agents,
             .world_level => &self.required.world_levels,
             .faction => &self.required.factions,
+            .ai_perception => &self.required.ai_perceptions,
         };
     }
 };
@@ -270,6 +277,7 @@ fn templateComponentCount(template: EntityTemplate) usize {
     if (template.steering_agent != null) count += 1;
     if (template.world_level != null) count += 1;
     if (template.faction != null) count += 1;
+    if (template.ai_perception != null) count += 1;
     return count;
 }
 
@@ -444,6 +452,16 @@ pub fn commitStructuralCommands(
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .faction, was_static_navigation_obstacle);
             },
+            .set_ai_perception => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setAiPerception(set.entity, set.perception);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .ai_perception, was_static_navigation_obstacle);
+            },
         }
     }
     return stats;
@@ -496,6 +514,7 @@ pub fn preflightStructuralCommands(
             .set_steering_agent => |set| try preflightSetComponent(self, set.entity, .steering_agent, scratch, &projection, &structural_event_count),
             .set_world_level => |set| try preflightSetComponent(self, set.entity, .world_level, scratch, &projection, &structural_event_count),
             .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
+            .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
             .set_simulation_tier => {},
         }
     }
@@ -539,6 +558,7 @@ fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) 
     try self.steering_agents.ensureCapacity(self.allocator, plan.capacity_needs.steering_agents);
     try self.world_levels.ensureCapacity(self.allocator, plan.capacity_needs.world_levels);
     try self.factions.ensureCapacity(self.allocator, plan.capacity_needs.factions);
+    try self.ai_perceptions.ensureCapacity(self.allocator, plan.capacity_needs.ai_perceptions);
 }
 
 pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -565,6 +585,9 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
                 if (template.steering_agent) |agent| {
                     try validateSteeringAgent(agent);
                 }
+                if (template.ai_perception) |perception| {
+                    try validateAiPerception(perception);
+                }
             },
             .set_movement_body => |set| try validateMovementBody(set.body),
             .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
@@ -572,6 +595,7 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
             .set_collision_response => |set| try validateCollisionResponse(set.response),
             .set_ai_agent => |set| try validateAiAgent(set.agent),
             .set_steering_agent => |set| try validateSteeringAgent(set.agent),
+            .set_ai_perception => |set| try validateAiPerception(set.perception),
             else => {},
         }
     }
@@ -601,6 +625,7 @@ fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype,
     if (template.steering_agent != null) recordComponentChange(self, change_sink, entity, .steering_agent, was_static_navigation_obstacle);
     if (template.world_level != null) recordComponentChange(self, change_sink, entity, .world_level, was_static_navigation_obstacle);
     if (template.faction != null) recordComponentChange(self, change_sink, entity, .faction, was_static_navigation_obstacle);
+    if (template.ai_perception != null) recordComponentChange(self, change_sink, entity, .ai_perception, was_static_navigation_obstacle);
 }
 
 fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
@@ -654,5 +679,20 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
         try self.setFaction(entity, entity_faction);
         components_set += 1;
     }
+    if (template.ai_perception) |perception| {
+        try self.setAiPerception(entity, perception);
+        components_set += 1;
+    }
     return components_set;
+}
+
+test "StructuralCapacityNeeds.validateLimits rejects an ai_perceptions count beyond u32" {
+    // Growing PerceptionStore to u32-max rows is impractical to exercise for
+    // real, so this proves the guard directly against the private capacity
+    // struct rather than via an actual oversized store.
+    var needs = std.mem.zeroes(StructuralCapacityNeeds);
+    try needs.validateLimits();
+
+    needs.ai_perceptions = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.TooManyAiPerceptionRows, needs.validateLimits());
 }

@@ -76,7 +76,9 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **24 / 24B** | Landed | Render collect hardening — acceptance history; follow-up in Scaling Gaps |
 | **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
-| **26–33** | Not started | Emergent AI track — see **Emergent AI Track Overview** then each slice |
+| **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
+| **29** | Partial | AI Perception Substrate — vision (component/system/events) landed; hearing tunable + stimulus buffer deferred; LOS-cost risk open (see slice section) |
+| **30–33** | Not started | AI memory, affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
 
@@ -1755,6 +1757,223 @@ Acceptance checks:
 
 ## Slice 29: AI Perception Substrate
 
+**Status: partial — vision landed (including the LOS cost-risk fix), hearing
+deferred.** `AiPerception` (`data_system/perception.zig`), `PerceptionSystem`
+(`systems/perception.zig`), the `entity_perceived`/`entity_lost` event
+contract, and the `perception`/`perception-los-dense` benchmark groups are all
+in place with full test coverage: range/FOV/LOS gating, faction-stance
+gating, same-level gating, player-as-candidate, all four transition shapes
+(acquire/lose/hold/identity-swap), the per-step event cap with drop
+diagnostics, serial/threaded parity, and a `FailingAllocator` steady-state
+allocation-free proof. Hearing (the `hearing_range` cold tunable and the
+transient world stimulus/sound buffer) was not built — vision ships first
+exactly as this slice's own architecture note scoped, and hearing stays
+tracked here rather than silently dropped. The squared-form FOV test
+(`dot(facing, to) > 0 AND dot^2 > cos_half_fov^2 * dist2`) turned out not to
+need the vector sin/cos polynomial Slice 34 deferred here — no production
+caller for `simd.sinFloat4`/`cosFloat4`/`sinCosFloat4` was added, since a
+unit-length facing vector makes the squared dot-product compare exact without
+any per-frame trig.
+
+**LOS cost-risk fix (`hasLineOfSight`'s per-sample lookup is now O(1)):** this
+slice originally shipped with `hasLineOfSight` calling
+`WorldSystem.levelBlocksMovement` once per raycast sample, which linearly
+rescans every sparse tile in the world on every call. `src/benchmarks/perception.zig`'s
+`perception`/`perception-los-dense` groups proved this was a real hazard, not
+theoretical: identical `sensed_count`/`los_checks`/`los_blocked`/
+`nearest_threat_found_count` between the two fixtures, but the `-dense`
+fixture (20,000 extra sparse tiles placed far outside any agent's path) paid
+a 6.5x–10x wall-clock penalty purely from world-wide tile-count bulk.
+
+The fix adds `PerceptionSystem.level_blocked`: a per-level, raw-world-tile-
+granularity blocked bitmap (`LevelBlockedSlot`), built at most once per
+distinct observer level per step by `ensureLevelBlockedCachesForObservers`/
+`ensureLevelBlockedCache` (mirrors `pathfinding/nav_grid.zig`'s
+`markWorldObstacles` shape — dense-band scan + sparse-tiles-filtered-to-level
+pass — but with no nav-cell rect rasterization, since this bitmap is
+tile-indexed 1:1). The build runs on the main thread before any range job is
+dispatched; every worker range only ever reads the completed, per-step-stable
+snapshot. `hasLineOfSight` now calls `lookupLevelBlocked` (an O(1) bitmap
+read) per sample instead of `levelBlocksMovement`.
+
+This slice deliberately did **not** reuse `pathfinding/nav_grid.zig`'s
+already-resident, incrementally-maintained `NavGrid` (via
+`NavGraph.grid(level)`), even though that would avoid a second structure.
+Two independent findings ruled it out: (1) `NavGrid.blocked` is a strict
+*superset* of `levelBlocksMovement`'s contract — it composes world obstacles
+**OR** (on level 0 only) `DataSystem` static collision bodies
+(`NavGrid.markStaticBodies`), so reusing it would silently occlude LOS behind
+entities that `levelBlocksMovement` never blocks on, failing the parity test
+by construction on any fixture with a level-0 static body not coincident with
+a world tile; and (2) `NavGrid.cell_size` (32, set explicitly at
+`rebuildStaticNavGrid`/`rebuildStaticNavGridWithWorld` call sites, e.g.
+`game_demo_state.zig`'s `nav_cell_size = 32`) equals `WorldSystem.tile_size`
+(also enforced to 32 at asset load, `world_tileset_meta.zig`'s
+`required_tile_size`) only *incidentally* — two independently-set literals,
+not an invariant enforced by an assert or a shared constant — so reuse would
+also risk a silent LOS-granularity change if that ever drifted.
+`NavGraph.grid(level)` is additionally nullable and only covers levels
+pathfinding has actually built, which observers are not guaranteed to be
+confined to. `PerceptionSystem` therefore owns its own cache, matching
+`levelBlocksMovement`'s exact contract with zero cross-grid coordinate or
+occlusion-set risk, proven by a dedicated parity test
+(dense-blocked/sparse-blocked/open/out-of-range-level/out-of-range-cell, all
+compared directly against `levelBlocksMovement`). The cache rebuilds fully
+every step for every level touched that step (no nav-invalidation-event-driven
+cross-step reuse) — a deliberate scope decision, not an oversight; see the
+residual note below.
+
+Before/after (`--profile quick`, same methodology as this slice's original
+risk-confirmation run), 10,000 agents, serial-direct: `perception` 33.60ms →
+21.98ms; `perception-los-dense` 217.58ms → 25.74ms (was a 6.5x regression,
+now 1.17x). Best-threaded case, 10,000 agents: `perception` ~6.24ms → 6.39ms
+(unchanged, within run-to-run noise); `perception-los-dense` 25.81ms (over the
+16.67ms/60Hz budget) → 9.64ms (`thread-small-range`, well under budget). Full
+8-case tables at 1,024/4,096/10,000 agents for both groups are in this
+change's PR/session record.
+
+**Honest residual, not rounded away:** the two groups do not fully converge.
+A fixed, non-scaling gap remains — measured best-case-threaded: ~2.99ms
+(1,024 agents), ~2.89ms (4,096), ~3.25ms (10,000); serial-direct: ~2.63ms,
+~3.27ms, ~3.76ms respectively. This gap is flat across a ~10x population
+range (not proportional to agent count or `los_checks`, which are identical
+between the two fixtures at every scale), which is itself the evidence the
+per-sample lookup is genuinely O(1): the residual is entirely the once-per-step
+cache-rebuild cost (a single O(world sparse-tile count) pass over the
+`-dense` fixture's 20,000 extra tiles, paid once per step regardless of how
+many agents or LOS samples run that step), not a per-sample or per-agent cost.
+The realistic `perception` fixture shows no regression at all. Cross-step
+caching (invalidating the bitmap only on an actual world-tile change, the same
+way `PathfindingSystem` already reacts to nav-invalidation events) would
+close this residual entirely but was deliberately deferred — it would touch
+the nav-invalidation event contract for a gap that only appears in a
+fixture engineered specifically to be an unrealistic sparse-tile-density
+torture test, not in any representative world density this project's other
+benchmarks use.
+
+**Shared per-level sparse-tile index (root-cause fix behind the residual):**
+after the LOS cost-risk fix above, a review pass found the *same*
+scan-every-sparse-tile-then-filter-by-level pattern independently duplicated
+in three places: `WorldSystem.levelBlocksMovement`, `NavGrid.markWorldObstacles`,
+and `PerceptionSystem.ensureLevelBlockedCache` (added by this slice). Each
+walked every `SparseTileRow` in the world checking `level_index` per tile,
+even though a `SparseTileRow`'s level is fixed at insertion and never changes.
+`WorldSystem` now carries a reverse per-level index —
+`sparse_level_tiles: std.ArrayList(std.ArrayList(u32))`, one growable bucket of
+`sparse_tiles` indices per level, plus the accessor
+`sparseTileIndicesForLevel(level_index) []const u32` — maintained *eagerly*
+inside `addSparseTile` (the sole inserter; tiles are never removed and never
+reassigned to another level, confirmed by inspection) rather than lazily
+rebuilt off a dirty flag. Eager maintenance was a deliberate deviation from
+the `sparse_render_order`/`sparse_depth_ranges` render-index pattern this was
+modeled after: that pattern's flat sorted-array-plus-ranges shape only stays
+correct if rebuilt in full on every structural change, and `render_index_dirty`
+is safely deferred only because its sole reader (`ensureRenderDepthIndex`) runs
+once per render frame. `levelBlocksMovement`, `NavGrid.markWorldObstacles`, and
+`PerceptionSystem.ensureLevelBlockedCache` do not have that luxury — they run
+inside the fixed-step gameplay tick (nav reacting to a dig, perception
+rebuilding its bitmap) and can be reached in the same step a sparse tile is
+placed, before any render pass would run; a lazily-rebuilt index keyed off a
+render-only dirty flag would have been stale for them. `sparse_level_tiles`
+also cannot itself be shaped like `sparse_render_order` for the same reason:
+keeping one level's run contiguous in a single flat array only works with a
+full resort after every insert, which is exactly the O(n) rescan this index
+exists to remove. All three consumers now iterate
+`sparseTileIndicesForLevel(level)` instead of the whole `sparse_tiles` set.
+Proof: a new `sparseTileIndicesForLevel` exact-set test (multiple levels,
+interleaved insertion order, a level with zero sparse tiles, and an
+out-of-range level) and a new `levelBlocksMovement` multi-level parity test
+placing an obstacle on one level at a cell shared with two other levels
+(`world_system.zig`); the existing `nav_graph.zig` incremental-update tests
+(which compare `NavGrid`'s composed mask directly against
+`levelBlocksMovement` cell-by-cell across every level of a multi-level demo
+world) continued to pass unchanged, since the contract did not move, only the
+scan did.
+
+Measured effect on the `perception`/`perception-los-dense` gap (`--profile
+quick`, same methodology as the numbers above): the `-dense` fixture's extra
+20,000 sparse tiles all land on the *same single level* as the populated
+region (`WorldSystem.initDemoFromMeta` never adds a second level), so this
+fixture cannot exercise the index's intended cross-level win — the
+scan-avoidance the three consumers now get on a genuinely multi-level world
+(e.g. the underground stack `nav_graph.zig`'s tests build) does not apply
+here. What the per-level index *did* remove from this single-level scan was
+the redundant per-tile `sparseTileLevel(idx)` accessor call and its
+`MultiArrayList.items(.level_index)` re-derivation on every one of the 20,000
+tiles, replaced by one hoisted slice read up front. An isolated, same-session
+A/B on identical 20,002-tile single-level data (30 back-to-back reps,
+`world_system.zig`, removed after measurement) showed this specific loop drop
+from ~784us/rebuild (old scan-and-filter) to ~45us/rebuild (new indexed
+scan) — a ~17x reduction in the loop itself, with zero behavior change (both
+loops agree on the blocked-tile count every rep).
+
+At the full pipeline level, serial-direct, 10,000 agents: `perception` 22.74ms,
+`perception-los-dense` 24.41ms — gap 1.67ms, versus the 3.76ms gap recorded
+above before this fix. Note this "before" comes from this same slice's own
+prior recorded numbers (above), not a controlled same-session revert of just
+this change — the sandbox's revert-safety policy ruled out stashing the
+working tree mid-task to get a stricter A/B, so the isolated loop measurement
+below is the controlled proof for this specific change; the table comparison
+against the prior recorded numbers is corroborating, not conclusive on its
+own. Full table:
+
+| agents | perception serial | los-dense serial | gap (was) | perception best-threaded | los-dense best-threaded | gap (was) |
+|---|---|---|---|---|---|---|
+| 1,024 | 3.42 ms | 5.43 ms | 2.01 ms (2.63 ms) | 2.24 ms | 4.13 ms | 1.89 ms (2.99 ms) |
+| 4,096 | 9.89 ms | 11.76 ms | 1.87 ms (3.27 ms) | 3.77 ms | 5.61 ms | 1.84 ms (2.89 ms) |
+| 10,000 | 22.74 ms | 24.41 ms | 1.67 ms (3.76 ms) | 6.49 ms | 8.34 ms | 1.85 ms (3.25 ms) |
+
+**Honest, not rounded away:** the gap shrank meaningfully (24–56% serial,
+36–43% threaded) but did **not** converge to indistinguishable, contrary to
+this fix's original hypothesis (which assumed the `-dense` fixture's extra
+tiles lived on a different level than the populated region — they do not).
+The isolated loop measurement (~45us/rebuild) is far smaller than the
+~1.7–2.0ms full-pipeline gap that remains; the difference is warm-vs-cold
+cache, not an unaccounted cost: the isolated microbenchmark runs 30 reps
+back-to-back, so the first rep warms the ~240KB working set (the u32 index
+plus the gathered `cell_index`/`flags` columns) into L2, and every later rep
+reads hot — but the real pipeline runs the rebuild exactly once per step,
+sandwiched between thousands of agents' spatial queries and bitmap reads that
+evict that working set, so every real rebuild pays a cold scan. A cold Debug
+scan landing at ~1–1.6ms for ~240KB is plausible and consistent with the
+observed residual. Closing it further (e.g. keeping the per-level working set
+resident, or a spatial index within a level) is out of this task's scope,
+which targeted the shared scan-and-filter duplication itself, not
+cache-residency within a level. `pathfinding-hard-fallback` (which exercises
+`levelBlocksMovement` directly via `simulation_pipeline.zig`'s local fallback
+graph) was spot-checked at 64/128 item counts post-fix: all cases completed
+with `fallback_requests == results` and no dropped/evicted requests, i.e. no
+functional regression; no controlled before/after number exists for this
+group specifically.
+
+**Multi-level proof for `NavGrid.markWorldObstacles`, transitively:** no
+dedicated multi-level-sparse `markWorldObstacles` test was added, but the
+requirement is still covered by chaining existing tests rather than by a new
+fixture: `sparseTileIndicesForLevel`'s exact-set test (above) proves the new
+per-level index itself is correct across levels with interleaved insertion
+order; both `markWorldObstacles` and `levelBlocksMovement` now read that same
+index; and `nav_graph.zig`'s existing incremental-update tests compare
+`NavGrid`'s composed blocked mask against `levelBlocksMovement` cell-by-cell
+across every level of a multi-level demo world. That chain — not the
+`nav_graph.zig` test alone, since both sides of that comparison changed
+together and a consistent-but-wrong shared index would still pass it — is
+what anchors correctness; the exact-set test and `levelBlocksMovement`'s own
+hardcoded-value assertions are the load-bearing proof underneath it.
+
+**Allocation and concurrency:** `sparseTileIndicesForLevel` and
+`levelBlocksMovement` take no allocator, so they cannot allocate by
+construction — reading the per-level index adds no new allocation risk on top
+of `PerceptionSystem`'s existing `FailingAllocator` steady-state proof, which
+already drives `ensureLevelBlockedCache`'s rebuild end to end. `sparse_level_tiles`
+is mutated only inside `addSparseTile`, a main-thread structural edit; the
+threaded nav-remask and perception phases only ever read it, so this adds no
+new concurrent-access hazard. One accepted gap: `addSparseLevelIndexEntry`
+runs after `sparse_tiles.appendAssumeCapacity`, so an allocation failure in
+the index update would leave a tile present in `sparse_tiles` but absent from
+`sparse_level_tiles`. `WorldSystem`'s existing sparse-tile append has the same
+OOM-is-fatal posture (no rollback on the `sparse_tiles` append either), so
+this is accepted as consistent with that posture, not a new hazard.
+
 Goal: let agents sense other entities (and later sounds) within vision/hearing
 limits, writing per-frame sensed state to columns and emitting only acquisition/
 loss transitions as events.
@@ -1785,26 +2004,42 @@ Checklist:
 - [ ] Add an `AiPerception` component: cold tunables (vision range, FOV
       half-angle, hearing range) plus hot output columns (`target_visible`,
       `last_seen_x/y`, `nearest_threat: EntityId`, `nearest_threat_dist`).
-- [ ] Add a `PerceptionSystem` parallel stage that queries the shared spatial
+      **Partial:** `vision_range`/`fov_half_angle_radians` (cold), the derived
+      `cos_half_fov`, all four listed hot output columns, and an additional
+      `facing_x/y` hot column the original wording didn't anticipate are all
+      landed in `data_system/perception.zig`. `hearing_range` does not exist —
+      deferred with item 4 below.
+- [x] Add a `PerceptionSystem` parallel stage that queries the shared spatial
       index for candidates, then applies bounded range/FOV/line-of-sight checks
       (LOS against world blocking tiles via `world_system` walkability), writing
       results to perception columns.
-- [ ] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
+- [x] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
       target acquisition/loss transitions, emitted at `domain_reaction` via the
       per-range writer with pre-reserved capacity.
 - [ ] Add a transient per-step world stimulus/sound buffer (position +
       intensity + type, scalar-only) and consume it for hearing; keep it separate
-      from the audio playback service.
+      from the audio playback service. **Not started.** No stimulus/sound
+      buffer exists; hearing is fully deferred to a follow-up pass (vision
+      ships first, exactly as this slice's architecture note scoped).
 
 Acceptance checks:
 
-- [ ] Per-frame sense results live in columns, not events; only transitions emit
+- [x] Per-frame sense results live in columns, not events; only transitions emit
       events, bounded by a per-step cap with drops surfaced via event stats.
-- [ ] Serial and threaded perception produce identical columns and event order.
-- [ ] Sensing is allocation-free after warmup and runs only for cognition-tier
+- [x] Serial and threaded perception produce identical columns and event order.
+- [x] Sensing is allocation-free after warmup and runs only for cognition-tier
       entities in scope.
-- [ ] `zig build test` covers range/FOV/LOS gating, transition events, and
+- [x] `zig build test` covers range/FOV/LOS gating, transition events, and
       serial/threaded parity.
+- [x] `hasLineOfSight`'s per-sample blocked test is O(1) (`level_blocked`'s
+      per-level bitmap cache, built at most once per distinct observer level
+      per step), proven behavior-identical to `WorldSystem.levelBlocksMovement`
+      by a dedicated parity test, and proven allocation-free after warmup by
+      dedicated `FailingAllocator` assertions (serial and threaded). The
+      `perception-los-dense` benchmark confirms the fix in practice: 10,000
+      agents best-threaded went from 25.81ms (over the 16.67ms/60Hz budget) to
+      9.64ms; see this slice's LOS cost-risk fix note above for the full
+      before/after and the honestly-reported residual gap.
 
 ## Slice 30: AI Memory And Scope-Aware AI State Policy
 

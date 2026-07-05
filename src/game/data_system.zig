@@ -70,6 +70,11 @@ pub const PrimitiveVisualCommand = @import("data_system/types.zig").PrimitiveVis
 pub const AssetReferenceCommand = @import("data_system/types.zig").AssetReferenceCommand;
 pub const SimulationTierCommand = @import("data_system/types.zig").SimulationTierCommand;
 pub const FactionCommand = @import("data_system/types.zig").FactionCommand;
+pub const AiPerception = @import("data_system/types.zig").AiPerception;
+pub const max_ai_perception_vision_range = @import("data_system/types.zig").max_ai_perception_vision_range;
+pub const AiPerceptionCommand = @import("data_system/types.zig").AiPerceptionCommand;
+pub const ConstPerceptionSlice = @import("data_system/types.zig").ConstPerceptionSlice;
+pub const PerceptionSlice = @import("data_system/types.zig").PerceptionSlice;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
 pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").StructuralEntityDestroyedChange;
@@ -85,6 +90,7 @@ test {
     _ = @import("data_system/collision.zig");
     _ = @import("data_system/agents.zig");
     _ = @import("data_system/faction_level.zig");
+    _ = @import("data_system/perception.zig");
     _ = @import("data_system/structural.zig");
     _ = @import("data_system/system.zig");
 }

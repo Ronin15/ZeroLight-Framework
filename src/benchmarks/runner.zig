@@ -11,6 +11,7 @@ const movement = @import("movement.zig");
 const nav_update = @import("nav_update.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
+const perception = @import("perception.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
@@ -51,6 +52,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     render_game_prep.dense_32_deep_group,
     scope.group,
     spatial_index.group,
+    perception.group,
+    perception.los_dense_group,
     steering.group,
 };
 

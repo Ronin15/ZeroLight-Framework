@@ -62,7 +62,10 @@ passes the borrowed audio command buffer through the pipeline-owned
 advance and the tier/halo/stagger gathers that select which entities enter each
 stage; chunk columns are derived in-pass by the movement processor, not a separate
 recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
-from that same cognition-scoped population for AI separation queries, then owns
+from that same cognition-scoped population for AI separation queries, runs the
+**perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
+`AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
+writing sensed state to `PerceptionStore`), then owns
 AI navigation-intent production, steering/path status, pathfinding, sparse
 movement-intent application, movement, bounds clamp, player-vs-world-tile
 gating, collision detection, and collision response — AI, movement, and

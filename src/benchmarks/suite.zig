@@ -641,6 +641,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
     if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
@@ -1064,6 +1065,13 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     }
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
+    }
+    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
+        return std.fmt.bufPrint(
+            buffer,
+            "sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}",
+            .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions },
+        ) catch "workload";
     }
     if (std.mem.eql(u8, group_name, "render-prep")) {
         if (stats.render_prep_phases) |phases| {

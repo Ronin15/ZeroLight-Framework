@@ -79,6 +79,16 @@ pub const EntityDestroyedEvent = struct {
     was_static_navigation_obstacle: bool = false,
 };
 
+pub const EntityPerceivedEvent = struct {
+    observer: EntityId,
+    target: EntityId,
+};
+
+pub const EntityLostEvent = struct {
+    observer: EntityId,
+    target: EntityId,
+};
+
 pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
     entity_destroyed: EntityDestroyedEvent,
@@ -86,6 +96,8 @@ pub const SimulationEventPayload = union(enum) {
     world_tile_changed: WorldTileChangedEvent,
     world_obstacle_changed: WorldObstacleChangedEvent,
     nav_region_invalidated: NavRegionInvalidatedEvent,
+    entity_perceived: EntityPerceivedEvent,
+    entity_lost: EntityLostEvent,
 };
 
 pub const SimulationEvent = struct {
@@ -102,6 +114,8 @@ pub const SimulationEventStats = struct {
     world_tile_changed: usize = 0,
     world_obstacle_changed: usize = 0,
     nav_region_invalidated: usize = 0,
+    entity_perceived: usize = 0,
+    entity_lost: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
 
@@ -118,6 +132,8 @@ pub const SimulationEventStats = struct {
             .world_tile_changed => self.world_tile_changed += 1,
             .world_obstacle_changed => self.world_obstacle_changed += 1,
             .nav_region_invalidated => self.nav_region_invalidated += 1,
+            .entity_perceived => self.entity_perceived += 1,
+            .entity_lost => self.entity_lost += 1,
         }
     }
 
@@ -129,6 +145,8 @@ pub const SimulationEventStats = struct {
         self.world_tile_changed += produced.world_tile_changed;
         self.world_obstacle_changed += produced.world_obstacle_changed;
         self.nav_region_invalidated += produced.nav_region_invalidated;
+        self.entity_perceived += produced.entity_perceived;
+        self.entity_lost += produced.entity_lost;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
@@ -142,6 +160,8 @@ pub const SimulationEventStats = struct {
         perf.recordMetric(.simulation_events_world_tile_changed, metric(self.world_tile_changed));
         perf.recordMetric(.simulation_events_world_obstacle_changed, metric(self.world_obstacle_changed));
         perf.recordMetric(.simulation_events_nav_region_invalidated, metric(self.nav_region_invalidated));
+        perf.recordMetric(.simulation_events_entity_perceived, metric(self.entity_perceived));
+        perf.recordMetric(.simulation_events_entity_lost, metric(self.entity_lost));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
     }

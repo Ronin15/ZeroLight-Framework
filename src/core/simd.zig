@@ -316,6 +316,11 @@ pub fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
     return .{ .x = lerpFloat4(start.x, end.x, amount), .y = lerpFloat4(start.y, end.y, amount) };
 }
 
+/// Per-lane 2D dot product: `ax * bx + ay * by`.
+pub fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
+    return addFloat4(mulFloat4(ax, bx), mulFloat4(ay, by));
+}
+
 /// Per-lane sine. Uses the compiler builtin element-wise over the vector; the
 /// single call site lets a vectorized polynomial replace this later without
 /// touching callers.
@@ -513,6 +518,20 @@ test "lerpVec2Float4 matches scalar math.lerpVec2 lane-for-lane with distinct pe
         );
         try std.testing.expectEqual(expected.x, x_out[lane]);
         try std.testing.expectEqual(expected.y, y_out[lane]);
+    }
+}
+
+test "dotFloat4 matches scalar ax*bx + ay*by lane-for-lane" {
+    const ax = float4(1, 10, -4, 100);
+    const ay = float4(0, -10, 8, -50);
+    const bx = float4(2, 0, 6, 0.5);
+    const by = float4(3, 4, -2, -0.25);
+
+    const result = toFloatArray(dotFloat4(ax, ay, bx, by));
+
+    inline for (0..lane_count) |lane| {
+        const expected = ax[lane] * bx[lane] + ay[lane] * by[lane];
+        try std.testing.expectEqual(expected, result[lane]);
     }
 }
 

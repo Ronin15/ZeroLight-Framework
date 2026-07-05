@@ -233,9 +233,10 @@ pub const NavGrid = struct {
 
     // Composes this level's blocked mask from the world's dense bands and sparse
     // obstacles by iterating those columns directly. Dense bands cost
-    // O(bands x cells) inherently; sparse obstacles cost O(sparse) total. This
-    // avoids polling levelBlocksMovement per cell, which rescanned every sparse
-    // obstacle for every cell (O(cells x sparse)).
+    // O(bands x cells) inherently; sparse obstacles cost O(sparse tiles on this
+    // level) via `sparseTileIndicesForLevel`, not O(sparse tiles in the whole
+    // world). This avoids polling levelBlocksMovement per cell, which rescanned
+    // every sparse obstacle for every cell (O(cells x sparse)).
     pub fn markWorldObstacles(self: *NavGrid, world: *const WorldSystem) void {
         if (@as(usize, self.level) >= world.levelCount()) return;
         for (0..world.denseLayerCount()) |layer_index| {
@@ -255,8 +256,7 @@ pub const NavGrid = struct {
                 }
             }
         }
-        for (0..world.sparseTileCount()) |sparse_index| {
-            if (world.sparseTileLevel(sparse_index) != self.level) continue;
+        for (world.sparseTileIndicesForLevel(self.level)) |sparse_index| {
             if (!world.sparseTileBlocksMovement(sparse_index)) continue;
             const cell = world.sparseTileCellCoord(sparse_index);
             self.markWorldCell(world, cell.x, cell.y);

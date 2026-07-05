@@ -65,6 +65,7 @@ pub const Component = enum(u5) {
     steering_agent,
     world_level,
     faction,
+    ai_perception,
 };
 
 pub const ComponentMask = u32;
@@ -80,6 +81,7 @@ pub const component_masks = struct {
     pub const steering_agent = componentMask(.steering_agent);
     pub const world_level = componentMask(.world_level);
     pub const faction = componentMask(.faction);
+    pub const ai_perception = componentMask(.ai_perception);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -372,6 +374,77 @@ pub const ConstSteeringAgentSlice = struct {
     unavailable_backoff_steps: []const u16,
 };
 
+// Default half-angle is 60 degrees (120 degree full cone). Capped in
+// validateAiPerception at pi/2 (90 degrees) so cos_half_fov never goes
+// negative — the FOV test in PerceptionSystem relies on cos_half_fov >= 0.
+// Widening past 90 degrees is deferred to a future slice if a wider cone is
+// ever needed.
+const default_ai_perception_fov_half_angle_radians: f32 = std.math.pi / 3.0;
+// cos(pi/3) == 0.5 exactly; kept as a literal comptime constant (not a
+// math.sinCos call) so the struct-field default stays trivially comptime-known.
+// The store always recomputes cos_half_fov from fov_half_angle_radians on
+// append/set, so this default value is never load-bearing.
+const default_ai_perception_cos_half_fov: f32 = 0.5;
+
+/// Cold tunables (vision_range, fov_half_angle_radians) are author-set.
+/// cos_half_fov is derived once from fov_half_angle_radians at set()/append()
+/// time by PerceptionStore — never recomputed per-frame — so FOV checks in
+/// the (future) PerceptionSystem need only a dot-product compare, no vector
+/// sin/cos polynomial. Hot fields are written every step by PerceptionSystem
+/// and held across steps otherwise.
+pub const AiPerception = struct {
+    vision_range: f32 = 240.0,
+    fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
+    cos_half_fov: f32 = default_ai_perception_cos_half_fov,
+    target_visible: bool = false,
+    last_seen_x: f32 = 0,
+    last_seen_y: f32 = 0,
+    nearest_threat: EntityId = EntityId.invalid,
+    nearest_threat_dist: f32 = std.math.inf(f32),
+    facing_x: f32 = 1.0,
+    facing_y: f32 = 0.0,
+};
+
+// Keeps LOS raycast step counts small by construction.
+pub const max_ai_perception_vision_range: f32 = 512.0;
+
+pub const AiPerceptionCommand = struct {
+    entity: EntityId,
+    perception: AiPerception,
+};
+
+pub const ConstPerceptionSlice = struct {
+    entities: []const EntityId,
+    vision_range: ConstHotF32Slice,
+    fov_half_angle_radians: ConstHotF32Slice,
+    cos_half_fov: ConstHotF32Slice,
+    target_visible: []const bool,
+    last_seen_x: ConstHotF32Slice,
+    last_seen_y: ConstHotF32Slice,
+    nearest_threat: []const EntityId,
+    nearest_threat_dist: ConstHotF32Slice,
+    facing_x: ConstHotF32Slice,
+    facing_y: ConstHotF32Slice,
+};
+
+/// Mutable view exposes only the hot output columns PerceptionSystem writes
+/// every step (target_visible, last_seen_x/y, nearest_threat,
+/// nearest_threat_dist, facing_x/y). Cold tunables stay const here — they
+/// change only through DataSystem.setAiPerception, mirroring ScopeColumnsSlice.
+pub const PerceptionSlice = struct {
+    entities: []const EntityId,
+    vision_range: ConstHotF32Slice,
+    fov_half_angle_radians: ConstHotF32Slice,
+    cos_half_fov: ConstHotF32Slice,
+    target_visible: []bool,
+    last_seen_x: HotF32Slice,
+    last_seen_y: HotF32Slice,
+    nearest_threat: []EntityId,
+    nearest_threat_dist: HotF32Slice,
+    facing_x: HotF32Slice,
+    facing_y: HotF32Slice,
+};
+
 pub const WorldLevelCommand = struct {
     entity: EntityId,
     level: u16,
@@ -395,6 +468,7 @@ pub const EntityTemplate = struct {
     steering_agent: ?SteeringAgent = null,
     world_level: ?u16 = null,
     faction: ?Faction = null,
+    ai_perception: ?AiPerception = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -444,6 +518,7 @@ pub const StructuralCommand = union(enum) {
     set_world_level: WorldLevelCommand,
     set_simulation_tier: SimulationTierCommand,
     set_faction: FactionCommand,
+    set_ai_perception: AiPerceptionCommand,
 };
 
 pub const StructuralCommitStats = struct {

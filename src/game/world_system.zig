@@ -287,6 +287,28 @@ pub const WorldSystem = struct {
 
     sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
 
+    // Reverse per-level index over `sparse_tiles`: one growable list of indices
+    // per level, indexed by level. Maintained eagerly (appended to) inside
+    // `addSparseTile` — the sole sparse-tile inserter, which never removes a
+    // tile and never changes a tile's level after insertion — so this needs no
+    // dirty flag or deferred rebuild. That matters because gameplay consumers
+    // (nav rebuild after a dig, the perception LOS-blocked cache) read it
+    // within the same fixed-step tick a tile is placed, well before the next
+    // `ensureRenderDepthIndex` render pass would run; a lazily-rebuilt index
+    // keyed off the render dirty flag would be stale for them. A future bulk
+    // sparse-tile insert path must maintain this the same way. Lets per-level
+    // consumers (levelBlocksMovement, NavGrid.markWorldObstacles, perception's
+    // blocked-cache rebuild) walk only one level's tiles instead of scanning
+    // every sparse tile in the world and filtering by level. Deliberately not
+    // shaped like `sparse_render_order` (one flat sorted array + range table):
+    // that shape requires a contiguous per-group run, which can only be kept
+    // contiguous by a full resort after every insert — exactly the O(n) full
+    // rescan this index exists to avoid. Grown lazily up to `level_index + 1`
+    // entries the first time a level gets a sparse tile; a level with no
+    // sparse tiles yet simply has no entry (the accessor treats that the same
+    // as an out-of-range level: an empty slice).
+    sparse_level_tiles: std.ArrayList(std.ArrayList(u32)) = .empty,
+
     // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
     // set changes (tracked by render_index_dirty), never per frame. render_depths
     // is the sorted distinct set of dense+sparse depths; sparse_render_order holds
@@ -517,6 +539,8 @@ pub const WorldSystem = struct {
         self.render_depths.deinit(self.allocator);
 
         self.sparse_tiles.deinit(self.allocator);
+        for (self.sparse_level_tiles.items) |*bucket| bucket.deinit(self.allocator);
+        self.sparse_level_tiles.deinit(self.allocator);
 
         self.dense_tile_edits.deinit(self.allocator);
         self.dense_layer_tile_buffers.deinit(self.allocator);
@@ -985,6 +1009,33 @@ pub const WorldSystem = struct {
         };
     }
 
+    /// Indices into `sparse_tiles` for every sparse tile on `level_index`, in no
+    /// particular order. Empty for an out-of-range level and for a level that
+    /// has no sparse tiles yet — callers do not need to distinguish the two.
+    /// Backed by `sparse_level_tiles`, maintained eagerly by `addSparseTile` (see
+    /// that field's doc comment), so this is always current with no rebuild step.
+    pub fn sparseTileIndicesForLevel(self: *const WorldSystem, level_index: u16) []const u32 {
+        if (level_index >= self.sparse_level_tiles.items.len) return &.{};
+        return self.sparse_level_tiles.items[level_index].items;
+    }
+
+    // Appends `sparse_index` to `level_index`'s bucket in `sparse_level_tiles`,
+    // growing the outer list with empty buckets up to `level_index` first if
+    // needed. Called once per `addSparseTile` call, right after the tile is
+    // appended to `sparse_tiles`.
+    fn addSparseLevelIndexEntry(self: *WorldSystem, level_index: u16, sparse_index: u32) !void {
+        const needed_buckets = @as(usize, level_index) + 1;
+        if (self.sparse_level_tiles.items.len < needed_buckets) {
+            try self.sparse_level_tiles.ensureTotalCapacity(self.allocator, needed_buckets);
+            while (self.sparse_level_tiles.items.len < needed_buckets) {
+                self.sparse_level_tiles.appendAssumeCapacity(.empty);
+            }
+        }
+        var bucket = &self.sparse_level_tiles.items[level_index];
+        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
+        bucket.appendAssumeCapacity(sparse_index);
+    }
+
     pub fn levelCount(self: *const WorldSystem) usize {
         return self.level_base_z.items.len;
     }
@@ -1031,7 +1082,9 @@ pub const WorldSystem = struct {
     // Out-of-range x/y returns blocked, matching denseTileBlocksMovement; an
     // invalid level also returns blocked (fail-closed) so a bad index can never
     // expose phantom open cells to the pathfinder. Allocation-free: iterates the
-    // dense band columns and sparse SoA columns directly with no joins.
+    // dense band columns directly, and only the sparse tiles on this level via
+    // `sparseTileIndicesForLevel` instead of scanning every sparse tile in the
+    // world.
     pub fn levelBlocksMovement(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
         if (@as(usize, level_index) >= self.level_base_z.items.len) return true;
         if (x >= self.width or y >= self.height) return true;
@@ -1041,13 +1094,11 @@ pub const WorldSystem = struct {
             if (self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement) return true;
         }
         const cell = self.cellIndex(x, y);
-        const sparse_levels = self.sparse_tiles.items(.level_index);
         const sparse_cells = self.sparse_tiles.items(.cell_index);
         const sparse_flags = self.sparse_tiles.items(.flags);
-        for (sparse_levels, sparse_cells, sparse_flags) |sparse_level, sparse_cell, flags| {
-            if (sparse_level != level_index) continue;
-            if (sparse_cell != cell) continue;
-            if (flags.blocks_movement) return true;
+        for (self.sparseTileIndicesForLevel(level_index)) |sparse_index| {
+            if (sparse_cells[sparse_index] != cell) continue;
+            if (sparse_flags[sparse_index].blocks_movement) return true;
         }
         return false;
     }
@@ -1241,6 +1292,7 @@ pub const WorldSystem = struct {
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
         try self.sparse_tiles.ensureTotalCapacity(self.allocator, self.sparse_tiles.len + 1);
+        const new_index: u32 = @intCast(self.sparse_tiles.len);
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
             .chunk_index = chunk_index,
@@ -1249,6 +1301,7 @@ pub const WorldSystem = struct {
             .depth_value = world_z,
             .flags = flags,
         });
+        try self.addSparseLevelIndexEntry(level_index, new_index);
         self.render_index_dirty = true;
         // The sparse set changed, so the cached visible-sparse count must refresh.
         self.visibility_window_valid = false;
@@ -2175,6 +2228,80 @@ test "level navigability does not collapse across levels" {
     try std.testing.expect(world.levelBlocksMovement(level1, 2, 2));
     // The same cell on level 0 must stay open: levels do not collapse.
     try std.testing.expect(!world.levelBlocksMovement(level0, 2, 2));
+}
+
+// Compares two index lists as sets: same members, order irrelevant. Copies
+// into scratch so the caller's slices are never mutated by the sort.
+fn expectSparseIndexSetEqual(expected: []const u32, actual: []const u32) !void {
+    const expected_sorted = try std.testing.allocator.dupe(u32, expected);
+    defer std.testing.allocator.free(expected_sorted);
+    const actual_sorted = try std.testing.allocator.dupe(u32, actual);
+    defer std.testing.allocator.free(actual_sorted);
+    std.mem.sort(u32, expected_sorted, {}, std.sort.asc(u32));
+    std.mem.sort(u32, actual_sorted, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, expected_sorted, actual_sorted);
+}
+
+test "sparseTileIndicesForLevel returns exactly this level's sparse tile indices" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const level2 = try world.addLevel(20); // added but never given a sparse tile
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Interleave insertion order across levels so a level's grouping cannot be
+    // inferred from insertion order alone — only the level field decides it.
+    _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // sparse index 0
+    _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // sparse index 1
+    _ = try world.addSparseTile(level0, 3, 3, deco, 0, .obstacle); // sparse index 2
+    _ = try world.addSparseTile(level1, 4, 4, deco, 0, .obstacle); // sparse index 3
+    _ = try world.addSparseTile(level0, 5, 5, deco, 0, .obstacle); // sparse index 4
+
+    try expectSparseIndexSetEqual(&.{ 0, 2, 4 }, world.sparseTileIndicesForLevel(level0));
+    try expectSparseIndexSetEqual(&.{ 1, 3 }, world.sparseTileIndicesForLevel(level1));
+    // A real level with no sparse tiles placed on it yet.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level2));
+    // An out-of-range level.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(99));
+}
+
+test "levelBlocksMovement scopes sparse obstacles to their own level at the same cell" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const level2 = try world.addLevel(20);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Same cell coordinate, obstacle placed on level 1 only. Level 0 and level
+    // 2 share the coordinate but must stay open — proves the per-level sparse
+    // index does not leak another level's obstacle into this cell's query.
+    _ = try world.addSparseTile(level1, 4, 4, deco, 0, .obstacle);
+
+    try std.testing.expect(!world.levelBlocksMovement(level0, 4, 4));
+    try std.testing.expect(world.levelBlocksMovement(level1, 4, 4));
+    try std.testing.expect(!world.levelBlocksMovement(level2, 4, 4));
 }
 
 test "addUndergroundLevelStack honors requested depth below an existing surface" {
