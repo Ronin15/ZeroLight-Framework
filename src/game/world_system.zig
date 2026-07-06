@@ -1006,12 +1006,6 @@ pub const WorldSystem = struct {
         return self.dense_layers.items(.level_index)[layer_index];
     }
 
-    /// Level a sparse tile belongs to. Pairs with `sparseTileCellCoord` so a
-    /// per-level sparse-cell set can be built in O(sparse), not O(cells x sparse).
-    pub fn sparseTileLevel(self: *const WorldSystem, index: usize) u16 {
-        return self.sparse_tiles.items(.level_index)[index];
-    }
-
     /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index.
     pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
         const cell = self.sparse_tiles.items(.cell_index)[index];

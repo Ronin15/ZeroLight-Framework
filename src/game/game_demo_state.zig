@@ -72,7 +72,9 @@ const demo_structural_reserve = test_square_count + 16;
 /// (1) and dig-mining event (1), plus up to `demo_structural_reserve`
 /// structural-commit events (tier changes / create / destroy), plus the
 /// post-commit nav-invalidation headroom (1) already tracked separately by
-/// `applyStructuralCommandsAndPostCommitEvents`.
+/// `applyStructuralCommandsAndPostCommitEvents`. No term for perception's
+/// `entity_perceived`/`entity_lost` events: no demo entity carries
+/// `AiPerception`, and `perception_max_events_per_step` is set to 0 below.
 const demo_event_reserve = test_square_count + 1 + 1 + demo_structural_reserve + 1;
 /// Per-step audio bound for demo tests: 32 movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop.
@@ -316,6 +318,9 @@ pub const GameDemoState = struct {
             .navigation_world = &world,
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
+            // No demo entity carries `AiPerception` yet. A state that wires
+            // it up must size this against `demo_event_reserve`.
+            .perception_max_events_per_step = 0,
         });
         errdefer pipeline.deinit();
 

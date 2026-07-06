@@ -15,6 +15,7 @@ const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
@@ -66,6 +67,12 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
+    /// This state's reserved share of `frame.events`'s `capacity_limit` (see
+    /// `SimulationFrame.reserveStreams`), passed through as
+    /// `PerceptionConfig.max_events_per_step`. Sized by the caller against its
+    /// own event-capacity budget, same as `contact_capacity`/
+    /// `static_obstacle_capacity`; defaults to 0.
+    perception_max_events_per_step: usize = 0,
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -218,6 +225,8 @@ pub const SimulationPipeline = struct {
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
+    /// See `SimulationPipelineConfig.perception_max_events_per_step`.
+    perception_max_events_per_step: usize,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -266,6 +275,7 @@ pub const SimulationPipeline = struct {
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
+            .perception_max_events_per_step = config.perception_max_events_per_step,
         };
     }
 
@@ -467,6 +477,7 @@ pub const SimulationPipeline = struct {
             .scope_dense_indices = ai_indices,
             .player_candidate = perception_player_candidate,
             .stimuli = frame.stimuli.mergedItems(),
+            .max_events_per_step = self.perception_max_events_per_step,
         });
         perception_timer.stop(context.perf, .pipeline_perception);
 
@@ -1192,4 +1203,86 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     // and AI does not perturb the existing movement stage's output — every
     // non-dormant body (player + both NPCs) still integrates.
     try std.testing.expectEqual(@as(usize, 3), stats.movement.body_count);
+}
+
+test "pipeline perception events truncate instead of throwing when the shared event capacity is tight" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    // Two observer/hostile pairs. Each observer is closer to its own hostile
+    // than to the other pair's, so nearest-threat selection locks each onto
+    // its own target; both newly perceive their hostile this step, so
+    // perception emits two events.
+    const observer_a = try data.createEntity();
+    try data.setMovementBody(observer_a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
+    try data.setAiAgent(observer_a, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(observer_a, .player);
+    try data.setAiPerception(observer_a, .{});
+    const hostile_a = try data.createEntity();
+    try data.setMovementBody(hostile_a, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile_a, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(hostile_a, .hostile);
+
+    const observer_b = try data.createEntity();
+    try data.setMovementBody(observer_b, .{ .position = .{ .x = 100, .y = 0 }, .previous_position = .{ .x = 100, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
+    try data.setAiAgent(observer_b, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(observer_b, .player);
+    try data.setAiPerception(observer_b, .{});
+    const hostile_b = try data.createEntity();
+    try data.setMovementBody(hostile_b, .{ .position = .{ .x = 110, .y = 0 }, .previous_position = .{ .x = 110, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile_b, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(hostile_b, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    // Real per-step event budget of 1 — tighter than the two events this
+    // step's perceptions produce.
+    try frame.reserveStreams(4, 1, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+        .perception_max_events_per_step = 1,
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.perceived_events + stats.perception.lost_events);
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
 }

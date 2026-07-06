@@ -50,10 +50,11 @@
 //! cell-scan traversal and stance lookup (Slice 28 shared infra; branchy and a
 //! 4-value enum table index, not float math), the small (<= 17) per-agent
 //! nearest-candidate sort (irreducibly small/branchy, does not scale with
-//! population), and the bounded LOS raycast (early-exit, one scattered cell
-//! lookup per sample). The per-sample blocked test itself is an O(1) read
-//! into `LevelBlockedSlot`'s per-level bitmap cache (`level_blocked`, brought
-//! current for a distinct observer level at most once per step by
+//! population), and the bounded LOS raycast (early-exit grid/DDA walk, one
+//! scattered cell lookup per visited cell). The per-cell blocked test itself
+//! is an O(1) read into `LevelBlockedSlot`'s per-level bitmap cache
+//! (`level_blocked`, brought current for a distinct observer level at most
+//! once per step by
 //! `ensureLevelBlockedCachesForObservers`/`ensureLevelBlockedCache` — a skip,
 //! a scoped patch, or a full rebuild, whichever `reactToPostCommitPerceptionEvents`'s
 //! dirty tracking says is cheapest, see `LevelBlockedSlot`'s doc comment), not
@@ -119,11 +120,17 @@ const max_perception_scratch: usize = max_perception_candidates + 1; // + player
 const facing_speed_squared_threshold: f32 = 1.0;
 const facing_normalize_epsilon: f32 = 1.0e-6;
 
-// Defensive ceiling on LOS raycast sample count. AiPerception.vision_range is
-// itself capped (max_ai_perception_vision_range) which already keeps the
-// normal ceil(distance / tile_size) step count small; this is a second,
-// independent bound.
-const los_max_steps: u32 = 32;
+// Defensive ceiling on LOS raycast visited-cell count (the DDA grid walk in
+// `hasLineOfSight` visits one cell per loop iteration, not one interpolated
+// sample). AiPerception.vision_range is itself capped
+// (max_ai_perception_vision_range) which already keeps the worst-case
+// Manhattan cell count small (at most ~26 cells for a maximally diagonal
+// 512-unit ray over 32-unit tiles); this is a second, independent bound with
+// headroom above that. Reaching this cap mid-traversal fails closed (treats
+// the rest of the ray as blocked) the same way an out-of-bounds cell does —
+// unreachable under any valid `AiPerception` config, only a fallback for a
+// pathological one.
+const los_max_cells: u32 = 64;
 
 const player_candidate_sentinel: usize = std.math.maxInt(usize);
 
@@ -177,10 +184,10 @@ pub const PerceptionStats = struct {
     nearest_threat_found_count: usize = 0,
     // `hasLineOfSight` call count and how many of those returned blocked,
     // summed across every range — see the per-range accumulation note on
-    // `PerceptionRangeStats`. `hasLineOfSight` samples are O(1) lookups into
+    // `PerceptionRangeStats`. `hasLineOfSight` visits are O(1) lookups into
     // `PerceptionSystem.level_blocked`'s per-level bitmap cache (see that
     // struct's doc comment), not raw `WorldSystem.levelBlocksMovement` calls,
-    // so these counters exist to make the LOS sample volume visible to
+    // so these counters exist to make the LOS visited-cell volume visible to
     // `src/benchmarks/perception.zig` rather than let it hide inside aggregate
     // step timing.
     los_checks: usize = 0,
@@ -1279,32 +1286,82 @@ fn survivorLessThan(ctx: SurvivorSortContext, lhs: usize, rhs: usize) bool {
     return resolveCandidate(ctx, lhs).entity.index < resolveCandidate(ctx, rhs).entity.index;
 }
 
-/// Bounded LOS raycast: fixed-step sampling with an early exit on the first
-/// blocked sample. Each sample is a branchy, scattered cell lookup (not
-/// dense/uniform), so the step loop itself stays scalar; the per-sample
-/// blocked test is `lookupLevelBlocked`'s O(1) bitmap read (see
+/// Bounded LOS raycast: an Amanatides-Woo grid/DDA walk from the observer's
+/// cell to the target's cell, with an early exit on the first blocked cell
+/// visited. Unlike fixed-step linear-interpolation sampling, this visits
+/// every grid cell the segment's interior actually crosses — a diagonal ray
+/// can no longer straddle a blocking cell's interior between two samples
+/// without either one landing inside it (see the module doc's LOS test for
+/// the reproduction this replaces). Each visited cell is a branchy, scattered
+/// lookup (not dense/uniform), so the walk itself stays scalar; the per-cell
+/// blocked test is still `lookupLevelBlocked`'s O(1) bitmap read (see
 /// `LevelBlockedSlot`), not a `WorldSystem.levelBlocksMovement` call.
 fn hasLineOfSight(world: *const WorldSystem, level_blocked: []const LevelBlockedSlot, level: u16, ox: f32, oy: f32, tx: f32, ty: f32) bool {
     const dx = tx - ox;
     const dy = ty - oy;
-    const distance = math.length(.{ .x = dx, .y = dy });
-    if (distance <= 0) return true;
-    const tile_size = world.tile_size;
-    // Ceil via floor negation (`ceil(x) == -floor(-x)`), same idiom as
-    // spatial_index.zig's cellScanRadius.
-    const raw_steps = -math.floorToI32(-(distance / tile_size));
-    const capped_steps: i32 = @min(raw_steps, @as(i32, @intCast(los_max_steps)));
-    const step_count: u32 = @intCast(@max(capped_steps, 1));
+    if (dx == 0 and dy == 0) return true;
 
-    var step: u32 = 1;
-    while (step <= step_count) : (step += 1) {
-        const t = @as(f32, @floatFromInt(step)) / @as(f32, @floatFromInt(step_count));
-        const px = ox + dx * t;
-        const py = oy + dy * t;
-        const cell = world.cellContaining(px, py) orelse return false;
-        if (lookupLevelBlocked(level_blocked, level, cell.x, cell.y)) return false;
+    const tile_size = world.tile_size;
+    const start_cell = world.cellContaining(ox, oy) orelse return false;
+    const end_cell = world.cellContaining(tx, ty) orelse return false;
+
+    // The observer's own starting cell is never checked (mirrors the old
+    // sampler, which never evaluated t == 0): a straight segment that starts
+    // and ends in the same cell never leaves it, so only the shared cell
+    // itself needs a blocked check.
+    if (start_cell.x == end_cell.x and start_cell.y == end_cell.y) {
+        return !lookupLevelBlocked(level_blocked, level, end_cell.x, end_cell.y);
     }
-    return true;
+
+    var cell_x: i32 = start_cell.x;
+    var cell_y: i32 = start_cell.y;
+    const end_x: i32 = end_cell.x;
+    const end_y: i32 = end_cell.y;
+    const world_width: i32 = world.width;
+    const world_height: i32 = world.height;
+
+    const step_x: i32 = if (dx > 0) 1 else if (dx < 0) -1 else 0;
+    const step_y: i32 = if (dy > 0) 1 else if (dy < 0) -1 else 0;
+
+    // t_max_* is the distance (in the segment's own [0,1] parameterization)
+    // to the next vertical/horizontal grid line; t_delta_* is that same unit
+    // distance between consecutive grid lines on that axis. An axis the
+    // segment never crosses (step == 0) is pinned at +inf so the `<`
+    // comparison below always advances the other axis.
+    var t_max_x = std.math.inf(f32);
+    var t_delta_x = std.math.inf(f32);
+    if (step_x != 0) {
+        const next_cell_x = if (step_x > 0) cell_x + 1 else cell_x;
+        const boundary_x = @as(f32, @floatFromInt(next_cell_x)) * tile_size;
+        t_max_x = (boundary_x - ox) / dx;
+        t_delta_x = tile_size / @abs(dx);
+    }
+
+    var t_max_y = std.math.inf(f32);
+    var t_delta_y = std.math.inf(f32);
+    if (step_y != 0) {
+        const next_cell_y = if (step_y > 0) cell_y + 1 else cell_y;
+        const boundary_y = @as(f32, @floatFromInt(next_cell_y)) * tile_size;
+        t_max_y = (boundary_y - oy) / dy;
+        t_delta_y = tile_size / @abs(dy);
+    }
+
+    var visited: u32 = 0;
+    while (visited < los_max_cells) : (visited += 1) {
+        if (t_max_x < t_max_y) {
+            cell_x += step_x;
+            t_max_x += t_delta_x;
+        } else {
+            cell_y += step_y;
+            t_max_y += t_delta_y;
+        }
+        if (cell_x < 0 or cell_y < 0 or cell_x >= world_width or cell_y >= world_height) return false;
+        const cx: u16 = @intCast(cell_x);
+        const cy: u16 = @intCast(cell_y);
+        if (lookupLevelBlocked(level_blocked, level, cx, cy)) return false;
+        if (cell_x == end_x and cell_y == end_y) return true;
+    }
+    return false;
 }
 
 fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *PerceptionRangeStats) void {
@@ -1982,6 +2039,62 @@ test "LOS gating skips a blocked nearer candidate in favor of a farther clear on
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(farther_clear.index, perception.nearest_threat.index);
+}
+
+test "LOS blocks a diagonal ray through a mid-segment occluder's interior, not just its corners" {
+    // Regression for a grid-traversal gap: a fixed-step interpolation sampler
+    // can jump from one sampled point to the next diagonally without ever
+    // landing inside a cell the *continuous* segment's interior actually
+    // crosses. Observer (0.7, 0.3) -> target (2.5, 2.1) in tile units is a
+    // 45-degree ray (dx == dy == 1.8), but the asymmetric fractional start
+    // offsets (0.7 vs 0.3) keep it off the exact grid-corner diagonal, so it
+    // has a genuine interior span through cell (2, 1) for roughly
+    // t in [0.72, 0.94] -- not the measure-zero corner graze the sibling
+    // "skips a blocked nearer candidate" test above exercises (that one is
+    // corner-exact: dx == dy with a zero start offset). A correct grid/DDA
+    // walk must still visit (2, 1) even though no fixed-step sample at
+    // t = 1/3, 2/3, 1 ever lands there.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    // Large bounds keep this test's small (cells 0..2) coordinate area away
+    // from `initDemoFromMeta`'s own fixed demo obstacles, same as the sibling
+    // LOS test above.
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    _ = try world.setDenseTile(layer, 2, 1, tree);
+
+    const tile_size = world.tile_size;
+    const target = try addAgent(&data, tile_size * 2.5, tile_size * 2.1, 0, 0, .hostile);
+    _ = target;
+    const observer = try addObserver(&data, tile_size * 0.7, tile_size * 0.3, 1, 1, .player, .{
+        .fov_half_angle_radians = std.math.pi / 2.0,
+        .vision_range = tile_size * 10,
+    });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(!perception.target_visible);
+    try testing.expectEqual(EntityId.invalid.index, perception.nearest_threat.index);
 }
 
 test "LevelBlockedSlot cache lookup matches WorldSystem.levelBlocksMovement exactly: dense-blocked, sparse-blocked, open, out-of-range level, out-of-range cell" {

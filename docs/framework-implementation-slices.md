@@ -2176,6 +2176,20 @@ Acceptance checks:
       the once-per-step cache-rebuild residual that fix left behind (see
       above for the full before/after and the honestly-reported numbers at
       each stage).
+- [x] `computeOneAgent`'s scatter writes into `job.perception_slice` at
+      `perception_dense_index[i]` were checked for cross-worker false-sharing
+      risk: the `perception-scattered-dense-index` benchmark
+      (`benchmarks/perception.zig`) shuffles `perception_dense_index` so
+      worker ranges write genuinely interleaved (same-cache-line) slots, unlike
+      `perception`/`perception-los-dense`'s near-monotonic assignment. At
+      50,000 agents this decorrelated case was not slower than the correlated
+      one (4.42x/4.54x vs 4.34x/4.49x threaded speedup, within noise), with
+      identical `sensed_count`/`los_checks`/`los_blocked`/
+      `nearest_threat_found_count` confirming only store-write locality
+      changed. Conclusion: measured, no regression — the per-agent
+      spatial-query/FOV/LOS cost dwarfs the 5 scattered writes, so the direct
+      scatter is left as-is rather than rewritten to a dense-pass-then-
+      serial-scatter pattern.
 
 ## Slice 30: AI Memory And Scope-Aware AI State Policy
 
