@@ -40,9 +40,9 @@ game-specific behavior under `src/game/`.
   for levels, dense layers, sparse tiles, catalog source rects, and chunk
   visibility.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
-  movement, visual, collision, agents, faction_level, structural, system) and
-  owns state-local persistent entity data in dense SoA stores for gameplay,
-  collision, and render systems.
+  movement, visual, collision, agents, faction_level, perception, structural,
+  system) and owns state-local persistent entity data in dense SoA stores for
+  gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -475,6 +475,27 @@ consumes the completed same-step contact stream through explicit response-policy
 components, computes aligned correction columns with `src/core/simd.zig`, and
 applies sparse movement writes deterministically on the main thread before
 structural commands commit.
+
+`PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
+cognition-scoped `AiPerception` subset right after the shared spatial index is
+built, reusing the same `SpatialIndexView` `AiSystem` consumes rather than
+building its own grid. Vision applies range/FOV/line-of-sight gating (faction
+stance and same-level checks included); LOS blocked-tile lookups are O(1)
+against `PerceptionSystem.level_blocked`, a per-level bitmap kept current by a
+skip/patch/rebuild decision driven by post-commit `world_tile_changed`/
+`world_obstacle_changed` events rather than an unconditional per-step rebuild,
+and `hasLineOfSight` itself walks every grid cell a ray's segment actually
+crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
+into the same per-agent pass as a same-level squared-distance check against
+`SimulationFrame.stimuli`, a transient per-step positional buffer that
+`DigController` is the sole producer for. Dense per-step results (visibility,
+last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
+hot columns; only acquisition/loss transitions emit low-volume
+`entity_perceived`/`entity_lost` domain events, capped per step by
+`SimulationPipelineConfig.perception_max_events_per_step` (caller-sized
+against the pipeline's real per-step event capacity, not a floating library
+default) with drops surfaced through event stats rather than an unhandled
+capacity error.
 
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
 It receives const AiAgent + movement prior-position slices and a read-only

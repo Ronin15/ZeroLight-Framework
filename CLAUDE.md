@@ -56,12 +56,12 @@ boundaries just to make a local change easier.
   `player.zig`, pipeline-owned controllers
   `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
   and `systems/` (movement, ai, steering, collision, collision_response, particle,
-  and the `pathfinding/` subpackage fronted by `pathfinding.zig`). The
-  `PathfindingSystem` owns nav-invalidation classification and the post-commit nav
-  reaction; the state only invokes it via the pipeline.
+  perception, and the `pathfinding/` subpackage fronted by `pathfinding.zig`).
+  The `PathfindingSystem` owns nav-invalidation classification and the
+  post-commit nav reaction; the state only invokes it via the pipeline.
 - `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
   GPU smoke probe. `src/benchmarks/` — CPU gameplay, pathfinding, nav-update,
-  scope, and render-prep benchmarks.
+  scope, perception, and render-prep benchmarks.
 
 ## Working Rules
 

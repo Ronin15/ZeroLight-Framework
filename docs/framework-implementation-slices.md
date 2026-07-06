@@ -77,7 +77,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
 | **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
-| **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed (see slice section) |
+| **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed, LOS diagonal-tunneling correctness fix, caller-sized event budget (see slice section) |
 | **30–33** | Not started | AI memory, affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
@@ -2102,6 +2102,58 @@ is now replaced with NavGraph-style incremental patching, mirroring
   original 3.76ms/3.25ms gap before any of this slice's LOS-cost work. See
   `src/benchmarks/perception.zig`'s module doc for the full write-up.
 
+**LOS correctness fix (diagonal tunneling):** a review pass found that
+`hasLineOfSight`'s original sampling — fixed `step_count = ceil(distance /
+tile_size)` linear-interpolation samples along the ray, each checked against
+`lookupLevelBlocked` — was not a true grid traversal. Consecutive samples on a
+non-45-degree diagonal ray can straddle a gridline such that the continuous
+segment passes through a blocking cell's interior without either sample ever
+landing inside it, so a single-tile diagonal occluder could be silently
+skipped and `target_visible`/`nearest_threat` set as if the wall weren't
+there. The existing corner-grazing 45-degree test did not exercise this (a
+perfectly corner-aligned line only ever touches cell corners, a measure-zero
+case, and never crosses a cell's interior off-axis).
+
+The fix replaces the fixed-step sampler with a proper Amanatides-Woo grid/DDA
+walk that visits every cell the segment's interior actually crosses between
+observer and target, still checking each visited cell with the same O(1)
+`lookupLevelBlocked` lookup, with an early exit on the first blocked cell. The
+defensive step ceiling (`los_max_steps`, 32) is now `los_max_cells` (64,
+doubled headroom since Manhattan cell counts on a diagonal run higher than
+the old Euclidean-based step count); hitting it now fails closed (returns
+blocked) rather than coarsening resolution while still resolving the
+endpoint — unreachable under any valid `AiPerception` config, a fallback for
+pathological input only. A dedicated regression test reproduces a mid-segment
+diagonal occluder a corner-grazing case would miss (observer/target placed so
+the ray's true path crosses one cell's interior that no fixed-step sample
+would land in) and confirms it is now correctly reported as blocked.
+Benchmarked at 1,024 and 10,000 agents (`--group perception`): best-threaded
+612.66us and 6.07ms respectively, in the same range as the cache-fix numbers
+above — the cell-walk correctness fix adds no measurable per-agent cost.
+
+**Perception event budget is caller-sized, not a floating default:**
+`PerceptionConfig.max_events_per_step` (library default 512) was never
+derived from the real per-step `frame.events` capacity a caller reserves via
+`SimulationFrame.reserveStreams`. Once enough observers change visibility in
+the same step to push the merged perception-event total past that real
+budget, `mergePerceptionEvents`'s `prefixAppendedRanges` call throws
+`error.EventCapacityExceeded` — unhandled all the way out of the fixed-step
+loop, not the graceful truncate-and-drop the module intends. `SimulationPipelineConfig`
+now carries `perception_max_events_per_step` (default `0`, following the same
+caller-sized-capacity convention as `contact_capacity`/`static_obstacle_capacity`),
+threaded into `PerceptionConfig` at the pipeline's perception call site. A
+static caller-declared share was chosen over reading remaining capacity at
+perception's call time, since perception runs before later
+event-emitting stages (structural commits, nav invalidation) that would
+otherwise inherit the same unhandled-throw risk on headroom perception
+consumed first. `game_demo_state.zig`'s `demo_event_reserve` (83) needs no
+added term today: no demo entity attaches `AiPerception`, so
+`perception_max_events_per_step` stays `0` and perception's real contribution
+to the shared budget is `0` by construction; a state that wires up
+`AiPerception` must size this field against its own reserve. A compact test
+(tight capacity, two observer/hostile pairs, `perception_max_events_per_step
+= 1`) proves the graceful-drop path: no throw, `dropped_events == 1`.
+
 Goal: let agents sense other entities (and later sounds) within vision/hearing
 limits, writing per-frame sensed state to columns and emitting only acquisition/
 loss transitions as events.
@@ -2162,7 +2214,7 @@ Acceptance checks:
       entities in scope.
 - [x] `zig build test` covers range/FOV/LOS gating, transition events, and
       serial/threaded parity.
-- [x] `hasLineOfSight`'s per-sample blocked test is O(1) (`level_blocked`'s
+- [x] `hasLineOfSight`'s per-cell blocked test is O(1) (`level_blocked`'s
       per-level bitmap cache, kept current for a distinct observer level at
       most once per step via a skip/patch/rebuild decision — see "Incremental
       dirty-tracked LOS-blocked cache" above), proven behavior-identical to
@@ -2190,6 +2242,18 @@ Acceptance checks:
       spatial-query/FOV/LOS cost dwarfs the 5 scattered writes, so the direct
       scatter is left as-is rather than rewritten to a dense-pass-then-
       serial-scatter pattern.
+- [x] `hasLineOfSight` walks every grid cell the segment's interior crosses
+      (Amanatides-Woo DDA), not fixed-distance samples, closing a diagonal-
+      tunneling gap where a mid-segment occluder could be skipped; proven by a
+      dedicated regression test and re-benchmarked with no measurable
+      per-agent cost regression. See "LOS correctness fix (diagonal
+      tunneling)" above.
+- [x] Perception's per-step event cap is caller-sized against the real
+      `frame.events` capacity (`SimulationPipelineConfig.perception_max_events_per_step`,
+      default `0`), not left at the library's permissive 512 default; proven
+      by a tight-capacity test asserting graceful drop-and-report instead of
+      an unhandled `error.EventCapacityExceeded`. See "Perception event budget
+      is caller-sized, not a floating default" above.
 
 ## Slice 30: AI Memory And Scope-Aware AI State Policy
 
