@@ -77,7 +77,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
 | **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
-| **29** | Partial | AI Perception Substrate — vision (component/system/events) landed; hearing tunable + stimulus buffer deferred; LOS-cost risk open (see slice section) |
+| **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed (see slice section) |
 | **30–33** | Not started | AI memory, affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
@@ -1757,23 +1757,49 @@ Acceptance checks:
 
 ## Slice 29: AI Perception Substrate
 
-**Status: partial — vision landed (including the LOS cost-risk fix), hearing
-deferred.** `AiPerception` (`data_system/perception.zig`), `PerceptionSystem`
+**Status: landed** — vision (including the LOS cost-risk fix) and hearing are
+both in place. `AiPerception` (`data_system/perception.zig`), `PerceptionSystem`
 (`systems/perception.zig`), the `entity_perceived`/`entity_lost` event
 contract, and the `perception`/`perception-los-dense` benchmark groups are all
 in place with full test coverage: range/FOV/LOS gating, faction-stance
 gating, same-level gating, player-as-candidate, all four transition shapes
 (acquire/lose/hold/identity-swap), the per-step event cap with drop
 diagnostics, serial/threaded parity, and a `FailingAllocator` steady-state
-allocation-free proof. Hearing (the `hearing_range` cold tunable and the
-transient world stimulus/sound buffer) was not built — vision ships first
-exactly as this slice's own architecture note scoped, and hearing stays
-tracked here rather than silently dropped. The squared-form FOV test
+allocation-free proof. The squared-form FOV test
 (`dot(facing, to) > 0 AND dot^2 > cos_half_fov^2 * dist2`) turned out not to
 need the vector sin/cos polynomial Slice 34 deferred here — no production
 caller for `simd.sinFloat4`/`cosFloat4`/`sinCosFloat4` was added, since a
 unit-length facing vector makes the squared dot-product compare exact without
 any per-frame trig.
+
+**Hearing (closes this slice):** `AiPerception` gained a cold `hearing_range`
+tunable and hot `heard_stimulus`/`heard_stimulus_x/y` columns
+(`data_system/types.zig`, `data_system/perception.zig`), following the same
+cold/hot split and `PerceptionStore.set`-preserves-hot-columns contract as
+vision. `SimulationFrame` gained `stimuli: RangeOutputStream(WorldStimulus)`
+(`simulation.zig`) — a transient per-step positional buffer
+(`position`/`intensity`/`kind`/`level`, scalar-only), cleared every
+`beginStep` and never promoted to a `SimulationEvent`, since it carries no
+stable entity identity to transition against (only state *transitions*
+become events, per the track-wide contract above). `intensity` is stored but
+unused until a second producer exists to calibrate a falloff curve.
+`DigController.process` is the sole producer today (`dig_controller.zig`),
+appending one stimulus alongside its existing `world_tile_changed` event; its
+sibling `carveLandingCell` (the fall/landing path) deliberately does not,
+since it runs after `PerceptionSystem.update` in the same fixed step and
+would be cleared before any hearing pass could read it — documented in place
+rather than silently wired up wrong. Hearing is folded into
+`PerceptionSystem.computeOneAgent` as a squared-distance range check gated by
+same-level only (no FOV, no faction-stance gate — a stimulus is positional
+and factionless), reading `frame.stimuli.mergedItems()` through a
+`PerceptionConfig.stimuli` field. The stream itself needs no reserve call
+from any owning module: its per-step count is a fixed producer invariant (at
+most one, from `dig.process`), not scene-scale-dependent, so it grows lazily
+on first use exactly like `PerceptionSystem`'s own gather buffers already do.
+Tests cover range/level gating, nearest-of-multiple selection, hot-column
+round-trip and preservation-on-retune, serial/threaded parity, and
+`FailingAllocator` allocation-free proofs alongside vision's existing
+coverage.
 
 **LOS cost-risk fix (`hasLineOfSight`'s per-sample lookup is now O(1)):** this
 slice originally shipped with `hasLineOfSight` calling
@@ -2103,14 +2129,14 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add an `AiPerception` component: cold tunables (vision range, FOV
+- [x] Add an `AiPerception` component: cold tunables (vision range, FOV
       half-angle, hearing range) plus hot output columns (`target_visible`,
       `last_seen_x/y`, `nearest_threat: EntityId`, `nearest_threat_dist`).
-      **Partial:** `vision_range`/`fov_half_angle_radians` (cold), the derived
-      `cos_half_fov`, all four listed hot output columns, and an additional
-      `facing_x/y` hot column the original wording didn't anticipate are all
-      landed in `data_system/perception.zig`. `hearing_range` does not exist —
-      deferred with item 4 below.
+      `vision_range`/`fov_half_angle_radians`/`hearing_range` (cold), the
+      derived `cos_half_fov`, the four listed hot output columns, plus
+      `facing_x/y` and `heard_stimulus`/`heard_stimulus_x/y` hot columns the
+      original wording didn't anticipate, are all landed in
+      `data_system/perception.zig`.
 - [x] Add a `PerceptionSystem` parallel stage that queries the shared spatial
       index for candidates, then applies bounded range/FOV/line-of-sight checks
       (LOS against world blocking tiles via `world_system` walkability), writing
@@ -2118,11 +2144,14 @@ Checklist:
 - [x] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
       target acquisition/loss transitions, emitted at `domain_reaction` via the
       per-range writer with pre-reserved capacity.
-- [ ] Add a transient per-step world stimulus/sound buffer (position +
+- [x] Add a transient per-step world stimulus/sound buffer (position +
       intensity + type, scalar-only) and consume it for hearing; keep it separate
-      from the audio playback service. **Not started.** No stimulus/sound
-      buffer exists; hearing is fully deferred to a follow-up pass (vision
-      ships first, exactly as this slice's architecture note scoped).
+      from the audio playback service. `SimulationFrame.stimuli`
+      (`RangeOutputStream(WorldStimulus)`, `simulation.zig`) is the buffer;
+      `DigController.process` is the sole producer; hearing is folded into
+      `PerceptionSystem.computeOneAgent` as a same-level squared-distance
+      check. See "Hearing (closes this slice)" above for the full account,
+      including why `carveLandingCell` does not also produce one.
 
 Acceptance checks:
 

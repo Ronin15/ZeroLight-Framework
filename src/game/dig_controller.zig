@@ -27,6 +27,7 @@ const TileId = @import("world_system.zig").TileId;
 const CellCoord = @import("world_system.zig").CellCoord;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
+const StimulusKind = @import("simulation.zig").StimulusKind;
 const DigIntent = @import("simulation.zig").DigIntent;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
@@ -135,6 +136,12 @@ pub const DigController = struct {
             .stage = .structural_commit,
             .payload = .{ .world_tile_changed = changed },
         });
+        try frame.appendStimulus(.{
+            .position = cellCenterWorldPos(world, cell),
+            .intensity = 1.0,
+            .kind = .dig,
+            .level = player.current_level,
+        });
     }
 
     /// Carves a walkable ramp tile and adds a bidirectional ramp `LevelLink` to the
@@ -219,7 +226,8 @@ pub const DigController = struct {
 
     /// Carves a fall's landing cell to the walkable tunnel tile and queues the tile
     /// change for the post-commit nav re-mask. No-op when the level has no floor
-    /// layer or the cell was already walkable.
+    /// layer or the cell was already walkable. Does not emit a stimulus: this runs
+    /// after this step's hearing read, so it would be cleared before ever seen.
     fn carveLandingCell(self: *const DigController, world: *WorldSystem, frame: *SimulationFrame, level: u16, cell: CellCoord) !void {
         const floor_layer = world.denseFloorLayerForLevel(level) orelse return;
         const changed = (try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile)) orelse return;
@@ -229,6 +237,13 @@ pub const DigController = struct {
         });
     }
 };
+
+fn cellCenterWorldPos(world: *const WorldSystem, cell: CellCoord) math.Vec2 {
+    return .{
+        .x = (@as(f32, @floatFromInt(cell.x)) + 0.5) * world.tile_size,
+        .y = (@as(f32, @floatFromInt(cell.y)) + 0.5) * world.tile_size,
+    };
+}
 
 /// Moves an entity onto a plane: tracks the level and snaps the body's render z
 /// (and its previous, since z is not interpolated) to that plane's base. When
@@ -333,6 +348,13 @@ test "dig controller punches a see-through hole in the faced cell" {
     try std.testing.expectEqual(@as(u16, 3), changed.y);
     try std.testing.expectEqual(invalid_tile_id, changed.new_tile_id);
     try std.testing.expect(!changed.new_blocks_movement);
+
+    const stimuli = frame.stimuli.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), stimuli.len);
+    try std.testing.expectEqual(StimulusKind.dig, stimuli[0].kind);
+    try std.testing.expectEqual(@as(u16, 0), stimuli[0].level);
+    try std.testing.expectEqual(@as(f32, 4.5) * tw.world.tile_size, stimuli[0].position.x);
+    try std.testing.expectEqual(@as(f32, 3.5) * tw.world.tile_size, stimuli[0].position.y);
 }
 
 test "dig controller mines a walkable tunnel floor underground instead of a hole" {
@@ -360,6 +382,10 @@ test "dig controller mines a walkable tunnel floor underground instead of a hole
     try std.testing.expectEqual(@as(u16, 1), changed.level);
     try std.testing.expect(changed.old_blocks_movement);
     try std.testing.expect(!changed.new_blocks_movement);
+
+    const stimuli = frame.stimuli.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), stimuli.len);
+    try std.testing.expectEqual(@as(u16, 1), stimuli[0].level);
 }
 
 test "dig controller down punches a drop hole through the faced cell underground" {
@@ -383,6 +409,10 @@ test "dig controller down punches a drop hole through the faced cell underground
     };
     try std.testing.expect(changed.old_blocks_movement);
     try std.testing.expect(!changed.new_blocks_movement);
+
+    const stimuli = frame.stimuli.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), stimuli.len);
+    try std.testing.expectEqual(@as(u16, 1), stimuli[0].level);
 }
 
 test "dig controller down is a no-op on the bottom plane" {
@@ -394,6 +424,7 @@ test "dig controller down is a no-op on the bottom plane" {
     defer frame.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
     // The bottom floor cell stays solid: there is nothing below to fall into.
     const floor = tw.world.denseFloorLayerForLevel(2).?;
     try std.testing.expect(tw.world.denseTileBlocksMovement(floor, 4, 3));
@@ -419,10 +450,15 @@ test "dig controller carves a ramp tile and one bidirectional link below the sur
     try std.testing.expectEqual(@as(u16, 4), links[0].cell_a.x);
     try std.testing.expectEqual(@as(u16, 3), links[0].cell_a.y);
 
-    // Re-digging the same cell does not add a second link.
+    const stimuli = frame.stimuli.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), stimuli.len);
+    try std.testing.expectEqual(@as(u16, 1), stimuli[0].level);
+
+    // Re-digging the same cell does not add a second link or a second stimulus.
     var frame2 = try runDig(&tw, dig, .ramp);
     defer frame2.deinit();
     try std.testing.expectEqual(@as(usize, 1), tw.world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 0), frame2.stimuli.mergedItems().len);
 }
 
 test "dig controller ramp is a no-op on the surface" {
@@ -435,6 +471,7 @@ test "dig controller ramp is a no-op on the surface" {
 
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
 }
 
 test "dig controller is a no-op for none intent or an off-world target" {
@@ -449,10 +486,12 @@ test "dig controller is a no-op for none intent or an off-world target" {
     var none_frame = try runDig(&tw, dig, .none);
     defer none_frame.deinit();
     try std.testing.expectEqual(@as(usize, 0), none_frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), none_frame.stimuli.mergedItems().len);
 
     var off_frame = try runDig(&tw, dig, .hole);
     defer off_frame.deinit();
     try std.testing.expectEqual(@as(usize, 0), off_frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), off_frame.stimuli.mergedItems().len);
 }
 
 test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell before it falls" {
@@ -495,6 +534,9 @@ test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell befo
     try std.testing.expectEqual(@as(f32, 3 * 32), body.position.y);
 
     try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+    // Falling carves the landing cell via carveLandingCell, not process(), so it
+    // emits no stimulus (see carveLandingCell's doc comment).
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
 }
 
 test "dig controller captures intent once on the rising edge of a held key" {

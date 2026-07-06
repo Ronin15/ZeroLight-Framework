@@ -97,6 +97,7 @@ const WorldSystem = @import("../world_system.zig").WorldSystem;
 const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
+const WorldStimulus = @import("../simulation.zig").WorldStimulus;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
@@ -149,6 +150,9 @@ pub const PerceptionConfig = struct {
     /// Optional player entity, resolved by the caller once per step (null if
     /// no player entity exists yet).
     player_candidate: ?PlayerPerceptionCandidate = null,
+    /// This step's merged world stimuli (`frame.stimuli.mergedItems()`), read
+    /// by the hearing pass folded into `computeOneAgent`.
+    stimuli: []const WorldStimulus = &.{},
     /// Deterministic per-step cap on emitted perception events, enforced by
     /// this system itself (see the module doc's threaded-writes note and
     /// `mergePerceptionEvents`) rather than letting `SimulationEvents`'s own
@@ -225,6 +229,7 @@ const PerceptionGatherRow = struct {
     velocity_y: f32,
     vision_range: f32,
     cos_half_fov: f32,
+    hearing_range: f32,
     faction: Faction,
     level: u16,
     // Row index in the FULL scoped population walk (same order as
@@ -504,7 +509,7 @@ pub const PerceptionSystem = struct {
         try self.prepareEventRangeBuffers(selection.range_count, selection.items_per_range, observer_count);
         try self.prepareRangeStats(selection.range_count);
 
-        var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, selection.range_count);
+        var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, selection.range_count);
         const batch = thread_system.parallelForWithOptions(observer_count, &job, writePerceptionRangeJob, .{
             .max_worker_threads = selection.worker_threads,
             .range_alignment_items = perception_range_alignment_items,
@@ -552,7 +557,7 @@ pub const PerceptionSystem = struct {
         try self.prepareEventRangeBuffers(range_count, observer_count, observer_count);
         try self.prepareRangeStats(range_count);
 
-        var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, range_count);
+        var job = self.buildJobContext(perception_slice, spatial, world, config.player_candidate, config.stimuli, range_count);
         computePerceptionRange(&job, .{ .index = 0, .start = 0, .end = observer_count });
 
         const merge = try self.mergePerceptionEvents(events, range_count, config.max_events_per_step);
@@ -577,6 +582,7 @@ pub const PerceptionSystem = struct {
         spatial: SpatialIndexView,
         world: *const WorldSystem,
         player_candidate: ?PlayerPerceptionCandidate,
+        stimuli: []const WorldStimulus,
         range_count: usize,
     ) PerceptionJobContext {
         const candidate_slice = self.candidates.slice();
@@ -587,6 +593,8 @@ pub const PerceptionSystem = struct {
             .pos_y = rows.items(.pos_y),
             .vision_range = rows.items(.vision_range),
             .cos_half_fov = rows.items(.cos_half_fov),
+            .hearing_range = rows.items(.hearing_range),
+            .stimuli = stimuli,
             .faction = rows.items(.faction),
             .level = rows.items(.level),
             .spatial_self_index = rows.items(.spatial_self_index),
@@ -822,6 +830,7 @@ pub const PerceptionSystem = struct {
                     .velocity_y = movement.velocity_y[mi],
                     .vision_range = perception_slice.vision_range[perception_index],
                     .cos_half_fov = perception_slice.cos_half_fov[perception_index],
+                    .hearing_range = perception_slice.hearing_range[perception_index],
                     .faction = ent_faction,
                     .level = ent_level,
                     .spatial_self_index = spatial_row_index,
@@ -1100,6 +1109,8 @@ const PerceptionJobContext = struct {
     pos_y: []const f32,
     vision_range: []const f32,
     cos_half_fov: []const f32,
+    hearing_range: []const f32,
+    stimuli: []const WorldStimulus,
     faction: []const Faction,
     level: []const u16,
     spatial_self_index: []const usize,
@@ -1386,6 +1397,26 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     }
     // last_seen_x/y are deliberately left unchanged when target_visible is
     // false, holding the last real sighting for a future memory slice.
+
+    const hearing_range = job.hearing_range[i];
+    const hearing_range_sq = hearing_range * hearing_range;
+    var heard_stimulus = false;
+    var heard_x: f32 = 0;
+    var heard_y: f32 = 0;
+    var best_dist2 = std.math.inf(f32);
+    for (job.stimuli) |stim| {
+        if (stim.level != observer_level) continue;
+        const dist2 = math.lengthSquared(.{ .x = stim.position.x - ox, .y = stim.position.y - oy });
+        if (dist2 <= hearing_range_sq and dist2 < best_dist2) {
+            heard_stimulus = true;
+            best_dist2 = dist2;
+            heard_x = stim.position.x;
+            heard_y = stim.position.y;
+        }
+    }
+    job.perception_slice.heard_stimulus[dense_index] = heard_stimulus;
+    job.perception_slice.heard_stimulus_x[dense_index] = heard_x;
+    job.perception_slice.heard_stimulus_y[dense_index] = heard_y;
 
     job.final_nearest_threat_index[i] = @bitCast(nearest_threat.index);
     job.final_nearest_threat_generation[i] = @bitCast(nearest_threat.generation);
@@ -1809,6 +1840,95 @@ test "same-level gating skips cross-level candidates even when closest" {
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(far_same_level.index, perception.nearest_threat.index);
+}
+
+test "hearing detects an in-range same-level stimulus" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(!perception.target_visible);
+    try testing.expect(perception.heard_stimulus);
+    try testing.expectEqual(@as(f32, 30), perception.heard_stimulus_x);
+    try testing.expectEqual(@as(f32, 0), perception.heard_stimulus_y);
+}
+
+test "hearing ignores an out-of-range stimulus" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 100, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
+test "hearing ignores a stimulus on a different level" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 1, .kind = .dig, .level = 1 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
+test "hearing picks the nearest of multiple in-range stimuli" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{
+        .{ .position = .{ .x = 40, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 },
+        .{ .position = .{ .x = 20, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 },
+    };
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(perception.heard_stimulus);
+    try testing.expectEqual(@as(f32, 20), perception.heard_stimulus_x);
 }
 
 test "LOS gating skips a blocked nearer candidate in favor of a farther clear one" {
@@ -2433,8 +2553,8 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     }
     for (0..40) |i| {
         const fi: f32 = @floatFromInt(i);
-        _ = try addObserver(&serial_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100 });
-        _ = try addObserver(&threaded_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100 });
+        _ = try addObserver(&serial_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
+        _ = try addObserver(&threaded_data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
     var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
@@ -2445,11 +2565,14 @@ test "serial and threaded PerceptionSystem updates route through identical math"
     var world = try minimalWorld(testing.allocator, 512, 64, 32);
     defer world.deinit();
 
+    // Only the observer near x=63 (i=10) is within hearing_range=5 of this stimulus.
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 63, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 }};
+
     var serial_sys = PerceptionSystem.init(testing.allocator);
     defer serial_sys.deinit();
     var serial_events = SimulationEvents.init(testing.allocator);
     defer serial_events.deinit();
-    _ = try serial_sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &world, &serial_data, &serial_events, .{});
+    _ = try serial_sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &world, &serial_data, &serial_events, .{ .stimuli = &stimuli });
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = perception_range_alignment_items });
     defer threads.deinit();
@@ -2463,11 +2586,13 @@ test "serial and threaded PerceptionSystem updates route through identical math"
         .items_per_range = perception_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
+        .stimuli = &stimuli,
     });
 
     const serial_ai = serial_data.aiAgentSliceConst();
     const threaded_ai = threaded_data.aiAgentSliceConst();
     try testing.expectEqual(serial_ai.entities.len, threaded_ai.entities.len);
+    var any_heard = false;
     for (serial_ai.entities, threaded_ai.entities) |serial_entity, threaded_entity| {
         const serial_perception = serial_data.aiPerceptionConst(serial_entity) orelse continue;
         const threaded_perception = threaded_data.aiPerceptionConst(threaded_entity) orelse continue;
@@ -2475,7 +2600,12 @@ test "serial and threaded PerceptionSystem updates route through identical math"
         try testing.expectEqual(serial_perception.nearest_threat.index, threaded_perception.nearest_threat.index);
         try testing.expectEqual(serial_perception.facing_x, threaded_perception.facing_x);
         try testing.expectEqual(serial_perception.facing_y, threaded_perception.facing_y);
+        try testing.expectEqual(serial_perception.heard_stimulus, threaded_perception.heard_stimulus);
+        try testing.expectEqual(serial_perception.heard_stimulus_x, threaded_perception.heard_stimulus_x);
+        try testing.expectEqual(serial_perception.heard_stimulus_y, threaded_perception.heard_stimulus_y);
+        if (serial_perception.heard_stimulus) any_heard = true;
     }
+    try testing.expect(any_heard);
 
     const serial_merged = serial_events.mergedItems();
     const threaded_merged = threaded_events.mergedItems();
@@ -2485,7 +2615,7 @@ test "serial and threaded PerceptionSystem updates route through identical math"
 test "PerceptionSystem has no steady-state allocation after warmup (FailingAllocator)" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    _ = try addObserver(&data, 0, 0, 10, 0, .player, .{});
+    _ = try addObserver(&data, 0, 0, 10, 0, .player, .{ .hearing_range = 50 });
     _ = try addAgent(&data, 10, 0, 0, 0, .hostile);
 
     var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
@@ -2498,10 +2628,12 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 20, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
+
     // Warm up: one full serial run sizes every scratch buffer (candidates,
     // rows, event range scratch, range_take_counts, and the per-level
     // LOS-blocked bitmap cache) to steady state.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
     try testing.expect(sys.level_blocked.items.len > 0);
     try testing.expect(sys.level_blocked.items[0].valid);
 
@@ -2520,9 +2652,11 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
     // reactToPostCommitPerceptionEvents between the two runs), so it takes
     // the skip branch rather than rebuilding — proving that path allocates
     // nothing either. The dedicated patch-path FailingAllocator test below
-    // covers the case where a dirty rect actually is pending.
-    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+    // covers the case where a dirty rect actually is pending. `job.stimuli` is
+    // a borrowed slice, never copied, so passing it here adds no allocation.
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
     try testing.expectEqual(@as(usize, 1), stats.observer_count);
+    try testing.expect(data.aiPerceptionConst(data.aiAgentSliceConst().entities[0]).?.heard_stimulus);
 }
 
 test "PerceptionSystem threaded update has no steady-state allocation after warmup, multi-range (FailingAllocator)" {
@@ -2541,7 +2675,7 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     }
     for (0..40) |i| {
         const fi: f32 = @floatFromInt(i);
-        _ = try addObserver(&data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100 });
+        _ = try addObserver(&data, fi * 6 + 3, 4, 1, 1, .player, .{ .fov_half_angle_radians = std.math.pi / 2.0, .vision_range = 100, .hearing_range = 5 });
     }
 
     var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
@@ -2558,10 +2692,12 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 63, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 }};
     const config = PerceptionConfig{
         .items_per_range = perception_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
+        .stimuli = &stimuli,
     };
 
     // Warm up: one full threaded run sizes every scratch buffer (candidates,

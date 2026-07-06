@@ -466,6 +466,7 @@ pub const SimulationPipeline = struct {
         const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
             .scope_dense_indices = ai_indices,
             .player_candidate = perception_player_candidate,
+            .stimuli = frame.stimuli.mergedItems(),
         });
         perception_timer.stop(context.perf, .pipeline_perception);
 

@@ -396,6 +396,7 @@ pub const AiPerception = struct {
     vision_range: f32 = 240.0,
     fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
     cos_half_fov: f32 = default_ai_perception_cos_half_fov,
+    hearing_range: f32 = 200.0,
     target_visible: bool = false,
     last_seen_x: f32 = 0,
     last_seen_y: f32 = 0,
@@ -403,10 +404,16 @@ pub const AiPerception = struct {
     nearest_threat_dist: f32 = std.math.inf(f32),
     facing_x: f32 = 1.0,
     facing_y: f32 = 0.0,
+    // Recomputed every step; unlike last_seen_x/y, holds no memory of a prior hit.
+    heard_stimulus: bool = false,
+    heard_stimulus_x: f32 = 0,
+    heard_stimulus_y: f32 = 0,
 };
 
 // Keeps LOS raycast step counts small by construction.
 pub const max_ai_perception_vision_range: f32 = 512.0;
+// No per-sample raycast cost to bound; this only rejects pathological config.
+pub const max_ai_perception_hearing_range: f32 = 1024.0;
 
 pub const AiPerceptionCommand = struct {
     entity: EntityId,
@@ -418,6 +425,7 @@ pub const ConstPerceptionSlice = struct {
     vision_range: ConstHotF32Slice,
     fov_half_angle_radians: ConstHotF32Slice,
     cos_half_fov: ConstHotF32Slice,
+    hearing_range: ConstHotF32Slice,
     target_visible: []const bool,
     last_seen_x: ConstHotF32Slice,
     last_seen_y: ConstHotF32Slice,
@@ -425,17 +433,22 @@ pub const ConstPerceptionSlice = struct {
     nearest_threat_dist: ConstHotF32Slice,
     facing_x: ConstHotF32Slice,
     facing_y: ConstHotF32Slice,
+    heard_stimulus: []const bool,
+    heard_stimulus_x: ConstHotF32Slice,
+    heard_stimulus_y: ConstHotF32Slice,
 };
 
 /// Mutable view exposes only the hot output columns PerceptionSystem writes
 /// every step (target_visible, last_seen_x/y, nearest_threat,
-/// nearest_threat_dist, facing_x/y). Cold tunables stay const here — they
-/// change only through DataSystem.setAiPerception, mirroring ScopeColumnsSlice.
+/// nearest_threat_dist, facing_x/y, heard_stimulus, heard_stimulus_x/y). Cold
+/// tunables stay const here — they change only through
+/// DataSystem.setAiPerception, mirroring ScopeColumnsSlice.
 pub const PerceptionSlice = struct {
     entities: []const EntityId,
     vision_range: ConstHotF32Slice,
     fov_half_angle_radians: ConstHotF32Slice,
     cos_half_fov: ConstHotF32Slice,
+    hearing_range: ConstHotF32Slice,
     target_visible: []bool,
     last_seen_x: HotF32Slice,
     last_seen_y: HotF32Slice,
@@ -443,6 +456,9 @@ pub const PerceptionSlice = struct {
     nearest_threat_dist: HotF32Slice,
     facing_x: HotF32Slice,
     facing_y: HotF32Slice,
+    heard_stimulus: []bool,
+    heard_stimulus_x: HotF32Slice,
+    heard_stimulus_y: HotF32Slice,
 };
 
 pub const WorldLevelCommand = struct {
