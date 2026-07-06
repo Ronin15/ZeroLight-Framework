@@ -21,6 +21,7 @@ const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
+const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
 
 pub const SimulationPhase = enum {
     idle,
@@ -89,6 +90,12 @@ pub const EntityLostEvent = struct {
     target: EntityId,
 };
 
+pub const AffectThresholdCrossedEvent = struct {
+    entity: EntityId,
+    drive: AiAffectDrive,
+    rising: bool,
+};
+
 pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
     entity_destroyed: EntityDestroyedEvent,
@@ -98,6 +105,7 @@ pub const SimulationEventPayload = union(enum) {
     nav_region_invalidated: NavRegionInvalidatedEvent,
     entity_perceived: EntityPerceivedEvent,
     entity_lost: EntityLostEvent,
+    affect_threshold_crossed: AffectThresholdCrossedEvent,
 };
 
 pub const SimulationEvent = struct {
@@ -116,6 +124,7 @@ pub const SimulationEventStats = struct {
     nav_region_invalidated: usize = 0,
     entity_perceived: usize = 0,
     entity_lost: usize = 0,
+    affect_threshold_crossed: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
 
@@ -134,6 +143,7 @@ pub const SimulationEventStats = struct {
             .nav_region_invalidated => self.nav_region_invalidated += 1,
             .entity_perceived => self.entity_perceived += 1,
             .entity_lost => self.entity_lost += 1,
+            .affect_threshold_crossed => self.affect_threshold_crossed += 1,
         }
     }
 
@@ -147,6 +157,7 @@ pub const SimulationEventStats = struct {
         self.nav_region_invalidated += produced.nav_region_invalidated;
         self.entity_perceived += produced.entity_perceived;
         self.entity_lost += produced.entity_lost;
+        self.affect_threshold_crossed += produced.affect_threshold_crossed;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
@@ -162,6 +173,7 @@ pub const SimulationEventStats = struct {
         perf.recordMetric(.simulation_events_nav_region_invalidated, metric(self.nav_region_invalidated));
         perf.recordMetric(.simulation_events_entity_perceived, metric(self.entity_perceived));
         perf.recordMetric(.simulation_events_entity_lost, metric(self.entity_lost));
+        perf.recordMetric(.simulation_events_affect_threshold_crossed, metric(self.affect_threshold_crossed));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
     }

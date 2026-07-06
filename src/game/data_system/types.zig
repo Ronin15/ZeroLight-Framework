@@ -67,6 +67,7 @@ pub const Component = enum(u5) {
     faction,
     ai_perception,
     ai_memory,
+    ai_affect,
 };
 
 pub const ComponentMask = u32;
@@ -84,6 +85,7 @@ pub const component_masks = struct {
     pub const faction = componentMask(.faction);
     pub const ai_perception = componentMask(.ai_perception);
     pub const ai_memory = componentMask(.ai_memory);
+    pub const ai_affect = componentMask(.ai_affect);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -527,6 +529,99 @@ pub const AiMemorySlice = struct {
     ring_next_slot: []u8,
 };
 
+/// One appraisal drive an `AiAffect` row tracks. A future arbitration slice
+/// switches behavior selection on this; this slice only appraises and
+/// decays the four drives.
+pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
+
+/// Rising/falling-edge threshold-crossing band: a drive must fall below
+/// `threshold - ai_affect_threshold_hysteresis` before a later rise back past
+/// `threshold` counts as a new rising edge, so a value hovering at `threshold`
+/// does not flap. The only global affect tunable — baselines, decay rates,
+/// and thresholds themselves are all per-entity (see `AiAffect`).
+pub const ai_affect_threshold_hysteresis: f32 = 0.05;
+
+/// Emotion-drive appraisal state: four independent drives (fear, curiosity,
+/// aggression, fatigue), each with its own per-entity resting baseline, decay
+/// speed, and rising-edge threshold. Cold fields (baseline_*, decay_rate_*,
+/// threshold_*) are author-set tunables preserved across a retune, mirroring
+/// `AiPerception`'s cold/hot split — `AiAffectStore.set` touches only these.
+/// Hot fields (fear/curiosity/aggression/fatigue) are `AffectSystem`'s live
+/// per-step appraisal output, each clamped to `[0, 1]`.
+///
+/// `decay_rate_*` and `threshold_*` are deliberately per-entity, not a single
+/// global constant: a future data-driven archetype needs per-personality decay
+/// speed and sensitivity, not just a per-personality resting level.
+pub const AiAffect = struct {
+    baseline_fear: f32 = 0,
+    baseline_curiosity: f32 = 0,
+    baseline_aggression: f32 = 0,
+    baseline_fatigue: f32 = 0,
+    decay_rate_fear: f32 = default_ai_affect_decay_rate,
+    decay_rate_curiosity: f32 = default_ai_affect_decay_rate,
+    decay_rate_aggression: f32 = default_ai_affect_decay_rate,
+    decay_rate_fatigue: f32 = default_ai_affect_decay_rate,
+    threshold_fear: f32 = default_ai_affect_threshold,
+    threshold_curiosity: f32 = default_ai_affect_threshold,
+    threshold_aggression: f32 = default_ai_affect_threshold,
+    threshold_fatigue: f32 = default_ai_affect_threshold,
+    fear: f32 = 0,
+    curiosity: f32 = 0,
+    aggression: f32 = 0,
+    fatigue: f32 = 0,
+};
+
+const default_ai_affect_decay_rate: f32 = 0.05;
+const default_ai_affect_threshold: f32 = 0.6;
+
+pub const AiAffectCommand = struct {
+    entity: EntityId,
+    affect: AiAffect,
+};
+
+pub const ConstAiAffectSlice = struct {
+    entities: []const EntityId,
+    baseline_fear: ConstHotF32Slice,
+    baseline_curiosity: ConstHotF32Slice,
+    baseline_aggression: ConstHotF32Slice,
+    baseline_fatigue: ConstHotF32Slice,
+    decay_rate_fear: ConstHotF32Slice,
+    decay_rate_curiosity: ConstHotF32Slice,
+    decay_rate_aggression: ConstHotF32Slice,
+    decay_rate_fatigue: ConstHotF32Slice,
+    threshold_fear: ConstHotF32Slice,
+    threshold_curiosity: ConstHotF32Slice,
+    threshold_aggression: ConstHotF32Slice,
+    threshold_fatigue: ConstHotF32Slice,
+    fear: ConstHotF32Slice,
+    curiosity: ConstHotF32Slice,
+    aggression: ConstHotF32Slice,
+    fatigue: ConstHotF32Slice,
+};
+
+/// Mutable view for `AffectSystem`'s per-step appraisal writes. Cold tunables
+/// stay const here — they change only through `DataSystem.setAiAffect`,
+/// mirroring `PerceptionSlice`.
+pub const AiAffectSlice = struct {
+    entities: []const EntityId,
+    baseline_fear: ConstHotF32Slice,
+    baseline_curiosity: ConstHotF32Slice,
+    baseline_aggression: ConstHotF32Slice,
+    baseline_fatigue: ConstHotF32Slice,
+    decay_rate_fear: ConstHotF32Slice,
+    decay_rate_curiosity: ConstHotF32Slice,
+    decay_rate_aggression: ConstHotF32Slice,
+    decay_rate_fatigue: ConstHotF32Slice,
+    threshold_fear: ConstHotF32Slice,
+    threshold_curiosity: ConstHotF32Slice,
+    threshold_aggression: ConstHotF32Slice,
+    threshold_fatigue: ConstHotF32Slice,
+    fear: HotF32Slice,
+    curiosity: HotF32Slice,
+    aggression: HotF32Slice,
+    fatigue: HotF32Slice,
+};
+
 pub const WorldLevelCommand = struct {
     entity: EntityId,
     level: u16,
@@ -552,6 +647,7 @@ pub const EntityTemplate = struct {
     faction: ?Faction = null,
     ai_perception: ?AiPerception = null,
     ai_memory: ?AiMemory = null,
+    ai_affect: ?AiAffect = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -603,6 +699,7 @@ pub const StructuralCommand = union(enum) {
     set_faction: FactionCommand,
     set_ai_perception: AiPerceptionCommand,
     set_ai_memory: AiMemoryCommand,
+    set_ai_affect: AiAffectCommand,
 };
 
 pub const StructuralCommitStats = struct {

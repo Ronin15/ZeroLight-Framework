@@ -28,6 +28,8 @@ const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
 const AiMemoryStats = @import("systems/ai_memory.zig").AiMemoryStats;
 const AiMemorySystem = @import("systems/ai_memory.zig").AiMemorySystem;
+const AffectStats = @import("systems/affect.zig").AffectStats;
+const AffectSystem = @import("systems/affect.zig").AffectSystem;
 const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
@@ -75,6 +77,11 @@ pub const SimulationPipelineConfig = struct {
     /// own event-capacity budget, same as `contact_capacity`/
     /// `static_obstacle_capacity`; defaults to 0.
     perception_max_events_per_step: usize = 0,
+    /// This state's reserved share of `frame.events`'s `capacity_limit`,
+    /// passed through as `AffectConfig.max_events_per_step`. Sized by the
+    /// caller against its own event-capacity budget, same as
+    /// `perception_max_events_per_step`; defaults to 0.
+    affect_max_events_per_step: usize = 0,
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -103,6 +110,7 @@ pub const SimulationPipelineStats = struct {
     spatial_index: SpatialIndexStats = .{},
     perception: PerceptionStats = .{},
     ai_memory: AiMemoryStats = .{},
+    affect: AffectStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
@@ -230,11 +238,19 @@ pub const SimulationPipeline = struct {
     /// this step's perception acquisition events, feeding `AiSystem`'s
     /// memory-aware cold-seek retarget.
     ai_memory: AiMemorySystem,
+    /// Emotion-drive appraisal (fear/curiosity/aggression/fatigue): appraises
+    /// this step's just-refreshed `AiPerception`/`AiMemory` state (both
+    /// optional per row) plus each agent's own `AiAgent.behavior` into the
+    /// cognition-scoped `AiAffect` subset. A future arbitration slice reads
+    /// the resulting drives; this stage only appraises and decays them.
+    affect: AffectSystem,
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
     /// See `SimulationPipelineConfig.perception_max_events_per_step`.
     perception_max_events_per_step: usize,
+    /// See `SimulationPipelineConfig.affect_max_events_per_step`.
+    affect_max_events_per_step: usize,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -273,6 +289,10 @@ pub const SimulationPipeline = struct {
         // gather buffer on first use, same as PerceptionSystem/AiSystem.
         var ai_memory = AiMemorySystem.init(allocator);
         errdefer ai_memory.deinit();
+        // No reserve method: AffectSystem lazily ensureTotalCapacity's its
+        // gather buffer on first use, same as AiMemorySystem/PerceptionSystem.
+        var affect = AffectSystem.init(allocator);
+        errdefer affect.deinit();
 
         return .{
             .movement = MovementSystem.init(),
@@ -285,16 +305,19 @@ pub const SimulationPipeline = struct {
             .spatial_index = spatial_index,
             .perception = perception,
             .ai_memory = ai_memory,
+            .affect = affect,
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
             .perception_max_events_per_step = config.perception_max_events_per_step,
+            .affect_max_events_per_step = config.affect_max_events_per_step,
         };
     }
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.affect.deinit();
         self.ai_memory.deinit();
         self.perception.deinit();
         self.spatial_index.deinit();
@@ -505,6 +528,19 @@ pub const SimulationPipeline = struct {
         });
         ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
 
+        // Appraises this step's just-written perception + memory state into
+        // fear/curiosity/aggression/fatigue, over the same cognition-scoped
+        // `ai_indices` population. Must run after both perception and
+        // ai_memory (it reads their this-step hot columns) and before
+        // AI/arbitration would read the resulting drives -- arbitration does
+        // not exist yet, this is a forward seam only, not implemented here.
+        var affect_timer = StageTimer.start();
+        const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
+            .scope_dense_indices = ai_indices,
+            .max_events_per_step = self.affect_max_events_per_step,
+        });
+        affect_timer.stop(context.perf, .pipeline_ai_affect);
+
         // The player's plane is deliberately NOT propagated into the AI goal level:
         // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
         // Seeding the player's underground plane here would make them request
@@ -628,6 +664,7 @@ pub const SimulationPipeline = struct {
             .spatial_index = spatial_index_stats,
             .perception = perception_stats,
             .ai_memory = ai_memory_stats,
+            .affect = affect_stats,
             .ai = ai_stats,
             .steering = steering_stats,
             .pathfinding = pathfinding_stats,
@@ -1042,6 +1079,88 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     try std.testing.expectEqual(@as(usize, 1), intents.len);
     try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
     try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
+}
+
+test "pipeline runs affect after perception and ai_memory, before ai" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    // A close hostile puts this step's real PerceptionSystem pass into
+    // target_visible=true with a small nearest_threat_dist, so affect's
+    // fear/aggression must observe *this step's* freshly written perception
+    // state (not a stale previous-step value) to move off baseline.
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(observer, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiAffect(observer, .{ .decay_rate_fear = 0.5, .decay_rate_aggression = 0.5 });
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
+    // observer as fail-closed (blocked), never reporting a target visible.
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Both perception and affect ran this step over the observer (the only
+    // entity carrying AiAffect); both agents (observer + hostile) reach AI.
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.affect.processed_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.ai.entity_count);
+
+    // Affect observed this step's perception output (hostile visible, close),
+    // proving it ran after perception -- a stale/previous-step read would
+    // have left fear/aggression at their zero default.
+    const affect_after = data.aiAffectConst(observer).?;
+    try std.testing.expect(affect_after.fear > 0);
+    try std.testing.expect(affect_after.aggression > 0);
 }
 
 const AssetStore = @import("../assets/assets.zig").AssetStore;

@@ -79,7 +79,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
 | **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed, LOS diagonal-tunneling correctness fix, caller-sized event budget (see slice section) |
 | **30** | Landed | AI memory (component/system, cold-seek retarget, scope freeze/resync) — `memory_expired` event deferred |
-| **31–33** | Not started | Affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
+| **31** | Landed | AI Affect And Emotion Drives (component/system, threshold events) — arbitration consumption deferred to Slice 32 |
+| **32–33** | Not started | Behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
 
@@ -2333,24 +2334,63 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add an `AiAffect` component with fixed scalar drive columns plus per-entity
+- [x] Add an `AiAffect` component with fixed scalar drive columns plus per-entity
       baselines, SIMD-aligned.
-- [ ] Add an `AffectSystem` parallel/SIMD stage that appraises perception +
+- [x] Add an `AffectSystem` parallel/SIMD stage that appraises perception +
       memory into drive deltas, applies them, and decays each drive toward its
       baseline; bounded, allocation-free, deterministic.
 - [ ] Expose drives to behavior arbitration (Slice 32) as weight modulators
       (fear → flee weight + speed, curiosity → investigate weight, fatigue → max
-      speed).
-- [ ] Add scalar-only `affect_threshold_crossed { entity, drive, rising }` events
+      speed). Deferred to Slice 32 itself — `AiConfig`/`decideDir()` do not yet
+      read any affect drive.
+- [x] Add scalar-only `affect_threshold_crossed { entity, drive, rising }` events
       for threshold crossings (panic onset/calm) at `domain_reaction`.
 
 Acceptance checks:
 
-- [ ] Scalar and SIMD affect updates produce identical results (parity test).
-- [ ] Drives stay bounded and decay to baseline with no inputs; updates are
+- [x] Scalar and SIMD affect updates produce identical results (parity test).
+- [x] Drives stay bounded and decay to baseline with no inputs; updates are
       allocation-free.
-- [ ] Threshold events are low-volume by construction and capacity-bounded.
-- [ ] `zig build test` covers appraisal, decay-to-baseline, and threshold events.
+- [x] Threshold events are low-volume by construction and capacity-bounded.
+- [x] `zig build test` covers appraisal, decay-to-baseline, and threshold events.
+
+**Status: landed** (arbitration consumption deferred to Slice 32, see
+Checklist). `AiAffect` (`data_system/types.zig`) carries four independent
+drives (`fear`, `curiosity`, `aggression`, `fatigue`), each with its own
+per-entity cold `baseline_*`/`decay_rate_*`/`threshold_*` tunables plus a hot
+per-step value clamped to `[0, 1]`; `decay_rate_*`/`threshold_*` are
+deliberately per-entity, not a single global constant, since a future
+data-driven archetype (Slice 33) needs per-personality decay speed and
+sensitivity, not just a per-personality resting level — the only global
+tunable is `ai_affect_threshold_hysteresis`. `AiAffectStore`
+(`data_system/affect.zig`) mirrors `PerceptionStore`'s cold-preserves-hot
+`set()` contract exactly. `AffectSystem` (`systems/affect.zig`) runs in
+`SimulationPipeline` between `AiMemorySystem` and `AiSystem`: it appraises the
+cognition-scoped `AiAffect` subset from this step's just-written
+`AiPerception`/`AiMemory` state (both independently optional per row — a
+missing component contributes "no signal," never excludes the row) plus each
+row's own `AiAgent.behavior` (fatigue's input, since active pursuit vs.
+wandering is not a perception/memory signal). Fear and aggression share the
+same visible-hostile/distance signal but use independent gain constants and
+are deliberately never cross-coupled; curiosity rises from an unseen heard
+stimulus and separately from low memory familiarity; cross-drive modulation of
+any kind is left to the future arbitration slice. The compute pass vectorizes
+across four scattered rows per lane group, one drive-column pass at a time
+(the same shape `AiMemorySystem.processDecayRange` uses for its own
+staleness/familiarity columns), gathering each row's own baseline/decay
+rate/threshold via `simd.gatherFloat4` — never a splatted global constant —
+after a branchy gather stage packs perception/memory presence into a
+contiguous per-row scratch table (mirrors `PerceptionGatherRow`). A
+rising/falling threshold-crossing check runs scalarly per lane afterward,
+with a hysteresis band (`ai_affect_threshold_hysteresis`) that provably
+prevents a value hovering at `threshold` from flapping. Event emission
+(range-owned scratch, deterministic capped merge) mirrors
+`PerceptionSystem.mergePerceptionEvents`, except up to four events can fire
+per row per step (one per independent drive). A dedicated `ai-affect` bench
+group (`src/benchmarks/affect.zig`) measures appraisal throughput with a
+mixed population (every 4th agent also carrying `AiPerception`/`AiMemory`).
+Measured (`--profile quick`, 10,000 agents): serial-direct 2.09ms,
+best-threaded (thread-large-range) 1.44ms (1.45x).
 
 ## Slice 32: AI Behavior Arbitration
 

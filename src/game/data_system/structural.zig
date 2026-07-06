@@ -28,6 +28,7 @@ const validateAiAgent = @import("agents.zig").validateAiAgent;
 const validateSteeringAgent = @import("agents.zig").validateSteeringAgent;
 const validateAiPerception = @import("perception.zig").validateAiPerception;
 const validateAiMemory = @import("memory.zig").validateAiMemory;
+const validateAiAffect = @import("affect.zig").validateAiAffect;
 
 pub const NullStructuralChangeSink = struct {
     fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
@@ -53,6 +54,7 @@ const StructuralCapacityNeeds = struct {
     factions: usize,
     ai_perceptions: usize,
     ai_memories: usize,
+    ai_affects: usize,
 
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
@@ -69,6 +71,7 @@ const StructuralCapacityNeeds = struct {
             .factions = data.factions.len(),
             .ai_perceptions = data.ai_perceptions.len(),
             .ai_memories = data.ai_memories.len(),
+            .ai_affects = data.ai_affects.len(),
         };
     }
 
@@ -86,6 +89,7 @@ const StructuralCapacityNeeds = struct {
         if (self.factions > std.math.maxInt(u32)) return error.TooManyFactionRows;
         if (self.ai_perceptions > std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
         if (self.ai_memories > std.math.maxInt(u32)) return error.TooManyAiMemoryRows;
+        if (self.ai_affects > std.math.maxInt(u32)) return error.TooManyAiAffectRows;
     }
 };
 
@@ -131,6 +135,7 @@ const StructuralCapacityProjection = struct {
         if (template.faction != null) try self.addComponent(.faction);
         if (template.ai_perception != null) try self.addComponent(.ai_perception);
         if (template.ai_memory != null) try self.addComponent(.ai_memory);
+        if (template.ai_affect != null) try self.addComponent(.ai_affect);
     }
 
     fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
@@ -160,6 +165,7 @@ const StructuralCapacityProjection = struct {
             .faction => &self.current.factions,
             .ai_perception => &self.current.ai_perceptions,
             .ai_memory => &self.current.ai_memories,
+            .ai_affect => &self.current.ai_affects,
         };
     }
 
@@ -177,6 +183,7 @@ const StructuralCapacityProjection = struct {
             .faction => &self.required.factions,
             .ai_perception => &self.required.ai_perceptions,
             .ai_memory => &self.required.ai_memories,
+            .ai_affect => &self.required.ai_affects,
         };
     }
 };
@@ -286,6 +293,7 @@ fn templateComponentCount(template: EntityTemplate) usize {
     if (template.faction != null) count += 1;
     if (template.ai_perception != null) count += 1;
     if (template.ai_memory != null) count += 1;
+    if (template.ai_affect != null) count += 1;
     return count;
 }
 
@@ -480,6 +488,16 @@ pub fn commitStructuralCommands(
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .ai_memory, was_static_navigation_obstacle);
             },
+            .set_ai_affect => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setAiAffect(set.entity, set.affect);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .ai_affect, was_static_navigation_obstacle);
+            },
         }
     }
     return stats;
@@ -534,6 +552,7 @@ pub fn preflightStructuralCommands(
             .set_faction => |set| try preflightSetComponent(self, set.entity, .faction, scratch, &projection, &structural_event_count),
             .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
             .set_ai_memory => |set| try preflightSetComponent(self, set.entity, .ai_memory, scratch, &projection, &structural_event_count),
+            .set_ai_affect => |set| try preflightSetComponent(self, set.entity, .ai_affect, scratch, &projection, &structural_event_count),
             .set_simulation_tier => {},
         }
     }
@@ -579,6 +598,7 @@ fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) 
     try self.factions.ensureCapacity(self.allocator, plan.capacity_needs.factions);
     try self.ai_perceptions.ensureCapacity(self.allocator, plan.capacity_needs.ai_perceptions);
     try self.ai_memories.ensureCapacity(self.allocator, plan.capacity_needs.ai_memories);
+    try self.ai_affects.ensureCapacity(self.allocator, plan.capacity_needs.ai_affects);
 }
 
 pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -611,6 +631,9 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
                 if (template.ai_memory) |ai_memory| {
                     try validateAiMemory(ai_memory);
                 }
+                if (template.ai_affect) |ai_affect| {
+                    try validateAiAffect(ai_affect);
+                }
             },
             .set_movement_body => |set| try validateMovementBody(set.body),
             .set_primitive_visual => |set| try validatePrimitiveVisual(set.visual),
@@ -620,6 +643,7 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
             .set_steering_agent => |set| try validateSteeringAgent(set.agent),
             .set_ai_perception => |set| try validateAiPerception(set.perception),
             .set_ai_memory => |set| try validateAiMemory(set.memory),
+            .set_ai_affect => |set| try validateAiAffect(set.affect),
             else => {},
         }
     }
@@ -651,6 +675,7 @@ fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype,
     if (template.faction != null) recordComponentChange(self, change_sink, entity, .faction, was_static_navigation_obstacle);
     if (template.ai_perception != null) recordComponentChange(self, change_sink, entity, .ai_perception, was_static_navigation_obstacle);
     if (template.ai_memory != null) recordComponentChange(self, change_sink, entity, .ai_memory, was_static_navigation_obstacle);
+    if (template.ai_affect != null) recordComponentChange(self, change_sink, entity, .ai_affect, was_static_navigation_obstacle);
 }
 
 fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
@@ -712,6 +737,10 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
         try self.setAiMemory(entity, ai_memory);
         components_set += 1;
     }
+    if (template.ai_affect) |ai_affect| {
+        try self.setAiAffect(entity, ai_affect);
+        components_set += 1;
+    }
     return components_set;
 }
 
@@ -735,4 +764,15 @@ test "StructuralCapacityNeeds.validateLimits rejects an ai_memories count beyond
 
     needs.ai_memories = @as(usize, std.math.maxInt(u32)) + 1;
     try std.testing.expectError(error.TooManyAiMemoryRows, needs.validateLimits());
+}
+
+test "StructuralCapacityNeeds.validateLimits rejects an ai_affects count beyond u32" {
+    // Growing AiAffectStore to u32-max rows is impractical to exercise for
+    // real, so this proves the guard directly against the private capacity
+    // struct rather than via an actual oversized store.
+    var needs = std.mem.zeroes(StructuralCapacityNeeds);
+    try needs.validateLimits();
+
+    needs.ai_affects = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.TooManyAiAffectRows, needs.validateLimits());
 }

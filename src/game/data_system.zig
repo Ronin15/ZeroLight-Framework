@@ -84,6 +84,12 @@ pub const ai_memory_familiarity_decay_rate = @import("data_system/types.zig").ai
 pub const AiMemoryCommand = @import("data_system/types.zig").AiMemoryCommand;
 pub const ConstAiMemorySlice = @import("data_system/types.zig").ConstAiMemorySlice;
 pub const AiMemorySlice = @import("data_system/types.zig").AiMemorySlice;
+pub const AiAffectDrive = @import("data_system/types.zig").AiAffectDrive;
+pub const ai_affect_threshold_hysteresis = @import("data_system/types.zig").ai_affect_threshold_hysteresis;
+pub const AiAffect = @import("data_system/types.zig").AiAffect;
+pub const AiAffectCommand = @import("data_system/types.zig").AiAffectCommand;
+pub const ConstAiAffectSlice = @import("data_system/types.zig").ConstAiAffectSlice;
+pub const AiAffectSlice = @import("data_system/types.zig").AiAffectSlice;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
 pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").StructuralEntityDestroyedChange;
@@ -101,6 +107,7 @@ test {
     _ = @import("data_system/faction_level.zig");
     _ = @import("data_system/perception.zig");
     _ = @import("data_system/memory.zig");
+    _ = @import("data_system/affect.zig");
     _ = @import("data_system/structural.zig");
     _ = @import("data_system/system.zig");
 }

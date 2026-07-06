@@ -642,6 +642,7 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
     if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "ai-affect")) return "AI agents";
     if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
     if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
