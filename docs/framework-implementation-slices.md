@@ -83,6 +83,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **32–33** | Not started | Behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
+| **36** | Not started | Single-pass dense-layer depth compositing (fixes fill-rate overdraw from per-layer tilemap draws) — Checklist open |
 
 **Landed slice sections (18–25, 24B):** checklists complete; sections are
 acceptance history. Follow-up hardening without a new slice number lives in
@@ -2681,6 +2682,100 @@ Acceptance checks:
       reason per the coding-standards policy.
 - [ ] `zig build verify` passes.
 
+## Slice 36: Single-Pass Dense-Layer Depth Compositing
+
+Goal: replace the Slice 23B per-layer full-screen tilemap draw (one draw call +
+one full-viewport fragment-shader pass per **submitted** dense layer) with a
+single fullscreen pass whose fragment shader walks the level stack itself, so
+GPU cost scales with screen pixels once per frame, not screen pixels ×
+submitted-layer count.
+
+Problem (current envelope):
+
+- Each in-window dense layer draws as one world-space quad clipped to the
+  viewport (GPU-Driven Tilemap, `docs/rendering-assets-shaders.md`). The
+  fragment shader (`assets/shaders/tilemap.frag.glsl`) reads a storage buffer,
+  and `discard`s on out-of-bounds or an empty (`invalid_tile_id`) cell so the
+  layer below shows through.
+- `discard` disables early-fragment-test culling, so every covered pixel of
+  every submitted layer runs the full shader even when it immediately
+  discards. With a render window of N layers, steady-state cost is
+  `N × viewport_pixels` fragment invocations per frame regardless of how many
+  layers are actually opaque at any given pixel — fill-rate cost with no
+  matching visual payoff, since a pixel's visible tile comes from at most one
+  layer.
+- This slice's mitigation, landing alongside it: `game_demo_state.zig`'s
+  procedural render window default was cut from `levels_below = 31` (submits
+  all 32 authored levels, the `k_max_dense_submit_stack_cap` ceiling, every
+  frame) to `levels_below = 6` (Slice 23B's recommended 4-8 range). That is a
+  submit-count mitigation, not a fill-rate fix — it still pays
+  `7 × viewport_pixels` per frame and still discards through most of that.
+- Digging can open a stacked shaft visible through more than one hole at a
+  time, so the window can't just be a fixed 1-2 layers without a correctness
+  regression (a deep shaft would go dark past the window edge).
+
+Current foundation (landed, do not rebuild):
+
+- `DenseLayerRenderWindow` / `collectDenseSubmitLayers` /
+  `submitStaticDenseGeometry` (Slice 23B) already collect and order the
+  in-window layer set correctly; this slice changes how that set reaches the
+  GPU, not which layers are in it.
+- Per-layer GPU tile-data storage buffers (`uploadDenseLayerBuffers`) and the
+  `cycle=false` retained-buffer upload policy (Slice 23A) are unaffected —
+  compositing still reads the same per-level storage buffers.
+- `tilemap.frag.glsl` already has the per-pixel cell lookup and atlas sample;
+  this slice's shader work extends that lookup to iterate levels instead of
+  running once per bound layer.
+
+Architecture notes:
+
+- Bind every in-window layer's storage buffer to one draw (an array of
+  storage buffer bindings, or one bindless/combined buffer indexed by layer)
+  and have the fragment shader loop from the topmost in-window level downward,
+  stopping at the first non-`invalid_tile_id` cell — most pixels resolve in
+  1-2 iterations (the visible floor), not N.
+- SDL_GPU resource-binding limits (see `docs/rendering-assets-shaders.md`'s
+  shader resource set layout) bound how many storage buffers one draw can
+  bind directly; if the window size can exceed that, pack per-level tile data
+  into one combined storage buffer (layer-major layout) instead of N separate
+  bindings, indexed by a per-pixel loop counter.
+- This is a render-cost change only — no dig/nav/simulation contract changes,
+  and `WorldSystem`'s CPU-side tile data remains the source of truth.
+- Keep `DrawGroup.material = .tilemap` as one draw per frame (or a small fixed
+  number if a combined-buffer size limit forces splitting), not one per level.
+
+Checklist:
+
+- [ ] Decide combined-buffer vs. multi-binding layer storage layout against
+      the actual SDL_GPU per-stage storage-buffer binding limit; document the
+      choice beside `tilemap.frag.glsl`.
+- [ ] Extend the tilemap fragment shader to loop the in-window levels
+      per-pixel (topmost first) and stop at the first opaque cell, replacing
+      the one-`discard`-per-layer-per-draw model.
+- [ ] Update `Renderer`/`WorldSystem` GPU-side wiring to submit the composited
+      pass as one (or a small bounded number of) draw call(s) instead of one
+      per submitted dense layer; keep `submitStaticDenseGeometry`'s CPU-side
+      layer collection unchanged.
+- [ ] Re-widen `game_demo_state.zig`'s procedural render window back toward
+      the full vertical stack now that steady-state cost no longer scales
+      with submitted-layer count, once this slice lands.
+- [ ] Add a bench case (or GPU timestamp query, if available in SDL_GPU) that
+      demonstrates fragment-shader cost no longer scales linearly with
+      submitted-layer count at a fixed viewport size.
+
+Acceptance checks:
+
+- [ ] Visual parity with the current per-layer draw at every window size
+      exercised by existing `render-game-prep` bench cases (8/16/32 static
+      tilemap groups) and the Slice 23B unit tests (window caps, player-level
+      transitions, per-band inclusion, depth order).
+- [ ] Digging a multi-level shaft still reveals the correct plane through
+      every stacked hole, matching pre-slice behavior.
+- [ ] Measured fill-rate cost is flat (or near-flat) as submitted-layer count
+      grows from 1 to the `k_max_dense_submit_stack_cap` ceiling, at a fixed
+      viewport size.
+- [ ] `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -2723,6 +2818,7 @@ Acceptance checks:
 32. AI behavior arbitration.
 33. Data-driven AI archetypes and debug introspection.
 35. AI and steering hot-loop SIMD restructure.
+36. Single-pass dense-layer depth compositing.
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents

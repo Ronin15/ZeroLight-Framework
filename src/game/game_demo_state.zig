@@ -90,9 +90,17 @@ const procedural_underground_count: u16 = 31; //31
 const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
 /// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
 const procedural_max_dense_bands_per_level: u8 = 1;
+/// Dense floors below `active_level` submitted as full-screen tilemap draws each
+/// frame (Slice 23B's recommended 4-8 range). Submitting the full 31-level stack
+/// here previously drove up to 32 full-screen overdraw passes of a discard-heavy
+/// fragment shader every frame regardless of camera position — real GPU cost with
+/// no matching visual payoff, since only the near stack is ever visible through a
+/// hole. Collapsing the per-layer overdraw into one per-pixel level walk is
+/// tracked as a follow-up (see roadmap Slice 36).
+const procedural_render_window_levels_below: u16 = 6;
 comptime {
     std.debug.assert(procedural_dense_layer_count <= world_system.k_max_dense_submit_stack_cap);
-    const submit_layers = @as(usize, 1 + procedural_underground_count) * procedural_max_dense_bands_per_level;
+    const submit_layers = @as(usize, 1 + procedural_render_window_levels_below) * procedural_max_dense_bands_per_level;
     std.debug.assert(submit_layers <= world_system.k_max_dense_submit_stack_cap);
 }
 /// `estimateDenseTileGpuBytes` ceiling: dense_layer_count * width * height * @sizeOf(u32).
@@ -108,12 +116,7 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .underground_level_count = procedural_underground_count,
     .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
     .max_dense_tile_gpu_bytes = procedural_max_dense_tile_gpu_bytes,
-    // Follow the player through the full vertical stack (32 planes); the legacy
-    // default `levels_below = 6` only submitted surface+near floors and made deep
-    // digs look like the old 3-level demo. Submit budget is
-    // `(1 + levels_below) * max_dense_bands_per_level` and must stay within
-    // `k_max_dense_submit_stack_cap` (32).
-    .render_window = .{ .levels_below = procedural_underground_count },
+    .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
 fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCapacity {
