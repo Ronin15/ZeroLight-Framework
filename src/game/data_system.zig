@@ -75,6 +75,15 @@ pub const max_ai_perception_vision_range = @import("data_system/types.zig").max_
 pub const AiPerceptionCommand = @import("data_system/types.zig").AiPerceptionCommand;
 pub const ConstPerceptionSlice = @import("data_system/types.zig").ConstPerceptionSlice;
 pub const PerceptionSlice = @import("data_system/types.zig").PerceptionSlice;
+pub const AiMemory = @import("data_system/types.zig").AiMemory;
+pub const AiMemoryContact = @import("data_system/types.zig").AiMemoryContact;
+pub const ai_memory_ring_capacity = @import("data_system/types.zig").ai_memory_ring_capacity;
+pub const max_ai_memory_staleness = @import("data_system/types.zig").max_ai_memory_staleness;
+pub const max_ai_memory_familiarity = @import("data_system/types.zig").max_ai_memory_familiarity;
+pub const ai_memory_familiarity_decay_rate = @import("data_system/types.zig").ai_memory_familiarity_decay_rate;
+pub const AiMemoryCommand = @import("data_system/types.zig").AiMemoryCommand;
+pub const ConstAiMemorySlice = @import("data_system/types.zig").ConstAiMemorySlice;
+pub const AiMemorySlice = @import("data_system/types.zig").AiMemorySlice;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
 pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").StructuralEntityDestroyedChange;
@@ -91,6 +100,7 @@ test {
     _ = @import("data_system/agents.zig");
     _ = @import("data_system/faction_level.zig");
     _ = @import("data_system/perception.zig");
+    _ = @import("data_system/memory.zig");
     _ = @import("data_system/structural.zig");
     _ = @import("data_system/system.zig");
 }

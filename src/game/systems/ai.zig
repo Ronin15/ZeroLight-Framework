@@ -29,8 +29,11 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const ConstAiAgentSlice = @import("../data_system.zig").ConstAiAgentSlice;
+const ConstAiMemorySlice = @import("../data_system.zig").ConstAiMemorySlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
+const ConstPerceptionSlice = @import("../data_system.zig").ConstPerceptionSlice;
 const DataSystem = @import("../data_system.zig").DataSystem;
+const max_ai_memory_staleness = @import("../data_system.zig").max_ai_memory_staleness;
 const EntityId = @import("../data_system.zig").EntityId;
 const AiAgent = @import("../data_system.zig").AiAgent;
 const AiBehavior = @import("../data_system.zig").AiBehavior;
@@ -62,6 +65,11 @@ const AiGatherRow = struct {
     sep_y: f32,
     separation_neighbor_count: u8,
     separation_candidate_count: u16,
+    /// Per-row seek target, resolved once at gather time (see `resolveRowTarget`):
+    /// the broadcast default unless perception reports the target not visible
+    /// and fresh `AiMemory` overrides it.
+    target_x: f32,
+    target_y: f32,
 };
 
 fn appendAiGatherRow(
@@ -121,6 +129,13 @@ pub const AiConfig = struct {
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
     seek_target: ?math.Vec2 = null,
+    /// Current perception state, consulted per-row to detect a cold (not
+    /// currently visible) seek target. Null always uses `seek_target`/center-of-mass.
+    perception_slice: ?ConstPerceptionSlice = null,
+    /// Last-known-position memory consulted when perception reports the target
+    /// not visible, to retarget a cold seek toward where the target was last
+    /// seen instead of falling back to nothing. Null disables the retarget.
+    memory_slice: ?ConstAiMemorySlice = null,
     /// Solver mode stamped on emitted navigation intents. The shared-player-seek
     /// demo declares `group` so all seekers share one managed flow field; tests
     /// and other callers keep the default `individual`.
@@ -174,7 +189,8 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
+        const default_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, default_target, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
@@ -229,9 +245,6 @@ pub const AiSystem = struct {
         );
         const rcount = intent_selection.range_count;
 
-        const target = if (system_config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
-        const target_x = target.x;
-        const target_y = target.y;
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
         const wander_step = system_config.step / @max(system_config.wander_resample_period_steps, 1);
@@ -246,8 +259,8 @@ pub const AiSystem = struct {
             .sep_x = gathered.items(.sep_x),
             .sep_y = gathered.items(.sep_y),
             .navigation_intents = navigation_stream,
-            .target_x = target_x,
-            .target_y = target_y,
+            .target_x = gathered.items(.target_x),
+            .target_y = gathered.items(.target_y),
             .seed = system_config.intent_seed,
             .wander_step = wander_step,
             .nav_request_kind = system_config.nav_request_kind,
@@ -294,7 +307,8 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds;
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices);
+        const default_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, default_target, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         self.resetSeparationScratch();
@@ -308,6 +322,8 @@ pub const AiSystem = struct {
         const seek_weights = gathered.items(.seek_weight);
         const sep_x = gathered.items(.sep_x);
         const sep_y = gathered.items(.sep_y);
+        const target_x = gathered.items(.target_x);
+        const target_y = gathered.items(.target_y);
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -316,17 +332,14 @@ pub const AiSystem = struct {
         navigation_stream.addCount(range_base, entity_count);
         try navigation_stream.prefixAppendedRanges(range_base);
         var writer = navigation_stream.rangeWriter(range_base);
-        const target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
-        const tx = target.x;
-        const ty = target.y;
         const wander_step = config.step / @max(config.wander_resample_period_steps, 1);
         for (range.start..range.end) |i| {
             const base_dir = decideDir(
                 behaviors[i],
                 pos_x[i],
                 pos_y[i],
-                tx,
-                ty,
+                target_x[i],
+                target_y[i],
                 wander_amplitudes[i],
                 seek_weights[i],
                 config.intent_seed,
@@ -340,7 +353,7 @@ pub const AiSystem = struct {
             writer.write(.{
                 .entity = entities[i],
                 .kind = system_config.nav_request_kind,
-                .goal = .{ .x = tx, .y = ty },
+                .goal = .{ .x = target_x[i], .y = target_y[i] },
                 .direct_direction_x = dir.x,
                 .direct_direction_y = dir.y,
                 .priority = priorityForBehavior(behaviors[i]),
@@ -376,6 +389,9 @@ pub const AiSystem = struct {
         movement: ConstMovementBodySlice,
         data: *const DataSystem,
         scope_dense_indices: ?[]const u32,
+        default_target: AiDir,
+        perception_slice: ?ConstPerceptionSlice,
+        memory_slice: ?ConstAiMemorySlice,
     ) !void {
         self.clearWork();
         // n is the candidate count: the scoped subset when the scope system has
@@ -394,6 +410,7 @@ pub const AiSystem = struct {
             const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
             const ent = ai_slice.entities[i];
             const mi = data.movementBodyDenseIndex(ent) orelse continue;
+            const row_target = resolveRowTarget(ent, default_target, data, perception_slice, memory_slice);
             appendAiGatherRow(&self.rows, &row_slice, .{
                 .entity = ent,
                 .pos_x = movement.previous_x[mi],
@@ -405,6 +422,8 @@ pub const AiSystem = struct {
                 .sep_y = 0,
                 .separation_neighbor_count = 0,
                 .separation_candidate_count = 0,
+                .target_x = row_target.x,
+                .target_y = row_target.y,
             });
         }
     }
@@ -462,7 +481,6 @@ const NormalizedAiConfig = struct {
     intent_seed: u64,
     step: u32,
     wander_resample_period_steps: u32,
-    seek_target: ?math.Vec2,
     nav_request_kind: PathRequestKind,
     navigation_intents: ?*RangeOutputStream(NavigationIntent),
 };
@@ -485,7 +503,6 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
         .intent_seed = config.intent_seed,
         .step = config.step,
         .wander_resample_period_steps = config.wander_resample_period_steps,
-        .seek_target = config.seek_target,
         .nav_request_kind = config.nav_request_kind,
         .navigation_intents = config.navigation_intents,
     };
@@ -574,6 +591,28 @@ fn computeTargetCenter(movement: ConstMovementBodySlice) AiDir {
     }
     const inv = 1.0 / @as(f32, @floatFromInt(movement.entities.len));
     return .{ .x = sum_x * inv, .y = sum_y * inv };
+}
+
+/// Per-row seek-target resolution. Returns `default_target` (the broadcast
+/// `seek_target`/center-of-mass value) unless perception reports the target
+/// currently not visible and `AiMemory` still holds a valid, fresh last-known
+/// position (`staleness < max_ai_memory_staleness`), in which case it retargets
+/// toward that remembered position instead.
+fn resolveRowTarget(
+    entity: EntityId,
+    default_target: AiDir,
+    data: *const DataSystem,
+    perception_slice: ?ConstPerceptionSlice,
+    memory_slice: ?ConstAiMemorySlice,
+) AiDir {
+    const perception = perception_slice orelse return default_target;
+    const memory = memory_slice orelse return default_target;
+    const perception_index = data.aiPerceptionDenseIndex(entity) orelse return default_target;
+    if (perception.target_visible[perception_index]) return default_target;
+    const memory_index = data.aiMemoryDenseIndex(entity) orelse return default_target;
+    if (!memory.last_known_target[memory_index].isValid()) return default_target;
+    if (memory.staleness[memory_index] >= max_ai_memory_staleness) return default_target;
+    return .{ .x = memory.last_known_x[memory_index], .y = memory.last_known_y[memory_index] };
 }
 
 const AiDir = struct { x: f32, y: f32 };
@@ -717,8 +756,11 @@ const AiJobContext = struct {
     sep_x: []const f32,
     sep_y: []const f32,
     navigation_intents: *RangeOutputStream(NavigationIntent),
-    target_x: f32,
-    target_y: f32,
+    /// Per-row resolved seek target (see `resolveRowTarget`), not a broadcast
+    /// scalar: each row may independently fall back to its `AiMemory`
+    /// last-known position when its perception target has gone cold.
+    target_x: []const f32,
+    target_y: []const f32,
     seed: u64,
     /// Pre-quantized wander epoch (`step / wander_resample_period_steps`,
     /// computed once by the caller), not the raw fixed-step counter.
@@ -735,8 +777,8 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.behaviors[i],
             job.pos_x[i],
             job.pos_y[i],
-            job.target_x,
-            job.target_y,
+            job.target_x[i],
+            job.target_y[i],
             job.wander_amplitudes[i],
             job.seek_weights[i],
             job.seed,
@@ -750,7 +792,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
         writer.write(.{
             .entity = job.entities[i],
             .kind = job.nav_request_kind,
-            .goal = .{ .x = job.target_x, .y = job.target_y },
+            .goal = .{ .x = job.target_x[i], .y = job.target_y[i] },
             .direct_direction_x = dir.x,
             .direct_direction_y = dir.y,
             .priority = priorityForBehavior(job.behaviors[i]),
@@ -794,6 +836,8 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.sep_y).len);
     try std.testing.expectEqual(count, s.items(.separation_neighbor_count).len);
     try std.testing.expectEqual(count, s.items(.separation_candidate_count).len);
+    try std.testing.expectEqual(count, s.items(.target_x).len);
+    try std.testing.expectEqual(count, s.items(.target_y).len);
 }
 
 test "ai gather rows keep MAL columns compact after gather" {
@@ -1180,6 +1224,77 @@ test "ai sparse high entity index does not allocate during warmed gather" {
     frame.phase = .finished;
 }
 
+test "ai memory-retargeted seek has no steady-state allocation after warmup (FailingAllocator)" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(e0, .{ .target_visible = false });
+    try data.setAiMemory(e0, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    // Built on the real testing allocator throughout — this test proves
+    // AiSystem's own warmed populated-branch allocation-free-ness, not the
+    // spatial index's (covered separately by `spatial_index.zig`'s own
+    // FailingAllocator test), so the index stays off the ai_sys/frame
+    // failing-allocator swap below.
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    // Warm-up run sizes rows/navigation_intents to steady state and exercises
+    // resolveRowTarget's populated (perception + fresh memory) branch.
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    frame.phase = .finished;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_ai_allocator = ai_sys.allocator;
+    const original_frame_allocator = frame.allocator;
+    const original_navigation_allocator = frame.navigation_intents.allocator;
+    ai_sys.allocator = failing.allocator();
+    frame.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    defer {
+        ai_sys.allocator = original_ai_allocator;
+        frame.allocator = original_frame_allocator;
+        frame.navigation_intents.allocator = original_navigation_allocator;
+    }
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].direct_direction_x);
+    try std.testing.expectEqual(@as(f32, 1), intents[0].direct_direction_y);
+}
+
 test "ai processor only emits for ai-masked entities using prior positions" {
     // Covered by data_system mask tests + ai determinism/gather tests.
     try std.testing.expect(true);
@@ -1469,7 +1584,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
 
     const ai_entities = ai_sys.rows.slice().items(.entity);
@@ -1542,7 +1657,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -1643,7 +1758,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -1691,4 +1806,230 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
         max_neighbor_count = @max(max_neighbor_count, reference.neighbor_count);
     }
     try std.testing.expect(max_neighbor_count >= 2);
+}
+
+test "ai seek retargets toward fresh AiMemory last-known position when perception target is cold" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(e0, .{ .target_visible = false });
+    try data.setAiMemory(e0, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        // Distinct from the memory position (0, 100) so a wrong fallback is
+        // trivially distinguishable: seek_target implies heading (1, 0),
+        // memory implies heading (0, 1).
+        .seek_target = .{ .x = 100, .y = 0 },
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    });
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].direct_direction_x);
+    try std.testing.expectEqual(@as(f32, 1), intents[0].direct_direction_y);
+}
+
+test "ai seek keeps the default seek target when memory can't override it" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+
+    // No memory / no perception at all: default behavior is unaffected by
+    // config fields defaulting to null (mirrors pre-Slice-30 seek).
+    const no_memory = try data.createEntity();
+    try data.setMovementBody(no_memory, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(no_memory, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(no_memory, .{ .target_visible = false });
+    // Deliberately no setAiMemory call for this entity.
+
+    // Memory present but last_known_target invalid: override must not apply.
+    // Same start position as `no_memory`; agents at exact-equal positions get
+    // zero separation contribution (the `dist2 > 0.1` near-zero guard in
+    // `separationNeighborVisit`), so this stays a pure seek-direction check.
+    const invalid_target = try data.createEntity();
+    try data.setMovementBody(invalid_target, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(invalid_target, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(invalid_target, .{ .target_visible = false });
+    try data.setAiMemory(invalid_target, .{
+        .last_known_target = EntityId.invalid,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    // Memory present, valid target, but saturated staleness: override must not apply.
+    const stale_memory = try data.createEntity();
+    try data.setMovementBody(stale_memory, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(stale_memory, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(stale_memory, .{ .target_visible = false });
+    try data.setAiMemory(stale_memory, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = max_ai_memory_staleness,
+    });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 4, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    });
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    for (intents) |intent| {
+        try std.testing.expectEqual(@as(f32, 100), intent.goal.x);
+        try std.testing.expectEqual(@as(f32, 0), intent.goal.y);
+        try std.testing.expectEqual(@as(f32, 1), intent.direct_direction_x);
+        try std.testing.expectEqual(@as(f32, 0), intent.direct_direction_y);
+    }
+}
+
+test "ai memory override does not apply while perception still reports the target visible" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    // target_visible = true: memory must not override even though it is fresh and valid.
+    try data.setAiPerception(e0, .{ .target_visible = true });
+    try data.setAiMemory(e0, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    });
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 100), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].goal.y);
+    try std.testing.expectEqual(@as(f32, 1), intents[0].direct_direction_x);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].direct_direction_y);
+}
+
+test "ai serial and threaded (0 workers) agree on a memory-overridden seek target" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(e0, .{ .target_visible = false });
+    try data.setAiMemory(e0, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    serial_frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &serial_frame, 0.016, cfg);
+    const serial = serial_frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), serial.len);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var threaded_frame = SimulationFrame.init(std.testing.allocator);
+    defer threaded_frame.deinit();
+    try threaded_frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    threaded_frame.beginStep();
+    _ = try ai_sys.update(ai_slice, move_slice, spatial_sys.view(), &data, &threaded_frame, &threads, 0.016, cfg);
+    const threaded = threaded_frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), threaded.len);
+
+    try std.testing.expectEqual(serial[0].goal.x, threaded[0].goal.x);
+    try std.testing.expectEqual(serial[0].goal.y, threaded[0].goal.y);
+    try std.testing.expectEqual(serial[0].direct_direction_x, threaded[0].direct_direction_x);
+    try std.testing.expectEqual(serial[0].direct_direction_y, threaded[0].direct_direction_y);
+    // Both must reflect the memory override, not the configured seek_target.
+    try std.testing.expectEqual(@as(f32, 0), serial[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 100), serial[0].goal.y);
 }

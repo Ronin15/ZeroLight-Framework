@@ -145,6 +145,7 @@ pub const Timing = enum {
     // gameplay_* timers cover state-owned glue outside the pipeline.
     pipeline_spatial_index,
     pipeline_perception,
+    pipeline_ai_memory,
     pipeline_ai,
     pipeline_steering,
     pipeline_pathfinding,
@@ -373,6 +374,7 @@ const EnabledRuntimePerfLog = struct {
         );
         const pipeline_spatial_index_timing = self.timingValue(.pipeline_spatial_index);
         const pipeline_perception_timing = self.timingValue(.pipeline_perception);
+        const pipeline_ai_memory_timing = self.timingValue(.pipeline_ai_memory);
         const pipeline_ai_timing = self.timingValue(.pipeline_ai);
         const pipeline_steering_timing = self.timingValue(.pipeline_steering);
         const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
@@ -382,13 +384,15 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         log.debug(
-            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(pipeline_spatial_index_timing.averageNs()),
                 millis(pipeline_spatial_index_timing.max_ns),
                 millis(pipeline_perception_timing.averageNs()),
                 millis(pipeline_perception_timing.max_ns),
+                millis(pipeline_ai_memory_timing.averageNs()),
+                millis(pipeline_ai_memory_timing.max_ns),
                 millis(pipeline_ai_timing.averageNs()),
                 millis(pipeline_ai_timing.max_ns),
                 millis(pipeline_steering_timing.averageNs()),

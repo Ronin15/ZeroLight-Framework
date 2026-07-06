@@ -66,6 +66,7 @@ pub const Component = enum(u5) {
     world_level,
     faction,
     ai_perception,
+    ai_memory,
 };
 
 pub const ComponentMask = u32;
@@ -82,6 +83,7 @@ pub const component_masks = struct {
     pub const world_level = componentMask(.world_level);
     pub const faction = componentMask(.faction);
     pub const ai_perception = componentMask(.ai_perception);
+    pub const ai_memory = componentMask(.ai_memory);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -461,6 +463,70 @@ pub const PerceptionSlice = struct {
     heard_stimulus_y: HotF32Slice,
 };
 
+pub const ai_memory_ring_capacity: usize = 4;
+pub const max_ai_memory_staleness: f32 = 3600.0;
+pub const max_ai_memory_familiarity: f32 = 1.0;
+pub const ai_memory_familiarity_decay_rate: f32 = 0.02;
+
+/// One remembered contact: who, where, and how long ago. Ring slots are
+/// overwritten oldest-first via ring_next_slot; there is no per-entity growth.
+pub const AiMemoryContact = struct {
+    entity: EntityId = EntityId.invalid,
+    x: f32 = 0,
+    y: f32 = 0,
+    age: f32 = 0,
+};
+
+/// Short-term AI memory: last-known target position with a staleness timer, a
+/// small fixed-capacity recent-contact ring, and a spatial familiarity scalar.
+/// All fields are hot per-step state — no cold/author-facing tunables to
+/// preserve across an overwrite, unlike AiPerception.
+pub const AiMemory = struct {
+    last_known_target: EntityId = EntityId.invalid,
+    last_known_x: f32 = 0,
+    last_known_y: f32 = 0,
+    staleness: f32 = max_ai_memory_staleness,
+    familiarity: f32 = 0,
+    ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity,
+    ring_next_slot: u8 = 0,
+};
+
+pub const AiMemoryCommand = struct {
+    entity: EntityId,
+    memory: AiMemory,
+};
+
+pub const ConstAiMemorySlice = struct {
+    entities: []const EntityId,
+    last_known_target: []const EntityId,
+    last_known_x: ConstHotF32Slice,
+    last_known_y: ConstHotF32Slice,
+    staleness: ConstHotF32Slice,
+    familiarity: ConstHotF32Slice,
+    ring_entity: []const [ai_memory_ring_capacity]EntityId,
+    ring_x: []const [ai_memory_ring_capacity]f32,
+    ring_y: []const [ai_memory_ring_capacity]f32,
+    ring_age: []const [ai_memory_ring_capacity]f32,
+    ring_next_slot: []const u8,
+};
+
+/// Mutable dense columns for the (future) AiMemorySystem's per-step refresh and
+/// decay writes. Every column is hot state here — unlike PerceptionSlice, there
+/// are no cold tunables to hold const.
+pub const AiMemorySlice = struct {
+    entities: []const EntityId,
+    last_known_target: []EntityId,
+    last_known_x: HotF32Slice,
+    last_known_y: HotF32Slice,
+    staleness: HotF32Slice,
+    familiarity: HotF32Slice,
+    ring_entity: [][ai_memory_ring_capacity]EntityId,
+    ring_x: [][ai_memory_ring_capacity]f32,
+    ring_y: [][ai_memory_ring_capacity]f32,
+    ring_age: [][ai_memory_ring_capacity]f32,
+    ring_next_slot: []u8,
+};
+
 pub const WorldLevelCommand = struct {
     entity: EntityId,
     level: u16,
@@ -485,6 +551,7 @@ pub const EntityTemplate = struct {
     world_level: ?u16 = null,
     faction: ?Faction = null,
     ai_perception: ?AiPerception = null,
+    ai_memory: ?AiMemory = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -535,6 +602,7 @@ pub const StructuralCommand = union(enum) {
     set_simulation_tier: SimulationTierCommand,
     set_faction: FactionCommand,
     set_ai_perception: AiPerceptionCommand,
+    set_ai_memory: AiMemoryCommand,
 };
 
 pub const StructuralCommitStats = struct {

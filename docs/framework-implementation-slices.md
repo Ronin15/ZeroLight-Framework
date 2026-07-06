@@ -78,7 +78,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
 | **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
 | **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed, LOS diagonal-tunneling correctness fix, caller-sized event budget (see slice section) |
-| **30–33** | Not started | AI memory, affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
+| **30** | Landed | AI memory (component/system, cold-seek retarget, scope freeze/resync) — `memory_expired` event deferred |
+| **31–33** | Not started | Affect, behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
 
@@ -2269,28 +2270,44 @@ Current foundation:
 
 Checklist:
 
-- [ ] Add an `AiMemory` component with fixed-size scalar columns: last-known
+- [x] Add an `AiMemory` component with fixed-size scalar columns: last-known
       target position + staleness timer, a small fixed-capacity recent-contact
       ring (entity id + last-seen pos + age), and a spatial familiarity scalar —
       no per-entity `ArrayList` on the hot path.
-- [ ] Refresh memory from perception transitions and decay it each step
+- [x] Refresh memory from perception transitions and decay it each step
       (staleness++, familiarity toward baseline); vectorizable column math.
-- [ ] Feed memory to AI when perception is cold (e.g. pursue last-known
+- [x] Feed memory to AI when perception is cold (e.g. pursue last-known
       position).
-- [ ] Implement the scope ↔ AI-state policy: freeze memory/affect decay on
+- [x] Implement the scope ↔ AI-state policy: freeze memory/affect decay on
       demotion out of cognition, resync on promotion, routed through the Slice 24
       deferred-commit path; no background per-frame work for out-of-scope agents.
 - [ ] Optional `memory_expired` event (scalar-only, `domain_reaction`) if a
-      reaction needs it; otherwise memory stays purely columnar.
+      reaction needs it; otherwise memory stays purely columnar. Deferred: no
+      current reaction consumes ring-contact expiry, which stays a pure
+      columnar decay (entity id cleared on the row, no event). Revisit if
+      Slice 32 (arbitration) or Slice 33 (debug introspection) needs to react
+      to a contact going stale.
 
 Acceptance checks:
 
-- [ ] Memory updates and decay are deterministic and allocation-free; fixed-size
+- [x] Memory updates and decay are deterministic and allocation-free; fixed-size
       storage never grows per frame.
-- [ ] Demoted entities preserve state with decay paused and resume correctly on
+- [x] Demoted entities preserve state with decay paused and resume correctly on
       promotion.
-- [ ] `zig build test` covers refresh-from-perception, decay, ring eviction, and
+- [x] `zig build test` covers refresh-from-perception, decay, ring eviction, and
       demotion/promotion state continuity.
+
+**Status: landed.** `AiMemory` component + `AiMemoryStore` (SoA, ring buffer
+flattened into parallel columns) land in `data_system/`; `AiMemorySystem`
+(`src/game/systems/ai_memory.zig`) runs between perception and AI in
+`SimulationPipeline`, decaying staleness/familiarity/ring contacts for the
+cognition-scoped `AiPerception`+`AiMemory` subset and refreshing from this
+step's perception-acquisition events. `AiSystem`'s `seek` behavior retargets
+toward `AiMemory.last_known_x/y` when perception reports the target cold and
+memory is still fresh. Scope freeze/resync falls out of reusing the same
+cognition-scope dense-index list perception/AI already gate on: a demoted
+entity is simply not gathered, so its memory row is untouched until it
+re-enters scope. The `memory_expired` event stays deferred (see Checklist).
 
 ## Slice 31: AI Affect And Emotion Drives
 

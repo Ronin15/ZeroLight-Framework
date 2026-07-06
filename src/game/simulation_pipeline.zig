@@ -26,6 +26,8 @@ const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const AiMemoryStats = @import("systems/ai_memory.zig").AiMemoryStats;
+const AiMemorySystem = @import("systems/ai_memory.zig").AiMemorySystem;
 const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
@@ -100,6 +102,7 @@ pub const SimulationPipelineStats = struct {
     scope: SimulationScope = .{},
     spatial_index: SpatialIndexStats = .{},
     perception: PerceptionStats = .{},
+    ai_memory: AiMemoryStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
@@ -222,6 +225,11 @@ pub const SimulationPipeline = struct {
     /// hostile candidates within vision/FOV/line-of-sight and writes sensed
     /// state to `PerceptionStore` for the cognition-scoped `AiPerception` subset.
     perception: PerceptionSystem,
+    /// AI short-term memory: decays staleness/familiarity/ring contacts for the
+    /// cognition-scoped `AiPerception` + `AiMemory` subset and refreshes from
+    /// this step's perception acquisition events, feeding `AiSystem`'s
+    /// memory-aware cold-seek retarget.
+    ai_memory: AiMemorySystem,
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
@@ -261,6 +269,10 @@ pub const SimulationPipeline = struct {
         // gather buffers on first use, same as AiSystem.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
+        // No reserve method: AiMemorySystem lazily ensureTotalCapacity's its
+        // gather buffer on first use, same as PerceptionSystem/AiSystem.
+        var ai_memory = AiMemorySystem.init(allocator);
+        errdefer ai_memory.deinit();
 
         return .{
             .movement = MovementSystem.init(),
@@ -272,6 +284,7 @@ pub const SimulationPipeline = struct {
             .scope = scope,
             .spatial_index = spatial_index,
             .perception = perception,
+            .ai_memory = ai_memory,
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
@@ -282,6 +295,7 @@ pub const SimulationPipeline = struct {
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.ai_memory.deinit();
         self.perception.deinit();
         self.spatial_index.deinit();
         self.scope.deinit();
@@ -481,6 +495,16 @@ pub const SimulationPipeline = struct {
         });
         perception_timer.stop(context.perf, .pipeline_perception);
 
+        // Decays staleness/familiarity/ring contacts and refreshes from this
+        // step's perception acquisition events, over the same cognition-scoped
+        // `ai_indices` population, before AI reads it for the cold-seek
+        // retarget below.
+        var ai_memory_timer = StageTimer.start();
+        const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
+            .scope_dense_indices = ai_indices,
+        });
+        ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
+
         // The player's plane is deliberately NOT propagated into the AI goal level:
         // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
         // Seeding the player's underground plane here would make them request
@@ -504,6 +528,10 @@ pub const SimulationPipeline = struct {
             // Cognition halo + stagger selection. Steering inherits this scope
             // transitively: it only acts on the navigation intents AI emits here.
             .scope_dense_indices = ai_indices,
+            // Cold-perception agents with fresh memory retarget seek toward
+            // their last-known position instead of losing the goal.
+            .perception_slice = data.aiPerceptionSliceConst(),
+            .memory_slice = data.aiMemorySliceConst(),
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
@@ -599,6 +627,7 @@ pub const SimulationPipeline = struct {
             .scope = scope,
             .spatial_index = spatial_index_stats,
             .perception = perception_stats,
+            .ai_memory = ai_memory_stats,
             .ai = ai_stats,
             .steering = steering_stats,
             .pathfinding = pathfinding_stats,
@@ -933,6 +962,86 @@ test "pipeline syncs movement previous positions" {
     const synced = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(synced.position.x, synced.previous_position.x);
     try std.testing.expectEqual(synced.position.y, synced.previous_position.y);
+}
+
+test "pipeline runs ai_memory after perception and before ai, feeding memory into AI's cold-seek retarget" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data); // Spawns at (400, 225).
+
+    const remembered_target = try data.createEntity();
+    const agent = try data.createEntity();
+    // Far outside the default AiPerception vision_range (240) from the
+    // player, so the real PerceptionSystem pass this step reports the target
+    // not visible regardless of hostility.
+    try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(agent, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(agent, .{});
+    try data.setAiMemory(agent, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Both stages ran over the same scoped agent this step (observable stage
+    // order: ai_memory processes after perception and before ai reads it).
+    try std.testing.expectEqual(@as(usize, 1), stats.ai_memory.processed_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+
+    // Perception never saw the player (out of vision range) and AiMemory's
+    // fresh last-known position survived AiMemorySystem's decay, so AI's
+    // per-row goal reflects the memory retarget (0, 100) rather than the
+    // player's seek_target (400, 225) — the actual end-to-end proof that a
+    // cold-perception agent retargets via memory through the real pipeline.
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
 }
 
 const AssetStore = @import("../assets/assets.zig").AssetStore;

@@ -80,6 +80,12 @@ const AiPerception = types.AiPerception;
 const max_ai_perception_vision_range = types.max_ai_perception_vision_range;
 const ConstPerceptionSlice = types.ConstPerceptionSlice;
 const PerceptionSlice = types.PerceptionSlice;
+const memory = @import("memory.zig");
+const AiMemoryStore = memory.AiMemoryStore;
+const validateAiMemory = memory.validateAiMemory;
+const AiMemory = types.AiMemory;
+const ConstAiMemorySlice = types.ConstAiMemorySlice;
+const AiMemorySlice = types.AiMemorySlice;
 const structural = @import("structural.zig");
 const StructuralPlanScratch = structural.StructuralPlanScratch;
 const NullStructuralChangeSink = structural.NullStructuralChangeSink;
@@ -108,12 +114,14 @@ pub const DataSystem = struct {
     world_levels: WorldLevelStore = .{},
     factions: FactionStore = .{},
     ai_perceptions: PerceptionStore = .{},
+    ai_memories: AiMemoryStore = .{},
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DataSystem) void {
+        self.ai_memories.deinit(self.allocator);
         self.ai_perceptions.deinit(self.allocator);
         self.factions.deinit(self.allocator);
         self.world_levels.deinit(self.allocator);
@@ -168,6 +176,7 @@ pub const DataSystem = struct {
         if (slot.world_level_index) |dense_index| self.removeWorldLevelAt(@intCast(dense_index));
         if (slot.faction_index) |dense_index| self.removeFactionAt(@intCast(dense_index));
         if (slot.ai_perception_index) |dense_index| self.removeAiPerceptionAt(@intCast(dense_index));
+        if (slot.ai_memory_index) |dense_index| self.removeAiMemoryAt(@intCast(dense_index));
 
         // tier_counts is decremented in removeMovementBodyAt (called above) since
         // the tier now lives on the dense movement-body scope row, not the slot.
@@ -187,6 +196,7 @@ pub const DataSystem = struct {
         retired_slot.world_level_index = null;
         retired_slot.faction_index = null;
         retired_slot.ai_perception_index = null;
+        retired_slot.ai_memory_index = null;
         self.first_free_slot = index;
         self.free_slot_count += 1;
         return true;
@@ -308,6 +318,7 @@ pub const DataSystem = struct {
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
+        self.ai_memories.clearRetainingCapacity();
         self.ai_perceptions.clearRetainingCapacity();
         self.factions.clearRetainingCapacity();
         self.world_levels.clearRetainingCapacity();
@@ -339,6 +350,7 @@ pub const DataSystem = struct {
             slot.world_level_index = null;
             slot.faction_index = null;
             slot.ai_perception_index = null;
+            slot.ai_memory_index = null;
             self.first_free_slot = @intCast(index);
         }
     }
@@ -725,6 +737,42 @@ pub const DataSystem = struct {
         return self.ai_perceptions.slice();
     }
 
+    pub fn setAiMemory(self: *DataSystem, id: EntityId, memory_value: AiMemory) !void {
+        try validateAiMemory(memory_value);
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.ai_memory_index) |index| {
+            self.ai_memories.set(@intCast(index), memory_value);
+            return;
+        }
+
+        const dense_index = try self.ai_memories.append(self.allocator, id, memory_value);
+        slot.ai_memory_index = dense_index;
+        slot.addComponent(.ai_memory);
+    }
+
+    pub fn aiMemoryConst(self: *const DataSystem, id: EntityId) ?AiMemory {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.ai_memory_index orelse return null;
+        return self.ai_memories.get(@intCast(dense_index));
+    }
+
+    pub fn aiMemorySliceConst(self: *const DataSystem) ConstAiMemorySlice {
+        return self.ai_memories.sliceConst();
+    }
+
+    /// Dense `AiMemoryStore` row index for `id`, or `null` when the entity
+    /// carries no `AiMemory` component. Mirrors `aiPerceptionDenseIndex`.
+    pub fn aiMemoryDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.ai_memory_index orelse return null;
+        return @intCast(dense_index);
+    }
+
+    /// Mutable hot-column view for `AiMemorySystem`'s per-step refresh/decay writes.
+    pub fn aiMemorySlice(self: *DataSystem) AiMemorySlice {
+        return self.ai_memories.slice();
+    }
+
     fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
         const metadata = self.simulationMetadata(id) orelse return;
         if (metadata.level == level) return;
@@ -856,6 +904,11 @@ pub const DataSystem = struct {
         const moved = self.ai_perceptions.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_perception_index = @intCast(index);
     }
+
+    fn removeAiMemoryAt(self: *DataSystem, index: usize) void {
+        const moved = self.ai_memories.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_memory_index = @intCast(index);
+    }
 };
 
 const EntitySlot = struct {
@@ -876,6 +929,7 @@ const EntitySlot = struct {
     world_level_index: ?u32 = null,
     faction_index: ?u32 = null,
     ai_perception_index: ?u32 = null,
+    ai_memory_index: ?u32 = null,
 
     fn addComponent(self: *EntitySlot, component: Component) void {
         self.component_mask |= componentMask(component);
@@ -2381,6 +2435,70 @@ test "ai perception survives entity destruction and reuse with generational corr
     try data.setAiPerception(reused, .{ .vision_range = 222 });
     try std.testing.expectEqual(@as(f32, 222), data.aiPerceptionConst(reused).?.vision_range);
     try std.testing.expectEqual(@as(?AiPerception, null), data.aiPerceptionConst(original));
+}
+
+test "ai memory round-trips through set/get and rejects invalid fields" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const target = try data.createEntity();
+    try data.setAiMemory(first, .{ .last_known_target = target, .last_known_x = 5, .last_known_y = 9, .staleness = 12, .familiarity = 0.4 });
+
+    const stored = data.aiMemoryConst(first).?;
+    try std.testing.expectEqual(target, stored.last_known_target);
+    try std.testing.expectEqual(@as(f32, 5), stored.last_known_x);
+    try std.testing.expectEqual(@as(f32, 9), stored.last_known_y);
+    try std.testing.expectEqual(@as(f32, 12), stored.staleness);
+    try std.testing.expectEqual(@as(f32, 0.4), stored.familiarity);
+    try std.testing.expect(data.hasComponents(first, component_masks.ai_memory));
+
+    try std.testing.expectError(error.InvalidAiMemory, data.setAiMemory(first, .{ .staleness = -1 }));
+    try std.testing.expectError(error.InvalidAiMemory, data.setAiMemory(first, .{ .familiarity = 2 }));
+    try std.testing.expectError(error.InvalidAiMemory, data.setAiMemory(first, .{ .ring_next_slot = 4 }));
+}
+
+test "ai memory store is columnar and compact after removal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setAiMemory(first, .{ .staleness = 100 });
+    try data.setAiMemory(second, .{ .staleness = 200 });
+    try data.setAiMemory(third, .{ .staleness = 300 });
+
+    try std.testing.expect(data.destroyEntity(second));
+
+    const slice = data.aiMemorySliceConst();
+    try std.testing.expectEqual(slice.entities.len, slice.staleness.len);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+
+    // The swap-remove moved `third` into `second`'s old dense slot; resolving
+    // it back through its EntitySlot proves removeAiMemoryAt fixed up the
+    // slot's ai_memory_index rather than just leaving the dense columns paired.
+    try std.testing.expectEqual(@as(f32, 300), data.aiMemoryConst(third).?.staleness);
+}
+
+test "ai memory survives entity destruction and reuse with generational correctness" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const original = try data.createEntity();
+    try data.setAiMemory(original, .{ .staleness = 111 });
+    try std.testing.expect(data.destroyEntity(original));
+
+    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(original));
+
+    const reused = try data.createEntity();
+    try std.testing.expectEqual(original.index, reused.index);
+    try std.testing.expect(reused.generation != original.generation);
+    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(reused));
+
+    try data.setAiMemory(reused, .{ .staleness = 222 });
+    try std.testing.expectEqual(@as(f32, 222), data.aiMemoryConst(reused).?.staleness);
+    try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(original));
 }
 
 fn testBody(base: f32) MovementBody {
