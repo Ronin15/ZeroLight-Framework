@@ -8,8 +8,10 @@
 //! never excludes the row) plus its own `AiAgent.behavior` into four
 //! independent drives (fear, curiosity, aggression, fatigue), decays each
 //! toward its own per-entity baseline, and emits a threshold-crossing event
-//! on a rising or falling edge (hysteresis band avoids flapping at the
-//! threshold). Runs after perception and ai_memory (both must have written
+//! on a rising or falling edge. A true Schmitt trigger (each drive's bit in
+//! `AiAffect.above_threshold_mask`, persisted across steps) gates the edges,
+//! so a value hovering at threshold cannot refire the same edge twice. Runs
+//! after perception and ai_memory (both must have written
 //! this step's state first) and before AI reads it — a future arbitration
 //! slice is expected to switch behavior on the resulting drives; this system
 //! only appraises and decays them.
@@ -36,9 +38,11 @@
 //! toward baseline via simd.lerpFloat4, clamped to [0, 1], and scattered back.
 //! The threshold-crossing check runs scalarly per lane afterward (mirrors
 //! ai_memory.zig's ageRingForRow: a vectorized combine followed by a small
-//! branchy per-lane remainder), comparing the pre-overwrite value against
-//! threshold (rising) and threshold - ai_affect_threshold_hysteresis
-//! (falling). A scalar tail repeats the same math for the remainder.
+//! branchy per-lane remainder), reading and updating this row's persisted
+//! above_threshold_mask bit for the drive: rising fires when the bit is clear
+//! and the new value reaches threshold; falling fires when the bit is set and
+//! the new value drops below threshold - ai_affect_threshold_hysteresis. A
+//! scalar tail repeats the same math for the remainder.
 //!
 //! Event emission (range-owned scratch, deterministic capped merge) mirrors
 //! perception.zig's mergePerceptionEvents almost exactly, except up to four
@@ -461,14 +465,32 @@ fn combineDriveScalar(prev: f32, delta: f32, baseline: f32, decay_rate: f32) f32
     return math.clamp(decayed, 0, 1);
 }
 
-/// Rising: prev below threshold, final at or above it. Falling: prev at or
-/// above threshold - ai_affect_threshold_hysteresis, final below it. A value
-/// that never leaves the hysteresis band between two crossings cannot refire
-/// the same edge twice.
-fn checkThresholdCrossing(prev: f32, final: f32, threshold: f32) ?bool {
-    if (prev < threshold and final >= threshold) return true;
-    const falling_threshold = threshold - ai_affect_threshold_hysteresis;
-    if (prev >= falling_threshold and final < falling_threshold) return false;
+/// One bit per AiAffectDrive tag, keyed by its declaration order (fear = bit
+/// 0, curiosity = bit 1, aggression = bit 2, fatigue = bit 3).
+fn driveBit(drive: AiAffectDrive) u8 {
+    return @as(u8, 1) << @intCast(@intFromEnum(drive));
+}
+
+/// True Schmitt trigger over `above_threshold.*`'s persisted per-drive bit
+/// (this row's AiAffect.above_threshold_mask), not a stateless comparison
+/// against this step's previous value -- a value that crosses threshold
+/// upward, dips back down without ever leaving the hysteresis band (falling
+/// below threshold - ai_affect_threshold_hysteresis), then crosses threshold
+/// upward again, cannot refire: the bit is already set, so the rising
+/// branch's "was not above" guard fails. Rising: bit clear and final >=
+/// threshold (sets the bit). Falling: bit set and final < threshold -
+/// ai_affect_threshold_hysteresis (clears the bit). Any other case leaves the
+/// bit and returns null.
+fn checkThresholdCrossing(above_threshold: *u8, bit: u8, final: f32, threshold: f32) ?bool {
+    const was_above = (above_threshold.* & bit) != 0;
+    if (!was_above and final >= threshold) {
+        above_threshold.* |= bit;
+        return true;
+    }
+    if (was_above and final < threshold - ai_affect_threshold_hysteresis) {
+        above_threshold.* &= ~bit;
+        return false;
+    }
     return null;
 }
 
@@ -521,7 +543,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fear, lanes, final);
-        emitCrossings(buffer, entities, k, .fear, simd.toFloatArray(prev), simd.toFloatArray(final), simd.toFloatArray(threshold));
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fear, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -531,7 +553,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const delta = if (visible) gain_fear * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
         const final = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
         s.fear[index] = final;
-        if (checkThresholdCrossing(prev, final, s.threshold_fear[index])) |rising| {
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fear), final, s.threshold_fear[index])) |rising| {
             appendCrossingEvent(buffer, entities[k], .fear, rising);
         }
     }
@@ -565,7 +587,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.aggression, lanes, final);
-        emitCrossings(buffer, entities, k, .aggression, simd.toFloatArray(prev), simd.toFloatArray(final), simd.toFloatArray(threshold));
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .aggression, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -575,7 +597,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const delta = if (visible) gain_aggression * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
         const final = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
         s.aggression[index] = final;
-        if (checkThresholdCrossing(prev, final, s.threshold_aggression[index])) |rising| {
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.aggression), final, s.threshold_aggression[index])) |rising| {
             appendCrossingEvent(buffer, entities[k], .aggression, rising);
         }
     }
@@ -615,7 +637,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.curiosity, lanes, final);
-        emitCrossings(buffer, entities, k, .curiosity, simd.toFloatArray(prev), simd.toFloatArray(final), simd.toFloatArray(threshold));
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .curiosity, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -626,7 +648,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
             gain_curiosity_novelty * (1 - familiarity[k]);
         const final = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
         s.curiosity[index] = final;
-        if (checkThresholdCrossing(prev, final, s.threshold_curiosity[index])) |rising| {
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.curiosity), final, s.threshold_curiosity[index])) |rising| {
             appendCrossingEvent(buffer, entities[k], .curiosity, rising);
         }
     }
@@ -661,7 +683,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
-        emitCrossings(buffer, entities, k, .fatigue, simd.toFloatArray(prev), simd.toFloatArray(final), simd.toFloatArray(threshold));
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fatigue, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -670,7 +692,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const delta: f32 = if (behavior_seek_f[k] > 0.5) gain_fatigue else 0;
         const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
         s.fatigue[index] = final;
-        if (checkThresholdCrossing(prev, final, s.threshold_fatigue[index])) |rising| {
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
             appendCrossingEvent(buffer, entities[k], .fatigue, rising);
         }
     }
@@ -679,14 +701,17 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
 fn emitCrossings(
     buffer: *AffectEventRangeBuffer,
     entities: []const EntityId,
+    dense_indices: []const u32,
+    above_threshold_mask: []u8,
     k: usize,
     drive: AiAffectDrive,
-    prev: [simd.lane_count]f32,
     final: [simd.lane_count]f32,
     threshold: [simd.lane_count]f32,
 ) void {
+    const bit = driveBit(drive);
     inline for (0..simd.lane_count) |lane| {
-        if (checkThresholdCrossing(prev[lane], final[lane], threshold[lane])) |rising| {
+        const dense_index = dense_indices[k + lane];
+        if (checkThresholdCrossing(&above_threshold_mask[dense_index], bit, final[lane], threshold[lane])) |rising| {
             appendCrossingEvent(buffer, entities[k + lane], drive, rising);
         }
     }
@@ -953,6 +978,69 @@ fn frameReserve(events: *SimulationEvents, capacity: usize) !void {
     try events.reserve(4, capacity);
 }
 
+fn expectCrossingCounts(items: []const SimulationEvent, expected_rising: usize, expected_falling: usize) !void {
+    var rising: usize = 0;
+    var falling: usize = 0;
+    for (items) |event| {
+        if (event.payload != .affect_threshold_crossed) continue;
+        if (event.payload.affect_threshold_crossed.rising) rising += 1 else falling += 1;
+    }
+    try testing.expectEqual(expected_rising, rising);
+    try testing.expectEqual(expected_falling, falling);
+}
+
+test "Schmitt trigger does not refire a rising edge while oscillating in-band, and fires again only after truly leaving it" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    // decay_rate_fear = 1 snaps fear straight to baseline every step
+    // regardless of perception/memory inputs (see combineDriveScalar), so
+    // retuning baseline_fear (a cold tunable) each step drives fear through
+    // an exact, controlled sequence of values.
+    const entity = try addAgentWithAffect(&data, .{}, .{
+        .baseline_fear = 0.601,
+        .decay_rate_fear = 1.0,
+        .threshold_fear = 0.6,
+    });
+
+    var sys = AffectSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    // (a) 0 -> 0.601 crosses threshold (0.6) upward: exactly one rising event.
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 1, 0);
+
+    // (b) dips to 0.599, still above the falling edge (0.6 - 0.05 = 0.55):
+    // the hysteresis band was never left, so no event fires.
+    try data.setAiAffect(entity, .{ .baseline_fear = 0.599, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 0, 0);
+
+    // (c) regression case: crosses threshold upward again without the drive
+    // ever having genuinely calmed down. The persisted above-threshold bit is
+    // already set, so this must NOT refire rising.
+    try data.setAiAffect(entity, .{ .baseline_fear = 0.601, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 0, 0);
+
+    // (d) genuinely drops below the falling edge: exactly one falling event.
+    try data.setAiAffect(entity, .{ .baseline_fear = 0.4, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 0, 1);
+
+    // (e) having truly left and now re-entered, this rising edge is new and
+    // must fire.
+    try data.setAiAffect(entity, .{ .baseline_fear = 0.601, .decay_rate_fear = 1.0, .threshold_fear = 0.6 });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 1, 0);
+}
+
 test "serial and threaded updates are byte-identical" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -1010,6 +1098,7 @@ test "serial and threaded updates are byte-identical" {
     try testing.expectEqualSlices(f32, slice_a.curiosity, slice_b.curiosity);
     try testing.expectEqualSlices(f32, slice_a.aggression, slice_b.aggression);
     try testing.expectEqualSlices(f32, slice_a.fatigue, slice_b.fatigue);
+    try testing.expectEqualSlices(u8, slice_a.above_threshold_mask, slice_b.above_threshold_mask);
     try testing.expectEqualSlices(SimulationEvent, events_a.mergedItems(), events_b.mergedItems());
 }
 

@@ -57,6 +57,7 @@ const AffectRow = struct {
     curiosity: f32,
     aggression: f32,
     fatigue: f32,
+    above_threshold_mask: u8,
 };
 
 pub const AiAffectStore = struct {
@@ -88,14 +89,15 @@ pub const AiAffectStore = struct {
             .curiosity = affect.curiosity,
             .aggression = affect.aggression,
             .fatigue = affect.fatigue,
+            .above_threshold_mask = affect.above_threshold_mask,
         });
         return index;
     }
 
     /// Updates only the cold tunables (baseline_*, decay_rate_*, threshold_*)
     /// on an existing row. A retune must not wipe this step's live appraisal
-    /// state, so the hot columns (fear, curiosity, aggression, fatigue) are
-    /// left untouched — mirrors PerceptionStore.set.
+    /// state, so the hot columns (fear, curiosity, aggression, fatigue,
+    /// above_threshold_mask) are left untouched — mirrors PerceptionStore.set.
     pub fn set(self: *AiAffectStore, index: usize, affect: AiAffect) void {
         const s = self.rows.slice();
         s.items(.baseline_fear)[index] = affect.baseline_fear;
@@ -131,6 +133,7 @@ pub const AiAffectStore = struct {
             .curiosity = s.items(.curiosity)[index],
             .aggression = s.items(.aggression)[index],
             .fatigue = s.items(.fatigue)[index],
+            .above_threshold_mask = s.items(.above_threshold_mask)[index],
         };
     }
 
@@ -162,6 +165,7 @@ pub const AiAffectStore = struct {
             .curiosity = s.items(.curiosity),
             .aggression = s.items(.aggression),
             .fatigue = s.items(.fatigue),
+            .above_threshold_mask = s.items(.above_threshold_mask),
         };
     }
 
@@ -188,6 +192,7 @@ pub const AiAffectStore = struct {
             .curiosity = s.items(.curiosity),
             .aggression = s.items(.aggression),
             .fatigue = s.items(.fatigue),
+            .above_threshold_mask = s.items(.above_threshold_mask),
         };
     }
 
@@ -279,6 +284,7 @@ test "AiAffectStore set on existing row preserves hot columns and only updates c
     live.curiosity[0] = 0.55;
     live.aggression[0] = 0.33;
     live.fatigue[0] = 0.11;
+    live.above_threshold_mask[0] = 0b0101;
 
     // A retune (baseline/decay/threshold) must not clear the hot state above.
     store.set(0, .{ .baseline_fear = 0.9, .decay_rate_fear = 0.4, .threshold_fear = 0.5 });
@@ -291,6 +297,7 @@ test "AiAffectStore set on existing row preserves hot columns and only updates c
     try std.testing.expectEqual(@as(f32, 0.55), after.curiosity);
     try std.testing.expectEqual(@as(f32, 0.33), after.aggression);
     try std.testing.expectEqual(@as(f32, 0.11), after.fatigue);
+    try std.testing.expectEqual(@as(u8, 0b0101), after.above_threshold_mask);
 }
 
 test "AiAffectStore sliceConst and mutable slice expose aligned columns" {
@@ -308,6 +315,7 @@ test "AiAffectStore sliceConst and mutable slice expose aligned columns" {
     try std.testing.expectEqual(const_slice.entities.len, const_slice.decay_rate_curiosity.len);
     try std.testing.expectEqual(const_slice.entities.len, const_slice.threshold_aggression.len);
     try std.testing.expectEqual(const_slice.entities.len, const_slice.fatigue.len);
+    try std.testing.expectEqual(const_slice.entities.len, const_slice.above_threshold_mask.len);
 
     const mutable_slice = store.slice();
     mutable_slice.fear[1] = 0.42;

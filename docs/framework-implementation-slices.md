@@ -2382,9 +2382,13 @@ staleness/familiarity columns), gathering each row's own baseline/decay
 rate/threshold via `simd.gatherFloat4` — never a splatted global constant —
 after a branchy gather stage packs perception/memory presence into a
 contiguous per-row scratch table (mirrors `PerceptionGatherRow`). A
-rising/falling threshold-crossing check runs scalarly per lane afterward,
-with a hysteresis band (`ai_affect_threshold_hysteresis`) that provably
-prevents a value hovering at `threshold` from flapping. Event emission
+rising/falling threshold-crossing check runs scalarly per lane afterward as
+a true Schmitt trigger: each drive's bit in `AiAffect.above_threshold_mask`
+is the persisted "is this drive currently above threshold" state, read and
+flipped on a confirmed edge, so a value hovering at `threshold` -- or
+oscillating within the hysteresis band (`ai_affect_threshold_hysteresis`)
+without ever leaving it -- cannot refire the same edge twice; only a
+genuine exit and re-entry of the band fires a new edge. Event emission
 (range-owned scratch, deterministic capped merge) mirrors
 `PerceptionSystem.mergePerceptionEvents`, except up to four events can fire
 per row per step (one per independent drive). A dedicated `ai-affect` bench

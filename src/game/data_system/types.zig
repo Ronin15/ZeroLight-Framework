@@ -537,7 +537,10 @@ pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
 /// Rising/falling-edge threshold-crossing band: a drive must fall below
 /// `threshold - ai_affect_threshold_hysteresis` before a later rise back past
 /// `threshold` counts as a new rising edge, so a value hovering at `threshold`
-/// does not flap. The only global affect tunable — baselines, decay rates,
+/// does not flap. Enforced as a true Schmitt trigger via `AiAffect`'s
+/// persisted `above_threshold_mask` bit per drive (see `checkThresholdCrossing`
+/// in `systems/affect.zig`), not a stateless comparison against this step's
+/// previous value. The only global affect tunable — baselines, decay rates,
 /// and thresholds themselves are all per-entity (see `AiAffect`).
 pub const ai_affect_threshold_hysteresis: f32 = 0.05;
 
@@ -546,8 +549,14 @@ pub const ai_affect_threshold_hysteresis: f32 = 0.05;
 /// speed, and rising-edge threshold. Cold fields (baseline_*, decay_rate_*,
 /// threshold_*) are author-set tunables preserved across a retune, mirroring
 /// `AiPerception`'s cold/hot split — `AiAffectStore.set` touches only these.
-/// Hot fields (fear/curiosity/aggression/fatigue) are `AffectSystem`'s live
-/// per-step appraisal output, each clamped to `[0, 1]`.
+/// Hot fields (fear/curiosity/aggression/fatigue/above_threshold_mask) are
+/// `AffectSystem`'s live per-step appraisal output: the four drive values are
+/// each clamped to `[0, 1]`; `above_threshold_mask` is the persisted Schmitt-
+/// trigger state that makes threshold-crossing detection stateful across
+/// steps (see `ai_affect_threshold_hysteresis`) — bit `@intFromEnum(drive)`
+/// is set while that drive is above its rising threshold. Not user-facing
+/// validated: any combination of the low 4 bits is valid internal state, and
+/// the upper 4 bits are unused.
 ///
 /// `decay_rate_*` and `threshold_*` are deliberately per-entity, not a single
 /// global constant: a future data-driven archetype needs per-personality decay
@@ -569,6 +578,7 @@ pub const AiAffect = struct {
     curiosity: f32 = 0,
     aggression: f32 = 0,
     fatigue: f32 = 0,
+    above_threshold_mask: u8 = 0,
 };
 
 const default_ai_affect_decay_rate: f32 = 0.05;
@@ -597,6 +607,7 @@ pub const ConstAiAffectSlice = struct {
     curiosity: ConstHotF32Slice,
     aggression: ConstHotF32Slice,
     fatigue: ConstHotF32Slice,
+    above_threshold_mask: []const u8,
 };
 
 /// Mutable view for `AffectSystem`'s per-step appraisal writes. Cold tunables
@@ -620,6 +631,7 @@ pub const AiAffectSlice = struct {
     curiosity: HotF32Slice,
     aggression: HotF32Slice,
     fatigue: HotF32Slice,
+    above_threshold_mask: []u8,
 };
 
 pub const WorldLevelCommand = struct {
