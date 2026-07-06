@@ -5,6 +5,7 @@
 const std = @import("std");
 const logging = @import("../core/logging.zig");
 const ai = @import("ai.zig");
+const ai_memory = @import("ai_memory.zig");
 const collision = @import("collision.zig");
 const collision_response = @import("collision_response.zig");
 const movement = @import("movement.zig");
@@ -25,6 +26,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     movement.group,
     particles.group,
     ai.group,
+    ai_memory.group,
     collision.group,
     collision.sparse_group,
     collision_response.solid_group,

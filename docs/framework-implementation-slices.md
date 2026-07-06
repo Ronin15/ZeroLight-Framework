@@ -2308,6 +2308,11 @@ memory is still fresh. Scope freeze/resync falls out of reusing the same
 cognition-scope dense-index list perception/AI already gate on: a demoted
 entity is simply not gathered, so its memory row is untouched until it
 re-enters scope. The `memory_expired` event stays deferred (see Checklist).
+A dedicated `ai-memory` bench group (`src/benchmarks/ai_memory.zig`) now
+isolates decay throughput (`processed_count`) from event-driven ring refresh
+(`refreshed_count`, injected for every 8th agent per step). Measured
+(`--profile quick`, 10,000 agents): serial-direct 802.76us, best-threaded
+(thread-large-range) 506.09us (1.58x).
 
 ## Slice 31: AI Affect And Emotion Drives
 
