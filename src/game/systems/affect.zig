@@ -1041,6 +1041,45 @@ test "Schmitt trigger does not refire a rising edge while oscillating in-band, a
     try expectCrossingCounts(events.mergedItems(), 1, 0);
 }
 
+test "a threshold just above the hysteresis floor still rises and falls, not permanently latched" {
+    // validateAiAffect rejects threshold_* at or below ai_affect_threshold_hysteresis
+    // (checkThresholdCrossing's falling bound, threshold - hysteresis, would never be
+    // reachable by a [0, 1]-clamped drive otherwise). This proves the smallest value it
+    // still accepts is a real, working Schmitt trigger: it rises, falls, and can rise
+    // again, rather than latching above_threshold_mask forever after the first rise.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    const low_threshold: f32 = ai_affect_threshold_hysteresis + 0.02;
+    const entity = try addAgentWithAffect(&data, .{}, .{
+        .baseline_fear = low_threshold + 0.01,
+        .decay_rate_fear = 1.0,
+        .threshold_fear = low_threshold,
+    });
+
+    var sys = AffectSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    // Rises: baseline sits just above threshold.
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 1, 0);
+
+    // Falls: baseline drops to 0, which is still strictly below threshold - hysteresis
+    // even though threshold itself is barely above the floor.
+    try data.setAiAffect(entity, .{ .baseline_fear = 0, .decay_rate_fear = 1.0, .threshold_fear = low_threshold });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 0, 1);
+
+    // Rises again: proves the bit was genuinely cleared, not permanently latched.
+    try data.setAiAffect(entity, .{ .baseline_fear = low_threshold + 0.01, .decay_rate_fear = 1.0, .threshold_fear = low_threshold });
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try expectCrossingCounts(events.mergedItems(), 1, 0);
+}
+
 test "serial and threaded updates are byte-identical" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 

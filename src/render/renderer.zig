@@ -157,12 +157,18 @@ pub const Renderer = struct {
     /// to avoid an import cycle).
     pub const k_max_tilemap_window_layers: usize = 32;
 
-    /// Defensive cap on separate tilemap composite draw calls in one frame. In
-    /// the shipped default config this always resolves to 1 (only the active
+    /// Cap on separate tilemap composite draw calls in one frame. In the
+    /// shipped default config this always resolves to 1 (only the active
     /// level's own actor depth is ever an interleave point); more buckets only
     /// appear when something (a sparse tile, a dynamic depth) needs to render
-    /// sandwiched between two dense layers this frame.
-    pub const k_max_dense_composite_draws: usize = 8;
+    /// sandwiched between two dense layers this frame. Sized to the
+    /// mathematically-proven worst case rather than a defensive guess:
+    /// `partitionDenseCompositeBuckets` can never produce more buckets than
+    /// submitted dense layers, which `world_system.zig` already hard-caps at
+    /// `k_max_dense_submit_stack_cap` — tied to that constant by a comptime
+    /// assert in that file (which already imports this module, avoiding an
+    /// import cycle).
+    pub const k_max_dense_composite_draws: usize = 32;
 
     /// One tilemap draw's composited layer window: up to
     /// `k_max_tilemap_window_layers` element offsets into a combined tile-data
@@ -171,15 +177,6 @@ pub const Renderer = struct {
     pub const TilemapWindowLayers = struct {
         count: u8 = 0,
         offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
-
-        /// Convenience constructor for the common one-layer case (a single dense
-        /// layer with nothing to sandwich against this frame).
-        pub fn single(offset: u32) TilemapWindowLayers {
-            var window = TilemapWindowLayers{};
-            window.count = 1;
-            window.offsets[0] = offset;
-            return window;
-        }
     };
 
     /// Fills `params.layer_meta`/`layer_offsets` from `window` right before the
@@ -1908,15 +1905,97 @@ test "applyWindowLayers fills layer count and topmost-first offsets" {
     try std.testing.expectEqual(@as(u32, 300), params.layer_offsets[2]);
 }
 
-test "applyWindowLayers single-layer constructor matches manual window" {
-    var params = TilemapParams{
-        .grid = .{ 1, 1, 1, 1 },
-        .atlas = .{ 1, 1, 1, 1 },
-    };
-    Renderer.applyWindowLayers(&params, Renderer.TilemapWindowLayers.single(42));
+// A minimal 6-vertex quad; `appendStaticTilemapSpan` only counts and stores
+// vertices, so their contents do not matter for these tests.
+fn testStaticQuad() [6]Position {
+    return [_]Position{.{ 0, 0 }} ** 6;
+}
 
-    try std.testing.expectEqual(@as(i32, 1), params.layer_meta[0]);
-    try std.testing.expectEqual(@as(u32, 42), params.layer_offsets[0]);
+fn testRenderer(allocator: std.mem.Allocator) Renderer {
+    return .{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+}
+
+fn deinitStaticGeometryTestRenderer(renderer: *Renderer, allocator: std.mem.Allocator) void {
+    renderer.static_positions.deinit(allocator);
+    renderer.static_uvs.deinit(allocator);
+    renderer.static_colors.deinit(allocator);
+    renderer.static_groups.deinit(allocator);
+    renderer.batch.deinit();
+}
+
+test "appendStaticTilemapSpan assigns sequential window slots per static-geometry cycle" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer deinitStaticGeometryTestRenderer(&renderer, allocator);
+
+    const positions = testStaticQuad();
+    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
+    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
+    const texture = testTextureId(0, 1);
+
+    renderer.beginStaticGeometry();
+    for (0..3) |i| {
+        var window = Renderer.TilemapWindowLayers{};
+        window.count = 1;
+        window.offsets[0] = @intCast(i);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
+    for (0..3) |i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), renderer.static_groups.items[i].window_slot);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), renderer.tilemap_window_layers[i].offsets[0]);
+    }
+
+    // A rebuild's beginStaticGeometry resets the slot count -- no leaked slots
+    // carry over from the prior cycle.
+    renderer.beginStaticGeometry();
+    try std.testing.expectEqual(@as(usize, 0), renderer.tilemap_window_layer_count);
+
+    var window = Renderer.TilemapWindowLayers{};
+    window.count = 1;
+    window.offsets[0] = 99;
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @enumFromInt(0), window);
+    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
+    try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
+}
+
+test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composite-draw cap" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer deinitStaticGeometryTestRenderer(&renderer, allocator);
+
+    const positions = testStaticQuad();
+    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
+    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
+    const texture = testTextureId(0, 1);
+    const window = Renderer.TilemapWindowLayers{ .count = 1 };
+
+    renderer.beginStaticGeometry();
+    for (0..Renderer.k_max_dense_composite_draws) |i| {
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+    }
+    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
+
+    try std.testing.expectError(
+        error.TooManyTilemapWindowDraws,
+        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @enumFromInt(0), window),
+    );
+    // The fixed-size table stayed exactly at the cap; the failed call past it
+    // neither corrupted it nor grew past bounds.
+    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
 }
 
 test "merge draw list stays allocation-free when reserved to combined size" {

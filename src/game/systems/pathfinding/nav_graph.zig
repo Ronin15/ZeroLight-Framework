@@ -1562,6 +1562,9 @@ pub const PortalComponentSort = struct {
 
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
 const ObstacleWorldRect = @import("../../data_system.zig").ObstacleWorldRect;
+const EntityId = @import("../../data_system.zig").EntityId;
+const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
+const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
 const abstractCapacity = test_support.abstractCapacity;
 const baselineCapacity = test_support.baselineCapacity;
@@ -2702,6 +2705,73 @@ test "entity-obstacle rect nav update is allocation-free at steady state" {
     const rect = data.staticObstacleWorldRect(entity).?;
     try system.markNavObstacleRectDirty(0, rect);
     const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
+// Commits a single set_movement_body structural command through `frame` (real
+// structural-commit -> event pipeline, mirroring how the game state drives it) and
+// applies it, so the produced component_changed event carries real
+// old/new_obstacle_world_rect fields resolved from DataSystem, not a hand-built event.
+fn commitMovedStaticObstacle(frame: *SimulationFrame, data: *DataSystem, entity: EntityId, position: math.Vec2) !void {
+    frame.beginStep();
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_movement_body = .{
+        .entity = entity,
+        .body = .{ .position = position, .previous_position = position },
+    } });
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(data);
+}
+
+test "reactToPostCommitNavEvents appends both old and new obstacle spans for one moved static obstacle, allocation-free at steady state (FailingAllocator)" {
+    // The steady-state test above only ever exercises ONE markNavObstacleRectDirty append
+    // per applyBufferedNavUpdates call (a create, then a destroy), called directly rather
+    // than through reactToPostCommitNavEvents. reactToPostCommitNavEvents's component_changed
+    // handling appends up to TWO spans per event -- old_obstacle_world_rect and
+    // new_obstacle_world_rect -- whenever a moving entity stays a static nav obstacle across
+    // the change, so this drives that real 2-appends-in-one-batch case through the actual
+    // structural-commit -> event -> react pipeline.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+
+    const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    // Warmup: move the obstacle once through the real pipeline (2 appends in one batch)
+    // so nav_dirty_cell_spans reaches its real steady-state high-water mark, along with
+    // every other buffer reactToPostCommitNavEvents touches, before the failing-allocator
+    // proof below.
+    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 224, .y = 224 });
+    const warmup_stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), warmup_stats.incremental_rebuilds);
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    // Move it again: a second single-batch, 2-append occurrence must not allocate.
+    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 64, .y = 64 });
+    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
 
     system.graph.allocator = original;

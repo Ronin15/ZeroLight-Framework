@@ -515,7 +515,9 @@ pub const NavGrid = struct {
         return null;
     }
 };
-pub const StaticBodyRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+// Same AABB shape data_system's ObstacleWorldRect aliases: both derive from
+// math.aabbFromOffsetSize so the two never drift apart.
+pub const StaticBodyRect = math.Aabb;
 
 // Index of `target` in a collision-bounds entity column, or null if absent. Relocated here
 // from the pathfinding types leaf: this is its only consumer (staticBodyWorldRect).
@@ -530,9 +532,11 @@ fn boundsEntityIndex(entities: []const EntityId, target: EntityId) ?usize {
 // and staticBodyWorldRect so the full mark and the incremental cell-coverage test derive
 // identical offset/size geometry.
 fn rectFromBounds(px: f32, py: f32, bounds: anytype, idx: usize) StaticBodyRect {
-    const min_x = px + bounds.offset_x[idx];
-    const min_y = py + bounds.offset_y[idx];
-    return .{ .min_x = min_x, .min_y = min_y, .max_x = min_x + bounds.size_x[idx], .max_y = min_y + bounds.size_y[idx] };
+    return math.aabbFromOffsetSize(
+        .{ .x = px, .y = py },
+        .{ .x = bounds.offset_x[idx], .y = bounds.offset_y[idx] },
+        .{ .x = bounds.size_x[idx], .y = bounds.size_y[idx] },
+    );
 }
 
 // World-space AABB of `entity`'s static collision body, or null if it has no bounds

@@ -10,6 +10,7 @@
 //! rather than living as DataSystem methods, keeping the wiring flat.
 
 const std = @import("std");
+const math = @import("../../core/math.zig");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Component = types.Component;
@@ -778,4 +779,87 @@ test "StructuralCapacityNeeds.validateLimits rejects an ai_affects count beyond 
 
     needs.ai_affects = @as(usize, std.math.maxInt(u32)) + 1;
     try std.testing.expectError(error.TooManyAiAffectRows, needs.validateLimits());
+}
+
+// Test-local capturing change sink: NullStructuralChangeSink (used by every other test in
+// this file) discards the StructuralChange payload entirely, so it cannot exercise the
+// obstacle-rect fields below. Grows via the real allocator (test-only; production commits
+// always reserve their own sink ahead of mutation, e.g. SimulationFrame's StructuralChangeSink).
+const CapturingChangeSink = struct {
+    changes: std.ArrayList(StructuralChange) = .empty,
+
+    fn record(self: *CapturingChangeSink, change: StructuralChange) void {
+        self.changes.append(std.testing.allocator, change) catch @panic("test allocation failure");
+    }
+
+    fn deinit(self: *CapturingChangeSink) void {
+        self.changes.deinit(std.testing.allocator);
+    }
+};
+
+test "commitStructuralCommands emits obstacle world rects across create, move, and destroy of a static nav obstacle" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var sink = CapturingChangeSink{};
+    defer sink.deinit();
+
+    const position = math.Vec2{ .x = 10, .y = 20 };
+    const offset = math.Vec2{ .x = 1, .y = 2 };
+    const size = math.Vec2{ .x = 8, .y = 4 };
+    const template = EntityTemplate{
+        .movement_body = .{ .position = position, .previous_position = position },
+        .collision_bounds = .{ .offset = offset, .size = size },
+        .collision_response = .{ .mobility = .static },
+    };
+
+    _ = try applyStructuralCommandsWithChangeSink(&data, &.{.{ .create_entity = template }}, &sink);
+
+    const expected_rect = ObstacleWorldRect{
+        .min_x = position.x + offset.x,
+        .min_y = position.y + offset.y,
+        .max_x = position.x + offset.x + size.x,
+        .max_y = position.y + offset.y + size.y,
+    };
+
+    var created_entity: ?EntityId = null;
+    var create_new_rect: ?ObstacleWorldRect = null;
+    for (sink.changes.items) |change| {
+        switch (change) {
+            .entity_created => |entity| created_entity = entity,
+            .component_changed => |changed| {
+                if (changed.component == .collision_response) create_new_rect = changed.new_obstacle_world_rect;
+            },
+            else => {},
+        }
+    }
+    const entity = created_entity orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(expected_rect, create_new_rect orelse return error.TestExpectedEqual);
+
+    sink.changes.clearRetainingCapacity();
+
+    const moved_position = math.Vec2{ .x = 100, .y = 200 };
+    _ = try applyStructuralCommandsWithChangeSink(&data, &.{.{ .set_movement_body = .{
+        .entity = entity,
+        .body = .{ .position = moved_position, .previous_position = moved_position },
+    } }}, &sink);
+
+    const expected_new_rect = ObstacleWorldRect{
+        .min_x = moved_position.x + offset.x,
+        .min_y = moved_position.y + offset.y,
+        .max_x = moved_position.x + offset.x + size.x,
+        .max_y = moved_position.y + offset.y + size.y,
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), sink.changes.items.len);
+    const move_change = sink.changes.items[0].component_changed;
+    try std.testing.expectEqual(expected_rect, move_change.old_obstacle_world_rect orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(expected_new_rect, move_change.new_obstacle_world_rect orelse return error.TestExpectedEqual);
+
+    sink.changes.clearRetainingCapacity();
+
+    _ = try applyStructuralCommandsWithChangeSink(&data, &.{.{ .destroy_entity = entity }}, &sink);
+    try std.testing.expectEqual(@as(usize, 1), sink.changes.items.len);
+    const destroy_change = sink.changes.items[0].entity_destroyed;
+    try std.testing.expectEqual(expected_new_rect, destroy_change.obstacle_world_rect orelse return error.TestExpectedEqual);
 }

@@ -406,10 +406,7 @@ pub fn collectDynamicRecords(
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
-    const max_world_level: u16 = if (scene.world.levelCount() == 0)
-        0
-    else
-        @intCast(scene.world.levelCount() - 1);
+    const max_world_level: u16 = scene.world.maxLevelIndex();
     // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
     // align with movement_index; has_primitive_visual skips movement-only rows
     // before the deferred slot resolve in renderCollectIndicesForMovement.

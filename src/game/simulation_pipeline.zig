@@ -8,7 +8,6 @@
 //! global scheduler or dynamic system registry.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const c = @import("../platform/sdl.zig").c;
@@ -142,9 +141,10 @@ fn stageContract(stage: StageId) StageContract {
     };
 }
 
-/// The pipeline's concrete fixed-step stage order. `update()` marks each stage
-/// via `stage_trace` at its real call site so the order-trace test below can
-/// prove this declared order matches what actually runs.
+/// The pipeline's concrete fixed-step stage order. Reads-before-writes ordering
+/// is enforced at comptime below; ordering it cannot see (e.g. two stages that
+/// share no `PipelineResource`) is proven by causal-effect tests further down
+/// in this file, the same technique the other stage-order tests use.
 const stage_order = [_]StageId{
     .dig_world_edit,
     .scope_advance_and_ai_gather,
@@ -178,27 +178,6 @@ comptime {
         produced.setUnion(contract.writes);
     }
 }
-
-/// Test-only record of the stage order `update()` actually ran, so a test can
-/// assert it matches `stage_order`. Zero-cost outside tests.
-const StageTrace = if (builtin.is_test) struct {
-    order: [stage_order.len]StageId = undefined,
-    count: usize = 0,
-
-    fn mark(self: *StageTrace, stage: StageId) void {
-        self.order[self.count] = stage;
-        self.count += 1;
-    }
-
-    fn slice(self: *const StageTrace) []const StageId {
-        return self.order[0..self.count];
-    }
-} else struct {
-    fn mark(_: *StageTrace, _: StageId) void {}
-    fn slice(_: *const StageTrace) []const StageId {
-        return &.{};
-    }
-};
 
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
@@ -391,7 +370,6 @@ pub const SimulationPipeline = struct {
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
-    stage_trace: StageTrace = .{},
     /// See `SimulationPipelineConfig.perception_max_events_per_step`.
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
@@ -601,12 +579,6 @@ pub const SimulationPipeline = struct {
         self.movement.syncPreviousPositions(&movement_slice);
     }
 
-    /// Test-only: the stage order `update()` actually ran this step, for
-    /// asserting it matches the declared `stage_order` contract.
-    fn debugStageOrder(self: *const SimulationPipeline) []const StageId {
-        return self.stage_trace.slice();
-    }
-
     /// Runs the current full-active fixed-step stage order and returns stage
     /// stats. Real scoped filtering is intentionally deferred until world/chunk
     /// visibility data exists.
@@ -614,11 +586,9 @@ pub const SimulationPipeline = struct {
         const data = context.data;
         const frame = context.frame;
 
-        self.stage_trace = .{};
         frame.phase = .processors;
         // Player-authored world edit. Runs first; its world_tile_changed event is
         // deferred and re-masks navigation in merge_outputs regardless of order.
-        self.stage_trace.mark(.dig_world_edit);
         try self.dig.process(context.world, data, context.player.*, frame);
 
         // Backbone scope pass. Advance the stagger clock, derive the camera
@@ -629,7 +599,6 @@ pub const SimulationPipeline = struct {
         // step (the body's current pre-move cell). Movement/collision gate on tier
         // only (no chunk filter), so they keep running off-screen; cognition gates
         // on the halo + stagger.
-        self.stage_trace.mark(.scope_advance_and_ai_gather);
         self.scope.advanceStep();
         const cognition_region: ?ActiveRegion = context.world.cognitionActiveRegion(cognition_halo_chunks);
         const stagger_step = self.scope.staggerStep();
@@ -643,7 +612,6 @@ pub const SimulationPipeline = struct {
         // row `i` and AiSystem row `i` refer to the same agent (see spatial_index.zig
         // and ai.zig's cross-file population-domain contract). AI separation queries
         // it read-only below; future perception stages will reuse it too.
-        self.stage_trace.mark(.spatial_index_build);
         var spatial_index_timer = StageTimer.start();
         const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_indices });
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
@@ -664,7 +632,6 @@ pub const SimulationPipeline = struct {
         else
             null;
 
-        self.stage_trace.mark(.perception_update);
         var perception_timer = StageTimer.start();
         const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
             .scope_dense_indices = ai_indices,
@@ -678,7 +645,6 @@ pub const SimulationPipeline = struct {
         // step's perception acquisition events, over the same cognition-scoped
         // `ai_indices` population, before AI reads it for the cold-seek
         // retarget below.
-        self.stage_trace.mark(.ai_memory_update);
         var ai_memory_timer = StageTimer.start();
         const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
             .scope_dense_indices = ai_indices,
@@ -691,7 +657,6 @@ pub const SimulationPipeline = struct {
         // ai_memory (it reads their this-step hot columns) and before
         // AI/arbitration would read the resulting drives -- arbitration does
         // not exist yet, this is a forward seam only, not implemented here.
-        self.stage_trace.mark(.affect_update);
         var affect_timer = StageTimer.start();
         const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
             .scope_dense_indices = ai_indices,
@@ -709,7 +674,6 @@ pub const SimulationPipeline = struct {
         else
             math.Vec2{ .x = 400, .y = 225 };
 
-        self.stage_trace.mark(.ai_decide);
         var ai_timer = StageTimer.start();
         const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
@@ -730,12 +694,10 @@ pub const SimulationPipeline = struct {
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
-        self.stage_trace.mark(.steering_update);
         var steering_timer = StageTimer.start();
         const steering_stats = try self.steering.update(data, frame, context.thread_system, &self.pathfinding, .{});
         steering_timer.stop(context.perf, .pipeline_steering);
 
-        self.stage_trace.mark(.pathfinding_update);
         var pathfinding_timer = StageTimer.start();
         // Drive elastic pathfinding capacity off the live steering-agent crowd (the
         // entities that consume paths), so pools grow for battles and shrink after.
@@ -743,7 +705,6 @@ pub const SimulationPipeline = struct {
         const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, path_agent_count, context.thread_system, .{});
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
 
-        self.stage_trace.mark(.apply_ai_movement_intents);
         var apply_intents_timer = StageTimer.start();
         applyAiMovementIntents(data, frame);
         apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
@@ -752,11 +713,9 @@ pub const SimulationPipeline = struct {
         // integrates, on- or off-screen. Null = full-active warm SIMD range. Movement
         // also derives each integrated body's chunk in-pass via chunk_grid, so chunk
         // stays exact every step with no separate recompute.
-        self.stage_trace.mark(.movement_scope_gather);
         const movement_scope_indices = (try self.scope.gatherMovementBodyIndices(data, context.thread_system, .{})).indices;
         const scope_columns = data.scopeColumnsSlice();
         var movement_slice = data.movementBodySlice();
-        self.stage_trace.mark(.movement_integrate);
         var movement_timer = StageTimer.start();
         const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{
             .scope_dense_indices = movement_scope_indices,
@@ -771,7 +730,6 @@ pub const SimulationPipeline = struct {
         });
         movement_timer.stop(context.perf, .pipeline_movement);
 
-        self.stage_trace.mark(.bounds_and_tile_gate);
         var clamp_timer = StageTimer.start();
         clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
         try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
@@ -786,16 +744,13 @@ pub const SimulationPipeline = struct {
 
         // Collision also gates on tier only (no chunk filter): off-screen entities
         // keep colliding with geometry. Null = full-active.
-        self.stage_trace.mark(.collision_scope_gather);
         const collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(data, context.thread_system, .{})).indices;
-        self.stage_trace.mark(.collision_detect);
         var collision_timer = StageTimer.start();
         const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{
             .scope_dense_indices = collision_scope_indices,
         });
         collision_timer.stop(context.perf, .pipeline_collision);
 
-        self.stage_trace.mark(.collision_respond);
         var collision_response_timer = StageTimer.start();
         const collision_response_stats = try self.collision_response.update(data, frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
@@ -805,7 +760,6 @@ pub const SimulationPipeline = struct {
         // the player and NPCs route through `DigController.applyEntityPlaneTraversal`
         // so falls carve their landing cell identically; a fall's tile change
         // re-masks navigation post-commit.
-        self.stage_trace.mark(.plane_traversal);
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
         try applyNpcPlaneTraversal(&self.dig, context.world, data, frame);
 
@@ -815,7 +769,6 @@ pub const SimulationPipeline = struct {
         // Uses the raw visible region (not the cognition halo) so all four bands
         // are measured from the same origin, anchored at the camera/player level so
         // off-level entities demote. Queues nothing when no tier changed.
-        self.stage_trace.mark(.tier_policy);
         var visible_region = context.world.visibleChunkRegion();
         if (visible_region) |*region| region.level = context.player.current_level;
         _ = try self.scope.queueTierChanges(data, visible_region, &frame.structural_commands, context.thread_system, .{});
@@ -1074,30 +1027,63 @@ test "pipeline updates full active player-only state through serial path" {
     try std.testing.expectEqual(@as(usize, 0), frame.contacts.mergedItems().len);
 }
 
-test "pipeline stage order matches its declared ordering contract" {
+test "pipeline commits the dig stage's world edit before plane traversal reads it in the same step" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // `dig_world_edit` and `plane_traversal` share no `PipelineResource` (dig
+    // authors the tile change directly on the borrowed `WorldSystem`, not a
+    // frame-tracked resource), so the comptime reads-before-writes check above
+    // cannot see this dependency. This test proves the real call-site order
+    // still runs dig before plane traversal, the same causal-effect technique
+    // the ai_memory/affect ordering tests below use.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 1,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 1,
-    };
-    defer world.deinit();
+    player.current_level = 0;
+    // Player stands at cell (5,3) facing right, so this step's dig punches a
+    // hole at (6,3) -- the same cell an NPC crosses into this step.
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    try std.testing.expect(!world.denseFloorIsEmpty(0, 6, 3));
+
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setWorldLevel(npc, 0);
+    try data.setSimulationTier(npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    const dig_config = try DigConfig.fromMeta(&meta);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
+        .dig = dig_config,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -1111,6 +1097,7 @@ test "pipeline stage order matches its declared ordering contract" {
     defer pipeline.deinit();
 
     frame.beginStep();
+    frame.dig_intent = .hole;
     _ = try pipeline.update(.{
         .data = &data,
         .frame = &frame,
@@ -1122,7 +1109,14 @@ test "pipeline stage order matches its declared ordering contract" {
         .bounds_height = 450,
     });
 
-    try std.testing.expectEqualSlices(StageId, &stage_order, pipeline.debugStageOrder());
+    // The NPC crossed from (5,3) into the just-dug hole cell (6,3) and fell to
+    // level 1 within this same step. That is only reachable if dig_world_edit's
+    // tile change committed to `WorldSystem` before plane_traversal read that
+    // cell's floor state this step -- a misordering would leave the tile solid
+    // until next step and the NPC would not fall yet.
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {

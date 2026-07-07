@@ -637,11 +637,20 @@ capacity preflight. Cell-localizable edits — blocking `world_tile_changed` /
 `world_obstacle_changed` changes (only when `old_blocks_movement !=
 new_blocks_movement`) — are forwarded to the system-owned dirty buffer via
 `pipeline.markNavDirty` (one entry per changed cell). Entity-driven obstacle changes
-do NOT carry a resolvable cell (a destroyed entity's footprint is gone), so they
-forward `pipeline.markNavLevelDirty(0)` instead — a whole-level dirty request that
-re-derives every chunk on level 0 (the only level sourcing collision bodies) from the
-world. `pipeline.applyNavUpdates` coalesces the buffered work to the set of touched
-chunks (or every chunk on a whole-level-dirty level), RE-DERIVES each touched chunk's
+(`component_changed` on `movement_body`/`collision_bounds`/`collision_response`, and
+`entity_destroyed`) instead carry an optional `ObstacleWorldRect` — the changed
+entity's world-space collision AABB, before and/or after the change, when it was/is a
+static navigation obstacle. `PathfindingSystem` resolves that rect to a nav-cell span
+via `markNavObstacleRectDirty` and patches only the affected chunks, the same
+incremental mechanism tile edits already use, instead of invalidating the whole level.
+`pipeline.markNavLevelDirty(0)` — a whole-level dirty request that re-derives every
+chunk on level 0 (the only level sourcing collision bodies) from the world — is only a
+defensive fallback for the (stated-unreachable) case where the carried rect is null:
+`isStaticNavigationObstacle` requires the same components the rect is derived from, so
+that fallback logs a warn rather than silently rebuilding the whole level.
+`pipeline.applyNavUpdates` coalesces the buffered work to the set of touched chunks
+(resolved obstacle-rect spans, plus every chunk on any whole-level-dirty level),
+RE-DERIVES each touched chunk's
 blocked mask from the world WHOLE-CHUNK (so a coalesced rect, a large multi-actor
 batch, or a cell-less entity change can never leave a cell stale against the world),
 recomputes those chunks' components, and patches the chunk-portal abstract graph once

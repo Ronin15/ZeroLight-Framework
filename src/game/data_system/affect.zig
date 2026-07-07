@@ -16,6 +16,7 @@ const AiAffect = types.AiAffect;
 const ConstAiAffectSlice = types.ConstAiAffectSlice;
 const AiAffectSlice = types.AiAffectSlice;
 const hotStoreCapacity = types.hotStoreCapacity;
+const ai_affect_threshold_hysteresis = types.ai_affect_threshold_hysteresis;
 
 pub fn validateAiAffect(affect: AiAffect) !void {
     const baselines = [_]f32{ affect.baseline_fear, affect.baseline_curiosity, affect.baseline_aggression, affect.baseline_fatigue };
@@ -28,9 +29,16 @@ pub fn validateAiAffect(affect: AiAffect) !void {
         if (!std.math.isFinite(value) or value <= 0 or value > 1) return error.InvalidAiAffect;
     }
 
+    // Must clear ai_affect_threshold_hysteresis strictly: checkThresholdCrossing's falling
+    // edge fires when the drive drops below threshold - hysteresis, and the drive is
+    // clamped to [0, 1] (0 is reachable). At threshold == hysteresis that bound is exactly
+    // 0, which a clamped drive can equal but never fall strictly below, so the falling edge
+    // could still never fire -- above_threshold_mask would latch permanently after the
+    // first rising edge. Requiring strictly-greater keeps every valid threshold a real,
+    // working Schmitt trigger.
     const thresholds = [_]f32{ affect.threshold_fear, affect.threshold_curiosity, affect.threshold_aggression, affect.threshold_fatigue };
     for (thresholds) |value| {
-        if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidAiAffect;
+        if (!std.math.isFinite(value) or value <= ai_affect_threshold_hysteresis or value > 1) return error.InvalidAiAffect;
     }
 
     const hot_values = [_]f32{ affect.fear, affect.curiosity, affect.aggression, affect.fatigue };
@@ -237,6 +245,14 @@ test "validateAiAffect accepts defaults and rejects out-of-range or non-finite f
     try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .threshold_curiosity = 1.1 }));
     try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .threshold_aggression = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .threshold_fatigue = std.math.inf(f32) }));
+
+    // At or below ai_affect_threshold_hysteresis (0.05): threshold - hysteresis would be
+    // <= 0, so the falling edge could never fire against a [0, 1]-clamped drive (0 is
+    // reachable but not strictly-less-than-0).
+    try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .threshold_fear = 0.02 }));
+    try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .threshold_fear = ai_affect_threshold_hysteresis }));
+    // Just above the hysteresis floor is the smallest valid threshold.
+    try validateAiAffect(.{ .threshold_fear = ai_affect_threshold_hysteresis + 0.001 });
 
     try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .fear = -0.1 }));
     try std.testing.expectError(error.InvalidAiAffect, validateAiAffect(.{ .curiosity = 1.1 }));

@@ -287,8 +287,11 @@ pub const PathfindingSystem = struct {
         // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
         // grows (never drops) for an unusually large structural step.
         try self.nav_dirty_edits.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
-        // Same bound as nav_dirty_edits: one entity-driven obstacle rect per structural change.
-        try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
+        // 2x nav_dirty_edits's bound: reactToPostCommitNavEvents's component_changed handling
+        // appends up to two spans per structural change (old_obstacle_world_rect and
+        // new_obstacle_world_rect) whenever a moving entity stays a static nav obstacle
+        // across the change, not just one.
+        try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests * 2);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.

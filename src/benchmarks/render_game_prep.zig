@@ -797,29 +797,29 @@ test "render game prep fixture collects the record count expectedBenchCollectedR
     }
 }
 
-test "initFixture leaves no leak and no double-deinit on partial init failure (FailingAllocator)" {
-    // Calls initFixture directly rather than through runCaseWithConfig: that
-    // caller's own `defer { fixture.deinit(); ... }` runs unconditionally
-    // (even when `try initFixture(...)` returns an error), which would run a
-    // second deinit pass on top of whatever initFixture's own errdefers
-    // already cleaned up and mask exactly the bug this test targets. Driving
-    // initFixture directly with a stack-local Fixture keeps the two cleanup
-    // paths from ever compounding.
-    //
-    // Sweeps fail_index upward (matching the fail_index-sweep convention used
-    // by "simulation events drop diagnostic records when capacity cannot
-    // grow" in src/game/simulation.zig) until an allocation failure no longer
-    // occurs, so failure points both before and after tileset_meta/world are
-    // constructed get exercised: an early failure previously hit the blanket
-    // errdefer while those fields were still `undefined` (UB), and a later
-    // failure previously double-deinited them via the blanket errdefer plus
-    // their own narrow errdefers.
+// Calls initFixture directly rather than through runCaseWithConfig: that
+// caller's own `defer { fixture.deinit(); ... }` runs unconditionally (even
+// when `try initFixture(...)` returns an error), which would run a second
+// deinit pass on top of whatever initFixture's own errdefers already cleaned
+// up and mask exactly the bug this helper targets. Driving initFixture
+// directly with a stack-local Fixture keeps the two cleanup paths from ever
+// compounding.
+//
+// Sweeps fail_index upward (matching the fail_index-sweep convention used by
+// "simulation events drop diagnostic records when capacity cannot grow" in
+// src/game/simulation.zig) until an allocation failure no longer occurs, so
+// failure points both before and after tileset_meta/world are constructed get
+// exercised: an early failure previously hit the blanket errdefer while those
+// fields were still `undefined` (UB), and a later failure previously
+// double-deinited them via the blanket errdefer plus their own narrow
+// errdefers.
+fn expectInitFixtureLeakFreeUnderFailingAllocator(fixture_config: FixtureConfig) !void {
     const item_count: usize = 8;
     var fail_index: usize = 0;
     while (fail_index < 4096) : (fail_index += 1) {
         var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var fixture: Fixture = undefined;
-        if (initFixture(&fixture, failing_allocator.allocator(), std.testing.io, item_count, default_fixture_config)) |_| {
+        if (initFixture(&fixture, failing_allocator.allocator(), std.testing.io, item_count, fixture_config)) |_| {
             fixture.deinit();
             return;
         } else |err| {
@@ -827,4 +827,16 @@ test "initFixture leaves no leak and no double-deinit on partial init failure (F
         }
     }
     return error.NondeterministicMemoryUsage;
+}
+
+test "initFixture leaves no leak and no double-deinit on partial init failure (FailingAllocator)" {
+    try expectInitFixtureLeakFreeUnderFailingAllocator(default_fixture_config);
+}
+
+test "initFixture leaves no leak and no double-deinit on partial init failure with a deep player_level (FailingAllocator)" {
+    // default_fixture_config's player_level is 0, so it never runs initFixture's
+    // `addLevel` loop that backfills levels up to fixture_config.player_level.
+    // A deep player_level (matching runDenseDeepCase's bench_mid_player_level)
+    // exercises that loop's allocation/errdefer behavior under injected OOM too.
+    try expectInitFixtureLeakFreeUnderFailingAllocator(.{ .player_level = bench_mid_player_level });
 }

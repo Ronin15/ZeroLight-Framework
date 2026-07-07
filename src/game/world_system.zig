@@ -61,6 +61,14 @@ comptime {
     std.debug.assert(Renderer.k_max_tilemap_window_layers == k_max_dense_submit_stack_cap);
 }
 
+// `partitionDenseCompositeBuckets` can never produce more buckets than
+// submitted dense layers (one cut point consumes at least one layer), so the
+// renderer's composite-draw budget must cover the full submit-stack cap or
+// the bucket-count invariant it relies on breaks.
+comptime {
+    std.debug.assert(Renderer.k_max_dense_composite_draws >= k_max_dense_submit_stack_cap);
+}
+
 pub const TileFlags = packed struct(u8) {
     walkable: bool = false,
     blocks_movement: bool = false,
@@ -843,7 +851,7 @@ pub const WorldSystem = struct {
 
         if (submit_count > 0) {
             var buckets: [Renderer.k_max_dense_composite_draws]DenseCompositeBucket = undefined;
-            const bucket_count = try self.partitionDenseCompositeBuckets(
+            const bucket_count = self.partitionDenseCompositeBuckets(
                 submit_layers[0..submit_count],
                 interleave_depths,
                 &buckets,
@@ -885,9 +893,9 @@ pub const WorldSystem = struct {
     }
 
     fn storeSubmittedInterleaveDepths(self: *WorldSystem, interleave_depths: []const i32) void {
-        const count = @min(interleave_depths.len, self.submitted_interleave_depths.len);
-        @memcpy(self.submitted_interleave_depths[0..count], interleave_depths[0..count]);
-        self.submitted_interleave_count = count;
+        std.debug.assert(interleave_depths.len <= self.submitted_interleave_depths.len);
+        @memcpy(self.submitted_interleave_depths[0..interleave_depths.len], interleave_depths);
+        self.submitted_interleave_count = interleave_depths.len;
     }
 
     /// Cuts `submit_layers` (depth-ascending, deepest-first, per
@@ -896,14 +904,25 @@ pub const WorldSystem = struct {
     /// value falls strictly between two consecutive submitted layers' depths
     /// (or exactly at the shallower one, since nothing may draw between that
     /// pair once composited together). `interleave_depths` must be sorted
-    /// ascending. Writes bucket ranges into `out` and returns the count.
+    /// ascending and deduplicated (asserted). Writes bucket ranges into `out`
+    /// and returns the count. Every cut point consumes at least one submitted
+    /// layer, so `out`'s count can never exceed `submit_layers.len`, which is
+    /// itself hard-capped at `k_max_dense_submit_stack_cap` — the comptime
+    /// assert tying `Renderer.k_max_dense_composite_draws` to that same cap
+    /// makes `out.len` always sufficient, so overflow here is unreachable in
+    /// a correct build, not a runtime condition to degrade gracefully around.
     fn partitionDenseCompositeBuckets(
         self: *const WorldSystem,
         submit_layers: []const usize,
         interleave_depths: []const i32,
         out: []DenseCompositeBucket,
-    ) error{TooManyDenseCompositeDraws}!usize {
+    ) usize {
         if (submit_layers.len == 0) return 0;
+        if (std.debug.runtime_safety and interleave_depths.len > 1) {
+            for (1..interleave_depths.len) |i| {
+                std.debug.assert(interleave_depths[i] > interleave_depths[i - 1]);
+            }
+        }
         var bucket_count: usize = 0;
         var bucket_start: usize = 0;
         var interleave_index: usize = 0;
@@ -920,7 +939,7 @@ pub const WorldSystem = struct {
                 }
             }
             if (cut) {
-                if (bucket_count >= out.len) return error.TooManyDenseCompositeDraws;
+                std.debug.assert(bucket_count < out.len);
                 out[bucket_count] = .{ .start = bucket_start, .end = index };
                 bucket_count += 1;
                 bucket_start = index;
@@ -954,10 +973,7 @@ pub const WorldSystem = struct {
         active_level: u16,
         out: []usize,
     ) error{TooManyDenseLayers}!usize {
-        const max_world_level: u16 = if (self.levelCount() == 0)
-            0
-        else
-            @intCast(self.levelCount() - 1);
+        const max_world_level: u16 = self.maxLevelIndex();
         var submit_count: usize = 0;
         const layer_count = self.denseLayerCount();
         for (0..layer_count) |layer_index| {
@@ -1276,6 +1292,12 @@ pub const WorldSystem = struct {
 
     pub fn levelCount(self: *const WorldSystem) usize {
         return self.level_base_z.items.len;
+    }
+
+    /// The deepest valid level index, or 0 when there are no levels. Shared by
+    /// every window-membership check that needs `levelInWindow`'s upper bound.
+    pub fn maxLevelIndex(self: *const WorldSystem) u16 {
+        return if (self.levelCount() == 0) 0 else @intCast(self.levelCount() - 1);
     }
 
     /// Render/plane z baseline for a level. An actor whose `position_z` equals
@@ -3198,7 +3220,7 @@ test "partitionDenseCompositeBuckets returns a single bucket with no interleave 
     const count = try world.collectDenseSubmitLayers(0, &layers);
 
     var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &.{}, &buckets);
+    const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &.{}, &buckets);
 
     try std.testing.expectEqual(@as(usize, 1), bucket_count);
     try std.testing.expectEqual(@as(usize, 0), buckets[0].start);
@@ -3232,7 +3254,7 @@ test "partitionDenseCompositeBuckets splits off the ceiling layer at the active 
     // today's ceiling-vs-window split, now expressed as the general rule.
     const interleave = [_]i32{world.activeLevelActorDepth(2)};
     var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+    const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
     try std.testing.expectEqual(@as(usize, 3), buckets[0].end - buckets[0].start);
@@ -3267,7 +3289,7 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
     // shallowest layer. This is the case an active-level-only design would miss.
     const interleave = [_]i32{world.worldZForLevel(5, 0, .effect)};
     var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
-    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+    const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
 
     try std.testing.expectEqual(@as(usize, 2), bucket_count);
     try std.testing.expectEqual(@as(usize, 2), buckets[0].end - buckets[0].start);
@@ -3276,7 +3298,7 @@ test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a
     try std.testing.expectEqual(@as(u16, 4), world.denseLayerLevel(layers[buckets[1].start]));
 }
 
-test "partitionDenseCompositeBuckets returns TooManyDenseCompositeDraws past the composite-draw cap" {
+test "partitionDenseCompositeBuckets produces one bucket per cut point at the proven worst case, no fold or error" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = WorldSystem{
@@ -3285,34 +3307,39 @@ test "partitionDenseCompositeBuckets returns TooManyDenseCompositeDraws past the
         .height = 4,
         .tile_size = meta.tileSize(),
         .chunk_size_tiles = 2,
-        .render_window = .{ .levels_below = 8 },
+        .render_window = .{ .levels_below = 40 },
+        .max_dense_bands_per_level = 1,
     };
     defer world.deinit();
     try world.buildCatalog(&meta);
     const grass = try world.requireTileByName(&meta, "grass");
-    for (0..9) |level_index| {
+    for (0..k_max_dense_submit_stack_cap) |level_index| {
         const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
         _ = try world.addDenseLayer(level, 0, .floor, grass);
     }
 
     var layers: [k_max_dense_submit_stack_cap]usize = undefined;
     const count = try world.collectDenseSubmitLayers(0, &layers);
-    try std.testing.expectEqual(@as(usize, 9), count);
+    try std.testing.expectEqual(k_max_dense_submit_stack_cap, count);
 
     // One interleave point strictly between every consecutive submitted-layer
-    // pair (8 pairs across 9 layers) forces 9 buckets — one past the cap.
-    var interleave: [8]i32 = undefined;
-    for (0..8) |i| {
+    // pair: `submit_layers.len - 1` cut points, the mathematically-proven
+    // worst case bucket count `Renderer.k_max_dense_composite_draws` is now
+    // sized to cover exactly, so this never folds or errors even here.
+    var interleave: [k_max_dense_submit_stack_cap - 1]i32 = undefined;
+    for (0..k_max_dense_submit_stack_cap - 1) |i| {
         const deeper = world.denseLayerOrder(layers[i]).depth;
         const shallower = world.denseLayerOrder(layers[i + 1]).depth;
         interleave[i] = deeper + @divTrunc(shallower - deeper, 2);
     }
 
     var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
-    try std.testing.expectError(
-        error.TooManyDenseCompositeDraws,
-        world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets),
-    );
+    const bucket_count = world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+
+    try std.testing.expectEqual(k_max_dense_submit_stack_cap, bucket_count);
+    for (0..bucket_count) |i| {
+        try std.testing.expectEqual(@as(usize, 1), buckets[i].end - buckets[i].start);
+    }
 }
 
 test "buildWindowLayers reverses a bucket's deepest-first layers to topmost-first offsets" {

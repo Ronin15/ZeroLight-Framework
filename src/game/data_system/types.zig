@@ -541,7 +541,11 @@ pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
 /// persisted `above_threshold_mask` bit per drive (see `checkThresholdCrossing`
 /// in `systems/affect.zig`), not a stateless comparison against this step's
 /// previous value. The only global affect tunable — baselines, decay rates,
-/// and thresholds themselves are all per-entity (see `AiAffect`).
+/// and thresholds themselves are all per-entity (see `AiAffect`). `validateAiAffect`
+/// requires every `threshold_*` to be strictly greater than this value: at or below
+/// it, `threshold - ai_affect_threshold_hysteresis` is <= 0, a bound a drive clamped
+/// to `[0, 1]` can never fall strictly below, which would latch `above_threshold_mask`
+/// permanently after the first rising edge.
 pub const ai_affect_threshold_hysteresis: f32 = 0.05;
 
 /// Emotion-drive appraisal state: four independent drives (fear, curiosity,
@@ -734,8 +738,10 @@ fn metric(value: usize) u64 {
 
 /// World-space AABB of a static navigation obstacle's collision body, resolved from its
 /// movement body position plus collision bounds offset/size. Lets nav invalidation localize
-/// to the covered nav cells instead of re-deriving the whole level.
-pub const ObstacleWorldRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+/// to the covered nav cells instead of re-deriving the whole level. Same shape pathfinding's
+/// nav_grid.zig StaticBodyRect aliases: both derive from math.aabbFromOffsetSize so the two
+/// can never drift apart.
+pub const ObstacleWorldRect = math.Aabb;
 
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,

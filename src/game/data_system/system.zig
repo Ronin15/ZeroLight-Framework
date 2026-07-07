@@ -10,6 +10,7 @@
 //! own per-domain modules, mirroring pathfinding's system.zig + solve.zig split.
 
 const std = @import("std");
+const math = @import("../../core/math.zig");
 const types = @import("types.zig");
 const EntityId = types.EntityId;
 const Component = types.Component;
@@ -326,20 +327,14 @@ pub const DataSystem = struct {
     }
 
     /// World-space AABB of `id`'s collision body (movement body position plus collision
-    /// bounds offset/size), or null when either component is absent. Matches the rect math
-    /// pathfinding's nav_grid.zig derives from the same columns, so a caller can localize
-    /// nav invalidation to the covered cells without re-deriving the whole level.
+    /// bounds offset/size), or null when either component is absent. Uses the same
+    /// math.aabbFromOffsetSize formula pathfinding's nav_grid.zig derives from the same
+    /// columns, so a caller can localize nav invalidation to the covered cells without
+    /// re-deriving the whole level.
     pub fn staticObstacleWorldRect(self: *const DataSystem, id: EntityId) ?types.ObstacleWorldRect {
         const body = self.movementBodyConst(id) orelse return null;
         const bounds = self.collisionBoundsConst(id) orelse return null;
-        const min_x = body.position.x + bounds.offset.x;
-        const min_y = body.position.y + bounds.offset.y;
-        return .{
-            .min_x = min_x,
-            .min_y = min_y,
-            .max_x = min_x + bounds.size.x,
-            .max_y = min_y + bounds.size.y,
-        };
+        return math.aabbFromOffsetSize(body.position, bounds.offset, bounds.size);
     }
 
     pub fn clearRetainingCapacity(self: *DataSystem) void {

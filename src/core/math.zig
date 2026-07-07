@@ -9,6 +9,21 @@ pub const Vec2 = struct {
     y: f32 = 0,
 };
 
+/// Axis-aligned world-space rectangle (min/max corners). Shared AABB shape for
+/// static collision/nav-obstacle geometry so every consumer derives it from one
+/// formula instead of each re-deriving its own min/max math.
+pub const Aabb = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+
+/// World-space AABB from an origin position plus a local offset/size pair: the
+/// min corner is `origin + offset`, the max corner is the min corner plus `size`.
+/// Shared by static collision-body and nav-obstacle rect derivations so they can
+/// never drift apart.
+pub fn aabbFromOffsetSize(origin: Vec2, offset: Vec2, size: Vec2) Aabb {
+    const min_x = origin.x + offset.x;
+    const min_y = origin.y + offset.y;
+    return .{ .min_x = min_x, .min_y = min_y, .max_x = min_x + size.x, .max_y = min_y + size.y };
+}
+
 pub fn clamp(value: f32, min: f32, max: f32) f32 {
     if (value < min) return min;
     if (value > max) return max;
@@ -137,6 +152,14 @@ pub fn rotate2D(v: Vec2, angle: SinCos) Vec2 {
         .x = v.x * angle.cos - v.y * angle.sin,
         .y = v.x * angle.sin + v.y * angle.cos,
     };
+}
+
+test "aabbFromOffsetSize derives min/max corners from origin, offset, and size" {
+    const rect = aabbFromOffsetSize(.{ .x = 10, .y = 20 }, .{ .x = 1, .y = 2 }, .{ .x = 8, .y = 4 });
+    try std.testing.expectEqual(@as(f32, 11), rect.min_x);
+    try std.testing.expectEqual(@as(f32, 22), rect.min_y);
+    try std.testing.expectEqual(@as(f32, 19), rect.max_x);
+    try std.testing.expectEqual(@as(f32, 26), rect.max_y);
 }
 
 test "clamp keeps values inside bounds" {
