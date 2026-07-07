@@ -54,6 +54,13 @@ pub const level_z_step: i32 = 16;
 /// `maxDenseSubmitLayerCount`; overflow here is a defensive submit-time guard.
 pub const k_max_dense_submit_stack_cap: usize = 32;
 
+// The renderer's per-draw composited layer window must be able to hold every
+// layer this stack can ever submit in one frame; tied here (this file already
+// imports renderer.zig) rather than in renderer.zig, to avoid an import cycle.
+comptime {
+    std.debug.assert(Renderer.k_max_tilemap_window_layers == k_max_dense_submit_stack_cap);
+}
+
 pub const TileFlags = packed struct(u8) {
     walkable: bool = false,
     blocks_movement: bool = false,
@@ -273,11 +280,13 @@ pub const WorldSystem = struct {
 
     dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
     dense_tile_ids: std.ArrayList(TileId) = .empty,
-    // One renderer-owned tile-data storage buffer per dense layer, built from
-    // dense_tile_ids at load. World holds only the opaque handles; the renderer
-    // owns and releases the GPU buffers. The tilemap shader reads these directly
-    // so no per-tile vertex geometry is built for dense layers.
-    dense_layer_tile_buffers: std.ArrayList(TileDataId) = .empty,
+    // Single renderer-owned tile-data storage buffer holding every dense layer's
+    // cells concatenated, mirroring dense_tile_ids's flat layout. Built once from
+    // the whole array at load. World holds only the opaque handle; the renderer
+    // owns and releases the GPU buffer. Each layer's draw reads only its own
+    // slice via denseLayerOffset, so no per-tile vertex geometry is built for
+    // dense layers.
+    dense_tile_data_buffer: TileDataId = .invalid,
     // Per-cell tile-data edits queued by setDenseTile once a layer's storage buffer
     // exists, flushed in one batched copy pass at the render boundary. Empty (and
     // allocation-free) on frames with no tile changes. Invariant: drained every frame
@@ -286,6 +295,35 @@ pub const WorldSystem = struct {
     dense_tile_edits: std.ArrayList(TileDataEdit) = .empty,
 
     sparse_tiles: std.MultiArrayList(SparseTileRow) = .{},
+
+    // Reverse per-level index over `sparse_tiles`: one growable list of indices
+    // per level, indexed by level. Maintained eagerly (appended to) inside
+    // `addSparseTile` — the sole sparse-tile inserter, which never removes a
+    // tile and never changes a tile's level after insertion — so this needs no
+    // dirty flag or deferred rebuild. That matters because gameplay consumers
+    // (nav rebuild after a dig, the perception LOS-blocked cache) read it
+    // within the same fixed-step tick a tile is placed, well before the next
+    // `ensureRenderDepthIndex` render pass would run; a lazily-rebuilt index
+    // keyed off the render dirty flag would be stale for them. A future bulk
+    // sparse-tile insert path must maintain this the same way. Lets per-level
+    // consumers (levelBlocksMovement, NavGrid.markWorldObstacles, perception's
+    // blocked-cache rebuild) walk only one level's tiles instead of scanning
+    // every sparse tile in the world and filtering by level. Deliberately not
+    // shaped like `sparse_render_order` (one flat sorted array + range table):
+    // that shape requires a contiguous per-group run, which can only be kept
+    // contiguous by a full resort after every insert — exactly the O(n) full
+    // rescan this index exists to avoid. Grown lazily up to `level_index + 1`
+    // entries the first time a level gets a sparse tile; a level with no
+    // sparse tiles yet simply has no entry (the accessor treats that the same
+    // as an out-of-range level: an empty slice).
+    sparse_level_tiles: std.ArrayList(std.ArrayList(u32)) = .empty,
+
+    // Finer sibling of sparse_level_tiles: outer by level_index, middle by the
+    // level-local chunk index (chunkY*chunksX+chunkX, see
+    // `localChunkIndexForCell`), inner the sparse_tiles indices in that chunk.
+    // Same eager-maintenance contract as sparse_level_tiles (see above) —
+    // maintained by `addSparseTile` only, never removed from or resorted.
+    sparse_level_chunk_tiles: std.ArrayList(std.ArrayList(std.ArrayList(u32))) = .empty,
 
     // Derived render-walk index, rebuilt only when the dense-layer or sparse-tile
     // set changes (tracked by render_index_dirty), never per frame. render_depths
@@ -321,8 +359,8 @@ pub const WorldSystem = struct {
     // atlas params and the safe-build runtime-texture-match assert.
     atlas_texture: TextureDesc = .{ .width = 0, .height = 0 },
     // World-constant grid + atlas geometry for the tilemap fragment shader. Built
-    // once at init; every dense layer's quad reuses it (only the tile-data buffer
-    // differs per layer). See [[dense_layer_tile_buffers]] above.
+    // once at init; every dense layer's quad reuses it (only the per-draw cell
+    // offset into [[dense_tile_data_buffer]] differs per layer, see above).
     tilemap_params: TilemapParams = .{ .grid = .{ 0, 0, 0, 0 }, .atlas = .{ 0, 0, 0, 0 } },
     // The dense-layer tilemap quads need (re)submitting into the renderer's static
     // buffer: true at init and on a structural change (new dense layer). Unlike the
@@ -333,6 +371,18 @@ pub const WorldSystem = struct {
     // re-submit even without a structural edit. Sentinel forces the first submit.
     submitted_active_level: u16 = std.math.maxInt(u16),
     submitted_window: DenseLayerRenderWindow = .{},
+    // Last submitted interleave-depth set (sorted ascending, deduplicated by the
+    // caller): the depths this frame's composite-draw buckets were cut against.
+    // A change forces a re-submit even without a structural/level/window change,
+    // since a newly-registered interleave point (e.g. a sparse tile at a new
+    // depth becoming relevant) can change where the dense stack must split.
+    submitted_interleave_depths: [k_max_dense_submit_stack_cap]i32 = undefined,
+    submitted_interleave_count: usize = 0,
+    // Cached result from the last time `denseWindowDepthSpan` actually recomputed
+    // (rather than reusing this cache): valid exactly when `dense_quads_dirty`,
+    // `submitted_active_level`, and `submitted_window` still match the request,
+    // since those are the only things that can change the window's real content.
+    dense_window_depth_span: ?DenseWindowDepthSpan = null,
     render_window: DenseLayerRenderWindow = .{},
     max_dense_bands_per_level: u8 = 2,
     max_dense_tile_gpu_bytes: usize = 0,
@@ -517,9 +567,15 @@ pub const WorldSystem = struct {
         self.render_depths.deinit(self.allocator);
 
         self.sparse_tiles.deinit(self.allocator);
+        for (self.sparse_level_tiles.items) |*bucket| bucket.deinit(self.allocator);
+        self.sparse_level_tiles.deinit(self.allocator);
+        for (self.sparse_level_chunk_tiles.items) |*level_chunks| {
+            for (level_chunks.items) |*bucket| bucket.deinit(self.allocator);
+            level_chunks.deinit(self.allocator);
+        }
+        self.sparse_level_chunk_tiles.deinit(self.allocator);
 
         self.dense_tile_edits.deinit(self.allocator);
-        self.dense_layer_tile_buffers.deinit(self.allocator);
         self.dense_tile_ids.deinit(self.allocator);
         self.dense_layers.deinit(self.allocator);
         self.dense_bands_per_level.deinit(self.allocator);
@@ -550,6 +606,15 @@ pub const WorldSystem = struct {
     /// configured render window and per-level band cap.
     pub fn maxDenseSubmitLayerCount(self: *const WorldSystem) usize {
         return self.render_window.maxSubmitLayers(self.max_dense_bands_per_level);
+    }
+
+    /// Upper bound on dense tilemap composite draw calls submitted in one frame.
+    /// Actual bucket count is data-dependent (which depths need a sandwich point
+    /// this frame); this is the worst case the render-prep boundary reserves
+    /// static-geometry draw-list capacity for.
+    pub fn maxDenseSubmitDrawCount(self: *const WorldSystem) usize {
+        _ = self;
+        return Renderer.k_max_dense_composite_draws;
     }
 
     pub fn estimateDenseTileGpuBytes(self: *const WorldSystem) usize {
@@ -690,26 +755,77 @@ pub const WorldSystem = struct {
         return @as(f32, @floatFromInt(self.height)) * self.tile_size;
     }
 
-    /// Submits each dense layer as one retained world-space tilemap quad: the
-    /// fragment shader reads tile ids from the layer's storage buffer and samples
-    /// the atlas, so a whole layer is one draw independent of world size. Builds the
-    /// per-layer storage buffers on first call. Re-submits only on a structural
-    /// change (`dense_quads_dirty`), never on a pan — the quads are full-world and
-    /// the camera lives in the vertex shader, so panning uploads nothing.
+    /// One dense composite draw's slice of `collectDenseSubmitLayers`'s
+    /// depth-ascending (deepest-first) output: `submit_layers[start..end]`.
+    pub const DenseCompositeBucket = struct {
+        start: usize,
+        end: usize,
+    };
+
+    pub const DenseWindowDepthSpan = struct { min: i32, max: i32 };
+
+    /// Returns the depth span (shallowest/deepest render depth) of whatever
+    /// `collectDenseSubmitLayers` would submit for `active_level` this frame, or
+    /// null when nothing is in window. Lets callers filter candidate interleave
+    /// depths to only the ones that could possibly matter before computing them,
+    /// without duplicating the window-selection rule. Reuses the cached span from
+    /// the last recompute while `dense_quads_dirty`, `active_level`, and
+    /// `render_window` all still match `submitted_active_level`/`submitted_window`
+    /// (the same triggers `submitStaticDenseGeometry` gates a re-submit on, so the
+    /// window's real dense-layer content is guaranteed unchanged too), sparing a
+    /// full dense-layer scan and sort on every still frame. Propagates
+    /// `error.TooManyDenseLayers` instead of swallowing it as an empty window.
+    pub fn denseWindowDepthSpan(self: *WorldSystem, active_level: u16) error{TooManyDenseLayers}!?DenseWindowDepthSpan {
+        if (!self.dense_quads_dirty and
+            active_level == self.submitted_active_level and
+            windowsEqual(self.render_window, self.submitted_window))
+            return self.dense_window_depth_span;
+
+        var submit_layers: [k_max_dense_submit_stack_cap]usize = undefined;
+        const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
+        const span: ?DenseWindowDepthSpan = if (submit_count == 0) null else .{
+            .min = self.denseLayerOrder(submit_layers[0]).depth,
+            .max = self.denseLayerOrder(submit_layers[submit_count - 1]).depth,
+        };
+        self.dense_window_depth_span = span;
+        return span;
+    }
+
+    /// The render depth an actor standing on `active_level` draws at. Always
+    /// treated as an interleave point so the common case (no other sandwiched
+    /// content) still splits off a `ceiling_when_underground` plane exactly like
+    /// before this frame's dense stack was collapsed to composite draws.
+    pub fn activeLevelActorDepth(self: *const WorldSystem, active_level: u16) i32 {
+        return self.worldZForLevel(active_level, 0, .actor);
+    }
+
+    /// Submits this frame's dense window as one retained world-space tilemap
+    /// quad per composite draw: each draw's fragment shader walks a topmost-first
+    /// window of dense layers sharing the combined tile-data buffer, stopping at
+    /// the first opaque cell, so a whole run of layers with nothing sandwiched
+    /// between them is one draw independent of world size. `interleave_depths`
+    /// (sorted ascending, deduplicated) are this frame's cut points — depths
+    /// something else (a sparse tile, a dynamic entity) needs to render strictly
+    /// between two dense layers; each one splits the stack into another
+    /// composite draw at that boundary. Builds the combined storage buffer on
+    /// first call. Re-submits on a structural change (`dense_quads_dirty`), an
+    /// `active_level`/window change, or an interleave-depth-set change — never
+    /// on a pan alone, since the quads are full-world and the camera lives in
+    /// the vertex shader.
     pub fn submitStaticDenseGeometry(
         self: *WorldSystem,
         renderer: *Renderer,
         runtime_assets: *const RuntimeAssets,
         active_level: u16,
+        interleave_depths: []const i32,
     ) !void {
         const prepared = runtime_assets.sprite(.world_tileset) orelse return error.WorldTilesetTextureUnavailable;
-        try self.uploadDenseLayerBuffers(renderer);
-        // Re-submit on a structural change OR when the player's active level (or
-        // window) changed: floors above the player's plane are skipped so the
-        // dense render slice follows the player down through level transitions.
+        try self.uploadDenseTileDataBuffer(renderer);
         if (!self.dense_quads_dirty and
             active_level == self.submitted_active_level and
-            windowsEqual(self.render_window, self.submitted_window)) return;
+            windowsEqual(self.render_window, self.submitted_window) and
+            std.mem.eql(i32, self.submitted_interleave_depths[0..self.submitted_interleave_count], interleave_depths))
+            return;
 
         // The tilemap atlas params are baked from the world atlas dimensions at init;
         // the bound runtime texture must match. Safe-build only, and only on a
@@ -724,11 +840,20 @@ pub const WorldSystem = struct {
         const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
         std.debug.assert(submit_count <= self.maxDenseSubmitLayerCount());
         renderer.beginStaticGeometry();
-        const world_w = self.worldWidthPixels();
-        const world_h = self.worldHeightPixels();
-        for (submit_layers[0..submit_count]) |layer_index| {
+
+        if (submit_count > 0) {
+            var buckets: [Renderer.k_max_dense_composite_draws]DenseCompositeBucket = undefined;
+            const bucket_count = try self.partitionDenseCompositeBuckets(
+                submit_layers[0..submit_count],
+                interleave_depths,
+                &buckets,
+            );
+
             // Only the world-space corners (position) are consumed by the tilemap
-            // shader; the source/uv are ignored, so the source rect is a placeholder.
+            // shader; the source/uv are ignored, so the source rect is a
+            // placeholder. Built once and reused for every composite draw.
+            const world_w = self.worldWidthPixels();
+            const world_h = self.worldHeightPixels();
             var pos: [6]Position = undefined;
             var uv: [6]Uv = undefined;
             var col: [6]VertexColor = undefined;
@@ -737,16 +862,91 @@ pub const WorldSystem = struct {
                 .source = .{ .x = 0, .y = 0, .w = self.tile_size, .h = self.tile_size },
                 .dest = .{ .x = 0, .y = 0, .w = world_w, .h = world_h },
             }, self.atlas_texture, .{ .positions = &pos, .uvs = &uv, .colors = &col });
-            try renderer.appendStaticTilemapSpan(
-                prepared.texture,
-                self.denseLayerOrder(layer_index),
-                .{ .positions = &pos, .uvs = &uv, .colors = &col },
-                self.denseLayerTileBuffer(layer_index),
-            );
+
+            for (buckets[0..bucket_count]) |bucket| {
+                const window_layers = try self.buildWindowLayers(submit_layers[0..submit_count], bucket.start, bucket.end);
+                // Order = the bucket's own shallowest submitted layer (depth-ascending
+                // input means that is the last index in the bucket's range).
+                const order = self.denseLayerOrder(submit_layers[bucket.end - 1]);
+                try renderer.appendStaticTilemapSpan(
+                    prepared.texture,
+                    order,
+                    .{ .positions = &pos, .uvs = &uv, .colors = &col },
+                    self.denseTileDataBuffer(),
+                    window_layers,
+                );
+            }
         }
+
         self.dense_quads_dirty = false;
         self.submitted_active_level = active_level;
         self.submitted_window = self.render_window;
+        self.storeSubmittedInterleaveDepths(interleave_depths);
+    }
+
+    fn storeSubmittedInterleaveDepths(self: *WorldSystem, interleave_depths: []const i32) void {
+        const count = @min(interleave_depths.len, self.submitted_interleave_depths.len);
+        @memcpy(self.submitted_interleave_depths[0..count], interleave_depths[0..count]);
+        self.submitted_interleave_count = count;
+    }
+
+    /// Cuts `submit_layers` (depth-ascending, deepest-first, per
+    /// `collectDenseSubmitLayers`'s contract) into composite-draw buckets: a new
+    /// bucket boundary is placed at every point where an `interleave_depths`
+    /// value falls strictly between two consecutive submitted layers' depths
+    /// (or exactly at the shallower one, since nothing may draw between that
+    /// pair once composited together). `interleave_depths` must be sorted
+    /// ascending. Writes bucket ranges into `out` and returns the count.
+    fn partitionDenseCompositeBuckets(
+        self: *const WorldSystem,
+        submit_layers: []const usize,
+        interleave_depths: []const i32,
+        out: []DenseCompositeBucket,
+    ) error{TooManyDenseCompositeDraws}!usize {
+        if (submit_layers.len == 0) return 0;
+        var bucket_count: usize = 0;
+        var bucket_start: usize = 0;
+        var interleave_index: usize = 0;
+        for (1..submit_layers.len + 1) |index| {
+            var cut = index == submit_layers.len;
+            if (!cut) {
+                const prev_depth = self.denseLayerOrder(submit_layers[index - 1]).depth;
+                const next_depth = self.denseLayerOrder(submit_layers[index]).depth;
+                while (interleave_index < interleave_depths.len and interleave_depths[interleave_index] <= prev_depth) {
+                    interleave_index += 1;
+                }
+                if (interleave_index < interleave_depths.len and interleave_depths[interleave_index] <= next_depth) {
+                    cut = true;
+                }
+            }
+            if (cut) {
+                if (bucket_count >= out.len) return error.TooManyDenseCompositeDraws;
+                out[bucket_count] = .{ .start = bucket_start, .end = index };
+                bucket_count += 1;
+                bucket_start = index;
+            }
+        }
+        return bucket_count;
+    }
+
+    /// Reverses one bucket's depth-ascending (deepest-first) layer slice into a
+    /// topmost-first `TilemapWindowLayers`, since the shader composites from the
+    /// top down.
+    fn buildWindowLayers(
+        self: *const WorldSystem,
+        submit_layers: []const usize,
+        bucket_start: usize,
+        bucket_end: usize,
+    ) !Renderer.TilemapWindowLayers {
+        var window = Renderer.TilemapWindowLayers{};
+        var index = bucket_end;
+        while (index > bucket_start) {
+            index -= 1;
+            const offset = self.denseLayerOffset(submit_layers[index]);
+            window.offsets[window.count] = std.math.cast(u32, offset) orelse return error.TileDataOffsetTooLarge;
+            window.count += 1;
+        }
+        return window;
     }
 
     fn collectDenseSubmitLayers(
@@ -855,6 +1055,20 @@ pub const WorldSystem = struct {
         return if (ranges.len == 0) null else ranges[0].depth;
     }
 
+    /// Distinct sparse render depths registered this frame (`sparse_depth_ranges`
+    /// length). Paired with `sparseDepthRangeAt` so a caller that needs the
+    /// ascending depth sequence more than once per frame can walk it by index
+    /// instead of paying `nextVisibleSparseDepthAfter`'s rescan-from-start cursor
+    /// twice. Callers must keep the index current via `ensureRenderDepthIndex`.
+    pub fn sparseDepthRangeCount(self: *const WorldSystem) usize {
+        return self.sparse_depth_ranges.items.len;
+    }
+
+    /// The `index`th distinct sparse render depth, ascending order.
+    pub fn sparseDepthRangeAt(self: *const WorldSystem, index: usize) i32 {
+        return self.sparse_depth_ranges.items[index].depth;
+    }
+
     pub fn denseTile(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) TileId {
         return self.dense_tile_ids.items[self.denseLayerOffset(layer_index) + self.cellIndex(x, y)];
     }
@@ -873,7 +1087,7 @@ pub const WorldSystem = struct {
     }
 
     /// Shared dense-cell write: bounds-checks, updates the CPU tile field (the
-    /// source of truth), queues one GPU cell edit once the layer buffer exists,
+    /// source of truth), queues one GPU cell edit once the combined buffer exists,
     /// and returns the compact change event. Tile-id validity is the caller's
     /// concern, so an empty (`invalid_tile_id`) write is allowed here.
     fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
@@ -886,13 +1100,15 @@ pub const WorldSystem = struct {
         const new_blocks_movement = self.flagsFor(tile_id).blocks_movement;
         self.dense_layers.items(.uniform_fill_tile)[layer_index] = null;
         self.dense_tile_ids.items[tile_index] = tile_id;
-        // Queue the GPU cell update once the layer buffer exists. Before it is built,
-        // the initial full upload captures the tile, so no edit is needed.
-        const buffer = self.denseLayerTileBuffer(layer_index);
+        // Queue the GPU cell update once the combined buffer exists. Before it is
+        // built, the initial full upload captures the tile, so no edit is needed.
+        // element_index is the global flat offset (matches this buffer's layout),
+        // not a per-layer-local index.
+        const buffer = self.denseTileDataBuffer();
         if (buffer != .invalid) {
             try self.dense_tile_edits.append(self.allocator, .{
                 .buffer = buffer,
-                .element_index = self.cellIndex(x, y),
+                .element_index = tile_index,
                 .value = tile_id,
             });
         }
@@ -911,51 +1127,45 @@ pub const WorldSystem = struct {
         return self.dense_layers.len;
     }
 
-    /// Widens a dense layer's row-major tile ids into `out` (one `u32` per cell)
-    /// for storage-buffer upload. `out.len` must equal `cellCount()`. The row-major
-    /// order here is exactly the tilemap shader's `cell.y * width + cell.x` read,
-    /// so the GPU lookup matches `cellIndex`. Load-time only (not a frame path).
-    fn writeDenseLayerTileData(self: *const WorldSystem, layer_index: usize, out: []u32) void {
-        const cells = self.cellCount();
-        std.debug.assert(out.len == cells);
-        const src = self.dense_tile_ids.items[self.denseLayerOffset(layer_index)..][0..cells];
-        for (src, out) |tile, *dst| dst.* = tile;
+    /// Widens the whole flat dense tile-id array (every dense layer's cells
+    /// concatenated, in layer order) into `out` (one `u32` per cell) for
+    /// storage-buffer upload. `out.len` must equal `dense_tile_ids.items.len`.
+    /// The row-major order within each layer is exactly the tilemap shader's
+    /// `cell.y * width + cell.x` read (offset by that layer's own
+    /// `denseLayerOffset`), so the GPU lookup matches `cellIndex`. Load-time
+    /// only (not a frame path).
+    fn widenDenseTileData(self: *const WorldSystem, out: []u32) void {
+        std.debug.assert(out.len == self.dense_tile_ids.items.len);
+        for (self.dense_tile_ids.items, out) |tile, *dst| dst.* = tile;
     }
 
-    /// Builds one renderer-owned tile-data storage buffer per dense layer from
-    /// `dense_tile_ids`. Idempotent: a no-op once the buffers exist. Call once at
-    /// world load, before the tilemap layers are submitted for drawing.
-    pub fn uploadDenseLayerBuffers(self: *WorldSystem, renderer: *Renderer) !void {
-        const layer_count = self.denseLayerCount();
-        // Resume from the first not-yet-built layer, so a mid-loop failure can be
-        // retried to completion and a fully-built world is a no-op.
-        if (self.dense_layer_tile_buffers.items.len == layer_count) return;
+    /// Builds the single renderer-owned tile-data storage buffer from the whole
+    /// flat `dense_tile_ids` array. Idempotent: a no-op once the buffer exists.
+    /// Call once at world load, before the tilemap layers are submitted for
+    /// drawing.
+    pub fn uploadDenseTileDataBuffer(self: *WorldSystem, renderer: *Renderer) !void {
+        if (self.dense_tile_data_buffer != .invalid) return;
 
-        const scratch = try self.allocator.alloc(u32, self.cellCount());
+        const scratch = try self.allocator.alloc(u32, self.dense_tile_ids.items.len);
         defer self.allocator.free(scratch);
-        try self.dense_layer_tile_buffers.ensureTotalCapacity(self.allocator, layer_count);
-        for (self.dense_layer_tile_buffers.items.len..layer_count) |layer_index| {
-            self.writeDenseLayerTileData(layer_index, scratch);
-            const id = try renderer.createTileDataBuffer(scratch, self.tilemap_params);
-            self.dense_layer_tile_buffers.appendAssumeCapacity(id);
-        }
+        self.widenDenseTileData(scratch);
+        self.dense_tile_data_buffer = try renderer.createTileDataBuffer(scratch, self.tilemap_params);
     }
 
-    /// Releases the renderer-owned tile-data buffers this world created and drops
-    /// the local handles, keeping the world's handle list and the renderer in
-    /// sync. The symmetric teardown for `uploadDenseLayerBuffers`: call before
+    /// Releases the renderer-owned tile-data buffer this world created and drops
+    /// the local handle, keeping the world's handle and the renderer in sync.
+    /// The symmetric teardown for `uploadDenseTileDataBuffer`: call before
     /// rebuilding the dense tilemap when the renderer outlives the world. App
-    /// shutdown instead frees these through `Renderer.deinit`.
-    pub fn releaseDenseLayerBuffers(self: *WorldSystem, renderer: *Renderer) void {
+    /// shutdown instead frees this through `Renderer.deinit`.
+    pub fn releaseDenseTileDataBuffer(self: *WorldSystem, renderer: *Renderer) void {
         renderer.releaseTileDataBuffers();
-        self.dense_layer_tile_buffers.clearRetainingCapacity();
+        self.dense_tile_data_buffer = .invalid;
     }
 
-    /// The tile-data storage buffer handle for a dense layer (`.invalid` until
-    /// `uploadDenseLayerBuffers` has run).
-    pub fn denseLayerTileBuffer(self: *const WorldSystem, layer_index: usize) TileDataId {
-        if (layer_index >= self.dense_layer_tile_buffers.items.len) return .invalid;
-        return self.dense_layer_tile_buffers.items[layer_index];
+    /// The combined tile-data storage buffer handle (`.invalid` until
+    /// `uploadDenseTileDataBuffer` has run).
+    pub fn denseTileDataBuffer(self: *const WorldSystem) TileDataId {
+        return self.dense_tile_data_buffer;
     }
 
     pub fn denseTileBlocksMovement(self: *const WorldSystem, layer_index: usize, x: u16, y: u16) bool {
@@ -970,12 +1180,6 @@ pub const WorldSystem = struct {
         return self.dense_layers.items(.level_index)[layer_index];
     }
 
-    /// Level a sparse tile belongs to. Pairs with `sparseTileCellCoord` so a
-    /// per-level sparse-cell set can be built in O(sparse), not O(cells x sparse).
-    pub fn sparseTileLevel(self: *const WorldSystem, index: usize) u16 {
-        return self.sparse_tiles.items(.level_index)[index];
-    }
-
     /// Tile-cell coordinate of a sparse tile, decoded from its stored cell index.
     pub fn sparseTileCellCoord(self: *const WorldSystem, index: usize) CellCoord {
         const cell = self.sparse_tiles.items(.cell_index)[index];
@@ -983,6 +1187,91 @@ pub const WorldSystem = struct {
             .x = @intCast(cell % self.width),
             .y = @intCast(cell / self.width),
         };
+    }
+
+    /// Indices into `sparse_tiles` for every sparse tile on `level_index`, in no
+    /// particular order. Empty for an out-of-range level and for a level that
+    /// has no sparse tiles yet — callers do not need to distinguish the two.
+    /// Backed by `sparse_level_tiles`, maintained eagerly by `addSparseTile` (see
+    /// that field's doc comment), so this is always current with no rebuild step.
+    pub fn sparseTileIndicesForLevel(self: *const WorldSystem, level_index: u16) []const u32 {
+        if (level_index >= self.sparse_level_tiles.items.len) return &.{};
+        return self.sparse_level_tiles.items[level_index].items;
+    }
+
+    /// Indices into `sparse_tiles` for every sparse tile in `chunk_index` (a
+    /// level-local chunk offset, `chunkY*chunksX+chunkX` — see
+    /// `localChunkIndexForCell`) on `level_index`, in no particular order.
+    /// Empty for an out-of-range level or chunk. Backed by
+    /// `sparse_level_chunk_tiles`, maintained the same way as
+    /// `sparse_level_tiles` (see that field's comment) so this is always
+    /// current with no rebuild step. Finer-grained than
+    /// `sparseTileIndicesForLevel` for consumers that only need one chunk's
+    /// worth of sparse tiles.
+    pub fn sparseTileIndicesForChunk(self: *const WorldSystem, level_index: u16, chunk_index: u32) []const u32 {
+        if (level_index >= self.sparse_level_chunk_tiles.items.len) return &.{};
+        const level_chunks = self.sparse_level_chunk_tiles.items[level_index].items;
+        if (chunk_index >= level_chunks.len) return &.{};
+        return level_chunks[chunk_index].items;
+    }
+
+    // Reserves capacity for one more entry in level_index's sparse_level_tiles
+    // bucket, growing the outer list with empty buckets up to level_index
+    // first if needed. Mutates no already-committed data — only capacity.
+    // Paired with commitSparseLevelIndexEntry so addSparseTile can reserve
+    // every sparse structure before committing to any of them (see
+    // addSparseTile): either every reservation for a tile succeeds and every
+    // commit is then guaranteed to succeed, or the whole call fails with
+    // nothing observably changed.
+    fn reserveSparseLevelIndexEntry(self: *WorldSystem, level_index: u16) !void {
+        const needed_buckets = @as(usize, level_index) + 1;
+        if (self.sparse_level_tiles.items.len < needed_buckets) {
+            try self.sparse_level_tiles.ensureTotalCapacity(self.allocator, needed_buckets);
+            while (self.sparse_level_tiles.items.len < needed_buckets) {
+                self.sparse_level_tiles.appendAssumeCapacity(.empty);
+            }
+        }
+        const bucket = &self.sparse_level_tiles.items[level_index];
+        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
+    }
+
+    // Infallible append into level_index's sparse_level_tiles bucket. Call
+    // only after reserveSparseLevelIndexEntry(level_index) has succeeded.
+    fn commitSparseLevelIndexEntry(self: *WorldSystem, level_index: u16, sparse_index: u32) void {
+        self.sparse_level_tiles.items[level_index].appendAssumeCapacity(sparse_index);
+    }
+
+    // Reserves capacity for one more entry in (level_index, chunk_index)'s
+    // sparse_level_chunk_tiles bucket: grows the outer per-level list, then
+    // that level's per-chunk list to chunkCountPerLevel() buckets on first
+    // touch, then the target chunk's bucket. Mutates no already-committed
+    // data — only capacity and empty placeholder buckets. See
+    // reserveSparseLevelIndexEntry for why this is split from its commit.
+    fn reserveSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32) !void {
+        const needed_levels = @as(usize, level_index) + 1;
+        if (self.sparse_level_chunk_tiles.items.len < needed_levels) {
+            try self.sparse_level_chunk_tiles.ensureTotalCapacity(self.allocator, needed_levels);
+            while (self.sparse_level_chunk_tiles.items.len < needed_levels) {
+                self.sparse_level_chunk_tiles.appendAssumeCapacity(.empty);
+            }
+        }
+        const level_chunks = &self.sparse_level_chunk_tiles.items[level_index];
+        const needed_chunks = self.chunkCountPerLevel();
+        if (level_chunks.items.len < needed_chunks) {
+            try level_chunks.ensureTotalCapacity(self.allocator, needed_chunks);
+            while (level_chunks.items.len < needed_chunks) {
+                level_chunks.appendAssumeCapacity(.empty);
+            }
+        }
+        const bucket = &level_chunks.items[chunk_index];
+        try bucket.ensureTotalCapacity(self.allocator, bucket.items.len + 1);
+    }
+
+    // Infallible append into (level_index, chunk_index)'s
+    // sparse_level_chunk_tiles bucket. Call only after
+    // reserveSparseChunkIndexEntry(level_index, chunk_index) has succeeded.
+    fn commitSparseChunkIndexEntry(self: *WorldSystem, level_index: u16, chunk_index: u32, sparse_index: u32) void {
+        self.sparse_level_chunk_tiles.items[level_index].items[chunk_index].appendAssumeCapacity(sparse_index);
     }
 
     pub fn levelCount(self: *const WorldSystem) usize {
@@ -1031,7 +1320,9 @@ pub const WorldSystem = struct {
     // Out-of-range x/y returns blocked, matching denseTileBlocksMovement; an
     // invalid level also returns blocked (fail-closed) so a bad index can never
     // expose phantom open cells to the pathfinder. Allocation-free: iterates the
-    // dense band columns and sparse SoA columns directly with no joins.
+    // dense band columns directly, and only the sparse tiles on this level via
+    // `sparseTileIndicesForLevel` instead of scanning every sparse tile in the
+    // world.
     pub fn levelBlocksMovement(self: *const WorldSystem, level_index: u16, x: u16, y: u16) bool {
         if (@as(usize, level_index) >= self.level_base_z.items.len) return true;
         if (x >= self.width or y >= self.height) return true;
@@ -1041,13 +1332,11 @@ pub const WorldSystem = struct {
             if (self.flagsFor(self.denseTile(layer_index, x, y)).blocks_movement) return true;
         }
         const cell = self.cellIndex(x, y);
-        const sparse_levels = self.sparse_tiles.items(.level_index);
         const sparse_cells = self.sparse_tiles.items(.cell_index);
         const sparse_flags = self.sparse_tiles.items(.flags);
-        for (sparse_levels, sparse_cells, sparse_flags) |sparse_level, sparse_cell, flags| {
-            if (sparse_level != level_index) continue;
-            if (sparse_cell != cell) continue;
-            if (flags.blocks_movement) return true;
+        for (self.sparseTileIndicesForLevel(level_index)) |sparse_index| {
+            if (sparse_cells[sparse_index] != cell) continue;
+            if (sparse_flags[sparse_index].blocks_movement) return true;
         }
         return false;
     }
@@ -1172,7 +1461,13 @@ pub const WorldSystem = struct {
         self.dense_layers.items(.uniform_fill_tile)[layer_index] = null;
     }
 
+    /// Fails loud instead of silently dropping a layer's cells: the combined
+    /// tile-data buffer is built once from the whole flat `dense_tile_ids`
+    /// array (`uploadDenseTileDataBuffer`) and is not incrementally resumable,
+    /// so a layer added after that build would compute a valid-looking
+    /// `denseLayerOffset` whose cells the GPU buffer never actually contains.
     pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
+        if (self.dense_tile_data_buffer != .invalid) return error.DenseLayerAddedAfterUpload;
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
         try self.trackDenseBandForLevel(level_index);
@@ -1190,8 +1485,9 @@ pub const WorldSystem = struct {
         self.dense_tile_ids.items.len = tile_offset + cell_count;
         @memset(self.dense_tile_ids.items[tile_offset..][0..cell_count], fill_tile);
         self.render_index_dirty = true;
-        // A new dense layer needs its own tilemap quad submitted; its storage buffer
-        // is built lazily on the next submit (uploadDenseLayerBuffers resumes).
+        // A new dense layer needs its own tilemap quad submitted; the combined
+        // storage buffer is built lazily on the next submit (uploadDenseTileDataBuffer).
+        // The guard above already rejects layers added after that build.
         self.dense_quads_dirty = true;
         return layer_index;
     }
@@ -1238,9 +1534,22 @@ pub const WorldSystem = struct {
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
         const cell = self.cellIndex(x, y);
         const chunk_index = try self.sparseChunkIndexForCell(level_index, x, y);
+        const local_chunk_index = self.localChunkIndexForCell(x, y);
         const flags = self.flagsFor(tile_id);
         const world_z = self.worldZForLevel(level_index, base_z, depth);
+
+        // Reserve capacity in sparse_tiles, sparse_level_tiles, and
+        // sparse_level_chunk_tiles before committing to any of them: an OOM
+        // partway through would otherwise leave a tile in one structure but
+        // invisible to the level/chunk lookups the other two back (nav
+        // rebuild, perception's blocked cache). Either all three reservations
+        // succeed and the three appends below are then infallible, or the
+        // call fails here with none of the three structures changed.
         try self.sparse_tiles.ensureTotalCapacity(self.allocator, self.sparse_tiles.len + 1);
+        try self.reserveSparseLevelIndexEntry(level_index);
+        try self.reserveSparseChunkIndexEntry(level_index, local_chunk_index);
+
+        const new_index: u32 = @intCast(self.sparse_tiles.len);
         self.sparse_tiles.appendAssumeCapacity(.{
             .level_index = level_index,
             .chunk_index = chunk_index,
@@ -1249,6 +1558,8 @@ pub const WorldSystem = struct {
             .depth_value = world_z,
             .flags = flags,
         });
+        self.commitSparseLevelIndexEntry(level_index, new_index);
+        self.commitSparseChunkIndexEntry(level_index, local_chunk_index, new_index);
         self.render_index_dirty = true;
         // The sparse set changed, so the cached visible-sparse count must refresh.
         self.visibility_window_valid = false;
@@ -1595,20 +1906,36 @@ pub const WorldSystem = struct {
     fn sparseChunkIndexForCell(self: *const WorldSystem, level_index: u16, x: u16, y: u16) !u32 {
         const chunks_x = self.chunksX();
         const chunks_y = self.chunksY();
-        const chunk_x = x / self.chunk_size_tiles;
-        const chunk_y = y / self.chunk_size_tiles;
+        const local_chunk_index = self.localChunkIndexForCell(x, y);
         const level_offset = @as(usize, level_index) * @as(usize, chunks_x) * @as(usize, chunks_y);
-        const chunk_offset = @as(usize, chunk_y) * @as(usize, chunks_x) + @as(usize, chunk_x);
-        const index = level_offset + chunk_offset;
+        const index = level_offset + @as(usize, local_chunk_index);
         if (index > std.math.maxInt(u32)) return error.WorldChunkOverflow;
         return @intCast(index);
     }
 
-    fn chunksX(self: *const WorldSystem) u16 {
+    // Flat level-local chunk offset for a cell (chunkY*chunksX+chunkX),
+    // identical for every level since width/height/chunk_size_tiles are
+    // world-wide, not per-level. Backs sparse_level_chunk_tiles' middle
+    // dimension; sparseChunkIndexForCell adds the level offset on top of this
+    // for the world-global chunk_index stored on each SparseTileRow.
+    fn localChunkIndexForCell(self: *const WorldSystem, x: u16, y: u16) u32 {
+        const chunks_x = self.chunksX();
+        const chunk_x = x / self.chunk_size_tiles;
+        const chunk_y = y / self.chunk_size_tiles;
+        return @as(u32, chunk_y) * @as(u32, chunks_x) + @as(u32, chunk_x);
+    }
+
+    /// Level-local chunk grid width (world-wide, identical for every level —
+    /// see `localChunkIndexForCell`). Exposed for callers (e.g. perception's
+    /// LOS-blocked cache patch path) that need to bound a dirty rect to the
+    /// overlapping `sparseTileIndicesForChunk` range without duplicating this
+    /// grid-shape arithmetic.
+    pub fn chunksX(self: *const WorldSystem) u16 {
         return ceilDiv(self.width, self.chunk_size_tiles);
     }
 
-    fn chunksY(self: *const WorldSystem) u16 {
+    /// Level-local chunk grid height. See `chunksX`.
+    pub fn chunksY(self: *const WorldSystem) u16 {
         return ceilDiv(self.height, self.chunk_size_tiles);
     }
 
@@ -1884,7 +2211,7 @@ test "world dense layer uses row-major indexing" {
     try std.testing.expectEqual(grass, world.denseTile(0, 2, 1));
 }
 
-test "dense layer tile-data staging matches denseTile by row-major cell index" {
+test "dense tile-data staging matches denseTile by row-major cell index" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
@@ -1893,25 +2220,26 @@ test "dense layer tile-data staging matches denseTile by row-major cell index" {
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.setDenseTile(0, 2, 1, grass);
 
-    const staging = try std.testing.allocator.alloc(u32, world.cellCount());
+    const staging = try std.testing.allocator.alloc(u32, world.dense_tile_ids.items.len);
     defer std.testing.allocator.free(staging);
-    world.writeDenseLayerTileData(0, staging);
+    world.widenDenseTileData(staging);
 
     for (0..world.height) |y| {
         for (0..world.width) |x| {
             const xi: u16 = @intCast(x);
             const yi: u16 = @intCast(y);
-            // The shader reads tile_ids[cell.y*width + cell.x]; cellIndex is that
-            // same index, so staging[cellIndex] must equal the logical tile.
+            // The shader reads tile_ids[cell.y*width + cell.x] from layer 0's own
+            // base offset within the combined buffer; denseLayerOffset(0) +
+            // cellIndex is that same index, so staging[..] must equal the tile.
             try std.testing.expectEqual(
                 @as(u32, world.denseTile(0, xi, yi)),
-                staging[world.cellIndex(xi, yi)],
+                staging[world.denseLayerOffset(0) + world.cellIndex(xi, yi)],
             );
         }
     }
 }
 
-test "setDenseTile queues a GPU cell edit only once the layer buffer exists" {
+test "setDenseTile queues a GPU cell edit only once the combined buffer exists" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
@@ -1925,14 +2253,14 @@ test "setDenseTile queues a GPU cell edit only once the layer buffer exists" {
     _ = try world.setDenseTile(0, 2, 1, water);
     try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
 
-    // Simulate the layer's storage buffer having been built (uploadDenseLayerBuffers
+    // Simulate the combined storage buffer having been built (uploadDenseTileDataBuffer
     // needs a renderer, unavailable headless).
-    try world.dense_layer_tile_buffers.append(std.testing.allocator, @enumFromInt(0));
+    world.dense_tile_data_buffer = @enumFromInt(0);
 
     _ = try world.setDenseTile(0, 1, 0, grass);
     try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
     const edit = world.dense_tile_edits.items[0];
-    try std.testing.expectEqual(@as(usize, world.cellIndex(1, 0)), edit.element_index);
+    try std.testing.expectEqual(world.denseLayerOffset(0) + @as(usize, world.cellIndex(1, 0)), edit.element_index);
     try std.testing.expectEqual(@as(u32, grass), edit.value);
 
     // A flushed queue is cleared; an unchanged tile records nothing.
@@ -2175,6 +2503,198 @@ test "level navigability does not collapse across levels" {
     try std.testing.expect(world.levelBlocksMovement(level1, 2, 2));
     // The same cell on level 0 must stay open: levels do not collapse.
     try std.testing.expect(!world.levelBlocksMovement(level0, 2, 2));
+}
+
+// Compares two index lists as sets: same members, order irrelevant. Copies
+// into scratch so the caller's slices are never mutated by the sort.
+fn expectSparseIndexSetEqual(expected: []const u32, actual: []const u32) !void {
+    const expected_sorted = try std.testing.allocator.dupe(u32, expected);
+    defer std.testing.allocator.free(expected_sorted);
+    const actual_sorted = try std.testing.allocator.dupe(u32, actual);
+    defer std.testing.allocator.free(actual_sorted);
+    std.mem.sort(u32, expected_sorted, {}, std.sort.asc(u32));
+    std.mem.sort(u32, actual_sorted, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, expected_sorted, actual_sorted);
+}
+
+test "sparseTileIndicesForLevel returns exactly this level's sparse tile indices" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const level2 = try world.addLevel(20); // added but never given a sparse tile
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Interleave insertion order across levels so a level's grouping cannot be
+    // inferred from insertion order alone — only the level field decides it.
+    _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // sparse index 0
+    _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // sparse index 1
+    _ = try world.addSparseTile(level0, 3, 3, deco, 0, .obstacle); // sparse index 2
+    _ = try world.addSparseTile(level1, 4, 4, deco, 0, .obstacle); // sparse index 3
+    _ = try world.addSparseTile(level0, 5, 5, deco, 0, .obstacle); // sparse index 4
+
+    try expectSparseIndexSetEqual(&.{ 0, 2, 4 }, world.sparseTileIndicesForLevel(level0));
+    try expectSparseIndexSetEqual(&.{ 1, 3 }, world.sparseTileIndicesForLevel(level1));
+    // A real level with no sparse tiles placed on it yet.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level2));
+    // An out-of-range level.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(99));
+}
+
+test "sparseTileIndicesForChunk returns exactly the chunk-scoped subset of sparseTileIndicesForLevel" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // 4x4 tiles, chunk_size_tiles=2 -> 2x2 chunk grid; level-local chunk
+    // offset = chunkY*2+chunkX, so (0,0)->0 (1,0)->1 (0,1)->2 (1,1)->3.
+    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle); // level0 chunk0
+    _ = try world.addSparseTile(level0, 1, 1, deco, 0, .obstacle); // level0 chunk0
+    _ = try world.addSparseTile(level0, 3, 0, deco, 0, .obstacle); // level0 chunk1
+    _ = try world.addSparseTile(level0, 1, 3, deco, 0, .obstacle); // level0 chunk2
+    // level1 > 0 so its global chunk_index (level_index*chunkCountPerLevel +
+    // local) differs from the level-local one this index is keyed by,
+    // proving the two are not conflated.
+    _ = try world.addSparseTile(level1, 2, 2, deco, 0, .obstacle); // level1 chunk3
+    _ = try world.addSparseTile(level1, 0, 1, deco, 0, .obstacle); // level1 chunk0
+
+    const chunks_x: u32 = 2;
+    for ([_]u16{ level0, level1 }) |level| {
+        const level_indices = world.sparseTileIndicesForLevel(level);
+        var chunk: u32 = 0;
+        while (chunk < 4) : (chunk += 1) {
+            var expected: std.ArrayList(u32) = .empty;
+            defer expected.deinit(std.testing.allocator);
+            for (level_indices) |sparse_index| {
+                const cell = world.sparseTileCellCoord(sparse_index);
+                const cell_chunk = @as(u32, cell.y / 2) * chunks_x + @as(u32, cell.x / 2);
+                if (cell_chunk == chunk) try expected.append(std.testing.allocator, sparse_index);
+            }
+            try expectSparseIndexSetEqual(expected.items, world.sparseTileIndicesForChunk(level, chunk));
+        }
+    }
+
+    // Out-of-range level and out-of-range chunk both return empty, matching
+    // sparseTileIndicesForLevel's out-of-range contract.
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(99, 0));
+    try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 99));
+}
+
+test "addSparseTile reserves sparse_tiles, sparse_level_tiles, and sparse_level_chunk_tiles before committing any of them (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level0 = try world.addLevel(0);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Case 1: sparse_tiles' own reservation fails on the very first
+    // addSparseTile call ever, before sparse_level_tiles or
+    // sparse_level_chunk_tiles have any entries to compare against.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 0, 0, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 0), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level0));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 0));
+    }
+
+    // Warm up with one real insert (level0, chunk0) so the next two cases can
+    // isolate a single fresh reservation each, with every other structure
+    // already carrying spare capacity from this insert.
+    _ = try world.addSparseTile(level0, 0, 0, deco, 0, .obstacle); // sparse index 0
+    try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+
+    // Case 2: a new level's sparse_level_tiles bucket needs its first-ever
+    // reservation. sparse_tiles has spare capacity from the warm-up insert
+    // and needs no allocation for this call.
+    const level1 = try world.addLevel(10);
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level1, 0, 0, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForLevel(level1));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level1, 0));
+    }
+
+    // Case 3: a new chunk bucket on the already-warmed level0 needs its
+    // first-ever reservation. sparse_tiles and level0's sparse_level_tiles
+    // bucket both have spare capacity and need no allocation for this call.
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        // Cell (3,3) is level-local chunk 3 (chunkY=1*2+chunkX=1), untouched
+        // by the level0/chunk0 warm-up insert above.
+        try std.testing.expectError(error.OutOfMemory, world.addSparseTile(level0, 3, 3, deco, 0, .obstacle));
+        try std.testing.expectEqual(@as(usize, 1), world.sparse_tiles.len);
+        try expectSparseIndexSetEqual(&.{0}, world.sparseTileIndicesForLevel(level0));
+        try expectSparseIndexSetEqual(&.{}, world.sparseTileIndicesForChunk(level0, 3));
+    }
+}
+
+test "levelBlocksMovement scopes sparse obstacles to their own level at the same cell" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+
+    const level0 = try world.addLevel(0);
+    const level1 = try world.addLevel(10);
+    const level2 = try world.addLevel(20);
+    const deco = try world.requireTileByName(&meta, "deco_0");
+
+    // Same cell coordinate, obstacle placed on level 1 only. Level 0 and level
+    // 2 share the coordinate but must stay open — proves the per-level sparse
+    // index does not leak another level's obstacle into this cell's query.
+    _ = try world.addSparseTile(level1, 4, 4, deco, 0, .obstacle);
+
+    try std.testing.expect(!world.levelBlocksMovement(level0, 4, 4));
+    try std.testing.expect(world.levelBlocksMovement(level1, 4, 4));
+    try std.testing.expect(!world.levelBlocksMovement(level2, 4, 4));
 }
 
 test "addUndergroundLevelStack honors requested depth below an existing surface" {
@@ -2587,6 +3107,235 @@ test "collectDenseSubmitLayers includes every band on an in-window level" {
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
+test "denseWindowDepthSpan returns the submitted window's shallowest and deepest depth" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    const span = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(world.denseLayerOrder(2).depth, span.min);
+    try std.testing.expectEqual(world.denseLayerOrder(0).depth, span.max);
+}
+
+test "denseWindowDepthSpan returns null when nothing is in window" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = 32,
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+
+    try std.testing.expect((try world.denseWindowDepthSpan(0)) == null);
+}
+
+test "denseWindowDepthSpan caches the span until dirty, level, or window changes" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    const first = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
+
+    // denseWindowDepthSpan itself never clears dense_quads_dirty or updates the
+    // submitted_* fields (only an actual submitStaticDenseGeometry call does);
+    // set them here to simulate "already submitted for this level/window" so the
+    // cache-hit path below is reachable without a live Renderer.
+    world.dense_quads_dirty = false;
+    world.submitted_active_level = 0;
+    world.submitted_window = world.render_window;
+
+    // Mutate the underlying layer order directly (bypassing addDenseLayer, which
+    // would mark dense_quads_dirty) to prove a clean-cache call really skips
+    // recomputation instead of coincidentally landing on the same answer.
+    const swapped = world.denseLayerOrder(0).depth + 1000;
+    world.dense_layers.items(.base_z)[0] += 1000;
+    const cached = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(first.min, cached.min);
+    try std.testing.expectEqual(first.max, cached.max);
+    try std.testing.expect(cached.max != swapped);
+
+    world.dense_quads_dirty = true;
+    const recomputed = (try world.denseWindowDepthSpan(0)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(swapped, recomputed.max);
+}
+
+test "denseWindowDepthSpan propagates TooManyDenseLayers instead of swallowing it" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .render_window = .{ .levels_below = 40 },
+        .max_dense_bands_per_level = 1,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..k_max_dense_submit_stack_cap + 1) |_| {
+        const level = try world.addLevel(0);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    try std.testing.expectError(error.TooManyDenseLayers, world.denseWindowDepthSpan(0));
+}
+
+test "partitionDenseCompositeBuckets returns a single bucket with no interleave depths in window" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+
+    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &.{}, &buckets);
+
+    try std.testing.expectEqual(@as(usize, 1), bucket_count);
+    try std.testing.expectEqual(@as(usize, 0), buckets[0].start);
+    try std.testing.expectEqual(count, buckets[0].end);
+}
+
+test "partitionDenseCompositeBuckets splits off the ceiling layer at the active level's own actor depth" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .render_window = .{ .ceiling_when_underground = true },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..5) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(2, &layers);
+    try std.testing.expectEqual(@as(usize, 4), count);
+
+    // The active level's own actor depth is the only interleave point — mirrors
+    // today's ceiling-vs-window split, now expressed as the general rule.
+    const interleave = [_]i32{world.activeLevelActorDepth(2)};
+    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+
+    try std.testing.expectEqual(@as(usize, 2), bucket_count);
+    try std.testing.expectEqual(@as(usize, 3), buckets[0].end - buckets[0].start);
+    try std.testing.expectEqual(@as(usize, 1), buckets[1].end - buckets[1].start);
+    try std.testing.expectEqual(@as(u16, 1), world.denseLayerLevel(layers[buckets[1].start]));
+}
+
+test "partitionDenseCompositeBuckets splits at a synthetic interleave point on a deeper non-active level" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..7) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 7), count);
+
+    // A synthetic sandwich point (e.g. a sparse tile) between level 5 and level
+    // 4's own floor depths — neither is the active level (0) nor the window's
+    // shallowest layer. This is the case an active-level-only design would miss.
+    const interleave = [_]i32{world.worldZForLevel(5, 0, .effect)};
+    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    const bucket_count = try world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets);
+
+    try std.testing.expectEqual(@as(usize, 2), bucket_count);
+    try std.testing.expectEqual(@as(usize, 2), buckets[0].end - buckets[0].start);
+    try std.testing.expectEqual(@as(usize, 5), buckets[1].end - buckets[1].start);
+    try std.testing.expectEqual(@as(u16, 5), world.denseLayerLevel(layers[buckets[0].end - 1]));
+    try std.testing.expectEqual(@as(u16, 4), world.denseLayerLevel(layers[buckets[1].start]));
+}
+
+test "partitionDenseCompositeBuckets returns TooManyDenseCompositeDraws past the composite-draw cap" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 2,
+        .render_window = .{ .levels_below = 8 },
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const grass = try world.requireTileByName(&meta, "grass");
+    for (0..9) |level_index| {
+        const level = try world.addLevel(-@as(i32, @intCast(level_index)) * level_z_step);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 9), count);
+
+    // One interleave point strictly between every consecutive submitted-layer
+    // pair (8 pairs across 9 layers) forces 9 buckets — one past the cap.
+    var interleave: [8]i32 = undefined;
+    for (0..8) |i| {
+        const deeper = world.denseLayerOrder(layers[i]).depth;
+        const shallower = world.denseLayerOrder(layers[i + 1]).depth;
+        interleave[i] = deeper + @divTrunc(shallower - deeper, 2);
+    }
+
+    var buckets: [Renderer.k_max_dense_composite_draws]WorldSystem.DenseCompositeBucket = undefined;
+    try std.testing.expectError(
+        error.TooManyDenseCompositeDraws,
+        world.partitionDenseCompositeBuckets(layers[0..count], &interleave, &buckets),
+    );
+}
+
+test "buildWindowLayers reverses a bucket's deepest-first layers to topmost-first offsets" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var layers: [k_max_dense_submit_stack_cap]usize = undefined;
+    const count = try world.collectDenseSubmitLayers(0, &layers);
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    const window = try world.buildWindowLayers(layers[0..count], 0, count);
+
+    try std.testing.expectEqual(@as(u8, 3), window.count);
+    // submit_layers is deepest-first (dirt_dark, dirt, grass); the window must be
+    // topmost-first (grass, dirt, dirt_dark) since the shader composites downward.
+    try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[2]))), window.offsets[0]);
+    try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[1]))), window.offsets[1]);
+    try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[0]))), window.offsets[2]);
+}
+
 test "addDenseLayer rejects bands beyond configured per-level cap" {
     var meta = try testWorldMeta();
     defer meta.deinit();
@@ -2605,6 +3354,23 @@ test "addDenseLayer rejects bands beyond configured per-level cap" {
     _ = try world.addDenseLayer(level, 0, .floor, grass);
     _ = try world.addDenseLayer(level, 0, .obstacle, grass);
     try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
+}
+
+test "addDenseLayer fails loud once the combined tile-data buffer already exists" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 64, 64);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const level = try world.addLevel(0);
+
+    // Simulate the combined storage buffer having been built (uploadDenseTileDataBuffer
+    // needs a renderer, unavailable headless): a layer added after this point would
+    // compute a valid-looking denseLayerOffset whose cells the GPU buffer never
+    // actually contains, so the call must fail loud instead of silently dropping it.
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    try std.testing.expectError(error.DenseLayerAddedAfterUpload, world.addDenseLayer(level, 0, .floor, grass));
 }
 
 test "validateDenseRenderBudget rejects oversized render window stack cap" {

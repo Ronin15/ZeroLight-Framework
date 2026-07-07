@@ -220,7 +220,37 @@ pub const SinCos4 = struct {
 };
 
 /// Gathers four `f32` values from `values` at the given indices into lane order.
-/// Use to pack sparse SoA rows into contiguous lanes before vector math.
+///
+/// This is the entry point of the **packed-SoA-scratch idiom**, the standard
+/// way to vectorize a loop over sparse/filtered SoA indices in this codebase:
+///
+///  1. Scan the sparse/filtered index sequence (e.g. surviving broadphase
+///     candidates, or entities that passed earlier scalar pre-filters) and
+///     buffer up to `lane_count` indices at a time.
+///  2. Once `lane_count` indices are buffered, `gatherFloat4` each needed SoA
+///     column at those indices into contiguous lanes.
+///  3. Vectorize the compare/math step over the gathered lanes, using
+///     `selectFloat4`/`selectInt4` to mask per-lane outcomes instead of
+///     branching.
+///  4. Finish each lane scalarly for anything that does not vectorize (list
+///     append, branchy asset/asset-ref lookups, building non-uniform output
+///     records) — typically an `inline for (0..lane_count)` reading the
+///     masked results lane-by-lane.
+///  5. Handle the final `< lane_count` remainder (the tail) with the plain
+///     scalar version of the same per-item logic; do not pad or mask a
+///     partial group into a fake vector call.
+///
+/// `CollisionSystem` in `src/game/systems/collision.zig` is the canonical
+/// example already in this codebase: `buildBroadphaseCandidatesSimd`
+/// (`while (candidate_sorted_index + simd.lane_count <= sorted_count)`) packs
+/// sorted proxy indices into `candidate_indices`, gathers `min_x`/`min_y`/
+/// `max_x`/`max_y` with `gatherFloat4`, vectorizes the AABB overlap test, then
+/// finishes each lane scalarly by appending surviving pairs — with a scalar
+/// tail loop below it for `candidate_sorted_index < sorted_count`.
+/// `writeNarrowphaseContactsSimd` follows the same shape one level further:
+/// it gathers both proxies of each candidate pair (`a_indices`/`b_indices`)
+/// to compute contacts in lanes, then appends only the lanes whose `valid`
+/// mask is true.
 pub fn gatherFloat4(values: []const f32, indices: [lane_count]usize) Float4 {
     return .{
         values[indices[0]],
@@ -278,6 +308,17 @@ pub fn normalizeOrZero2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
         .x = selectFloat4(positive, x * inv_len, zero),
         .y = selectFloat4(positive, y * inv_len, zero),
     };
+}
+
+/// Per-lane linear interpolation of 2D vectors between `start` and `end` by
+/// `amount`. SIMD counterpart of `math.lerpVec2`.
+pub fn lerpVec2Float4(start: Vec2x4, end: Vec2x4, amount: Float4) Vec2x4 {
+    return .{ .x = lerpFloat4(start.x, end.x, amount), .y = lerpFloat4(start.y, end.y, amount) };
+}
+
+/// Per-lane 2D dot product: `ax * bx + ay * by`.
+pub fn dotFloat4(ax: Float4, ay: Float4, bx: Float4, by: Float4) Float4 {
+    return addFloat4(mulFloat4(ax, bx), mulFloat4(ay, by));
 }
 
 /// Per-lane sine. Uses the compiler builtin element-wise over the vector; the
@@ -451,6 +492,46 @@ test "normalize or zero matches scalar and zeroes short lanes" {
             try std.testing.expectApproxEqAbs(ys[lane] * inv, y_out[lane], 0.001);
             try std.testing.expectApproxEqAbs(@as(f32, 1), x_out[lane] * x_out[lane] + y_out[lane] * y_out[lane], 0.001);
         }
+    }
+}
+
+test "lerpVec2Float4 matches scalar math.lerpVec2 lane-for-lane with distinct per-lane amounts" {
+    const start = Vec2x4{
+        .x = float4(0, 10, -4, 100),
+        .y = float4(0, -10, 8, -50),
+    };
+    const end = Vec2x4{
+        .x = float4(10, 0, 6, 200),
+        .y = float4(20, 10, -2, 25),
+    };
+    const amount = float4(0.0, 0.25, 0.5, 0.75);
+
+    const result = lerpVec2Float4(start, end, amount);
+    const x_out = toFloatArray(result.x);
+    const y_out = toFloatArray(result.y);
+
+    inline for (0..lane_count) |lane| {
+        const expected = math.lerpVec2(
+            .{ .x = start.x[lane], .y = start.y[lane] },
+            .{ .x = end.x[lane], .y = end.y[lane] },
+            amount[lane],
+        );
+        try std.testing.expectEqual(expected.x, x_out[lane]);
+        try std.testing.expectEqual(expected.y, y_out[lane]);
+    }
+}
+
+test "dotFloat4 matches scalar ax*bx + ay*by lane-for-lane" {
+    const ax = float4(1, 10, -4, 100);
+    const ay = float4(0, -10, 8, -50);
+    const bx = float4(2, 0, 6, 0.5);
+    const by = float4(3, 4, -2, -0.25);
+
+    const result = toFloatArray(dotFloat4(ax, ay, bx, by));
+
+    inline for (0..lane_count) |lane| {
+        const expected = ax[lane] * bx[lane] + ay[lane] * by[lane];
+        try std.testing.expectEqual(expected, result[lane]);
     }
 }
 

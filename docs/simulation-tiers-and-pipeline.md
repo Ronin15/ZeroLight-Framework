@@ -62,7 +62,18 @@ passes the borrowed audio command buffer through the pipeline-owned
 advance and the tier/halo/stagger gathers that select which entities enter each
 stage; chunk columns are derived in-pass by the movement processor, not a separate
 recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
-from that same cognition-scoped population for AI separation queries, then owns
+from that same cognition-scoped population for AI separation queries, runs the
+**perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
+`AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
+writing sensed state to `PerceptionStore`), then the **memory stage**
+(`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
+subset (decaying staleness/familiarity/ring contacts and refreshing from this
+step's perception-acquisition events), then the **affect stage**
+(`AffectSystem`, Slice 31) over the cognition-scoped `AiAffect` subset
+(appraising this step's just-written perception/memory state, both
+independently optional per row, plus each agent's own `AiAgent.behavior`, into
+four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
+baselines), then owns
 AI navigation-intent production, steering/path status, pathfinding, sparse
 movement-intent application, movement, bounds clamp, player-vs-world-tile
 gating, collision detection, and collision response — AI, movement, and
@@ -178,6 +189,8 @@ Current event payloads are:
 - `world_tile_changed`
 - `world_obstacle_changed`
 - `nav_region_invalidated`
+- `entity_perceived` / `entity_lost` (Slice 29 perception acquire/lose transitions)
+- `affect_threshold_crossed` (Slice 31 drive rising/falling-edge transitions)
 
 Current event stages are:
 
@@ -209,12 +222,12 @@ diagnostic events only for optional observability.
 
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,
-or future perception, memory, and affect state — belong in component columns or
-transient range streams; only state transitions (such as acquiring or losing a
-target, or a drive crossing a threshold) become events. This keeps the event
-stream bounded and the per-frame data path allocation-free. New signal payloads
-must still follow the scalar-only rule above and emit through the per-range
-writers so merge order stays deterministic.
+or perception/memory/affect state — belong in component columns or transient
+range streams; only state transitions (such as acquiring or losing a target,
+or a drive crossing a threshold) become events. This keeps the event stream
+bounded and the per-frame data path allocation-free. New signal payloads must
+still follow the scalar-only rule above and emit through the per-range writers
+so merge order stays deterministic.
 
 ## Structural Commands
 

@@ -36,23 +36,26 @@ const world_overscan_chunks: u16 = 1;
 const bench_viewport_w: f32 = 800;
 const bench_viewport_h: f32 = 450;
 const static_sprite_group_count: usize = 1;
-const max_dense_tilemap_group_count: usize = 32;
-const max_static_group_count: usize = max_dense_tilemap_group_count + static_sprite_group_count;
+/// Slice 36 collapsed `submitStaticDenseGeometry`'s per-layer draws into at
+/// most `Renderer.k_max_dense_composite_draws` interleave-partitioned
+/// composite draws; this fixture has no sparse/entity content at non-active
+/// levels, so it always hits the common single-bucket case, i.e. exactly one
+/// retained `.tilemap` group regardless of dense window depth.
+const tilemap_group_count: usize = 1;
+const max_static_group_count: usize = tilemap_group_count + static_sprite_group_count;
 /// Mid-depth play level for dense render-window bench variants (Slice 23B).
 const bench_mid_player_level: u16 = 40;
 
 const FixtureConfig = struct {
-    dense_tilemap_group_count: usize,
     player_level: u16 = 0,
 
     fn staticGroupCount(self: FixtureConfig) usize {
-        return self.dense_tilemap_group_count + static_sprite_group_count;
+        _ = self;
+        return tilemap_group_count + static_sprite_group_count;
     }
 };
 
-const default_fixture_config = FixtureConfig{
-    .dense_tilemap_group_count = 3,
-};
+const default_fixture_config = FixtureConfig{};
 
 pub const group = suite.BenchmarkGroup{
     .name = "render-game-prep",
@@ -60,40 +63,16 @@ pub const group = suite.BenchmarkGroup{
     .runCase = runCase,
 };
 
-pub const dense_8_surface_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-8-surface",
+pub const dense_surface_group = suite.BenchmarkGroup{
+    .name = "render-game-prep-dense-surface",
     .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense8SurfaceCase,
+    .runCase = runDenseSurfaceCase,
 };
 
-pub const dense_8_deep_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-8-deep",
+pub const dense_deep_group = suite.BenchmarkGroup{
+    .name = "render-game-prep-dense-deep",
     .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense8DeepCase,
-};
-
-pub const dense_16_surface_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-16-surface",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense16SurfaceCase,
-};
-
-pub const dense_16_deep_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-16-deep",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense16DeepCase,
-};
-
-pub const dense_32_surface_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-32-surface",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense32SurfaceCase,
-};
-
-pub const dense_32_deep_group = suite.BenchmarkGroup{
-    .name = "render-game-prep-dense-32-deep",
-    .defaultItemCounts = defaultItemCounts,
-    .runCase = runDense32DeepCase,
+    .runCase = runDenseDeepCase,
 };
 
 pub fn defaultItemCounts(profile: suite.Profile) []const usize {
@@ -137,7 +116,6 @@ const Fixture = struct {
     static_groups: [max_static_group_count]sprite_batch.DrawGroup,
     static_group_count: usize,
     player_level: u16,
-    dense_tilemap_group_count: usize,
     tile_texture: sprite_batch.TextureId,
     white_texture: sprite_batch.TextureId,
     item_count: usize = 0,
@@ -172,28 +150,12 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     return runCaseWithConfig(allocator, io, options, case, item_count, default_fixture_config);
 }
 
-pub fn runDense8SurfaceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 8, .player_level = 0 });
+pub fn runDenseSurfaceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .player_level = 0 });
 }
 
-pub fn runDense8DeepCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 8, .player_level = bench_mid_player_level });
-}
-
-pub fn runDense16SurfaceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 16, .player_level = 0 });
-}
-
-pub fn runDense16DeepCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 16, .player_level = bench_mid_player_level });
-}
-
-pub fn runDense32SurfaceCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 32, .player_level = 0 });
-}
-
-pub fn runDense32DeepCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
-    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .dense_tilemap_group_count = 32, .player_level = bench_mid_player_level });
+pub fn runDenseDeepCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    return runCaseWithConfig(allocator, io, options, case, item_count, .{ .player_level = bench_mid_player_level });
 }
 
 fn runCaseWithConfig(
@@ -282,6 +244,7 @@ fn runCaseWithConfig(
     var last_prep = sprite_batch.SpritePrepStats{};
     var last_sparse_submitted: usize = 0;
     var last_merged_groups: usize = 0;
+    var last_merged_tilemap_groups: usize = 0;
     for (0..options.iterations) |_| {
         const start_ns = suite.nowNs(io);
         const measured = try runMeasuredOnce(
@@ -300,6 +263,13 @@ fn runCaseWithConfig(
         last_prep = measured.stats;
         last_sparse_submitted = measured.sparse_submitted;
         last_merged_groups = measured.merged_group_count;
+        last_merged_tilemap_groups = measured.merged_tilemap_group_count;
+        // This fixture has no sparse/entity content at non-active levels, so it
+        // always hits `partitionDenseCompositeBuckets`'s common single-bucket
+        // case: exactly one merged `.tilemap` group regardless of player_level
+        // (surface/deep). Proves draw/bind count no longer scales with dense
+        // window depth.
+        std.debug.assert(last_merged_tilemap_groups == tilemap_group_count);
     }
 
     var stats = accumulator.finish();
@@ -311,6 +281,7 @@ fn runCaseWithConfig(
     stats.render_game_prep_sparse_submitted = last_sparse_submitted;
     stats.render_game_prep_dynamic_records = fixture.last_collected_records;
     stats.render_game_prep_static_groups = fixture.static_group_count;
+    stats.render_game_prep_merged_tilemap_groups = last_merged_tilemap_groups;
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(batch.adaptive_tuner.report(), settled_before_measurement);
     }
@@ -322,6 +293,7 @@ const MeasuredGamePrep = struct {
     phases: suite.RenderGamePrepPhaseSummary,
     sparse_submitted: usize,
     merged_group_count: usize,
+    merged_tilemap_group_count: usize,
 };
 
 const PhaseAccumulator = struct {
@@ -380,12 +352,17 @@ fn runMeasuredOnce(
     const merge_start_ns = suite.nowNs(io);
     try mergeDrawList(draw_list, allocator, fixture.static_groups[0..fixture.static_group_count], batch.draw_groups.items);
     const merged_group_count = draw_list.items.len;
+    var merged_tilemap_group_count: usize = 0;
+    for (draw_list.items) |merged_group| {
+        if (merged_group.material == .tilemap) merged_tilemap_group_count += 1;
+    }
     const merge_end_ns = suite.nowNs(io);
 
     return .{
         .stats = stats,
         .sparse_submitted = sparse_submitted,
         .merged_group_count = merged_group_count,
+        .merged_tilemap_group_count = merged_tilemap_group_count,
         .phases = .{
             .entity_collect_ns = suite.elapsedNs(collect_start_ns, collect_end_ns),
             .merge_ns = suite.elapsedNs(merge_start_ns, merge_end_ns),
@@ -539,7 +516,6 @@ fn initFixture(
         .static_groups = undefined,
         .static_group_count = 0,
         .player_level = fixture_config.player_level,
-        .dense_tilemap_group_count = fixture_config.dense_tilemap_group_count,
         .tile_texture = tile_texture,
         .white_texture = textureId(0, 1),
         .dynamic_record_capacity = 0,
@@ -631,29 +607,27 @@ fn initFixture(
     fixture.dynamic_record_capacity = render_prep.dynamicRecordCapacity(scene);
 }
 
-/// Builds static draw groups in dense-layer storage order (window start toward
-/// deeper levels), matching `submitStaticDenseGeometry` input before merge sort.
+/// Builds the static draw groups `submitStaticDenseGeometry` produces post
+/// Slice 36: one retained `.tilemap` composite draw ordered at the window's
+/// own shallowest submitted layer (`start_level`, the common single-bucket
+/// case this fixture always hits) plus one static sprite accent group.
 fn benchStaticGroups(
     tile_texture: sprite_batch.TextureId,
     fixture_config: FixtureConfig,
     out: *[max_static_group_count]sprite_batch.DrawGroup,
 ) usize {
-    std.debug.assert(fixture_config.dense_tilemap_group_count <= max_dense_tilemap_group_count);
     const start_level = benchWindowStartLevel(fixture_config.player_level);
-    for (0..fixture_config.dense_tilemap_group_count) |index| {
-        const world_level = start_level +% @as(u16, @intCast(index));
-        out[index] = .{
-            .source = .static,
-            .material = .tilemap,
-            .texture = tile_texture,
-            .presentation = .world,
-            .order = sprite_batch.RenderOrder.world(benchDenseFloorDepth(world_level)),
-            .first_vertex = @intCast(index * 6),
-            .vertex_count = 6,
-            .tile_data = @enumFromInt(index),
-        };
-    }
-    const sprite_index = fixture_config.dense_tilemap_group_count;
+    out[0] = .{
+        .source = .static,
+        .material = .tilemap,
+        .texture = tile_texture,
+        .presentation = .world,
+        .order = sprite_batch.RenderOrder.world(benchDenseFloorDepth(start_level)),
+        .first_vertex = 0,
+        .vertex_count = 6,
+        .tile_data = @enumFromInt(0),
+    };
+    const sprite_index = tilemap_group_count;
     out[sprite_index] = .{
         .source = .static,
         .material = .sprite,
@@ -807,7 +781,7 @@ test "render game prep fixture collects the record count expectedBenchCollectedR
         try std.testing.expectEqual(suite.RunStatus.measured, stats.status);
         try std.testing.expectEqual(count, stats.item_count);
 
-        const deep_stats = try runDense8DeepCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
+        const deep_stats = try runDenseDeepCase(std.testing.allocator, std.testing.io, options, suite.default_cases[0], count);
         try std.testing.expectEqual(suite.RunStatus.measured, deep_stats.status);
         try std.testing.expectEqual(count, deep_stats.item_count);
     }

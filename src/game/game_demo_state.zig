@@ -72,7 +72,12 @@ const demo_structural_reserve = test_square_count + 16;
 /// (1) and dig-mining event (1), plus up to `demo_structural_reserve`
 /// structural-commit events (tier changes / create / destroy), plus the
 /// post-commit nav-invalidation headroom (1) already tracked separately by
-/// `applyStructuralCommandsAndPostCommitEvents`.
+/// `applyStructuralCommandsAndPostCommitEvents`. No term for perception's
+/// `entity_perceived`/`entity_lost` events: no demo entity carries
+/// `AiPerception`, and `perception_max_events_per_step` is set to 0 below.
+/// Likewise no term for affect's `affect_threshold_crossed` events: no demo
+/// entity carries `AiAffect` yet, and `affect_max_events_per_step` is set to
+/// 0 below.
 const demo_event_reserve = test_square_count + 1 + 1 + demo_structural_reserve + 1;
 /// Per-step audio bound for demo tests: 32 movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop.
@@ -85,9 +90,15 @@ const procedural_underground_count: u16 = 31; //31
 const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
 /// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
 const procedural_max_dense_bands_per_level: u8 = 1;
+/// Dense floors below `active_level` kept in the render window. Draw/fragment
+/// cost is proportional to actual interleave points this frame (normally 1),
+/// not window depth, so the full authored underground stack fits:
+/// `1 + procedural_render_window_levels_below == procedural_dense_layer_count`,
+/// exactly filling `k_max_dense_submit_stack_cap`.
+const procedural_render_window_levels_below: u16 = procedural_underground_count;
 comptime {
     std.debug.assert(procedural_dense_layer_count <= world_system.k_max_dense_submit_stack_cap);
-    const submit_layers = @as(usize, 1 + procedural_underground_count) * procedural_max_dense_bands_per_level;
+    const submit_layers = @as(usize, 1 + procedural_render_window_levels_below) * procedural_max_dense_bands_per_level;
     std.debug.assert(submit_layers <= world_system.k_max_dense_submit_stack_cap);
 }
 /// `estimateDenseTileGpuBytes` ceiling: dense_layer_count * width * height * @sizeOf(u32).
@@ -103,12 +114,7 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .underground_level_count = procedural_underground_count,
     .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
     .max_dense_tile_gpu_bytes = procedural_max_dense_tile_gpu_bytes,
-    // Follow the player through the full vertical stack (32 planes); the legacy
-    // default `levels_below = 6` only submitted surface+near floors and made deep
-    // digs look like the old 3-level demo. Submit budget is
-    // `(1 + levels_below) * max_dense_bands_per_level` and must stay within
-    // `k_max_dense_submit_stack_cap` (32).
-    .render_window = .{ .levels_below = procedural_underground_count },
+    .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
 fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCapacity {
@@ -316,6 +322,12 @@ pub const GameDemoState = struct {
             .navigation_world = &world,
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
+            // No demo entity carries `AiPerception` yet. A state that wires
+            // it up must size this against `demo_event_reserve`.
+            .perception_max_events_per_step = 0,
+            // No demo entity carries `AiAffect` yet either. A state that
+            // wires it up must size this against `demo_event_reserve`.
+            .affect_max_events_per_step = 0,
         });
         errdefer pipeline.deinit();
 
@@ -499,6 +511,7 @@ pub const GameDemoState = struct {
         const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
+        try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
         try render_prep.ensureScenePrepCapacity(&self.scene_prep, self.gameplayScene());
         return stats;
     }
@@ -1207,6 +1220,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
     });
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1278,6 +1292,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     // The link still climbs planes via the world tier (independent of the abstract graph).
     placePlayerInCell(&demo, 5, 3);
@@ -1358,6 +1373,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
     });
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+    try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
 
     // The incremental update ran; a pure incremental dig keeps nav_version stable
     // (caches are scope-evicted, not version-invalidated), so no version bump.

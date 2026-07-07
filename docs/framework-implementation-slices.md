@@ -76,8 +76,14 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **24 / 24B** | Landed | Render collect hardening — acceptance history; follow-up in Scaling Gaps |
 | **23A** | Partial | Landed on `expand2`; merge to `world` remains backlog |
 | **25E** | Landed | Per-entity depth alignment + demo 32L/32E validation |
-| **26–33** | Not started | Emergent AI track — see **Emergent AI Track Overview** then each slice |
-| **34–35** | Not started | SIMD expansion — Checklists open |
+| **26–28** | Landed | Entity faction/classification, deterministic per-entity RNG, shared spatial index — see **Emergent AI Track Overview** |
+| **29** | Landed | AI Perception Substrate — vision and hearing (component/system/events), LOS-cost risk closed, LOS diagonal-tunneling correctness fix, caller-sized event budget (see slice section) |
+| **30** | Landed | AI memory (component/system, cold-seek retarget, scope freeze/resync) — `memory_expired` event deferred |
+| **31** | Landed | AI Affect And Emotion Drives (component/system, threshold events) — arbitration consumption deferred to Slice 32 |
+| **32–33** | Not started | Behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
+| **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
+| **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
+| **36** | Landed | Single-pass dense-layer depth compositing (combined tile buffer + interleave-depth-partitioned composite draws; render window widened to the full authored stack) |
 
 **Landed slice sections (18–25, 24B):** checklists complete; sections are
 acceptance history. Follow-up hardening without a new slice number lives in
@@ -141,10 +147,10 @@ world depth, or cognition-track scope.
       camera gates skip draw prep but not the scan. Hardening: warmed visible
       movement dense-index list parallel to scoped simulation gathers (Slice 22
       handoff; partial inline gating landed in 24B).
-- [ ] **Dense floor submit vs camera.** The vertical render window bounds layer
-      count; each in-window layer still submits one full-world tilemap quad (GPU
-      clips). Hardening: chunked dense submit if layer-quad cost dominates
-      (Slice 23B follow-up).
+- [ ] **Dense floor submit vs camera.** Each dense composite draw (Slice 36) is
+      still one full-world tilemap quad regardless of camera pan (GPU clips).
+      Hardening: chunked dense submit if quad cost dominates at very large
+      worlds.
 - [ ] **On-screen record ordering.** `finalizeDepthBuckets` sorts collected
       dynamic records; replace with fixed-band or counting buckets when on-screen
       density rises (Slice 24B follow-up).
@@ -987,9 +993,11 @@ Current foundation (landed):
 - `render_prep.ensureStaticGeometryCapacity` reserves static geometry from
   `WorldSystem.maxDenseSubmitLayerCount()` at the start of `submitGameplayFrame`
   (grow-only; allocation-free after the first reserve).
-- `render-game-prep` dense 8/16/32 surface (`player_level = 0`) and deep
-  (`player_level = 40`) benchmark groups; unit tests cover window caps, player
-  level transitions, per-band inclusion, and depth order.
+- `render-game-prep` dense surface (`player_level = 0`) and deep
+  (`player_level = 40`) benchmark groups (Slice 36 collapsed the original
+  8/16/32 tilemap-group-count variants once that parameter stopped varying
+  the fixture); unit tests cover window caps, player level transitions,
+  per-band inclusion, and depth order.
 
 Checklist:
 
@@ -1000,8 +1008,10 @@ Checklist:
 - [x] Wire window into `submitStaticDenseGeometry` and
       `GameplayScene.player_level` / camera-level handoff.
 - [x] Reserve renderer static-group high-water from window + sparse overhead.
-- [x] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
-      `player_level` 0 vs mid-depth; record `mergeDrawList` and submit cost.
+- [x] Add `render-game-prep` bench cases at `player_level` 0 vs mid-depth;
+      record `mergeDrawList` and submit cost (originally also varied at
+      8/16/32 static tilemap groups; that axis was collapsed in Slice 36 once
+      it stopped affecting the built fixture).
 - [x] Add unit tests: surface window caps submit count; deep play submits only
       the near stack; depth order preserved within the window.
 - [x] Profile GPU memory budget for target level count × world size; document
@@ -1768,6 +1778,403 @@ Acceptance checks:
 
 ## Slice 29: AI Perception Substrate
 
+**Status: landed** — vision (including the LOS cost-risk fix) and hearing are
+both in place. `AiPerception` (`data_system/perception.zig`), `PerceptionSystem`
+(`systems/perception.zig`), the `entity_perceived`/`entity_lost` event
+contract, and the `perception`/`perception-los-dense` benchmark groups are all
+in place with full test coverage: range/FOV/LOS gating, faction-stance
+gating, same-level gating, player-as-candidate, all four transition shapes
+(acquire/lose/hold/identity-swap), the per-step event cap with drop
+diagnostics, serial/threaded parity, and a `FailingAllocator` steady-state
+allocation-free proof. The squared-form FOV test
+(`dot(facing, to) > 0 AND dot^2 > cos_half_fov^2 * dist2`) turned out not to
+need the vector sin/cos polynomial Slice 34 deferred here — no production
+caller for `simd.sinFloat4`/`cosFloat4`/`sinCosFloat4` was added, since a
+unit-length facing vector makes the squared dot-product compare exact without
+any per-frame trig.
+
+**Hearing (closes this slice):** `AiPerception` gained a cold `hearing_range`
+tunable and hot `heard_stimulus`/`heard_stimulus_x/y` columns
+(`data_system/types.zig`, `data_system/perception.zig`), following the same
+cold/hot split and `PerceptionStore.set`-preserves-hot-columns contract as
+vision. `SimulationFrame` gained `stimuli: RangeOutputStream(WorldStimulus)`
+(`simulation.zig`) — a transient per-step positional buffer
+(`position`/`intensity`/`kind`/`level`, scalar-only), cleared every
+`beginStep` and never promoted to a `SimulationEvent`, since it carries no
+stable entity identity to transition against (only state *transitions*
+become events, per the track-wide contract above). `intensity` is stored but
+unused until a second producer exists to calibrate a falloff curve.
+`DigController.process` is the sole producer today (`dig_controller.zig`),
+appending one stimulus alongside its existing `world_tile_changed` event; its
+sibling `carveLandingCell` (the fall/landing path) deliberately does not,
+since it runs after `PerceptionSystem.update` in the same fixed step and
+would be cleared before any hearing pass could read it — documented in place
+rather than silently wired up wrong. Hearing is folded into
+`PerceptionSystem.computeOneAgent` as a squared-distance range check gated by
+same-level only (no FOV, no faction-stance gate — a stimulus is positional
+and factionless), reading `frame.stimuli.mergedItems()` through a
+`PerceptionConfig.stimuli` field. The stream itself needs no reserve call
+from any owning module: its per-step count is a fixed producer invariant (at
+most one, from `dig.process`), not scene-scale-dependent, so it grows lazily
+on first use exactly like `PerceptionSystem`'s own gather buffers already do.
+Tests cover range/level gating, nearest-of-multiple selection, hot-column
+round-trip and preservation-on-retune, serial/threaded parity, and
+`FailingAllocator` allocation-free proofs alongside vision's existing
+coverage.
+
+**LOS cost-risk fix (`hasLineOfSight`'s per-sample lookup is now O(1)):** this
+slice originally shipped with `hasLineOfSight` calling
+`WorldSystem.levelBlocksMovement` once per raycast sample, which linearly
+rescans every sparse tile in the world on every call. `src/benchmarks/perception.zig`'s
+`perception`/`perception-los-dense` groups proved this was a real hazard, not
+theoretical: identical `sensed_count`/`los_checks`/`los_blocked`/
+`nearest_threat_found_count` between the two fixtures, but the `-dense`
+fixture (20,000 extra sparse tiles placed far outside any agent's path) paid
+a 6.5x–10x wall-clock penalty purely from world-wide tile-count bulk.
+
+The fix adds `PerceptionSystem.level_blocked`: a per-level, raw-world-tile-
+granularity blocked bitmap (`LevelBlockedSlot`), built at most once per
+distinct observer level per step by `ensureLevelBlockedCachesForObservers`/
+`ensureLevelBlockedCache` (mirrors `pathfinding/nav_grid.zig`'s
+`markWorldObstacles` shape — dense-band scan + sparse-tiles-filtered-to-level
+pass — but with no nav-cell rect rasterization, since this bitmap is
+tile-indexed 1:1). The build runs on the main thread before any range job is
+dispatched; every worker range only ever reads the completed, per-step-stable
+snapshot. `hasLineOfSight` now calls `lookupLevelBlocked` (an O(1) bitmap
+read) per sample instead of `levelBlocksMovement`.
+
+This slice deliberately did **not** reuse `pathfinding/nav_grid.zig`'s
+already-resident, incrementally-maintained `NavGrid` (via
+`NavGraph.grid(level)`), even though that would avoid a second structure.
+Two independent findings ruled it out: (1) `NavGrid.blocked` is a strict
+*superset* of `levelBlocksMovement`'s contract — it composes world obstacles
+**OR** (on level 0 only) `DataSystem` static collision bodies
+(`NavGrid.markStaticBodies`), so reusing it would silently occlude LOS behind
+entities that `levelBlocksMovement` never blocks on, failing the parity test
+by construction on any fixture with a level-0 static body not coincident with
+a world tile; and (2) `NavGrid.cell_size` (32, set explicitly at
+`rebuildStaticNavGrid`/`rebuildStaticNavGridWithWorld` call sites, e.g.
+`game_demo_state.zig`'s `nav_cell_size = 32`) equals `WorldSystem.tile_size`
+(also enforced to 32 at asset load, `world_tileset_meta.zig`'s
+`required_tile_size`) only *incidentally* — two independently-set literals,
+not an invariant enforced by an assert or a shared constant — so reuse would
+also risk a silent LOS-granularity change if that ever drifted.
+`NavGraph.grid(level)` is additionally nullable and only covers levels
+pathfinding has actually built, which observers are not guaranteed to be
+confined to. `PerceptionSystem` therefore owns its own cache, matching
+`levelBlocksMovement`'s exact contract with zero cross-grid coordinate or
+occlusion-set risk, proven by a dedicated parity test
+(dense-blocked/sparse-blocked/open/out-of-range-level/out-of-range-cell, all
+compared directly against `levelBlocksMovement`). The cache originally
+rebuilt fully every step for every level touched that step (no
+nav-invalidation-event-driven cross-step reuse) — a deliberate scope decision
+at the time, not an oversight; see the residual note below, and the
+incremental dirty-tracking fix that later replaced this (superseding the
+residual note) further down this section.
+
+Before/after (`--profile quick`, same methodology as this slice's original
+risk-confirmation run), 10,000 agents, serial-direct: `perception` 33.60ms →
+21.98ms; `perception-los-dense` 217.58ms → 25.74ms (was a 6.5x regression,
+now 1.17x). Best-threaded case, 10,000 agents: `perception` ~6.24ms → 6.39ms
+(unchanged, within run-to-run noise); `perception-los-dense` 25.81ms (over the
+16.67ms/60Hz budget) → 9.64ms (`thread-small-range`, well under budget). Full
+8-case tables at 1,024/4,096/10,000 agents for both groups are in this
+change's PR/session record.
+
+**Honest residual, not rounded away:** the two groups do not fully converge.
+A fixed, non-scaling gap remains — measured best-case-threaded: ~2.99ms
+(1,024 agents), ~2.89ms (4,096), ~3.25ms (10,000); serial-direct: ~2.63ms,
+~3.27ms, ~3.76ms respectively. This gap is flat across a ~10x population
+range (not proportional to agent count or `los_checks`, which are identical
+between the two fixtures at every scale), which is itself the evidence the
+per-sample lookup is genuinely O(1): the residual is entirely the once-per-step
+cache-rebuild cost (a single O(world sparse-tile count) pass over the
+`-dense` fixture's 20,000 extra tiles, paid once per step regardless of how
+many agents or LOS samples run that step), not a per-sample or per-agent cost.
+The realistic `perception` fixture shows no regression at all. Cross-step
+caching (invalidating the bitmap only on an actual world-tile change, the same
+way `PathfindingSystem` already reacts to nav-invalidation events) would
+close this residual entirely but was deliberately deferred at the time — it
+would touch the nav-invalidation event contract for a gap that only appears
+in a fixture engineered specifically to be an unrealistic sparse-tile-density
+torture test, not in any representative world density this project's other
+benchmarks use. **This deferral is now superseded** — see "Incremental
+dirty-tracked LOS-blocked cache" below, which implements exactly this and
+closes the residual.
+
+**Shared per-level sparse-tile index (root-cause fix behind the residual):**
+after the LOS cost-risk fix above, a review pass found the *same*
+scan-every-sparse-tile-then-filter-by-level pattern independently duplicated
+in three places: `WorldSystem.levelBlocksMovement`, `NavGrid.markWorldObstacles`,
+and `PerceptionSystem.ensureLevelBlockedCache` (added by this slice). Each
+walked every `SparseTileRow` in the world checking `level_index` per tile,
+even though a `SparseTileRow`'s level is fixed at insertion and never changes.
+`WorldSystem` now carries a reverse per-level index —
+`sparse_level_tiles: std.ArrayList(std.ArrayList(u32))`, one growable bucket of
+`sparse_tiles` indices per level, plus the accessor
+`sparseTileIndicesForLevel(level_index) []const u32` — maintained *eagerly*
+inside `addSparseTile` (the sole inserter; tiles are never removed and never
+reassigned to another level, confirmed by inspection) rather than lazily
+rebuilt off a dirty flag. Eager maintenance was a deliberate deviation from
+the `sparse_render_order`/`sparse_depth_ranges` render-index pattern this was
+modeled after: that pattern's flat sorted-array-plus-ranges shape only stays
+correct if rebuilt in full on every structural change, and `render_index_dirty`
+is safely deferred only because its sole reader (`ensureRenderDepthIndex`) runs
+once per render frame. `levelBlocksMovement`, `NavGrid.markWorldObstacles`, and
+`PerceptionSystem.ensureLevelBlockedCache` do not have that luxury — they run
+inside the fixed-step gameplay tick (nav reacting to a dig, perception
+rebuilding its bitmap) and can be reached in the same step a sparse tile is
+placed, before any render pass would run; a lazily-rebuilt index keyed off a
+render-only dirty flag would have been stale for them. `sparse_level_tiles`
+also cannot itself be shaped like `sparse_render_order` for the same reason:
+keeping one level's run contiguous in a single flat array only works with a
+full resort after every insert, which is exactly the O(n) rescan this index
+exists to remove. All three consumers now iterate
+`sparseTileIndicesForLevel(level)` instead of the whole `sparse_tiles` set.
+Proof: a new `sparseTileIndicesForLevel` exact-set test (multiple levels,
+interleaved insertion order, a level with zero sparse tiles, and an
+out-of-range level) and a new `levelBlocksMovement` multi-level parity test
+placing an obstacle on one level at a cell shared with two other levels
+(`world_system.zig`); the existing `nav_graph.zig` incremental-update tests
+(which compare `NavGrid`'s composed mask directly against
+`levelBlocksMovement` cell-by-cell across every level of a multi-level demo
+world) continued to pass unchanged, since the contract did not move, only the
+scan did.
+
+Measured effect on the `perception`/`perception-los-dense` gap (`--profile
+quick`, same methodology as the numbers above): the `-dense` fixture's extra
+20,000 sparse tiles all land on the *same single level* as the populated
+region (`WorldSystem.initDemoFromMeta` never adds a second level), so this
+fixture cannot exercise the index's intended cross-level win — the
+scan-avoidance the three consumers now get on a genuinely multi-level world
+(e.g. the underground stack `nav_graph.zig`'s tests build) does not apply
+here. What the per-level index *did* remove from this single-level scan was
+the redundant per-tile `sparseTileLevel(idx)` accessor call and its
+`MultiArrayList.items(.level_index)` re-derivation on every one of the 20,000
+tiles, replaced by one hoisted slice read up front. An isolated, same-session
+A/B on identical 20,002-tile single-level data (30 back-to-back reps,
+`world_system.zig`, removed after measurement) showed this specific loop drop
+from ~784us/rebuild (old scan-and-filter) to ~45us/rebuild (new indexed
+scan) — a ~17x reduction in the loop itself, with zero behavior change (both
+loops agree on the blocked-tile count every rep).
+
+At the full pipeline level, serial-direct, 10,000 agents: `perception` 22.74ms,
+`perception-los-dense` 24.41ms — gap 1.67ms, versus the 3.76ms gap recorded
+above before this fix. Note this "before" comes from this same slice's own
+prior recorded numbers (above), not a controlled same-session revert of just
+this change — the sandbox's revert-safety policy ruled out stashing the
+working tree mid-task to get a stricter A/B, so the isolated loop measurement
+below is the controlled proof for this specific change; the table comparison
+against the prior recorded numbers is corroborating, not conclusive on its
+own. Full table:
+
+| agents | perception serial | los-dense serial | gap (was) | perception best-threaded | los-dense best-threaded | gap (was) |
+|---|---|---|---|---|---|---|
+| 1,024 | 3.42 ms | 5.43 ms | 2.01 ms (2.63 ms) | 2.24 ms | 4.13 ms | 1.89 ms (2.99 ms) |
+| 4,096 | 9.89 ms | 11.76 ms | 1.87 ms (3.27 ms) | 3.77 ms | 5.61 ms | 1.84 ms (2.89 ms) |
+| 10,000 | 22.74 ms | 24.41 ms | 1.67 ms (3.76 ms) | 6.49 ms | 8.34 ms | 1.85 ms (3.25 ms) |
+
+**Honest, not rounded away:** the gap shrank meaningfully (24–56% serial,
+36–43% threaded) but did **not** converge to indistinguishable, contrary to
+this fix's original hypothesis (which assumed the `-dense` fixture's extra
+tiles lived on a different level than the populated region — they do not).
+The isolated loop measurement (~45us/rebuild) is far smaller than the
+~1.7–2.0ms full-pipeline gap that remains; the difference is warm-vs-cold
+cache, not an unaccounted cost: the isolated microbenchmark runs 30 reps
+back-to-back, so the first rep warms the ~240KB working set (the u32 index
+plus the gathered `cell_index`/`flags` columns) into L2, and every later rep
+reads hot — but the real pipeline runs the rebuild exactly once per step,
+sandwiched between thousands of agents' spatial queries and bitmap reads that
+evict that working set, so every real rebuild pays a cold scan. A cold Debug
+scan landing at ~1–1.6ms for ~240KB is plausible and consistent with the
+observed residual. Closing it further (e.g. keeping the per-level working set
+resident, or a spatial index within a level) is out of this task's scope,
+which targeted the shared scan-and-filter duplication itself, not
+cache-residency within a level. `pathfinding-hard-fallback` (which exercises
+`levelBlocksMovement` directly via `simulation_pipeline.zig`'s local fallback
+graph) was spot-checked at 64/128 item counts post-fix: all cases completed
+with `fallback_requests == results` and no dropped/evicted requests, i.e. no
+functional regression; no controlled before/after number exists for this
+group specifically.
+
+**Multi-level proof for `NavGrid.markWorldObstacles`, transitively:** no
+dedicated multi-level-sparse `markWorldObstacles` test was added, but the
+requirement is still covered by chaining existing tests rather than by a new
+fixture: `sparseTileIndicesForLevel`'s exact-set test (above) proves the new
+per-level index itself is correct across levels with interleaved insertion
+order; both `markWorldObstacles` and `levelBlocksMovement` now read that same
+index; and `nav_graph.zig`'s existing incremental-update tests compare
+`NavGrid`'s composed blocked mask against `levelBlocksMovement` cell-by-cell
+across every level of a multi-level demo world. That chain — not the
+`nav_graph.zig` test alone, since both sides of that comparison changed
+together and a consistent-but-wrong shared index would still pass it — is
+what anchors correctness; the exact-set test and `levelBlocksMovement`'s own
+hardcoded-value assertions are the load-bearing proof underneath it.
+
+**Allocation and concurrency:** `sparseTileIndicesForLevel` and
+`levelBlocksMovement` take no allocator, so they cannot allocate by
+construction — reading the per-level index adds no new allocation risk on top
+of `PerceptionSystem`'s existing `FailingAllocator` steady-state proof, which
+already drives `ensureLevelBlockedCache`'s rebuild end to end. `sparse_level_tiles`
+and its chunk-bucketed sibling `sparse_level_chunk_tiles` (see
+`sparseTileIndicesForChunk`) are mutated only inside `addSparseTile`, a
+main-thread structural edit; the threaded nav-remask and perception phases
+only ever read them, so this adds no new concurrent-access hazard.
+`addSparseTile` now reserves capacity in `sparse_tiles`, `sparse_level_tiles`,
+and `sparse_level_chunk_tiles` up front (`reserveSparseLevelIndexEntry`,
+`reserveSparseChunkIndexEntry`) before appending to any of them
+(`commitSparseLevelIndexEntry`, `commitSparseChunkIndexEntry`), closing the
+gap that used to exist here: an allocation failure partway through can no
+longer leave a tile present in one structure but absent from the other two.
+A `FailingAllocator` test drives a failure at each of the three reservation
+steps and asserts all three structures are unchanged afterward.
+
+**Incremental dirty-tracked LOS-blocked cache (closes the residual above):**
+`ensureLevelBlockedCache` originally keyed staleness only on
+`PerceptionSystem.step_counter` — since that counter is unique per step, every
+distinct level touched by an observer paid a full rebuild every single step,
+regardless of whether the world actually changed since the last build. This
+is now replaced with NavGraph-style incremental patching, mirroring
+`PathfindingSystem`'s post-commit nav reaction but deliberately narrower:
+
+- `LevelBlockedSlot` gains `pending_dirty: std.ArrayList(DirtyRect)`, a plain
+  min-inclusive/max-exclusive rect list (not `NavGrid`'s chunk-grid
+  `NavCellEdit` — reusing that would couple this file to nav's chunk-grid
+  shape for no benefit; the chunk grid is only consulted transiently, at
+  patch time, to scope the sparse-tile rescan). It grows rather than drops on
+  append (same must-not-lose-an-edit contract as
+  `PathfindingSystem.nav_dirty_edits`) and, unlike that per-step-drained
+  buffer, can persist across MULTIPLE untouched steps: a level with no
+  observer this step is never asked to rebuild, so edits on it simply
+  accumulate until an observer next looks at it.
+- `PerceptionSystem.reactToPostCommitPerceptionEvents(frame, world)` — a new
+  pipeline-level reaction (`SimulationPipeline.reactToPostCommitPerceptionEvents`,
+  called alongside `reactToPostCommitNavEvents` at every one of its call
+  sites; the two are fully independent side effects on disjoint state, so
+  call order does not matter) — filters `frame.events.mergedItems()` to
+  exactly `.world_tile_changed` (single-cell rect, only when the
+  movement-blocking flag actually flipped) and `.world_obstacle_changed` (the
+  event's own already-multi-cell rect), pushing a `DirtyRect` into the
+  relevant level's `pending_dirty`. This is deliberately narrower than
+  `PathfindingSystem.eventInvalidatesNavigation`: no other event variant is
+  read, and there is no non-localizable whole-level fallback case (unlike
+  nav's fallback for entity-obstacle toggles, which this cache never needs to
+  react to, since it only ever reads world tiles). No event is emitted in
+  return — nothing currently reacts to "perception's cache changed."
+- `ensureLevelBlockedCache`'s decision tree, after the existing "already built
+  this exact step" short-circuit: first-ever build for a level runs the full
+  rebuild unchanged (discarding any `pending_dirty` recorded before that first
+  build, rather than replaying it as a patch — the fresh rebuild already
+  reflects current world state directly); an already-built slot with an empty
+  `pending_dirty` SKIPS the rescan entirely (the headline fix — this case
+  never used to happen, since staleness was keyed only on the step counter,
+  not on whether anything changed); an already-built slot with a bounded
+  amount of pending dirty area PATCHES only the affected cells (`@memset`
+  false first per rect, since a bit can go blocked→unblocked and not just the
+  reverse, then rescans only that rect per relevant dense layer and only the
+  sparse tiles in the rect's overlapping level-local chunks via
+  `WorldSystem.sparseTileIndicesForChunk`, bounding the sparse-side candidate
+  set by chunk population instead of level population); an already-built slot
+  whose accumulated dirty area exceeds a quarter of the level's total cells
+  falls back to a full rebuild instead (patch overhead — a memset, rescan,
+  and chunk walk per pending rect — starts to rival one dense full pass well
+  before "half the level changed"; the 25% constant mirrors the spirit of
+  `nav_graph.zig`'s `full_relabel_level_threshold`, which caps affected
+  *levels* rather than a fraction of one level's *cells*, the finer unit this
+  cache actually works in). `WorldSystem.chunksX`/`chunksY` (the level-local
+  chunk grid shape, previously private) are now `pub` so this patch-time
+  chunk-range computation can live in `perception.zig` without duplicating
+  `localChunkIndexForCell`'s per-cell arithmetic.
+- Proof: parity tests compare a patched/skipped/fallback-rebuilt result
+  bit-for-bit against a fresh full rebuild of the same post-edit world state,
+  covering a single dense-tile flip (both directions), a single sparse-tile
+  add, a simulated sparse-tile blocking removal (two independently built
+  `WorldSystem`s, since sparse tiles are append-only with no removal API — see
+  `sparse_level_tiles`'s doc comment), a multi-cell `world_obstacle_changed`
+  rect, dirty rects accumulated across several untouched steps before the
+  level is next touched, an edit recorded before a level's first-ever build
+  (discarded, not replayed), and the full-rebuild-threshold fallback path. A
+  dedicated `FailingAllocator` test proves the steady-state patch path (and
+  the dirty-rect bookkeeping that feeds it) allocates nothing once
+  `pending_dirty`'s capacity has plateaued. The existing serial/threaded
+  parity test continues to pass unchanged (the skip/patch/rebuild decision
+  still happens entirely on the main thread, before any worker dispatch, same
+  as the old unconditional rebuild).
+- Measured effect (`--profile quick`): two new benchmark groups,
+  `perception-cache-full-rebuild` and `perception-cache-patch`, isolate the
+  cache-maintenance cost itself by reporting one synthetic structural-commit
+  event per iteration (a whole-level rect vs. a single-cell rect) against
+  `perception`'s own representative-density fixture, so `sensed_count`/
+  `los_checks`/`nearest_threat_found_count` stay identical between the two and
+  only wall-clock cost differs — serial-direct: 1,024 agents 3.58ms
+  (full-rebuild-forced) vs 2.25ms (patch), 4,096 agents 11.74ms vs 10.75ms,
+  10,000 agents 29.10ms vs 26.61ms; best-threaded: 1,024 agents 1.97ms vs
+  0.65ms, 4,096 agents 3.85ms vs 2.41ms, 10,000 agents 7.58ms vs 6.10ms — a
+  roughly flat ~1.3–1.5ms gap across a ~10x population range, confirming the
+  gap really is the once-per-step cache-maintenance cost and not a per-agent
+  cost. More directly, this fix also re-closes the `perception`/
+  `perception-los-dense` residual documented above, since neither of those
+  fixtures' positions ever change across iterations and neither calls
+  `reactToPostCommitPerceptionEvents`, so every measured step after the first
+  now skips instead of rebuilding: re-measured at 10,000 agents,
+  `perception` 26.92ms serial / 6.09ms best-threaded, `perception-los-dense`
+  27.31ms serial / 6.11ms best-threaded — a ~0.4ms/~0.02ms gap, down from the
+  1.67ms/1.85ms gap recorded right after the shared-index fix and the
+  original 3.76ms/3.25ms gap before any of this slice's LOS-cost work. See
+  `src/benchmarks/perception.zig`'s module doc for the full write-up.
+
+**LOS correctness fix (diagonal tunneling):** a review pass found that
+`hasLineOfSight`'s original sampling — fixed `step_count = ceil(distance /
+tile_size)` linear-interpolation samples along the ray, each checked against
+`lookupLevelBlocked` — was not a true grid traversal. Consecutive samples on a
+non-45-degree diagonal ray can straddle a gridline such that the continuous
+segment passes through a blocking cell's interior without either sample ever
+landing inside it, so a single-tile diagonal occluder could be silently
+skipped and `target_visible`/`nearest_threat` set as if the wall weren't
+there. The existing corner-grazing 45-degree test did not exercise this (a
+perfectly corner-aligned line only ever touches cell corners, a measure-zero
+case, and never crosses a cell's interior off-axis).
+
+The fix replaces the fixed-step sampler with a proper Amanatides-Woo grid/DDA
+walk that visits every cell the segment's interior actually crosses between
+observer and target, still checking each visited cell with the same O(1)
+`lookupLevelBlocked` lookup, with an early exit on the first blocked cell. The
+defensive step ceiling (`los_max_steps`, 32) is now `los_max_cells` (64,
+doubled headroom since Manhattan cell counts on a diagonal run higher than
+the old Euclidean-based step count); hitting it now fails closed (returns
+blocked) rather than coarsening resolution while still resolving the
+endpoint — unreachable under any valid `AiPerception` config, a fallback for
+pathological input only. A dedicated regression test reproduces a mid-segment
+diagonal occluder a corner-grazing case would miss (observer/target placed so
+the ray's true path crosses one cell's interior that no fixed-step sample
+would land in) and confirms it is now correctly reported as blocked.
+Benchmarked at 1,024 and 10,000 agents (`--group perception`): best-threaded
+612.66us and 6.07ms respectively, in the same range as the cache-fix numbers
+above — the cell-walk correctness fix adds no measurable per-agent cost.
+
+**Perception event budget is caller-sized, not a floating default:**
+`PerceptionConfig.max_events_per_step` (library default 512) was never
+derived from the real per-step `frame.events` capacity a caller reserves via
+`SimulationFrame.reserveStreams`. Once enough observers change visibility in
+the same step to push the merged perception-event total past that real
+budget, `mergePerceptionEvents`'s `prefixAppendedRanges` call throws
+`error.EventCapacityExceeded` — unhandled all the way out of the fixed-step
+loop, not the graceful truncate-and-drop the module intends. `SimulationPipelineConfig`
+now carries `perception_max_events_per_step` (default `0`, following the same
+caller-sized-capacity convention as `contact_capacity`/`static_obstacle_capacity`),
+threaded into `PerceptionConfig` at the pipeline's perception call site. A
+static caller-declared share was chosen over reading remaining capacity at
+perception's call time, since perception runs before later
+event-emitting stages (structural commits, nav invalidation) that would
+otherwise inherit the same unhandled-throw risk on headroom perception
+consumed first. `game_demo_state.zig`'s `demo_event_reserve` (83) needs no
+added term today: no demo entity attaches `AiPerception`, so
+`perception_max_events_per_step` stays `0` and perception's real contribution
+to the shared budget is `0` by construction; a state that wires up
+`AiPerception` must size this field against its own reserve. A compact test
+(tight capacity, two observer/hostile pairs, `perception_max_events_per_step
+= 1`) proves the graceful-drop path: no throw, `dropped_events == 1`.
+
 Goal: let agents sense other entities (and later sounds) within vision/hearing
 limits, writing per-frame sensed state to columns and emitting only acquisition/
 loss transitions as events.
@@ -1779,6 +2186,12 @@ Current foundation:
   of distinct sensed entities.
 - Slice 26 supplies faction stance; Slice 28 supplies a shared spatial index;
   Slice 21 supplies the event contract.
+- Slice 34 deferred the vector sin/cos polynomial approximation to here:
+  `simd.sinFloat4`/`cosFloat4`/`sinCosFloat4` exist today only as thin
+  `@sin`/`@cos` vector-builtin wrappers with no production caller. If this
+  slice's FOV math needs batched-angle trig across many agents, implement and
+  benchmark the real polynomial (with a documented error bound and scalar
+  fallback) here, against this slice's actual workload.
 
 Architecture notes:
 
@@ -1789,29 +2202,79 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add an `AiPerception` component: cold tunables (vision range, FOV
+- [x] Add an `AiPerception` component: cold tunables (vision range, FOV
       half-angle, hearing range) plus hot output columns (`target_visible`,
       `last_seen_x/y`, `nearest_threat: EntityId`, `nearest_threat_dist`).
-- [ ] Add a `PerceptionSystem` parallel stage that queries the shared spatial
+      `vision_range`/`fov_half_angle_radians`/`hearing_range` (cold), the
+      derived `cos_half_fov`, the four listed hot output columns, plus
+      `facing_x/y` and `heard_stimulus`/`heard_stimulus_x/y` hot columns the
+      original wording didn't anticipate, are all landed in
+      `data_system/perception.zig`.
+- [x] Add a `PerceptionSystem` parallel stage that queries the shared spatial
       index for candidates, then applies bounded range/FOV/line-of-sight checks
       (LOS against world blocking tiles via `world_system` walkability), writing
       results to perception columns.
-- [ ] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
+- [x] Add scalar-only `entity_perceived` / `entity_lost` event payloads for
       target acquisition/loss transitions, emitted at `domain_reaction` via the
       per-range writer with pre-reserved capacity.
-- [ ] Add a transient per-step world stimulus/sound buffer (position +
+- [x] Add a transient per-step world stimulus/sound buffer (position +
       intensity + type, scalar-only) and consume it for hearing; keep it separate
-      from the audio playback service.
+      from the audio playback service. `SimulationFrame.stimuli`
+      (`RangeOutputStream(WorldStimulus)`, `simulation.zig`) is the buffer;
+      `DigController.process` is the sole producer; hearing is folded into
+      `PerceptionSystem.computeOneAgent` as a same-level squared-distance
+      check. See "Hearing (closes this slice)" above for the full account,
+      including why `carveLandingCell` does not also produce one.
 
 Acceptance checks:
 
-- [ ] Per-frame sense results live in columns, not events; only transitions emit
+- [x] Per-frame sense results live in columns, not events; only transitions emit
       events, bounded by a per-step cap with drops surfaced via event stats.
-- [ ] Serial and threaded perception produce identical columns and event order.
-- [ ] Sensing is allocation-free after warmup and runs only for cognition-tier
+- [x] Serial and threaded perception produce identical columns and event order.
+- [x] Sensing is allocation-free after warmup and runs only for cognition-tier
       entities in scope.
-- [ ] `zig build test` covers range/FOV/LOS gating, transition events, and
+- [x] `zig build test` covers range/FOV/LOS gating, transition events, and
       serial/threaded parity.
+- [x] `hasLineOfSight`'s per-cell blocked test is O(1) (`level_blocked`'s
+      per-level bitmap cache, kept current for a distinct observer level at
+      most once per step via a skip/patch/rebuild decision — see "Incremental
+      dirty-tracked LOS-blocked cache" above), proven behavior-identical to
+      `WorldSystem.levelBlocksMovement` by dedicated parity tests (including
+      patch-vs-fresh-rebuild parity across every dirty-tracking case), and
+      proven allocation-free after warmup by dedicated `FailingAllocator`
+      assertions (serial, threaded, and the dirty-tracked patch path). The
+      `perception-los-dense` benchmark confirms the original fix in practice:
+      10,000 agents best-threaded went from 25.81ms (over the 16.67ms/60Hz
+      budget) to 9.64ms; the incremental dirty-tracking fix further closed
+      the once-per-step cache-rebuild residual that fix left behind (see
+      above for the full before/after and the honestly-reported numbers at
+      each stage).
+- [x] `computeOneAgent`'s scatter writes into `job.perception_slice` at
+      `perception_dense_index[i]` were checked for cross-worker false-sharing
+      risk: the `perception-scattered-dense-index` benchmark
+      (`benchmarks/perception.zig`) shuffles `perception_dense_index` so
+      worker ranges write genuinely interleaved (same-cache-line) slots, unlike
+      `perception`/`perception-los-dense`'s near-monotonic assignment. At
+      50,000 agents this decorrelated case was not slower than the correlated
+      one (4.42x/4.54x vs 4.34x/4.49x threaded speedup, within noise), with
+      identical `sensed_count`/`los_checks`/`los_blocked`/
+      `nearest_threat_found_count` confirming only store-write locality
+      changed. Conclusion: measured, no regression — the per-agent
+      spatial-query/FOV/LOS cost dwarfs the 5 scattered writes, so the direct
+      scatter is left as-is rather than rewritten to a dense-pass-then-
+      serial-scatter pattern.
+- [x] `hasLineOfSight` walks every grid cell the segment's interior crosses
+      (Amanatides-Woo DDA), not fixed-distance samples, closing a diagonal-
+      tunneling gap where a mid-segment occluder could be skipped; proven by a
+      dedicated regression test and re-benchmarked with no measurable
+      per-agent cost regression. See "LOS correctness fix (diagonal
+      tunneling)" above.
+- [x] Perception's per-step event cap is caller-sized against the real
+      `frame.events` capacity (`SimulationPipelineConfig.perception_max_events_per_step`,
+      default `0`), not left at the library's permissive 512 default; proven
+      by a tight-capacity test asserting graceful drop-and-report instead of
+      an unhandled `error.EventCapacityExceeded`. See "Perception event budget
+      is caller-sized, not a floating default" above.
 
 ## Slice 30: AI Memory And Scope-Aware AI State Policy
 
@@ -1827,28 +2290,49 @@ Current foundation:
 
 Checklist:
 
-- [ ] Add an `AiMemory` component with fixed-size scalar columns: last-known
+- [x] Add an `AiMemory` component with fixed-size scalar columns: last-known
       target position + staleness timer, a small fixed-capacity recent-contact
       ring (entity id + last-seen pos + age), and a spatial familiarity scalar —
       no per-entity `ArrayList` on the hot path.
-- [ ] Refresh memory from perception transitions and decay it each step
+- [x] Refresh memory from perception transitions and decay it each step
       (staleness++, familiarity toward baseline); vectorizable column math.
-- [ ] Feed memory to AI when perception is cold (e.g. pursue last-known
+- [x] Feed memory to AI when perception is cold (e.g. pursue last-known
       position).
-- [ ] Implement the scope ↔ AI-state policy: freeze memory/affect decay on
+- [x] Implement the scope ↔ AI-state policy: freeze memory/affect decay on
       demotion out of cognition, resync on promotion, routed through the Slice 24
       deferred-commit path; no background per-frame work for out-of-scope agents.
 - [ ] Optional `memory_expired` event (scalar-only, `domain_reaction`) if a
-      reaction needs it; otherwise memory stays purely columnar.
+      reaction needs it; otherwise memory stays purely columnar. Deferred: no
+      current reaction consumes ring-contact expiry, which stays a pure
+      columnar decay (entity id cleared on the row, no event). Revisit if
+      Slice 32 (arbitration) or Slice 33 (debug introspection) needs to react
+      to a contact going stale.
 
 Acceptance checks:
 
-- [ ] Memory updates and decay are deterministic and allocation-free; fixed-size
+- [x] Memory updates and decay are deterministic and allocation-free; fixed-size
       storage never grows per frame.
-- [ ] Demoted entities preserve state with decay paused and resume correctly on
+- [x] Demoted entities preserve state with decay paused and resume correctly on
       promotion.
-- [ ] `zig build test` covers refresh-from-perception, decay, ring eviction, and
+- [x] `zig build test` covers refresh-from-perception, decay, ring eviction, and
       demotion/promotion state continuity.
+
+**Status: landed.** `AiMemory` component + `AiMemoryStore` (SoA, ring buffer
+flattened into parallel columns) land in `data_system/`; `AiMemorySystem`
+(`src/game/systems/ai_memory.zig`) runs between perception and AI in
+`SimulationPipeline`, decaying staleness/familiarity/ring contacts for the
+cognition-scoped `AiPerception`+`AiMemory` subset and refreshing from this
+step's perception-acquisition events. `AiSystem`'s `seek` behavior retargets
+toward `AiMemory.last_known_x/y` when perception reports the target cold and
+memory is still fresh. Scope freeze/resync falls out of reusing the same
+cognition-scope dense-index list perception/AI already gate on: a demoted
+entity is simply not gathered, so its memory row is untouched until it
+re-enters scope. The `memory_expired` event stays deferred (see Checklist).
+A dedicated `ai-memory` bench group (`src/benchmarks/ai_memory.zig`) now
+isolates decay throughput (`processed_count`) from event-driven ring refresh
+(`refreshed_count`, injected for every 8th agent per step). Measured
+(`--profile quick`, 10,000 agents): serial-direct 802.76us, best-threaded
+(thread-large-range) 506.09us (1.58x).
 
 ## Slice 31: AI Affect And Emotion Drives
 
@@ -1869,24 +2353,67 @@ Architecture notes:
 
 Checklist:
 
-- [ ] Add an `AiAffect` component with fixed scalar drive columns plus per-entity
+- [x] Add an `AiAffect` component with fixed scalar drive columns plus per-entity
       baselines, SIMD-aligned.
-- [ ] Add an `AffectSystem` parallel/SIMD stage that appraises perception +
+- [x] Add an `AffectSystem` parallel/SIMD stage that appraises perception +
       memory into drive deltas, applies them, and decays each drive toward its
       baseline; bounded, allocation-free, deterministic.
 - [ ] Expose drives to behavior arbitration (Slice 32) as weight modulators
       (fear → flee weight + speed, curiosity → investigate weight, fatigue → max
-      speed).
-- [ ] Add scalar-only `affect_threshold_crossed { entity, drive, rising }` events
+      speed). Deferred to Slice 32 itself — `AiConfig`/`decideDir()` do not yet
+      read any affect drive.
+- [x] Add scalar-only `affect_threshold_crossed { entity, drive, rising }` events
       for threshold crossings (panic onset/calm) at `domain_reaction`.
 
 Acceptance checks:
 
-- [ ] Scalar and SIMD affect updates produce identical results (parity test).
-- [ ] Drives stay bounded and decay to baseline with no inputs; updates are
+- [x] Scalar and SIMD affect updates produce identical results (parity test).
+- [x] Drives stay bounded and decay to baseline with no inputs; updates are
       allocation-free.
-- [ ] Threshold events are low-volume by construction and capacity-bounded.
-- [ ] `zig build test` covers appraisal, decay-to-baseline, and threshold events.
+- [x] Threshold events are low-volume by construction and capacity-bounded.
+- [x] `zig build test` covers appraisal, decay-to-baseline, and threshold events.
+
+**Status: landed** (arbitration consumption deferred to Slice 32, see
+Checklist). `AiAffect` (`data_system/types.zig`) carries four independent
+drives (`fear`, `curiosity`, `aggression`, `fatigue`), each with its own
+per-entity cold `baseline_*`/`decay_rate_*`/`threshold_*` tunables plus a hot
+per-step value clamped to `[0, 1]`; `decay_rate_*`/`threshold_*` are
+deliberately per-entity, not a single global constant, since a future
+data-driven archetype (Slice 33) needs per-personality decay speed and
+sensitivity, not just a per-personality resting level — the only global
+tunable is `ai_affect_threshold_hysteresis`. `AiAffectStore`
+(`data_system/affect.zig`) mirrors `PerceptionStore`'s cold-preserves-hot
+`set()` contract exactly. `AffectSystem` (`systems/affect.zig`) runs in
+`SimulationPipeline` between `AiMemorySystem` and `AiSystem`: it appraises the
+cognition-scoped `AiAffect` subset from this step's just-written
+`AiPerception`/`AiMemory` state (both independently optional per row — a
+missing component contributes "no signal," never excludes the row) plus each
+row's own `AiAgent.behavior` (fatigue's input, since active pursuit vs.
+wandering is not a perception/memory signal). Fear and aggression share the
+same visible-hostile/distance signal but use independent gain constants and
+are deliberately never cross-coupled; curiosity rises from an unseen heard
+stimulus and separately from low memory familiarity; cross-drive modulation of
+any kind is left to the future arbitration slice. The compute pass vectorizes
+across four scattered rows per lane group, one drive-column pass at a time
+(the same shape `AiMemorySystem.processDecayRange` uses for its own
+staleness/familiarity columns), gathering each row's own baseline/decay
+rate/threshold via `simd.gatherFloat4` — never a splatted global constant —
+after a branchy gather stage packs perception/memory presence into a
+contiguous per-row scratch table (mirrors `PerceptionGatherRow`). A
+rising/falling threshold-crossing check runs scalarly per lane afterward as
+a true Schmitt trigger: each drive's bit in `AiAffect.above_threshold_mask`
+is the persisted "is this drive currently above threshold" state, read and
+flipped on a confirmed edge, so a value hovering at `threshold` -- or
+oscillating within the hysteresis band (`ai_affect_threshold_hysteresis`)
+without ever leaving it -- cannot refire the same edge twice; only a
+genuine exit and re-entry of the band fires a new edge. Event emission
+(range-owned scratch, deterministic capped merge) mirrors
+`PerceptionSystem.mergePerceptionEvents`, except up to four events can fire
+per row per step (one per independent drive). A dedicated `ai-affect` bench
+group (`src/benchmarks/affect.zig`) measures appraisal throughput with a
+mixed population (every 4th agent also carrying `AiPerception`/`AiMemory`).
+Measured (`--profile quick`, 10,000 agents): serial-direct 2.09ms,
+best-threaded (thread-large-range) 1.44ms (1.45x).
 
 ## Slice 32: AI Behavior Arbitration
 
@@ -1970,6 +2497,29 @@ Acceptance checks:
 
 ## Slice 34: Core SIMD Primitive Layer Expansion And Dense-Path Wins
 
+**Status: landed, with two items deferred/reverted by evidence.** The gather/
+scatter, rsqrt/normalize, sprite-transform, and AI-memset items were already
+shipped pre-existing. The packed-SoA-scratch idiom doc landed. The batched
+`lerpVec2Float4` primitive landed (correct, tested) but its `render_prep.zig`
+consumer was **built, benchmarked, and reverted** — see item 6 below. The
+sin/cos polynomial stays deferred to Slice 29.
+
+> Doc-drift note: this section previously listed every item below as `[ ]`
+> "Not started." Direct code reading found most of this slice had already
+> shipped in earlier commits without the roadmap being updated — the gather/
+> scatter helper, rsqrt/normalize, the sprite vertex-transform vectorization,
+> and the AI separation-grid `@memset` all predate this correction pass (see
+> commit `a723821`, "updated collisions hand rolled gather 4 into SIMD.zig",
+> and the `world` branch changelog's "Expanded `src/core/simd.zig` and
+> `src/core/math.zig` with reusable gather, normalize, sin/cos, and tail
+> helpers"). This pass corrects the stale checkboxes and lands the packed-
+> SoA-scratch idiom documentation. It also attempted the batched-lerp item
+> (item 6) with a `render_prep.zig` consumer, measured it rigorously, found no
+> real win, and reverted the consumer — see item 6 for the full account,
+> including a caution about benchmark methodology worth reading before trying
+> this again. Two items are **reinterpreted, not implemented as originally
+> worded** — see the notes on items 3 and 5 below.
+
 Goal: extend `src/core/simd.zig` with the vector primitives the SIMD-first
 gameplay/AI stages will need, and land the layout-independent dense-path
 vectorization wins that are measurable today. This is foundational and should
@@ -1988,57 +2538,131 @@ Current foundation (already vectorized through `src/core/simd.zig`, with scalar
 tails, no raw `@Vector` in systems):
 
 - `systems/movement.zig` — position/velocity integration over SoA columns.
-- `systems/collision.zig` — broadphase AABB sweep and narrowphase contact math
-  (a locally hand-rolled `gather4` + masked select).
+- `systems/collision.zig` — broadphase AABB sweep and narrowphase contact math,
+  both ported onto the shared `simd.gatherFloat4`/`scatterFloat4` helpers
+  (`a723821`) — no local hand-rolled `gather4` remains.
 - `systems/collision_response.zig` — normal/penetration/velocity correction math.
 - `systems/particle.zig` — particle integration and color/size lerp.
 - `systems/pathfinding.zig` — flow-field octile heuristic and nav-grid marking;
   `pathfinding_range_alignment_items = simd.lane_count`.
-- The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp, and
-  tail helpers, with a single `lane_count` source of width.
-
-Gaps the SIMD-first stages need (the missing primitives):
-
-- No shared gather/scatter helper — collision hand-rolls `gather4`; AI/steering
-  and perception will all need the same.
-- No reciprocal/inverse sqrt and no vectorized 2D normalize (with a masked
-  zero-length guard) — required by every separation/avoidance/perception kernel.
-- No vector sin/cos approximation — Zig `@cos`/`@sin` do not auto-vectorize, and
-  rotation (sprites) and FOV (perception) math need it.
-- No documented packed-SoA-scratch idiom (gather sparse indices into contiguous
-  lanes) — the standard tool for making gather-bound loops vectorizable.
+- `game/render_prep.zig`'s `collectDynamicRecords` interpolation loops remain
+  scalar `math.lerp` per entity/particle — a batched version was built and
+  reverted; see item 6 below for why.
+- The helper exposes `Float4/Int4/Mask4`, arithmetic, compare, select, clamp,
+  gather/scatter, reciprocal-sqrt/normalize, sin/cos, lerp (including the
+  `Vec2x4` batched `lerpVec2Float4`), and tail helpers, with a single
+  `lane_count` source of width and a documented packed-SoA-scratch idiom on
+  `gatherFloat4`.
 
 Checklist:
 
-- [ ] Add gather/scatter helpers to `core/simd.zig`, generalizing collision's
-      local `gather4`; port collision to the shared helper.
-- [ ] Add reciprocal-sqrt / inverse-length and a vectorized 2D normalize with a
+- [x] Add gather/scatter helpers to `core/simd.zig`, generalizing collision's
+      local `gather4`; port collision to the shared helper. Landed pre-existing
+      (`a723821`); `gatherFloat4`/`gatherInt4`/`scatterFloat4` are in
+      `core/simd.zig`, collision's broadphase/narrowphase call them directly.
+- [x] Add reciprocal-sqrt / inverse-length and a vectorized 2D normalize with a
       masked zero-guard (matching the scalar `normalizeOrZero` semantics).
+      Landed pre-existing: `reciprocalSqrtFloat4`/`normalizeOrZero2Float4`.
 - [ ] Add a vector sin/cos (or sincos) approximation with a documented error
-      bound and a scalar fallback path.
-- [ ] Document the packed-SoA-scratch idiom in `core/simd.zig` (or a sibling
-      helper) so later stages reuse one gather-into-lanes pattern.
-- [ ] Vectorize the sprite vertex transform in `render/sprite_batch.zig`
-      (`writePreparedSpriteVertices` / `fillPreparedRange`): pack the 4-corner
-      rotation + translation + camera transform through the helpers over the
-      contiguous prepared-command array, mask the `coordinate_space` branch, keep
-      a scalar tail (~1.3–1.5x on large batches).
-- [ ] Replace the AI separation-grid zero-fill (`systems/ai.zig`) with `@memset`
-      or a vector fill.
-- [ ] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
-      when the interpolation pass iterates many entities over contiguous columns.
+      bound and a scalar fallback path. **Deferred, not implemented.**
+      `sinFloat4`/`cosFloat4`/`sinCosFloat4` exist as thin `@sin`/`@cos`
+      vector-builtin wrappers (correct, but not a polynomial approximation),
+      and have **zero production callers** today. Building a bespoke
+      polynomial with no consumer would be unmeasurable, premature
+      optimization. Deferred to Slice 29 (AI Perception), the first stage
+      needing batched-angle FOV trig across many agents — implement and
+      benchmark it there, against a real workload, not here.
+- [x] Document the packed-SoA-scratch idiom in `core/simd.zig` (or a sibling
+      helper) so later stages reuse one gather-into-lanes pattern. Landed this
+      pass: a worked-example doc block on `gatherFloat4` citing
+      `CollisionSystem.buildBroadphaseCandidatesSimd`/
+      `writeNarrowphaseContactsSimd` as the canonical existing example.
+- [x] Vectorize the sprite vertex transform in `render/sprite_batch.zig`
+      (`writePreparedSpriteVertices` / `fillPreparedRange`). **Reinterpreted:**
+      `writeSpriteQuad` already vectorizes the 4-corner rotation+translation via
+      `Float4` math (landed pre-existing). The "camera transform" and
+      "coordinate_space branch" clauses in the original wording no longer map
+      onto the code as it evolved — the camera transform is baked into the GPU
+      vertex uniform (no CPU-side camera math exists to vectorize), and
+      `coordinate_space` is read only in `buildDrawGroups` for draw-group
+      boundaries, not in the per-vertex emit path, so there is no branch there
+      to mask.
+- [x] Replace the AI separation-grid zero-fill (`systems/ai.zig`) with `@memset`
+      or a vector fill. Landed pre-existing: `resetSeparationScratch` already
+      zero-fills via `@memset` (the separation grid itself was replaced by
+      `SpatialIndexSystem` in Slice 28).
+- [x] Add a batched `lerpVec2` path in `core/math.zig` for render interpolation
+      when the interpolation pass iterates many entities over contiguous
+      columns. **Primitive landed, consumer reverted.** `lerpVec2Float4`
+      landed in `core/simd.zig` (co-located with the other `Vec2x4` SIMD
+      primitives it mirrors, not `core/math.zig` as originally worded) — it is
+      correct and bit-exact parity-tested, and stays, currently without a
+      production caller (same situation as `sinCosFloat4`, item 3).
+      `game/render_prep.zig`'s `collectDynamicRecords` was restructured to
+      consume it (buffer `simd.lane_count` already-scalar-filtered candidates
+      → `gatherFloat4` → `lerpVec2Float4` → per-lane finish, scalar tail for
+      the remainder) and initially reported as a ~6–9% `entity_collect` win.
+      That result did not reproduce and the consumer was reverted:
+      - The original comparison was against a stale `benchmark_outputs/`
+        file from a non-adjacent ancestor commit, 9 commits and 226 unrelated
+        `render_prep.zig` lines removed from the true parent — the true
+        unmodified parent commit, measured in isolation, was itself ~2–6%
+        faster than that stale baseline at every scale, which alone accounts
+        for most of the falsely-reported win. Lesson: a benchmark file's age
+        isn't the issue (that's what `benchmark_outputs/` history is for);
+        comparing against a **non-adjacent commit with unrelated changes in
+        the exact function under test** is.
+      - The first "real" comparison also ran under the default `Debug`
+        optimize mode, where per-element safety checks can dominate and mask
+        (or invert) whatever a vectorized change would show under the
+        `ReleaseFast` mode this project actually ships.
+      - A corrected, controlled comparison (`git worktree` at the true parent
+        commit, 8 repeated runs per side, both `Debug` and `--release=fast`)
+        found **no reliable win at any scale, and a real ~5–15% regression at
+        two of three scales under `--release=fast`** — confirmed
+        independently by a `zig-review-specialist` review that reproduced the
+        regression before the corrected comparison above was even run.
+      - Root cause: `collectDynamicRecords`'s interpolation loop is
+        memory-bound and dominated by non-vectorizable branchy work (asset-
+        reference resolution, AABB cull, draw-record construction) — the two
+        float lerps being batched were never the bottleneck. The batching
+        overhead (scattered-index gather lowers to scalar loads + vector
+        inserts, not a hardware gather; per-lane extract to feed the still-
+        scalar finish work; stack-buffer bookkeeping; a by-value 4-candidate
+        struct array passed to a non-trivially-sized function that may not
+        fully inline) cost more than the ~24 scalar flops it replaced could
+        ever save. This is a poor fit for the packed-SoA-scratch idiom
+        compared to collision.zig's canonical use (compare/select-bound over
+        many candidates, not memory/branch-bound over a few).
+      Before retrying this consumer, either (a) profile first to confirm
+      `collectDynamicRecords` is actually a hot path at real gameplay scale
+      (not bench-fixture scale), or (b) extend the batch to vectorize the
+      AABB cull alongside the lerp (gather `visual_index`-indexed
+      `size_x`/`size_y`, compute the overlap mask in-lane) so the vectorized
+      portion amortizes its own gather/extract cost over more work — both
+      unverified, next-step ideas, not requirements.
 
 Acceptance checks:
 
-- [ ] New primitives have unit tests and scalar-vs-SIMD parity tests; numeric
+- [x] New primitives have unit tests and scalar-vs-SIMD parity tests; numeric
       approximations (rsqrt, sin/cos) document error bounds and keep a scalar
-      fallback.
-- [ ] Collision narrowphase produces identical contacts after porting to the
-      shared gather helper (parity test).
-- [ ] `zig build bench` shows a render-prep vertex-emit win at 10k–50k sprites
-      with no regression at low counts.
-- [ ] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
-- [ ] `zig build verify` passes.
+      fallback. `lerpVec2Float4` has a bit-exact parity test against
+      `math.lerpVec2` (no fast-math in this codebase, so `expectEqual`, not an
+      approximate tolerance, is the correct — and stronger — check). Sin/cos
+      approximation remains deferred per above.
+- [x] Collision narrowphase produces identical contacts after porting to the
+      shared gather helper (parity test) — landed pre-existing.
+- [x] `zig build bench` shows a render-prep win at 10k–50k sprites with no
+      regression at low counts. **Not satisfied by `render_prep.zig`'s
+      interpolation loop** — see item 6's full account: a controlled
+      before/after comparison found no reliable win and a real regression at
+      two of three scales, so that consumer was reverted rather than kept
+      against this acceptance bar. The primitive-layer items (gather/scatter,
+      rsqrt/normalize, sprite-transform vectorization) that this check was
+      originally written against were already landed pre-existing and are
+      unaffected by the revert.
+- [x] Systems use `src/core/simd.zig` helpers, not raw `@Vector`.
+- [x] `zig build verify` passes.
 
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 
@@ -2091,6 +2715,151 @@ Acceptance checks:
       reason per the coding-standards policy.
 - [ ] `zig build verify` passes.
 
+## Slice 36: Single-Pass Dense-Layer Depth Compositing
+
+Status: All 4 steps landed. One combined GPU tile-data buffer replaces the
+former per-layer buffer array (`WorldSystem.dense_tile_data_buffer`), and
+`submitStaticDenseGeometry` now partitions the in-window dense layer set into a
+small, bounded number of composite draws cut at this frame's interleave depths
+(`partitionDenseCompositeBuckets`/`buildWindowLayers`; a topmost-first
+`Renderer.TilemapWindowLayers` per draw), instead of one draw per submitted
+layer. `tilemap.frag.glsl` composites the window per-pixel, stopping at the
+first opaque cell. `render_prep.staticGeometryCapacity` now reserves static
+geometry from `WorldSystem.maxDenseSubmitDrawCount()` (flat, composite-draw-count
+bound) instead of the old per-layer bound, and the `render-game-prep` bench
+fixture/assertions were rewritten to match (`merged_tilemap_group_count` stays
+flat at 1 across the surface/deep cases; the earlier 8/16/32 tilemap-group-count
+axis was collapsed since it never varied the fixture's built content post-step-3).
+`game_demo_state.zig`'s procedural render window default is re-widened to the full authored 31-level
+underground stack (`procedural_render_window_levels_below = procedural_underground_count`),
+the payoff this slice unlocks.
+
+Goal: replace the Slice 23B per-layer full-screen tilemap draw (one draw call +
+one full-viewport fragment-shader pass per **submitted** dense layer) with a
+single fullscreen pass whose fragment shader walks the level stack itself, so
+GPU cost scales with screen pixels once per frame, not screen pixels ×
+submitted-layer count.
+
+Problem (current envelope):
+
+- Each in-window dense layer draws as one world-space quad clipped to the
+  viewport (GPU-Driven Tilemap, `docs/rendering-assets-shaders.md`). The
+  fragment shader (`assets/shaders/tilemap.frag.glsl`) reads a storage buffer,
+  and `discard`s on out-of-bounds or an empty (`invalid_tile_id`) cell so the
+  layer below shows through.
+- `discard` disables early-fragment-test culling, so every covered pixel of
+  every submitted layer runs the full shader even when it immediately
+  discards. With a render window of N layers, steady-state cost is
+  `N × viewport_pixels` fragment invocations per frame regardless of how many
+  layers are actually opaque at any given pixel — fill-rate cost with no
+  matching visual payoff, since a pixel's visible tile comes from at most one
+  layer.
+- This slice's mitigation, landing alongside it: `game_demo_state.zig`'s
+  procedural render window default was cut from `levels_below = 31` (submits
+  all 32 authored levels, the `k_max_dense_submit_stack_cap` ceiling, every
+  frame) to `levels_below = 6` (Slice 23B's recommended 4-8 range). That is a
+  submit-count mitigation, not a fill-rate fix — it still pays
+  `7 × viewport_pixels` per frame and still discards through most of that.
+- Digging can open a stacked shaft visible through more than one hole at a
+  time, so the window can't just be a fixed 1-2 layers without a correctness
+  regression (a deep shaft would go dark past the window edge).
+
+Current foundation (landed, do not rebuild):
+
+- `DenseLayerRenderWindow` / `collectDenseSubmitLayers` /
+  `submitStaticDenseGeometry` (Slice 23B) already collect and order the
+  in-window layer set correctly; this slice changes how that set reaches the
+  GPU, not which layers are in it.
+- Per-layer GPU tile-data storage buffers were replaced, not left unaffected:
+  `uploadDenseLayerBuffers` is now `uploadDenseTileDataBuffer`, building one
+  combined `WorldSystem.dense_tile_data_buffer` from the whole flat
+  `dense_tile_ids` array instead of one buffer object per dense layer.
+  Compositing reads that single buffer at each layer's `denseLayerOffset`.
+- `tilemap.frag.glsl` already has the per-pixel cell lookup and atlas sample;
+  this slice's shader work extends that lookup to iterate levels instead of
+  running once per bound layer.
+
+Architecture notes:
+
+- **Landed:** one combined GPU storage buffer (`WorldSystem.dense_tile_ids`
+  concatenated whole, `denseLayerOffset(layer_index) = layer_index *
+  cellCount()`), not per-level bindings — sidesteps SDL_GPU per-stage
+  storage-binding limits and the Metal storage-slot-shift quirk entirely, since
+  every tilemap draw binds exactly one storage buffer regardless of window
+  depth.
+- **Landed:** the fragment shader loops a per-draw, topmost-first window of
+  element offsets into that buffer (`TilemapUniform.layer_meta`/`layer_offsets`,
+  a `uvec4[8]` matching a flat `[32]u32` byte-for-byte under std140), stopping
+  at the first non-`invalid_tile_id` cell — most pixels resolve in 1-2
+  iterations (the visible floor), not N.
+- **Landed:** `submitStaticDenseGeometry` computes the composite-draw window
+  split on the CPU (`partitionDenseCompositeBuckets`) rather than pushing a
+  full per-level index array to the GPU every frame: it cuts the in-window
+  layer list at every depth something else needs to render sandwiched between
+  two dense layers this frame (`render_prep.collectDenseInterleaveDepths` —
+  the active level's own actor depth, this frame's distinct dynamic depths,
+  and every registered sparse-tile depth at any in-window level, not only the
+  active one). In the shipped default config this always resolves to exactly 1
+  draw; `Renderer.k_max_dense_composite_draws = 8` is the defensive cap.
+- This is a render-cost change only — no dig/nav/simulation contract changes,
+  and `WorldSystem`'s CPU-side tile data remains the source of truth.
+- `DrawGroup.material = .tilemap` is one draw per composite-draw bucket per
+  frame (data-dependent, capped at 8), not one per submitted dense layer.
+
+Checklist:
+
+- [x] Decided combined-buffer layout (not multi-binding) against the SDL_GPU
+      per-stage storage-buffer binding limit and the Metal storage-slot-shift
+      quirk; documented beside `tilemap.frag.glsl` and in
+      `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section.
+- [x] Extended the tilemap fragment shader to loop a per-draw window of levels
+      per-pixel (topmost first) and stop at the first opaque cell, replacing
+      the one-`discard`-per-layer-per-draw model.
+- [x] Updated `Renderer`/`WorldSystem` GPU-side wiring to submit the
+      composited window as a small bounded number of draw calls (data-dependent
+      per frame, capped at `Renderer.k_max_dense_composite_draws`) instead of
+      one per submitted dense layer; `collectDenseSubmitLayers`'s CPU-side
+      layer collection contract is unchanged.
+- [x] Re-widen `game_demo_state.zig`'s procedural render window back toward
+      the full vertical stack now that steady-state draw count no longer
+      scales with submitted-layer count (Step 4).
+- [x] Shrink `render_prep.staticGeometryCapacity`'s reservation from
+      `maxDenseSubmitLayerCount()` to `WorldSystem.maxDenseSubmitDrawCount()`,
+      and rewrite the `render-game-prep` bench fixture/assertions so the
+      tilemap portion of `merged_group_count` is asserted flat across the
+      surface/deep cases (Step 3; the earlier 8/16/32 tilemap-group-count axis
+      was collapsed since it never varied the fixture's built content) — no GPU
+      timestamp-query infrastructure exists in this repo, so this bench proves
+      draw/bind count stops scaling with window depth; it cannot produce a
+      fill-rate number.
+
+Acceptance checks:
+
+- [x] Visual/behavioral parity with the current per-layer draw, proven by
+      `partitionDenseCompositeBuckets`/`buildWindowLayers`/`applyWindowLayers`
+      unit tests (single-bucket common case, ceiling-style split, a synthetic
+      split at a deeper non-active level, the composite-draw-cap overflow
+      case) plus a `render_prep.zig` end-to-end test proving a sparse tile at a
+      deeper in-window level produces a second composite draw group in the
+      merged list, and `zig build gpu-smoke` (multi-layer composite window
+      renders without an SDL_GPU validation error).
+- [x] Digging a multi-level shaft still reveals the correct plane through
+      every stacked hole: closed generally via interleave-depth partitioning,
+      not an `active_level`-only special case — the synthetic non-active-level
+      unit test above is the proof this generalizes to sparse content at any
+      in-window level, present or future.
+- [x] Measured draw/bind count stays flat as submitted-layer count grows from 1
+      to the `k_max_dense_submit_stack_cap` ceiling, at a fixed viewport size:
+      `zig build bench -- --group render-game-prep` asserts
+      `merged_tilemap_group_count == 1` across the surface/deep cases.
+      This proves draw/bind **count** no longer scales with window depth, the
+      CPU-measurable proxy this repo can produce — there is no GPU
+      timestamp-query infrastructure here to measure actual fragment-shader
+      fill-rate cost directly, so that number itself is not measured, only
+      `zig build gpu-smoke`'s qualitative visual check that compositing still
+      renders correctly.
+- [x] `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -2133,6 +2902,7 @@ Acceptance checks:
 32. AI behavior arbitration.
 33. Data-driven AI archetypes and debug introspection.
 35. AI and steering hot-loop SIMD restructure.
+36. Single-pass dense-layer depth compositing.
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents

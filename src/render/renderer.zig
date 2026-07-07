@@ -151,6 +151,47 @@ pub const Renderer = struct {
         std.debug.assert(kStackedStateUiHeadroom >= 2 * kOverlayCommandHeadroom);
     }
 
+    /// Upper bound on composited layers in one tilemap draw's window. Tied to
+    /// `world_system.zig`'s `k_max_dense_submit_stack_cap` by a comptime assert in
+    /// that file (which already imports this module, so the assert lives there
+    /// to avoid an import cycle).
+    pub const k_max_tilemap_window_layers: usize = 32;
+
+    /// Defensive cap on separate tilemap composite draw calls in one frame. In
+    /// the shipped default config this always resolves to 1 (only the active
+    /// level's own actor depth is ever an interleave point); more buckets only
+    /// appear when something (a sparse tile, a dynamic depth) needs to render
+    /// sandwiched between two dense layers this frame.
+    pub const k_max_dense_composite_draws: usize = 8;
+
+    /// One tilemap draw's composited layer window: up to
+    /// `k_max_tilemap_window_layers` element offsets into a combined tile-data
+    /// buffer, topmost layer first. The fragment shader walks these in order and
+    /// stops at the first opaque cell.
+    pub const TilemapWindowLayers = struct {
+        count: u8 = 0,
+        offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
+
+        /// Convenience constructor for the common one-layer case (a single dense
+        /// layer with nothing to sandwich against this frame).
+        pub fn single(offset: u32) TilemapWindowLayers {
+            var window = TilemapWindowLayers{};
+            window.count = 1;
+            window.offsets[0] = offset;
+            return window;
+        }
+    };
+
+    /// Fills `params.layer_meta`/`layer_offsets` from `window` right before the
+    /// fragment uniform push. Pure and GPU-free so it is unit-testable headlessly.
+    pub fn applyWindowLayers(params: *TilemapParams, window: TilemapWindowLayers) void {
+        std.debug.assert(window.count <= k_max_tilemap_window_layers);
+        params.layer_meta[0] = @intCast(window.count);
+        for (0..window.count) |i| {
+            params.layer_offsets[i] = window.offsets[i];
+        }
+    }
+
     allocator: std.mem.Allocator,
     device: *c.SDL_GPUDevice,
     window: *c.SDL_Window,
@@ -199,6 +240,11 @@ pub const Renderer = struct {
     static_colors: std.ArrayListUnmanaged(VertexColor) = .empty,
     static_groups: std.ArrayListUnmanaged(DrawGroup) = .empty,
     static_dirty: bool = false,
+    // Per-frame side table for tilemap DrawGroup.window_slot: which composited
+    // layer offsets each static tilemap span reads this frame. Reset by
+    // beginStaticGeometry; populated by appendStaticTilemapSpan.
+    tilemap_window_layers: [k_max_dense_composite_draws]TilemapWindowLayers = undefined,
+    tilemap_window_layer_count: usize = 0,
     draw_list: std.ArrayListUnmanaged(DrawGroup) = .empty,
     // Reserved upper bounds feeding the merged draw list. `draw_list` is sized to
     // their sum so the per-frame merge stays allocation-free.
@@ -369,6 +415,7 @@ pub const Renderer = struct {
         self.static_uvs.clearRetainingCapacity();
         self.static_colors.clearRetainingCapacity();
         self.static_groups.clearRetainingCapacity();
+        self.tilemap_window_layer_count = 0;
         self.static_dirty = true;
     }
 
@@ -392,26 +439,34 @@ pub const Renderer = struct {
         self.draw_list_high_water = total;
     }
 
-    /// Appends one retained world-space quad that draws a whole dense layer via
-    /// the tilemap pipeline: the fragment shader reads `tile_data` per pixel and
-    /// samples `atlas_texture`. `vertices` are the quad's world-space corners (6).
-    /// Must be called between `beginStaticGeometry` and the next `endFrame`.
+    /// Appends one retained world-space quad that composites `window_layers`
+    /// (topmost-first offsets into a combined tile-data buffer) via the tilemap
+    /// pipeline: the fragment shader walks them per pixel, stopping at the first
+    /// opaque cell, and samples `atlas_texture`. `vertices` are the quad's
+    /// world-space corners (6). Must be called between `beginStaticGeometry` and
+    /// the next `endFrame`. At most `k_max_dense_composite_draws` calls are
+    /// allowed between two `beginStaticGeometry` calls.
     pub fn appendStaticTilemapSpan(
         self: *Renderer,
         atlas_texture: TextureId,
         order: RenderOrder,
         vertices: VertexColumnsConst,
         tile_data: TileDataId,
+        window_layers: TilemapWindowLayers,
     ) !void {
         const vertex_count = vertices.positions.len;
         std.debug.assert(vertices.uvs.len == vertex_count and vertices.colors.len == vertex_count);
         if (vertex_count == 0) return;
+        if (self.tilemap_window_layer_count >= k_max_dense_composite_draws) return error.TooManyTilemapWindowDraws;
         const end = try std.math.add(usize, self.static_positions.items.len, vertex_count);
         const first_vertex = std.math.cast(u32, self.static_positions.items.len) orelse return error.StaticGeometryTooLarge;
         _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
         try self.static_positions.appendSlice(self.allocator, vertices.positions);
         try self.static_uvs.appendSlice(self.allocator, vertices.uvs);
         try self.static_colors.appendSlice(self.allocator, vertices.colors);
+        const window_slot: u8 = @intCast(self.tilemap_window_layer_count);
+        self.tilemap_window_layers[window_slot] = window_layers;
+        self.tilemap_window_layer_count += 1;
         try self.static_groups.append(self.allocator, .{
             .source = .static,
             .material = .tilemap,
@@ -421,6 +476,7 @@ pub const Renderer = struct {
             .first_vertex = first_vertex,
             .vertex_count = @intCast(vertex_count),
             .tile_data = tile_data,
+            .window_slot = window_slot,
         });
         self.static_dirty = true;
     }
@@ -658,6 +714,10 @@ pub const Renderer = struct {
                     var storage = tile_buffer.?;
                     c.SDL_BindGPUFragmentStorageBuffers(render_pass, 0, &storage, 1);
                     var params = self.tileDataParams(group.tile_data);
+                    // The per-buffer params carry only the world-constant grid/atlas
+                    // geometry; the per-draw composited layer window (which offsets
+                    // into a possibly-shared buffer this group reads) is set here.
+                    applyWindowLayers(&params, self.tilemap_window_layers[group.window_slot]);
                     c.SDL_PushGPUFragmentUniformData(command_buffer, 0, &params, @sizeOf(TilemapParams));
                 }
 
@@ -832,9 +892,12 @@ pub const Renderer = struct {
     }
 
     /// Creates a renderer-owned tile-data storage buffer from a row-major tile
-    /// array (one `u32` per cell) and returns its handle. `params` is the layer's
+    /// array (one `u32` per cell) and returns its handle. `params` is the
     /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
-    /// the handle. Built once per dense layer at world load.
+    /// the handle. A generic multi-buffer registry: `WorldSystem` registers one
+    /// entry holding every dense layer's cells concatenated, built once at world
+    /// load; draw groups distinguish layers via a per-draw cell offset instead of
+    /// a distinct buffer per layer.
     pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32, params: TilemapParams) !TileDataId {
         const cell_count = std.math.cast(u32, tiles.len) orelse return error.TileDataBufferTooLarge;
         const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
@@ -1824,6 +1887,36 @@ test "contiguous tilemap groups never coalesce" {
 
     try mergeDrawList(&list, allocator, &static_groups, &.{});
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "applyWindowLayers fills layer count and topmost-first offsets" {
+    var params = TilemapParams{
+        .grid = .{ 1, 1, 1, 1 },
+        .atlas = .{ 1, 1, 1, 1 },
+    };
+    var window = Renderer.TilemapWindowLayers{};
+    window.count = 3;
+    window.offsets[0] = 100;
+    window.offsets[1] = 200;
+    window.offsets[2] = 300;
+
+    Renderer.applyWindowLayers(&params, window);
+
+    try std.testing.expectEqual(@as(i32, 3), params.layer_meta[0]);
+    try std.testing.expectEqual(@as(u32, 100), params.layer_offsets[0]);
+    try std.testing.expectEqual(@as(u32, 200), params.layer_offsets[1]);
+    try std.testing.expectEqual(@as(u32, 300), params.layer_offsets[2]);
+}
+
+test "applyWindowLayers single-layer constructor matches manual window" {
+    var params = TilemapParams{
+        .grid = .{ 1, 1, 1, 1 },
+        .atlas = .{ 1, 1, 1, 1 },
+    };
+    Renderer.applyWindowLayers(&params, Renderer.TilemapWindowLayers.single(42));
+
+    try std.testing.expectEqual(@as(i32, 1), params.layer_meta[0]);
+    try std.testing.expectEqual(@as(u32, 42), params.layer_offsets[0]);
 }
 
 test "merge draw list stays allocation-free when reserved to combined size" {

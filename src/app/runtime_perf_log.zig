@@ -125,6 +125,9 @@ pub const Metric = enum {
     simulation_events_world_tile_changed,
     simulation_events_world_obstacle_changed,
     simulation_events_nav_region_invalidated,
+    simulation_events_entity_perceived,
+    simulation_events_entity_lost,
+    simulation_events_affect_threshold_crossed,
     simulation_events_structural_commit_stage,
     simulation_events_domain_reaction_stage,
 };
@@ -142,6 +145,9 @@ pub const Timing = enum {
     // serial/dispatch overhead that the batch counters never see. The
     // gameplay_* timers cover state-owned glue outside the pipeline.
     pipeline_spatial_index,
+    pipeline_perception,
+    pipeline_ai_memory,
+    pipeline_ai_affect,
     pipeline_ai,
     pipeline_steering,
     pipeline_pathfinding,
@@ -369,6 +375,9 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         const pipeline_spatial_index_timing = self.timingValue(.pipeline_spatial_index);
+        const pipeline_perception_timing = self.timingValue(.pipeline_perception);
+        const pipeline_ai_memory_timing = self.timingValue(.pipeline_ai_memory);
+        const pipeline_ai_affect_timing = self.timingValue(.pipeline_ai_affect);
         const pipeline_ai_timing = self.timingValue(.pipeline_ai);
         const pipeline_steering_timing = self.timingValue(.pipeline_steering);
         const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
@@ -378,11 +387,17 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         log.debug(
-            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(pipeline_spatial_index_timing.averageNs()),
                 millis(pipeline_spatial_index_timing.max_ns),
+                millis(pipeline_perception_timing.averageNs()),
+                millis(pipeline_perception_timing.max_ns),
+                millis(pipeline_ai_memory_timing.averageNs()),
+                millis(pipeline_ai_memory_timing.max_ns),
+                millis(pipeline_ai_affect_timing.averageNs()),
+                millis(pipeline_ai_affect_timing.max_ns),
                 millis(pipeline_ai_timing.averageNs()),
                 millis(pipeline_ai_timing.max_ns),
                 millis(pipeline_steering_timing.averageNs()),
@@ -507,7 +522,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} structural_stage={} domain_stage={}",
+            "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} entity_perceived={} entity_lost={} affect_crossed={} structural_stage={} domain_stage={}",
             .{
                 elapsed_s,
                 self.metricValue(.simulation_events_total),
@@ -518,6 +533,9 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.simulation_events_world_tile_changed),
                 self.metricValue(.simulation_events_world_obstacle_changed),
                 self.metricValue(.simulation_events_nav_region_invalidated),
+                self.metricValue(.simulation_events_entity_perceived),
+                self.metricValue(.simulation_events_entity_lost),
+                self.metricValue(.simulation_events_affect_threshold_crossed),
                 self.metricValue(.simulation_events_structural_commit_stage),
                 self.metricValue(.simulation_events_domain_reaction_stage),
             },

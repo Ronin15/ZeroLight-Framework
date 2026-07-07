@@ -52,11 +52,14 @@ comptime {
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/world_system.zig");
     _ = @import("game/systems/ai.zig");
+    _ = @import("game/systems/ai_memory.zig");
+    _ = @import("game/systems/affect.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/pathfinding.zig");
     _ = @import("game/systems/particle.zig");
+    _ = @import("game/systems/perception.zig");
     _ = @import("game/systems/simulation_scope.zig");
     _ = @import("game/systems/spatial_index.zig");
     _ = @import("game/systems/steering.zig");

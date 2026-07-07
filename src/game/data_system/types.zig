@@ -65,6 +65,9 @@ pub const Component = enum(u5) {
     steering_agent,
     world_level,
     faction,
+    ai_perception,
+    ai_memory,
+    ai_affect,
 };
 
 pub const ComponentMask = u32;
@@ -80,6 +83,9 @@ pub const component_masks = struct {
     pub const steering_agent = componentMask(.steering_agent);
     pub const world_level = componentMask(.world_level);
     pub const faction = componentMask(.faction);
+    pub const ai_perception = componentMask(.ai_perception);
+    pub const ai_memory = componentMask(.ai_memory);
+    pub const ai_affect = componentMask(.ai_affect);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -372,6 +378,262 @@ pub const ConstSteeringAgentSlice = struct {
     unavailable_backoff_steps: []const u16,
 };
 
+// Default half-angle is 60 degrees (120 degree full cone). Capped in
+// validateAiPerception at pi/2 (90 degrees) so cos_half_fov never goes
+// negative — the FOV test in PerceptionSystem relies on cos_half_fov >= 0.
+// Widening past 90 degrees is deferred to a future slice if a wider cone is
+// ever needed.
+const default_ai_perception_fov_half_angle_radians: f32 = std.math.pi / 3.0;
+// cos(pi/3) == 0.5 exactly; kept as a literal comptime constant (not a
+// math.sinCos call) so the struct-field default stays trivially comptime-known.
+// The store always recomputes cos_half_fov from fov_half_angle_radians on
+// append/set, so this default value is never load-bearing.
+const default_ai_perception_cos_half_fov: f32 = 0.5;
+
+/// Cold tunables (vision_range, fov_half_angle_radians) are author-set.
+/// cos_half_fov is derived once from fov_half_angle_radians at set()/append()
+/// time by PerceptionStore — never recomputed per-frame — so FOV checks in
+/// the (future) PerceptionSystem need only a dot-product compare, no vector
+/// sin/cos polynomial. Hot fields are written every step by PerceptionSystem
+/// and held across steps otherwise.
+pub const AiPerception = struct {
+    vision_range: f32 = 240.0,
+    fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
+    cos_half_fov: f32 = default_ai_perception_cos_half_fov,
+    hearing_range: f32 = 200.0,
+    target_visible: bool = false,
+    last_seen_x: f32 = 0,
+    last_seen_y: f32 = 0,
+    nearest_threat: EntityId = EntityId.invalid,
+    nearest_threat_dist: f32 = std.math.inf(f32),
+    facing_x: f32 = 1.0,
+    facing_y: f32 = 0.0,
+    // Recomputed every step; unlike last_seen_x/y, holds no memory of a prior hit.
+    heard_stimulus: bool = false,
+    heard_stimulus_x: f32 = 0,
+    heard_stimulus_y: f32 = 0,
+};
+
+// Keeps LOS raycast step counts small by construction.
+pub const max_ai_perception_vision_range: f32 = 512.0;
+// No per-sample raycast cost to bound; this only rejects pathological config.
+pub const max_ai_perception_hearing_range: f32 = 1024.0;
+
+pub const AiPerceptionCommand = struct {
+    entity: EntityId,
+    perception: AiPerception,
+};
+
+pub const ConstPerceptionSlice = struct {
+    entities: []const EntityId,
+    vision_range: ConstHotF32Slice,
+    fov_half_angle_radians: ConstHotF32Slice,
+    cos_half_fov: ConstHotF32Slice,
+    hearing_range: ConstHotF32Slice,
+    target_visible: []const bool,
+    last_seen_x: ConstHotF32Slice,
+    last_seen_y: ConstHotF32Slice,
+    nearest_threat: []const EntityId,
+    nearest_threat_dist: ConstHotF32Slice,
+    facing_x: ConstHotF32Slice,
+    facing_y: ConstHotF32Slice,
+    heard_stimulus: []const bool,
+    heard_stimulus_x: ConstHotF32Slice,
+    heard_stimulus_y: ConstHotF32Slice,
+};
+
+/// Mutable view exposes only the hot output columns PerceptionSystem writes
+/// every step (target_visible, last_seen_x/y, nearest_threat,
+/// nearest_threat_dist, facing_x/y, heard_stimulus, heard_stimulus_x/y). Cold
+/// tunables stay const here — they change only through
+/// DataSystem.setAiPerception, mirroring ScopeColumnsSlice.
+pub const PerceptionSlice = struct {
+    entities: []const EntityId,
+    vision_range: ConstHotF32Slice,
+    fov_half_angle_radians: ConstHotF32Slice,
+    cos_half_fov: ConstHotF32Slice,
+    hearing_range: ConstHotF32Slice,
+    target_visible: []bool,
+    last_seen_x: HotF32Slice,
+    last_seen_y: HotF32Slice,
+    nearest_threat: []EntityId,
+    nearest_threat_dist: HotF32Slice,
+    facing_x: HotF32Slice,
+    facing_y: HotF32Slice,
+    heard_stimulus: []bool,
+    heard_stimulus_x: HotF32Slice,
+    heard_stimulus_y: HotF32Slice,
+};
+
+pub const ai_memory_ring_capacity: usize = 4;
+pub const max_ai_memory_staleness: f32 = 3600.0;
+pub const max_ai_memory_familiarity: f32 = 1.0;
+pub const ai_memory_familiarity_decay_rate: f32 = 0.02;
+
+/// One remembered contact: who, where, and how long ago. Ring slots are
+/// overwritten oldest-first via ring_next_slot; there is no per-entity growth.
+pub const AiMemoryContact = struct {
+    entity: EntityId = EntityId.invalid,
+    x: f32 = 0,
+    y: f32 = 0,
+    age: f32 = 0,
+};
+
+/// Short-term AI memory: last-known target position with a staleness timer, a
+/// small fixed-capacity recent-contact ring, and a spatial familiarity scalar.
+/// All fields are hot per-step state — no cold/author-facing tunables to
+/// preserve across an overwrite, unlike AiPerception.
+pub const AiMemory = struct {
+    last_known_target: EntityId = EntityId.invalid,
+    last_known_x: f32 = 0,
+    last_known_y: f32 = 0,
+    staleness: f32 = max_ai_memory_staleness,
+    familiarity: f32 = 0,
+    ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity,
+    ring_next_slot: u8 = 0,
+};
+
+pub const AiMemoryCommand = struct {
+    entity: EntityId,
+    memory: AiMemory,
+};
+
+pub const ConstAiMemorySlice = struct {
+    entities: []const EntityId,
+    last_known_target: []const EntityId,
+    last_known_x: ConstHotF32Slice,
+    last_known_y: ConstHotF32Slice,
+    staleness: ConstHotF32Slice,
+    familiarity: ConstHotF32Slice,
+    ring_entity: []const [ai_memory_ring_capacity]EntityId,
+    ring_x: []const [ai_memory_ring_capacity]f32,
+    ring_y: []const [ai_memory_ring_capacity]f32,
+    ring_age: []const [ai_memory_ring_capacity]f32,
+    ring_next_slot: []const u8,
+};
+
+/// Mutable dense columns for the (future) AiMemorySystem's per-step refresh and
+/// decay writes. Every column is hot state here — unlike PerceptionSlice, there
+/// are no cold tunables to hold const.
+pub const AiMemorySlice = struct {
+    entities: []const EntityId,
+    last_known_target: []EntityId,
+    last_known_x: HotF32Slice,
+    last_known_y: HotF32Slice,
+    staleness: HotF32Slice,
+    familiarity: HotF32Slice,
+    ring_entity: [][ai_memory_ring_capacity]EntityId,
+    ring_x: [][ai_memory_ring_capacity]f32,
+    ring_y: [][ai_memory_ring_capacity]f32,
+    ring_age: [][ai_memory_ring_capacity]f32,
+    ring_next_slot: []u8,
+};
+
+/// One appraisal drive an `AiAffect` row tracks. A future arbitration slice
+/// switches behavior selection on this; this slice only appraises and
+/// decays the four drives.
+pub const AiAffectDrive = enum { fear, curiosity, aggression, fatigue };
+
+/// Rising/falling-edge threshold-crossing band: a drive must fall below
+/// `threshold - ai_affect_threshold_hysteresis` before a later rise back past
+/// `threshold` counts as a new rising edge, so a value hovering at `threshold`
+/// does not flap. Enforced as a true Schmitt trigger via `AiAffect`'s
+/// persisted `above_threshold_mask` bit per drive (see `checkThresholdCrossing`
+/// in `systems/affect.zig`), not a stateless comparison against this step's
+/// previous value. The only global affect tunable — baselines, decay rates,
+/// and thresholds themselves are all per-entity (see `AiAffect`).
+pub const ai_affect_threshold_hysteresis: f32 = 0.05;
+
+/// Emotion-drive appraisal state: four independent drives (fear, curiosity,
+/// aggression, fatigue), each with its own per-entity resting baseline, decay
+/// speed, and rising-edge threshold. Cold fields (baseline_*, decay_rate_*,
+/// threshold_*) are author-set tunables preserved across a retune, mirroring
+/// `AiPerception`'s cold/hot split — `AiAffectStore.set` touches only these.
+/// Hot fields (fear/curiosity/aggression/fatigue/above_threshold_mask) are
+/// `AffectSystem`'s live per-step appraisal output: the four drive values are
+/// each clamped to `[0, 1]`; `above_threshold_mask` is the persisted Schmitt-
+/// trigger state that makes threshold-crossing detection stateful across
+/// steps (see `ai_affect_threshold_hysteresis`) — bit `@intFromEnum(drive)`
+/// is set while that drive is above its rising threshold. Not user-facing
+/// validated: any combination of the low 4 bits is valid internal state, and
+/// the upper 4 bits are unused.
+///
+/// `decay_rate_*` and `threshold_*` are deliberately per-entity, not a single
+/// global constant: a future data-driven archetype needs per-personality decay
+/// speed and sensitivity, not just a per-personality resting level.
+pub const AiAffect = struct {
+    baseline_fear: f32 = 0,
+    baseline_curiosity: f32 = 0,
+    baseline_aggression: f32 = 0,
+    baseline_fatigue: f32 = 0,
+    decay_rate_fear: f32 = default_ai_affect_decay_rate,
+    decay_rate_curiosity: f32 = default_ai_affect_decay_rate,
+    decay_rate_aggression: f32 = default_ai_affect_decay_rate,
+    decay_rate_fatigue: f32 = default_ai_affect_decay_rate,
+    threshold_fear: f32 = default_ai_affect_threshold,
+    threshold_curiosity: f32 = default_ai_affect_threshold,
+    threshold_aggression: f32 = default_ai_affect_threshold,
+    threshold_fatigue: f32 = default_ai_affect_threshold,
+    fear: f32 = 0,
+    curiosity: f32 = 0,
+    aggression: f32 = 0,
+    fatigue: f32 = 0,
+    above_threshold_mask: u8 = 0,
+};
+
+const default_ai_affect_decay_rate: f32 = 0.05;
+const default_ai_affect_threshold: f32 = 0.6;
+
+pub const AiAffectCommand = struct {
+    entity: EntityId,
+    affect: AiAffect,
+};
+
+pub const ConstAiAffectSlice = struct {
+    entities: []const EntityId,
+    baseline_fear: ConstHotF32Slice,
+    baseline_curiosity: ConstHotF32Slice,
+    baseline_aggression: ConstHotF32Slice,
+    baseline_fatigue: ConstHotF32Slice,
+    decay_rate_fear: ConstHotF32Slice,
+    decay_rate_curiosity: ConstHotF32Slice,
+    decay_rate_aggression: ConstHotF32Slice,
+    decay_rate_fatigue: ConstHotF32Slice,
+    threshold_fear: ConstHotF32Slice,
+    threshold_curiosity: ConstHotF32Slice,
+    threshold_aggression: ConstHotF32Slice,
+    threshold_fatigue: ConstHotF32Slice,
+    fear: ConstHotF32Slice,
+    curiosity: ConstHotF32Slice,
+    aggression: ConstHotF32Slice,
+    fatigue: ConstHotF32Slice,
+    above_threshold_mask: []const u8,
+};
+
+/// Mutable view for `AffectSystem`'s per-step appraisal writes. Cold tunables
+/// stay const here — they change only through `DataSystem.setAiAffect`,
+/// mirroring `PerceptionSlice`.
+pub const AiAffectSlice = struct {
+    entities: []const EntityId,
+    baseline_fear: ConstHotF32Slice,
+    baseline_curiosity: ConstHotF32Slice,
+    baseline_aggression: ConstHotF32Slice,
+    baseline_fatigue: ConstHotF32Slice,
+    decay_rate_fear: ConstHotF32Slice,
+    decay_rate_curiosity: ConstHotF32Slice,
+    decay_rate_aggression: ConstHotF32Slice,
+    decay_rate_fatigue: ConstHotF32Slice,
+    threshold_fear: ConstHotF32Slice,
+    threshold_curiosity: ConstHotF32Slice,
+    threshold_aggression: ConstHotF32Slice,
+    threshold_fatigue: ConstHotF32Slice,
+    fear: HotF32Slice,
+    curiosity: HotF32Slice,
+    aggression: HotF32Slice,
+    fatigue: HotF32Slice,
+    above_threshold_mask: []u8,
+};
+
 pub const WorldLevelCommand = struct {
     entity: EntityId,
     level: u16,
@@ -395,6 +657,9 @@ pub const EntityTemplate = struct {
     steering_agent: ?SteeringAgent = null,
     world_level: ?u16 = null,
     faction: ?Faction = null,
+    ai_perception: ?AiPerception = null,
+    ai_memory: ?AiMemory = null,
+    ai_affect: ?AiAffect = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -444,6 +709,9 @@ pub const StructuralCommand = union(enum) {
     set_world_level: WorldLevelCommand,
     set_simulation_tier: SimulationTierCommand,
     set_faction: FactionCommand,
+    set_ai_perception: AiPerceptionCommand,
+    set_ai_memory: AiMemoryCommand,
+    set_ai_affect: AiAffectCommand,
 };
 
 pub const StructuralCommitStats = struct {
