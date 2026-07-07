@@ -72,6 +72,7 @@ pub const SimulationTierCommand = @import("data_system/types.zig").SimulationTie
 pub const FactionCommand = @import("data_system/types.zig").FactionCommand;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
+pub const ObstacleWorldRect = @import("data_system/types.zig").ObstacleWorldRect;
 pub const StructuralEntityDestroyedChange = @import("data_system/types.zig").StructuralEntityDestroyedChange;
 pub const StructuralComponentChangedChange = @import("data_system/types.zig").StructuralComponentChangedChange;
 pub const StructuralChange = @import("data_system/types.zig").StructuralChange;

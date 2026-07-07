@@ -294,6 +294,23 @@ pub const DataSystem = struct {
         return response.mobility == .static;
     }
 
+    /// World-space AABB of `id`'s collision body (movement body position plus collision
+    /// bounds offset/size), or null when either component is absent. Matches the rect math
+    /// pathfinding's nav_grid.zig derives from the same columns, so a caller can localize
+    /// nav invalidation to the covered cells without re-deriving the whole level.
+    pub fn staticObstacleWorldRect(self: *const DataSystem, id: EntityId) ?types.ObstacleWorldRect {
+        const body = self.movementBodyConst(id) orelse return null;
+        const bounds = self.collisionBoundsConst(id) orelse return null;
+        const min_x = body.position.x + bounds.offset.x;
+        const min_y = body.position.y + bounds.offset.y;
+        return .{
+            .min_x = min_x,
+            .min_y = min_y,
+            .max_x = min_x + bounds.size.x,
+            .max_y = min_y + bounds.size.y,
+        };
+    }
+
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.

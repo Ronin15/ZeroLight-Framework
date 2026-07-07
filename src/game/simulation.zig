@@ -19,6 +19,7 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
+const ObstacleWorldRect = @import("data_system.zig").ObstacleWorldRect;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
 
@@ -71,12 +72,20 @@ pub const ComponentChangedEvent = struct {
     component: Component,
     was_static_navigation_obstacle: bool = false,
     is_static_navigation_obstacle: bool = false,
+    // World-space obstacle rect before/after this change, when the entity was/is a static
+    // navigation obstacle. Lets the post-commit nav reaction localize invalidation to the
+    // covered nav cells instead of the whole level.
+    old_obstacle_world_rect: ?ObstacleWorldRect = null,
+    new_obstacle_world_rect: ?ObstacleWorldRect = null,
 };
 
 pub const EntityDestroyedEvent = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool = false,
+    // World-space obstacle rect at destroy time, when the entity was a static navigation
+    // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
+    obstacle_world_rect: ?ObstacleWorldRect = null,
 };
 
 pub const SimulationEventPayload = union(enum) {
@@ -534,6 +543,7 @@ pub const SimulationFrame = struct {
                         .entity = destroyed.entity,
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
+                        .obstacle_world_rect = destroyed.obstacle_world_rect,
                     } },
                 },
                 .component_changed => |changed| .{
@@ -543,6 +553,8 @@ pub const SimulationFrame = struct {
                         .component = changed.component,
                         .was_static_navigation_obstacle = changed.was_static_navigation_obstacle,
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
+                        .old_obstacle_world_rect = changed.old_obstacle_world_rect,
+                        .new_obstacle_world_rect = changed.new_obstacle_world_rect,
                     } },
                 },
             });

@@ -8,6 +8,7 @@
 //! global scheduler or dynamic system registry.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../core/math.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
 const c = @import("../platform/sdl.zig").c;
@@ -47,6 +48,135 @@ const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+
+/// Coarse per-step data resources stages read/write, for the stage-ordering
+/// contract below. Some tags bundle several SoA columns owned by one system
+/// (e.g. `movement_positions` covers the movement body's position/velocity
+/// columns together) rather than tracking every field individually.
+const PipelineResource = enum {
+    world_tiles,
+    events,
+    ai_scope_indices,
+    spatial_index,
+    navigation_intents,
+    movement_intents,
+    path_requests,
+    movement_positions,
+    movement_scope_indices,
+    collision_scope_indices,
+    contacts,
+    collision_triggers,
+    world_level,
+    structural_commands,
+    // Reserved for stages landing under Slices 29-32 (not yet implemented):
+    perception_sensed,
+    ai_memory,
+    affect_drives,
+};
+
+const ResourceSet = std.EnumSet(PipelineResource);
+
+fn resources(comptime items: []const PipelineResource) ResourceSet {
+    return ResourceSet.initMany(items);
+}
+
+const StageId = enum {
+    dig_world_edit,
+    scope_advance_and_ai_gather,
+    spatial_index_build,
+    ai_decide,
+    steering_update,
+    pathfinding_update,
+    apply_ai_movement_intents,
+    movement_scope_gather,
+    movement_integrate,
+    bounds_and_tile_gate,
+    collision_scope_gather,
+    collision_detect,
+    collision_respond,
+    plane_traversal,
+    tier_policy,
+};
+
+const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
+
+/// Declares each stage's resource reads/writes against `stage_order` below.
+/// Checked at comptime: a stage cannot read a resource no earlier stage in
+/// `stage_order` writes.
+fn stageContract(stage: StageId) StageContract {
+    return switch (stage) {
+        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
+        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_scope_indices}) },
+        .spatial_index_build => .{ .reads = resources(&.{.ai_scope_indices}), .writes = resources(&.{.spatial_index}) },
+        .ai_decide => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index }), .writes = resources(&.{.navigation_intents}) },
+        .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
+        .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
+        .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
+        .movement_scope_gather => .{ .reads = .empty, .writes = resources(&.{.movement_scope_indices}) },
+        .movement_integrate => .{ .reads = resources(&.{ .movement_positions, .movement_scope_indices }), .writes = resources(&.{.movement_positions}) },
+        .bounds_and_tile_gate => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.movement_positions}) },
+        .collision_scope_gather => .{ .reads = .empty, .writes = resources(&.{.collision_scope_indices}) },
+        .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
+        .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
+        .plane_traversal => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{ .world_tiles, .world_level, .events }) },
+        .tier_policy => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.structural_commands}) },
+    };
+}
+
+/// The pipeline's concrete fixed-step stage order. `update()` marks each stage
+/// via `stage_trace` at its real call site so the order-trace test below can
+/// prove this declared order matches what actually runs.
+const stage_order = [_]StageId{
+    .dig_world_edit,
+    .scope_advance_and_ai_gather,
+    .spatial_index_build,
+    .ai_decide,
+    .steering_update,
+    .pathfinding_update,
+    .apply_ai_movement_intents,
+    .movement_scope_gather,
+    .movement_integrate,
+    .bounds_and_tile_gate,
+    .collision_scope_gather,
+    .collision_detect,
+    .collision_respond,
+    .plane_traversal,
+    .tier_policy,
+};
+
+comptime {
+    var produced: ResourceSet = .empty;
+    for (stage_order) |stage| {
+        const contract = stageContract(stage);
+        const unmet = contract.reads.differenceWith(produced);
+        if (unmet.count() != 0) {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' reads a resource no earlier stage writes — fix stage_order or stageContract()");
+        }
+        produced.setUnion(contract.writes);
+    }
+}
+
+/// Test-only record of the stage order `update()` actually ran, so a test can
+/// assert it matches `stage_order`. Zero-cost outside tests.
+const StageTrace = if (builtin.is_test) struct {
+    order: [stage_order.len]StageId = undefined,
+    count: usize = 0,
+
+    fn mark(self: *StageTrace, stage: StageId) void {
+        self.order[self.count] = stage;
+        self.count += 1;
+    }
+
+    fn slice(self: *const StageTrace) []const StageId {
+        return self.order[0..self.count];
+    }
+} else struct {
+    fn mark(_: *StageTrace, _: StageId) void {}
+    fn slice(_: *const StageTrace) []const StageId {
+        return &.{};
+    }
+};
 
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
@@ -210,6 +340,7 @@ pub const SimulationPipeline = struct {
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
+    stage_trace: StageTrace = .{},
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -381,6 +512,12 @@ pub const SimulationPipeline = struct {
         self.movement.syncPreviousPositions(&movement_slice);
     }
 
+    /// Test-only: the stage order `update()` actually ran this step, for
+    /// asserting it matches the declared `stage_order` contract.
+    fn debugStageOrder(self: *const SimulationPipeline) []const StageId {
+        return self.stage_trace.slice();
+    }
+
     /// Runs the current full-active fixed-step stage order and returns stage
     /// stats. Real scoped filtering is intentionally deferred until world/chunk
     /// visibility data exists.
@@ -388,9 +525,11 @@ pub const SimulationPipeline = struct {
         const data = context.data;
         const frame = context.frame;
 
+        self.stage_trace = .{};
         frame.phase = .processors;
         // Player-authored world edit. Runs first; its world_tile_changed event is
         // deferred and re-masks navigation in merge_outputs regardless of order.
+        self.stage_trace.mark(.dig_world_edit);
         try self.dig.process(context.world, data, context.player.*, frame);
 
         // Backbone scope pass. Advance the stagger clock, derive the camera
@@ -401,6 +540,7 @@ pub const SimulationPipeline = struct {
         // step (the body's current pre-move cell). Movement/collision gate on tier
         // only (no chunk filter), so they keep running off-screen; cognition gates
         // on the halo + stagger.
+        self.stage_trace.mark(.scope_advance_and_ai_gather);
         self.scope.advanceStep();
         const cognition_region: ?ActiveRegion = context.world.cognitionActiveRegion(cognition_halo_chunks);
         const stagger_step = self.scope.staggerStep();
@@ -414,6 +554,7 @@ pub const SimulationPipeline = struct {
         // row `i` and AiSystem row `i` refer to the same agent (see spatial_index.zig
         // and ai.zig's cross-file population-domain contract). AI separation queries
         // it read-only below; future perception stages will reuse it too.
+        self.stage_trace.mark(.spatial_index_build);
         var spatial_index_timer = StageTimer.start();
         const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_indices });
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
@@ -428,6 +569,7 @@ pub const SimulationPipeline = struct {
         else
             math.Vec2{ .x = 400, .y = 225 };
 
+        self.stage_trace.mark(.ai_decide);
         var ai_timer = StageTimer.start();
         const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
@@ -444,10 +586,12 @@ pub const SimulationPipeline = struct {
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
+        self.stage_trace.mark(.steering_update);
         var steering_timer = StageTimer.start();
         const steering_stats = try self.steering.update(data, frame, context.thread_system, &self.pathfinding, .{});
         steering_timer.stop(context.perf, .pipeline_steering);
 
+        self.stage_trace.mark(.pathfinding_update);
         var pathfinding_timer = StageTimer.start();
         // Drive elastic pathfinding capacity off the live steering-agent crowd (the
         // entities that consume paths), so pools grow for battles and shrink after.
@@ -455,6 +599,7 @@ pub const SimulationPipeline = struct {
         const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, path_agent_count, context.thread_system, .{});
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
 
+        self.stage_trace.mark(.apply_ai_movement_intents);
         var apply_intents_timer = StageTimer.start();
         applyAiMovementIntents(data, frame);
         apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
@@ -463,9 +608,11 @@ pub const SimulationPipeline = struct {
         // integrates, on- or off-screen. Null = full-active warm SIMD range. Movement
         // also derives each integrated body's chunk in-pass via chunk_grid, so chunk
         // stays exact every step with no separate recompute.
+        self.stage_trace.mark(.movement_scope_gather);
         const movement_scope_indices = (try self.scope.gatherMovementBodyIndices(data, context.thread_system, .{})).indices;
         const scope_columns = data.scopeColumnsSlice();
         var movement_slice = data.movementBodySlice();
+        self.stage_trace.mark(.movement_integrate);
         var movement_timer = StageTimer.start();
         const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{
             .scope_dense_indices = movement_scope_indices,
@@ -480,6 +627,7 @@ pub const SimulationPipeline = struct {
         });
         movement_timer.stop(context.perf, .pipeline_movement);
 
+        self.stage_trace.mark(.bounds_and_tile_gate);
         var clamp_timer = StageTimer.start();
         clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
         try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
@@ -494,13 +642,16 @@ pub const SimulationPipeline = struct {
 
         // Collision also gates on tier only (no chunk filter): off-screen entities
         // keep colliding with geometry. Null = full-active.
+        self.stage_trace.mark(.collision_scope_gather);
         const collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(data, context.thread_system, .{})).indices;
+        self.stage_trace.mark(.collision_detect);
         var collision_timer = StageTimer.start();
         const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{
             .scope_dense_indices = collision_scope_indices,
         });
         collision_timer.stop(context.perf, .pipeline_collision);
 
+        self.stage_trace.mark(.collision_respond);
         var collision_response_timer = StageTimer.start();
         const collision_response_stats = try self.collision_response.update(data, frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
@@ -510,6 +661,7 @@ pub const SimulationPipeline = struct {
         // the player and NPCs route through `DigController.applyEntityPlaneTraversal`
         // so falls carve their landing cell identically; a fall's tile change
         // re-masks navigation post-commit.
+        self.stage_trace.mark(.plane_traversal);
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
         try applyNpcPlaneTraversal(&self.dig, context.world, data, frame);
 
@@ -519,6 +671,7 @@ pub const SimulationPipeline = struct {
         // Uses the raw visible region (not the cognition halo) so all four bands
         // are measured from the same origin, anchored at the camera/player level so
         // off-level entities demote. Queues nothing when no tier changed.
+        self.stage_trace.mark(.tier_policy);
         var visible_region = context.world.visibleChunkRegion();
         if (visible_region) |*region| region.level = context.player.current_level;
         _ = try self.scope.queueTierChanges(data, visible_region, &frame.structural_commands, context.thread_system, .{});
@@ -772,6 +925,57 @@ test "pipeline updates full active player-only state through serial path" {
     try std.testing.expectEqual(@as(usize, 0), stats.ai.entity_count);
     try std.testing.expectEqual(@as(usize, 1), stats.movement.body_count);
     try std.testing.expectEqual(@as(usize, 0), frame.contacts.mergedItems().len);
+}
+
+test "pipeline stage order matches its declared ordering contract" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    try std.testing.expectEqualSlices(StageId, &stage_order, pipeline.debugStageOrder());
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {

@@ -464,10 +464,16 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
+/// World-space AABB of a static navigation obstacle's collision body, resolved from its
+/// movement body position plus collision bounds offset/size. Lets nav invalidation localize
+/// to the covered nav cells instead of re-deriving the whole level.
+pub const ObstacleWorldRect = struct { min_x: f32, min_y: f32, max_x: f32, max_y: f32 };
+
 pub const StructuralEntityDestroyedChange = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool,
+    obstacle_world_rect: ?ObstacleWorldRect = null,
 };
 
 pub const StructuralComponentChangedChange = struct {
@@ -475,6 +481,8 @@ pub const StructuralComponentChangedChange = struct {
     component: Component,
     was_static_navigation_obstacle: bool,
     is_static_navigation_obstacle: bool,
+    old_obstacle_world_rect: ?ObstacleWorldRect = null,
+    new_obstacle_world_rect: ?ObstacleWorldRect = null,
 };
 
 pub const StructuralChange = union(enum) {

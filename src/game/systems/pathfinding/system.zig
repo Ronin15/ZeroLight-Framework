@@ -24,6 +24,7 @@ const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const NavInvalidationReason = @import("../../simulation.zig").NavInvalidationReason;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
+const ObstacleWorldRect = @import("../../data_system.zig").ObstacleWorldRect;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
@@ -119,6 +120,9 @@ pub const PathfindingSystem = struct {
     // (a dropped cell would leave the graph stale against the world). Reserved at capacity
     // so typical steps are allocation-free; a large step does one bounded amortized grow.
     nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
+    // Entity-driven obstacle-rect edits for this step, already resolved to nav-cell spans (see
+    // markNavObstacleRectDirty). Bounded/reserved and cleared alongside nav_dirty_edits.
+    nav_dirty_cell_spans: std.ArrayList(types.ChangedSpan) = .empty,
     // Levels to remask + repatch in full this step (deduped). Used when a change cannot be
     // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
     // longer resolvable from the entity — so the whole level is re-derived from the world.
@@ -190,6 +194,7 @@ pub const PathfindingSystem = struct {
         self.affected_levels.deinit(self.allocator);
         self.nav_changed_spans.deinit(self.allocator);
         self.nav_dirty_levels.deinit(self.allocator);
+        self.nav_dirty_cell_spans.deinit(self.allocator);
         self.nav_dirty_edits.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
@@ -282,6 +287,8 @@ pub const PathfindingSystem = struct {
         // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
         // grows (never drops) for an unusually large structural step.
         try self.nav_dirty_edits.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
+        // Same bound as nav_dirty_edits: one entity-driven obstacle rect per structural change.
+        try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -453,7 +460,7 @@ pub const PathfindingSystem = struct {
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
-        return self.applyNavUpdatesImpl(data, world, edits, &.{}, null);
+        return self.applyNavUpdatesImpl(data, world, edits, &.{}, &.{}, null);
     }
 
     fn applyNavUpdatesImpl(
@@ -461,6 +468,7 @@ pub const PathfindingSystem = struct {
         data: *const DataSystem,
         world: ?*const WorldSystem,
         edits: []const NavCellEdit,
+        cell_edits: []const types.ChangedSpan,
         full_level_ids: []const u16,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
@@ -481,6 +489,7 @@ pub const PathfindingSystem = struct {
             data,
             world,
             edits,
+            cell_edits,
             full_level_ids,
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
@@ -501,7 +510,7 @@ pub const PathfindingSystem = struct {
                 // When world is null the span derivation cannot run, so drop the entire
                 // completed cache to avoid serving stale paths through now-blocked cells.
                 if (world != null) {
-                    try self.evictCachedPathsCrossingEdits(world, edits);
+                    try self.evictCachedPathsCrossingEdits(world, edits, cell_edits);
                 } else {
                     self.completed.clear();
                 }
@@ -517,6 +526,7 @@ pub const PathfindingSystem = struct {
     // an error path that skips the apply never leaks stale edits into the next step.
     pub fn clearNavDirty(self: *PathfindingSystem) void {
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_cell_spans.clearRetainingCapacity();
         self.nav_dirty_levels.clearRetainingCapacity();
     }
 
@@ -525,6 +535,16 @@ pub const PathfindingSystem = struct {
     // dropped cell would leave the nav graph stale against the world.
     pub fn markNavDirty(self: *PathfindingSystem, level: u16, x: u16, y: u16) !void {
         try self.nav_dirty_edits.append(self.allocator, .{ .level = level, .x = x, .y = y });
+    }
+
+    // Records one entity-driven static-obstacle world-space rect for the next incremental
+    // update, resolved to a nav-cell span immediately so the buffered batch never re-derives
+    // it from a stale entity. A no-op when `level` has no built grid. Grows the buffer rather
+    // than dropping, matching markNavDirty.
+    pub fn markNavObstacleRectDirty(self: *PathfindingSystem, level: u16, rect: ObstacleWorldRect) !void {
+        const grid = self.graph.grid(level) orelse return;
+        const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+        try self.nav_dirty_cell_spans.append(self.allocator, .{ .level = level, .span = span });
     }
 
     // Marks a whole level for re-derivation next update. Use when a change cannot be reduced to
@@ -537,17 +557,30 @@ pub const PathfindingSystem = struct {
         try self.nav_dirty_levels.append(self.allocator, level);
     }
 
-    // Whether any dirty nav cell or whole-level request is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
-        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    // Defensive fallback for reactToPostCommitNavEvents: an entity-driven obstacle event that
+    // invalidates navigation but carries no resolvable world-space rect. Should be unreachable
+    // (isStaticNavigationObstacle requires movement_body + collision_bounds + collision_response,
+    // exactly what staticObstacleWorldRect needs), so this is loud rather than a silent whole-level
+    // rebuild, matching the edge-cap-fallback warn pattern in nav_graph.zig.
+    fn markNavLevelDirtyWithFallbackWarn(self: *PathfindingSystem, level: u16) !void {
+        if (comptime logging.enabled(.warn))
+            logging.game.warn("nav obstacle invalidation with no resolvable world rect; falling back to whole-level dirty (level {})", .{level});
+        try self.markNavLevelDirty(level);
     }
 
-    // Applies the buffered dirty nav cells (and whole-level requests) as one incremental update,
-    // then clears the buffers. Returns zero stats when nothing is buffered. A non-null
-    // thread_system lets the chunk patch thread (tuner-gated); null keeps it serial.
+    // Whether any dirty nav cell, obstacle rect, or whole-level request is buffered for this step.
+    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
+        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_cell_spans.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    }
+
+    // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
+    // incremental update, then clears the buffers. Returns zero stats when nothing is
+    // buffered. A non-null thread_system lets the chunk patch thread (tuner-gated); null keeps
+    // it serial.
     pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_levels.items, thread_system);
+        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_cell_spans.items, self.nav_dirty_levels.items, thread_system);
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_cell_spans.clearRetainingCapacity();
         self.nav_dirty_levels.clearRetainingCapacity();
         return stats;
     }
@@ -556,12 +589,11 @@ pub const PathfindingSystem = struct {
     // into dirty nav cells, folds them into the existing nav graph incrementally (affected levels
     // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
     // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
-    // changes carry no resolvable cell, so level 0 (the only level sourcing collision bodies) is
-    // marked whole-level dirty. Returns the batch stats (zero when nothing was pending).
+    // changes resolve their carried world-space rect to a nav-cell span and patch only the
+    // affected chunks, same as tile edits. Returns the batch stats (zero when nothing was pending).
     pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
         // Clear first so a skipped apply never leaks stale edits into the next step.
         self.clearNavDirty();
-        var entity_obstacle_change = false;
         for (frame.events.mergedItems()) |event| {
             if (event.stage != .structural_commit) continue;
             if (!eventInvalidatesNavigation(event)) continue;
@@ -576,10 +608,28 @@ pub const PathfindingSystem = struct {
                         }
                     }
                 },
-                else => entity_obstacle_change = true,
+                .entity_destroyed => |destroyed| {
+                    if (destroyed.obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(0, rect);
+                    } else {
+                        try self.markNavLevelDirtyWithFallbackWarn(0);
+                    }
+                },
+                .component_changed => |changed| {
+                    if (changed.old_obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(0, rect);
+                    } else if (changed.was_static_navigation_obstacle) {
+                        try self.markNavLevelDirtyWithFallbackWarn(0);
+                    }
+                    if (changed.new_obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(0, rect);
+                    } else if (changed.is_static_navigation_obstacle) {
+                        try self.markNavLevelDirtyWithFallbackWarn(0);
+                    }
+                },
+                else => {},
             }
         }
-        if (entity_obstacle_change) try self.markNavLevelDirty(0);
 
         if (!self.hasPendingNavUpdates()) return .{};
         try frame.events.ensureCanAppend(1);
@@ -646,24 +696,34 @@ pub const PathfindingSystem = struct {
             template.collision_bounds != null;
     }
 
-    // Evicts cached paths crossing this batch's changed-cell spans.
-    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) !void {
+    // Evicts cached paths crossing this batch's changed-cell spans (tile edits plus
+    // entity-driven obstacle-rect edits, already resolved to nav-cell spans).
+    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: ?*const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan) !void {
         const world_system = world orelse return;
-        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len);
+        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len + cell_edits.len);
         self.nav_changed_spans.clearRetainingCapacity();
         for (edits) |edit| {
             const grid = self.graph.grid(edit.level) orelse continue;
             const span = grid.navSpanForTile(world_system, edit) orelse continue;
-            // One-cell halo: also evict paths running ALONGSIDE the change so an agent
-            // beside a newly-opened cell re-solves into the opening.
-            self.nav_changed_spans.appendAssumeCapacity(.{ .level = edit.level, .span = .{
-                .min_x = span.min_x -| 1,
-                .min_y = span.min_y -| 1,
-                .max_x = @min(span.max_x + 1, grid.width - 1),
-                .max_y = @min(span.max_y + 1, grid.height - 1),
-            } });
+            self.appendChangedSpanWithHalo(edit.level, span, grid.width, grid.height);
+        }
+        for (cell_edits) |edit| {
+            const grid = self.graph.grid(edit.level) orelse continue;
+            self.appendChangedSpanWithHalo(edit.level, edit.span, grid.width, grid.height);
         }
         self.completed.evictCrossing(&self.graph, self.nav_changed_spans.items);
+    }
+
+    // One-cell halo: also evicts paths running ALONGSIDE the change so an agent beside a
+    // newly-opened cell re-solves into the opening. Shared by the tile-edit and entity-driven
+    // cell-edit passes above.
+    fn appendChangedSpanWithHalo(self: *PathfindingSystem, level: u16, span: types.NavSpan, grid_width: usize, grid_height: usize) void {
+        self.nav_changed_spans.appendAssumeCapacity(.{ .level = level, .span = .{
+            .min_x = span.min_x -| 1,
+            .min_y = span.min_y -| 1,
+            .max_x = @min(span.max_x + 1, grid_width - 1),
+            .max_y = @min(span.max_y + 1, grid_height - 1),
+        } });
     }
 
     fn dropGroupFields(self: *PathfindingSystem) void {

@@ -41,6 +41,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.query_group,
     nav_update.group,
     nav_update.multichunk_group,
+    nav_update.entity_obstacle_group,
     render_prep.group,
     render_game_prep.group,
     render_game_prep.dense_8_surface_group,

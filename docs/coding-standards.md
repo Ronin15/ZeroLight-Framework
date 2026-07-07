@@ -108,6 +108,33 @@ masks are for membership/query decisions, not a replacement for direct slice
 iteration in hot processors. Worker ranges should write disjoint rows and avoid
 sharing writable cache lines in hot SoA columns.
 
+### Simulation pipeline stage ordering (mandatory, not advisory)
+
+`SimulationPipeline`'s `update()` runs a fixed stage order over per-step
+resources (navigation intents, movement intents, path requests, contacts, and
+similar), where a later stage's correctness depends on an earlier stage having
+already produced what it reads. This dependency is enforced at comptime, not
+by convention: `simulation_pipeline.zig`'s `stageContract()` declares each
+stage's resource reads/writes, `stage_order` is the concrete order `update()`
+runs them in, and a `comptime` block walks `stage_order` failing the build if
+any stage reads a resource no earlier stage writes.
+
+Every new or reordered `SimulationPipeline` stage must add, in the same
+change:
+
+1. The `PipelineResource` tag(s) it reads or writes (reuse an existing tag
+   when it is the same coarse resource; do not add a redundant one-off tag).
+2. Its `StageId` slotted into `stage_order` at the position its real
+   dependencies require.
+3. Its `stageContract()` arm declaring those reads/writes.
+4. The real call in `update()` plus a matching `self.stage_trace.mark(...)`
+   immediately at that call site.
+
+`zig build check` catches a stage reading a resource before any earlier stage
+produces it. The `stage_trace` order-trace test proves the declared
+`stage_order` matches what `update()` actually runs, catching a `mark()` call
+added at the wrong point.
+
 ### Dense SoA storage (`std.MultiArrayList`)
 
 Prefer `std.MultiArrayList` when several columns grow, shrink, append, or

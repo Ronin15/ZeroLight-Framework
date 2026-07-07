@@ -1445,16 +1445,19 @@ saturation or a per-segment node-budget spill returns `budget_exhausted` (retry)
 than a hard negative. The old auto-grouped goal fields, cell gates, start-cell key, and
 their stats remain removed; `deferred_requests` is a single post-compaction write in
 both update paths; the memory gate fails loud at rebuild. 25D (event-driven incremental
-rebuild) is implemented: `applyNavUpdates` folds a dirty nav-cell set from
-world-tile/obstacle (and entity-driven obstacle) events into the existing graph by
-recomputing only affected levels' masks/components, rebuilding the chunk-portal abstract
-graph once, and bumping `nav_version` once per batch so goal-keyed work re-solves; the
-whole-world build runs only at init. Granularity is per-affected-level (the bounded
-fallback) with a counted `nav_full_relabel` past a level threshold; true per-chunk
-portal/CSR surgery is deferred pending a per-chunk-addressable portal store. Route the
-slice diff to review with attention to the goal-keyed cache reuse and
-corridor-advancement contracts, the per-affected-level update scope, and the
-allocation-free steady-path claim.
+rebuild) is implemented: `applyNavUpdates` folds a dirty nav-cell set from world-tile/
+obstacle events, plus entity-driven obstacle events (`component_changed`/
+`entity_destroyed`) resolved to a localized nav-cell span via the changed entity's
+world-space collision rect, into the existing graph by remasking + patching only the
+chunks the dirty cells/spans touch, rebuilding the chunk-portal abstract graph once, and
+bumping `nav_version` once per batch so goal-keyed work re-solves; the whole-world build
+runs only at init. A whole-level remask (recomputing every chunk on the affected level)
+is a bounded fallback for the rare case an entity change carries no resolvable rect, not
+the normal path; a full relabel of every level happens only past a configured
+affected-level threshold, counted via `nav_full_relabel`. True per-chunk portal/CSR
+surgery is deferred pending a per-chunk-addressable portal store. Route the slice diff to
+review with attention to the goal-keyed cache reuse and corridor-advancement contracts,
+the per-affected-chunk update scope, and the allocation-free steady-path claim.
 
 Post-25 performance pass (architecture unchanged — same A* results, deterministic,
 allocation-free on the warmed path; all layers retained): (1) the per-worker local A*
@@ -1473,7 +1476,18 @@ budget-spill escalate to the abstract corridor (the considered "WIN C") was NOT 
 with component-scoped seeding the abstract corridor for a same-component goal collapses
 to a single portal, so escalation cannot subdivide the long segment and would only add
 per-frame work — making it effective would require start-chunk-scoped seeding (a global
-corridor-shape change), a design decision left for a future slice.
+corridor-shape change), a design decision left for a future slice. (4) Entity-driven
+static-obstacle changes (an entity destroyed or its `movement_body`/`collision_bounds`/
+`collision_response` changed) now localize the same way tile edits already did: the
+structural-commit event carries the entity's world-space collision rect (before and/or
+after the change), `PathfindingSystem.markNavObstacleRectDirty` resolves it to a nav-cell
+span, and the incremental update patches only the chunks that span touches. The prior
+25D behavior — treating every entity-driven obstacle change as whole-level dirty,
+remasking and re-flooding every chunk on level 0 — is now only the defensive fallback for
+the case a change carries no resolvable rect (`markNavLevelDirty`/
+`markNavLevelDirtyWithFallbackWarn`, logged at `warn`); it should not occur in practice
+since every static-obstacle-eligible entity has the movement_body + collision_bounds a
+rect needs.
 
 Deferred follow-up: per-entity depth alignment across sim, navigation, and
 render is tracked as Slice 25E below and under **Scaling Gaps And Hardening
@@ -1894,6 +1908,14 @@ Architecture notes:
   vectorizable and emergent. Emergence comes from richer intent inputs, not new
   pipeline plumbing — the intent → steering → pathfinding → movement contract is
   untouched.
+- Build the weight-resolution mechanism itself as a reusable arbitration
+  contract, not another bespoke one-off priority scheme like `NavigationIntent`'s
+  current arbitration. More controllers and competing-intent systems are already
+  planned beyond this AI stack (e.g. future world-mutation controllers); a
+  shared, generically-typed resolution mechanism lets those register competing
+  weighted inputs against the same contract instead of each inventing its own
+  priority rule. This slice's four behaviors are the first concrete consumer,
+  not the only planned one.
 
 Checklist:
 
@@ -1902,6 +1924,9 @@ Checklist:
 - [ ] Compute behavior selection as a weighted arbitration over affect drives
       (31), memory (30), and perception (29), emitting `NavigationIntent` +
       priority through the existing path.
+- [ ] Design the arbitration/weight-resolution mechanism as a reusable contract
+      (not hardcoded to only these four behaviors) so future competing-intent
+      systems outside AI can register against it later without a rewrite.
 - [ ] Keep steering/pathfinding/movement and their merge contracts unchanged.
 
 Acceptance checks:

@@ -92,6 +92,40 @@ committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
 by a path-view field (a `PathView.next_cell_level` field was tried and removed
 as an unused duplicate — see `docs/framework-implementation-slices.md` Slice 25E).
 
+## Stage Ordering Contract
+
+`SimulationPipeline` (`src/game/simulation_pipeline.zig`) checks its own stage
+order at comptime so a future reorder or inserted stage that reads a resource
+before it is written fails the build instead of silently corrupting behavior.
+
+- `PipelineResource` is the coarse set of per-step resources stages read or
+  write (navigation intents, movement intents, path requests, contacts,
+  movement body state, and similar). Some tags bundle several SoA columns one
+  system owns together rather than tracking every field.
+- `StageId` names each concrete stage in `update()`.
+- `stageContract(stage)` declares each stage's reads and writes over
+  `PipelineResource`.
+- `stage_order` is the concrete order `update()` runs stages in.
+- A `comptime` block walks `stage_order`, accumulating the resources written
+  so far, and fails the build (`@compileError`) if any stage's declared reads
+  are not a subset of what an earlier stage already wrote.
+- A private `stage_trace` (test builds only, zero-cost otherwise) records the
+  `StageId` `update()` actually marks at each real call site; the "pipeline
+  stage order matches its declared ordering contract" test asserts this trace
+  equals `stage_order`, catching a `mark()` call placed at the wrong point.
+
+Checklist for adding or reordering a stage:
+
+1. Add the `PipelineResource` tag(s) it reads/writes, if none of the existing
+   tags already cover them.
+2. Insert its `StageId` into `stage_order` at the position its real
+   dependencies require.
+3. Add its `stageContract()` arm.
+4. Add the real call in `update()` plus a `self.stage_trace.mark(...)` at that
+   call site.
+5. `zig build check` fails at comptime if a dependency is missing; the
+   order-trace test fails if the `mark()` call does not match `stage_order`.
+
 ## Range Output Streams
 
 `RangeOutputStream(T)` is the deterministic high-volume output pattern used by
@@ -158,6 +192,15 @@ World tile and obstacle events carry compact level/cell regions plus old/new
 tile and obstacle flags. They wake explicit reaction points such as pathfinding
 or future world-collision refreshes; they are not immediate callbacks from
 `WorldSystem`.
+
+Entity-driven obstacle events (`component_changed` on `movement_body`/
+`collision_bounds`/`collision_response`, and `entity_destroyed`) also carry an
+optional `ObstacleWorldRect` — the changed entity's world-space collision AABB,
+before and/or after the change, when it was/is a static navigation obstacle.
+Pathfinding resolves that rect to a nav-cell span (`markNavObstacleRectDirty`)
+and patches only the affected chunks, the same incremental mechanism tile edits
+already use, instead of invalidating the whole level. A null rect (component
+data insufficient to derive one) falls back to a whole-level nav dirty mark.
 
 `appendRequired` fails if the configured event capacity cannot hold the event.
 `appendDiagnostic` drops on capacity failure and increments dropped stats. Use

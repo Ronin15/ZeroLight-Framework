@@ -19,6 +19,7 @@ const EntityTemplate = types.EntityTemplate;
 const StructuralCommand = types.StructuralCommand;
 const StructuralCommitStats = types.StructuralCommitStats;
 const StructuralChange = types.StructuralChange;
+const ObstacleWorldRect = types.ObstacleWorldRect;
 const DataSystem = @import("system.zig").DataSystem;
 const validateMovementBody = @import("movement.zig").validateMovementBody;
 const validatePrimitiveVisual = @import("visual.zig").validatePrimitiveVisual;
@@ -322,12 +323,14 @@ pub fn commitStructuralCommands(
             .destroy_entity => |entity| {
                 const component_mask = self.componentMaskFor(entity);
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
+                const obstacle_world_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null;
                 if (self.destroyEntity(entity)) {
                     stats.destroyed += 1;
                     change_sink.record(.{ .entity_destroyed = .{
                         .entity = entity,
                         .component_mask = component_mask,
                         .was_static_navigation_obstacle = was_static_navigation_obstacle,
+                        .obstacle_world_rect = obstacle_world_rect,
                     } });
                 } else {
                     stats.stale_skipped += 1;
@@ -339,9 +342,10 @@ pub fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                const old_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(set.entity) else null;
                 try self.setMovementBody(set.entity, set.body);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .movement_body, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .movement_body, was_static_navigation_obstacle, old_rect);
             },
             .set_facing => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -351,7 +355,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setFacing(set.entity, set.facing);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .facing, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .facing, was_static_navigation_obstacle, null);
             },
             .set_primitive_visual => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -361,7 +365,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setPrimitiveVisual(set.entity, set.visual);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .primitive_visual, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .primitive_visual, was_static_navigation_obstacle, null);
             },
             .set_asset_reference => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -371,7 +375,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setAssetReference(set.entity, set.asset_reference);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .asset_reference, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .asset_reference, was_static_navigation_obstacle, null);
             },
             .set_collision_bounds => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -379,9 +383,10 @@ pub fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                const old_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(set.entity) else null;
                 try self.setCollisionBounds(set.entity, set.bounds);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .collision_bounds, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .collision_bounds, was_static_navigation_obstacle, old_rect);
             },
             .set_collision_response => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -389,9 +394,10 @@ pub fn commitStructuralCommands(
                     continue;
                 }
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                const old_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(set.entity) else null;
                 try self.setCollisionResponse(set.entity, set.response);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .collision_response, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .collision_response, was_static_navigation_obstacle, old_rect);
             },
             .set_ai_agent => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -401,7 +407,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setAiAgent(set.entity, set.agent);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .ai_agent, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .ai_agent, was_static_navigation_obstacle, null);
             },
             .set_steering_agent => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -411,7 +417,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setSteeringAgent(set.entity, set.agent);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .steering_agent, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .steering_agent, was_static_navigation_obstacle, null);
             },
             .set_world_level => |set| {
                 if (!self.isAlive(set.entity)) {
@@ -421,7 +427,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setWorldLevel(set.entity, set.level);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .world_level, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .world_level, was_static_navigation_obstacle, null);
             },
             .set_simulation_tier => |set| {
                 // Skip stale IDs and live entities without a movement body
@@ -442,7 +448,7 @@ pub fn commitStructuralCommands(
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
                 try self.setFaction(set.entity, set.faction);
                 stats.components_set += 1;
-                recordComponentChange(self, change_sink, set.entity, .faction, was_static_navigation_obstacle);
+                recordComponentChange(self, change_sink, set.entity, .faction, was_static_navigation_obstacle, null);
             },
         }
     }
@@ -578,37 +584,34 @@ pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
 }
 
 fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype, entity: EntityId, template: EntityTemplate) void {
-    // Navigation-obstacle notifications compare before/after state across
-    // the component sequence because movement, bounds, and response together
-    // define whether pathfinding needs a grid rebuild.
-    var was_static_navigation_obstacle = false;
-    if (template.movement_body != null) {
-        recordComponentChange(self, change_sink, entity, .movement_body, was_static_navigation_obstacle);
-        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
-    }
-    if (template.facing != null) recordComponentChange(self, change_sink, entity, .facing, was_static_navigation_obstacle);
-    if (template.primitive_visual != null) recordComponentChange(self, change_sink, entity, .primitive_visual, was_static_navigation_obstacle);
-    if (template.asset_reference != null) recordComponentChange(self, change_sink, entity, .asset_reference, was_static_navigation_obstacle);
-    if (template.collision_bounds != null) {
-        recordComponentChange(self, change_sink, entity, .collision_bounds, was_static_navigation_obstacle);
-        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
-    }
-    if (template.collision_response != null) {
-        recordComponentChange(self, change_sink, entity, .collision_response, was_static_navigation_obstacle);
-        was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
-    }
-    if (template.ai_agent != null) recordComponentChange(self, change_sink, entity, .ai_agent, was_static_navigation_obstacle);
-    if (template.steering_agent != null) recordComponentChange(self, change_sink, entity, .steering_agent, was_static_navigation_obstacle);
-    if (template.world_level != null) recordComponentChange(self, change_sink, entity, .world_level, was_static_navigation_obstacle);
-    if (template.faction != null) recordComponentChange(self, change_sink, entity, .faction, was_static_navigation_obstacle);
+    // applyTemplateComponents (called before this) already applied every template
+    // component, so a fresh entity never has a real "before this component" obstacle
+    // state to report: every event here passes was_static_navigation_obstacle = false
+    // and old_obstacle_world_rect = null (nothing to clear). recordComponentChange still
+    // computes the live is/new side from the (already fully applied) entity, so the
+    // component whose event completes movement_body + collision_bounds + a static
+    // collision_response correctly reports the new obstacle rect.
+    if (template.movement_body != null) recordComponentChange(self, change_sink, entity, .movement_body, false, null);
+    if (template.facing != null) recordComponentChange(self, change_sink, entity, .facing, false, null);
+    if (template.primitive_visual != null) recordComponentChange(self, change_sink, entity, .primitive_visual, false, null);
+    if (template.asset_reference != null) recordComponentChange(self, change_sink, entity, .asset_reference, false, null);
+    if (template.collision_bounds != null) recordComponentChange(self, change_sink, entity, .collision_bounds, false, null);
+    if (template.collision_response != null) recordComponentChange(self, change_sink, entity, .collision_response, false, null);
+    if (template.ai_agent != null) recordComponentChange(self, change_sink, entity, .ai_agent, false, null);
+    if (template.steering_agent != null) recordComponentChange(self, change_sink, entity, .steering_agent, false, null);
+    if (template.world_level != null) recordComponentChange(self, change_sink, entity, .world_level, false, null);
+    if (template.faction != null) recordComponentChange(self, change_sink, entity, .faction, false, null);
 }
 
-fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool) void {
+fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool, old_rect: ?ObstacleWorldRect) void {
+    const is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
     change_sink.record(.{ .component_changed = .{
         .entity = entity,
         .component = component,
         .was_static_navigation_obstacle = was_static_navigation_obstacle,
-        .is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity),
+        .is_static_navigation_obstacle = is_static_navigation_obstacle,
+        .old_obstacle_world_rect = old_rect,
+        .new_obstacle_world_rect = if (is_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null,
     } });
 }
 

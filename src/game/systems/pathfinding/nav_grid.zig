@@ -121,19 +121,44 @@ pub const NavGrid = struct {
     // overlaps, using the same clamped rect->cell mapping as markBlockedRectSimd and
     // staticBodyCoversNavCell so all three agree on which cells a body covers.
     fn rasterizeStaticCoverage(self: *NavGrid, rect: StaticBodyRect) void {
-        const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
-        const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - rect_edge_epsilon), .y = @max(rect.min_y, rect.max_y - rect_edge_epsilon) });
-        const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
-        const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
-        const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
-        const cy1: usize = @intCast(@max(min_cell.y, max_cell.y));
-        var cy = cy0;
-        while (cy <= cy1) : (cy += 1) {
-            var cx = cx0;
-            while (cx <= cx1) : (cx += 1) {
+        const span = self.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+        var cy = span.min_y;
+        while (cy <= span.max_y) : (cy += 1) {
+            var cx = span.min_x;
+            while (cx <= span.max_x) : (cx += 1) {
                 self.static_blocked.items[cy * self.width + cx] = true;
             }
         }
+    }
+
+    // Re-derives the static-body coverage cache for exactly the cells in `span` from the
+    // CURRENT live static-body set (not a blind toggle), so overlapping bodies stay correctly
+    // covered when only one of them is destroyed/moved. A no-op when the cache has not been
+    // built (matches staticBodyCoversNavCell's scan fallback). Callers scope `span` to the
+    // touched nav cells so this stays bounded by the edit footprint, not the whole level.
+    pub fn refreshStaticCoverageSpan(self: *NavGrid, data: *const DataSystem, span: NavSpan) void {
+        if (self.static_blocked.items.len != self.cellCount()) return;
+        var cy = span.min_y;
+        while (cy <= span.max_y) : (cy += 1) {
+            var cx = span.min_x;
+            while (cx <= span.max_x) : (cx += 1) {
+                self.static_blocked.items[cy * self.width + cx] = self.scanStaticBodiesCoverCell(data, cx, cy);
+            }
+        }
+    }
+
+    // World-rect -> inclusive nav-cell span, clamped to the grid. Shared by the blocked-rect
+    // marking path, the static-coverage rasterization path, and tile-edit span derivation so
+    // every rect->cell site uses identical epsilon-adjusted clamping.
+    pub fn cellSpanForWorldRect(self: *const NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) NavSpan {
+        const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
+        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - rect_edge_epsilon), .y = @max(min_y, max_y - rect_edge_epsilon) });
+        return .{
+            .min_x = @intCast(@min(min_cell.x, max_cell.x)),
+            .min_y = @intCast(@min(min_cell.y, max_cell.y)),
+            .max_x = @intCast(@max(min_cell.x, max_cell.x)),
+            .max_y = @intCast(@max(min_cell.y, max_cell.y)),
+        };
     }
 
     pub fn cellCount(self: *const NavGrid) usize {
@@ -193,14 +218,11 @@ pub const NavGrid = struct {
 
     pub fn markBlockedRectSimd(self: *NavGrid, min_x: f32, min_y: f32, max_x: f32, max_y: f32) void {
         if (!self.valid()) return;
-        const min_cell = self.worldToCellClamped(.{ .x = min_x, .y = min_y });
-        const max_cell = self.worldToCellClamped(.{ .x = @max(min_x, max_x - rect_edge_epsilon), .y = @max(min_y, max_y - rect_edge_epsilon) });
-        const row_start: usize = @intCast(@min(min_cell.y, max_cell.y));
-        const row_end: usize = @intCast(@max(min_cell.y, max_cell.y));
-        const col_start_i = @min(min_cell.x, max_cell.x);
-        const col_end_i = @max(min_cell.x, max_cell.x);
-        const col_start: usize = @intCast(col_start_i);
-        const col_end: usize = @intCast(col_end_i);
+        const span = self.cellSpanForWorldRect(min_x, min_y, max_x, max_y);
+        const row_start: usize = span.min_y;
+        const row_end: usize = span.max_y;
+        const col_start: usize = span.min_x;
+        const col_end: usize = span.max_x;
 
         const all_blocked: simd.Mask4 = @splat(true);
         var y = row_start;
@@ -296,17 +318,7 @@ pub const NavGrid = struct {
     // The inverse of markWorldCell: which nav cells must be recomputed for this edit.
     pub fn navSpanForTile(self: *const NavGrid, world: *const WorldSystem, edit: NavCellEdit) ?NavSpan {
         const rect = world.cellRect(edit.x, edit.y) orelse return null;
-        const min_cell = self.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
-        const max_cell = self.worldToCellClamped(.{
-            .x = @max(rect.x, rect.x + rect.w - rect_edge_epsilon),
-            .y = @max(rect.y, rect.y + rect.h - rect_edge_epsilon),
-        });
-        return .{
-            .min_x = @intCast(@min(min_cell.x, max_cell.x)),
-            .min_y = @intCast(@min(min_cell.y, max_cell.y)),
-            .max_x = @intCast(@max(min_cell.x, max_cell.x)),
-            .max_y = @intCast(@max(min_cell.y, max_cell.y)),
-        };
+        return self.cellSpanForWorldRect(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
     }
 
     // Recomputes one nav cell's blocked state from the authoritative static sources:
@@ -337,24 +349,28 @@ pub const NavGrid = struct {
     // cell-coverage rule as markStaticBodies/markBlockedRectSimd so the incremental
     // remask exactly matches a full mark. Bounded by the static-body count.
     pub fn staticBodyCoversNavCell(self: *const NavGrid, data: *const DataSystem, ncx: usize, ncy: usize) bool {
-        // Fast path: the coverage cache built at the last full mark. Static bodies are
-        // constant between rebuilds, so this is authoritative and O(1).
+        // Fast path: the coverage cache built at the last full mark (or refreshed by
+        // refreshStaticCoverageSpan). Static bodies are constant between rebuilds/refreshes,
+        // so this is authoritative and O(1).
         if (self.static_blocked.items.len == self.cellCount()) {
             return self.static_blocked.items[ncy * self.width + ncx];
         }
         // Fallback: scan static bodies directly (cache not yet built for this grid).
+        return self.scanStaticBodiesCoverCell(data, ncx, ncy);
+    }
+
+    // Scans every live static collision body directly for whether it covers nav cell
+    // (ncx, ncy). O(static-body count); used only when the coverage cache is absent
+    // (staticBodyCoversNavCell's fallback) or to re-derive one cell for the cache
+    // (refreshStaticCoverageSpan).
+    fn scanStaticBodiesCoverCell(self: *const NavGrid, data: *const DataSystem, ncx: usize, ncy: usize) bool {
         const bounds = data.collisionBoundsSliceConst();
         const responses = data.collisionResponseSliceConst();
         for (responses.entities, 0..) |entity, response_index| {
             if (responses.mobilities[response_index] != .static) continue;
             const rect = staticBodyWorldRect(data, bounds, entity) orelse continue;
-            const min_cell = self.worldToCellClamped(.{ .x = rect.min_x, .y = rect.min_y });
-            const max_cell = self.worldToCellClamped(.{ .x = @max(rect.min_x, rect.max_x - rect_edge_epsilon), .y = @max(rect.min_y, rect.max_y - rect_edge_epsilon) });
-            const cx0: usize = @intCast(@min(min_cell.x, max_cell.x));
-            const cx1: usize = @intCast(@max(min_cell.x, max_cell.x));
-            const cy0: usize = @intCast(@min(min_cell.y, max_cell.y));
-            const cy1: usize = @intCast(@max(min_cell.y, max_cell.y));
-            if (ncx >= cx0 and ncx <= cx1 and ncy >= cy0 and ncy <= cy1) return true;
+            const span = self.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+            if (ncx >= span.min_x and ncx <= span.max_x and ncy >= span.min_y and ncy <= span.max_y) return true;
         }
         return false;
     }
