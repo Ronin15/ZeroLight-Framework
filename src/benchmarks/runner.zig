@@ -43,6 +43,7 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.fallback_unreachable_group,
     pathfinding.hard_fallback_group,
     pathfinding.hard_fallback_budget_group,
+    pathfinding.escalated_detour_group,
     pathfinding.query_group,
     nav_update.group,
     nav_update.multichunk_group,

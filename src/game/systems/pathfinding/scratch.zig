@@ -42,6 +42,15 @@ pub const SearchCellRow = struct {
 pub const AbstractScratch = struct {
     generation: u32 = 1,
     slot_capacity: usize = 0,
+    // Per-query logical node-attempt budget, distinct from slot_capacity (the PHYSICAL
+    // table size, sized once at reserve() to the largest — tier-1/derived — ceiling).
+    // A caller (abstractCorridor) sets this before each search so a cheap tier-0 attempt
+    // spills at its own small cap even though the table itself is sized much larger.
+    // reserve() defaults it to the full physical budget so a direct caller that never
+    // sets it explicitly keeps the old unconstrained-up-to-physical-size behavior.
+    node_budget: usize = 0,
+    // Distinct NEW nodes claimed this generation; reset alongside the generation bump.
+    nodes_used: usize = 0,
     open: std.ArrayList(OpenNode) = .empty,
     // Node identity is a packed (level << 32) | local ref (usize); parent holds the
     // parent ref or no_ref. via_link records whether the slot's best parent edge was
@@ -68,6 +77,10 @@ pub const AbstractScratch = struct {
     pub fn reserve(self: *AbstractScratch, allocator: std.mem.Allocator, max_abstract_nodes: usize) !void {
         const slot_capacity = @max(@as(usize, 16), max_abstract_nodes * 2);
         self.slot_capacity = slot_capacity;
+        // Default node_budget to the full reserved size; abstractCorridor overrides it
+        // per-query with the attempt-scoped tier cap.
+        self.node_budget = max_abstract_nodes;
+        self.nodes_used = 0;
         // Headroom above the distinct-node budget: relaxAbstractNode pushes a fresh entry
         // on every g-improvement, so the live heap holds stale duplicates the slot table
         // (slotFor) does not. Sizing it past the budget keeps a sub-budget search from
@@ -96,6 +109,7 @@ pub const AbstractScratch = struct {
         self.open.clearRetainingCapacity();
         self.corridor.clearRetainingCapacity();
         self.corridor_link.clearRetainingCapacity();
+        self.nodes_used = 0;
         self.generation +%= 1;
         if (self.generation == 0) {
             @memset(self.slot_stamp, 0);
@@ -119,6 +133,11 @@ pub const AbstractScratch = struct {
                 if (nodes[index] == node) return index;
                 continue;
             }
+            // A NEW node past the per-query attempt budget spills the search (returns
+            // null -> saturated) even though the physical table has room; an
+            // already-touched node (above) always resolves regardless of the budget.
+            if (self.nodes_used >= self.node_budget) return null;
+            self.nodes_used += 1;
             stamp[index] = self.generation;
             nodes[index] = node;
             g[index] = unreachable_cost;

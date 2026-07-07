@@ -77,6 +77,20 @@ boundaries just to make a local change easier.
   missed optimization. Avoid per-frame string lookups, hash-map dispatch,
   broad dynamic dispatch, formatted logging, and resource churn unless the
   cost is measured, bounded, and isolated.
+- **Per-query/per-frame work budgets (search node caps, solve ceilings, and
+  similar) must be fixed constants — never derived from or scaled to world
+  size, map size, cell count, portal count, or any other measured "current
+  scale."** Worlds vary in size; a budget that scales with it means
+  correctness/performance silently depends on which map happens to be loaded.
+  This is a load-bearing, explicitly tested invariant in several modules (grep
+  for `independent of` and `regardless of world size` before touching a
+  budget/capacity constant — e.g. `src/game/systems/pathfinding/`'s abstract
+  A* node budget and `nav_graph.zig`'s incremental-dig chunk-patch tests). When
+  a fixed budget is chronically insufficient for a hard case, the fix is
+  graceful degradation (deterministic deferral / a bounded retry ladder that
+  gives up cleanly) or an algorithmic change that keeps the SAME fixed budget
+  sufficient — never a bigger number picked because one particular map needed
+  it.
 - Threaded writes into a shared buffer must be partitioned (disjoint
   per-worker/per-range slots) and reserved before dispatch, never after or
   during. Allocators are explicit fields set at `init`, never a global reached
@@ -139,3 +153,11 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 - Always run a targeted benchmark with `zig build bench -- --group <name>`
   (optionally `--case`/`--items`) unless explicitly told to run the full suite.
   Do not run the whole `zig build bench` and filter its output.
+- **Never measure or report performance/timing by hand-rolling a timer inside
+  a `zig build test` test — not even temporarily, not even with
+  `-Doptimize=ReleaseFast`.** `zig build test` is for correctness only.
+  All performance numbers must come from `zig build bench`, which already
+  provides warmup, repeated iterations, and adaptive-settle statistics
+  (`src/benchmarks/suite.zig`) that a one-off timed test block does not. If a
+  perf question needs answering and no benchmark case covers it yet, add or
+  extend one under `src/benchmarks/` and run it via `zig build bench`.

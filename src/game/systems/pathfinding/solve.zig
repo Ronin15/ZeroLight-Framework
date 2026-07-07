@@ -106,7 +106,20 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
         // teleport back onto this level) could connect them. Fall to abstract.
     }
 
-    return solveAbstract(system, pending_index, scratch, path_slot, request, start_grid, goal_grid, start_index, goal_index);
+    // Two-tier attempt caps: tier 0 (the common case) stays cheap even though the
+    // physical scratch is sized for the larger FIXED tier-1 ceiling; tier 1 (already
+    // promoted by a prior budget_exhausted) uses the full fixed tier-1 budget — never
+    // derived from or scaled to world/graph size. See PendingRequest.tier and
+    // compactPendingAfterSolve's budget_exhausted handling.
+    const abstract_node_cap = if (request.tier == 0) system.capacity.tier0_abstract_node_cap else system.capacity.max_abstract_nodes;
+    // Clamped against the tier-1 ceiling: stitched_scratch is physically reserved to
+    // max_stitched_path_cells (SearchScratch.reserve), never to tier0_stitched_cell_cap.
+    // The two are independently settable, so an unclamped tier-0 cap tuned above the
+    // tier-1 ceiling would let appendSegment's appendAssumeCapacity write past the
+    // reserved buffer. Tier 0 is also semantically the CHEAPER attempt, so clamping
+    // down to the tier-1 ceiling is never a behavior change in the intended direction.
+    const stitched_cell_cap = if (request.tier == 0) @min(system.capacity.tier0_stitched_cell_cap, system.capacity.max_stitched_path_cells) else system.capacity.max_stitched_path_cells;
+    return solveAbstract(system, pending_index, scratch, path_slot, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap);
 }
 
 // Abstract A* over portal nodes + link edges to choose a corridor across
@@ -127,9 +140,11 @@ pub fn solveAbstract(
     goal_grid: *const NavGrid,
     start_index: usize,
     goal_index: usize,
+    abstract_node_cap: usize,
+    stitched_cell_cap: usize,
 ) PathSolveResult {
     const graph = &system.graph;
-    const corridor = switch (abstractCorridor(graph, scratch, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index)) {
+    const corridor = switch (abstractCorridor(graph, scratch, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap)) {
         .found => |c| c,
         // Abstract scratch saturated: retry next frame instead of a hard negative.
         .saturated => return .{ .budget_exhausted = request.key },
@@ -138,7 +153,7 @@ pub fn solveAbstract(
 
     // Stitch the full obstacle-aware path across every corridor segment. A node-budget
     // spill or an overflow of the stitched buffer is a transient: retry next frame.
-    switch (stitchCorridor(system, scratch, request, goal_grid, start_index, goal_index)) {
+    switch (stitchCorridor(system, scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap)) {
         .found => {},
         .budget_exhausted => return .{ .budget_exhausted = request.key },
         .none => return .{ .unavailable = request.key },
@@ -170,9 +185,9 @@ pub fn stitchCorridor(
     goal_grid: *const NavGrid,
     start_index: usize,
     goal_index: usize,
+    cap: usize,
 ) LocalSolve {
     const graph = &system.graph;
-    const cap = system.capacity.max_stitched_path_cells;
     scratch.stitched_scratch.clearRetainingCapacity();
     if (cap == 0) return .budget_exhausted;
     // Seed the path with the start cell on the start level.
@@ -307,9 +322,14 @@ pub fn abstractCorridor(
     goal_level: u16,
     start_index: usize,
     goal_index: usize,
+    node_cap: usize,
 ) AbstractResult {
     const abstract = &scratch.abstract;
     abstract.reset();
+    // Per-query attempt-scoped cap (tier-0 stays small; tier-1 uses the derived
+    // ceiling), independent of the PHYSICAL slot/open-heap sizing done once at
+    // reserve() time. See AbstractScratch.node_budget.
+    abstract.node_budget = node_cap;
     const abstract_closed = abstract.slot_closed;
     const abstract_g = abstract.slot_g;
     const abstract_parent = abstract.slot_parent;

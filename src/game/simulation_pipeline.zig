@@ -303,6 +303,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
         perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
+        perf.recordMetric(.path_escalated_solves, metric(pathfinding_stats.escalated_solves));
+        perf.recordMetric(.path_escalated_deferred, metric(pathfinding_stats.escalated_deferred));
         perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
         perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
         perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));

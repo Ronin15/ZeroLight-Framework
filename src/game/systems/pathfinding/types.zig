@@ -107,23 +107,43 @@ pub const inter_level_penalty: u32 = cardinal_cost * 4;
 // Bounded node budget for the abstract A* over portal/link nodes. The abstract
 // graph is small (portals scale with chunk borders, not cells), so this caps the
 // per-query abstract work; refinement of each segment uses the local budget.
+// This is the TIER-0 (first, cheap attempt) default — see PendingRequest.tier.
+// A FIXED constant, deliberately never derived from world/graph size: per-query
+// work must stay bounded independent of world size (see the existing
+// "regardless of world size" test on the abstract solve, and the constant-set
+// invariant nav_graph.zig's incremental-dig tests pin), so a request that does
+// not fit is a bounded, honest "try the bigger fixed tier-1 budget next", never
+// a bigger number picked because THIS map happened to need it.
 pub const default_max_abstract_nodes: usize = 4096;
 // Cap on the stored stitched-path cells per cached cross-chunk/cross-level result.
 // An abstract corridor is refined into a single grid-adjacent (level,cell) path by
 // stitching local A* segments; this bounds that path. A stitched path that exceeds
 // the cap spills to a later frame (budget_exhausted) and is retried from the agent's
-// advanced position, so the cap is never a silent truncation.
+// advanced position, so the cap is never a silent truncation. Tier-0 default; see
+// default_max_abstract_nodes's doc comment for why this stays fixed.
 pub const default_max_stitched_path_cells: usize = 512;
+// Tier-0 (first-attempt) abstract-search attempt caps, independently settable from
+// max_abstract_nodes/max_stitched_path_cells (the tier-1 ceiling below) so a
+// caller/test can force a deterministic tier-0 saturation without disturbing tier 1.
+// Default equals the historical fixed defaults, so the common case's solve cost is
+// unchanged by the tier split.
+pub const default_tier0_abstract_node_attempt_cap: usize = default_max_abstract_nodes;
+pub const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_cells;
+// Tier-1 (second, escalated attempt) caps: FIXED constants, a flat multiple of the
+// tier-0 defaults, exactly like every other budget in this module — NOT derived from
+// or scaled to the built graph's portal count, level size, or any other measured
+// world state (a prior version of this fix did that and was rejected: worlds vary in
+// size, so a budget must stay bounded independent of it, matching this file's other
+// "independent of total cell count" / "independent of world size" invariants). A
+// request that still exhausts the tier-1 budget is genuinely hard for THIS fixed
+// budget, not "this particular map is big" — see PendingRequest.tier and
+// compactPendingAfterSolve's budget_exhausted handling, which drops such a request to
+// `.missing` (retryable later, NOT a false negative) rather than growing the budget.
+pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
+pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
 // Steps after which a cached result is re-solved when next requested, so an agent
 // picks up world changes that did not directly cross its path. 0 disables. ~5s at 60Hz.
 pub const default_cache_ttl_steps: u32 = 300;
-// Queue-fairness thresholds for a pending entry that keeps budget-spilling. After this
-// many consecutive budget-exhausted retries it is rotated to the BACK of pending so
-// late-queued work behind a chronic spiller still reaches the solver.
-pub const budget_exhausted_rotate_after: u32 = 4;
-// After this many it is demoted to a hard negative (negative-cached) so a request that
-// never fits the per-solve budget stops consuming a solve slot every frame.
-pub const budget_exhausted_drop_after: u32 = 32;
 
 pub const no_parent: usize = std.math.maxInt(usize);
 pub const no_cell: u32 = std.math.maxInt(u32);
@@ -333,11 +353,24 @@ pub const PathfindingCapacity = struct {
     // Budget-bounded A* sizing.
     max_explored_nodes: usize = default_max_explored_nodes,
     max_stored_path_cells: usize = default_max_stored_path_cells,
-    // Abstract chunk-portal tier sizing. nav_chunk_tiles sets the abstract chunk
-    // side length; max_abstract_nodes bounds abstract A* work.
+    // Abstract chunk-portal tier sizing. nav_chunk_tiles sets the abstract chunk side
+    // length. max_abstract_nodes/max_stitched_path_cells bound the ESCALATED (tier-1)
+    // abstract A*/stitched-corridor work — FIXED constants (default_tier1_*), never
+    // derived from or scaled to world/graph size (see those constants' doc comments).
     nav_chunk_tiles: u16 = default_nav_chunk_tiles,
-    max_abstract_nodes: usize = default_max_abstract_nodes,
-    max_stitched_path_cells: usize = default_max_stitched_path_cells,
+    max_abstract_nodes: usize = default_tier1_abstract_node_cap,
+    max_stitched_path_cells: usize = default_tier1_stitched_cell_cap,
+    // Tier-0 (first-attempt) abstract-search caps: independent of max_abstract_nodes/
+    // max_stitched_path_cells above, so a caller/test can force a deterministic tier-0
+    // saturation without disturbing the tier-1 ceiling.
+    tier0_abstract_node_cap: usize = default_tier0_abstract_node_attempt_cap,
+    tier0_stitched_cell_cap: usize = default_tier0_stitched_attempt_cap,
+    // Per-step cap on ESCALATED (tier-1) solve attempts admitted into the fallback
+    // batch. Tier-1 attempts are the expensive ones (the derived, larger ceiling), so
+    // bounding how many run in one step bounds worst-case per-step solver cost even
+    // when several agents are simultaneously stuck. Tier-0 attempts are unaffected and
+    // keep filling remaining slots up to max_fallback_requests_per_step as before.
+    max_escalated_solves_per_step: usize = 1,
     // Incremental nav update: when an `applyNavUpdates` batch touches more than this
     // many levels, it relabels every level (a loud, counted fallback) rather than
     // only the affected ones.
@@ -403,6 +436,15 @@ pub const PathfindingStats = struct {
     cache_evictions: usize = 0,
     // Solver and flow-field counters.
     budget_exhausted: usize = 0,
+    // Tier-1 (escalated) solve attempts admitted into this step's fallback batch, and
+    // tier-1-ready requests that were NOT admitted because max_escalated_solves_per_step
+    // was already reached this step (they simply wait for a later step).
+    escalated_solves: usize = 0,
+    escalated_deferred: usize = 0,
+    // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending
+    // WITHOUT negative-caching, so the next query falls through to `.missing` (retryable
+    // later) rather than a false definitive `.unavailable`. See compactPendingAfterSolve.
+    escalated_dropped: usize = 0,
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
     group_field_reuses: usize = 0,
@@ -451,10 +493,16 @@ pub const PendingRequest = struct {
     // `no_parent` means projection found no open cell near the goal: a
     // definitive unavailable.
     goal_index: usize,
-    // Consecutive frames this entry has budget-spilled. Drives queue-fairness aging in
-    // compactPendingAfterSolve (rotate-to-back, then demote) so a chronic spiller never
-    // starves the tail. Reset implicitly: a solved entry leaves pending entirely.
-    retries: u32 = 0,
+    // Two-tier retry ladder: 0 is the first (cheap, fixed-budget) attempt; a
+    // budget_exhausted at tier 0 promotes to tier 1 (a larger but still FIXED
+    // abstract-node/stitched-cell ceiling — never derived from world/graph size) and
+    // rotates to the back of pending once. A budget_exhausted AT tier 1 drops the
+    // request WITHOUT negative-caching (not a definitive negative, just "doesn't fit
+    // either fixed budget") — worst case exactly two solve attempts per request, never
+    // the old unbounded retry storm, and never a false `.unavailable` for a goal that
+    // may genuinely be reachable. Reset implicitly: a solved or dropped entry leaves
+    // pending entirely.
+    tier: u8 = 0,
 };
 
 // One cell of a stitched obstacle-aware corridor path, tagged with its level. The

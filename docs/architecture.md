@@ -562,7 +562,25 @@ for per-worker scratch that is O(cells) (the grid is world-bounded, so this is a
 cost the build-time memory gate counts). `max_explored_nodes` stays the node BUDGET:
 an explicit per-solve expansion counter caps how many distinct cells one solve may
 stamp. Hitting that local node budget or saturating the abstract scratch returns
-`pending` and increments `path_budget_exhausted`. A blocked
+`pending` and increments `path_budget_exhausted`. Abstract/stitched-corridor work
+follows a two-tier attempt ladder (`PendingRequest.tier`) rather than retrying a
+budget-exhausted query at unchanged cost: a cheap tier-0 attempt uses the small fixed
+`tier0_abstract_node_cap`/`tier0_stitched_cell_cap`; exhausting it promotes the
+request to tier 1 exactly once, which retries against `max_abstract_nodes`/
+`max_stitched_path_cells` — a larger but still FIXED ceiling (`default_tier1_*` in
+`types.zig`), deliberately never derived from or scaled to world/graph size: per-query
+work stays bounded independent of world size, matching this module's other
+"independent of total cell count" invariants (portals scale with border-cell density,
+so a size-derived budget would have little margin on a larger or more-obstructed map
+and would silently depend on which map happens to be loaded). A tier-1 exhaustion
+drops the request WITHOUT negative-caching — it does not fit either fixed budget,
+which is not the same as a definitive "no path exists" — so the next query falls
+through to `.missing` (retryable after the caller's own replan cooldown) rather than a
+false `unavailable`. A request therefore costs at most two solve attempts per replan
+cycle, never an unbounded retry storm and never a permanently wrong negative. Per-step
+`max_escalated_solves_per_step` additionally bounds how many tier-1 (expensive)
+attempts one fixed step admits, so several simultaneously-stuck agents cannot
+stack their escalated cost into a single frame. A blocked
 goal projects to the nearest open cell on the goal level
 (`path_goal_projected`); `unavailable` is reserved for definitive negatives
 (disconnected component, no open cell near the goal, or no corridor across levels). Oversized worlds fail

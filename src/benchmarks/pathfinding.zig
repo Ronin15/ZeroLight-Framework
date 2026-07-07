@@ -75,6 +75,28 @@ pub const hard_fallback_budget_group = suite.BenchmarkGroup{
     .runCase = runHardFallbackBudgetCase,
 };
 
+// Escalated (tier-1) detour guard: a full-height wall with a single gap far from the
+// start/goal line forces the longest possible corridor detour — the shape of the
+// game-breaking FPS-drop bug (agents pathfinding around a large obstacle, e.g. a lake)
+// the two-tier retry ladder (PendingRequest.tier) fixed. Both tiers use FIXED budgets
+// (default_max_abstract_nodes for tier 0, default_tier1_abstract_node_cap for tier 1 —
+// never derived from or scaled to world/graph size, see types.zig), so per-query cost
+// stays bounded independent of grid size; item_count here is the grid SIDE in cells (not
+// an agent count), chosen to stay well under the fixed tier-1 budget regardless of
+// profile. The scenario that mattered was ONE agent's ONE worst-case long-range solve (a
+// simultaneous crowd of them is bounded separately by max_escalated_solves_per_step, not
+// this case). tier0_abstract_node_cap is forced deliberately tiny so the FIRST attempt
+// exhausts regardless of grid size — exercising the real promote-to-tier-1 path against
+// the fixed tier-1 budget. Measures the COLD escalated (tier-1) solve only, so a
+// regression that reintroduces the unbounded retry storm, or a detour this grid size that
+// no longer fits the fixed tier-1 budget, shows up here as a wall-clock regression or a
+// failed debug-assert.
+pub const escalated_detour_group = suite.BenchmarkGroup{
+    .name = "pathfinding-escalated-detour",
+    .defaultItemCounts = escalatedDetourItemCounts,
+    .runCase = runEscalatedDetourCase,
+};
+
 // Query tier: per-agent statusForWorld against a WARM cache, distinct from the solve
 // groups (which measure update) and from steering/ai (which measure avoidance). Each
 // agent reads its own cached path mid-route, so this isolates the cache probe and the
@@ -112,6 +134,13 @@ const unreachable_stress_counts = [_]usize{ 64, 128, 1024 };
 const query_quick_counts = [_]usize{ 256, 1024 };
 const query_standard_counts = [_]usize{ 1024, 4096 };
 const query_stress_counts = [_]usize{4096};
+// Grid SIDE (cells), not agent count — see escalated_detour_group's doc comment. Kept
+// well below the calibration repro's 256x256 production map so this stays CI-fast; the
+// fixed tier-1 budget does not depend on grid size, so a smaller grid still exercises
+// the real promote-to-tier-1 path once tier0 is forced to exhaust.
+const escalated_detour_quick_counts = [_]usize{64};
+const escalated_detour_standard_counts = [_]usize{96};
+const escalated_detour_stress_counts = [_]usize{128};
 
 // A cold pathfinding frame runs up to the per-frame solve ceiling of A* on a count-sized grid
 // — orders of magnitude heavier than the vectorized subsystem benches the suite measurement
@@ -210,6 +239,14 @@ pub fn queryDefaultItemCounts(profile: suite.Profile) []const usize {
         .quick => &query_quick_counts,
         .standard => &query_standard_counts,
         .stress => &query_stress_counts,
+    };
+}
+
+pub fn escalatedDetourItemCounts(profile: suite.Profile) []const usize {
+    return switch (profile) {
+        .quick => &escalated_detour_quick_counts,
+        .standard => &escalated_detour_standard_counts,
+        .stress => &escalated_detour_stress_counts,
     };
 }
 
@@ -714,6 +751,118 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     var stats = accumulator.finish();
     stats.output_count = item_count;
     stats.candidate_pairs = warm_paths; // agents served from a warm cached path
+    return stats;
+}
+
+// Builds the single-agent, single-request large-obstacle-detour fixture: a full-height
+// wall at the grid's horizontal midline with ONE gap near the TOP edge, and the
+// start/goal pair placed near the BOTTOM edge on either side of the wall — the longest
+// possible detour on a `side`-cell-square grid (see escalated_detour_group).
+fn createEscalatedDetourFixture(allocator: std.mem.Allocator, side: usize) !Fixture {
+    var data = DataSystem.init(allocator);
+    errdefer data.deinit();
+    var requests = RangeOutputStream(PathRequest).init(allocator);
+    errdefer requests.deinit();
+    try requests.reserve(1, 1);
+
+    const wall_x = side / 2;
+    const gap_y: usize = 1;
+    for (0..side) |y| {
+        if (y == gap_y) continue;
+        _ = try addEntity(&data, .{
+            .x = @as(f32, @floatFromInt(wall_x)) * 32.0,
+            .y = @as(f32, @floatFromInt(y)) * 32.0,
+        }, true);
+    }
+    const far_y = side - 2;
+    const entity = try addEntity(&data, .{
+        .x = 2.0 * 32.0,
+        .y = @as(f32, @floatFromInt(far_y)) * 32.0,
+    }, false);
+    try appendRequest(&requests, .{
+        .entity = entity,
+        .start = .{ .x = 2.0 * 32.0 + 8.0, .y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0 },
+        .goal = .{ .x = @as(f32, @floatFromInt(side - 2)) * 32.0 + 8.0, .y = @as(f32, @floatFromInt(far_y)) * 32.0 + 8.0 },
+    });
+
+    return .{ .data = data, .requests = requests };
+}
+
+// Measures the COLD ESCALATED (tier-1) solve only: an unmeasured setup step submits the
+// request and lets the forced-tiny tier-0 attempt cap exhaust (promoting the request to
+// tier 1, per compactPendingAfterSolve), then the timed step re-solves the SAME
+// now-tier-1 request against the fixed tier-1 budget. See escalated_detour_group.
+pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
+    if (suite.skipIfWorkersUnavailable(case)) |skip| return skip;
+    const side = item_count;
+
+    var fixture = try createEscalatedDetourFixture(allocator, side);
+    defer fixture.deinit();
+    var system = PathfindingSystem.init(allocator);
+    defer system.deinit();
+
+    const world_extent = @as(f32, @floatFromInt(side)) * 32.0;
+    var threads: ?ThreadSystem = null;
+    if (case.usesThreadSystem()) {
+        threads = try ThreadSystem.init(allocator, io, .{
+            .max_worker_threads = case.maxWorkerThreads(),
+            .items_per_range = suite.default_items_per_range,
+        });
+    }
+    defer if (threads) |*thread_system| thread_system.deinit();
+    const participant_count: usize = if (threads) |*thread_system| thread_system.participantSlotCount() else 1;
+    const thread_ptr: ?*ThreadSystem = if (threads) |*thread_system| thread_system else null;
+
+    try system.reserve(PathfindingCapacity{
+        .max_group_fields = 1,
+        .worker_participant_count = participant_count,
+        .max_agent_budget = 8,
+        // Deliberately tiny so the FIRST (tier-0) attempt exhausts regardless of grid
+        // size, exercising the real promote-to-tier-1 path against the fixed tier-1
+        // budget (see the group doc comment).
+        .tier0_abstract_node_cap = 64,
+    });
+    try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
+
+    var empty = RangeOutputStream(PathRequest).init(allocator);
+    defer empty.deinit();
+
+    // One tier-0 setup step per sample: submits the request (or re-submits a dedup no-op
+    // after the first) and exhausts at the tiny tier-0 cap, promoting to tier 1.
+    const promoteToTier1 = struct {
+        fn run(sys: *PathfindingSystem, fixture_requests: *RangeOutputStream(PathRequest), threads_ptr: ?*ThreadSystem, bench_case: suite.BenchmarkCase) !void {
+            sys.clearRuntimeState();
+            const setup_stats = try runColdOnce(sys, fixture_requests, threads_ptr, bench_case, 1, 1, 1);
+            std.debug.assert(setup_stats.budget_exhausted == 1);
+            std.debug.assert(sys.pending.items.len == 1);
+            std.debug.assert(sys.pending.items[0].tier == 1);
+        }
+    }.run;
+
+    for (0..coldWarmup(options)) |_| {
+        try promoteToTier1(&system, &fixture.requests, thread_ptr, case);
+        _ = try runColdOnce(&system, &empty, thread_ptr, case, 1, 1, 1);
+    }
+
+    var accumulator = suite.StatsAccumulator.init(1);
+    var last_stats = PathfindingStats{};
+    for (0..coldIterations(options)) |_| {
+        try promoteToTier1(&system, &fixture.requests, thread_ptr, case);
+        const start_ns = suite.nowNs(io);
+        last_stats = try runColdOnce(&system, &empty, thread_ptr, case, 1, 1, 1);
+        const end_ns = suite.nowNs(io);
+        accumulator.record(suite.elapsedNs(start_ns, end_ns), last_stats.solveBatch());
+    }
+
+    // Regression guard: the fixed tier-1 budget must actually resolve this grid size's
+    // detour, not leave it budget_exhausted again (which would drop it to `.missing`
+    // instead of solving — still not a false negative, but no longer what this
+    // benchmark exists to measure).
+    std.debug.assert(last_stats.available_results == 1);
+
+    var stats = accumulator.finish();
+    stats.output_count = last_stats.available_results + last_stats.unavailable_results;
+    if (stats.mean_ns != 0) stats.items_per_second = suite.itemsPerSecond(stats.output_count, stats.mean_ns);
     return stats;
 }
 

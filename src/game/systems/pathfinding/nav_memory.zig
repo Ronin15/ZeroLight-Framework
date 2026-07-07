@@ -15,6 +15,7 @@ const PortalNode = types.PortalNode;
 const AbstractEdge = types.AbstractEdge;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
+const open_heap_headroom_factor = types.open_heap_headroom_factor;
 
 pub const NavMemoryBudget = struct {
     max_bytes: usize,
@@ -29,6 +30,11 @@ pub const NavMemoryBudget = struct {
     max_cached_results: usize,
     max_solved_requests_per_step: usize,
     max_stitched_path_cells: usize,
+    // Escalated (tier-1) abstract-search node ceiling — a fixed capacity constant, never
+    // derived from world/graph size. Counted here (AbstractScratch's per-participant
+    // slot table + open heap + corridor buffers) so it is gated by max_bytes exactly
+    // like every other reserve-config term, not silently excluded.
+    max_abstract_nodes: usize,
     // Abstract chunk-portal graph sizing. Per-slot buffers are geometrically sized to the
     // chunk-stable slot space (4*ct slots per chunk plus interior link tails); the edge
     // arena grows to a measured, slack-padded size at the init build. The gate uses a
@@ -51,6 +57,12 @@ pub const NavMemoryBudget = struct {
     const portal_edge_bytes: usize = @sizeOf(AbstractEdge);
     // PortalNode (u16 level + u32 cell_index + u32 chunk), including alignment padding.
     const portal_node_bytes: usize = @sizeOf(PortalNode);
+    // AbstractSlotRow (node usize + g u32 + parent usize + closed bool + stamp u32 +
+    // via_link bool), mirroring AbstractScratch's per-slot MultiArrayList row (scratch.zig).
+    const abstract_slot_bytes: usize = 2 * @sizeOf(usize) + 2 * @sizeOf(u32) + 2;
+    // Parallel corridor/corridor_link reconstruction buffers: one usize ref plus one bool
+    // flag per entry.
+    const abstract_corridor_bytes: usize = @sizeOf(usize) + 1;
 
     // Saturating estimate of total nav memory. An overflowing term clamps to
     // maxInt so the gate rejects rather than wrapping to a small value.
@@ -75,6 +87,18 @@ pub const NavMemoryBudget = struct {
             (self.max_explored_nodes *| @sizeOf(OpenNode)) +|
             (@max(self.max_explored_nodes, self.max_stored_path_cells) *| @sizeOf(u32));
         const scratch_bytes = self.worker_participant_count *| per_participant_scratch_bytes;
+        // Per-participant abstract-tier (AbstractScratch) search state, mirroring its
+        // reserve() sizing exactly: a slot_capacity = max(16, 2x) open-addressed table,
+        // an open-heap-headroom-factor-sized open heap of OpenNode, and the
+        // corridor/corridor_link reconstruction buffers. Each participant owns a
+        // disjoint AbstractScratch, so this is counted per participant like the local
+        // A* scratch above.
+        const abstract_slot_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| 2);
+        const abstract_open_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| open_heap_headroom_factor);
+        const per_participant_abstract_bytes = (abstract_slot_capacity *| abstract_slot_bytes) +|
+            (abstract_open_capacity *| @sizeOf(OpenNode)) +|
+            (self.max_abstract_nodes *| abstract_corridor_bytes);
+        const abstract_scratch_bytes = self.worker_participant_count *| per_participant_abstract_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.
@@ -87,7 +111,7 @@ pub const NavMemoryBudget = struct {
         // portals/edges are estimated from border structure, not a per-cell worst case).
         const abstract_bytes = self.abstractGraphBytes(width, height, levels);
         return static_bytes +| group_registry_bytes +|
-            scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
+            scratch_bytes +| abstract_scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
             abstract_bytes;
     }
 
@@ -149,6 +173,7 @@ pub fn autoSizedMaxNavMemoryBytes(capacity: types.PathfindingCapacity, level_cou
         .max_cached_results = capacity.max_cached_results,
         .max_solved_requests_per_step = capacity.max_solved_requests_per_step,
         .max_stitched_path_cells = capacity.max_stitched_path_cells,
+        .max_abstract_nodes = capacity.max_abstract_nodes,
         .chunk_tiles = capacity.nav_chunk_tiles,
         .link_count = 0,
     };
@@ -196,6 +221,7 @@ fn testBudget(max_bytes: usize) NavMemoryBudget {
         .max_cached_results = 256,
         .max_solved_requests_per_step = 512,
         .max_stitched_path_cells = 256,
+        .max_abstract_nodes = 4096,
         .chunk_tiles = 16,
         .link_count = 0,
     };
@@ -230,7 +256,20 @@ test "autoSizedMaxNavMemoryBytes returns a sane floor for degenerate zero-sized 
         .max_explored_nodes = 0,
         .max_stored_path_cells = 0,
         .max_stitched_path_cells = 0,
+        .max_abstract_nodes = 0,
     };
     const result = autoSizedMaxNavMemoryBytes(capacity, 1, 0, 0);
     try std.testing.expect(result >= 1);
+}
+
+test "requiredBytes counts AbstractScratch memory: a bigger max_abstract_nodes raises the estimate" {
+    // Pins that the abstract-tier per-participant scratch (slot table + open heap +
+    // corridor buffers, mirroring AbstractScratch.reserve's own sizing) is actually
+    // included in requiredBytes, not silently excluded — a real memory-safety gate must
+    // account for every buffer a rebuild reserves, including this one.
+    var small = testBudget(std.math.maxInt(usize));
+    small.max_abstract_nodes = 64;
+    var large = testBudget(std.math.maxInt(usize));
+    large.max_abstract_nodes = 8192;
+    try std.testing.expect(large.requiredBytes(256, 256) > small.requiredBytes(256, 256));
 }

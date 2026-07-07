@@ -78,6 +78,8 @@ pub const Metric = enum {
     path_cache_hits,
     path_cache_evictions,
     path_budget_exhausted,
+    path_escalated_solves,
+    path_escalated_deferred,
     path_goal_projected,
     path_group_fields_built,
     path_group_field_reuses,
@@ -541,7 +543,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
                 self.metricValue(.path_accepted_requests),
@@ -557,6 +559,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_cache_hits),
                 self.metricValue(.path_cache_evictions),
                 self.metricValue(.path_budget_exhausted),
+                self.metricValue(.path_escalated_solves),
+                self.metricValue(.path_escalated_deferred),
                 self.metricValue(.path_goal_projected),
                 self.metricValue(.path_group_fields_built),
                 self.metricValue(.path_group_field_reuses),
