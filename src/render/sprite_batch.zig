@@ -157,15 +157,43 @@ pub const Material = enum {
 };
 
 /// Fragment uniform (set 3) for a tilemap draw — world-constant grid + atlas
-/// geometry. extern for a stable GPU layout matching `tilemap.frag.glsl`. Kept off
-/// `DrawGroup` (looked up in the renderer by `tile_data`) so the per-frame draw-group
-/// sort/coalesce/merge does not drag this payload through every sprite group.
+/// geometry plus this draw's composited layer window. extern for a stable GPU
+/// layout matching `tilemap.frag.glsl`. Kept off `DrawGroup` (looked up in the
+/// renderer by `tile_data`) so the per-frame draw-group sort/coalesce/merge does
+/// not drag this payload through every sprite group.
 pub const TilemapParams = extern struct {
     // x=tile_size, y=grid_width, z=grid_height, w=invalid_tile_id
     grid: [4]f32,
     // x=atlas_columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     atlas: [4]f32,
+    // x=this draw's composited layer count (topmost-first), y/z/w unused. Filled
+    // per draw group at push time (Renderer.applyWindowLayers), not stored in
+    // createTileDataBuffer's per-buffer params, since several draws can
+    // composite different layer subsets from one combined buffer.
+    layer_meta: [4]i32 = .{ 0, 0, 0, 0 },
+    // Topmost-first element offsets into the tile-data buffer named by
+    // DrawGroup.tile_data, one per composited layer (layer_meta[0] of them
+    // valid; the rest are stale). Packed as a flat [32]u32 to byte-match a GLSL
+    // uvec4[8] array under std140 (uvec4 array elements have no interior
+    // padding, so this is contiguous with no guessed compiler padding).
+    layer_offsets: [32]u32 = @splat(0),
 };
+
+// std140 (the default GLSL uniform-block layout, and what `tilemap.frag.glsl`'s
+// `TilemapUniform` uses since it names neither std140 nor std430) requires every
+// `vec4`/`ivec4`/`uvec4` field, and every element of an array of them, to sit at
+// a 16-byte-aligned offset with no interior padding — exactly this struct's
+// four 16-byte fields back to back. Confirmed (not just asserted) against the
+// SPIRV-Cross-generated MSL for this shader: `struct TilemapUniform { float4
+// grid; float4 atlas; int4 layer_meta; uint4 layer_offsets[8]; };`, byte-for-byte
+// matching this extern struct with zero padding either side.
+comptime {
+    std.debug.assert(@sizeOf(TilemapParams) == 4 * 4 + 4 * 4 + 4 * 4 + 32 * 4);
+    std.debug.assert(@offsetOf(TilemapParams, "grid") == 0);
+    std.debug.assert(@offsetOf(TilemapParams, "atlas") == 16);
+    std.debug.assert(@offsetOf(TilemapParams, "layer_meta") == 32);
+    std.debug.assert(@offsetOf(TilemapParams, "layer_offsets") == 48);
+}
 
 pub const DrawGroup = struct {
     source: DrawSource = .dynamic,
@@ -175,9 +203,14 @@ pub const DrawGroup = struct {
     order: RenderOrder = .{},
     first_vertex: u32,
     vertex_count: u32,
-    // Tilemap-material groups only: the layer's storage-buffer handle. The grid/atlas
+    // Tilemap-material groups only: the buffer's storage-buffer handle. The grid/atlas
     // uniform lives in the renderer keyed by this id.
     tile_data: resources.TileDataId = .invalid,
+    // Tilemap-material groups only: indexes the renderer's per-frame
+    // TilemapWindowLayers side table (populated by appendStaticTilemapSpan),
+    // giving this draw's topmost-first composited layer offsets. Zero (and
+    // unused) for non-tilemap groups.
+    window_slot: u8 = 0,
 };
 
 pub const TextureResolver = struct {

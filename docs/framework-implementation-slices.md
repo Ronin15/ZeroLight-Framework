@@ -83,7 +83,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **32–33** | Not started | Behavior arbitration, data-driven archetypes/debug — see **Emergent AI Track Overview** then each slice |
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
-| **36** | Not started | Single-pass dense-layer depth compositing (fixes fill-rate overdraw from per-layer tilemap draws) — Checklist open |
+| **36** | Landed | Single-pass dense-layer depth compositing (combined tile buffer + interleave-depth-partitioned composite draws; render window widened to the full authored stack) |
 
 **Landed slice sections (18–25, 24B):** checklists complete; sections are
 acceptance history. Follow-up hardening without a new slice number lives in
@@ -147,10 +147,10 @@ world depth, or cognition-track scope.
       camera gates skip draw prep but not the scan. Hardening: warmed visible
       movement dense-index list parallel to scoped simulation gathers (Slice 22
       handoff; partial inline gating landed in 24B).
-- [ ] **Dense floor submit vs camera.** The vertical render window bounds layer
-      count; each in-window layer still submits one full-world tilemap quad (GPU
-      clips). Hardening: chunked dense submit if layer-quad cost dominates
-      (Slice 23B follow-up).
+- [ ] **Dense floor submit vs camera.** Each dense composite draw (Slice 36) is
+      still one full-world tilemap quad regardless of camera pan (GPU clips).
+      Hardening: chunked dense submit if quad cost dominates at very large
+      worlds.
 - [ ] **On-screen record ordering.** `finalizeDepthBuckets` sorts collected
       dynamic records; replace with fixed-band or counting buckets when on-screen
       density rises (Slice 24B follow-up).
@@ -993,9 +993,11 @@ Current foundation (landed):
 - `render_prep.ensureStaticGeometryCapacity` reserves static geometry from
   `WorldSystem.maxDenseSubmitLayerCount()` at the start of `submitGameplayFrame`
   (grow-only; allocation-free after the first reserve).
-- `render-game-prep` dense 8/16/32 surface (`player_level = 0`) and deep
-  (`player_level = 40`) benchmark groups; unit tests cover window caps, player
-  level transitions, per-band inclusion, and depth order.
+- `render-game-prep` dense surface (`player_level = 0`) and deep
+  (`player_level = 40`) benchmark groups (Slice 36 collapsed the original
+  8/16/32 tilemap-group-count variants once that parameter stopped varying
+  the fixture); unit tests cover window caps, player level transitions,
+  per-band inclusion, and depth order.
 
 Checklist:
 
@@ -1006,8 +1008,10 @@ Checklist:
 - [x] Wire window into `submitStaticDenseGeometry` and
       `GameplayScene.player_level` / camera-level handoff.
 - [x] Reserve renderer static-group high-water from window + sparse overhead.
-- [x] Add `render-game-prep` bench cases at 8/16/32 static tilemap groups and
-      `player_level` 0 vs mid-depth; record `mergeDrawList` and submit cost.
+- [x] Add `render-game-prep` bench cases at `player_level` 0 vs mid-depth;
+      record `mergeDrawList` and submit cost (originally also varied at
+      8/16/32 static tilemap groups; that axis was collapsed in Slice 36 once
+      it stopped affecting the built fixture).
 - [x] Add unit tests: surface window caps submit count; deep play submits only
       the near stack; depth order preserved within the window.
 - [x] Profile GPU memory budget for target level count × world size; document
@@ -2688,6 +2692,23 @@ Acceptance checks:
 
 ## Slice 36: Single-Pass Dense-Layer Depth Compositing
 
+Status: All 4 steps landed. One combined GPU tile-data buffer replaces the
+former per-layer buffer array (`WorldSystem.dense_tile_data_buffer`), and
+`submitStaticDenseGeometry` now partitions the in-window dense layer set into a
+small, bounded number of composite draws cut at this frame's interleave depths
+(`partitionDenseCompositeBuckets`/`buildWindowLayers`; a topmost-first
+`Renderer.TilemapWindowLayers` per draw), instead of one draw per submitted
+layer. `tilemap.frag.glsl` composites the window per-pixel, stopping at the
+first opaque cell. `render_prep.staticGeometryCapacity` now reserves static
+geometry from `WorldSystem.maxDenseSubmitDrawCount()` (flat, composite-draw-count
+bound) instead of the old per-layer bound, and the `render-game-prep` bench
+fixture/assertions were rewritten to match (`merged_tilemap_group_count` stays
+flat at 1 across the surface/deep cases; the earlier 8/16/32 tilemap-group-count
+axis was collapsed since it never varied the fixture's built content post-step-3).
+`game_demo_state.zig`'s procedural render window default is re-widened to the full authored 31-level
+underground stack (`procedural_render_window_levels_below = procedural_underground_count`),
+the payoff this slice unlocks.
+
 Goal: replace the Slice 23B per-layer full-screen tilemap draw (one draw call +
 one full-viewport fragment-shader pass per **submitted** dense layer) with a
 single fullscreen pass whose fragment shader walks the level stack itself, so
@@ -2724,61 +2745,95 @@ Current foundation (landed, do not rebuild):
   `submitStaticDenseGeometry` (Slice 23B) already collect and order the
   in-window layer set correctly; this slice changes how that set reaches the
   GPU, not which layers are in it.
-- Per-layer GPU tile-data storage buffers (`uploadDenseLayerBuffers`) and the
-  `cycle=false` retained-buffer upload policy (Slice 23A) are unaffected —
-  compositing still reads the same per-level storage buffers.
+- Per-layer GPU tile-data storage buffers were replaced, not left unaffected:
+  `uploadDenseLayerBuffers` is now `uploadDenseTileDataBuffer`, building one
+  combined `WorldSystem.dense_tile_data_buffer` from the whole flat
+  `dense_tile_ids` array instead of one buffer object per dense layer.
+  Compositing reads that single buffer at each layer's `denseLayerOffset`.
 - `tilemap.frag.glsl` already has the per-pixel cell lookup and atlas sample;
   this slice's shader work extends that lookup to iterate levels instead of
   running once per bound layer.
 
 Architecture notes:
 
-- Bind every in-window layer's storage buffer to one draw (an array of
-  storage buffer bindings, or one bindless/combined buffer indexed by layer)
-  and have the fragment shader loop from the topmost in-window level downward,
-  stopping at the first non-`invalid_tile_id` cell — most pixels resolve in
-  1-2 iterations (the visible floor), not N.
-- SDL_GPU resource-binding limits (see `docs/rendering-assets-shaders.md`'s
-  shader resource set layout) bound how many storage buffers one draw can
-  bind directly; if the window size can exceed that, pack per-level tile data
-  into one combined storage buffer (layer-major layout) instead of N separate
-  bindings, indexed by a per-pixel loop counter.
+- **Landed:** one combined GPU storage buffer (`WorldSystem.dense_tile_ids`
+  concatenated whole, `denseLayerOffset(layer_index) = layer_index *
+  cellCount()`), not per-level bindings — sidesteps SDL_GPU per-stage
+  storage-binding limits and the Metal storage-slot-shift quirk entirely, since
+  every tilemap draw binds exactly one storage buffer regardless of window
+  depth.
+- **Landed:** the fragment shader loops a per-draw, topmost-first window of
+  element offsets into that buffer (`TilemapUniform.layer_meta`/`layer_offsets`,
+  a `uvec4[8]` matching a flat `[32]u32` byte-for-byte under std140), stopping
+  at the first non-`invalid_tile_id` cell — most pixels resolve in 1-2
+  iterations (the visible floor), not N.
+- **Landed:** `submitStaticDenseGeometry` computes the composite-draw window
+  split on the CPU (`partitionDenseCompositeBuckets`) rather than pushing a
+  full per-level index array to the GPU every frame: it cuts the in-window
+  layer list at every depth something else needs to render sandwiched between
+  two dense layers this frame (`render_prep.collectDenseInterleaveDepths` —
+  the active level's own actor depth, this frame's distinct dynamic depths,
+  and every registered sparse-tile depth at any in-window level, not only the
+  active one). In the shipped default config this always resolves to exactly 1
+  draw; `Renderer.k_max_dense_composite_draws = 8` is the defensive cap.
 - This is a render-cost change only — no dig/nav/simulation contract changes,
   and `WorldSystem`'s CPU-side tile data remains the source of truth.
-- Keep `DrawGroup.material = .tilemap` as one draw per frame (or a small fixed
-  number if a combined-buffer size limit forces splitting), not one per level.
+- `DrawGroup.material = .tilemap` is one draw per composite-draw bucket per
+  frame (data-dependent, capped at 8), not one per submitted dense layer.
 
 Checklist:
 
-- [ ] Decide combined-buffer vs. multi-binding layer storage layout against
-      the actual SDL_GPU per-stage storage-buffer binding limit; document the
-      choice beside `tilemap.frag.glsl`.
-- [ ] Extend the tilemap fragment shader to loop the in-window levels
+- [x] Decided combined-buffer layout (not multi-binding) against the SDL_GPU
+      per-stage storage-buffer binding limit and the Metal storage-slot-shift
+      quirk; documented beside `tilemap.frag.glsl` and in
+      `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section.
+- [x] Extended the tilemap fragment shader to loop a per-draw window of levels
       per-pixel (topmost first) and stop at the first opaque cell, replacing
       the one-`discard`-per-layer-per-draw model.
-- [ ] Update `Renderer`/`WorldSystem` GPU-side wiring to submit the composited
-      pass as one (or a small bounded number of) draw call(s) instead of one
-      per submitted dense layer; keep `submitStaticDenseGeometry`'s CPU-side
-      layer collection unchanged.
-- [ ] Re-widen `game_demo_state.zig`'s procedural render window back toward
-      the full vertical stack now that steady-state cost no longer scales
-      with submitted-layer count, once this slice lands.
-- [ ] Add a bench case (or GPU timestamp query, if available in SDL_GPU) that
-      demonstrates fragment-shader cost no longer scales linearly with
-      submitted-layer count at a fixed viewport size.
+- [x] Updated `Renderer`/`WorldSystem` GPU-side wiring to submit the
+      composited window as a small bounded number of draw calls (data-dependent
+      per frame, capped at `Renderer.k_max_dense_composite_draws`) instead of
+      one per submitted dense layer; `collectDenseSubmitLayers`'s CPU-side
+      layer collection contract is unchanged.
+- [x] Re-widen `game_demo_state.zig`'s procedural render window back toward
+      the full vertical stack now that steady-state draw count no longer
+      scales with submitted-layer count (Step 4).
+- [x] Shrink `render_prep.staticGeometryCapacity`'s reservation from
+      `maxDenseSubmitLayerCount()` to `WorldSystem.maxDenseSubmitDrawCount()`,
+      and rewrite the `render-game-prep` bench fixture/assertions so the
+      tilemap portion of `merged_group_count` is asserted flat across the
+      surface/deep cases (Step 3; the earlier 8/16/32 tilemap-group-count axis
+      was collapsed since it never varied the fixture's built content) — no GPU
+      timestamp-query infrastructure exists in this repo, so this bench proves
+      draw/bind count stops scaling with window depth; it cannot produce a
+      fill-rate number.
 
 Acceptance checks:
 
-- [ ] Visual parity with the current per-layer draw at every window size
-      exercised by existing `render-game-prep` bench cases (8/16/32 static
-      tilemap groups) and the Slice 23B unit tests (window caps, player-level
-      transitions, per-band inclusion, depth order).
-- [ ] Digging a multi-level shaft still reveals the correct plane through
-      every stacked hole, matching pre-slice behavior.
-- [ ] Measured fill-rate cost is flat (or near-flat) as submitted-layer count
-      grows from 1 to the `k_max_dense_submit_stack_cap` ceiling, at a fixed
-      viewport size.
-- [ ] `zig build verify` passes.
+- [x] Visual/behavioral parity with the current per-layer draw, proven by
+      `partitionDenseCompositeBuckets`/`buildWindowLayers`/`applyWindowLayers`
+      unit tests (single-bucket common case, ceiling-style split, a synthetic
+      split at a deeper non-active level, the composite-draw-cap overflow
+      case) plus a `render_prep.zig` end-to-end test proving a sparse tile at a
+      deeper in-window level produces a second composite draw group in the
+      merged list, and `zig build gpu-smoke` (multi-layer composite window
+      renders without an SDL_GPU validation error).
+- [x] Digging a multi-level shaft still reveals the correct plane through
+      every stacked hole: closed generally via interleave-depth partitioning,
+      not an `active_level`-only special case — the synthetic non-active-level
+      unit test above is the proof this generalizes to sparse content at any
+      in-window level, present or future.
+- [x] Measured draw/bind count stays flat as submitted-layer count grows from 1
+      to the `k_max_dense_submit_stack_cap` ceiling, at a fixed viewport size:
+      `zig build bench -- --group render-game-prep` asserts
+      `merged_tilemap_group_count == 1` across the surface/deep cases.
+      This proves draw/bind **count** no longer scales with window depth, the
+      CPU-measurable proxy this repo can produce — there is no GPU
+      timestamp-query infrastructure here to measure actual fragment-shader
+      fill-rate cost directly, so that number itself is not measured, only
+      `zig build gpu-smoke`'s qualitative visual check that compositing still
+      renders correctly.
+- [x] `zig build verify` passes.
 
 ## Suggested Order
 

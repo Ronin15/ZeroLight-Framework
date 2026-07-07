@@ -68,7 +68,8 @@ tracked with generational `TextureId` values so stale or destroyed IDs are
 rejected deterministically during batch prep.
 
 The renderer owns a second, **static** set of vertex buffers for retained world
-geometry — now just one quad per dense layer (see GPU-Driven Tilemap). Each frame it
+geometry — now a small, bounded number of composite dense tilemap quads rather
+than one per dense layer (see GPU-Driven Tilemap). Each frame it
 builds one order-merged draw list from the dynamic draw groups plus the static spans,
 stable-sorted by `RenderOrder` (static appended first, so world/dense geometry draws
 under sparse/dynamic at equal order). Per source it binds that source's three
@@ -134,23 +135,57 @@ ordered-command, prepared-command, vertex, and draw-group capacity.
 
 ## GPU-Driven Tilemap
 
-Dense world tiles are not emitted as per-tile vertices. Each dense layer's tile ids
-are uploaded once to a GPU **storage buffer** (`GRAPHICS_STORAGE_READ`, one `u32`
-per cell, row-major — a direct copy of `WorldSystem.dense_tile_ids` via
-`Renderer.createTileDataBuffer`). The world draws **one world-space quad per dense
-layer** through the retained static vertex buffer (`Renderer.beginStaticGeometry` /
-`appendStaticTilemapSpan`) at `denseLayerOrder(layer)`, tagged
-`DrawGroup.material = .tilemap`. The tilemap fragment shader maps each screen pixel
-to a world cell, reads the tile id from the storage buffer, derives the atlas cell
-from the tight grid (`col = id % columns`, `row = id / columns`; that layout is
-enforced for every tile at meta load by `validateGridEntry`), and samples the
-atlas. Cost scales with the **screen**, not the world: ~0.5 MB/layer of tile data
-and a handful of draw calls regardless of world size.
+Dense world tiles are not emitted as per-tile vertices. Every dense layer's tile ids
+are concatenated into one flat array (`WorldSystem.dense_tile_ids`) and uploaded
+once, in one pass, to a single combined GPU **storage buffer**
+(`GRAPHICS_STORAGE_READ`, one `u32` per cell, row-major — via
+`WorldSystem.uploadDenseTileDataBuffer` / `Renderer.createTileDataBuffer`).
+
+The world draws its dense render window as a small, bounded number of **composite**
+draws, not one draw per dense layer. `WorldSystem.submitStaticDenseGeometry` takes
+`GameplayScene.player_level` as `active_level`, collects the in-window dense layers
+back-to-front (`collectDenseSubmitLayers`, unchanged contract), then cuts that
+depth-ascending list into composite-draw buckets at every **interleave depth** —
+a depth something else needs to render strictly between two dense layers this
+frame (`partitionDenseCompositeBuckets`). Interleave depths come from three
+sources, gathered by `render_prep.collectDenseInterleaveDepths` before the submit
+call: `active_level`'s own actor depth (always included — this is what makes the
+common case, no sandwiched content, behave exactly like a single draw), every
+distinct dynamic entity/particle depth this frame, and every depth a sparse tile
+is registered at **anywhere in the world**, not just `active_level` — closing what
+would otherwise be a real gap: a whole-layer composite draw has no per-cell cull,
+so a sparse tile (an ore vein, a pickup seen through a dug shaft) at *any*
+in-window level must still get its own sandwich point the moment one exists, not
+just the active level's. Depths are filtered to the dense window's own depth span
+(`WorldSystem.denseWindowDepthSpan`) before partitioning, since anything outside it
+cannot cut a boundary.
+
+Each bucket becomes one retained world-space quad (`Renderer.beginStaticGeometry` /
+`appendStaticTilemapSpan`) ordered at that bucket's own shallowest layer's real
+`denseLayerOrder`, tagged `DrawGroup.material = .tilemap` and carrying a
+`Renderer.TilemapWindowLayers` — up to `Renderer.k_max_tilemap_window_layers`
+topmost-first element offsets into the combined buffer
+(`WorldSystem.buildWindowLayers` reverses `collectDenseSubmitLayers`'s
+deepest-first bucket slice, since the shader composites top-down). The tilemap
+fragment shader maps each screen pixel to a world cell, then loops its window
+topmost-first — `tile_ids[layer_offsets[i] + cell_index]` — stopping at the first
+non-`invalid_tile_id` hit (or discarding if every composited layer is empty at
+that pixel), derives the atlas cell from the tight grid (`col = id % columns`,
+`row = id / columns`; enforced for every tile at meta load by
+`validateGridEntry`), and samples the atlas. The loop's trip count
+(`TilemapUniform.layer_meta.x`) is the same for every fragment in one draw
+(dynamically uniform), so this is an ordinary bounded GLSL loop with no
+toolchain risk. Draw count scales with how many interleave points exist this
+frame (`Renderer.k_max_dense_composite_draws = 8` is the defensive cap; the
+shipped default config always resolves to 1), never with window depth — cost
+still scales with the **screen**, not the world: ~0.5 MB/layer of tile data and a
+handful of draw calls regardless of world size or render-window depth.
 
 The camera lives in the vertex shader (Sprite Rendering's `position_transform`), so
 a **pan uploads nothing** — the full-world quads are unchanged. The quads re-submit
-only on a structural change (`dense_quads_dirty`: a new dense layer or chunk
-rebuild), never per frame or per pan.
+on a structural change (`dense_quads_dirty`), an `active_level`/window change, or
+an interleave-depth-set change (a newly relevant sandwich point) — never on a pan
+alone.
 
 A **dig/build** (`setDenseTile`) writes the CPU tile field — the source of truth for
 collision and gameplay — and queues a single-cell GPU edit. `flushDenseTileEdits`
@@ -160,23 +195,24 @@ element write, no full re-upload and no vertex work.
 
 Two pipelines share the ordered draw list. The renderer binds the **sprite** or
 **tilemap** pipeline on a `DrawGroup.material` change; tilemap groups additionally
-bind the layer storage buffer (rebound per group, covering a Metal storage-slot
-shift) and a small grid/atlas fragment uniform. Only sprite groups coalesce — each
-tilemap group binds its own buffer. Multi-z is native: deeper levels are dense
-layers at a lower `RenderOrder`, and the order-merged draw list interleaves them
-with dynamic entities, so an actor in a dug pit renders between the floor below and
-walls above. `WorldSystem.submitStaticDenseGeometry` takes `GameplayScene.player_level`
-as `active_level` and submits only dense layers inside the configured
-`DenseLayerRenderWindow` (re-submitting on `dense_quads_dirty`, plane change, or
-window change).
+bind the (now shared) tile-data storage buffer (rebound per group, covering a
+Metal storage-slot shift) and a small grid/atlas/composited-layer-window fragment
+uniform (`Renderer.applyWindowLayers`, keyed by `DrawGroup.window_slot` into a
+per-frame side table populated by `appendStaticTilemapSpan`). Only sprite groups
+coalesce — every tilemap group is its own draw, distinguished by its composited
+layer window rather than a distinct buffer. Multi-z is native: a composite draw's
+order is its bucket's shallowest layer, and the order-merged draw list interleaves
+it with dynamic entities and sparse tiles, so an actor in a dug pit — or a sparse
+tile on any in-window level — renders between the floor below and walls above.
 
 ### Dense render window policy (Slice 23B)
 
 Vertical scale is a **submit/draw** policy problem, not a per-tile vertex or
-full-buffer residency problem. Every authored dense layer still gets a retained
-GPU tile-data storage buffer at load (`uploadDenseLayerBuffers`); memory scales
-with total level count × cell count. The render window bounds how many of those
-layers become static tilemap draw groups each frame.
+full-buffer residency problem. Every authored dense layer's cells still land in
+the one combined GPU tile-data storage buffer at load
+(`uploadDenseTileDataBuffer`); memory scales with total level count × cell count.
+The render window bounds how many of those layers become static tilemap draw
+groups each frame.
 
 Default `DenseLayerRenderWindow` (`world_system.zig`):
 
@@ -185,20 +221,42 @@ Default `DenseLayerRenderWindow` (`world_system.zig`):
 | `levels_below` | `6` | Submit `active_level` through `active_level + 6` (inclusive). |
 | `ceiling_when_underground` | `false` | Opt-in only: redraws the full ceiling plane and breaks player-level follow. Surface hole see-through uses `levels_below` while `active_level == 0`. |
 
+`world_system.zig`'s struct default is conservative for arbitrary callers, but
+composite-draw bucketing (below) decouples fragment cost from window depth, so
+`game_demo_state.zig`'s procedural world config now widens `levels_below` to
+`procedural_underground_count` (the full authored 31-level underground stack) —
+`1 + levels_below` exactly fills `k_max_dense_submit_stack_cap = 32`, checked by
+a `comptime` assert alongside `validateDenseRenderBudget`. Widening the window
+no longer costs extra fragment invocations in the common case (still 1 composite
+draw); it does not change the GPU tile-data memory bound, which already sizes
+for every authored layer regardless of window depth.
+
 `collectDenseSubmitLayers` filters by `levelInWindow`, then sorts back-to-front
-before append. `maxDenseSubmitLayerCount` derives the cap from the window and
+before append — this contract is unchanged by composite-draw bucketing.
+`maxDenseSubmitLayerCount` derives the **layer** cap from the window and
 `max_dense_bands_per_level`; `validateDenseRenderBudget` fails at world build if
 the window exceeds `k_max_dense_submit_stack_cap` or optional
-`WorldBuildConfig.max_dense_tile_gpu_bytes`. `render_prep.ensureStaticGeometryCapacity`
-warms renderer static-geometry reservation from `maxDenseSubmitLayerCount()` at
-the start of each `submitGameplayFrame` (grow-only after the first reserve).
+`WorldBuildConfig.max_dense_tile_gpu_bytes` — this bounds GPU tile-data memory
+and the depth-ascending collection buffer, not draw count. The separate
+**draw**-count cap is `WorldSystem.maxDenseSubmitDrawCount()`
+(`Renderer.k_max_dense_composite_draws`): the actual bucket count is
+data-dependent per frame (how many interleave points exist), so this is the
+worst case. `render_prep.staticGeometryCapacity` sources its span/vertex
+reservation from `maxDenseSubmitDrawCount()` (the fixed composite-draw bound),
+not `maxDenseSubmitLayerCount()` — reservation stays flat regardless of window
+depth, since every direct `appendStaticTilemapSpan` caller now builds one span
+per bucket rather than one per layer.
 
 **Sparse/dense boundary:** chunk visibility (`setVisibleChunksForWorldRect`)
 still culls sparse tiles and sizes dynamic sparse prep (`reserveRenderRecords`);
-it no longer drives dense floor submit. Each in-window dense layer is one
-full-world quad regardless of camera pan — panning uploads nothing. Sparse
-overlays and dense floors interleave in the merged draw list by `RenderOrder`;
-Per-entity depth cull (Slice 25E) is separate from this floor window.
+it does not drive dense floor submit or bucketing — a sparse tile becomes an
+interleave point purely by being *registered* at some depth
+(`WorldSystem.sparseDepthRangeCount`/`sparseDepthRangeAt` walk every registered
+depth, not only the currently visible ones), independent of camera position.
+Each dense composite draw is one full-world quad regardless of camera
+pan — panning uploads nothing. Sparse overlays and dense composite draws
+interleave in the merged draw list by `RenderOrder`; per-entity depth cull
+(Slice 25E) is separate from this floor window.
 
 ### Dynamic entity collect (Slice 24B)
 
@@ -226,10 +284,11 @@ controls fixed-step processor participation only. Render visibility is camera
 policy only — an on-screen `dormant` row still draws; an off-screen `cognition`
 row does not. Do not add `allowsRender`-style predicates on `SimulationTier`.
 
-**Dense floors (separate cost model):** in-window dense layers still submit one
-full-world tilemap quad per layer (Slice 23B window). GPU clips to the viewport;
-submit/draw count is per-layer, not per visible tile. Chunked dense submit is a
-future optimization if profiling requires it.
+**Dense floors (separate cost model):** in-window dense layers submit as a small,
+bounded number of composite tilemap quads (see GPU-Driven Tilemap), not one draw
+per layer or per visible tile. GPU clips to the viewport; submit/draw count
+scales with interleave points this frame, not window depth. Chunked dense submit
+is a future optimization if profiling requires it.
 
 A pre-built visible movement dense-index list (parallel to scoped simulation
 gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
@@ -237,7 +296,7 @@ gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 
-Retained per-layer tile-data storage buffers are **not** ring-buffered. Partial
+The retained combined tile-data storage buffer is **not** ring-buffered. Partial
 dig uploads must never pass `cycle=true` to `SDL_UploadToGPUBuffer` or map the
 tile-edit transfer buffer with `cycle=true` — doing so ping-pongs GPU storage and
 flips visible tiles while CPU state stays correct.
@@ -245,7 +304,7 @@ flips visible tiles while CPU state stays correct.
 | Resource | `cycle` on upload / map |
 | --- | --- |
 | Dynamic/static **vertex** streams (per-frame ring) | `true` on the last **vertex** upload in the copy pass |
-| **Tile-data storage** buffers (per dense layer, retained) | **always `false`** |
+| **Tile-data storage** buffer (combined, retained) | **always `false`** |
 | Tile-edit transfer buffer (`stageStorageRegions`) | **`false`** |
 
 Tile edits are excluded from the vertex upload `cycle` counter; they are batched
@@ -320,8 +379,9 @@ construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
 a primitive rectangle fallback. The runtime loading path builds the procedural
 512x512 tile world through the Engine-owned `ThreadSystem`. Dense world tiles draw
-as one GPU-driven tilemap quad per layer (see GPU-Driven Tilemap) while sparse
-tiles, entities, and particles stream through the ordered dynamic batch — the
+as a small, bounded number of GPU-driven composite tilemap quads (see
+GPU-Driven Tilemap) while sparse tiles, entities, and particles stream through
+the ordered dynamic batch — the
 camera-visible chunk window still crops sparse-tile submission, with optional
 configured overscan. The renderer's order-merged draw list interleaves all of them
 by `RenderOrder`, so there is no hand-written world/entity depth merge and

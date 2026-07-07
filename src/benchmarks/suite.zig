@@ -192,6 +192,7 @@ pub const RunStats = struct {
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
+    render_game_prep_merged_tilemap_groups: usize = 0,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -850,7 +851,7 @@ fn printValidationSummary(
             const render_game_prep_focus = adaptive orelse best;
             const focus_label = if (adaptive != null) "production_adaptive" else "render_game_prep_focus";
             std.debug.print(
-                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}. ",
+                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}. ",
                 .{
                     focus_label,
                     render_game_prep_focus.case.name,
@@ -861,6 +862,7 @@ fn printValidationSummary(
                     render_game_prep_focus.stats.render_game_prep_sparse_submitted,
                     render_game_prep_focus.stats.render_game_prep_dynamic_records,
                     render_game_prep_focus.stats.render_game_prep_static_groups,
+                    render_game_prep_focus.stats.render_game_prep_merged_tilemap_groups,
                 },
             );
             if (render_game_prep_focus.stats.render_game_prep_phases) |phases| {
@@ -1098,7 +1100,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         if (stats.render_game_prep_phases) |phases| {
             return std.fmt.bufPrint(
                 buffer,
-                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
+                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
                 .{
                     stats.candidate_pairs,
                     stats.output_count,
@@ -1107,6 +1109,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
                     stats.render_game_prep_sparse_submitted,
                     stats.render_game_prep_dynamic_records,
                     stats.render_game_prep_static_groups,
+                    stats.render_game_prep_merged_tilemap_groups,
                     formatDuration(phases.entity_collect_ns),
                     formatDuration(phases.merge_ns),
                     formatDuration(phases.snapshot_ns),
@@ -1116,7 +1119,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         }
         return std.fmt.bufPrint(
             buffer,
-            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}",
+            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}",
             .{
                 stats.candidate_pairs,
                 stats.output_count,
@@ -1125,6 +1128,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
                 stats.render_game_prep_sparse_submitted,
                 stats.render_game_prep_dynamic_records,
                 stats.render_game_prep_static_groups,
+                stats.render_game_prep_merged_tilemap_groups,
             },
         ) catch "workload";
     }

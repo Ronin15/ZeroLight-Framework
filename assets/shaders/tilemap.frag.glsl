@@ -21,6 +21,13 @@ layout(set = 3, binding = 0) uniform TilemapUniform {
     vec4 grid;
     // atlas: x=columns, y=atlas_width_px, z=atlas_height_px, w=atlas_tile_px
     vec4 atlas;
+    // layer_meta: x=this draw's composited layer count (topmost-first), y/z/w unused
+    ivec4 layer_meta;
+    // layer_offsets: element offsets into the combined tile-data buffer, one per
+    // composited layer (layer_meta.x of them valid), topmost layer first. Packed
+    // 4-per-uvec4 so this matches a flat Zig [32]u32 byte-for-byte under std140
+    // (uvec4 array elements have no interior padding).
+    uvec4 layer_offsets[8];
 } tm;
 
 void main() {
@@ -36,9 +43,24 @@ void main() {
         discard;
     }
 
-    uint tile_id = tiles.tile_ids[cy * grid_w + cx];
+    uint cell_index = uint(cy * grid_w + cx);
+    int layer_count = tm.layer_meta.x;
+    uint tile_id = invalid_id;
+    // Dynamically-uniform loop: every fragment in this draw shares layer_count,
+    // so this is an ordinary bounded loop, no toolchain risk. Stops at the first
+    // opaque hit walking topmost-first, so a hole in a shallower layer falls
+    // through to whichever composited layer beneath it is actually opaque.
+    for (int i = 0; i < layer_count; i++) {
+        uint layer_offset = tm.layer_offsets[i / 4][i % 4];
+        uint candidate = tiles.tile_ids[layer_offset + cell_index];
+        if (candidate != invalid_id) {
+            tile_id = candidate;
+            break;
+        }
+    }
     if (tile_id == invalid_id) {
-        // Empty cell: see-through to whatever layer drew below.
+        // Every composited layer is empty at this cell: see-through to whatever
+        // draws below (another composite draw, or the clear color).
         discard;
     }
 

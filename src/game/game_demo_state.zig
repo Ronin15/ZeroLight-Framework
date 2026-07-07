@@ -90,14 +90,12 @@ const procedural_underground_count: u16 = 31; //31
 const procedural_dense_layer_count: usize = 1 + procedural_underground_count;
 /// Procedural worlds author one `.floor` dense band per level (no obstacle stack per plane).
 const procedural_max_dense_bands_per_level: u8 = 1;
-/// Dense floors below `active_level` submitted as full-screen tilemap draws each
-/// frame (Slice 23B's recommended 4-8 range). Submitting the full 31-level stack
-/// here previously drove up to 32 full-screen overdraw passes of a discard-heavy
-/// fragment shader every frame regardless of camera position — real GPU cost with
-/// no matching visual payoff, since only the near stack is ever visible through a
-/// hole. Collapsing the per-layer overdraw into one per-pixel level walk is
-/// tracked as a follow-up (see roadmap Slice 36).
-const procedural_render_window_levels_below: u16 = 6;
+/// Dense floors below `active_level` kept in the render window. Draw/fragment
+/// cost is proportional to actual interleave points this frame (normally 1),
+/// not window depth, so the full authored underground stack fits:
+/// `1 + procedural_render_window_levels_below == procedural_dense_layer_count`,
+/// exactly filling `k_max_dense_submit_stack_cap`.
+const procedural_render_window_levels_below: u16 = procedural_underground_count;
 comptime {
     std.debug.assert(procedural_dense_layer_count <= world_system.k_max_dense_submit_stack_cap);
     const submit_layers = @as(usize, 1 + procedural_render_window_levels_below) * procedural_max_dense_bands_per_level;
