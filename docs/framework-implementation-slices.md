@@ -84,6 +84,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **34** | Landed | Core SIMD primitive layer + dense-path wins; sin/cos polynomial deferred to Slice 29 |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — Checklist open |
 | **36** | Landed | Single-pass dense-layer depth compositing (combined tile buffer + interleave-depth-partitioned composite draws; render window widened to the full authored stack) |
+| **37** | Not started | Dense render-window ceiling raise (32→128) + permanent shader/host layer-count sync hardening |
+| **38** | Not started | Elevation above the surface — explicit per-level elevation fact, symmetric render window, surface-relative gameplay checks (depends on Slice 37) |
 
 **Landed slice sections (18–25, 24B):** checklists complete; sections are
 acceptance history. Follow-up hardening without a new slice number lives in
@@ -2860,6 +2862,262 @@ Acceptance checks:
       renders correctly.
 - [x] `zig build verify` passes.
 
+## Slice 37: Dense Render-Window Ceiling Raise And Shader/Host Sync Hardening
+
+Goal: raise the composited dense render-window ceiling from 32 to a materially
+larger, reasoned bound (128) so worlds bigger than today's demo (more levels,
+more dense bands per level) can use Slice 36's single-pass compositing path,
+and permanently close the one gap Slice 36 left open: the GLSL shader's
+fixed-size layer-offset array and its Zig-side mirror struct are not tied to
+any shared constant, so a future ceiling bump could silently overrun a fixed
+array in a ReleaseFast build instead of failing to compile.
+
+Why now: Slice 23B's original goal targeted ~120 depth levels; the ceiling
+that shipped (`k_max_dense_submit_stack_cap = 32`) never actually reached it.
+Today's shipped procedural world already sits at that ceiling (its render
+window intentionally spans the full 31-level authored stack, Slice 36's
+payoff). Slice 38 (elevation above the surface) needs headroom in the same cap
+to add levels above the player without shrinking how many can be below — this
+slice is a prerequisite for that, not just a number bump.
+
+Problem (current envelope):
+
+- `world_system.k_max_dense_submit_stack_cap = 32` bounds
+  `DenseLayerRenderWindow.maxSubmitLayers()`; `Renderer.k_max_tilemap_window_layers`
+  and `Renderer.k_max_dense_composite_draws` are comptime-tied to it via
+  cross-module asserts (`world_system.zig:60-70`). All three must move
+  together.
+- `assets/shaders/tilemap.frag.glsl`'s `uvec4 layer_offsets[8]` (32 `u32`
+  slots) and `sprite_batch.zig`'s `TilemapParams.layer_offsets: [32]u32` both
+  hardcode that literal independently of `Renderer.k_max_tilemap_window_layers`.
+  Nothing currently fails to compile or asserts at runtime if these three
+  values drift apart. `Renderer.applyWindowLayers`'s existing assert only
+  checks the caller's `window.count` against the Zig constant, not the
+  physical array size — so bumping the Zig constant alone would pass that
+  assert and then write past the end of the fixed 32-slot array. In Debug/
+  ReleaseSafe that's a bounds-check panic; in **ReleaseFast, what this project
+  ships, bounds checks are stripped — silent memory corruption**, not a crash.
+- `docs/rendering-assets-shaders.md` and this file's Slice 36 section still
+  say `Renderer.k_max_dense_composite_draws = 8` — stale even before this
+  slice (today's crash-safety fix already raised it to 32 to match the
+  submit-stack cap); correct alongside the real ceiling raise.
+- `game_demo_state.zig`'s `procedural_max_dense_tile_gpu_bytes` computes its
+  budget ceiling from the exact same formula `estimateDenseTileGpuBytes`
+  checks it against, so `validateDenseRenderBudget`'s GPU-byte gate can never
+  actually fail for that world. The mechanism itself
+  (`WorldBuildConfig.max_dense_tile_gpu_bytes` + `validateDenseRenderBudget`)
+  is otherwise correct and already tested — only this one caller defeats it.
+
+Current foundation (landed, do not rebuild):
+
+- Slice 36's single-pass compositing (`partitionDenseCompositeBuckets`,
+  `buildWindowLayers`, `TilemapWindowLayers`, the per-pixel shader walk)
+  already makes draw-call count track interleave points rather than window
+  depth — this slice only widens the fixed capacity those mechanisms operate
+  within, it does not change how they work.
+- `WorldBuildConfig.max_dense_tile_gpu_bytes` / `validateDenseRenderBudget`
+  (`world_system.zig`) is a real, independently-settable, already-tested
+  budget gate — do not redesign it, just stop one caller from defeating it.
+  Choosing the actual byte ceiling is deferred to a future release-sizing
+  pass with a runtime RAM/VRAM check gating world/chunk size — out of scope
+  here.
+
+Architecture notes:
+
+- Raise `k_max_dense_submit_stack_cap` and the two renderer constants
+  comptime-tied to it from 32 to 128 together. 128 gives headroom for roughly
+  double today's demo level count, or a symmetric ~30-level-above/~30-level-below
+  world at 2 dense bands/level (Slice 38's shape) — a concrete target, not an
+  arbitrary doubling. If a future world's real need
+  (`(levels_above + levels_below + 1) * max_dense_bands_per_level`) exceeds
+  128, that is the signal to design a dynamic/runtime-sized compositing
+  window instead of bumping this constant again — not a decision to make
+  preemptively now.
+- Move `k_max_tilemap_window_layers` ownership (and `TilemapParams.layer_offsets`'s
+  array size) into `sprite_batch.zig`, defined directly off the shared
+  constant instead of a hardcoded literal, so the Zig-side half of the gap is
+  structurally closed rather than merely asserted against. `Renderer`
+  re-exports the constant so `world_system.zig`'s existing cross-module
+  comptime asserts keep compiling unchanged.
+- GLSL cannot read a Zig constant, so the shader-side literal needs its own
+  enforcement: add a headless `zig build test` test (co-located with
+  `sprite_batch.zig`'s existing `TilemapParams` layout tests) that
+  `@embedFile`s `tilemap.frag.glsl`, parses its `layer_offsets[N]`
+  declaration, and asserts `N == k_max_tilemap_window_layers / 4`. This turns
+  a doc-comment convention into a CI-enforced contract; document the exact
+  literal pattern the test expects so an unrelated shader edit doesn't break
+  it confusingly.
+- Fix `game_demo_state.zig`'s self-referential GPU-byte budget by removing the
+  computed-from-the-same-count ceiling, leaving `max_dense_tile_gpu_bytes` at
+  the `WorldBuildConfig` default (`0`, gate disabled) with a comment noting
+  this is intentionally unset pending a future release-time hardware-based
+  ceiling — not replacing one guessed number with another.
+- No gameplay, dig, or nav contract changes in this slice — capacity and
+  correctness-of-synchronization only.
+
+Checklist:
+
+- [ ] Raise `k_max_dense_submit_stack_cap` (`world_system.zig`),
+      `Renderer.k_max_tilemap_window_layers`, and
+      `Renderer.k_max_dense_composite_draws` from 32 to 128 together; confirm
+      the existing cross-module comptime asserts still tie them.
+- [ ] Move `k_max_tilemap_window_layers` and `TilemapParams.layer_offsets`'s
+      array-size ownership into `sprite_batch.zig`, defined off the shared
+      constant; `Renderer` re-exports it.
+- [ ] Update `assets/shaders/tilemap.frag.glsl`'s `uvec4 layer_offsets[8]` to
+      `[32]` (128/4) and recompile shaders (`zig build shaders`).
+- [ ] Add an `@embedFile`-based headless test asserting the GLSL
+      `layer_offsets[N]` literal matches `k_max_tilemap_window_layers / 4`;
+      cross-reference the test by name in both the Zig doc comment and the
+      GLSL comment so neither side can drift silently again.
+- [ ] Remove `game_demo_state.zig`'s self-referential
+      `procedural_max_dense_tile_gpu_bytes` computation; leave the budget gate
+      at its default disabled state with a comment pointing at the deferred
+      release-sizing/RAM-check work.
+- [ ] Correct the stale `Renderer.k_max_dense_composite_draws = 8` references
+      in `docs/rendering-assets-shaders.md` and this file's Slice 36 section
+      to the current/raised value.
+
+Acceptance checks:
+
+- [ ] `zig build verify` passes (check + test + shader compile + atlas lint)
+      with the raised constants and the new GLSL array size together.
+- [ ] The new GLSL-sync test fails if either the Zig constant or the shader
+      literal changes without the other (spot-checked by temporarily editing
+      one in a scratch branch, not shipped).
+- [ ] `partitionDenseCompositeBuckets`'s existing worst-case test (proving no
+      fold/error at the cap) passes at the new 128 cap.
+- [ ] `validateDenseRenderBudget`'s existing GPU-byte-budget test still
+      passes, and the demo world no longer computes a self-defeating ceiling
+      (confirm by inspection: `procedural_max_dense_tile_gpu_bytes` is gone or
+      explicitly `0`).
+
+## Slice 38: Elevation Above The Surface
+
+Goal: let a world represent levels above the surface (not just underground
+depth below it) as an explicit, stable per-level fact, and generalize the
+dense render window to a symmetric above/below policy — so elevation, not
+append order or storage index, determines what "surface" means.
+
+Depends on: Slice 37 (raised render-window ceiling; a world with levels both
+above and below the surface needs headroom in the same cap Slice 37 raises).
+
+Problem (current envelope):
+
+- `WorldSystem.level_base_z` / `world_level: u16` is a plain 0-based,
+  append-order storage index everywhere (`NavGraph.levels`, `LevelLink`,
+  `CellCoord`, `DataSystem.world_level`) — none of that needs to change, since
+  it's always treated as an opaque stable index, never a signed or centered
+  value.
+- But "level 0 is the surface" is not just a storage convention — three
+  gameplay call sites bake in "index 0 == surface" directly: `dig_controller.zig`'s
+  hole-vs-tunnel dig branch, its `setEntityLevel` open-surface snap exemption,
+  and `simulation_pipeline.zig`'s `gateBodyToWalkableTiles` surface
+  pass-through. If a level could exist above index 0 without a corresponding
+  semantic fix, it would silently inherit the surface's
+  no-collision/no-snap/hole-not-tunnel treatment.
+- `DenseLayerRenderWindow.ceiling_when_underground` is the only existing
+  "look upward" mechanic, and it's a narrow, explicitly-documented special
+  case (exactly one level above the active level, whole-layer-only —
+  "cannot do per-cell shaft cull") — not a pattern to generalize from.
+
+Current foundation (landed, do not rebuild):
+
+- Slice 37's raised `k_max_dense_submit_stack_cap` /
+  `k_max_tilemap_window_layers` / `k_max_dense_composite_draws` (128) and
+  closed shader/host sync gap — this slice needs that headroom and that
+  safety net, not a redesign of the compositing mechanism itself.
+- `worldZForLevel` already saturates Z to the `i32` range via `i64` math — no
+  overflow risk from added elevated levels.
+- `addUndergroundLevelStack` / `addLevel` (`world_system.zig`) already
+  correctly append levels with negative Z going deeper; this slice adds a
+  parallel "above" path, it does not change the existing one.
+
+Architecture notes:
+
+- Add an explicit `level_elevation: std.ArrayList(i32)` column to
+  `WorldSystem`, always the same length as `level_base_z` (enforced at the
+  single `appendLevelBaseZ` choke point, not by caller convention) — not a
+  signed storage index, and not derived from `base_z` or append order.
+  `base_z` stays a free-form, caller-supplied render/Z-sort value (existing
+  tests already pass arbitrary non-multiple values); coupling elevation to it
+  or to build order would make elevation an implicit fact with no compiler or
+  runtime signal if a future change reordered level construction — exactly
+  the kind of derived-not-stored fact this project's stable-ID discipline
+  avoids elsewhere (`LevelLink` / `CellCoord`).
+- `addLevel`'s existing signature is unchanged (defaults `elevation = 0`
+  internally) so none of its ~30 existing call sites need to change;
+  `addUndergroundLevelStack` passes the real negative tier it already
+  computes the sign for. New `addElevatedLevelStack` mirrors
+  `addUndergroundLevelStack`'s shape for positive elevation — scoped as
+  allocation/indexing only in this slice (no default fill tile the way
+  underground gets solid dirt; there's no universal "what's above the world"
+  content yet, so leave dense-floor authoring for elevated levels to the
+  caller via the existing `addDenseLayer`).
+- New `pub fn levelElevation(self, level_index: u16) i32` — O(1) lookup, `0`
+  at the surface, positive above, negative below.
+- `DenseLayerRenderWindow.ceiling_when_underground: bool` is replaced by
+  `levels_above: u16 = 0` (default preserves today's behavior byte-for-byte —
+  today's default never looks above the active level either way).
+  `levelInWindow` is rewritten in elevation-relative terms
+  (`world_elevation <= active_elevation` → within `levels_below`; else within
+  `levels_above`) instead of raw-index arithmetic, removing the narrow
+  "only when underground" conditional entirely.
+- Migrate the three gameplay call sites off `level == 0`: `dig_controller.zig`'s
+  hole-vs-tunnel branch and `setEntityLevel`'s surface exemption become
+  `world.levelElevation(level) == 0`. `simulation_pipeline.zig`'s
+  `gateBodyToWalkableTiles` surface pass-through becomes the same check.
+  **`digRamp`'s "no-op on the surface, nothing above" check needs new logic,
+  not a rename** — once index 0 has no privileged geometric meaning, "is
+  there a level above this one" must become an elevation-adjacency lookup (a
+  level whose elevation is this level's elevation + 1), not an index
+  comparison. Do not treat this as mechanical find-replace.
+- Explicitly out of scope for this slice (deferred, not silently dropped):
+  actual elevated-world demo content/tile authoring (fill tiles, ramps up
+  into an elevated stack, any new dig/build tool targeting elevation), and
+  the release-time RAM/VRAM-based GPU memory ceiling (Slice 37 already leaves
+  that hook in place, unset).
+
+Checklist:
+
+- [ ] Add `WorldSystem.level_elevation` column, populated at the single
+      `appendLevelBaseZ` choke point so it can never drift out of
+      length-sync with `level_base_z`.
+- [ ] Add `levelElevation()` accessor; update `addUndergroundLevelStack` to
+      pass real negative elevation.
+- [ ] Add `addElevatedLevelStack` (allocation/indexing only, mirroring
+      `addUndergroundLevelStack`'s shape) for positive-elevation levels.
+- [ ] Replace `DenseLayerRenderWindow.ceiling_when_underground` with
+      `levels_above: u16 = 0`; rewrite `levelInWindow` / `maxLevelSpan` in
+      elevation-relative terms; confirm `levels_above = 0` reproduces today's
+      behavior exactly.
+- [ ] Migrate `dig_controller.zig`'s two `level == 0` / `current_level == 0`
+      call sites and `simulation_pipeline.zig`'s `gateBodyToWalkableTiles` to
+      `levelElevation(...) == 0`.
+- [ ] Replace `digRamp`'s raw index-0 "nothing above" check with an
+      elevation-adjacency lookup (a reachable level at
+      `levelElevation(level) + 1`), verified against a real multi-tier
+      (elevated + surface + underground) fixture, not just the current
+      surface-and-below-only demo world.
+- [ ] Update `docs/architecture.md` / `docs/simulation-tiers-and-pipeline.md`
+      wherever they describe level 0 as structurally special, to describe
+      elevation instead.
+
+Acceptance checks:
+
+- [ ] New tests: `levelElevation` correctness for surface/underground/elevated
+      levels; `addElevatedLevelStack` index/elevation bookkeeping (parity with
+      existing `addUndergroundLevelStack` tests); symmetric `levelInWindow`
+      behavior (above only, below only, both at once).
+- [ ] The three migrated gameplay call sites are re-proven against a world
+      whose surface is *not* index 0 (i.e., has at least one elevated level
+      above it) — this is the case that actually catches a regression back to
+      "surface == index 0"; today's demo alone would not.
+- [ ] `digRamp`'s elevation-adjacency replacement is verified against a real
+      multi-tier fixture (zig-debug-specialist review recommended given this
+      is the one non-mechanical change in this slice).
+- [ ] `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -2903,6 +3161,8 @@ Acceptance checks:
 33. Data-driven AI archetypes and debug introspection.
 35. AI and steering hot-loop SIMD restructure.
 36. Single-pass dense-layer depth compositing.
+37. Dense render-window ceiling raise + shader/host sync hardening.
+38. Elevation above the surface.
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents
