@@ -153,11 +153,25 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 - Always run a targeted benchmark with `zig build bench -- --group <name>`
   (optionally `--case`/`--items`) unless explicitly told to run the full suite.
   Do not run the whole `zig build bench` and filter its output.
-- **Never measure or report performance/timing by hand-rolling a timer inside
-  a `zig build test` test — not even temporarily, not even with
-  `-Doptimize=ReleaseFast`.** `zig build test` is for correctness only.
-  All performance numbers must come from `zig build bench`, which already
+- **`zig build bench` is for perf and OOM/leak-sweep checks; `zig build test`
+  is for fast contract/correctness checks only.** Never measure or report
+  performance/timing by hand-rolling a timer inside a `zig build test` test —
+  not even temporarily, not even with `-Doptimize=ReleaseFast`. All
+  performance numbers must come from `zig build bench`, which already
   provides warmup, repeated iterations, and adaptive-settle statistics
-  (`src/benchmarks/suite.zig`) that a one-off timed test block does not. If a
-  perf question needs answering and no benchmark case covers it yet, add or
+  (`src/benchmarks/suite.zig`) that a one-off timed test block does not.
+  **Test code must never call into `src/benchmarks/*.zig` functions at all**
+  — not just to avoid hand-timing: a benchmark file's fixture builders
+  (`createFixture`, `initFixture`, etc.) and case runners build large
+  synthetic fixtures meant for throughput measurement, not fast correctness
+  checks, and calling them from `zig build test` makes the whole suite slow
+  even without any timing code in the test itself. The one exception is
+  `suite.zig`'s own tests, which cover only its pure utility logic (arg
+  parsing, formatting, alignment math) against hand-built stubs, never a real
+  fixture. If a correctness property belongs to production code, test it in
+  the owning production module with a small hand-built fixture; if it's
+  benchmark-fixture-specific (e.g. does this fixture shape still assert
+  correctly), rely on the module's own internal `std.debug.assert` firing
+  during an actual `zig build bench` run instead of wrapping it in a test. If
+  a perf question needs answering and no benchmark case covers it yet, add or
   extend one under `src/benchmarks/` and run it via `zig build bench`.
