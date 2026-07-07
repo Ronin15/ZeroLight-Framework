@@ -549,6 +549,16 @@ fn initFixture(
     fixture.world = try WorldSystem.initDemoFromMeta(allocator, &fixture.tileset_meta, world_width_px, world_height_px);
     errdefer fixture.world.deinit();
 
+    // Render-prep's dense-window entity cull bounds the deep submit limit by
+    // the world's real level count (WorldSystem.levelInWindow), so a deep
+    // fixture_config.player_level needs that many real (dense-layer-empty)
+    // levels to exist, or every entity placed at that level would be culled
+    // as beyond the window even though it matches player_level exactly.
+    var level_index: u16 = 1;
+    while (level_index <= fixture_config.player_level) : (level_index += 1) {
+        _ = try fixture.world.addLevel(-@as(i32, @intCast(level_index)) * world_system.level_z_step);
+    }
+
     const deco = try requireTile(&fixture.tileset_meta, "deco_0");
     const level: u16 = 0;
 

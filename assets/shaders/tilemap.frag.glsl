@@ -46,6 +46,7 @@ void main() {
     uint cell_index = uint(cy * grid_w + cx);
     int layer_count = tm.layer_meta.x;
     uint tile_id = invalid_id;
+    int resolved_depth = 0;
     // Dynamically-uniform loop: every fragment in this draw shares layer_count,
     // so this is an ordinary bounded loop, no toolchain risk. Stops at the first
     // opaque hit walking topmost-first, so a hole in a shallower layer falls
@@ -55,6 +56,7 @@ void main() {
         uint candidate = tiles.tile_ids[layer_offset + cell_index];
         if (candidate != invalid_id) {
             tile_id = candidate;
+            resolved_depth = i;
             break;
         }
     }
@@ -80,4 +82,53 @@ void main() {
     vec2 atlas_uv = atlas_px / vec2(atlas_w, atlas_h);
 
     out_color = texture(atlas_texture, atlas_uv);
+
+    // Soft contact-shadow on the rim of the surface tile where it overhangs a
+    // hole (a neighboring cell whose topmost layer is empty) — reads as a cast
+    // shadow, not a colored highlight. Only applies to the surface tile itself
+    // (resolved_depth == 0); the tile visible through the hole is left alone.
+    // Deliberately not screen-space-derivative-based (fwidth on a value that is
+    // constant per-cell and jumps hard at cell edges depends on where that edge
+    // falls relative to the GPU's 2x2 derivative quads, which shifts with camera
+    // pan — it fired inconsistently). Reading the neighbor cells' actual tile
+    // data directly is deterministic regardless of camera position.
+    if (resolved_depth == 0 && layer_count > 0) {
+        uint top_layer_offset = tm.layer_offsets[0][0];
+        const float rim_margin = 0.28;
+        // Subtractive, not multiplicative: this tileset's floor/cave tiles sit at
+        // ~0.09-0.19 luminance (measured from world_tileset.png), so scaling by a
+        // percentage shrinks to an imperceptible absolute change on the darkest
+        // ones. A fixed subtract-and-clamp crushes the darkest tiles toward black
+        // at the rim (still a real, visible shadow) while giving lighter tiles a
+        // clearly visible dip too.
+        const float rim_shadow_amount = 0.09;
+        float rim = 0.0;
+
+        if (in_tile.x < rim_margin && cx > 0) {
+            uint left_index = uint(cy * grid_w + (cx - 1));
+            if (tiles.tile_ids[top_layer_offset + left_index] == invalid_id) {
+                rim = max(rim, 1.0 - in_tile.x / rim_margin);
+            }
+        }
+        if (in_tile.x > 1.0 - rim_margin && cx + 1 < grid_w) {
+            uint right_index = uint(cy * grid_w + (cx + 1));
+            if (tiles.tile_ids[top_layer_offset + right_index] == invalid_id) {
+                rim = max(rim, 1.0 - (1.0 - in_tile.x) / rim_margin);
+            }
+        }
+        if (in_tile.y < rim_margin && cy > 0) {
+            uint up_index = uint((cy - 1) * grid_w + cx);
+            if (tiles.tile_ids[top_layer_offset + up_index] == invalid_id) {
+                rim = max(rim, 1.0 - in_tile.y / rim_margin);
+            }
+        }
+        if (in_tile.y > 1.0 - rim_margin && cy + 1 < grid_h) {
+            uint down_index = uint((cy + 1) * grid_w + cx);
+            if (tiles.tile_ids[top_layer_offset + down_index] == invalid_id) {
+                rim = max(rim, 1.0 - (1.0 - in_tile.y) / rim_margin);
+            }
+        }
+
+        out_color.rgb = max(out_color.rgb - rim_shadow_amount * rim, 0.0);
+    }
 }

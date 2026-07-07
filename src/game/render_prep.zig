@@ -406,6 +406,10 @@ pub fn collectDynamicRecords(
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
+    const max_world_level: u16 = if (scene.world.levelCount() == 0)
+        0
+    else
+        @intCast(scene.world.levelCount() - 1);
     // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
     // align with movement_index; has_primitive_visual skips movement-only rows
     // before the deferred slot resolve in renderCollectIndicesForMovement.
@@ -413,7 +417,11 @@ pub fn collectDynamicRecords(
         const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
         if (!is_player) {
             const entity_level = scene.data.worldLevelConst(entity) orelse 0;
-            if (entity_level != scene.player_level) continue;
+            // Window membership (not exact equality) so an entity that fell to a
+            // deeper in-window level (e.g. through a dug hole) still renders, at
+            // its own real depth — matches the dense-layer window this frame
+            // already composites via WorldSystem.collectDenseSubmitLayers.
+            if (!scene.world.render_window.levelInWindow(scene.player_level, entity_level, max_world_level)) continue;
         }
         if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
         if (!movement.has_primitive_visual[movement_index]) continue;
@@ -1080,6 +1088,130 @@ test "collect dynamic records after structural growth stays within reserve and a
     try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "collect dynamic records includes an entity that fell to a level within the render window" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+
+    // Entity fell through a dug hole: DigController's applyEntityPlaneTraversal
+    // moves it to level 1 via setWorldLevel while the player stays at level 0.
+    const fallen_entity = try data.createEntity();
+    try data.setMovementBody(fallen_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(fallen_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(fallen_entity, 1);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(-level_z_step);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = -1, .min_y = -1, .max_x = 256, .max_y = 256 };
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+
+    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
+}
+
+test "collect dynamic records excludes an entity beyond the render window depth" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+
+    // In-window boundary: default DenseLayerRenderWindow.levels_below is 6, so a
+    // level-6 fall is the deepest still-visible level from player_level 0.
+    const in_window_entity = try data.createEntity();
+    try data.setMovementBody(in_window_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(in_window_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(in_window_entity, 6);
+
+    // One level deeper (7) falls outside the window and must stay excluded —
+    // this is not a blanket "render every level" regression of the original
+    // teleport-bug this gate was guarding against.
+    const out_of_window_entity = try data.createEntity();
+    try data.setMovementBody(out_of_window_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(out_of_window_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(out_of_window_entity, 7);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    for (0..8) |_| _ = try world.addLevel(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = -1, .min_y = -1, .max_x = 256, .max_y = 256 };
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+
+    // Player + the level-6 entity only; the level-7 entity is dropped.
+    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
