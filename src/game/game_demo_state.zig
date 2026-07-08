@@ -59,49 +59,84 @@ const c = @import("../platform/sdl.zig").c;
 /// Smallest demo patch that still covers dig/nav tests (cells through 7x7).
 const demo_test_viewport_width: f32 = 256;
 const demo_test_viewport_height: f32 = 256;
-// Battle-scale exercise (see game_demo_state's pathfinding capacity doc comment for the
-// group-field threshold this is sized to comfortably cross): was 32.
-const test_square_count = 2048;
-const surface_demo_mover_count = 1536;
-const underground_demo_mover_count = test_square_count - surface_demo_mover_count;
+// Default mover count for every path EXCEPT the real battle-scale procedural entry
+// (initProceduralWithRuntimeAssets) — this is what initDemoForTest and every other test
+// in this file spawn through, so it stays small on purpose (see coding-standards.md /
+// CLAUDE.md's "keep test fixtures at the smallest size that still exercises the
+// behavior under test"). A prior pass bumped this GLOBALLY to battle-scale to exercise
+// the pathfinding group-field threshold live — that made every test in this file spawn
+// 2048 movers too, taking `zig build test` from ~6s to ~43s. Population is now a
+// runtime parameter (see DemoPopulationCapacity/deriveDemoPopulationCapacity) so the
+// battle-scale exercise and fast tests don't have to share one global constant.
+const default_demo_mover_count: usize = 32;
+// Only initProceduralWithRuntimeAssets (the real game, not tests) passes this.
+const battle_scale_demo_mover_count: usize = 2048;
 const obstacle_count = 4;
-// Owned by CollisionSystem (this demo has no independent opinion on worst-case
-// simultaneous contacts for N bodies — that's collision's own domain knowledge, not a
-// ratio to guess here). A contact-stream overflow is a graceful, counted drop
-// (RangeOutputStream.stats.dropped), not a crash, so an approximation is fine.
-const demo_contact_capacity = CollisionSystem.estimateContactCapacity(test_square_count + obstacle_count + 1);
-// Every steering agent emits one navigation intent per step unconditionally (unlike path
-// REQUESTS, which are sparse/event-driven) — this must cover the full population, not an
-// independent guess. Previously a bare `32` passed inline at the reserveStreams call site
-// that happened to equal the OLD test_square_count by coincidence, not by reference — see
-// that call site's history: this is exactly the kind of stale-magic-number footgun a
-// future population bump should not have to rediscover.
-const demo_intent_capacity = test_square_count + obstacle_count + 1;
-// Owned by collision_response (a trigger event requires an underlying contact, so
-// trigger count is bounded by contact count — collision_response's own domain
-// knowledge, not a second independent ratio for this demo to guess).
-const demo_collision_trigger_capacity = estimateTriggerCapacity(demo_contact_capacity);
-const demo_structural_reserve = test_square_count + 16;
-/// Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining
-/// event and every structural-commit event shares this one budget for the step
-/// (cleared only at `beginStep`), so it must cover the worst case of all of
-/// them landing in the same step, not just the largest single source:
-/// `applyNpcPlaneTraversal` walks every AI agent and can emit up to
-/// `test_square_count` fall events, plus the player's own plane-traversal fall
-/// (1) and dig-mining event (1), plus up to `demo_structural_reserve`
-/// structural-commit events (tier changes / create / destroy), plus the
-/// post-commit nav-invalidation headroom (1) already tracked separately by
-/// `applyStructuralCommandsAndPostCommitEvents`. No term for perception's
-/// `entity_perceived`/`entity_lost` events: no demo entity carries
-/// `AiPerception`, and `perception_max_events_per_step` is set to 0 below.
-/// Likewise no term for affect's `affect_threshold_crossed` events: no demo
-/// entity carries `AiAffect` yet, and `affect_max_events_per_step` is set to
-/// 0 below.
-const demo_event_reserve = test_square_count + 1 + 1 + demo_structural_reserve + 1;
+
+/// Every mover-count-dependent capacity this demo needs, derived from a single runtime
+/// population — mirrors pathfinding's own `deriveCapacity(base, agent_count)` pattern
+/// (one source value, everything else computed from it) rather than a scattered set of
+/// independent constants that can drift out of sync with each other or with whichever
+/// mover count a given init path actually uses.
+const DemoPopulationCapacity = struct {
+    mover_count: usize,
+    surface_movers: usize,
+    underground_movers: usize,
+    contact_capacity: usize,
+    intent_capacity: usize,
+    collision_trigger_capacity: usize,
+    structural_reserve: usize,
+    event_reserve: usize,
+};
+
+fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
+    // Matches the historical 24/32 == 0.75 surface/total split.
+    const surface_movers = mover_count * 3 / 4;
+    const underground_movers = mover_count - surface_movers;
+    // Owned by CollisionSystem (this demo has no independent opinion on worst-case
+    // simultaneous contacts for N bodies — that's collision's own domain knowledge, not
+    // a ratio to guess here). A contact-stream overflow is a graceful, counted drop
+    // (RangeOutputStream.stats.dropped), not a crash, so an approximation is fine.
+    const contact_capacity = CollisionSystem.estimateContactCapacity(mover_count + obstacle_count + 1);
+    // Every steering agent emits one navigation intent per step unconditionally (unlike
+    // path REQUESTS, which are sparse/event-driven) — this must cover the full
+    // population, not an independent guess.
+    const intent_capacity = mover_count + obstacle_count + 1;
+    // Owned by collision_response (a trigger event requires an underlying contact, so
+    // trigger count is bounded by contact count — collision_response's own domain
+    // knowledge, not a second independent ratio for this demo to guess).
+    const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
+    const structural_reserve = mover_count + 16;
+    // Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining event and
+    // every structural-commit event shares this one budget for the step (cleared only at
+    // `beginStep`), so it must cover the worst case of all of them landing in the same
+    // step, not just the largest single source: `applyNpcPlaneTraversal` walks every AI
+    // agent and can emit up to `mover_count` fall events, plus the player's own
+    // plane-traversal fall (1) and dig-mining event (1), plus up to `structural_reserve`
+    // structural-commit events (tier changes / create / destroy), plus the post-commit
+    // nav-invalidation headroom (1) already tracked separately by
+    // `applyStructuralCommandsAndPostCommitEvents`. No term for perception's
+    // `entity_perceived`/`entity_lost` events: no demo entity carries `AiPerception`, and
+    // `perception_max_events_per_step` is set to 0 below. Likewise no term for affect's
+    // `affect_threshold_crossed` events: no demo entity carries `AiAffect` yet, and
+    // `affect_max_events_per_step` is set to 0 below.
+    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1;
+    return .{
+        .mover_count = mover_count,
+        .surface_movers = surface_movers,
+        .underground_movers = underground_movers,
+        .contact_capacity = contact_capacity,
+        .intent_capacity = intent_capacity,
+        .collision_trigger_capacity = collision_trigger_capacity,
+        .structural_reserve = structural_reserve,
+        .event_reserve = event_reserve,
+    };
+}
+
 /// Per-step audio bound for demo tests: movers can emit collision SFX alongside
-/// ambient music, listener, and the player jet loop. Not scaled 1:1 with
-/// test_square_count — concurrent AUDIBLE sounds have a natural ceiling far below the
-/// mover count, so this stays a fixed, generous-but-bounded budget.
+/// ambient music, listener, and the player jet loop. Not scaled 1:1 with mover count —
+/// concurrent AUDIBLE sounds have a natural ceiling far below the mover count, so this
+/// stays a fixed, generous-but-bounded budget.
 const demo_test_audio_capacity = 256;
 const procedural_world_width_tiles: u16 = 256; //512
 const procedural_world_height_tiles: u16 = 256; //512
@@ -188,7 +223,9 @@ pub const GameDemoState = struct {
     player: Player,
     particles: ParticleSystem,
     scene_prep: render_prep.DynamicScenePrep,
-    test_squares: [test_square_count]EntityId,
+    // Owned, allocator-backed: mover count is a runtime parameter (see
+    // DemoPopulationCapacity), not a comptime constant, so this can't be a fixed array.
+    test_squares: []EntityId,
     obstacles: [obstacle_count]EntityId,
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
@@ -231,6 +268,7 @@ pub const GameDemoState = struct {
             1,
             null,
             null,
+            default_demo_mover_count,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -264,6 +302,7 @@ pub const GameDemoState = struct {
             thread_system.participantSlotCount(),
             proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
             thread_system,
+            battle_scale_demo_mover_count,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -283,7 +322,9 @@ pub const GameDemoState = struct {
         worker_participant_count: usize,
         pathfinding_override: ?PathfindingCapacity,
         nav_build_thread_system: ?*ThreadSystem,
+        mover_count: usize,
     ) !GameDemoState {
+        const pop_cap = deriveDemoPopulationCapacity(mover_count);
         var world = world_value;
         errdefer world.deinit();
         var data = DataSystem.init(allocator);
@@ -304,7 +345,8 @@ pub const GameDemoState = struct {
         }
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
-        const test_squares = try spawnTestSquares(&data, &world, dig_config.tunnel_tile);
+        const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap);
+        errdefer allocator.free(test_squares);
         const obstacles = try spawnObstacles(&data, &world);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
         errdefer particles.deinit();
@@ -321,19 +363,19 @@ pub const GameDemoState = struct {
         // Last arg sizes the structural-command stream: the per-step LOD tier policy
         // can emit up to one set_simulation_tier per movement body when many cross a
         // band at once, plus headroom for dig/create bursts — keeps the commit seam
-        // allocation-free on churn frames. The event-capacity arg (`demo_event_reserve`)
-        // covers every source that shares that one per-step budget; see its doc comment.
-        // The range_count arg (first) is shared across every one of these streams and
-        // each `appendRequired`-style call consumes one range, so it must cover the
-        // largest per-step range consumer — events (`demo_event_reserve`), not a flat
-        // constant unrelated to that budget.
-        try simulation_frame.reserveStreams(demo_event_reserve, demo_event_reserve, demo_intent_capacity, demo_contact_capacity, demo_collision_trigger_capacity, demo_structural_reserve);
-        try simulation_frame.reservePathRequests(16, test_square_count);
+        // allocation-free on churn frames. The event-capacity arg (`pop_cap.event_reserve`)
+        // covers every source that shares that one per-step budget; see
+        // DemoPopulationCapacity's doc comment. The range_count arg (first) is shared
+        // across every one of these streams and each `appendRequired`-style call
+        // consumes one range, so it must cover the largest per-step range consumer —
+        // events (`pop_cap.event_reserve`), not a flat constant unrelated to that budget.
+        try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
+        try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
-            .steering_agent_capacity = test_square_count,
+            .steering_agent_capacity = pop_cap.mover_count,
             .static_obstacle_capacity = obstacle_count,
-            .contact_capacity = demo_contact_capacity,
-            .movement_body_capacity = test_square_count + obstacle_count + 1,
+            .contact_capacity = pop_cap.contact_capacity,
+            .movement_body_capacity = pop_cap.mover_count + obstacle_count + 1,
             // 512x512 tiles at a 32px nav cell = one nav cell per tile, full
             // resolution.
             .nav_cell_size = 32,
@@ -353,10 +395,10 @@ pub const GameDemoState = struct {
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
             // No demo entity carries `AiPerception` yet. A state that wires
-            // it up must size this against `demo_event_reserve`.
+            // it up must size this against `pop_cap.event_reserve`.
             .perception_max_events_per_step = 0,
             // No demo entity carries `AiAffect` yet either. A state that
-            // wires it up must size this against `demo_event_reserve`.
+            // wires it up must size this against `pop_cap.event_reserve`.
             .affect_max_events_per_step = 0,
         });
         errdefer pipeline.deinit();
@@ -382,6 +424,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
+        self.data.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
         self.world.deinit();
@@ -570,15 +613,17 @@ fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
     return world.width <= 16 and world.height <= 16;
 }
 
-fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId) ![test_square_count]EntityId {
-    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(data, world);
-    var entities: [test_square_count]EntityId = undefined;
+fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, pop_cap: DemoPopulationCapacity) ![]EntityId {
+    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(allocator, data, world, pop_cap);
+    const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
+    errdefer allocator.free(entities);
+    // Wraps naturally (col = index % cols, row = index / cols) rather than requiring an
+    // exact cols*rows == surface_movers factorization, so this works for any runtime
+    // population instead of only counts with a clean integer factorization.
     const cols: usize = 48;
-    const rows: usize = 32;
-    comptime std.debug.assert(surface_demo_mover_count == cols * rows);
 
     var index: usize = 0;
-    while (index < surface_demo_mover_count) : (index += 1) {
+    while (index < pop_cap.surface_movers) : (index += 1) {
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
@@ -600,12 +645,12 @@ fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_s
 
     const underground_enabled = world.width >= 128 and world.height >= 128;
 
-    while (index < test_square_count) : (index += 1) {
-        const underground_index = index - surface_demo_mover_count;
+    while (index < pop_cap.mover_count) : (index += 1) {
+        const underground_index = index - pop_cap.surface_movers;
         const tile = world.tile_size;
         const size: math.Vec2 = .{ .x = 22, .y = 22 };
         const spec = if (underground_enabled) blk: {
-            const level = undergroundSpawnLevelForIndex(world, underground_index);
+            const level = undergroundSpawnLevelForIndex(world, underground_index, pop_cap.underground_movers);
             const cell = undergroundSpawnCellForIndex(underground_index);
             try carveUndergroundSpawnPocket(world, tunnel_tile, level, cell);
             break :blk DemoSpawnSpec{
@@ -642,8 +687,9 @@ fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_s
     return entities;
 }
 
-fn spawnTestSquaresCompact(data: *DataSystem, world: *WorldSystem) ![test_square_count]EntityId {
-    var entities: [test_square_count]EntityId = undefined;
+fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, pop_cap: DemoPopulationCapacity) ![]EntityId {
+    const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
+    errdefer allocator.free(entities);
     const cols: usize = 6;
     const surface_rows: usize = 4;
     const margin: f32 = 12;
@@ -655,7 +701,7 @@ fn spawnTestSquaresCompact(data: *DataSystem, world: *WorldSystem) ![test_square
     const step_x = if (cols > 1) span_x / @as(f32, @floatFromInt(cols - 1)) else 0;
     const step_y = if (surface_rows > 1) span_y / @as(f32, @floatFromInt(surface_rows - 1)) else 0;
 
-    for (0..surface_demo_mover_count) |index| {
+    for (0..pop_cap.surface_movers) |index| {
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
@@ -683,8 +729,8 @@ fn spawnTestSquaresCompact(data: *DataSystem, world: *WorldSystem) ![test_square
     const underground_step_x = if (underground_cols > 1) underground_span_x / @as(f32, @floatFromInt(underground_cols - 1)) else 0;
     const underground_step_y = if (underground_rows > 1) underground_span_y / @as(f32, @floatFromInt(underground_rows - 1)) else 0;
 
-    for (0..underground_demo_mover_count) |underground_index| {
-        const index = surface_demo_mover_count + underground_index;
+    for (0..pop_cap.underground_movers) |underground_index| {
+        const index = pop_cap.surface_movers + underground_index;
         const col = underground_index % underground_cols;
         const row = underground_index / underground_cols;
         const spec = DemoSpawnSpec{
@@ -705,25 +751,21 @@ fn spawnTestSquaresCompact(data: *DataSystem, world: *WorldSystem) ![test_square
 }
 
 /// Spreads demo underground movers across planes `1..max_underground`, not the legacy 1–3 stack.
-fn undergroundSpawnLevelForIndex(world: *const WorldSystem, underground_index: usize) u16 {
+fn undergroundSpawnLevelForIndex(world: *const WorldSystem, underground_index: usize, underground_movers: usize) u16 {
     const max_underground: usize = if (world.levelCount() > 1) world.levelCount() - 1 else 0;
     if (max_underground == 0) return 0;
-    const slot = (underground_index * max_underground + (underground_demo_mover_count - 1)) / underground_demo_mover_count;
+    const slot = (underground_index * max_underground + (underground_movers - 1)) / underground_movers;
     return @intCast(1 + @min(slot, max_underground - 1));
 }
 
-// Grid dimensions covering every underground mover exactly once (cols * rows ==
-// underground_demo_mover_count), so every index gets a distinct cell — no two movers
-// carve/spawn at the same coordinate, regardless of which level undergroundSpawnLevelForIndex
-// happens to assign them to.
 const underground_spawn_cols: usize = 32;
-comptime {
-    std.debug.assert(underground_spawn_cols * (underground_demo_mover_count / underground_spawn_cols) == underground_demo_mover_count);
-}
 
 /// Procedural replacement for a hand-picked coordinate list (infeasible past a handful of
 /// movers): a simple grid starting at (40,40), stepping 4 tiles per column/row, comfortably
-/// inside any world this demo builds (procedural_world_width/height_tiles == 256).
+/// inside any world this demo builds (procedural_world_width/height_tiles == 256). `row =
+/// underground_index / underground_spawn_cols` is unbounded (grows with index), so every
+/// index gets a distinct cell regardless of total population — no exact cols*rows
+/// factorization required.
 fn undergroundSpawnCellForIndex(underground_index: usize) SpawnCellCoord {
     const col = underground_index % underground_spawn_cols;
     const row = underground_index / underground_spawn_cols;
@@ -998,6 +1040,7 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
         1,
         null,
         null,
+        default_demo_mover_count,
     );
 }
 
@@ -1070,10 +1113,10 @@ test "demo spawns atlas-backed moving actors" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
     const player_asset = demo.data.assetReferenceConst(demo.player.entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, player_asset.sprite);
     try std.testing.expect(player_asset.hasAtlasEntry());
@@ -1123,6 +1166,7 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
         1,
         null,
         null,
+        default_demo_mover_count,
     );
     defer demo.deinit();
 
@@ -1134,10 +1178,10 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
     try std.testing.expectEqual(@as(f32, 462), first_obstacle_body.position.x);
     try std.testing.expectEqual(@as(f32, 215), first_obstacle_body.position.y);
 
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionBoundsSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.collisionResponseSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
     const player_asset = demo.data.assetReferenceConst(demo.player.entity).?;
     try std.testing.expectEqual(SpriteAssetId.grim_characters, player_asset.sprite);
     try std.testing.expect(player_asset.hasAtlasEntry());
@@ -1179,7 +1223,7 @@ test "demo actor atlas entries resolve in installed character metadata" {
 
     const player_asset = AssetReference{ .sprite = .grim_characters, .atlas_entry_id = 0 };
     try std.testing.expect(meta.sourceRectForId(player_asset.atlas_entry_id) != null);
-    for (0..test_square_count) |index| {
+    for (0..default_demo_mover_count) |index| {
         const asset_ref = demoCharacterAssetReference(index);
         try std.testing.expectEqual(SpriteAssetId.grim_characters, asset_ref.sprite);
         try std.testing.expect(meta.sourceRectForId(asset_ref.atlas_entry_id) != null);
@@ -1193,7 +1237,7 @@ test "demo init validates atlas-backed references at loading boundary" {
     var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height);
     defer demo.deinit();
 
-    try std.testing.expectEqual(@as(usize, test_square_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
+    try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
 }
 
 test "procedural demo uses large world bounds and interpolated follow camera" {
@@ -1219,6 +1263,7 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
         1,
         null,
         null,
+        default_demo_mover_count,
     );
     defer demo.deinit();
 
@@ -1466,7 +1511,7 @@ test "demo owns and completes a simulation frame during update" {
     var input = InputState{};
     input.setHeld(.moveRight, true);
     const player_before = demo.data.movementBodyConst(demo.player.entity).?;
-    var square_before: [test_square_count]math.Vec2 = undefined;
+    var square_before: [default_demo_mover_count]math.Vec2 = undefined;
     for (demo.test_squares, 0..) |entity, index| {
         square_before[index] = demo.data.movementBodyConst(entity).?.position;
     }
@@ -1805,16 +1850,16 @@ test "demo event capacity covers every NPC falling plus player fall, mining, str
     demo.simulation_frame.beginStep();
     // Shares one `frame.events` capacity_limit across every source that can land in
     // the same step: `applyNpcPlaneTraversal` walks every AI agent and can emit up
-    // to `test_square_count` fall events, plus the player's own plane-traversal
-    // fall (1) and dig-mining event (1), plus up to `demo_structural_reserve`
+    // to `default_demo_mover_count` fall events, plus the player's own plane-traversal
+    // fall (1) and dig-mining event (1), plus up to the derived structural reserve
     // structural-commit events, plus the post-commit nav-invalidation headroom (1).
     //
-    // The 4115 below is a hard-coded expectation, not `test_square_count + 1 + 1 +
-    // demo_structural_reserve + 1` re-derived: re-deriving it here would make this
-    // assertion pass trivially even if that formula (or `demo_event_reserve` itself)
-    // drifted, since both sides would drift together. A literal catches that.
-    const worst_case_event_count: usize = 4115;
-    try std.testing.expectEqual(worst_case_event_count, demo_event_reserve);
+    // The 83 below is a hard-coded expectation, not re-derived from
+    // deriveDemoPopulationCapacity: re-deriving it here would make this assertion pass
+    // trivially even if that formula drifted, since both sides would drift together.
+    // A literal catches that.
+    const worst_case_event_count: usize = 83;
+    try std.testing.expectEqual(worst_case_event_count, deriveDemoPopulationCapacity(default_demo_mover_count).event_reserve);
 
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
