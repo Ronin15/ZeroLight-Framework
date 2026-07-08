@@ -85,6 +85,10 @@ const AiGatherRow = struct {
     /// perception reports the target cold.
     direct_target_x: f32,
     direct_target_y: f32,
+    /// Whether this row took the memory-fallback (cold) branch in `resolveRowTarget` —
+    /// see that function's doc comment for why this forces the emitted request's kind
+    /// down to `.individual` regardless of the caller's declared nav_request_kind.
+    cold: bool,
 };
 
 fn appendAiGatherRow(
@@ -293,6 +297,7 @@ pub const AiSystem = struct {
             .target_y = gathered.items(.target_y),
             .direct_target_x = gathered.items(.direct_target_x),
             .direct_target_y = gathered.items(.direct_target_y),
+            .cold = gathered.items(.cold),
             .seed = system_config.intent_seed,
             .wander_step = wander_step,
             .nav_request_kind = system_config.nav_request_kind,
@@ -359,6 +364,7 @@ pub const AiSystem = struct {
         const target_y = gathered.items(.target_y);
         const direct_target_x = gathered.items(.direct_target_x);
         const direct_target_y = gathered.items(.direct_target_y);
+        const cold = gathered.items(.cold);
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -387,7 +393,7 @@ pub const AiSystem = struct {
 
             writer.write(.{
                 .entity = entities[i],
-                .kind = system_config.nav_request_kind,
+                .kind = if (cold[i]) .individual else system_config.nav_request_kind,
                 .goal = .{ .x = target_x[i], .y = target_y[i] },
                 .direct_direction_x = dir.x,
                 .direct_direction_y = dir.y,
@@ -462,6 +468,7 @@ pub const AiSystem = struct {
                 .target_y = row_target.goal.y,
                 .direct_target_x = row_target.direct.x,
                 .direct_target_y = row_target.direct.y,
+                .cold = row_target.cold,
             });
         }
     }
@@ -642,7 +649,7 @@ fn computeTargetCenter(movement: ConstMovementBodySlice) AiDir {
     return .{ .x = sum_x * inv, .y = sum_y * inv };
 }
 
-const RowTarget = struct { direct: AiDir, goal: AiDir };
+const RowTarget = struct { direct: AiDir, goal: AiDir, cold: bool };
 
 /// Per-row seek-target resolution. Returns `live_target`/`goal_target`
 /// unchanged (the "warm" case) unless perception reports the target
@@ -652,7 +659,12 @@ const RowTarget = struct { direct: AiDir, goal: AiDir };
 /// decision is unaffected by goal-requantization hysteresis, only which warm
 /// value each consumer sees. `direct` feeds `decideDir`'s fallback steering
 /// term (must track the raw live target instantly); `goal` feeds the
-/// path-request `.goal` (the hysteresis-throttled value).
+/// path-request `.goal` (the hysteresis-throttled value). `cold` reports
+/// whether this row took the memory-fallback branch: a memory-based retarget
+/// is inherently PER-AGENT (each agent remembers its own last-known position,
+/// not a shared broadcast), so it must never be declared as a `.group`
+/// request alongside genuinely warm, actually-shared rows — see
+/// AiJobContext.nav_request_kind's doc comment for why.
 fn resolveRowTarget(
     entity: EntityId,
     live_target: AiDir,
@@ -661,7 +673,7 @@ fn resolveRowTarget(
     perception_slice: ?ConstPerceptionSlice,
     memory_slice: ?ConstAiMemorySlice,
 ) RowTarget {
-    const warm = RowTarget{ .direct = live_target, .goal = goal_target };
+    const warm = RowTarget{ .direct = live_target, .goal = goal_target, .cold = false };
     const perception = perception_slice orelse return warm;
     const memory = memory_slice orelse return warm;
     const perception_index = data.aiPerceptionDenseIndex(entity) orelse return warm;
@@ -670,7 +682,7 @@ fn resolveRowTarget(
     if (!memory.last_known_target[memory_index].isValid()) return warm;
     if (memory.staleness[memory_index] >= max_ai_memory_staleness) return warm;
     const remembered = AiDir{ .x = memory.last_known_x[memory_index], .y = memory.last_known_y[memory_index] };
-    return .{ .direct = remembered, .goal = remembered };
+    return .{ .direct = remembered, .goal = remembered, .cold = true };
 }
 
 pub const AiDir = struct { x: f32, y: f32 };
@@ -843,6 +855,10 @@ const AiJobContext = struct {
     /// term, so it tracks the live target instantly.
     direct_target_x: []const f32,
     direct_target_y: []const f32,
+    /// Per-row cold (memory-fallback) flag from `resolveRowTarget` — see
+    /// AiGatherRow.cold's doc comment. Forces `.individual` for that row
+    /// regardless of `nav_request_kind`.
+    cold: []const bool,
     seed: u64,
     /// Pre-quantized wander epoch (`step / wander_resample_period_steps`,
     /// computed once by the caller), not the raw fixed-step counter.
@@ -873,7 +889,7 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
 
         writer.write(.{
             .entity = job.entities[i],
-            .kind = job.nav_request_kind,
+            .kind = if (job.cold[i]) .individual else job.nav_request_kind,
             .goal = .{ .x = job.target_x[i], .y = job.target_y[i] },
             .direct_direction_x = dir.x,
             .direct_direction_y = dir.y,
@@ -2087,6 +2103,70 @@ test "ai seek retargets toward fresh AiMemory last-known position when perceptio
     try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
     try std.testing.expectEqual(@as(f32, 0), intents[0].direct_direction_x);
     try std.testing.expectEqual(@as(f32, 1), intents[0].direct_direction_y);
+}
+
+// A cold (memory-fallback) row must never be declared `.group`, even when the caller
+// requests group mode for the whole batch: each agent's remembered last-known position
+// is inherently its OWN, not a shared broadcast, so treating it as a shared goal is what
+// caused the group-field to constantly rebuild for competing one-off positions instead
+// of amortizing one genuinely shared flood — see AiGatherRow.cold's doc comment.
+test "ai forces .individual for a cold memory-retargeted row even when nav_request_kind is .group" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const remembered_target = try data.createEntity();
+
+    // e0: perception cold, fresh memory — must emit .individual regardless of the
+    // caller's .group request.
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(e0, .{ .target_visible = false });
+    try data.setAiMemory(e0, .{
+        .last_known_target = remembered_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    // e1: perception warm (target visible) — keeps the caller's .group request.
+    const e1 = try data.createEntity();
+    try data.setMovementBody(e1, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e1, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(e1, .{ .target_visible = true });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .nav_request_kind = .group,
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .memory_slice = data.aiMemorySliceConst(),
+    });
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 2), intents.len);
+    for (intents) |intent| {
+        if (intent.entity.index == e0.index) {
+            try std.testing.expectEqual(PathRequestKind.individual, intent.kind);
+        } else if (intent.entity.index == e1.index) {
+            try std.testing.expectEqual(PathRequestKind.group, intent.kind);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "ai seek keeps the default seek target when memory can't override it" {
