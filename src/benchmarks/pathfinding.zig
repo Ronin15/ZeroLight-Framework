@@ -761,9 +761,12 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
-    // Warm the cache: solve every agent's path. Solves are capped per frame, so run enough
-    // frames to drain the queue (re-submitted already-cached requests are cheap no-ops).
-    const warm_frames = item_count / 256 + 4;
+    // Warm the cache: solve every agent's path. Solves are capped per frame at
+    // default_max_solves_per_frame, so run enough frames to drain the queue (re-submitted
+    // already-cached requests are cheap no-ops). Derived from the real ceiling (not a
+    // hand-picked constant) so a lowered ceiling still warms fully instead of silently
+    // leaving this a partial-miss bench mislabeled as warm-cache.
+    const warm_frames = item_count / default_max_solves_per_frame + 4;
     for (0..warm_frames) |_| {
         _ = try system.updateSerial(&fixture.requests, item_count, .{});
     }
@@ -800,6 +803,11 @@ pub fn runQueryCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Opt
             }
         }
     }
+
+    // Every agent's path must be resident before the timed loop, or this silently measures
+    // the cache-miss path while labeled a warm-cache bench (see the group-field cases'
+    // analogous group_field_samples assert).
+    std.debug.assert(warm_paths == item_count);
 
     var context = QueryContext{ .system = &system, .starts = starts, .goals = goals, .hints = hints, .sink = sink };
 
@@ -887,8 +895,13 @@ pub fn runEscalatedDetourCase(allocator: std.mem.Allocator, io: std.Io, options:
         .max_agent_budget = 8,
         // Deliberately tiny so the FIRST (tier-0) attempt exhausts regardless of grid
         // size, exercising the real promote-to-tier-1 path against the fixed tier-1
-        // budget (see the group doc comment).
-        .tier0_abstract_node_cap = 64,
+        // budget (see the group doc comment). Must stay below the fewest abstract-graph
+        // hops any such detour could need — nav_graph.zig's discoverChunkPortals now
+        // consolidates open boundary runs to one portal per side, so the graph is far
+        // sparser than a per-cell scheme and a merely-small cap (64) is no longer
+        // guaranteed to exhaust; 1 is the true floor, matching the same pattern already
+        // used to force guaranteed tier-0 exhaustion in system.zig's own tests.
+        .tier0_abstract_node_cap = 1,
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);
 
@@ -1132,9 +1145,16 @@ fn writeGroupFieldDetourRequests(requests: *RangeOutputStream(PathRequest), enti
 // `Player.speed` is a private struct constant) so this bench states its own assumption
 // explicitly. A tuned throttle must rebuild well within this window to matter.
 const group_field_detour_rekey_period_steps: usize = 16;
-// Mirrors game_demo_state.proceduralPathfindingCapacity's group_field_rebuild_min_steps
-// override (see that field's doc comment for the full derivation against this cadence and
-// GroupField.expand's measured build cost).
+// A worst-case full-grid detour (group_field_detour_grid_side^2 cells, per this bench's
+// setup) needs cells/default_group_field_build_budget steps to reach `.ready` — well
+// under the rekey cadence above, so a build reliably finishes and gets resampled before
+// the next rekey supersedes it. This must stay BELOW group_field_detour_rekey_period_steps:
+// a field that finishes only AFTER the goal has already moved again is always ready for an
+// already-stale key, so it can never exact-match the current request and is never sampled
+// (see types.zig's group_field_build_budget doc comment for the budget/throttle pairing
+// this validates). The demo no longer pins its own override at this population (see
+// game_demo_state.proceduralPathfindingCapacity) — this is purely this bench's own
+// standalone exercise of the rebuild-under-motion mechanism.
 const group_field_detour_rebuild_min_steps: u32 = 8;
 // Rekey cycles run untimed before measuring, so the field has engaged past its first
 // (always-immediate, empty-slot) build and any transient has settled.
@@ -1156,13 +1176,14 @@ const group_field_detour_moving_cycles: usize = 6;
 // field cannot already be `.ready` for a goal it has not started building), and PathQueryKey
 // dedup already collapses that one solve to a single attempt regardless of the field — so one
 // bounded solve per rekey is an expected, irreducible cost of a moving shared goal, not a
-// regression. What a broken throttle actually breaks (see default_group_field_rebuild_min_steps
-// vs this bench's tuned override) is everything AFTER that first solve: with the throttle at or
-// above the real cadence, `ensureGroupField` finds the previous goal's field "stale" every
-// single step but never re-clears the throttle wait, so the field never reaches `.ready` again
-// and group_field_samples stays 0 for the rest of the run (proven by group_field_detour_group's
-// static case going stale forever). A tuned throttle instead lets the field reach `.ready`
-// partway through each cycle and serve the remainder cheaply.
+// regression. What a broken throttle actually breaks is everything AFTER that first solve: with
+// the throttle at or above the real cadence (this bench's tuned group_field_detour_rebuild_min_steps
+// matches types.zig's default_group_field_rebuild_min_steps precisely to stay below it),
+// `ensureGroupField` finds the previous goal's field "stale" every single step but never
+// re-clears the throttle wait, so the field never reaches `.ready` again and group_field_samples
+// stays 0 for the rest of the run (proven by group_field_detour_group's static case going stale
+// forever). A tuned throttle instead lets the field reach `.ready` partway through each cycle
+// and serve the remainder cheaply.
 pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
     // Cycle counts are fixed (like group_field_detour_setup_guard's loop-safety bound):
     // this case simulates a fixed number of real re-key cycles rather than repeating one
@@ -1241,9 +1262,9 @@ pub fn runGroupFieldDetourMovingCase(allocator: std.mem.Allocator, io: std.Io, o
 
     // Regression guard: the tuned throttle must let the field actually reach `.ready` and
     // serve part of the run. A regression that leaves the throttle at/above the real cadence
-    // (default_group_field_rebuild_min_steps=30 vs a 16-step cadence) makes the field
-    // permanently stale — this assert fires with samples_total == 0 in that case, which is
-    // exactly how the bug this bench guards was found.
+    // (an earlier default_group_field_rebuild_min_steps of 30 vs this bench's 16-step cadence
+    // is exactly how this was originally found) makes the field permanently stale — this
+    // assert fires with samples_total == 0 in that case.
     std.debug.assert(samples_total > 0);
     // Escalated solves are expected (one bounded, dedup'd solve per genuinely new rekey — see
     // the doc comment above), but must stay bounded at one per cycle, not run away.
@@ -1313,10 +1334,15 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
     var snapped_goal = math.Vec2{ .x = world_x, .y = start_world_y };
     var snapped_initialized = false;
     var last_written_goal: ?math.Vec2 = null;
+    // Counts actual goal rewrites (post-hysteresis), not raw steps, so the escalation bound
+    // below proves hysteresis is doing its job: without it, a per-step-advancing goal would
+    // rewrite (and escalate) every single step instead of only every real re-key.
+    var rewrite_count: usize = 0;
 
     const total_cycles = group_field_detour_moving_warmup_cycles + group_field_detour_moving_cycles;
     const total_steps = total_cycles * group_field_detour_rekey_period_steps;
     const warmup_steps = group_field_detour_moving_warmup_cycles * group_field_detour_rekey_period_steps;
+    const measured_steps = total_steps - warmup_steps;
 
     for (0..total_steps) |step_index| {
         const live = math.Vec2{
@@ -1337,6 +1363,7 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
         if (last_written_goal == null or last_written_goal.?.x != snapped_goal.x or last_written_goal.?.y != snapped_goal.y) {
             try writeGroupFieldDetourRequests(&requests, fixture.entities, fixture.starts, snapped_goal);
             last_written_goal = snapped_goal;
+            if (step_index >= warmup_steps) rewrite_count += 1;
         }
 
         const measured = step_index >= warmup_steps;
@@ -1355,6 +1382,12 @@ pub fn runGroupFieldDetourMovingHysteresisCase(allocator: std.mem.Allocator, io:
     // Regression guard: the throttle must still let the field reach `.ready` and serve
     // part of the run under hysteresis-throttled re-keys, same as the zero-hysteresis case.
     std.debug.assert(samples_total > 0);
+    // The actual proof this case exists for: escalated solves are bounded by the
+    // HYSTERESIS-REDUCED rewrite count, not the raw per-step count — a regression that
+    // reintroduces a per-step re-key storm shows up here as escalated_total exceeding a
+    // rewrite count that itself stayed small.
+    std.debug.assert(rewrite_count < measured_steps);
+    std.debug.assert(escalated_total <= rewrite_count);
 
     var stats = accumulator.finish();
     stats.output_count = escalated_total;

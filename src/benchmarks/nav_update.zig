@@ -132,6 +132,11 @@ pub fn runMultichunkCase(allocator: std.mem.Allocator, io: std.Io, options: suit
 // so the EXPENSIVE O(world^2) rebuild is done ONCE per variant and reused across every case/count
 // (see sharedFixture). Only `edits` is regenerated per count; the toggle re-derives nav state.
 const Fixture = struct {
+    // Stored at build time (not passed again to deinit): this is a module-global fixture
+    // freed once at the end of a whole bench run by deinitCaches, potentially far from
+    // where it was built, so trusting a caller to re-supply the SAME allocator instance
+    // is an avoidable mismatched alloc/free risk.
+    allocator: std.mem.Allocator,
     data: DataSystem,
     world: WorldSystem,
     system: PathfindingSystem,
@@ -141,8 +146,8 @@ const Fixture = struct {
     // Tiles toggled each timed iteration: the current count's footprint on level 1.
     edits: std.ArrayList(NavCellEdit),
 
-    fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
-        self.edits.deinit(allocator);
+    fn deinit(self: *Fixture) void {
+        self.edits.deinit(self.allocator);
         self.system.deinit();
         self.world.deinit();
         self.data.deinit();
@@ -159,12 +164,12 @@ const Fixture = struct {
 // deinitCaches afterward or the fixtures leak.
 var shared_fixtures: [@typeInfo(Variant).@"enum".fields.len]?Fixture = .{ null, null };
 
-pub fn deinitCaches(allocator: std.mem.Allocator) void {
+pub fn deinitCaches() void {
     for (&shared_fixtures) |*slot| {
-        if (slot.*) |*fixture| fixture.deinit(allocator);
+        if (slot.*) |*fixture| fixture.deinit();
         slot.* = null;
     }
-    if (entity_obstacle_fixture) |*fixture| fixture.deinit(allocator);
+    if (entity_obstacle_fixture) |*fixture| fixture.deinit();
     entity_obstacle_fixture = null;
 }
 
@@ -218,6 +223,7 @@ fn buildSharedFixture(allocator: std.mem.Allocator, io: std.Io, participant_coun
     try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
 
     return .{
+        .allocator = allocator,
         .data = data,
         .world = world,
         .system = system,
@@ -254,7 +260,13 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
             }
         },
         .multichunk => {
-            const side = squareSide(cells);
+            // Capped at the world's full tile area: a centered side-length-`side` block only
+            // stays in bounds while side <= world_tiles (center sits at exactly world_tiles/2),
+            // so an --items override large enough to demand a bigger square would otherwise
+            // walk x/y past the world edge instead of erroring loudly at the world write.
+            const max_multichunk_cells: usize = @as(usize, world_tiles) * @as(usize, world_tiles);
+            const n = @min(cells, max_multichunk_cells);
+            const side = squareSide(n);
             // world_tiles/2 is a multiple of chunk_tiles, i.e. a chunk boundary; centering the
             // block there keeps it border-straddling at every size.
             const center: u16 = world_tiles / 2;
@@ -262,10 +274,10 @@ fn setFootprint(fixture: *Fixture, allocator: std.mem.Allocator, variant: Varian
             const ay: u16 = center -| side / 2;
             var placed: usize = 0;
             var dy: u16 = 0;
-            outer: while (placed < cells) : (dy += 1) {
+            outer: while (placed < n) : (dy += 1) {
                 var dx: u16 = 0;
                 while (dx < side) : (dx += 1) {
-                    if (placed >= cells) break :outer;
+                    if (placed >= n) break :outer;
                     try fixture.edits.append(allocator, .{ .level = 1, .x = ax + dx, .y = ay + dy });
                     placed += 1;
                 }
@@ -423,15 +435,17 @@ pub fn entityObstacleItemCounts(profile: suite.Profile) []const usize {
 // run ascending). The live count is always exactly the obstacle count under test, since a
 // whole-level static-coverage refresh costs O(cells x live bodies).
 const EntityObstacleFixture = struct {
+    // Stored at build time — see Fixture's matching field for why.
+    allocator: std.mem.Allocator,
     data: DataSystem,
     world: WorldSystem,
     system: PathfindingSystem,
     entities: std.ArrayList(EntityId),
     rects: std.ArrayList(ObstacleWorldRect),
 
-    fn deinit(self: *EntityObstacleFixture, allocator: std.mem.Allocator) void {
-        self.entities.deinit(allocator);
-        self.rects.deinit(allocator);
+    fn deinit(self: *EntityObstacleFixture) void {
+        self.entities.deinit(self.allocator);
+        self.rects.deinit(self.allocator);
         self.system.deinit();
         self.world.deinit();
         self.data.deinit();
@@ -490,7 +504,7 @@ fn buildEntityObstacleFixture(allocator: std.mem.Allocator, io: std.Io, particip
         rects.appendAssumeCapacity(.{ .min_x = x, .min_y = y, .max_x = x + obstacle_size, .max_y = y + obstacle_size });
     }
 
-    return .{ .data = data, .world = world, .system = system, .entities = entities, .rects = rects };
+    return .{ .allocator = allocator, .data = data, .world = world, .system = system, .entities = entities, .rects = rects };
 }
 
 // Grows the live obstacle population to exactly `n` (never shrinks — item counts run

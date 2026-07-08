@@ -32,7 +32,7 @@ const Player = @import("player.zig").Player;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
-const nav_memory = @import("systems/pathfinding/nav_memory.zig");
+const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -117,53 +117,43 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
-fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCapacity {
+fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_count: usize) PathfindingCapacity {
     var cap: PathfindingCapacity = .{
         .max_group_fields = 4,
         .max_agent_budget = 4096,
         .worker_participant_count = worker_participant_count,
-        // Fixed: pins the shared-goal flow-field threshold below the demo's ~24-mover
-        // pursuit pack so it engages instead of the derived (grid-scaled) threshold,
-        // which is dead at this population. See types.zig min_group_field_agents.
+        // A shared flow-field build floods the LOCAL nav grid directly (Dial's algorithm,
+        // group_field.zig) and never touches the abstract chunk-portal graph at all, unlike
+        // every individual/tier-0/tier-1 solve (solve.zig's abstractCorridor). Portal
+        // generation now consolidates contiguous open boundary runs (nav_graph.zig's
+        // discoverChunkPortals), so a single abstract solve is no longer pathologically
+        // expensive on open terrain — but it is still real, non-zero work PAID PER AGENT
+        // PER REKEY, while a shared flood is paid ONCE and amortized across however many
+        // pursuers currently share the goal. A raised threshold here (a prior pass set
+        // 1000, on the unverified assumption individual solves stay sub-millisecond
+        // regardless of terrain — never actually measured against a real pursuit-pack
+        // rekey rate) forces the demo's pursuit pack off the cheap shared-flood path and
+        // onto N duplicated abstract searches per rekey instead — worse, not better.
+        // Pinning back to a low, fixed threshold routes the pack through the flood
+        // instead, which is what pathfinding-group-field-detour-moving's benchmark
+        // comment already documents as the intended fix for this exact "water-adjacent
+        // FPS-drop" chase shape. The field's own once-unbounded build cost is now real
+        // fixed budgets (see group_field_max_cells and ensureGroupField's in-progress-
+        // build guard), so engaging it at this population is no longer the expensive
+        // side of the trade.
         .min_group_field_agents = 8,
-        // Fixed: the default (30 steps) exceeds the fastest real re-key cadence, so a
-        // chasing pack's shared goal (re-keyed whenever the player crosses a nav cell)
-        // always finds the field "stale" and throttled, and it never rebuilds again —
-        // group_field_samples stays 0 forever after the first goal. Player speed 120px/s
-        // (player.zig) crossing a 32px nav cell (types.zig default_cell_size) at 60Hz
-        // re-keys every 32/120*60 = 16 steps in the worst case (straight-line crossing).
-        // 8 is half that, leaving headroom for the rebuild to trigger promptly after a
-        // rekey while still clearing GroupField's budgeted fill (measured ~9 steps to
-        // `.ready` at this grid's scale and group_field_build_budget=8192 cells/step) well
-        // before the next rekey. See pathfinding-group-field-detour-moving bench.
-        .group_field_rebuild_min_steps = 8,
+        // group_field_rebuild_min_steps is intentionally left at its default: the safe
+        // value is an internal relationship between group_field_build_budget and this
+        // throttle (both pathfinding-owned), not a demo-specific judgment call — see
+        // default_group_field_rebuild_min_steps' doc comment.
     };
-    cap.max_nav_memory_bytes = nav_memory.autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles);
+    cap.max_nav_memory_bytes = autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, level_link_count);
     return cap;
 }
 /// Chunk + pixel AABB margin for dynamic collect and sparse visibility (Slice 24B).
 const world_render_overscan_chunks: u16 = 1;
 
-/// Comptime-gated wall-clock timer for one gameplay-tick stage. Zero-cost no-op
-/// when perf logging is disabled; samples the SDL nanosecond clock otherwise.
-const StageTimer = if (runtime_perf_log.enabled) struct {
-    start_ns: u64,
-
-    fn start() StageTimer {
-        return .{ .start_ns = c.SDL_GetTicksNS() };
-    }
-
-    fn stop(self: StageTimer, perf: runtime_perf_log.Context, timing: runtime_perf_log.Timing) void {
-        const end_ns = c.SDL_GetTicksNS();
-        perf.recordTiming(timing, if (end_ns > self.start_ns) end_ns - self.start_ns else 0);
-    }
-} else struct {
-    fn start() StageTimer {
-        return .{};
-    }
-
-    fn stop(_: StageTimer, _: runtime_perf_log.Context, _: runtime_perf_log.Timing) void {}
-};
+const StageTimer = runtime_perf_log.StageTimer;
 
 pub const GameDemoState = struct {
     data: DataSystem,
@@ -247,7 +237,7 @@ pub const GameDemoState = struct {
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
-            proceduralPathfindingCapacity(thread_system.participantSlotCount()),
+            proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
             thread_system,
         );
         errdefer state.deinit();
@@ -1034,14 +1024,13 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.velocity_y.* = 0;
 }
 
-test "proceduralPathfindingCapacity pins the group-field engagement thresholds" {
-    const capacity = proceduralPathfindingCapacity(1);
-    // Below the derived (grid-scaled) threshold, which goes dead at the demo's pursuit-pack
-    // population — see the field's doc comment.
+test "proceduralPathfindingCapacity routes the pursuit pack through the shared flow-field" {
+    const capacity = proceduralPathfindingCapacity(1, 0);
+    // Low enough that the demo's ~24-32 mover pursuit pack crosses the threshold and
+    // shares one flood instead of each agent paying the abstract chunk-portal search
+    // individually — see the field's doc comment for why that search, not the field
+    // build, is the expensive path on this demo's open terrain.
     try std.testing.expectEqual(@as(usize, 8), capacity.min_group_field_agents);
-    // Below the fastest real re-key cadence (16 steps), so a chasing pack's shared goal
-    // rebuild is never permanently throttled — see the field's doc comment.
-    try std.testing.expectEqual(@as(u32, 8), capacity.group_field_rebuild_min_steps);
 }
 
 test "demo spawns atlas-backed moving actors" {

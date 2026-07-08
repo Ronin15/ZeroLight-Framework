@@ -30,6 +30,7 @@ pub const pathfinding_range_alignment_items = @import("pathfinding/types.zig").p
 pub const default_max_fallback_requests_per_step = @import("pathfinding/types.zig").default_max_fallback_requests_per_step;
 pub const default_max_solves_per_frame = @import("pathfinding/types.zig").default_max_solves_per_frame;
 pub const default_nav_chunk_tiles = @import("pathfinding/types.zig").default_nav_chunk_tiles;
+pub const autoSizedMaxNavMemoryBytes = @import("pathfinding/nav_memory.zig").autoSizedMaxNavMemoryBytes;
 
 test {
     _ = @import("pathfinding/types.zig");

@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
+const sdl = @import("../platform/sdl.zig").c;
 const BatchStats = @import("thread_system.zig").BatchStats;
 const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
@@ -85,6 +86,7 @@ pub const Metric = enum {
     path_group_field_reuses,
     path_group_field_rebuild_throttled,
     path_group_field_samples,
+    path_max_stitch_segments,
     nav_dirty_chunks,
     nav_incremental_rebuilds,
     nav_full_relabel,
@@ -217,6 +219,14 @@ pub const Context = if (enabled) struct {
         if (self.logger) |logger| logger.recordMetric(metric, value);
     }
 
+    // High-water-mark variant: keeps the max value recorded within the interval
+    // instead of summing every call, for metrics that are already a per-step peak
+    // (e.g. max_stitch_segments_observed) where summing across steps would conflate
+    // magnitude with frequency.
+    pub fn recordMetricMax(self: Context, metric: Metric, value: u64) void {
+        if (self.logger) |logger| logger.recordMetricMax(metric, value);
+    }
+
     pub fn recordTiming(self: Context, timing: Timing, duration_ns: u64) void {
         if (self.logger) |logger| logger.recordTiming(timing, duration_ns);
     }
@@ -230,6 +240,7 @@ pub const Context = if (enabled) struct {
     }
 
     pub fn recordMetric(_: Context, _: Metric, _: u64) void {}
+    pub fn recordMetricMax(_: Context, _: Metric, _: u64) void {}
     pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
     pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
 };
@@ -241,12 +252,47 @@ comptime {
     }
 }
 
+// Comptime-gated wall-clock timer for one fixed-step stage/phase. Zero-field,
+// zero-cost no-op when perf logging is disabled; otherwise samples the SDL
+// monotonic clock. `stop` is the direct-to-context convenience for a stage bound
+// to one Timing id; `lap` returns the raw duration for a caller that folds it into
+// its own stats struct first (e.g. PathfindingStats' per-phase ns fields) before it
+// reaches the perf log.
+pub const StageTimer = if (enabled) struct {
+    start_ns: u64,
+
+    pub fn start() StageTimer {
+        return .{ .start_ns = sdl.SDL_GetTicksNS() };
+    }
+
+    pub const begin = start;
+
+    pub fn lap(self: *const StageTimer) u64 {
+        const now = sdl.SDL_GetTicksNS();
+        return if (now > self.start_ns) now - self.start_ns else 0;
+    }
+
+    pub fn stop(self: StageTimer, perf: Context, timing: Timing) void {
+        perf.recordTiming(timing, self.lap());
+    }
+} else struct {
+    pub fn start() StageTimer {
+        return .{};
+    }
+    pub const begin = start;
+    pub fn lap(_: *const StageTimer) u64 {
+        return 0;
+    }
+    pub fn stop(_: StageTimer, _: Context, _: Timing) void {}
+};
+
 const DisabledRuntimePerfLog = struct {
     pub fn init(_: u64) DisabledRuntimePerfLog {
         return .{};
     }
 
     pub fn recordMetric(_: *DisabledRuntimePerfLog, _: Metric, _: u64) void {}
+    pub fn recordMetricMax(_: *DisabledRuntimePerfLog, _: Metric, _: u64) void {}
     pub fn recordTiming(_: *DisabledRuntimePerfLog, _: Timing, _: u64) void {}
     pub fn recordBatch(_: *DisabledRuntimePerfLog, _: BatchStage, _: BatchStats) void {}
     pub fn recordFrame(_: *DisabledRuntimePerfLog, _: u64, _: FrameSample) void {}
@@ -265,6 +311,11 @@ const EnabledRuntimePerfLog = struct {
 
     pub fn recordMetric(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
         self.metrics[@intFromEnum(metric_id)] += value;
+    }
+
+    pub fn recordMetricMax(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
+        const slot = &self.metrics[@intFromEnum(metric_id)];
+        slot.* = @max(slot.*, value);
     }
 
     pub fn recordTiming(self: *EnabledRuntimePerfLog, timing_id: Timing, duration_ns: u64) void {
@@ -444,7 +495,7 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -455,6 +506,7 @@ const EnabledRuntimePerfLog = struct {
                 millis(pathfinding_solve_timing.max_ns),
                 millis(pathfinding_publish_timing.averageNs()),
                 millis(pathfinding_publish_timing.max_ns),
+                self.metricValue(.path_max_stitch_segments),
             },
         );
         log.debug(

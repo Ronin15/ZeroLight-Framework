@@ -10,7 +10,6 @@
 const std = @import("std");
 const math = @import("../core/math.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
-const c = @import("../platform/sdl.zig").c;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
@@ -311,6 +310,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
+        perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
         perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
@@ -831,27 +831,7 @@ pub const SimulationPipeline = struct {
     }
 };
 
-/// Comptime-gated wall-clock timer for one pipeline stage. When perf logging
-/// is disabled it is a zero-field, zero-cost no-op; when enabled it samples the
-/// SDL nanosecond clock and forwards the duration to the bound perf context.
-const StageTimer = if (runtime_perf_log.enabled) struct {
-    start_ns: u64,
-
-    fn start() StageTimer {
-        return .{ .start_ns = c.SDL_GetTicksNS() };
-    }
-
-    fn stop(self: StageTimer, perf: runtime_perf_log.Context, timing: runtime_perf_log.Timing) void {
-        const end_ns = c.SDL_GetTicksNS();
-        perf.recordTiming(timing, if (end_ns > self.start_ns) end_ns - self.start_ns else 0);
-    }
-} else struct {
-    fn start() StageTimer {
-        return .{};
-    }
-
-    fn stop(_: StageTimer, _: runtime_perf_log.Context, _: runtime_perf_log.Timing) void {}
-};
+const StageTimer = runtime_perf_log.StageTimer;
 
 fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
     for (frame.intents.mergedItems()) |item| {

@@ -46,8 +46,10 @@ pub const AbstractScratch = struct {
     // table size, sized once at reserve() to the largest — tier-1/derived — ceiling).
     // A caller (abstractCorridor) sets this before each search so a cheap tier-0 attempt
     // spills at its own small cap even though the table itself is sized much larger.
-    // reserve() defaults it to the full physical budget so a direct caller that never
-    // sets it explicitly keeps the old unconstrained-up-to-physical-size behavior.
+    // reserve() defaults it to max_abstract_nodes (the LOGICAL ceiling it was reserved
+    // for, half or less of the physical slot_capacity headroom above it — see reserve),
+    // so a direct caller that never sets it explicitly keeps the old
+    // unconstrained-up-to-the-reserved-ceiling behavior.
     node_budget: usize = 0,
     // Distinct NEW nodes claimed this generation; reset alongside the generation bump.
     nodes_used: usize = 0,
@@ -185,6 +187,12 @@ pub const SearchScratch = struct {
     // Worker-private abstract-tier scratch so long-range/cross-level routing stays
     // disjoint per worker, matching the local A* scratch ownership.
     abstract: AbstractScratch = .{},
+    // Diagnostic only: highest per-solve stitch segment count (solve.zig's
+    // stitchCorridor) this worker has produced since the last aggregation. NOT
+    // reset by reset() (that runs per-segment, many times per solve); the owning
+    // PathfindingSystem aggregates and clears it once per step in finishUpdate, so
+    // it reflects one step's true worst case rather than a single solve's.
+    max_stitch_segments_used: usize = 0,
 
     pub fn deinit(self: *SearchScratch, allocator: std.mem.Allocator) void {
         self.abstract.deinit(allocator);
@@ -238,9 +246,14 @@ pub const SearchScratch = struct {
     // Returns the direct cell slot, freshening it on first touch this generation.
     // Returns null only when freshening a NEW cell would exceed the node budget
     // (the spill cap) — already-touched cells always resolve, so reopening a cell
-    // never spills. cell_index must be < cell_count (a valid grid cell).
+    // never spills. cell_index must be < cell_count (a valid grid cell): every real
+    // caller derives it from NavGrid.indexForCell or an already-bounds-checked
+    // neighbor step, so an out-of-range index here is a caller bug, not a legitimate
+    // spill — asserted rather than folded into the budget_exhausted return, so it
+    // fails loud at the defect instead of presenting as a request that silently never
+    // makes progress.
     pub fn slotFor(self: *SearchScratch, cell: usize) ?usize {
-        if (cell >= self.cell_count) return null;
+        std.debug.assert(cell < self.cell_count);
         const stamp = self.cell_stamp;
         const g = self.cell_g;
         const parent = self.cell_parent;
@@ -255,3 +268,50 @@ pub const SearchScratch = struct {
         return cell;
     }
 };
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+test "SearchScratch generation wraparound clears stamps instead of aliasing a stale touch" {
+    var scratch = SearchScratch{};
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.reserve(std.testing.allocator, 16, 16, 16, 16, 16);
+
+    // Force the wraparound on the NEXT reset(): stamp a cell at generation maxInt first.
+    scratch.generation = std.math.maxInt(u32);
+    const slot = scratch.slotFor(5).?;
+    try std.testing.expectEqual(scratch.generation, scratch.cell_stamp[slot]);
+
+    scratch.reset();
+    // Guard clamps generation back to 1, never wrapping to 0 (0 is the zeroed sentinel
+    // memset uses for "untouched", so generation==0 would alias every untouched cell).
+    try std.testing.expectEqual(@as(u32, 1), scratch.generation);
+    try std.testing.expectEqual(@as(u32, 0), scratch.cell_stamp[slot]);
+
+    // The previously-touched cell must read as untouched this generation: slotFor spends a
+    // fresh `explored` budget slot on it again rather than matching a stale stamp==0 alias.
+    try std.testing.expectEqual(@as(usize, 0), scratch.explored);
+    _ = scratch.slotFor(5).?;
+    try std.testing.expectEqual(@as(usize, 1), scratch.explored);
+}
+
+test "AbstractScratch generation wraparound clears stamps instead of aliasing a stale touch" {
+    var scratch = AbstractScratch{};
+    defer scratch.deinit(std.testing.allocator);
+    try scratch.reserve(std.testing.allocator, 16);
+
+    scratch.generation = std.math.maxInt(u32);
+    const slot = scratch.slotFor(42).?;
+    try std.testing.expectEqual(scratch.generation, scratch.slot_stamp[slot]);
+
+    scratch.reset();
+    try std.testing.expectEqual(@as(u32, 1), scratch.generation);
+    try std.testing.expectEqual(@as(u32, 0), scratch.slot_stamp[slot]);
+
+    // A fresh touch of the same ref after wraparound spends a new nodes_used slot rather
+    // than resolving via a stale stamp==0 alias.
+    try std.testing.expectEqual(@as(usize, 0), scratch.nodes_used);
+    _ = scratch.slotFor(42).?;
+    try std.testing.expectEqual(@as(usize, 1), scratch.nodes_used);
+}

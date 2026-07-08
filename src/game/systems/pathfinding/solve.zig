@@ -60,23 +60,28 @@ pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: Wo
 }
 
 // Outcome of a budget-bounded local A* over one level's grid.
-pub const LocalSolve = enum { found, budget_exhausted, none };
+const LocalSolve = enum { found, budget_exhausted, none };
 
 // Solves one request. Short same-component hops use the budget-bounded local A*
 // directly and store a plain path (no stitched corridor). Long-range or cross-level
 // queries route through the abstract chunk-portal/link graph to pick a corridor, then
 // stitch the full obstacle-aware (level,cell) path from per-segment local A* runs;
 // the query walks it per-agent on its current level. Per-solve work is bounded by the
-// abstract node budget plus the per-segment local budget, independent of total cells.
+// abstract node budget, plus at most max_stitch_segments per-segment local searches
+// (see default_max_stitch_segments) — not just one, since a corridor can cross many
+// portals — each capped at the per-segment local budget, independent of total cells.
 pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *SearchScratch, path_slot: usize) PathSolveResult {
     const graph = &system.graph;
     const request = system.pending.items[pending_index];
     if (!graph.valid()) return .{ .unavailable = request.key };
 
-    const start_grid = graph.grid(request.start_level) orelse return .{ .unavailable = request.key };
+    // Start-side failures are start_invalid, never unavailable: the negative cache is
+    // goal-keyed and shared, so a blocked/off-grid representative start (e.g. an agent
+    // momentarily overlapping a body) must not mark the goal unavailable for everyone.
+    const start_grid = graph.grid(request.start_level) orelse return .{ .start_invalid = request.key };
     const goal_grid = graph.grid(request.key.goal_level) orelse return .{ .unavailable = request.key };
-    const start_index = start_grid.indexForCell(request.start) orelse return .{ .unavailable = request.key };
-    if (start_grid.isBlockedIndex(start_index)) return .{ .unavailable = request.key };
+    const start_index = start_grid.indexForCell(request.start) orelse return .{ .start_invalid = request.key };
+    if (start_grid.isBlockedIndex(start_index)) return .{ .start_invalid = request.key };
 
     // Projection (including failure) was resolved at acceptance against the goal
     // level. no_parent means no open cell near the goal: a definitive negative.
@@ -102,8 +107,10 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
                 .none => return .{ .unavailable = request.key },
             }
         }
-        // Same level but different component: only a link corridor (e.g. a
-        // teleport back onto this level) could connect them. Fall to abstract.
+        // Same level but different component: NavGrid components are CHUNK-LOCAL (a flood
+        // never crosses a chunk border), so this is the COMMON case of a start/goal in
+        // different chunks, not just the rare same-level teleport link — either way, only
+        // the abstract chunk-portal/link graph can connect them. Fall to abstract.
     }
 
     // Two-tier attempt caps: tier 0 (the common case) stays cheap even though the
@@ -119,7 +126,7 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     // reserved buffer. Tier 0 is also semantically the CHEAPER attempt, so clamping
     // down to the tier-1 ceiling is never a behavior change in the intended direction.
     const stitched_cell_cap = if (request.tier == 0) @min(system.capacity.tier0_stitched_cell_cap, system.capacity.max_stitched_path_cells) else system.capacity.max_stitched_path_cells;
-    return solveAbstract(system, pending_index, scratch, path_slot, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap);
+    return solveAbstract(system, pending_index, scratch, path_slot, request, start_grid, goal_grid, start_index, goal_index, abstract_node_cap, stitched_cell_cap, system.capacity.max_stitch_segments);
 }
 
 // Abstract A* over portal nodes + link edges to choose a corridor across
@@ -130,7 +137,7 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
 // level, so every heading is to a traversable neighbor. Saturating the abstract
 // scratch or a segment's node budget spills to a later frame (budget_exhausted)
 // rather than mislabeling it; only a genuinely missing corridor is unavailable.
-pub fn solveAbstract(
+fn solveAbstract(
     system: *PathfindingSystem,
     pending_index: usize,
     scratch: *SearchScratch,
@@ -142,6 +149,7 @@ pub fn solveAbstract(
     goal_index: usize,
     abstract_node_cap: usize,
     stitched_cell_cap: usize,
+    segment_cap: usize,
 ) PathSolveResult {
     const graph = &system.graph;
     const corridor = switch (abstractCorridor(graph, scratch, start_grid, goal_grid, request.start_level, request.key.goal_level, start_index, goal_index, abstract_node_cap)) {
@@ -149,11 +157,14 @@ pub fn solveAbstract(
         // Abstract scratch saturated: retry next frame instead of a hard negative.
         .saturated => return .{ .budget_exhausted = request.key },
         .none => return .{ .unavailable = request.key },
+        // Start-side seeding failure: drop without poisoning the goal-keyed negative cache.
+        .unseedable => return .{ .start_invalid = request.key },
     };
 
     // Stitch the full obstacle-aware path across every corridor segment. A node-budget
-    // spill or an overflow of the stitched buffer is a transient: retry next frame.
-    switch (stitchCorridor(system, scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap)) {
+    // spill, a stitched-buffer overflow, or a segment-count spill (see
+    // default_max_stitch_segments) is a transient: retry next frame.
+    switch (stitchCorridor(system, scratch, request, goal_grid, start_index, goal_index, stitched_cell_cap, segment_cap)) {
         .found => {},
         .budget_exhausted => return .{ .budget_exhausted = request.key },
         .none => return .{ .unavailable = request.key },
@@ -165,7 +176,7 @@ pub fn solveAbstract(
     // full stitched path the query walks.
     recordStartLevelPrefix(system, pending_index, path_slot, stitched, request.start_level);
     recordStitched(system, pending_index, path_slot, stitched);
-    var solved = &system.solved_paths.items[pending_index];
+    const solved = &system.solved_paths.items[pending_index];
     solved.via_abstract = true;
     solved.cross_level = corridor.crosses_level;
     return .{ .available = request.key };
@@ -177,8 +188,10 @@ pub fn solveAbstract(
 // consecutive portal cells; a LINK transition (corridor_link[i] == true) is a single
 // discrete jump (no intermediate cells), whether it crosses Z or is a same-level
 // teleport. The final span (last portal -> goal) is a same-level local A*. Returns
-// budget_exhausted on any segment node-budget spill or stitched-buffer overflow.
-pub fn stitchCorridor(
+// budget_exhausted on any segment node-budget spill, stitched-buffer overflow, or
+// segment-count spill (segment_cap, see default_max_stitch_segments — bounds total
+// local-search work independent of how many portals the chosen corridor crosses).
+fn stitchCorridor(
     system: *PathfindingSystem,
     scratch: *SearchScratch,
     request: PendingRequest,
@@ -186,6 +199,7 @@ pub fn stitchCorridor(
     start_index: usize,
     goal_index: usize,
     cap: usize,
+    segment_cap: usize,
 ) LocalSolve {
     const graph = &system.graph;
     scratch.stitched_scratch.clearRetainingCapacity();
@@ -195,6 +209,7 @@ pub fn stitchCorridor(
 
     var prev_level = request.start_level;
     var prev_cell: usize = start_index;
+    var segments_used: usize = 0;
     for (scratch.abstract.corridor.items, 0..) |ref, i| {
         const portal = graph.level_graphs.items[refLevel(ref)].portals.items[refLocal(ref)];
         // The first corridor portal (i == 0) is on the start level and reached from
@@ -209,6 +224,13 @@ pub fn stitchCorridor(
             // prev_level indexes a live level by construction (it came from the corridor
             // we just built); spill rather than panic if a malformed graph ever violates that.
             const grid = graph.grid(prev_level) orelse return .none;
+            // appendSegment no-ops (no localAStar call) when prev_cell already equals the
+            // portal cell, so only a genuine local search counts against segment_cap.
+            if (prev_cell != portal.cell_index) {
+                if (segments_used >= segment_cap) return .budget_exhausted;
+                segments_used += 1;
+                if (segments_used > scratch.max_stitch_segments_used) scratch.max_stitch_segments_used = segments_used;
+            }
             switch (appendSegment(scratch, grid, prev_level, prev_cell, portal.cell_index, cap)) {
                 .found => {},
                 else => |r| return r,
@@ -221,6 +243,11 @@ pub fn stitchCorridor(
     // abstractCorridor only returns .found after buildCorridor validates the corridor ends
     // on goal_level, so prev_level == goal_level here. Dead-code defensive guard.
     if (prev_level != request.key.goal_level) return .none;
+    if (prev_cell != goal_index) {
+        if (segments_used >= segment_cap) return .budget_exhausted;
+        segments_used += 1;
+        if (segments_used > scratch.max_stitch_segments_used) scratch.max_stitch_segments_used = segments_used;
+    }
     switch (appendSegment(scratch, goal_grid, prev_level, prev_cell, @intCast(goal_index), cap)) {
         .found => {},
         else => |r| return r,
@@ -232,7 +259,7 @@ pub fn stitchCorridor(
 // (skipping the first, already present as the previous segment's tail) to the
 // stitched buffer, tagged with `level`. Returns the local A* outcome, or
 // budget_exhausted if appending would overflow the stitched cap.
-pub fn appendSegment(scratch: *SearchScratch, grid: *const NavGrid, level: u16, from: usize, to: usize, cap: usize) LocalSolve {
+fn appendSegment(scratch: *SearchScratch, grid: *const NavGrid, level: u16, from: usize, to: usize, cap: usize) LocalSolve {
     if (from == to) return .found;
     switch (localAStar(grid, scratch, from, to)) {
         .found => {},
@@ -250,24 +277,27 @@ pub fn appendSegment(scratch: *SearchScratch, grid: *const NavGrid, level: u16, 
     return .found;
 }
 
-pub const AbstractCorridor = struct {
+const AbstractCorridor = struct {
     // Whether the chosen corridor crosses at least one inter-level link.
     crosses_level: bool,
 };
 
-pub const AbstractResult = union(enum) {
+const AbstractResult = union(enum) {
     found: AbstractCorridor,
     // The bounded abstract scratch saturated (open/slot table full); the corridor
     // may exist but could not be searched this frame.
     saturated,
     // No corridor reaches the goal level/cell from the start.
     none,
+    // The representative start carries no component label (a blocked/degenerate
+    // cell): a start-side condition, not a goal negative.
+    unseedable,
 };
 
 // Relaxes one abstract neighbor `neighbor_ref` reached from `parent_ref` at `cost`,
 // recording whether the relaxing edge was a cross-level link. Returns false on
 // saturation (the bounded slot table or open heap is full).
-pub fn relaxAbstractNode(
+fn relaxAbstractNode(
     abstract: *AbstractScratch,
     parent_ref: usize,
     parent_g: u32,
@@ -313,7 +343,7 @@ fn lowerBoundLinkRef(items: []const LinkEdgeRef, query_level: u16, query_cell: u
 // the stitcher to refine, and reports whether the corridor crosses a level. Per-query
 // work is bounded by the abstract node budget; seeding scans only the start chunk's
 // local-component portals, so it stays bounded independent of total cell count.
-pub fn abstractCorridor(
+fn abstractCorridor(
     graph: *const NavGraph,
     scratch: *SearchScratch,
     start_grid: *const NavGrid,
@@ -338,7 +368,7 @@ pub fn abstractCorridor(
     // Seed the open set with the start cell's chunk-local-component portals on the start
     // level, costed by octile distance from the start.
     const start_component = start_grid.components.items[start_index];
-    if (start_component == no_component) return .none;
+    if (start_component == no_component) return .unseedable;
     var seeded: usize = 0;
     for (graph.levelComponentPortals(start_level, start_component)) |local_node| {
         const portal = graph.level_graphs.items[start_level].portals.items[local_node];
@@ -359,6 +389,9 @@ pub fn abstractCorridor(
         siftUp(abstract.open.items, abstract.open.items.len - 1);
         seeded += 1;
     }
+    // A labeled component with zero portals is structurally sealed off from every
+    // other chunk: a definitive negative (the disconnected-goal contract), not a
+    // transient start condition.
     if (seeded == 0) return .none;
 
     const goal_component = goal_grid.components.items[goal_index];
@@ -436,7 +469,7 @@ pub fn abstractCorridor(
 }
 
 // Outcome of reconstructing the abstract corridor from the parent chain.
-pub const CorridorBuild = enum {
+const CorridorBuild = enum {
     // Full chain root->goal rebuilt and rooted on the start level.
     ok,
     // The parent chain filled corridor.capacity before reaching the seed root: a budget
@@ -450,7 +483,7 @@ pub const CorridorBuild = enum {
 // start-level root, writing the ordered packed-ref sequence (root -> goal portal) into
 // abstract.corridor and the per-step link flags into corridor_link from the recorded
 // slot_via_link. Returns .ok when the corridor's root is a start-level portal.
-pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) CorridorBuild {
+fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u16) CorridorBuild {
     abstract.corridor.clearRetainingCapacity();
     const parent_col = abstract.slot_parent;
     const via_link_col = abstract.slot_via_link;
@@ -486,7 +519,7 @@ pub fn buildCorridor(abstract: *AbstractScratch, goal_ref: usize, start_level: u
 // Budget-bounded heap A* over one level's grid. Fills scratch.path_scratch with
 // the reconstructed start-to-goal cells on success. The node budget keeps explored
 // count bounded; exhausting it spills the request to a later frame.
-pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize, goal_index: usize) LocalSolve {
+fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: usize, goal_index: usize) LocalSolve {
     if (start_index == goal_index) {
         scratch.path_scratch.clearRetainingCapacity();
         scratch.path_scratch.appendAssumeCapacity(@intCast(goal_index));
@@ -552,7 +585,7 @@ pub fn localAStar(grid: *const NavGrid, scratch: *SearchScratch, start_index: us
     return .none;
 }
 
-pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_index: usize) void {
+fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_index: usize) void {
     scratch.path_scratch.clearRetainingCapacity();
     const parent_col = scratch.cell_parent;
     var current = goal_index;
@@ -571,7 +604,7 @@ pub fn reconstructLocalPath(scratch: *SearchScratch, start_index: usize, goal_in
     std.mem.reverse(u32, scratch.path_scratch.items);
 }
 
-pub fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: usize, path: []const u32, path_level: u16) void {
+fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: usize, path: []const u32, path_level: u16) void {
     const stride = system.capacity.max_stored_path_cells;
     const offset = path_slot * stride;
     // Downsample (not head-truncate) an over-stride plain path so the agent keeps
@@ -590,7 +623,7 @@ pub fn recordPath(system: *PathfindingSystem, pending_index: usize, path_slot: u
 // Records the leading start-level run of the stitched path as the plain path buffer
 // (used only as a first-cell fallback in the query). Writes the rest of the
 // SolvedPath entry, mirroring recordPath's contract for a local solve.
-pub fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell, start_level: u16) void {
+fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell, start_level: u16) void {
     const stride = system.capacity.max_stored_path_cells;
     const offset = path_slot * stride;
     var count: usize = 0;
@@ -610,14 +643,19 @@ pub fn recordStartLevelPrefix(system: *PathfindingSystem, pending_index: usize, 
 
 // Copies the full stitched (level,cell) corridor path into this request's disjoint
 // stripe. Must run after recordStartLevelPrefix, which writes the rest of the entry.
-pub fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell) void {
+fn recordStitched(system: *PathfindingSystem, pending_index: usize, path_slot: usize, stitched: []const StitchedCell) void {
     const stride = system.capacity.max_stitched_path_cells;
     if (stride == 0) return;
+    // stitchCorridor's cap (tier0_stitched_cell_cap or max_stitched_path_cells, both
+    // <= max_stitched_path_cells) already bounds `stitched` before this is ever called,
+    // so it is genuinely stored whole here. Assert rather than @min-and-truncate so a
+    // future drift between the solve-side cap and this stride fails loud instead of
+    // silently dead-ending the agent at the truncation point.
+    std.debug.assert(stitched.len <= stride);
     const offset = path_slot * stride;
-    const count = @min(stitched.len, stride);
-    @memcpy(system.worker_stitched_pool.items[offset .. offset + count], stitched[0..count]);
+    @memcpy(system.worker_stitched_pool.items[offset .. offset + stitched.len], stitched);
     system.solved_paths.items[pending_index].stitched_offset = offset;
-    system.solved_paths.items[pending_index].stitched_len = count;
+    system.solved_paths.items[pending_index].stitched_len = stitched.len;
 }
 
 // ----------------------------------------------------------------------------

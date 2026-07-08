@@ -87,12 +87,23 @@ pub const NavGrid = struct {
         @memset(self.components.items, no_component);
         self.blocked_count = 0;
         self.component_queue.clearRetainingCapacity();
+        // Not authoritative until markStaticBodies rebuilds it for this build: the fast
+        // path in staticBodyCoversNavCell trusts static_blocked whenever its length happens
+        // to match the current cellCount, which a stale cache from a prior build could
+        // satisfy by coincidence (e.g. an unchanged width/height). Clearing it here makes
+        // "not yet built" unconditional rather than depending on prepare() always being
+        // immediately followed by markStaticBodies in the caller.
+        self.static_blocked.clearRetainingCapacity();
     }
 
     // Marks DataSystem static collision bodies as blocked. Only level 0 consumes
     // collision bodies (the demo's entities live on the ground floor); other
-    // levels source obstacles purely from their world mask.
+    // levels source obstacles purely from their world mask. Guarded here (not just at
+    // call sites) so a caller iterating an arbitrary level set — e.g. a whole-level-dirty
+    // incremental update — can never transiently corrupt a non-zero level's live mask or
+    // permanently populate its static_blocked cache.
     pub fn markStaticBodies(self: *NavGrid, allocator: std.mem.Allocator, data: *const DataSystem) !void {
+        if (self.level != 0) return;
         const bounds = data.collisionBoundsSliceConst();
         const responses = data.collisionResponseSliceConst();
         // Build the per-cell coverage cache alongside the live mask so an incremental
@@ -169,7 +180,12 @@ pub const NavGrid = struct {
         return self.width != 0 and self.height != 0 and self.blocked.items.len == self.cellCount();
     }
 
+    // Precondition: a prepared grid (width/height != 0), i.e. valid() would report true for
+    // the mask. Every real caller resolves a NavGrid via NavGraph.grid()/rebuild(), which
+    // guarantees this (rebuild floors both dimensions to >= 1); a degenerate zero-dimension
+    // grid would underflow the `- 1` below.
     pub fn worldToCellClamped(self: *const NavGrid, value: math.Vec2) GridCell {
+        std.debug.assert(self.width != 0 and self.height != 0);
         const max_x: i32 = @intCast(self.width - 1);
         const max_y: i32 = @intCast(self.height - 1);
         const raw_x: i32 = math.floorToI32(value.x / self.cell_size);
@@ -493,7 +509,9 @@ pub const NavGrid = struct {
     }
 
     // Projects a blocked goal cell to the nearest open cell on this level within a
-    // bounded radius. Returns the open index, or null if none is reachable.
+    // bounded radius. Only tests openness, not actual reachability from any start (that
+    // is the search's job); returns the open index, or null if no open cell is found
+    // within the radius.
     pub fn projectToNearestOpen(self: *const NavGrid, cell: GridCell, radius: i32) ?usize {
         if (self.indexForCell(cell)) |index| {
             if (!self.isBlockedIndex(index)) return index;
@@ -596,6 +614,24 @@ test "pathfinding nav grid blocked set matches per-level composed mask" {
     }
     try std.testing.expect(expected_blocked > 0);
     try std.testing.expectEqual(expected_blocked, system.graph.grid(0).?.blocked_count);
+}
+
+test "pathfinding nav grid markStaticBodies is a no-op on any level but 0" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // A static body covering cell (0,0) so a level-0 call would visibly block it.
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, true);
+
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    try grid.prepare(std.testing.allocator, 1, 4, 4, 32, 4);
+
+    try grid.markStaticBodies(std.testing.allocator, &data);
+
+    // No cell was marked and the static-body coverage cache was never built (the
+    // documented "empty on non-zero levels" contract), not just left at its prior value.
+    try std.testing.expectEqual(@as(usize, 0), grid.blocked_count);
+    try std.testing.expectEqual(@as(usize, 0), grid.static_blocked.items.len);
 }
 
 test "pathfinding nav grid survives degenerate cell size and bounds" {
