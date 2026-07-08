@@ -87,6 +87,7 @@ pub const Metric = enum {
     path_group_field_rebuild_throttled,
     path_group_field_samples,
     path_max_stitch_segments,
+    path_max_distinct_group_keys,
     nav_dirty_chunks,
     nav_incremental_rebuilds,
     nav_full_relabel,
@@ -495,7 +496,7 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -507,6 +508,11 @@ const EnabledRuntimePerfLog = struct {
                 millis(pathfinding_publish_timing.averageNs()),
                 millis(pathfinding_publish_timing.max_ns),
                 self.metricValue(.path_max_stitch_segments),
+                self.metricValue(.path_group_fields_built),
+                self.metricValue(.path_group_field_reuses),
+                self.metricValue(.path_group_field_rebuild_throttled),
+                self.metricValue(.path_group_field_samples),
+                self.metricValue(.path_max_distinct_group_keys),
             },
         );
         log.debug(

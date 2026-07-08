@@ -122,26 +122,30 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_cou
         .max_group_fields = 4,
         .max_agent_budget = 4096,
         .worker_participant_count = worker_participant_count,
-        // A shared flow-field build floods the LOCAL nav grid directly (Dial's algorithm,
-        // group_field.zig) and never touches the abstract chunk-portal graph at all, unlike
-        // every individual/tier-0/tier-1 solve (solve.zig's abstractCorridor). Portal
-        // generation now consolidates contiguous open boundary runs (nav_graph.zig's
-        // discoverChunkPortals), so a single abstract solve is no longer pathologically
-        // expensive on open terrain — but it is still real, non-zero work PAID PER AGENT
-        // PER REKEY, while a shared flood is paid ONCE and amortized across however many
-        // pursuers currently share the goal. A raised threshold here (a prior pass set
-        // 1000, on the unverified assumption individual solves stay sub-millisecond
-        // regardless of terrain — never actually measured against a real pursuit-pack
-        // rekey rate) forces the demo's pursuit pack off the cheap shared-flood path and
-        // onto N duplicated abstract searches per rekey instead — worse, not better.
-        // Pinning back to a low, fixed threshold routes the pack through the flood
-        // instead, which is what pathfinding-group-field-detour-moving's benchmark
-        // comment already documents as the intended fix for this exact "water-adjacent
-        // FPS-drop" chase shape. The field's own once-unbounded build cost is now real
-        // fixed budgets (see group_field_max_cells and ensureGroupField's in-progress-
-        // build guard), so engaging it at this population is no longer the expensive
-        // side of the trade.
-        .min_group_field_agents = 8,
+        // MEASURED, not assumed (a live perf capture on this exact demo, after the
+        // portal-consolidation and group-field hardening fixes below were both already
+        // in place, over one 60-SECOND window): at population/threshold=8, the shared
+        // flow-field built ~115 times across those 60 seconds (group_fields_built ==
+        // accepted_requests, roughly one new build every 0.5s) but was NEVER actually
+        // sampled even once (group_field_samples == 0 across every single one of those
+        // builds) — 100% build cost, 0% payoff, for the whole window. Why: this demo's
+        // AI issues path requests only when an agent's CURRENT path is missing/invalid
+        // (event-driven, not a continuous per-step re-request), targeting one
+        // hysteresis-throttled shared broadcast goal. When that goal changes (roughly
+        // every 0.5s here), the resulting burst of requests is served by ONE real solve
+        // — every other requester in the burst dedups against that single IN-FLIGHT
+        // request (PathfindingSystem's pending_keys set) or, failing that, the
+        // goal-keyed result cache (default_cache_ttl_steps, far longer than this goal's
+        // own ~0.5s rekey cadence) — for FREE, before the shared field ever finishes
+        // building. This holds regardless of population size: pending-dedup absorbs the
+        // whole burst off one solve no matter how many agents share it, so a bigger
+        // crowd doesn't change the math. A shared flood only earns its cost when
+        // SIMULTANEOUS demand within one burst exceeds what a single dedup'd solve can
+        // serve — i.e. genuine mass-combat scale. 2000 sits comfortably above any
+        // population this demo produces while staying a real, considered ceiling (not
+        // "disabled") for when a battle-scale crowd feature exists; revisit with a fresh
+        // measurement, not a guess, once that feature is built.
+        .min_group_field_agents = 2000,
         // group_field_rebuild_min_steps is intentionally left at its default: the safe
         // value is an internal relationship between group_field_build_budget and this
         // throttle (both pathfinding-owned), not a demo-specific judgment call — see
@@ -1024,13 +1028,14 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.velocity_y.* = 0;
 }
 
-test "proceduralPathfindingCapacity routes the pursuit pack through the shared flow-field" {
+test "proceduralPathfindingCapacity reserves the shared flow-field for a future battle-scale crowd" {
     const capacity = proceduralPathfindingCapacity(1, 0);
-    // Low enough that the demo's ~24-32 mover pursuit pack crosses the threshold and
-    // shares one flood instead of each agent paying the abstract chunk-portal search
-    // individually — see the field's doc comment for why that search, not the field
-    // build, is the expensive path on this demo's open terrain.
-    try std.testing.expectEqual(@as(usize, 8), capacity.min_group_field_agents);
+    // Pinned so high the demo's pursuit pack can never cross it: a live capture measured
+    // the shared flood building constantly but never once being sampled at this demo's
+    // scale — pending-request dedup and the goal-keyed result cache already serve every
+    // requester in a goal-change burst off one solve, for free, regardless of population
+    // — see the field's doc comment for the measured evidence.
+    try std.testing.expectEqual(@as(usize, 2000), capacity.min_group_field_agents);
 }
 
 test "demo spawns atlas-backed moving actors" {

@@ -106,14 +106,21 @@ pub const escalated_detour_group = suite.BenchmarkGroup{
 // pack (~24 agents) declaring `.group`. This is the water-adjacent FPS-drop shape:
 // a chasing pack whose shared goal re-keys often, near a large blocked region (the
 // same wall/gap shape as escalated_detour_group). With min_group_field_agents
-// pinned to a fixed 8 (matching game_demo_state.proceduralPathfindingCapacity), the
-// pack crosses the threshold and the managed flow field (serviceGroupFields /
-// ensureGroupField) engages, so once built every re-key is answered by a field
-// sample instead of a per-agent tier-0/tier-1 A* re-solve. Measures the STEADY-STATE
-// ready-field sampling cost (build happens during untimed setup) — a regression
-// that stops the field from engaging at this population/grid combination shows up
-// here as group_fields_built no longer 0 during measurement, or group_field_samples
-// dropping below item_count.
+// pinned to a fixed 8 (this bench's own standalone override — the demo no longer
+// pins this low: a live capture measured the field building constantly but never
+// once being sampled at demo scale, since pending-dedup and the result cache
+// already serve a goal-change burst off one solve for free, so the demo now pins
+// this far above any population it has), the pack crosses the threshold and the
+// managed flow field (serviceGroupFields / ensureGroupField) engages, so once
+// built every re-key is answered by a field sample instead of a per-agent
+// tier-0/tier-1 A* re-solve. Measures the STEADY-STATE ready-field sampling cost
+// (build happens during untimed setup) — a regression that stops the field from
+// engaging at this population/grid combination shows up here as
+// group_fields_built no longer 0 during measurement, or group_field_samples
+// dropping below item_count. This exercises the MECHANISM (a warm, actually-used
+// field is cheap) in isolation; whether real gameplay ever reaches this population
+// pattern is a separate, demo-level question — see proceduralPathfindingCapacity's
+// doc comment.
 pub const group_field_detour_group = suite.BenchmarkGroup{
     .name = "pathfinding-group-field-detour",
     .defaultItemCounts = groupFieldDetourItemCounts,
@@ -1029,9 +1036,12 @@ pub fn runGroupFieldDetourCase(allocator: std.mem.Allocator, io: std.Io, options
         .max_group_fields = 4,
         .worker_participant_count = participant_count,
         .max_agent_budget = @max(item_count, 1),
-        // Fixed: mirrors the production pin in game_demo_state.proceduralPathfindingCapacity
-        // that makes this the common case for the demo's pursuit pack (see the fix this
-        // benchmark guards).
+        // Fixed low so a small item_count still exercises the field mechanism directly —
+        // this bench's own standalone override, decoupled from whatever population the
+        // demo currently pins (see game_demo_state.proceduralPathfindingCapacity's doc
+        // comment: production now reserves the field for battle-scale, not this pack
+        // size). --items overrides item_count for a direct at-scale check (verified up
+        // to 5000 agents at ~2.76ms mean, comfortably inside a 6ms frame budget).
         .min_group_field_agents = 8,
     });
     try system.rebuildStaticNavGrid(&fixture.data, world_extent, world_extent, 32.0);

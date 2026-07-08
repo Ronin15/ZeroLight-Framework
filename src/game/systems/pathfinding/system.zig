@@ -825,6 +825,11 @@ pub const PathfindingSystem = struct {
         var group_timer = PhaseTimer.begin();
         self.serviceGroupFields(stats);
         stats.group_service_ns = group_timer.lap();
+        // Diagnostic only: how many DISTINCT group keys were tallied this step, after
+        // decay/compaction. Distinguishes "one goal whose build never catches up" (this
+        // stays 1) from "several competing goals thrashing the group_fields slot table"
+        // (this stays near/above max_group_fields) when reading a live capture.
+        stats.distinct_group_keys = self.group_requests.items.len;
         return self.effectiveSolveLimit(config);
     }
 

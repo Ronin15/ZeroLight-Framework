@@ -550,6 +550,10 @@ pub const PathfindingStats = struct {
     // fixed max_stitch_segments cap is what's bounding solve cost" (this stays pinned at
     // or near the cap every spike) from "some other cost dominates" (this stays low).
     max_stitch_segments_observed: usize = 0,
+    // Diagnostic only: distinct group keys tallied this step, after decay/compaction —
+    // see beginSolve's doc comment for why this distinguishes the two group-cost failure
+    // shapes a live perf capture can't otherwise tell apart.
+    distinct_group_keys: usize = 0,
     fallback_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
