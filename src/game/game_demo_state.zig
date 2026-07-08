@@ -38,6 +38,8 @@ const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
+const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
+const estimateTriggerCapacity = @import("systems/collision_response.zig").estimateTriggerCapacity;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -57,11 +59,28 @@ const c = @import("../platform/sdl.zig").c;
 /// Smallest demo patch that still covers dig/nav tests (cells through 7x7).
 const demo_test_viewport_width: f32 = 256;
 const demo_test_viewport_height: f32 = 256;
-const test_square_count = 32;
-const surface_demo_mover_count = 24;
+// Battle-scale exercise (see game_demo_state's pathfinding capacity doc comment for the
+// group-field threshold this is sized to comfortably cross): was 32.
+const test_square_count = 2048;
+const surface_demo_mover_count = 1536;
 const underground_demo_mover_count = test_square_count - surface_demo_mover_count;
 const obstacle_count = 4;
-const demo_contact_capacity = 128;
+// Owned by CollisionSystem (this demo has no independent opinion on worst-case
+// simultaneous contacts for N bodies — that's collision's own domain knowledge, not a
+// ratio to guess here). A contact-stream overflow is a graceful, counted drop
+// (RangeOutputStream.stats.dropped), not a crash, so an approximation is fine.
+const demo_contact_capacity = CollisionSystem.estimateContactCapacity(test_square_count + obstacle_count + 1);
+// Every steering agent emits one navigation intent per step unconditionally (unlike path
+// REQUESTS, which are sparse/event-driven) — this must cover the full population, not an
+// independent guess. Previously a bare `32` passed inline at the reserveStreams call site
+// that happened to equal the OLD test_square_count by coincidence, not by reference — see
+// that call site's history: this is exactly the kind of stale-magic-number footgun a
+// future population bump should not have to rediscover.
+const demo_intent_capacity = test_square_count + obstacle_count + 1;
+// Owned by collision_response (a trigger event requires an underlying contact, so
+// trigger count is bounded by contact count — collision_response's own domain
+// knowledge, not a second independent ratio for this demo to guess).
+const demo_collision_trigger_capacity = estimateTriggerCapacity(demo_contact_capacity);
 const demo_structural_reserve = test_square_count + 16;
 /// Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining
 /// event and every structural-commit event shares this one budget for the step
@@ -79,9 +98,11 @@ const demo_structural_reserve = test_square_count + 16;
 /// entity carries `AiAffect` yet, and `affect_max_events_per_step` is set to
 /// 0 below.
 const demo_event_reserve = test_square_count + 1 + 1 + demo_structural_reserve + 1;
-/// Per-step audio bound for demo tests: 32 movers can emit collision SFX alongside
-/// ambient music, listener, and the player jet loop.
-const demo_test_audio_capacity = 64;
+/// Per-step audio bound for demo tests: movers can emit collision SFX alongside
+/// ambient music, listener, and the player jet loop. Not scaled 1:1 with
+/// test_square_count — concurrent AUDIBLE sounds have a natural ceiling far below the
+/// mover count, so this stays a fixed, generous-but-bounded budget.
+const demo_test_audio_capacity = 256;
 const procedural_world_width_tiles: u16 = 256; //512
 const procedural_world_height_tiles: u16 = 256; //512
 /// Surface + underground dense floors for the procedural 32-level mine (runtime load).
@@ -306,7 +327,7 @@ pub const GameDemoState = struct {
         // each `appendRequired`-style call consumes one range, so it must cover the
         // largest per-step range consumer — events (`demo_event_reserve`), not a flat
         // constant unrelated to that budget.
-        try simulation_frame.reserveStreams(demo_event_reserve, demo_event_reserve, 32, demo_contact_capacity, 32, demo_structural_reserve);
+        try simulation_frame.reserveStreams(demo_event_reserve, demo_event_reserve, demo_intent_capacity, demo_contact_capacity, demo_collision_trigger_capacity, demo_structural_reserve);
         try simulation_frame.reservePathRequests(16, test_square_count);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = test_square_count,
@@ -552,8 +573,8 @@ fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
 fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId) ![test_square_count]EntityId {
     if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(data, world);
     var entities: [test_square_count]EntityId = undefined;
-    const cols: usize = 6;
-    const rows: usize = 4;
+    const cols: usize = 48;
+    const rows: usize = 32;
     comptime std.debug.assert(surface_demo_mover_count == cols * rows);
 
     var index: usize = 0;
@@ -577,17 +598,6 @@ fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_s
         entities[index] = try spawnDemoMover(data, world, spec, index);
     }
 
-    const underground_cells = [_]SpawnCellCoord{
-        .{ .x = 40, .y = 40 },
-        .{ .x = 48, .y = 44 },
-        .{ .x = 52, .y = 52 },
-        .{ .x = 60, .y = 56 },
-        .{ .x = 44, .y = 64 },
-        .{ .x = 56, .y = 72 },
-        .{ .x = 64, .y = 80 },
-        .{ .x = 72, .y = 88 },
-    };
-    comptime std.debug.assert(underground_demo_mover_count == underground_cells.len);
     const underground_enabled = world.width >= 128 and world.height >= 128;
 
     while (index < test_square_count) : (index += 1) {
@@ -596,7 +606,7 @@ fn spawnTestSquares(data: *DataSystem, world: *WorldSystem, tunnel_tile: world_s
         const size: math.Vec2 = .{ .x = 22, .y = 22 };
         const spec = if (underground_enabled) blk: {
             const level = undergroundSpawnLevelForIndex(world, underground_index);
-            const cell = underground_cells[underground_index];
+            const cell = undergroundSpawnCellForIndex(underground_index);
             try carveUndergroundSpawnPocket(world, tunnel_tile, level, cell);
             break :blk DemoSpawnSpec{
                 .position = .{
@@ -700,6 +710,24 @@ fn undergroundSpawnLevelForIndex(world: *const WorldSystem, underground_index: u
     if (max_underground == 0) return 0;
     const slot = (underground_index * max_underground + (underground_demo_mover_count - 1)) / underground_demo_mover_count;
     return @intCast(1 + @min(slot, max_underground - 1));
+}
+
+// Grid dimensions covering every underground mover exactly once (cols * rows ==
+// underground_demo_mover_count), so every index gets a distinct cell — no two movers
+// carve/spawn at the same coordinate, regardless of which level undergroundSpawnLevelForIndex
+// happens to assign them to.
+const underground_spawn_cols: usize = 32;
+comptime {
+    std.debug.assert(underground_spawn_cols * (underground_demo_mover_count / underground_spawn_cols) == underground_demo_mover_count);
+}
+
+/// Procedural replacement for a hand-picked coordinate list (infeasible past a handful of
+/// movers): a simple grid starting at (40,40), stepping 4 tiles per column/row, comfortably
+/// inside any world this demo builds (procedural_world_width/height_tiles == 256).
+fn undergroundSpawnCellForIndex(underground_index: usize) SpawnCellCoord {
+    const col = underground_index % underground_spawn_cols;
+    const row = underground_index / underground_spawn_cols;
+    return .{ .x = @intCast(40 + col * 4), .y = @intCast(40 + row * 4) };
 }
 
 fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.TileId, level: u16, cell: SpawnCellCoord) !void {
@@ -1781,11 +1809,11 @@ test "demo event capacity covers every NPC falling plus player fall, mining, str
     // fall (1) and dig-mining event (1), plus up to `demo_structural_reserve`
     // structural-commit events, plus the post-commit nav-invalidation headroom (1).
     //
-    // The 83 below is a hard-coded expectation, not `test_square_count + 1 + 1 +
+    // The 4115 below is a hard-coded expectation, not `test_square_count + 1 + 1 +
     // demo_structural_reserve + 1` re-derived: re-deriving it here would make this
     // assertion pass trivially even if that formula (or `demo_event_reserve` itself)
     // drifted, since both sides would drift together. A literal catches that.
-    const worst_case_event_count: usize = 83;
+    const worst_case_event_count: usize = 4115;
     try std.testing.expectEqual(worst_case_event_count, demo_event_reserve);
 
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;
