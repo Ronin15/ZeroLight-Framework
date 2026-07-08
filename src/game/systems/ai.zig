@@ -48,6 +48,12 @@ const NeighborVisitResult = spatial_index.NeighborVisitResult;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
+/// Fixed hysteresis distance for the demo's live-player chase: 1.75x
+/// pathfinding's nav cell size (`pathfinding/types.zig`'s `default_cell_size`
+/// == 32.0), not derived from world/map size. See
+/// `AiConfig.goal_requantization_hysteresis_distance`.
+pub const default_goal_requantization_hysteresis_distance: f32 = 56.0;
+
 pub const HotF32Slice = []f32;
 
 fn hotStoreCapacity(min_len: usize) usize {
@@ -65,11 +71,20 @@ const AiGatherRow = struct {
     sep_y: f32,
     separation_neighbor_count: u8,
     separation_candidate_count: u16,
-    /// Per-row seek target, resolved once at gather time (see `resolveRowTarget`):
-    /// the broadcast default unless perception reports the target not visible
-    /// and fresh `AiMemory` overrides it.
+    /// Per-row goal target, resolved once at gather time (see `resolveRowTarget`):
+    /// feeds the path-request `.goal`. The hysteresis-requantized broadcast
+    /// default unless perception reports the target not visible and fresh
+    /// `AiMemory` overrides it.
     target_x: f32,
     target_y: f32,
+    /// Per-row RAW (non-requantized) seek target, resolved once at gather time
+    /// (see `resolveRowTarget`): feeds only `decideDir`'s fallback direct-
+    /// steering term, so no-path/pending agents track the live target
+    /// instantly instead of the throttled path-request goal. Falls back to the
+    /// same `AiMemory` last-known position as `target_x`/`target_y` when
+    /// perception reports the target cold.
+    direct_target_x: f32,
+    direct_target_y: f32,
 };
 
 fn appendAiGatherRow(
@@ -129,6 +144,16 @@ pub const AiConfig = struct {
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
     seek_target: ?math.Vec2 = null,
+    /// Fixed distance (world units) the live broadcast target (`seek_target`/
+    /// center-of-mass) must move from the last reported goal before that goal
+    /// snaps to the new position. 0 (default) snaps every step — exact instant
+    /// tracking, preserving pre-hysteresis behavior. Nonzero throttles how
+    /// often a shared `.group` path goal re-keys (see
+    /// `default_goal_requantization_hysteresis_distance`), since local
+    /// separation/steering closes the small gap between path updates. Applies
+    /// only to the broadcast default target; `resolveRowTarget`'s per-row
+    /// perception/memory retarget is unaffected.
+    goal_requantization_hysteresis_distance: f32 = 0,
     /// Current perception state, consulted per-row to detect a cold (not
     /// currently visible) seek target. Null always uses `seek_target`/center-of-mass.
     perception_slice: ?ConstPerceptionSlice = null,
@@ -163,6 +188,10 @@ pub const AiSystem = struct {
     rows: std.MultiArrayList(AiGatherRow) = .{},
     separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    // Broadcast goal-requantization state (see `requantizeGoal`); one scalar
+    // pair since every default-target row shares this same broadcast value.
+    snapped_goal: AiDir = .{ .x = 0, .y = 0 },
+    snapped_goal_initialized: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
@@ -189,8 +218,9 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
-        const default_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, default_target, config.perception_slice, config.memory_slice);
+        const live_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        const goal_target = self.requantizeGoal(live_target, config.goal_requantization_hysteresis_distance);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
@@ -261,6 +291,8 @@ pub const AiSystem = struct {
             .navigation_intents = navigation_stream,
             .target_x = gathered.items(.target_x),
             .target_y = gathered.items(.target_y),
+            .direct_target_x = gathered.items(.direct_target_x),
+            .direct_target_y = gathered.items(.direct_target_y),
             .seed = system_config.intent_seed,
             .wander_step = wander_step,
             .nav_request_kind = system_config.nav_request_kind,
@@ -307,8 +339,9 @@ pub const AiSystem = struct {
         config: AiConfig,
     ) !AiStats {
         _ = delta_seconds;
-        const default_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, default_target, config.perception_slice, config.memory_slice);
+        const live_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
+        const goal_target = self.requantizeGoal(live_target, config.goal_requantization_hysteresis_distance);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         self.resetSeparationScratch();
@@ -324,6 +357,8 @@ pub const AiSystem = struct {
         const sep_y = gathered.items(.sep_y);
         const target_x = gathered.items(.target_x);
         const target_y = gathered.items(.target_y);
+        const direct_target_x = gathered.items(.direct_target_x);
+        const direct_target_y = gathered.items(.direct_target_y);
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
@@ -338,8 +373,8 @@ pub const AiSystem = struct {
                 behaviors[i],
                 pos_x[i],
                 pos_y[i],
-                target_x[i],
-                target_y[i],
+                direct_target_x[i],
+                direct_target_y[i],
                 wander_amplitudes[i],
                 seek_weights[i],
                 config.intent_seed,
@@ -389,7 +424,8 @@ pub const AiSystem = struct {
         movement: ConstMovementBodySlice,
         data: *const DataSystem,
         scope_dense_indices: ?[]const u32,
-        default_target: AiDir,
+        live_target: AiDir,
+        goal_target: AiDir,
         perception_slice: ?ConstPerceptionSlice,
         memory_slice: ?ConstAiMemorySlice,
     ) !void {
@@ -410,7 +446,7 @@ pub const AiSystem = struct {
             const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
             const ent = ai_slice.entities[i];
             const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            const row_target = resolveRowTarget(ent, default_target, data, perception_slice, memory_slice);
+            const row_target = resolveRowTarget(ent, live_target, goal_target, data, perception_slice, memory_slice);
             appendAiGatherRow(&self.rows, &row_slice, .{
                 .entity = ent,
                 .pos_x = movement.previous_x[mi],
@@ -422,14 +458,27 @@ pub const AiSystem = struct {
                 .sep_y = 0,
                 .separation_neighbor_count = 0,
                 .separation_candidate_count = 0,
-                .target_x = row_target.x,
-                .target_y = row_target.y,
+                .target_x = row_target.goal.x,
+                .target_y = row_target.goal.y,
+                .direct_target_x = row_target.direct.x,
+                .direct_target_y = row_target.direct.y,
             });
         }
     }
 
     fn clearWork(self: *AiSystem) void {
         self.rows.clearRetainingCapacity();
+    }
+
+    /// Requantizes the broadcast seek target with fixed-distance hysteresis
+    /// (`AiConfig.goal_requantization_hysteresis_distance`) by delegating to
+    /// `computeRequantizedGoal` (the pure comparison, also exercised directly
+    /// by `zig build bench`) and persisting its result.
+    fn requantizeGoal(self: *AiSystem, live: AiDir, hysteresis_distance: f32) AiDir {
+        const result = computeRequantizedGoal(self.snapped_goal, self.snapped_goal_initialized, live, hysteresis_distance);
+        self.snapped_goal = result.goal;
+        self.snapped_goal_initialized = result.initialized;
+        return result.goal;
     }
 
     /// Zeroes this step's separation accumulator columns. No longer builds a
@@ -593,29 +642,56 @@ fn computeTargetCenter(movement: ConstMovementBodySlice) AiDir {
     return .{ .x = sum_x * inv, .y = sum_y * inv };
 }
 
-/// Per-row seek-target resolution. Returns `default_target` (the broadcast
-/// `seek_target`/center-of-mass value) unless perception reports the target
+const RowTarget = struct { direct: AiDir, goal: AiDir };
+
+/// Per-row seek-target resolution. Returns `live_target`/`goal_target`
+/// unchanged (the "warm" case) unless perception reports the target
 /// currently not visible and `AiMemory` still holds a valid, fresh last-known
-/// position (`staleness < max_ai_memory_staleness`), in which case it retargets
-/// toward that remembered position instead.
+/// position (`staleness < max_ai_memory_staleness`), in which case BOTH
+/// outputs retarget toward that remembered position — the cold-target
+/// decision is unaffected by goal-requantization hysteresis, only which warm
+/// value each consumer sees. `direct` feeds `decideDir`'s fallback steering
+/// term (must track the raw live target instantly); `goal` feeds the
+/// path-request `.goal` (the hysteresis-throttled value).
 fn resolveRowTarget(
     entity: EntityId,
-    default_target: AiDir,
+    live_target: AiDir,
+    goal_target: AiDir,
     data: *const DataSystem,
     perception_slice: ?ConstPerceptionSlice,
     memory_slice: ?ConstAiMemorySlice,
-) AiDir {
-    const perception = perception_slice orelse return default_target;
-    const memory = memory_slice orelse return default_target;
-    const perception_index = data.aiPerceptionDenseIndex(entity) orelse return default_target;
-    if (perception.target_visible[perception_index]) return default_target;
-    const memory_index = data.aiMemoryDenseIndex(entity) orelse return default_target;
-    if (!memory.last_known_target[memory_index].isValid()) return default_target;
-    if (memory.staleness[memory_index] >= max_ai_memory_staleness) return default_target;
-    return .{ .x = memory.last_known_x[memory_index], .y = memory.last_known_y[memory_index] };
+) RowTarget {
+    const warm = RowTarget{ .direct = live_target, .goal = goal_target };
+    const perception = perception_slice orelse return warm;
+    const memory = memory_slice orelse return warm;
+    const perception_index = data.aiPerceptionDenseIndex(entity) orelse return warm;
+    if (perception.target_visible[perception_index]) return warm;
+    const memory_index = data.aiMemoryDenseIndex(entity) orelse return warm;
+    if (!memory.last_known_target[memory_index].isValid()) return warm;
+    if (memory.staleness[memory_index] >= max_ai_memory_staleness) return warm;
+    const remembered = AiDir{ .x = memory.last_known_x[memory_index], .y = memory.last_known_y[memory_index] };
+    return .{ .direct = remembered, .goal = remembered };
 }
 
-const AiDir = struct { x: f32, y: f32 };
+pub const AiDir = struct { x: f32, y: f32 };
+
+pub const RequantizedGoal = struct { goal: AiDir, initialized: bool };
+
+/// Pure snap/hold comparison behind `AiSystem.requantizeGoal`: holds `current`
+/// unless `live` has moved past `hysteresis` from it, in which case it snaps
+/// to `live`. Zero hysteresis or `!initialized` always snaps. Exposed (and
+/// kept pure) so `zig build bench`'s hysteresis case calls the real
+/// comparison instead of a hand-duplicated copy.
+pub fn computeRequantizedGoal(current: AiDir, initialized: bool, live: AiDir, hysteresis: f32) RequantizedGoal {
+    if (hysteresis <= 0 or !initialized) {
+        return .{ .goal = live, .initialized = true };
+    }
+    const delta = math.Vec2{ .x = live.x - current.x, .y = live.y - current.y };
+    if (math.lengthSquared(delta) > hysteresis * hysteresis) {
+        return .{ .goal = live, .initialized = true };
+    }
+    return .{ .goal = current, .initialized = true };
+}
 
 fn decideDir(
     behavior: AiBehavior,
@@ -756,11 +832,17 @@ const AiJobContext = struct {
     sep_x: []const f32,
     sep_y: []const f32,
     navigation_intents: *RangeOutputStream(NavigationIntent),
-    /// Per-row resolved seek target (see `resolveRowTarget`), not a broadcast
+    /// Per-row resolved goal target (see `resolveRowTarget`), not a broadcast
     /// scalar: each row may independently fall back to its `AiMemory`
-    /// last-known position when its perception target has gone cold.
+    /// last-known position when its perception target has gone cold. Feeds
+    /// the path-request `.goal` only; hysteresis-throttled.
     target_x: []const f32,
     target_y: []const f32,
+    /// Per-row resolved RAW (non-requantized) seek target (see
+    /// `resolveRowTarget`); feeds only `decideDir`'s fallback direct-steering
+    /// term, so it tracks the live target instantly.
+    direct_target_x: []const f32,
+    direct_target_y: []const f32,
     seed: u64,
     /// Pre-quantized wander epoch (`step / wander_resample_period_steps`,
     /// computed once by the caller), not the raw fixed-step counter.
@@ -777,8 +859,8 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.behaviors[i],
             job.pos_x[i],
             job.pos_y[i],
-            job.target_x[i],
-            job.target_y[i],
+            job.direct_target_x[i],
+            job.direct_target_y[i],
             job.wander_amplitudes[i],
             job.seek_weights[i],
             job.seed,
@@ -838,6 +920,8 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.separation_candidate_count).len);
     try std.testing.expectEqual(count, s.items(.target_x).len);
     try std.testing.expectEqual(count, s.items(.target_y).len);
+    try std.testing.expectEqual(count, s.items(.direct_target_x).len);
+    try std.testing.expectEqual(count, s.items(.direct_target_y).len);
 }
 
 test "ai gather rows keep MAL columns compact after gather" {
@@ -921,6 +1005,155 @@ test "ai processor emits deterministic NavigationIntent for same seed" {
     const other = frame.navigation_intents.mergedItems();
     // Not strictly required different but for coverage; allow equal only if degenerate
     _ = other;
+}
+
+test "ai goal requantization: zero hysteresis snaps to the live target every step" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .seek_weight = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 3, 0, 0, 0);
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 100 },
+    });
+    const goal_a = frame.navigation_intents.mergedItems()[0].goal;
+    try std.testing.expectEqual(@as(f32, 100), goal_a.x);
+    try std.testing.expectEqual(@as(f32, 100), goal_a.y);
+    frame.phase = .finished;
+
+    // Even a tiny displacement snaps immediately with the default (0) hysteresis.
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 105, .y = 100 },
+    });
+    const goal_b = frame.navigation_intents.mergedItems()[0].goal;
+    try std.testing.expectEqual(@as(f32, 105), goal_b.x);
+    try std.testing.expectEqual(@as(f32, 100), goal_b.y);
+    frame.phase = .finished;
+}
+
+test "ai goal requantization: nonzero hysteresis holds the goal until displacement exceeds it" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .seek_weight = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    const hysteresis: f32 = 50;
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 100 },
+        .goal_requantization_hysteresis_distance = hysteresis,
+    });
+    const first_goal = frame.navigation_intents.mergedItems()[0].goal;
+    try std.testing.expectEqual(@as(f32, 100), first_goal.x);
+    try std.testing.expectEqual(@as(f32, 100), first_goal.y);
+    frame.phase = .finished;
+
+    // 20px displacement stays under the 50px threshold: goal holds.
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 120, .y = 100 },
+        .goal_requantization_hysteresis_distance = hysteresis,
+    });
+    const held_goal = frame.navigation_intents.mergedItems()[0].goal;
+    try std.testing.expectEqual(first_goal.x, held_goal.x);
+    try std.testing.expectEqual(first_goal.y, held_goal.y);
+    frame.phase = .finished;
+
+    // 100px displacement from the held goal clears the 50px threshold: goal snaps.
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 200, .y = 100 },
+        .goal_requantization_hysteresis_distance = hysteresis,
+    });
+    const snapped_goal = frame.navigation_intents.mergedItems()[0].goal;
+    try std.testing.expectEqual(@as(f32, 200), snapped_goal.x);
+    try std.testing.expectEqual(@as(f32, 100), snapped_goal.y);
+    frame.phase = .finished;
+}
+
+test "ai goal requantization: decideDir's fallback direct-direction tracks the raw live target, not the held goal" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const e0 = try data.createEntity();
+    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(e0, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    // Larger than the displacement between the two live targets below, so the
+    // path-request goal stays held across both steps.
+    const hysteresis: f32 = 1000;
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 100, .y = 0 },
+        .goal_requantization_hysteresis_distance = hysteresis,
+    });
+    const first = frame.navigation_intents.mergedItems()[0];
+    try std.testing.expectEqual(@as(f32, 100), first.goal.x);
+    try std.testing.expectEqual(@as(f32, 0), first.goal.y);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), first.direct_direction_x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), first.direct_direction_y, 1e-4);
+    frame.phase = .finished;
+
+    // Live target swings 90 degrees; displacement (~141px) stays under the
+    // 1000px hysteresis so the goal holds, but the fallback direct-direction
+    // term must still track the new live target instantly.
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .seek_target = .{ .x = 0, .y = 100 },
+        .goal_requantization_hysteresis_distance = hysteresis,
+    });
+    const second = frame.navigation_intents.mergedItems()[0];
+    try std.testing.expectEqual(first.goal.x, second.goal.x);
+    try std.testing.expectEqual(first.goal.y, second.goal.y);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), second.direct_direction_x, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), second.direct_direction_y, 1e-4);
+    frame.phase = .finished;
 }
 
 test "ai processor appends navigation intents without clearing existing stream output" {
@@ -1584,7 +1817,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
 
     const ai_entities = ai_sys.rows.slice().items(.entity);
@@ -1657,7 +1890,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -1758,7 +1991,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();

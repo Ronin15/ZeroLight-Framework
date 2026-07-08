@@ -122,6 +122,21 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize) PathfindingCap
         .max_group_fields = 4,
         .max_agent_budget = 4096,
         .worker_participant_count = worker_participant_count,
+        // Fixed: pins the shared-goal flow-field threshold below the demo's ~24-mover
+        // pursuit pack so it engages instead of the derived (grid-scaled) threshold,
+        // which is dead at this population. See types.zig min_group_field_agents.
+        .min_group_field_agents = 8,
+        // Fixed: the default (30 steps) exceeds the fastest real re-key cadence, so a
+        // chasing pack's shared goal (re-keyed whenever the player crosses a nav cell)
+        // always finds the field "stale" and throttled, and it never rebuilds again —
+        // group_field_samples stays 0 forever after the first goal. Player speed 120px/s
+        // (player.zig) crossing a 32px nav cell (types.zig default_cell_size) at 60Hz
+        // re-keys every 32/120*60 = 16 steps in the worst case (straight-line crossing).
+        // 8 is half that, leaving headroom for the rebuild to trigger promptly after a
+        // rekey while still clearing GroupField's budgeted fill (measured ~9 steps to
+        // `.ready` at this grid's scale and group_field_build_budget=8192 cells/step) well
+        // before the next rekey. See pathfinding-group-field-detour-moving bench.
+        .group_field_rebuild_min_steps = 8,
     };
     cap.max_nav_memory_bytes = nav_memory.autoSizedMaxNavMemoryBytes(cap, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles);
     return cap;
@@ -1017,6 +1032,16 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.previous_y.* = isolate_y;
     player_body.velocity_x.* = 0;
     player_body.velocity_y.* = 0;
+}
+
+test "proceduralPathfindingCapacity pins the group-field engagement thresholds" {
+    const capacity = proceduralPathfindingCapacity(1);
+    // Below the derived (grid-scaled) threshold, which goes dead at the demo's pursuit-pack
+    // population — see the field's doc comment.
+    try std.testing.expectEqual(@as(usize, 8), capacity.min_group_field_agents);
+    // Below the fastest real re-key cadence (16 steps), so a chasing pack's shared goal
+    // rebuild is never permanently throttled — see the field's doc comment.
+    try std.testing.expectEqual(@as(u32, 8), capacity.group_field_rebuild_min_steps);
 }
 
 test "demo spawns atlas-backed moving actors" {

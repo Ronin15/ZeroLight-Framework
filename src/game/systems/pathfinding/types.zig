@@ -382,7 +382,8 @@ pub const PathfindingCapacity = struct {
     group_field_rebuild_min_steps: u32 = default_group_field_rebuild_min_steps,
     group_field_build_budget: usize = default_group_field_build_budget,
     // Pins the group-field threshold when non-zero; 0 derives it from grid size (see
-    // groupFieldThreshold). Non-zero is for tests exercising field mechanics.
+    // groupFieldThreshold). Production pins this too: a derived threshold scales with
+    // grid size and goes dead when the map is large relative to the mover count.
     min_group_field_agents: usize = default_min_group_field_agents,
     // Elastic capacity ceiling (the only fixed capacity number). Live capacity
     // tracks the agent count up to this, then requests follow dropped_requests.

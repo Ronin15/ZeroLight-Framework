@@ -26,6 +26,7 @@ const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const default_goal_requantization_hysteresis_distance = @import("systems/ai.zig").default_goal_requantization_hysteresis_distance;
 const AiMemoryStats = @import("systems/ai_memory.zig").AiMemoryStats;
 const AiMemorySystem = @import("systems/ai_memory.zig").AiMemorySystem;
 const AffectStats = @import("systems/affect.zig").AffectStats;
@@ -681,6 +682,12 @@ pub const SimulationPipeline = struct {
             .intent_seed = 0xfeedf00d,
             .step = self.scope.currentStep(),
             .seek_target = player_target,
+            // Throttles how often the shared goal re-keys as the player moves
+            // continuously, since local separation/steering closes the small
+            // gap between path updates. Without this, the goal re-keys (and
+            // triggers one bounded escalated solve) roughly every nav cell
+            // the player crosses.
+            .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
             // Every demo agent seeks the moving player: the canonical shared goal.
             // Declaring group mode routes them through one managed flow field
             // toward the player's nav cell instead of N individual A* solves.
