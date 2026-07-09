@@ -85,14 +85,24 @@ void main() {
 
     // Soft contact-shadow on the rim of the surface tile where it overhangs a
     // hole (a neighboring cell whose topmost layer is empty) — reads as a cast
-    // shadow, not a colored highlight. Only applies to the surface tile itself
-    // (resolved_depth == 0); the tile visible through the hole is left alone.
-    // Deliberately not screen-space-derivative-based (fwidth on a value that is
-    // constant per-cell and jumps hard at cell edges depends on where that edge
-    // falls relative to the GPU's 2x2 derivative quads, which shifts with camera
-    // pan — it fired inconsistently). Reading the neighbor cells' actual tile
-    // data directly is deterministic regardless of camera position.
-    if (resolved_depth == 0 && layer_count > 0) {
+    // shadow, not a colored highlight. Only applies to the world's true topmost
+    // tile: `resolved_depth == 0` alone means "topmost within this draw's own
+    // composited window", which is NOT the same thing when the CPU split the
+    // dense stack into more than one composite draw this frame (host-side
+    // `partitionDenseCompositeBuckets`/`collectDenseInterleaveDepths`) — a
+    // deeper draw's own resolved_depth 0 can be a tile only visible because a
+    // shallower draw is a hole here, i.e. exactly the "tile visible through the
+    // hole is left alone" case, not the surface case. `layer_meta.y` is set by
+    // the host only for the one composite draw holding the frame's actual
+    // shallowest submitted layer (`Renderer.TilemapWindowLayers.is_shallowest_bucket`),
+    // so gating on both keeps this stable regardless of how the CPU happened to
+    // bucket the draws this frame. Deliberately not screen-space-derivative-based
+    // (fwidth on a value that is constant per-cell and jumps hard at cell edges
+    // depends on where that edge falls relative to the GPU's 2x2 derivative
+    // quads, which shifts with camera pan — it fired inconsistently). Reading
+    // the neighbor cells' actual tile data directly is deterministic regardless
+    // of camera position.
+    if (resolved_depth == 0 && layer_count > 0 && tm.layer_meta.y != 0) {
         uint top_layer_offset = tm.layer_offsets[0][0];
         const float rim_margin = 0.28;
         // Subtractive, not multiplicative: this tileset's floor/cave tiles sit at

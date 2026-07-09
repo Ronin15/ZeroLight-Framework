@@ -148,6 +148,14 @@ pub const AiConfig = struct {
     /// of all movement bodies. This makes "seek" chase a specific target (e.g. the player)
     /// rather than causing mutual attraction and clumping among multiple seekers.
     seek_target: ?math.Vec2 = null,
+    /// EntityId backing `seek_target`, when the live target represents one
+    /// specific entity (e.g. the demo's player). `resolveRowTarget` compares
+    /// this against a cold row's `AiMemory.last_known_target` before trusting
+    /// the remembered position as a substitute for the live goal, so memory
+    /// of some OTHER entity never snaps a row toward it. Null skips that
+    /// identity check (legacy behavior) — the right default when `seek_target`
+    /// itself has no single backing entity (e.g. the center-of-mass fallback).
+    seek_entity: ?EntityId = null,
     /// Fixed distance (world units) the live broadcast target (`seek_target`/
     /// center-of-mass) must move from the last reported goal before that goal
     /// snaps to the new position. 0 (default) snaps every step — exact instant
@@ -224,7 +232,7 @@ pub const AiSystem = struct {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
         const live_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
         const goal_target = self.requantizeGoal(live_target, config.goal_requantization_hysteresis_distance);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.perception_slice, config.memory_slice);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.seek_entity, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
@@ -346,7 +354,7 @@ pub const AiSystem = struct {
         _ = delta_seconds;
         const live_target = if (config.seek_target) |t| AiDir{ .x = t.x, .y = t.y } else computeTargetCenter(movement);
         const goal_target = self.requantizeGoal(live_target, config.goal_requantization_hysteresis_distance);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.perception_slice, config.memory_slice);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, live_target, goal_target, config.seek_entity, config.perception_slice, config.memory_slice);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         self.resetSeparationScratch();
@@ -432,6 +440,7 @@ pub const AiSystem = struct {
         scope_dense_indices: ?[]const u32,
         live_target: AiDir,
         goal_target: AiDir,
+        seek_entity: ?EntityId,
         perception_slice: ?ConstPerceptionSlice,
         memory_slice: ?ConstAiMemorySlice,
     ) !void {
@@ -452,7 +461,7 @@ pub const AiSystem = struct {
             const i: usize = if (scope_dense_indices) |idx| idx[k] else k;
             const ent = ai_slice.entities[i];
             const mi = data.movementBodyDenseIndex(ent) orelse continue;
-            const row_target = resolveRowTarget(ent, live_target, goal_target, data, perception_slice, memory_slice);
+            const row_target = resolveRowTarget(ent, live_target, goal_target, seek_entity, data, perception_slice, memory_slice);
             appendAiGatherRow(&self.rows, &row_slice, .{
                 .entity = ent,
                 .pos_x = movement.previous_x[mi],
@@ -665,10 +674,18 @@ const RowTarget = struct { direct: AiDir, goal: AiDir, cold: bool };
 /// not a shared broadcast), so it must never be declared as a `.group`
 /// request alongside genuinely warm, actually-shared rows — see
 /// AiJobContext.nav_request_kind's doc comment for why.
+///
+/// `seek_entity`, when provided, must match `AiMemory.last_known_target`
+/// before the remembered position is trusted: memory of some OTHER entity
+/// (e.g. a different hostile-stance target this agent glimpsed earlier) is
+/// not a valid stand-in for the live goal's entity, even if it is fresh and
+/// valid. Null `seek_entity` skips this check (no single entity backs the
+/// live target to compare against).
 fn resolveRowTarget(
     entity: EntityId,
     live_target: AiDir,
     goal_target: AiDir,
+    seek_entity: ?EntityId,
     data: *const DataSystem,
     perception_slice: ?ConstPerceptionSlice,
     memory_slice: ?ConstAiMemorySlice,
@@ -679,10 +696,18 @@ fn resolveRowTarget(
     const perception_index = data.aiPerceptionDenseIndex(entity) orelse return warm;
     if (perception.target_visible[perception_index]) return warm;
     const memory_index = data.aiMemoryDenseIndex(entity) orelse return warm;
-    if (!memory.last_known_target[memory_index].isValid()) return warm;
+    const remembered_entity = memory.last_known_target[memory_index];
+    if (!remembered_entity.isValid()) return warm;
     if (memory.staleness[memory_index] >= max_ai_memory_staleness) return warm;
+    if (seek_entity) |wanted| {
+        if (!entityIdsEqual(remembered_entity, wanted)) return warm;
+    }
     const remembered = AiDir{ .x = memory.last_known_x[memory_index], .y = memory.last_known_y[memory_index] };
     return .{ .direct = remembered, .goal = remembered, .cold = true };
+}
+
+fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
+    return lhs.index == rhs.index and lhs.generation == rhs.generation;
 }
 
 pub const AiDir = struct { x: f32, y: f32 };
@@ -1833,7 +1858,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null, null);
     try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
 
     const ai_entities = ai_sys.rows.slice().items(.entity);
@@ -1906,7 +1931,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -2007,7 +2032,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, .{ .x = 0, .y = 0 }, .{ .x = 0, .y = 0 }, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();

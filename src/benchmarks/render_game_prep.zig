@@ -493,6 +493,11 @@ fn emitPreparedDraw(
     }
 }
 
+/// How far `initFixture` got building `Fixture`'s heap-owning fields, in
+/// construction order. Backs the single consolidated `errdefer` in
+/// `initFixture` that unwinds everything built so far on any later failure.
+const InitStage = enum(u8) { scene_prep, tileset_meta, world };
+
 fn initFixture(
     fixture: *Fixture,
     allocator: std.mem.Allocator,
@@ -521,23 +526,32 @@ fn initFixture(
         .dynamic_record_capacity = 0,
         .sparse_tile_count = sparse_tile_count,
     };
-    // `data`/`particles`/`scene_prep` are all validly constructed the instant the
-    // literal above finishes (a failing `try` inside the literal never reaches
-    // this point, and none of the fields evaluated before it own allocated
-    // memory), so each gets its own errdefer here rather than a blanket
-    // `fixture.deinit()`, which would run over `tileset_meta`/`world` while
-    // they are still `undefined` if a later step fails before those are built,
-    // and would double-deinit them if a step fails after their own narrow
-    // errdefers below are already registered.
-    errdefer fixture.data.deinit();
-    errdefer fixture.particles.deinit();
-    errdefer fixture.scene_prep.deinit();
+    // `tileset_meta`/`world` must be built directly at their final `fixture.*`
+    // address rather than a temporary local, because `WorldSystem` retains the
+    // `*const WorldTilesetMeta` pointer it's given (`buildCatalog`) for its own
+    // lifetime; moving `tileset_meta` after the fact would dangle that pointer.
+    // `stage` tracks how far construction got so this single `errdefer` is the
+    // one place responsible for unwinding everything built so far, in reverse
+    // init order — adding a future heap-owning field only needs one new
+    // `InitStage` variant, one line here, and one `stage = .field;` below,
+    // instead of a fresh standalone `errdefer` that must be placed exactly right.
+    // `data`/`particles`/`scene_prep` are all validly constructed the instant
+    // the literal above finishes (a failing `try` inside it never reaches this
+    // point), so `stage` starts past all three.
+    var stage: InitStage = .scene_prep;
+    errdefer {
+        if (@intFromEnum(stage) >= @intFromEnum(InitStage.world)) fixture.world.deinit();
+        if (@intFromEnum(stage) >= @intFromEnum(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
+        fixture.scene_prep.deinit();
+        fixture.particles.deinit();
+        fixture.data.deinit();
+    }
 
     fixture.static_group_count = benchStaticGroups(tile_texture, fixture_config, &fixture.static_groups);
 
     const asset_store = AssetStore.init(allocator, io, "assets");
     fixture.tileset_meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    errdefer fixture.tileset_meta.deinit();
+    stage = .tileset_meta;
 
     const tile_size_px = fixture.tileset_meta.tileSize();
     const entity_layout = entitySpawnLayout(item_count);
@@ -547,7 +561,7 @@ fn initFixture(
     const world_width_px = @max(sparse_world_px, entity_layout.width);
     const world_height_px = @max(sparse_world_px, entity_layout.height);
     fixture.world = try WorldSystem.initDemoFromMeta(allocator, &fixture.tileset_meta, world_width_px, world_height_px);
-    errdefer fixture.world.deinit();
+    stage = .world;
 
     // Render-prep's dense-window entity cull bounds the deep submit limit by
     // the world's real level count (WorldSystem.levelInWindow), so a deep

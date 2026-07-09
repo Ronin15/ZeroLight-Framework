@@ -1652,7 +1652,7 @@ Current foundation:
 
 Checklist:
 
-- [x] Add an `AiFaction` (or lightweight `entity_tag`) component: a small enum
+- [x] Add a `Faction` component (`src/game/faction.zig`): a small enum
       faction id per entity, following the full component-store pattern.
 - [x] Add a fixed faction-relationship matrix (enum × enum → stance:
       hostile / neutral / friendly), const-evaluated, scalar/enum only, no
@@ -2802,11 +2802,11 @@ Architecture notes:
   the active level's own actor depth, this frame's distinct dynamic depths,
   and every registered sparse-tile depth at any in-window level, not only the
   active one). In the shipped default config this always resolves to exactly 1
-  draw; `Renderer.k_max_dense_composite_draws = 8` is the defensive cap.
+  draw; `Renderer.k_max_dense_composite_draws = 32` is the defensive cap.
 - This is a render-cost change only — no dig/nav/simulation contract changes,
   and `WorldSystem`'s CPU-side tile data remains the source of truth.
 - `DrawGroup.material = .tilemap` is one draw per composite-draw bucket per
-  frame (data-dependent, capped at 8), not one per submitted dense layer.
+  frame (data-dependent, capped at 32), not one per submitted dense layer.
 
 Checklist:
 
@@ -2897,10 +2897,10 @@ Problem (current envelope):
   assert and then write past the end of the fixed 32-slot array. In Debug/
   ReleaseSafe that's a bounds-check panic; in **ReleaseFast, what this project
   ships, bounds checks are stripped — silent memory corruption**, not a crash.
-- `docs/rendering-assets-shaders.md` and this file's Slice 36 section still
-  say `Renderer.k_max_dense_composite_draws = 8` — stale even before this
-  slice (today's crash-safety fix already raised it to 32 to match the
-  submit-stack cap); correct alongside the real ceiling raise.
+- `docs/rendering-assets-shaders.md` and this file's Slice 36 section said
+  `Renderer.k_max_dense_composite_draws = 8` — stale even before this slice
+  (today's crash-safety fix already raised it to 32 to match the submit-stack
+  cap); corrected alongside the real ceiling raise.
 - `game_demo_state.zig`'s `procedural_max_dense_tile_gpu_bytes` computes its
   budget ceiling from the exact same formula `estimateDenseTileGpuBytes`
   checks it against, so `validateDenseRenderBudget`'s GPU-byte gate can never
@@ -2974,7 +2974,7 @@ Checklist:
       `procedural_max_dense_tile_gpu_bytes` computation; leave the budget gate
       at its default disabled state with a comment pointing at the deferred
       release-sizing/RAM-check work.
-- [ ] Correct the stale `Renderer.k_max_dense_composite_draws = 8` references
+- [x] Correct the stale `Renderer.k_max_dense_composite_draws = 8` references
       in `docs/rendering-assets-shaders.md` and this file's Slice 36 section
       to the current/raised value.
 

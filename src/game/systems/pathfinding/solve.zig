@@ -118,7 +118,16 @@ pub fn solveOne(system: *PathfindingSystem, pending_index: usize, scratch: *Sear
     // promoted by a prior budget_exhausted) uses the full fixed tier-1 budget — never
     // derived from or scaled to world/graph size. See PendingRequest.tier and
     // compactPendingAfterSolve's budget_exhausted handling.
-    const abstract_node_cap = if (request.tier == 0) system.capacity.tier0_abstract_node_cap else system.capacity.max_abstract_nodes;
+    // Clamped against the tier-1 ceiling: AbstractScratch.reserve sizes slot_capacity as
+    // max(16, max_abstract_nodes * 2), using only max_abstract_nodes, never
+    // tier0_abstract_node_cap. The two are independently settable, so an unclamped tier-0
+    // cap tuned above the tier-1 ceiling would let nodes_used race past slot_capacity via
+    // slotFor's linear-probe loop: the search would silently saturate (return null) at the
+    // physical slot count instead of at the configured tier-0 budget, an undocumented
+    // asymmetry rather than the intended budget check. Tier 0 is also semantically the
+    // CHEAPER attempt, so clamping down to the tier-1 ceiling is never a behavior change
+    // in the intended direction.
+    const abstract_node_cap = if (request.tier == 0) @min(system.capacity.tier0_abstract_node_cap, system.capacity.max_abstract_nodes) else system.capacity.max_abstract_nodes;
     // Clamped against the tier-1 ceiling: stitched_scratch is physically reserved to
     // max_stitched_path_cells (SearchScratch.reserve), never to tier0_stitched_cell_cap.
     // The two are independently settable, so an unclamped tier-0 cap tuned above the

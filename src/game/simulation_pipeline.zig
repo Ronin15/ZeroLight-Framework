@@ -682,6 +682,11 @@ pub const SimulationPipeline = struct {
             .intent_seed = 0xfeedf00d,
             .step = self.scope.currentStep(),
             .seek_target = player_target,
+            // Ties `resolveRowTarget`'s identity check to the actual entity
+            // `player_target` represents, so a cold row only retargets via
+            // memory of this same entity — not memory of some other
+            // hostile-stance target this agent glimpsed earlier.
+            .seek_entity = context.player.entity,
             // Throttles how often the shared goal re-keys as the player moves
             // continuously, since local separation/steering closes the small
             // gap between path updates. Without this, the goal re-keys (and
@@ -1212,7 +1217,6 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     defer data.deinit();
     var player = try Player.spawn(&data); // Spawns at (400, 225).
 
-    const remembered_target = try data.createEntity();
     const agent = try data.createEntity();
     // Far outside the default AiPerception vision_range (240) from the
     // player, so the real PerceptionSystem pass this step reports the target
@@ -1220,8 +1224,11 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
     try data.setAiAgent(agent, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
     try data.setAiPerception(agent, .{});
+    // Memory of the player -- the same entity the pipeline's seek_entity
+    // resolves to below -- so the identity gate in resolveRowTarget lets the
+    // retarget through and this still proves the ai_memory-before-ai order.
     try data.setAiMemory(agent, .{
-        .last_known_target = remembered_target,
+        .last_known_target = player.entity,
         .last_known_x = 0,
         .last_known_y = 100,
         .staleness = 10,
@@ -1283,6 +1290,82 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     try std.testing.expectEqual(@as(usize, 1), intents.len);
     try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
     try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
+}
+
+test "pipeline does not retarget a cold agent toward memory of an entity other than the current seek entity" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data); // Spawns at (400, 225); this is the pipeline's seek_entity.
+
+    // A throwaway entity the agent glimpsed earlier, disconnected from the
+    // player. Memory of it must not be trusted as a substitute for the live
+    // player-seek goal, even though it is fresh and valid.
+    const other_target = try data.createEntity();
+    const agent = try data.createEntity();
+    // Far outside the default AiPerception vision_range (240) from the
+    // player, so the real PerceptionSystem pass this step reports the target
+    // not visible regardless of hostility.
+    try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(agent, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiPerception(agent, .{});
+    try data.setAiMemory(agent, .{
+        .last_known_target = other_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Memory is fresh and valid, but belongs to `other_target`, not the
+    // player the pipeline is currently seeking -- the goal must stay the
+    // live player seek_target (400, 225), not snap to (0, 100).
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 400), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 225), intents[0].goal.y);
 }
 
 test "pipeline runs affect after perception and ai_memory, before ai" {

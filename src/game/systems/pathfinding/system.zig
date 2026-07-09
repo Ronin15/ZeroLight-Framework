@@ -2840,6 +2840,40 @@ test "pathfinding tier0_stitched_cell_cap above the tier-1 ceiling still solves 
     try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
 }
 
+// tier0_abstract_node_cap and max_abstract_nodes (the fixed tier-1 ceiling) are
+// independently settable fields, but AbstractScratch.reserve physically sizes
+// slot_capacity from max_abstract_nodes only (max(16, max_abstract_nodes * 2)) —
+// never from the tier-0 field. If a caller tunes tier0_abstract_node_cap ABOVE the
+// tier-1 ceiling, solveOne must clamp the tier-0 attempt cap down to the tier-1
+// ceiling rather than handing abstractCorridor a logical budget the physical slot
+// table cannot back (nodes_used would race past slot_capacity via slotFor's
+// linear-probe loop, saturating far short of the configured cap instead of via the
+// intended budget check). This pins that a deliberately-inverted config (tier0 far
+// above tier1) still resolves cleanly instead of tripping that asymmetry.
+test "pathfinding tier0_abstract_node_cap above the tier-1 ceiling still solves cleanly" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const built = try buildCorridorWorld(&meta, &.{5});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = abstractCapacity();
+    // Deliberately inverted: far above the fixed tier-1 ceiling (abstractCapacity's own
+    // max_abstract_nodes default).
+    capacity.tier0_abstract_node_cap = 500_000;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
+
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const stats = try solveStep(&system, requester, .{ .x = 16, .y = 176 }, .{ .x = 336, .y = 176 });
+    try std.testing.expectEqual(@as(usize, 1), stats.available_results);
+    try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
+}
+
 // A tier-1 (already-escalated) budget_exhausted drops the request WITHOUT
 // negative-caching: it does not fit either fixed budget, which is not the same as a
 // definitive "no path exists" (unavailable is reserved for structural negatives). The

@@ -391,6 +391,13 @@ pub const WorldSystem = struct {
     // `submitted_active_level`, and `submitted_window` still match the request,
     // since those are the only things that can change the window's real content.
     dense_window_depth_span: ?DenseWindowDepthSpan = null,
+    // The submitted layers' own depths (ascending), cached alongside
+    // `dense_window_depth_span` on the same recompute condition. Lets
+    // `render_prep.collectDenseInterleaveDepths` bucket candidate depths by
+    // which gap between adjacent submitted layers they would cut, without
+    // recomputing `collectDenseSubmitLayers` a second time.
+    dense_window_layer_depths: [k_max_dense_submit_stack_cap]i32 = undefined,
+    dense_window_layer_depth_count: usize = 0,
     render_window: DenseLayerRenderWindow = .{},
     max_dense_bands_per_level: u8 = 2,
     max_dense_tile_gpu_bytes: usize = 0,
@@ -791,12 +798,26 @@ pub const WorldSystem = struct {
 
         var submit_layers: [k_max_dense_submit_stack_cap]usize = undefined;
         const submit_count = try self.collectDenseSubmitLayers(active_level, &submit_layers);
+        for (submit_layers[0..submit_count], 0..) |layer_index, i| {
+            self.dense_window_layer_depths[i] = self.denseLayerOrder(layer_index).depth;
+        }
+        self.dense_window_layer_depth_count = submit_count;
         const span: ?DenseWindowDepthSpan = if (submit_count == 0) null else .{
-            .min = self.denseLayerOrder(submit_layers[0]).depth,
-            .max = self.denseLayerOrder(submit_layers[submit_count - 1]).depth,
+            .min = self.dense_window_layer_depths[0],
+            .max = self.dense_window_layer_depths[submit_count - 1],
         };
         self.dense_window_depth_span = span;
         return span;
+    }
+
+    /// This frame's submitted dense layer depths (ascending, deepest first),
+    /// cached by the last `denseWindowDepthSpan` recompute. Callers must call
+    /// `denseWindowDepthSpan` for the same `active_level` first in the same
+    /// frame (`render_prep.collectDenseInterleaveDepths` does, by construction)
+    /// so this reads a fresh cache rather than a stale one from a prior level
+    /// or window.
+    pub fn denseWindowLayerDepths(self: *const WorldSystem) []const i32 {
+        return self.dense_window_layer_depths[0..self.dense_window_layer_depth_count];
     }
 
     /// The render depth an actor standing on `active_level` draws at. Always
@@ -872,7 +893,15 @@ pub const WorldSystem = struct {
             }, self.atlas_texture, .{ .positions = &pos, .uvs = &uv, .colors = &col });
 
             for (buckets[0..bucket_count]) |bucket| {
-                const window_layers = try self.buildWindowLayers(submit_layers[0..submit_count], bucket.start, bucket.end);
+                var window_layers = try self.buildWindowLayers(submit_layers[0..submit_count], bucket.start, bucket.end);
+                // True only for the bucket holding the overall shallowest submitted
+                // layer (the last bucket, since submit_layers is depth-ascending):
+                // the fragment shader's rim-shadow effect must gate on this, not on
+                // its own draw-local `resolved_depth == 0`, since a bucket split for
+                // an unrelated interleave point elsewhere can put a merely
+                // hole-revealed (not truly topmost) tile at `resolved_depth == 0`
+                // within its own draw.
+                window_layers.is_shallowest_bucket = bucket.end == submit_count;
                 // Order = the bucket's own shallowest submitted layer (depth-ascending
                 // input means that is the last index in the bucket's range).
                 const order = self.denseLayerOrder(submit_layers[bucket.end - 1]);
@@ -3361,6 +3390,64 @@ test "buildWindowLayers reverses a bucket's deepest-first layers to topmost-firs
     try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[2]))), window.offsets[0]);
     try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[1]))), window.offsets[1]);
     try std.testing.expectEqual(@as(u32, @intCast(world.denseLayerOffset(layers[0]))), window.offsets[2]);
+}
+
+test "submitStaticDenseGeometry marks only the bucket holding the shallowest submitted layer, regardless of where an unrelated interleave point splits the stack" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const level1 = try world.addLevel(-level_z_step);
+    _ = try world.addDenseLayer(level1, 0, .floor, grass);
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.static_positions.deinit(allocator);
+    defer renderer.static_uvs.deinit(allocator);
+    defer renderer.static_colors.deinit(allocator);
+    defer renderer.static_groups.deinit(allocator);
+    defer renderer.draw_list.deinit(allocator);
+
+    // No interleave points this frame: both layers merge into one bucket,
+    // which must be marked shallowest (the common case the rim-shadow effect
+    // was originally written for).
+    try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{});
+    try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
+    try std.testing.expect(renderer.tilemap_window_layers[0].is_shallowest_bucket);
+
+    // An unrelated interleave point (e.g. a dynamic entity or sparse tile
+    // elsewhere on the map, nothing to do with this cell's own geometry)
+    // strictly between the two layers' depths splits them into two buckets.
+    // The deeper bucket -- exactly what a hole in the surface layer would
+    // reveal -- must never be marked shallowest, matching the shader's
+    // "tile visible through the hole is left alone" contract regardless of
+    // how the CPU happened to bucket the draws this frame.
+    world.dense_quads_dirty = true;
+    const surface_depth = world.denseLayerOrder(0).depth;
+    const deeper_depth = world.denseLayerOrder(1).depth;
+    const cut = deeper_depth + @divTrunc(surface_depth - deeper_depth, 2);
+    try world.submitStaticDenseGeometry(&renderer, &runtime_assets, 0, &.{cut});
+
+    try std.testing.expectEqual(@as(usize, 2), renderer.tilemap_window_layer_count);
+    try std.testing.expect(!renderer.tilemap_window_layers[0].is_shallowest_bucket);
+    try std.testing.expect(renderer.tilemap_window_layers[1].is_shallowest_bucket);
 }
 
 test "addDenseLayer rejects bands beyond configured per-level cap" {

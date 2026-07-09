@@ -216,6 +216,9 @@ const world_render_overscan_chunks: u16 = 1;
 const StageTimer = runtime_perf_log.StageTimer;
 
 pub const GameDemoState = struct {
+    // Owns test_squares; freed via this field in deinit (not data.allocator, a
+    // substructure's allocator that need not match).
+    allocator: std.mem.Allocator,
     data: DataSystem,
     simulation_frame: SimulationFrame,
     pipeline: SimulationPipeline,
@@ -404,6 +407,7 @@ pub const GameDemoState = struct {
         errdefer pipeline.deinit();
 
         var state = GameDemoState{
+            .allocator = allocator,
             .data = data,
             .simulation_frame = simulation_frame,
             .pipeline = pipeline,
@@ -424,7 +428,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
-        self.data.allocator.free(self.test_squares);
+        self.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
         self.world.deinit();
@@ -1097,6 +1101,17 @@ fn isolateDemoBodiesAwayFrom(demo: *GameDemoState, subject: EntityId) void {
     player_body.previous_y.* = isolate_y;
     player_body.velocity_x.* = 0;
     player_body.velocity_y.* = 0;
+}
+
+test "GameDemoState owns test_squares via its own allocator field, not DataSystem's" {
+    var demo = try initDemoForTest(std.testing.allocator);
+    defer demo.deinit();
+
+    // deinit frees test_squares via self.allocator, set at init from the same
+    // parameter spawnTestSquares used -- not inherited from data.allocator, a
+    // substructure field that could diverge from it.
+    try std.testing.expectEqual(std.testing.allocator.ptr, demo.allocator.ptr);
+    try std.testing.expectEqual(std.testing.allocator.vtable, demo.allocator.vtable);
 }
 
 test "proceduralPathfindingCapacity reserves the shared flow-field for a future battle-scale crowd" {

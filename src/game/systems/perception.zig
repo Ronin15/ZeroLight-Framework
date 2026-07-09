@@ -202,9 +202,13 @@ pub const PerceptionStats = struct {
 // job owns one slot (indexed by `range.index`, mirrors `event_ranges`), writes
 // to a local `PerceptionRangeStats` value throughout its own
 // `computeOneAgent` calls, and stores it once at the end of
-// `computePerceptionRange` — a single write per range, so no atomics or
-// padding are needed (unlike the event scratch buffers, nothing appends
-// concurrently into a range's slot).
+// `computePerceptionRange` — a single write per range, so no atomics are
+// needed (unlike the event scratch buffers, nothing appends concurrently
+// into a range's slot). It is 32 bytes (4 `usize` fields), so two adjacent
+// slots would otherwise share one 64-byte cache line; concurrently running
+// worker ranges writing their final stats into adjacent slots would then
+// false-share that line, so `PerceptionRangeStatsSlot` pads it the same way
+// `PerceptionEventRangeSlot` pads `PerceptionEventRangeBuffer` below.
 const PerceptionRangeStats = struct {
     sensed_count: usize = 0,
     nearest_threat_found: usize = 0,
@@ -299,6 +303,16 @@ const PerceptionEventRangeSlot = struct {
 
 const PerceptionEventRangeSlotList = std.ArrayListAligned(PerceptionEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));
 
+const PerceptionRangeStatsSlot = struct {
+    // Each worker writes only its assigned slot, once, at the end of its
+    // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
+    // write off shared cache lines across concurrently running ranges.
+    stats: PerceptionRangeStats = .{},
+    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = [_]u8{0} ** paddingForCacheLine(PerceptionRangeStats),
+};
+
+const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));
+
 fn paddingForCacheLine(comptime T: type) usize {
     const rem = @sizeOf(T) % thread_shared_record_alignment;
     return if (rem == 0) 0 else thread_shared_record_alignment - rem;
@@ -381,12 +395,17 @@ fn dirtyAreaExceedsFullRebuildThreshold(pending_dirty: []const DirtyRect, cell_c
 // rasterization, so it is a direct, provable stand-in for
 // `levelBlocksMovement` — see the parity test.
 const LevelBlockedSlot = struct {
-    // `invalid_build_step` until the first build; thereafter the
-    // `PerceptionSystem.step_counter` value as of the last build/patch. A
-    // step-counter mismatch (a new step ran since) revisits the slot the next
-    // time its level is touched — see `pending_dirty` for what that revisit
-    // actually does (skip/patch/rebuild), which is no longer "always
-    // rebuild" the way a bare step-counter mismatch alone would imply.
+    // `invalid_build_step` until the first build that finds `valid == true`;
+    // thereafter the `PerceptionSystem.step_counter` value as of the last
+    // build/patch. A rebuild attempt that finds the level still out of range
+    // leaves this at `invalid_build_step` (see `ensureLevelBlockedCache`'s
+    // self-healing note), so a level queried before it exists retries a full
+    // rebuild every time it is touched until the level is actually added,
+    // instead of staying stuck fail-closed forever. A step-counter mismatch
+    // (a new step ran since) revisits the slot the next time its level is
+    // touched — see `pending_dirty` for what that revisit actually does
+    // (skip/patch/rebuild), which is no longer "always rebuild" the way a
+    // bare step-counter mismatch alone would imply.
     built_step: u64 = invalid_build_step,
     // False for a level index that did not exist in `WorldSystem` at build
     // time (`level_index >= world.levelCount()`), matching
@@ -437,7 +456,7 @@ pub const PerceptionSystem = struct {
     candidates: std.MultiArrayList(CandidateRow) = .{},
     rows: std.MultiArrayList(PerceptionGatherRow) = .{},
     event_ranges: PerceptionEventRangeSlotList = .empty,
-    range_stats: std.ArrayList(PerceptionRangeStats) = .empty,
+    range_stats: PerceptionRangeStatsSlotList = .empty,
     range_take_counts: std.ArrayList(usize) = .empty,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     // Per-level LOS-blocked bitmap cache, indexed directly by level (see
@@ -669,6 +688,13 @@ pub const PerceptionSystem = struct {
     // against: the full rebuild below already reflects the current world
     // state directly, so replaying pre-first-build edits on top would be
     // redundant at best.
+    //
+    // Self-healing for a level queried before `WorldSystem.addLevel` created
+    // it: a rebuild that finds the level still out of range leaves
+    // `slot.valid == false` AND leaves `built_step` unstamped (still
+    // `invalid_build_step`), so the next call for this level still sees
+    // `first_build == true` and retries a full rebuild rather than being
+    // stuck fail-closed forever once the level actually exists.
     fn ensureLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16) !void {
         const slot = try self.levelBlockedSlot(level);
         if (slot.built_step == self.step_counter) return;
@@ -685,8 +711,9 @@ pub const PerceptionSystem = struct {
             patchLevelBlockedCache(world, level, slot);
         }
 
-        slot.built_step = self.step_counter;
         slot.pending_dirty.clearRetainingCapacity();
+        if (!slot.valid) return;
+        slot.built_step = self.step_counter;
     }
 
     // Rebuilds one level's LOS-blocked bitmap from `world`'s dense bands and
@@ -699,8 +726,9 @@ pub const PerceptionSystem = struct {
     // `WorldSystem.levelBlocksMovement` (see `LevelBlockedSlot`'s doc comment
     // and the parity test). `blocked`'s backing storage is grown once and
     // reused across steps (never deinit/re-init between steps); only its
-    // contents are refreshed. Caller (`ensureLevelBlockedCache`) stamps
-    // `built_step`/clears `pending_dirty` afterward.
+    // contents are refreshed. Caller (`ensureLevelBlockedCache`) clears
+    // `pending_dirty` afterward and stamps `built_step` only if the level
+    // turned out valid (see that function's self-healing note).
     fn rebuildLevelBlockedCache(self: *PerceptionSystem, world: *const WorldSystem, level: u16, slot: *LevelBlockedSlot, cell_count: usize) !void {
         try slot.blocked.ensureTotalCapacity(self.allocator, cell_count);
         slot.blocked.items.len = cell_count;
@@ -929,16 +957,16 @@ pub const PerceptionSystem = struct {
     fn prepareRangeStats(self: *PerceptionSystem, range_count: usize) !void {
         try self.range_stats.ensureTotalCapacity(self.allocator, range_count);
         while (self.range_stats.items.len < range_count) self.range_stats.appendAssumeCapacity(.{});
-        for (self.range_stats.items[0..range_count]) |*stats| stats.* = .{};
+        for (self.range_stats.items[0..range_count]) |*slot| slot.stats = .{};
     }
 
     fn sumRangeStats(self: *const PerceptionSystem, range_count: usize) PerceptionRangeStats {
         var totals = PerceptionRangeStats{};
-        for (self.range_stats.items[0..range_count]) |per_range| {
-            totals.sensed_count += per_range.sensed_count;
-            totals.nearest_threat_found += per_range.nearest_threat_found;
-            totals.los_checks += per_range.los_checks;
-            totals.los_blocked += per_range.los_blocked;
+        for (self.range_stats.items[0..range_count]) |slot| {
+            totals.sensed_count += slot.stats.sensed_count;
+            totals.nearest_threat_found += slot.stats.nearest_threat_found;
+            totals.los_checks += slot.stats.los_checks;
+            totals.los_blocked += slot.stats.los_blocked;
         }
         return totals;
     }
@@ -1140,7 +1168,7 @@ const PerceptionJobContext = struct {
     level_blocked: []const LevelBlockedSlot,
     player_candidate: ?PlayerPerceptionCandidate,
     event_ranges: []PerceptionEventRangeSlot,
-    range_stats: []PerceptionRangeStats,
+    range_stats: []PerceptionRangeStatsSlot,
 };
 
 fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
@@ -1163,7 +1191,7 @@ fn computePerceptionRange(job: *PerceptionJobContext, range: ParallelRange) void
     var range_stats = PerceptionRangeStats{};
     for (range.start..range.end) |i| computeOneAgent(job, i, &range_stats);
     emitTransitionsForRange(job, range);
-    job.range_stats[range.index] = range_stats;
+    job.range_stats[range.index].stats = range_stats;
 }
 
 const CandidateScratch = struct {
@@ -2147,6 +2175,37 @@ test "LevelBlockedSlot cache lookup matches WorldSystem.levelBlocksMovement exac
         const actual = lookupLevelBlocked(sys.level_blocked.items, c.level, c.x, c.y);
         try testing.expectEqual(expected, actual);
     }
+}
+
+test "ensureLevelBlockedCache self-heals once a level queried before it existed is actually added" {
+    // No addLevel call yet: levelCount() == 0, so level 0 is out of range at
+    // the moment of this first touch.
+    var world = WorldSystem{
+        .allocator = testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+
+    try sys.ensureLevelBlockedCache(&world, 0);
+    try testing.expect(!sys.level_blocked.items[0].valid);
+    try testing.expect(lookupLevelBlocked(sys.level_blocked.items, 0, 0, 0)); // fail-closed
+
+    // Level added post-init (a future caller calling WorldSystem.addLevel
+    // after startup).
+    _ = try world.addLevel(0);
+
+    // A later step's touch must retry a full rebuild and recover, not stay
+    // permanently fail-closed.
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0);
+    try testing.expect(sys.level_blocked.items[0].valid);
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 0, 0)); // real, open tile data
 }
 
 // Shared parity check for the dirty-tracked patch/skip/fallback tests below:

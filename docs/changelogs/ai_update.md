@@ -249,7 +249,7 @@ path carries a `FailingAllocator` proof rather than a comment.
   "interleave depths" — a depth something else (dynamic entity, particle, or
   any sparse tile anywhere in the world) needs to render sandwiched between
   two dense layers this frame. The shipped default config resolves to
-  exactly 1 composite draw; `Renderer.k_max_dense_composite_draws = 8` is a
+  exactly 1 composite draw; `Renderer.k_max_dense_composite_draws = 32` is a
   defensive cap, not the expected case.
 - Because draw count no longer scales with render-window depth, the
   procedural render window returned from Slice 23B's `levels_below = 6`

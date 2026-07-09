@@ -319,11 +319,28 @@ fn createFixture(allocator: std.mem.Allocator, io: std.Io, count: usize, extra_s
     return .{ .data = data, .world = world };
 }
 
-// Stride for `createDecorrelatedFixture`'s observer-creation-order shuffle.
-// Prime, odd, and not a multiple of 5, so it stays coprime with every pair
-// count this bench's `eventScaleCounts` tiers produce (each is `2^a * 5^b`),
-// guaranteeing the shuffle below visits every observer exactly once.
+// Preferred stride for `createDecorrelatedFixture`'s observer-creation-order
+// shuffle. Prime, odd, and not a multiple of 5, so it stays coprime with
+// every pair count this bench's default `eventScaleCounts` tiers produce
+// (each is `2^a * 5^b`). `shuffleStrideFor` below falls back to searching
+// upward from this value for a pair count supplied via `--items`, so the
+// shuffle stays a bijection (visits every observer exactly once) regardless
+// of item count.
 const dense_index_shuffle_stride: usize = 97;
+
+// Smallest stride >= `dense_index_shuffle_stride` that is coprime with
+// `pair_count`, so `(step * stride) % pair_count` is a bijection over
+// `0..pair_count` for any positive `pair_count` (not just ones coprime with
+// the preferred stride). Search is bounded: `pair_count` consecutive integers
+// always contain one coprime with `pair_count` (residue 1 alone guarantees
+// this), so the loop below always terminates within `pair_count` steps. Runs
+// once at fixture-build time, not on a measured path.
+fn shuffleStrideFor(pair_count: usize) usize {
+    if (pair_count <= 1) return 1;
+    var stride = dense_index_shuffle_stride;
+    while (std.math.gcd(stride, pair_count) != 1) : (stride += 1) {}
+    return stride;
+}
 
 // Same population, geometry, and blocked-tile pattern as `createFixture`
 // (isolating one variable, same as `perception-los-dense`'s own module-doc
@@ -334,9 +351,9 @@ const dense_index_shuffle_stride: usize = 97;
 // creation order -- see `gatherPerceptionData`'s doc comment). Phase 1
 // creates every pair exactly as `createFixture` does but withholds
 // `setAiPerception`; phase 2 calls it for every observer in a fixed
-// reversible permutation (`(step * dense_index_shuffle_stride) % pair_count`)
-// instead of creation order. This lets two entities whose gather rows fall in
-// *different* worker ranges land in numerically close (same-cache-line)
+// reversible permutation (`(step * shuffleStrideFor(pair_count)) %
+// pair_count`) instead of creation order. This lets two entities whose gather
+// rows fall in *different* worker ranges land in numerically close (same-cache-line)
 // `perception_dense_index` slots, so `computeOneAgent`'s unconditional
 // scatter into `job.perception_slice` (see that function) can be compared
 // threaded-vs-serial against `createFixture`'s today-correlated order. See
@@ -357,7 +374,8 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
 
     const observer_offset_x = tile_size * observer_offset_tile_fraction;
     const pair_count = count / 2;
-    std.debug.assert(pair_count == 0 or std.math.gcd(dense_index_shuffle_stride, pair_count) == 1);
+    const shuffle_stride = shuffleStrideFor(pair_count);
+    std.debug.assert(pair_count == 0 or std.math.gcd(shuffle_stride, pair_count) == 1);
 
     var observers = std.ArrayList(EntityId).empty;
     defer observers.deinit(allocator);
@@ -381,7 +399,7 @@ fn createDecorrelatedFixture(allocator: std.mem.Allocator, io: std.Io, count: us
 
     var step: usize = 0;
     while (step < pair_count) : (step += 1) {
-        const source = (step * dense_index_shuffle_stride) % pair_count;
+        const source = (step * shuffle_stride) % pair_count;
         try data.setAiPerception(observers.items[source], .{ .vision_range = observer_vision_range });
     }
 

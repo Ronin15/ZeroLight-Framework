@@ -173,9 +173,16 @@ pub const Renderer = struct {
     /// One tilemap draw's composited layer window: up to
     /// `k_max_tilemap_window_layers` element offsets into a combined tile-data
     /// buffer, topmost layer first. The fragment shader walks these in order and
-    /// stops at the first opaque cell.
+    /// stops at the first opaque cell. `is_shallowest_bucket` is true only for
+    /// the composite draw holding the frame's overall shallowest submitted dense
+    /// layer (`world_system.zig`'s `submitStaticDenseGeometry`) — the fragment
+    /// shader's rim-shadow effect must gate on this rather than its own
+    /// draw-local resolved depth, since bucket splitting for an unrelated
+    /// interleave point can otherwise put a merely hole-revealed tile at
+    /// resolved depth 0 within a non-shallowest draw.
     pub const TilemapWindowLayers = struct {
         count: u8 = 0,
+        is_shallowest_bucket: bool = false,
         offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
     };
 
@@ -184,6 +191,7 @@ pub const Renderer = struct {
     pub fn applyWindowLayers(params: *TilemapParams, window: TilemapWindowLayers) void {
         std.debug.assert(window.count <= k_max_tilemap_window_layers);
         params.layer_meta[0] = @intCast(window.count);
+        params.layer_meta[1] = @intFromBool(window.is_shallowest_bucket);
         for (0..window.count) |i| {
             params.layer_offsets[i] = window.offsets[i];
         }
