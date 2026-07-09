@@ -40,9 +40,9 @@ game-specific behavior under `src/game/`.
   for levels, dense layers, sparse tiles, catalog source rects, and chunk
   visibility.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
-  movement, visual, collision, agents, faction_level, perception, structural,
-  system) and owns state-local persistent entity data in dense SoA stores for
-  gameplay, collision, and render systems.
+  movement, visual, collision, agents, faction_level, perception, memory,
+  affect, structural, system) and owns state-local persistent entity data in
+  dense SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -58,6 +58,20 @@ game-specific behavior under `src/game/`.
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges.
+- `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
+  pipeline-shared per-step uniform grid built once from the cognition-scoped
+  population and read by AI separation and perception.
+- `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
+  (range/FOV/LOS/faction-stance gating) and hearing (transient world
+  stimuli), emitting `entity_perceived`/`entity_lost` events on acquire/lose
+  transitions and reacting to post-commit world edits to keep its per-level
+  LOS-blocked cache incrementally patched.
+- `src/game/systems/ai_memory.zig` owns `AiMemorySystem`: decays last-known-
+  target position, a fixed-capacity recent-contact ring, and spatial
+  familiarity, and refreshes state from perception's acquisition events.
+- `src/game/systems/affect.zig` owns `AffectSystem`: appraises perception and
+  memory into four independent per-entity mood drives (fear, curiosity,
+  aggression, fatigue) and emits threshold-crossing events.
 - `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
 - `src/game/systems/steering.zig` consumes navigation intents and path status,
   then emits final NPC movement intents with local avoidance.
@@ -84,6 +98,9 @@ game-specific behavior under `src/game/`.
 - Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
   live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
+- `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
+  facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
+  gameplay randomness (AI wander, etc.).
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
@@ -173,23 +190,32 @@ Sprite prep emits presentation-independent world/logical or drawable positions;
 the acquired swapchain interval stays focused on acquired-size presentation
 uniforms, copy-pass upload, render-pass encoding, and submit.
 
-Dense world floors use retained per-layer tile-data storage buffers (Slice 23A):
-partial dig uploads always use `cycle=false`; vertex ring buffers alone use
-`cycle=true` on the final upload in a batched copy pass. Multi-level compositing
-requires back-to-front dense-layer depth order at submit and in `mergeDrawList`.
-Dense floor submit uses a vertical render window (`DenseLayerRenderWindow`:
-six levels below the player, skipping floors above `active_level` so the slice
-follows player level transitions) so draw count
-stays bounded at the surface; all authored layers still retain GPU tile-data
-buffers (Slice 23B). Sparse tiles cull by camera chunk visibility separately.
+Dense world floors use one combined per-world tile-data storage buffer
+(layer-offset indexed, Slice 36), not one buffer per layer: partial dig
+uploads always use `cycle=false`; vertex ring buffers alone use `cycle=true`
+on the final upload in a batched copy pass. Multi-level compositing requires
+back-to-front dense-layer depth order at submit and in `mergeDrawList`. Dense
+floor submit uses a vertical render window (`DenseLayerRenderWindow`,
+`levels_below` default 6, widened to the full authored underground stack in
+the procedural demo world since Slice 36 removed draw count's dependency on
+window depth) so the in-window layer set stays bounded; all authored layers
+still retain data in the combined GPU buffer. Sparse tiles cull by camera
+chunk visibility separately.
 Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).
-Dense floor submit uses a per-layer full-world quad inside the 23B window (GPU
-clips; not camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
+Dense floor submit buckets the in-window layer set into a small bounded
+number of composite draws (`partitionDenseCompositeBuckets`, cut only at true
+depth-interleave points where a dynamic entity, particle, or sparse tile
+needs to render between two dense layers this frame; capped by
+`Renderer.k_max_dense_composite_draws`), not one draw per layer; the
+fragment shader loops a bounded topmost-first window of layers per pixel and
+stops at the first opaque cell (GPU clips full-world quads; not
+camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
 as the gameplay/nav/render authority; `setWorldLevel` syncs `scope.level` for
 cube LOD. Player floor policy stays on `Player.current_level` for digging.
-See `docs/rendering-assets-shaders.md` and slices 23B/24B in
+See `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section (source
+of truth for the composite-draw/shader-loop detail) and slice 36 in
 `docs/framework-implementation-slices.md`.
 
 Simulation LOD and render visibility are separate policies: tier, halos, and scope
@@ -365,17 +391,29 @@ The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
-3. `SimulationPipeline` builds the shared `SpatialIndexSystem` from the
-   cognition-scoped population, then runs AI decision output (querying that
-   index for separation), steering, and frame-delayed pathfinding.
-4. `SimulationPipeline` applies merged AI movement intents.
-5. `SimulationPipeline` runs movement over dense `DataSystem` movement slices.
-6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
-7. Queue contact audio, emit/update transient particles, and merge outputs.
-8. Commit deferred structural commands to `DataSystem`.
-9. Update the state-owned follow camera and visible world chunks.
-10. Render current `WorldSystem`, `DataSystem`, and particle state with
-    interpolation.
+3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
+   "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
+   `docs/simulation-tiers-and-pipeline.md` for the full contract):
+   `dig_world_edit` (author world-tile edits from player digging) →
+   `scope_advance_and_ai_gather` → `spatial_index_build` (shared
+   `SpatialIndexSystem`, Slice 28) → `perception_update` (vision/hearing,
+   Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
+   `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
+   `apply_ai_movement_intents` → `movement_scope_gather` →
+   `movement_integrate` → `bounds_and_tile_gate` →
+   `collision_scope_gather` → `collision_detect` → `collision_respond` →
+   `plane_traversal` (ramp/fall/carve/snap) → `tier_policy` (deferred
+   `set_simulation_tier` commands).
+4. Queue contact audio, emit/update transient particles, and merge outputs.
+5. Update the state-owned follow camera and visible world chunks.
+6. Commit deferred structural commands to `DataSystem`, then run the
+   pipeline's post-commit reactions
+   (`SimulationPipeline.reactToPostCommitNavEvents` and
+   `.reactToPostCommitPerceptionEvents`, both independent side effects on
+   disjoint state reacting to the same committed event stream) so nav and
+   perception caches patch from this step's world edits.
+7. Render current `WorldSystem`, `DataSystem`, and particle state with
+   interpolation.
 
 `SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
 stage order, scope stats, budgets, and processor handoff for one gameplay state

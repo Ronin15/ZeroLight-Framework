@@ -148,9 +148,9 @@ pub const DrawSource = enum {
 };
 
 // Which pipeline draws a group. `sprite` samples a texture per vertex UV (the
-// default path). `tilemap` draws one world-space quad per dense layer and the
-// fragment shader reads tile ids from a storage buffer, so a whole layer is one
-// draw independent of world size.
+// default path). `tilemap` draws one world-space quad per composite bucket and
+// the fragment shader reads tile ids from a shared storage buffer, so a bucket
+// of layers is one draw independent of world size.
 pub const Material = enum {
     sprite,
     tilemap,

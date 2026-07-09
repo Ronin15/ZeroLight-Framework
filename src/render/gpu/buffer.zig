@@ -226,8 +226,8 @@ pub fn stageStorageRegions(
 }
 
 /// Records partial tile-data storage-buffer writes into an open copy pass.
-/// Always uses `cycle=false`: these target retained per-layer GPU tile buffers
-/// read by the tilemap shader, not ring-buffered vertex streams.
+/// Always uses `cycle=false`: these target the retained combined GPU tile
+/// buffer read by the tilemap shader, not ring-buffered vertex streams.
 pub fn recordStorageRegionsInPass(
     copy_pass: *c.SDL_GPUCopyPass,
     transfer_buffer: *c.SDL_GPUTransferBuffer,

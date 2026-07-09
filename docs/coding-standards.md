@@ -127,13 +127,18 @@ change:
 2. Its `StageId` slotted into `stage_order` at the position its real
    dependencies require.
 3. Its `stageContract()` arm declaring those reads/writes.
-4. The real call in `update()` plus a matching `self.stage_trace.mark(...)`
-   immediately at that call site.
+4. The real call in `update()` at the position `stage_order` requires.
 
 `zig build check` catches a stage reading a resource before any earlier stage
-produces it. The `stage_trace` order-trace test proves the declared
-`stage_order` matches what `update()` actually runs, catching a `mark()` call
-added at the wrong point.
+produces it. Not every real ordering dependency is expressible as a
+`PipelineResource` read/write (e.g. two stages that share no tracked resource
+but still depend on call order). For those, add a targeted causal-effect
+test: construct a scenario where the wrong order would produce an observably
+different result, and assert the correct one. See `simulation_pipeline.zig`'s
+"pipeline commits the dig stage's world edit before plane traversal reads it
+in the same step", "pipeline runs ai_memory after perception and before ai",
+and "pipeline runs affect after perception and ai_memory, before ai" tests
+for the pattern.
 
 ### Dense SoA storage (`std.MultiArrayList`)
 

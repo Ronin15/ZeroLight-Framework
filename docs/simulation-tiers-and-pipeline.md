@@ -68,7 +68,11 @@ from that same cognition-scoped population for AI separation queries, runs the
 writing sensed state to `PerceptionStore`), then the **memory stage**
 (`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
 subset (decaying staleness/familiarity/ring contacts and refreshing from this
-step's perception-acquisition events), then the **affect stage**
+step's perception-acquisition events; decay is itself scope-gated through the
+same cognition-scope dense-index list, so an entity demoted out of the
+cognition halo simply stops being gathered — its memory row freezes rather
+than decaying, and resumes cleanly on resync, with no separate freeze
+mechanism needed), then the **affect stage**
 (`AffectSystem`, Slice 31) over the cognition-scoped `AiAffect` subset
 (appraising this step's just-written perception/memory state, both
 independently optional per row, plus each agent's own `AiAgent.behavior`, into
@@ -120,10 +124,16 @@ before it is written fails the build instead of silently corrupting behavior.
 - A `comptime` block walks `stage_order`, accumulating the resources written
   so far, and fails the build (`@compileError`) if any stage's declared reads
   are not a subset of what an earlier stage already wrote.
-- A private `stage_trace` (test builds only, zero-cost otherwise) records the
-  `StageId` `update()` actually marks at each real call site; the "pipeline
-  stage order matches its declared ordering contract" test asserts this trace
-  equals `stage_order`, catching a `mark()` call placed at the wrong point.
+- Not every real ordering dependency is expressible as a `PipelineResource`
+  read/write — two stages can depend on call order while sharing no tracked
+  resource. Those dependencies are proven by targeted causal-effect tests
+  co-located in `simulation_pipeline.zig`: each sets up a scenario where the
+  wrong order would produce an observably different result and asserts the
+  correct one. See "pipeline commits the dig stage's world edit before plane
+  traversal reads it in the same step", "pipeline runs ai_memory after
+  perception and before ai, feeding memory into AI's cold-seek retarget", and
+  "pipeline runs affect after perception and ai_memory, before ai" for the
+  pattern.
 
 Checklist for adding or reordering a stage:
 
@@ -132,10 +142,12 @@ Checklist for adding or reordering a stage:
 2. Insert its `StageId` into `stage_order` at the position its real
    dependencies require.
 3. Add its `stageContract()` arm.
-4. Add the real call in `update()` plus a `self.stage_trace.mark(...)` at that
-   call site.
-5. `zig build check` fails at comptime if a dependency is missing; the
-   order-trace test fails if the `mark()` call does not match `stage_order`.
+4. Add the real call in `update()` at the position `stage_order` requires. If
+   the dependency isn't expressible via `PipelineResource`, add a
+   causal-effect test proving the real call order.
+5. `zig build check` fails at comptime if a `PipelineResource` dependency is
+   missing; a causal-effect test fails if the stages run out of order for a
+   dependency the comptime check can't see.
 
 ## Range Output Streams
 
@@ -166,6 +178,14 @@ part of the contract: count and write phases must stay consistent.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
 - `structural_commands`: deferred entity/component changes.
+- `stimuli`: transient per-step positional stimuli AI hearing can sense (e.g.
+  dig noise), read by `PerceptionSystem`. Cleared every `beginStep` and never
+  promoted to an event, since a stimulus carries no stable entity identity to
+  transition against. Appended via a dedicated `appendStimulus` single-value
+  helper rather than the batch `reserveStreams`/`reservePathRequests`
+  pattern: its per-step count is a fixed producer invariant (at most one,
+  from `DigController`), not scene-scale-dependent, so it grows lazily on
+  first use like `PerceptionSystem`'s own gather buffers.
 
 High-volume data should stay in its specialized stream. Do not collapse
 contacts, movement intents, navigation intents, path requests, render-prep
@@ -248,6 +268,25 @@ Commit behavior:
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.
+
+## Post-Commit Reactions
+
+After structural commit and event publication, `GameDemoState` calls two
+independent `SimulationPipeline` reactions against the same committed event
+stream:
+
+- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, interpreting
+  nav-invalidating committed events (`world_tile_changed`,
+  `world_obstacle_changed`, entity-driven obstacle changes) into dirty nav
+  cells, applying the incremental nav-graph patch, and emitting
+  `nav_region_invalidated`.
+- `reactToPostCommitPerceptionEvents` delegates to `PerceptionSystem`,
+  recording localized dirty rects from the same `world_tile_changed`/
+  `world_obstacle_changed` events to incrementally patch its per-level
+  LOS-blocked bitmap cache. It emits no event of its own.
+
+Both reactions are side effects on fully disjoint state, so call order
+between them does not matter.
 
 ## Current Integration
 

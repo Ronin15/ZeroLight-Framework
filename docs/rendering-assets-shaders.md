@@ -176,10 +176,17 @@ that pixel), derives the atlas cell from the tight grid (`col = id % columns`,
 (`TilemapUniform.layer_meta.x`) is the same for every fragment in one draw
 (dynamically uniform), so this is an ordinary bounded GLSL loop with no
 toolchain risk. Draw count scales with how many interleave points exist this
-frame (`Renderer.k_max_dense_composite_draws = 8` is the defensive cap; the
+frame (`Renderer.k_max_dense_composite_draws = 32` is the defensive cap; the
 shipped default config always resolves to 1), never with window depth — cost
 still scales with the **screen**, not the world: ~0.5 MB/layer of tile data and a
 handful of draw calls regardless of world size or render-window depth.
+
+The fragment shader also applies a fixed-margin rim-darkening (contact-shadow)
+pass on the surface tile's rim where it overhangs a hole: it reads neighboring
+cells' top-layer tile ids from the same tile-data buffer and subtracts a
+falloff from `out_color.rgb` near the edge. This is deliberately not
+derivative-based (`fwidth`) — see the in-shader comment in
+`tilemap.frag.glsl` for why that was rejected.
 
 The camera lives in the vertex shader (Sprite Rendering's `position_transform`), so
 a **pan uploads nothing** — the full-world quads are unchanged. The quads re-submit
@@ -378,7 +385,7 @@ columns, level z columns, and chunk/visibility columns in SoA form. World
 construction requires `.world_tileset` metadata, and world render enqueue
 requires the `.world_tileset` texture; missing world atlas data is an error, not
 a primitive rectangle fallback. The runtime loading path builds the procedural
-512x512 tile world through the Engine-owned `ThreadSystem`. Dense world tiles draw
+256x256 tile world through the Engine-owned `ThreadSystem`. Dense world tiles draw
 as a small, bounded number of GPU-driven composite tilemap quads (see
 GPU-Driven Tilemap) while sparse tiles, entities, and particles stream through
 the ordered dynamic batch — the

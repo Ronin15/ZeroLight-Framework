@@ -138,8 +138,8 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
 /// concurrent AUDIBLE sounds have a natural ceiling far below the mover count, so this
 /// stays a fixed, generous-but-bounded budget.
 const demo_test_audio_capacity = 256;
-const procedural_world_width_tiles: u16 = 256; //512
-const procedural_world_height_tiles: u16 = 256; //512
+const procedural_world_width_tiles: u16 = 256;
+const procedural_world_height_tiles: u16 = 256;
 /// Surface + underground dense floors for the procedural 32-level mine (runtime load).
 /// Unit tests use `initDemoForTest` / `initDemoFromMetaWithUnderground` (3 levels), not this config.
 const procedural_underground_count: u16 = 31; //31
