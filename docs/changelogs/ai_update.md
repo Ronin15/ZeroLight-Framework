@@ -6,7 +6,7 @@ Range: `main..ai_update`
 
 Base: `e6ed17b` (`Merge pull request #8 from Ronin15/expand2`)
 
-Tip: `107dd03` (`test seperation from demo state`)
+Tip: `a26487d` (`branch review and fixes`)
 
 ## Summary
 
@@ -111,6 +111,13 @@ path carries a `FailingAllocator` proof rather than a comment.
   to `CLAUDE.md` after removing heavyweight fixture-building `test` blocks
   from benchmark files that were slowing the unit-test suite without adding
   fast-feedback value.
+- A full-branch code review pass (`a26487d`) found and fixed two more Slice
+  36 rendering correctness bugs (a dense composite-draw interleave-depth
+  collector that could silently drop a needed cut, and a rim-shadow flicker
+  driven by unrelated scene content), an AI memory retarget bug where a cold
+  agent could snap toward a remembered position belonging to the wrong
+  entity, a pathfinding tier-0 budget clamp gap, and a perception cache
+  false-sharing/self-healing hardening pass — see "Branch Review Pass" below.
 
 ## AI Perception, Memory, And Affect (Slices 26–31)
 
@@ -260,6 +267,31 @@ path carries a `FailingAllocator` proof rather than a comment.
   build gpu-smoke`; `render-game-prep` benches assert
   `merged_tilemap_group_count == 1` as the CPU-measurable proxy for the fix
   (this repo has no GPU timestamp-query infra to measure fill-rate directly).
+- Review pass fix: `render_prep.collectDenseInterleaveDepths` deduplicated
+  candidate cut depths by raw value, so enough unrelated dynamic/sparse
+  depths could fill the fixed 32-slot scratch buffer before a real,
+  needed sparse-tile cut (appended last) was ever seen — silently merging a
+  composite draw that should have stayed split. Candidates are now
+  deduplicated by which *gap* between two adjacent submitted dense layers
+  they'd cut (`interleaveGapIndex`), bounded at
+  `k_max_dense_submit_stack_cap - 1` regardless of how many raw candidate
+  depths the scene produces; `WorldSystem.denseWindowLayerDepths()` exposes
+  the cached submitted-layer depths this relies on. Proven by a
+  `render_prep.zig` test feeding 93 candidates (3x the real gap count) and
+  asserting all 32 composite draws still land.
+- Review pass fix: the fragment shader's rim-shadow effect gated on
+  `resolved_depth == 0`, which means "topmost within this draw's own
+  composited window", not "topmost in the world at this cell" — an unrelated
+  interleave point elsewhere on the map could split a hole-revealing pair of
+  dense layers into two composite draws, making the deeper (merely
+  hole-revealed) tile flicker rim-shadow on and off as unrelated entities
+  moved. Fixed with a new per-draw `TilemapWindowLayers.is_shallowest_bucket`
+  flag (`Renderer.applyWindowLayers` forwards it into the previously-unused
+  `layer_meta.y`), set by `WorldSystem.submitStaticDenseGeometry` only for
+  the bucket holding the frame's actual shallowest submitted layer; the
+  shader now gates on `resolved_depth == 0 && layer_meta.y != 0`. Proven by a
+  `world_system.zig` test that splits the same two layers via an unrelated
+  interleave point and asserts only the shallower bucket is ever marked.
 
 ## SIMD Primitives (Slice 34)
 
@@ -348,6 +380,71 @@ path carries a `FailingAllocator` proof rather than a comment.
   35 (AI/steering hot-loop SIMD restructure), 37 (dense render-window ceiling
   raise), and 38 (elevation above the surface).
 
+## Branch Review Pass (`a26487d`)
+
+A full-branch code review pass across rendering, AI, and pathfinding found
+and fixed several real correctness bugs beyond the two Slice 36 rendering
+fixes already covered above:
+
+- `AiSystem.resolveRowTarget` let a cold agent's `AiMemory.last_known_target`
+  substitute for the live seek goal even when that memory belonged to a
+  different entity than the one actually being sought (e.g. some other
+  hostile-stance target glimpsed earlier), snapping the agent toward a stale,
+  unrelated position. `AiConfig` gained an optional `seek_entity` identity
+  gate; `resolveRowTarget` now only trusts remembered position when the
+  memory's target matches it. Null `seek_entity` preserves prior behavior for
+  callers with no single entity backing `seek_target` (e.g. the
+  center-of-mass fallback).
+- `pathfinding/solve.zig`'s tier-0 search used
+  `capacity.tier0_abstract_node_cap` unclamped, but `AbstractScratch.reserve`
+  always physically sizes its slot table from `max_abstract_nodes` (the
+  tier-1 ceiling) alone. A caller tuning `tier0_abstract_node_cap` above that
+  ceiling would silently saturate the physical slot table via `slotFor`'s
+  linear-probe loop well short of the configured budget, instead of hitting
+  the intended budget check. `solveOne` now clamps the tier-0 cap to
+  `@min(tier0_abstract_node_cap, max_abstract_nodes)`; a new
+  `pathfinding/system.zig` test pins a deliberately-inverted config (tier-0
+  far above tier-1) still solving cleanly.
+- `PerceptionSystem.range_stats` was a bare `ArrayList(PerceptionRangeStats)`
+  (32 bytes/slot) with concurrently-running worker ranges each writing their
+  final stats into adjacent slots — two slots could share one 64-byte cache
+  line, a false-sharing risk the analogous `PerceptionEventRangeSlot` buffer
+  already guarded against. Wrapped in a padded
+  `PerceptionRangeStatsSlot`, matching the existing pattern.
+- `PerceptionSystem.ensureLevelBlockedCache`'s self-healing gap: a level
+  queried (fail-closed) before `WorldSystem.addLevel` created it left
+  `built_step` stamped as if a real build had happened, so a later step could
+  see a step-counter match and skip revisiting it even after the level
+  actually existed, staying permanently fail-closed. A rebuild that still
+  finds the level out of range now leaves `built_step` unstamped, so the
+  cache keeps retrying every touch until the level is real. New test:
+  `"ensureLevelBlockedCache self-heals once a level queried before it
+  existed is actually added"`.
+- `GameDemoState.deinit` freed `test_squares` through `self.data.allocator`
+  — `DataSystem`'s own allocator field, which need not match the allocator
+  `test_squares` was actually spawned with. `GameDemoState` now stores its
+  own `allocator` field, set once at `init` from the same parameter
+  `spawnTestSquares` used, and frees through that instead.
+- `benchmarks/perception.zig`'s decorrelated-fixture shuffle asserted a
+  fixed stride (97) was coprime with the pair count, which only held for the
+  bench's own default `--items` tiers; a `--items` override could trip the
+  assert. `shuffleStrideFor` now searches upward from the preferred stride
+  for one that's actually coprime with the supplied pair count (bounded,
+  fixture-build-time only, not on a measured path).
+- `benchmarks/render_game_prep.zig`'s `initFixture` used one narrow
+  `errdefer` per heap-owning field, added as each field was built; a new
+  `InitStage` enum plus a single consolidated `errdefer` unwinds everything
+  built so far in reverse order instead, so a future added field only needs
+  one enum variant and one `stage = .field;` line rather than a fresh
+  standalone `errdefer` placed exactly right.
+- Corrected two documentation/comment inaccuracies: the stale
+  `Renderer.k_max_dense_composite_draws = 8` references in
+  `docs/rendering-assets-shaders.md` and this file's own Slice 36 section
+  (the real shipped value is `32`), and `docs/framework-implementation-slices.md`'s
+  Slice 26 checklist item, which described the landed component as
+  `AiFaction`/`entity_tag` when it actually shipped as `Faction`
+  (`src/game/faction.zig`).
+
 ## Follow-Up Work Left Explicit
 
 - Slice 32 (behavior arbitration) and Slice 33 (data-driven archetypes/
@@ -395,3 +492,5 @@ path carries a `FailingAllocator` proof rather than a comment.
 - `9201f9f` pathfinder fixes and mre tweaks
 - `e56831e` more capcity and perf tunning
 - `107dd03` test seperation from demo state
+- `f8b6e6b` changelog and documentation update
+- `a26487d` branch review and fixes
