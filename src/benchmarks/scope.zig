@@ -167,6 +167,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer scope.deinit();
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
+    try spatial_index.reserve(item_count, .{});
     var ai = AiSystem.init(allocator);
     defer ai.deinit();
     var collision = CollisionSystem.init(allocator);

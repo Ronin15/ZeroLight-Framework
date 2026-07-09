@@ -1312,6 +1312,7 @@ fn testSpatialIndex(
 ) !SpatialIndexSystem {
     var sys = SpatialIndexSystem.init(std.testing.allocator);
     errdefer sys.deinit();
+    try sys.reserve(ai_slice.entities.len, .{});
     _ = try sys.buildSerial(ai_slice, movement_slice, data, .{});
     return sys;
 }
@@ -2245,6 +2246,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var spatial_sys = SpatialIndexSystem.init(std.testing.allocator);
     defer spatial_sys.deinit();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     const spatial_stats = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{});
     try std.testing.expectEqual(@as(usize, 4), spatial_stats.entity_count);
 

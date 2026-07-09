@@ -8,6 +8,7 @@ const math = @import("math.zig");
 pub const lane_count: usize = 4;
 pub const Float4 = @Vector(lane_count, f32);
 pub const Int4 = @Vector(lane_count, i32);
+pub const Uint4 = @Vector(lane_count, u32);
 pub const Mask4 = @Vector(lane_count, bool);
 
 pub fn float4(x: f32, y: f32, z: f32, w: f32) Float4 {
@@ -26,12 +27,25 @@ pub fn splatInt4(value: i32) Int4 {
     return @splat(value);
 }
 
+pub fn splatUint4(value: u32) Uint4 {
+    return @splat(value);
+}
+
 pub fn loadFloat4(values: []const f32) Float4 {
     std.debug.assert(values.len >= lane_count);
     return .{ values[0], values[1], values[2], values[3] };
 }
 
 pub fn loadInt4(values: []const i32) Int4 {
+    std.debug.assert(values.len >= lane_count);
+    return .{ values[0], values[1], values[2], values[3] };
+}
+
+/// Loads four contiguous `u32` values into lane order. Used for direct
+/// (non-gathered) loads over row-major dense storage where consecutive
+/// indices are already adjacent in memory (see `spatial_index.zig`'s
+/// `DenseCellLookupView` occupancy scan).
+pub fn loadUint4(values: []const u32) Uint4 {
     std.debug.assert(values.len >= lane_count);
     return .{ values[0], values[1], values[2], values[3] };
 }
@@ -167,6 +181,10 @@ pub fn equalFloat4(lhs: Float4, rhs: Float4) Mask4 {
 }
 
 pub fn equalInt4(lhs: Int4, rhs: Int4) Mask4 {
+    return lhs == rhs;
+}
+
+pub fn equalUint4(lhs: Uint4, rhs: Uint4) Mask4 {
     return lhs == rhs;
 }
 
@@ -369,6 +387,18 @@ test "int load store and conversion keep stable lane order" {
     var stored: [lane_count]i32 = undefined;
     storeInt4(&stored, vector);
     try std.testing.expectEqual(source, stored);
+}
+
+test "uint load and equal match scalar results, including the u32-max lane" {
+    const lhs_source = [_]u32{ 5, 0, std.math.maxInt(u32), 7 };
+    const rhs_source = [_]u32{ 5, 1, std.math.maxInt(u32), 8 };
+    const lhs = loadUint4(&lhs_source);
+    const rhs = loadUint4(&rhs_source);
+
+    const mask = equalUint4(lhs, rhs);
+    inline for (0..lane_count) |lane| {
+        try std.testing.expectEqual(lhs_source[lane] == rhs_source[lane], mask[lane]);
+    }
 }
 
 test "float operations match scalar results" {

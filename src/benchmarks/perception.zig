@@ -469,6 +469,7 @@ fn runCaseImpl(
     defer spatial_sys.deinit();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
     const spatial_view = spatial_sys.view();
 
@@ -618,6 +619,7 @@ fn runCacheEditCaseImpl(
     defer spatial_sys.deinit();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
     const spatial_view = spatial_sys.view();
 

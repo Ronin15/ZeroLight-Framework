@@ -53,6 +53,7 @@ const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chu
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
 const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
+const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
 
@@ -417,7 +418,11 @@ pub const SimulationPipeline = struct {
         try scope.reserve(config.movement_body_capacity);
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
-        try spatial_index.reserve(config.movement_body_capacity);
+        const spatial_geometry: SpatialIndexDenseWindowGeometry = if (config.navigation_world) |world|
+            .{ .chunk_size_tiles = world.chunk_size_tiles, .tile_size = world.tile_size }
+        else
+            .{};
+        try spatial_index.reserve(config.movement_body_capacity, spatial_geometry);
         // No reserve method: PerceptionSystem lazily ensureTotalCapacity's its
         // gather buffers on first use, same as AiSystem.
         var perception = PerceptionSystem.init(allocator);

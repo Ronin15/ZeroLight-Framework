@@ -70,7 +70,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer fixture.deinit();
     var system = SpatialIndexSystem.init(allocator);
     defer system.deinit();
-    try system.reserve(item_count);
+    try system.reserve(item_count, .{});
     if (suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items)) |tuner| {
         system.build_tuner = tuner;
     }

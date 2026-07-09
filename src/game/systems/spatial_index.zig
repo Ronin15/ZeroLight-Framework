@@ -43,10 +43,20 @@
 //! rows at a time through `simd.floorToI4` with a scalar tail: gather into
 //! packed SoA scratch, then vectorize the dense math, per
 //! `docs/coding-standards.md`'s SIMD section.
+//!
+//! Populated-cell lookup: a row-major dense grid over a bounded,
+//! camera-relative window (`DenseCellLookup`), direct-indexed rather than
+//! hashed, so consecutive `cell.x` values at a fixed `cell.y` land on
+//! consecutive flat indices. `queryNeighbors` exploits exactly that: it loads
+//! 4 cells' `starts`/`ends` per batch with a plain contiguous
+//! `simd.loadUint4` and tests occupancy with one `simd.equalUint4` compare
+//! (see its doc comment). See `max_dense_window_side_cells`'s doc comment for
+//! how the window is sized and the assumption it rests on.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
+const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
 const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -81,36 +91,111 @@ pub const SpatialCellRange = struct {
     end: usize,
 };
 
-/// Cheap, non-cryptographic hash for a `SpatialCell` (two `i32`s). A prior
-/// version of `CellLookup` used `std.AutoHashMapUnmanaged`, which hashes
-/// struct keys via `Wyhash` — a streaming hash designed for variable-length
-/// data. Profiling this query under real gameplay load showed `Wyhash.hash`/
-/// `.init` was the majority of `queryNeighbors`' own cost: the per-call
-/// streaming setup dominated when paid on every one of up to ~169 scanned
-/// cells per observer, most of them misses. This context replaces it with a
-/// fixed handful of multiplies/shifts (splitmix64-style finalizer over a
-/// combine of the two coordinates) — no streaming state, no per-byte loop.
-const SpatialCellHashContext = struct {
-    pub fn hash(_: SpatialCellHashContext, cell: SpatialCell) u64 {
-        const x: u64 = @as(u32, @bitCast(cell.x));
-        const y: u64 = @as(u32, @bitCast(cell.y));
-        var h = x *% 0x9E3779B185EBCA87;
-        h ^= y *% 0xC2B2AE3D27D4EB4F;
-        h ^= h >> 29;
-        h *%= 0xBF58476D1CE4E5B9;
-        h ^= h >> 32;
-        return h;
+/// Fixed cap on the camera-visible region's own span, in spatial-index cells,
+/// added on top of the cognition-halo margin when sizing the dense window.
+/// Camera zoom is hardcoded to 1.0 everywhere in today's production code
+/// (`game_demo_state.zig`), so the visible region's cell span has no live,
+/// reachable path to grow beyond this assumed worst case right now; see
+/// `SpatialIndexSystem.reserve`'s doc comment for the margin math this
+/// combines with, and `max_dense_window_side_cells`'s doc comment for the
+/// caveat on how long that assumption holds.
+pub const max_expected_visible_window_cells: u32 = 256;
+
+/// Fixed capacity the dense window's side length is reserved to, independent
+/// of any world config.
+///
+/// Camera zoom is hardcoded to 1.0 in today's production code, but zoom-out is
+/// a planned future feature for this genre (top-down, multi-agent AI battles
+/// with 2048+ NPCs) with no min-zoom value decided yet. Rather than size only
+/// to today's literal zoom=1.0 state and have to redo this the moment zoom
+/// ships, this ceiling is sized by extrapolating a reasonable future zoom
+/// range for the genre (~0.2-0.25x is typical) combined with a generously
+/// large display: at 0.2x zoom on a ~20000x8600px display, the visible window
+/// alone reaches roughly 3125x1350 cells, and adding the ~512-cell halo margin
+/// at this project's real defaults gives roughly 3637x1862 cells needed. 4096
+/// covers that with real headroom (4096x4096 cells is ~134MB at 8 bytes/cell
+/// entry — a trivial one-time reserve).
+///
+/// This is still a documented, revisit-when-decided assumption, not a
+/// proven-forever bound: if/when camera zoom becomes an adjustable, designed
+/// feature, this constant and the debug-assert-based invariant in
+/// `buildEntriesAndRanges` must be revisited against that feature's actual
+/// designed min-zoom value, not left as-is.
+pub const max_dense_window_side_cells: u32 = 4096;
+
+/// World-config inputs the dense window's halo-margin formula needs. Callers
+/// (the pipeline) already hold these from the loaded WorldSystem; this struct
+/// keeps spatial_index.zig decoupled from importing WorldSystem itself.
+pub const DenseWindowGeometry = struct {
+    cell_size: f32 = 32.0,
+    chunk_size_tiles: u16 = 16,
+    tile_size: f32 = 32.0,
+};
+
+/// Row-major dense grid over a bounded, camera-relative window, re-anchored
+/// every build to that step's own populated-cell bounding box (not to
+/// absolute world coordinates) so a fixed-size buffer represents any camera
+/// position without growing. `starts`/`ends` are u32 (population/entries
+/// counts are bounded well under u32 by movement_body_capacity; assert the
+/// narrowing cast at write time). `start == end` at a slot means "not
+/// populated" — buildEntriesAndRanges never emits an empty [start,end), so
+/// this sentinel can't collide with a real range.
+pub const DenseCellLookup = struct {
+    starts: std.ArrayList(u32) = .empty,
+    ends: std.ArrayList(u32) = .empty,
+    // Flat indices written by the last build; cleared at the start of the
+    // next build before that build's new writes land. Capacity == population
+    // capacity (same bound as entries/ranges), so this never grows the
+    // O(window) direction — clear cost tracks populated-cell count, not
+    // window area. THIS is the mechanism that keeps per-step clear cost
+    // bounded by population, not by window area — get this right, it's the
+    // main way this design could quietly regress despite passing tests.
+    touched: std.ArrayList(usize) = .empty,
+    origin: SpatialCell = .{ .x = 0, .y = 0 },
+    width: u32 = 0,
+    height: u32 = 0,
+    capacity_cells_x: u32 = 0,
+    capacity_cells_y: u32 = 0,
+
+    fn reserve(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32, population_capacity: usize) !void {
+        const total = @as(usize, width) * @as(usize, height);
+        try self.starts.ensureTotalCapacity(allocator, total);
+        try self.ends.ensureTotalCapacity(allocator, total);
+        self.starts.appendNTimesAssumeCapacity(0, total);
+        self.ends.appendNTimesAssumeCapacity(0, total);
+        try self.touched.ensureTotalCapacity(allocator, population_capacity);
+        self.capacity_cells_x = width;
+        self.capacity_cells_y = height;
     }
 
-    pub fn eql(_: SpatialCellHashContext, a: SpatialCell, b: SpatialCell) bool {
-        return a.x == b.x and a.y == b.y;
+    fn clearTouched(self: *DenseCellLookup) void {
+        for (self.touched.items) |idx| {
+            self.starts.items[idx] = 0;
+            self.ends.items[idx] = 0;
+        }
+        self.touched.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *DenseCellLookup, allocator: std.mem.Allocator) void {
+        self.starts.deinit(allocator);
+        self.ends.deinit(allocator);
+        self.touched.deinit(allocator);
+        self.* = undefined;
     }
 };
 
-/// O(1) average-case populated-cell lookup, keyed by `SpatialCell`. See
-/// `SpatialCellHashContext`'s doc comment for why this uses a custom context
-/// instead of `std.AutoHashMapUnmanaged`.
-pub const CellLookup = std.HashMapUnmanaged(SpatialCell, SpatialCellRange, SpatialCellHashContext, std.hash_map.default_max_load_percentage);
+/// Read-only per-step slice into DenseCellLookup, embedded in SpatialIndexView.
+/// `queryNeighbors` is the sole reader; it indexes `starts`/`ends` directly
+/// (batched 4-wide within a row) rather than through a per-cell lookup method,
+/// since row-major layout makes consecutive `cell.x` values consecutive flat
+/// indices — see `queryNeighbors`'s doc comment.
+pub const DenseCellLookupView = struct {
+    starts: []const u32,
+    ends: []const u32,
+    origin: SpatialCell,
+    width: u32,
+    height: u32,
+};
 
 pub const SpatialIndexConfig = struct {
     /// World-unit size of one grid cell. Callers that share a population (AI
@@ -159,11 +244,12 @@ pub const SpatialIndexView = struct {
     pos_y: []const f32,
     entries: []const SpatialEntry,
     ranges: []const SpatialCellRange,
-    // O(1) populated-cell lookup, built alongside `ranges` from the exact same
-    // data (see `SpatialIndexSystem.buildEntriesAndRanges`). `ranges` itself
-    // stays (existing parity tests read it directly); this is a second,
-    // redundant index over the same rows purely for query-time lookup.
-    cell_lookup: CellLookup,
+    // O(1) direct-indexed populated-cell lookup, built alongside `ranges`
+    // from the exact same data (see `SpatialIndexSystem.buildEntriesAndRanges`
+    // and `DenseCellLookup`'s doc comment). `ranges` itself stays (existing
+    // parity tests read it directly); this is a second, redundant index over
+    // the same rows purely for query-time lookup.
+    dense_lookup: DenseCellLookupView,
     cell_size: f32,
 
     /// Scans the `cell_scan_radius` block of cells around `(origin_x, origin_y)`
@@ -178,6 +264,22 @@ pub const SpatialIndexView = struct {
     /// never reaches `visit_fn`. `visit_fn` receives `origin - candidate` for
     /// `dx`/`dy` and the already-computed `dist2`; returning `.stop` ends the
     /// whole scan immediately (not just the current cell).
+    ///
+    /// Occupancy is checked 4 cells at a time within a row: the dense window's
+    /// row-major layout means consecutive `cell_x` values at a fixed `cell_y`
+    /// are consecutive flat indices into `dense_lookup.starts`/`ends`, so a
+    /// plain contiguous `simd.loadUint4` (not a gather) loads 4 lanes at once
+    /// and `simd.equalUint4` tests all 4 for "unpopulated" (`start == end`) in
+    /// one compare. Each populated lane is then finished scalarly, in ascending
+    /// lane order, with the exact same per-entry visiting logic used before
+    /// vectorization — this changes only how occupancy is tested, never the
+    /// order entries are visited (see the determinism note above). The row's
+    /// x-span is first clipped to the dense window's bounds so the batch loop
+    /// never reads outside `starts`/`ends`; the row itself is skipped up front
+    /// when `cell_y` falls outside the window's y-span, exactly as
+    /// `DenseCellLookupView.get` would reject every cell in it today. A row's
+    /// clipped span not landing on a multiple of 4 finishes with a plain
+    /// scalar per-cell tail.
     pub fn queryNeighbors(
         self: SpatialIndexView,
         origin_x: f32,
@@ -191,28 +293,104 @@ pub const SpatialIndexView = struct {
         const own_cell = cellForPosition(origin_x, origin_y, self.cell_size);
         var stats = NeighborQueryStats{};
         const radius2 = limits.radius * limits.radius;
+
+        // Row-independent x clip: the scanned x-span never depends on cell_y,
+        // so it is computed once against the dense window's bounds rather than
+        // once per row.
+        const window_min_x = self.dense_lookup.origin.x;
+        const window_max_x = window_min_x + @as(i32, @intCast(self.dense_lookup.width)) - 1;
+        const clipped_min_x = @max(own_cell.x - cell_scan_radius, window_min_x);
+        const clipped_max_x = @min(own_cell.x + cell_scan_radius, window_max_x);
+        if (clipped_min_x > clipped_max_x) return stats;
+        const row_x_offset: usize = @intCast(clipped_min_x - window_min_x);
+        const n_cells: usize = @intCast(clipped_max_x - clipped_min_x + 1);
+        const vectorized_len = simd.vectorizedEnd(n_cells);
+
         var cell_y = own_cell.y - cell_scan_radius;
         while (cell_y <= own_cell.y + cell_scan_radius) : (cell_y += 1) {
-            var cell_x = own_cell.x - cell_scan_radius;
-            while (cell_x <= own_cell.x + cell_scan_radius) : (cell_x += 1) {
-                const range = self.cell_lookup.get(.{ .x = cell_x, .y = cell_y }) orelse continue;
-                for (self.entries[range.start..range.end]) |entry| {
-                    if (self_index) |self_i| {
-                        if (entry.index == self_i) continue;
-                    }
-                    if (stats.candidate_checks >= limits.max_candidate_checks) return stats;
-                    stats.candidate_checks += 1;
+            const rel_y = cell_y - self.dense_lookup.origin.y;
+            if (rel_y < 0 or rel_y >= @as(i32, @intCast(self.dense_lookup.height))) continue;
+            const row_base = @as(usize, @intCast(rel_y)) * self.dense_lookup.width + row_x_offset;
 
-                    const dx = origin_x - self.pos_x[entry.index];
-                    const dy = origin_y - self.pos_y[entry.index];
-                    const dist2 = dx * dx + dy * dy;
-                    if (dist2 < radius2) {
-                        if (visit_fn(context, entry.index, dx, dy, dist2) == .stop) return stats;
+            var j: usize = 0;
+            while (j < vectorized_len) : (j += simd.lane_count) {
+                const idx = row_base + j;
+                const starts_vec = simd.loadUint4(self.dense_lookup.starts[idx..]);
+                const ends_vec = simd.loadUint4(self.dense_lookup.ends[idx..]);
+                const unpopulated_mask = simd.equalUint4(starts_vec, ends_vec);
+                inline for (0..simd.lane_count) |lane| {
+                    if (!unpopulated_mask[lane]) {
+                        if (self.visitEntryRange(
+                            origin_x,
+                            origin_y,
+                            self_index,
+                            radius2,
+                            limits,
+                            context,
+                            visit_fn,
+                            @intCast(starts_vec[lane]),
+                            @intCast(ends_vec[lane]),
+                            &stats,
+                        )) return stats;
                     }
                 }
             }
+            while (j < n_cells) : (j += 1) {
+                const idx = row_base + j;
+                const start = self.dense_lookup.starts[idx];
+                const end = self.dense_lookup.ends[idx];
+                if (start == end) continue;
+                if (self.visitEntryRange(
+                    origin_x,
+                    origin_y,
+                    self_index,
+                    radius2,
+                    limits,
+                    context,
+                    visit_fn,
+                    @intCast(start),
+                    @intCast(end),
+                    &stats,
+                )) return stats;
+            }
         }
         return stats;
+    }
+
+    /// Visits `entries[start..end]` in ascending stored order with the
+    /// unvectorized per-entry logic (self-skip, candidate-check counting/cap,
+    /// strict radius prefilter, `visit_fn`). Returns `true` when the whole scan
+    /// must stop immediately (either the candidate-check cap was reached or
+    /// `visit_fn` returned `.stop`), letting the caller unwind out of the
+    /// vectorized-batch, row, and `cell_y` loops in one propagated signal.
+    fn visitEntryRange(
+        self: SpatialIndexView,
+        origin_x: f32,
+        origin_y: f32,
+        self_index: ?usize,
+        radius2: f32,
+        limits: NeighborQueryLimits,
+        context: *anyopaque,
+        visit_fn: NeighborVisitFn,
+        start: usize,
+        end: usize,
+        stats: *NeighborQueryStats,
+    ) bool {
+        for (self.entries[start..end]) |entry| {
+            if (self_index) |self_i| {
+                if (entry.index == self_i) continue;
+            }
+            if (stats.candidate_checks >= limits.max_candidate_checks) return true;
+            stats.candidate_checks += 1;
+
+            const dx = origin_x - self.pos_x[entry.index];
+            const dy = origin_y - self.pos_y[entry.index];
+            const dist2 = dx * dx + dy * dy;
+            if (dist2 < radius2) {
+                if (visit_fn(context, entry.index, dx, dy, dist2) == .stop) return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -247,7 +425,9 @@ pub const SpatialIndexSystem = struct {
     ranges: std.ArrayList(SpatialCellRange) = .empty,
     // O(1) query-time index over the same populated cells as `ranges` --
     // rebuilt alongside `ranges` every step, not a separate source of truth.
-    cell_lookup: CellLookup = .empty,
+    // Sized in `reserve` from the halo/world geometry; see `DenseCellLookup`'s
+    // doc comment.
+    dense_lookup: DenseCellLookup = .{},
     gather_ranges: RowRangeSlotList = .empty,
     build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     cell_size: f32 = 32.0,
@@ -262,23 +442,39 @@ pub const SpatialIndexSystem = struct {
     pub fn deinit(self: *SpatialIndexSystem) void {
         for (self.gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
         self.gather_ranges.deinit(self.allocator);
-        self.cell_lookup.deinit(self.allocator);
+        self.dense_lookup.deinit(self.allocator);
         self.ranges.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Pre-sizes `rows`/`entries`/`ranges`/`cell_lookup` to `capacity`
+    /// Pre-sizes `rows`/`entries`/`ranges`/`dense_lookup` to `capacity`
     /// movement bodies (worst case: one entity per cell) so the per-step
     /// build is allocation-free after init. The threaded per-range gather
     /// slots still warm on their first threaded step, same as
     /// `SimulationScopeSystem.reserve`.
-    pub fn reserve(self: *SpatialIndexSystem, capacity: usize) !void {
+    ///
+    /// `geometry` sizes the dense lookup window: the cognition-halo margin
+    /// (`2 * cognition_halo_chunks * chunk_size_tiles * tile_size` world
+    /// units, converted to cells by `cell_size`) plus a fixed assumed
+    /// visible-region span (`max_expected_visible_window_cells`), clamped to
+    /// `max_dense_window_side_cells`. At this project's real defaults
+    /// (`cognition_halo_chunks` 16, `chunk_size_tiles` 16, `tile_size`/
+    /// `cell_size` ~32) the margin alone is 512 cells — see
+    /// `max_dense_window_side_cells`'s doc comment for the headroom this
+    /// leaves and the assumption it rests on.
+    pub fn reserve(self: *SpatialIndexSystem, capacity: usize, geometry: DenseWindowGeometry) !void {
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
         try self.ranges.ensureTotalCapacity(self.allocator, capacity);
-        try self.cell_lookup.ensureTotalCapacity(self.allocator, @intCast(capacity));
+
+        const halo_world_units = 2.0 * @as(f32, @floatFromInt(cognition_halo_chunks)) *
+            @as(f32, @floatFromInt(geometry.chunk_size_tiles)) * geometry.tile_size;
+        const margin_cells: u32 = @intFromFloat(@ceil(halo_world_units / geometry.cell_size));
+        const window_side = @min(margin_cells + max_expected_visible_window_cells, max_dense_window_side_cells);
+
+        try self.dense_lookup.reserve(self.allocator, window_side, window_side, capacity);
     }
 
     /// Read-only snapshot of the most recently built index.
@@ -289,7 +485,13 @@ pub const SpatialIndexSystem = struct {
             .pos_y = slice.items(.pos_y),
             .entries = self.entries.items,
             .ranges = self.ranges.items,
-            .cell_lookup = self.cell_lookup,
+            .dense_lookup = .{
+                .starts = self.dense_lookup.starts.items,
+                .ends = self.dense_lookup.ends.items,
+                .origin = self.dense_lookup.origin,
+                .width = self.dense_lookup.width,
+                .height = self.dense_lookup.height,
+            },
             .cell_size = self.cell_size,
         };
     }
@@ -379,7 +581,6 @@ pub const SpatialIndexSystem = struct {
         self.rows.clearRetainingCapacity();
         self.entries.clearRetainingCapacity();
         self.ranges.clearRetainingCapacity();
-        self.cell_lookup.clearRetainingCapacity();
     }
 
     fn mergeRowRanges(self: *SpatialIndexSystem, slots: []RowRangeSlot) !void {
@@ -427,10 +628,20 @@ pub const SpatialIndexSystem = struct {
     }
 
     /// Builds `entries` (one per row) and derives `ranges` from the sorted
-    /// order. `entries`/`ranges` are reserved to `self.rows.len` up front (a
-    /// no-op once `reserve` has already sized them, matching the reserve-then-
-    /// ensureTotalCapacity belt-and-suspenders pattern the other processors use).
+    /// order, then writes the populated ranges into `dense_lookup`, re-anchored
+    /// to this step's own populated-cell bounding box. `entries`/`ranges` are
+    /// reserved to `self.rows.len` up front (a no-op once `reserve` has already
+    /// sized them, matching the reserve-then-ensureTotalCapacity
+    /// belt-and-suspenders pattern the other processors use).
+    ///
+    /// The bounding box fitting inside `dense_lookup`'s reserved capacity is a
+    /// program invariant, not a runtime-handled case — `reserve`'s sizing
+    /// keeps this comfortably true for every world/camera configuration
+    /// reachable in this codebase today (see `max_dense_window_side_cells`'s
+    /// doc comment for the caveat on that assumption). If it is ever violated
+    /// this asserts rather than silently degrading.
     fn buildEntriesAndRanges(self: *SpatialIndexSystem) !void {
+        self.dense_lookup.clearTouched();
         const n = self.rows.len;
         const cells = self.rows.items(.cell);
         try self.entries.ensureTotalCapacity(self.allocator, n);
@@ -442,7 +653,35 @@ pub const SpatialIndexSystem = struct {
 
         try self.ranges.ensureTotalCapacity(self.allocator, n);
         self.ranges.clearRetainingCapacity();
-        try self.cell_lookup.ensureTotalCapacity(self.allocator, @intCast(n));
+        if (n == 0) return;
+
+        // min_y/max_y fall out of the cell-major sort (first/last entry); x
+        // only sorts within a fixed y, so min_x/max_x need a scan.
+        var min_x: i32 = self.entries.items[0].cell.x;
+        var max_x: i32 = min_x;
+        for (self.entries.items) |entry| {
+            min_x = @min(min_x, entry.cell.x);
+            max_x = @max(max_x, entry.cell.x);
+        }
+        const min_y = self.entries.items[0].cell.y;
+        const max_y = self.entries.items[self.entries.items.len - 1].cell.y;
+        const width: u32 = @intCast(max_x - min_x + 1);
+        const height: u32 = @intCast(max_y - min_y + 1);
+
+        std.debug.assert(width <= self.dense_lookup.capacity_cells_x);
+        std.debug.assert(height <= self.dense_lookup.capacity_cells_y);
+
+        self.dense_lookup.origin = .{ .x = min_x, .y = min_y };
+        self.dense_lookup.width = width;
+        self.dense_lookup.height = height;
+        // Belt-and-suspenders growth, matching entries/ranges above: `touched`
+        // is reserved once in `reserve()` to the configured movement-body
+        // capacity (a no-op here in steady state), but a step whose
+        // population exceeds that capacity (e.g. `reserve` was called with a
+        // deliberately small capacity) still needs at most one touched slot
+        // per distinct populated cell, which is bounded by `n`.
+        try self.dense_lookup.touched.ensureTotalCapacity(self.allocator, n);
+
         var entry_index: usize = 0;
         while (entry_index < self.entries.items.len) {
             const cell = self.entries.items[entry_index].cell;
@@ -452,9 +691,14 @@ pub const SpatialIndexSystem = struct {
             }
             const range = SpatialCellRange{ .cell = cell, .start = start, .end = entry_index };
             self.ranges.appendAssumeCapacity(range);
-            // Populated cells are unique by construction (grouped by equal
-            // `cell` above), so this never overwrites an existing entry.
-            self.cell_lookup.putAssumeCapacity(cell, range);
+
+            std.debug.assert(range.start <= std.math.maxInt(u32) and range.end <= std.math.maxInt(u32));
+            const rel_x: u32 = @intCast(cell.x - min_x);
+            const rel_y: u32 = @intCast(cell.y - min_y);
+            const idx = @as(usize, rel_y) * width + rel_x;
+            self.dense_lookup.starts.items[idx] = @intCast(range.start);
+            self.dense_lookup.ends.items[idx] = @intCast(range.end);
+            self.dense_lookup.touched.appendAssumeCapacity(idx);
         }
     }
 };
@@ -639,25 +883,67 @@ fn serialBatch(count: usize) BatchStats {
 
 const testing = std.testing;
 
-// `cell_lookup` is caller-owned (the test calls `defer cell_lookup.deinit(...)`)
-// since `SpatialIndexView.cell_lookup` only holds a shallow copy referencing
-// the same backing buckets -- the real allocation must outlive the view.
+/// Builds a `SpatialIndexView` over caller-owned fixture data for
+/// `queryNeighbors`'s scan/visit/stop-semantics tests, which construct
+/// `entries`/`ranges` by hand rather than going through `buildEntriesAndRanges`.
+/// `dense_starts`/`dense_ends` are caller-owned scratch sized to at least the
+/// populated cells' bounding box; that box is computed here from `ranges` the
+/// same way production code does, just without an allocator.
 fn makeFixtureView(
     pos_x: []const f32,
     pos_y: []const f32,
     entries: []const SpatialEntry,
     ranges: []const SpatialCellRange,
-    cell_lookup: *CellLookup,
+    dense_starts: []u32,
+    dense_ends: []u32,
     cell_size: f32,
-) !SpatialIndexView {
-    cell_lookup.clearRetainingCapacity();
-    try cell_lookup.ensureTotalCapacity(testing.allocator, @intCast(ranges.len));
-    for (ranges) |range| cell_lookup.putAssumeCapacity(range.cell, range);
-    return .{ .pos_x = pos_x, .pos_y = pos_y, .entries = entries, .ranges = ranges, .cell_lookup = cell_lookup.*, .cell_size = cell_size };
+) SpatialIndexView {
+    var origin = SpatialCell{ .x = 0, .y = 0 };
+    var width: u32 = 1;
+    var height: u32 = 1;
+    if (ranges.len > 0) {
+        var min_x = ranges[0].cell.x;
+        var max_x = min_x;
+        var min_y = ranges[0].cell.y;
+        var max_y = min_y;
+        for (ranges) |range| {
+            min_x = @min(min_x, range.cell.x);
+            max_x = @max(max_x, range.cell.x);
+            min_y = @min(min_y, range.cell.y);
+            max_y = @max(max_y, range.cell.y);
+        }
+        origin = .{ .x = min_x, .y = min_y };
+        width = @intCast(max_x - min_x + 1);
+        height = @intCast(max_y - min_y + 1);
+    }
+    const cell_count = @as(usize, width) * @as(usize, height);
+    @memset(dense_starts[0..cell_count], 0);
+    @memset(dense_ends[0..cell_count], 0);
+    for (ranges) |range| {
+        const rel_x: u32 = @intCast(range.cell.x - origin.x);
+        const rel_y: u32 = @intCast(range.cell.y - origin.y);
+        const idx = @as(usize, rel_y) * width + rel_x;
+        dense_starts[idx] = @intCast(range.start);
+        dense_ends[idx] = @intCast(range.end);
+    }
+    return .{
+        .pos_x = pos_x,
+        .pos_y = pos_y,
+        .entries = entries,
+        .ranges = ranges,
+        .dense_lookup = .{
+            .starts = dense_starts[0..cell_count],
+            .ends = dense_ends[0..cell_count],
+            .origin = origin,
+            .width = width,
+            .height = height,
+        },
+        .cell_size = cell_size,
+    };
 }
 
 const RecordingVisitor = struct {
-    visited: [16]usize = undefined,
+    visited: [64]usize = undefined,
     count: usize = 0,
 
     fn record(context: *anyopaque, candidate_index: usize, _: f32, _: f32, _: f32) NeighborVisitResult {
@@ -687,9 +973,9 @@ test "queryNeighbors visits candidates in ascending stored order, excludes self 
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 4 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 5 }};
-    var cell_lookup: CellLookup = .empty;
-    defer cell_lookup.deinit(testing.allocator);
-    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
+    var dense_starts: [1]u32 = undefined;
+    var dense_ends: [1]u32 = undefined;
+    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
 
     var visitor = RecordingVisitor{};
     const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 5.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
@@ -714,9 +1000,9 @@ test "queryNeighbors stops at max_candidate_checks before processing the tipping
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 3 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 4 }};
-    var cell_lookup: CellLookup = .empty;
-    defer cell_lookup.deinit(testing.allocator);
-    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
+    var dense_starts: [1]u32 = undefined;
+    var dense_ends: [1]u32 = undefined;
+    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
 
     var visitor = RecordingVisitor{};
     const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 100.0, .max_candidate_checks = 1 }, &visitor, RecordingVisitor.record);
@@ -734,14 +1020,169 @@ test "queryNeighbors with no self_index scans every entry including index 0" {
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 2 }};
-    var cell_lookup: CellLookup = .empty;
-    defer cell_lookup.deinit(testing.allocator);
-    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
+    var dense_starts: [1]u32 = undefined;
+    var dense_ends: [1]u32 = undefined;
+    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &dense_starts, &dense_ends, 10.0);
 
     var visitor = RecordingVisitor{};
     _ = view.queryNeighbors(5, 0, null, 1, .{ .radius = 100.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
 
     try testing.expectEqualSlices(usize, &.{ 0, 1 }, visitor.visited[0..visitor.count]);
+}
+
+/// Builds a `SpatialIndexView` directly from an explicit dense window
+/// (`origin`/`width`/`height`/`dense_starts`/`dense_ends`), for the
+/// vectorized-batch tests below that need to place unpopulated gaps or
+/// out-of-window scan bounds precisely rather than deriving the window from a
+/// populated bounding box (as `makeFixtureView` does). `ranges` is left empty
+/// since `queryNeighbors` only reads `entries` and `dense_lookup`.
+fn makeDenseFixtureView(
+    pos_x: []const f32,
+    pos_y: []const f32,
+    entries: []const SpatialEntry,
+    dense_starts: []const u32,
+    dense_ends: []const u32,
+    origin: SpatialCell,
+    width: u32,
+    height: u32,
+    cell_size: f32,
+) SpatialIndexView {
+    return .{
+        .pos_x = pos_x,
+        .pos_y = pos_y,
+        .entries = entries,
+        .ranges = &[_]SpatialCellRange{},
+        .dense_lookup = .{
+            .starts = dense_starts,
+            .ends = dense_ends,
+            .origin = origin,
+            .width = width,
+            .height = height,
+        },
+        .cell_size = cell_size,
+    };
+}
+
+test "queryNeighbors vectorized batch visits mixed populated/unpopulated cells in ascending order across a row" {
+    // cell_size 10, one row (cell_y=0) spanning cell_x 0..4 (5 cells, so the
+    // 4-wide vectorized batch covers x=0..3 and the scalar tail covers x=4):
+    // populated at x=0 (indices 0,1), x=2 (index 2), x=3 (indices 3,4); x=1
+    // and x=4 are unpopulated gaps the batch/tail must skip without visiting.
+    const pos_x = [_]f32{ 0, 0, 0, 0, 0 };
+    const pos_y = [_]f32{ 0, 0, 0, 0, 0 };
+    const entries = [_]SpatialEntry{
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
+        .{ .cell = .{ .x = 2, .y = 0 }, .index = 2 },
+        .{ .cell = .{ .x = 3, .y = 0 }, .index = 3 },
+        .{ .cell = .{ .x = 3, .y = 0 }, .index = 4 },
+    };
+    const dense_starts = [_]u32{ 0, 0, 2, 3, 0 };
+    const dense_ends = [_]u32{ 2, 0, 3, 5, 0 };
+    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 5, 1, 10.0);
+
+    var visitor = RecordingVisitor{};
+    const stats = view.queryNeighbors(25, 5, null, 2, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
+
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3, 4 }, visitor.visited[0..visitor.count]);
+    try testing.expectEqual(@as(u16, 5), stats.candidate_checks);
+}
+
+test "queryNeighbors clips a scan radius extending past the dense window's edges without reading out of bounds" {
+    // Dense window covers only cell_y=0, cell_x in {0,1}. own_cell resolves to
+    // (0,0) and the scan radius (3) reaches x=-3..3 and y=-3..3, far past the
+    // window on every side; only the in-window cells may contribute.
+    const pos_x = [_]f32{ 0, 0, 0, 0 };
+    const pos_y = [_]f32{ 0, 0, 0, 0 };
+    const entries = [_]SpatialEntry{
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
+        .{ .cell = .{ .x = 1, .y = 0 }, .index = 2 },
+        .{ .cell = .{ .x = 1, .y = 0 }, .index = 3 },
+    };
+    const dense_starts = [_]u32{ 0, 2 };
+    const dense_ends = [_]u32{ 2, 4 };
+    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 2, 1, 10.0);
+
+    var visitor = RecordingVisitor{};
+    const stats = view.queryNeighbors(5, 5, null, 3, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
+
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 2, 3 }, visitor.visited[0..visitor.count]);
+    try testing.expectEqual(@as(u16, 4), stats.candidate_checks);
+}
+
+test "queryNeighbors scalar tail covers row spans that aren't a multiple of the lane count" {
+    const row_lengths = .{ 1, 2, 3, 5, 6, 7 };
+    inline for (row_lengths) |n| {
+        var pos_x: [n]f32 = undefined;
+        var pos_y: [n]f32 = undefined;
+        var entries: [n]SpatialEntry = undefined;
+        var dense_starts: [n]u32 = undefined;
+        var dense_ends: [n]u32 = undefined;
+        inline for (0..n) |i| {
+            pos_x[i] = 0;
+            pos_y[i] = 0;
+            entries[i] = .{ .cell = .{ .x = i, .y = 0 }, .index = i };
+            dense_starts[i] = i;
+            dense_ends[i] = i + 1;
+        }
+        // own_cell resolves to (0,0); scan_radius == n guarantees the window
+        // (width n) clips the scan down to exactly x in [0, n-1].
+        const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, n, 1, 10.0);
+
+        var visitor = RecordingVisitor{};
+        const stats = view.queryNeighbors(5, 5, null, n, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, RecordingVisitor.record);
+
+        var expected: [n]usize = undefined;
+        inline for (0..n) |i| expected[i] = i;
+        try testing.expectEqualSlices(usize, &expected, visitor.visited[0..visitor.count]);
+        try testing.expectEqual(@as(u16, n), stats.candidate_checks);
+    }
+}
+
+const StoppingVisitor = struct {
+    visited: [64]usize = undefined,
+    count: usize = 0,
+    stop_after: usize,
+
+    fn record(context: *anyopaque, candidate_index: usize, _: f32, _: f32, _: f32) NeighborVisitResult {
+        const self: *StoppingVisitor = @ptrCast(@alignCast(context));
+        self.visited[self.count] = candidate_index;
+        self.count += 1;
+        return if (self.count >= self.stop_after) .stop else .keep_going;
+    }
+};
+
+test "queryNeighbors propagates an early .stop out of a vectorized batch, its row, and the outer scan" {
+    // Two-row window (cell_y 0 and 1), row 0 spanning x=0..4 like the batch
+    // test above, row 1 also populated at x=0. stop_after=1 fires inside the
+    // very first visited cell's range (x=0 has two entries), before the
+    // vectorized batch even reaches x=2/x=3, before the scalar tail (x=4),
+    // and before row 1 is ever scanned.
+    const pos_x = [_]f32{ 0, 0, 0, 0, 0, 0 };
+    const pos_y = [_]f32{ 0, 0, 0, 0, 0, 0 };
+    const entries = [_]SpatialEntry{
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 0 },
+        .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
+        .{ .cell = .{ .x = 2, .y = 0 }, .index = 2 },
+        .{ .cell = .{ .x = 3, .y = 0 }, .index = 3 },
+        .{ .cell = .{ .x = 3, .y = 0 }, .index = 4 },
+        .{ .cell = .{ .x = 0, .y = 1 }, .index = 5 },
+    };
+    const dense_starts = [_]u32{
+        0, 0, 2, 3, 0, // row y=0: x=0..4
+        5, 0, 0, 0, 0, // row y=1: x=0..4
+    };
+    const dense_ends = [_]u32{
+        2, 0, 3, 5, 0,
+        6, 0, 0, 0, 0,
+    };
+    const view = makeDenseFixtureView(&pos_x, &pos_y, &entries, &dense_starts, &dense_ends, .{ .x = 0, .y = 0 }, 5, 2, 10.0);
+
+    var visitor = StoppingVisitor{ .stop_after = 1 };
+    _ = view.queryNeighbors(5, 5, null, 4, .{ .radius = 1000.0, .max_candidate_checks = 64 }, &visitor, StoppingVisitor.record);
+
+    try testing.expectEqualSlices(usize, &.{0}, visitor.visited[0..visitor.count]);
 }
 
 const SpatialTestFixture = struct {
@@ -767,7 +1208,7 @@ const SpatialTestFixture = struct {
     }
 };
 
-test "SpatialIndexSystem serial and threaded builds produce identical rows/entries/ranges" {
+test "SpatialIndexSystem serial and threaded builds produce identical rows/entries/ranges/dense_lookup" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var fixture = try SpatialTestFixture.init(testing.allocator, 63);
@@ -777,6 +1218,7 @@ test "SpatialIndexSystem serial and threaded builds produce identical rows/entri
 
     var serial_sys = SpatialIndexSystem.init(testing.allocator);
     defer serial_sys.deinit();
+    try serial_sys.reserve(ai_slice.entities.len, .{});
     const serial_stats = try serial_sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 3, .items_per_range = 8 });
@@ -785,6 +1227,7 @@ test "SpatialIndexSystem serial and threaded builds produce identical rows/entri
 
     var threaded_sys = SpatialIndexSystem.init(testing.allocator);
     defer threaded_sys.deinit();
+    try threaded_sys.reserve(ai_slice.entities.len, .{});
     const threaded_stats = try threaded_sys.build(ai_slice, move_slice, &fixture.data, &threads, .{
         .items_per_range = 8,
         .max_worker_threads = 3,
@@ -812,6 +1255,17 @@ test "SpatialIndexSystem serial and threaded builds produce identical rows/entri
         try testing.expectEqual(a.start, b.start);
         try testing.expectEqual(a.end, b.end);
     }
+
+    try testing.expectEqual(serial_sys.dense_lookup.origin, threaded_sys.dense_lookup.origin);
+    try testing.expectEqual(serial_sys.dense_lookup.width, threaded_sys.dense_lookup.width);
+    try testing.expectEqual(serial_sys.dense_lookup.height, threaded_sys.dense_lookup.height);
+    for (serial_sys.ranges.items) |range| {
+        const rel_x: u32 = @intCast(range.cell.x - serial_sys.dense_lookup.origin.x);
+        const rel_y: u32 = @intCast(range.cell.y - serial_sys.dense_lookup.origin.y);
+        const idx = @as(usize, rel_y) * serial_sys.dense_lookup.width + rel_x;
+        try testing.expectEqual(serial_sys.dense_lookup.starts.items[idx], threaded_sys.dense_lookup.starts.items[idx]);
+        try testing.expectEqual(serial_sys.dense_lookup.ends.items[idx], threaded_sys.dense_lookup.ends.items[idx]);
+    }
 }
 
 test "assignCellsDense matches an independently computed scalar cellForPosition, including the non-multiple-of-4 scalar tail" {
@@ -827,6 +1281,7 @@ test "assignCellsDense matches an independently computed scalar cellForPosition,
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
+    try sys.reserve(ai_slice.entities.len, .{});
     const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{ .cell_size = 30.0 });
     try testing.expectEqual(@as(usize, 25), stats.entity_count);
 
@@ -852,7 +1307,7 @@ test "SpatialIndexSystem builds correctly above a small reserved capacity" {
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(4);
+    try sys.reserve(4, .{});
 
     const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
     try testing.expectEqual(@as(usize, 40), stats.entity_count);
@@ -866,7 +1321,7 @@ test "SpatialIndexSystem empty population yields zero stats and touches nothing"
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(8);
+    try sys.reserve(8, .{});
 
     const ai_slice = data.aiAgentSliceConst();
     const move_slice = data.movementBodySliceConst();
@@ -902,7 +1357,7 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
-    try sys.reserve(24);
+    try sys.reserve(24, .{});
 
     // Warmup: one threaded build (warms `gather_ranges`) and one serial build.
     _ = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
@@ -917,4 +1372,74 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
     try testing.expectEqual(@as(usize, 24), threaded_stats.entity_count);
     const serial_stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
     try testing.expectEqual(@as(usize, 24), serial_stats.entity_count);
+
+    var visitor = RecordingVisitor{};
+    _ = sys.view().queryNeighbors(0, 0, null, 4, .{ .radius = 1000.0, .max_candidate_checks = 16 }, &visitor, RecordingVisitor.record);
+}
+
+test "queryNeighbors on the dense lookup finds exactly the entities within radius" {
+    var fixture = try SpatialTestFixture.init(testing.allocator, 30);
+    defer fixture.deinit();
+    const ai_slice = fixture.data.aiAgentSliceConst();
+    const move_slice = fixture.data.movementBodySliceConst();
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(30, .{});
+    const stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
+    try testing.expectEqual(@as(usize, 30), stats.entity_count);
+
+    const view = sys.view();
+    const query_radius = 64.0;
+    const scan_radius = cellScanRadius(query_radius, sys.cell_size);
+    for (0..view.pos_x.len) |origin_i| {
+        var visitor = RecordingVisitor{};
+        _ = view.queryNeighbors(
+            view.pos_x[origin_i],
+            view.pos_y[origin_i],
+            origin_i,
+            scan_radius,
+            .{ .radius = query_radius, .max_candidate_checks = 64 },
+            &visitor,
+            RecordingVisitor.record,
+        );
+
+        // Brute-force expected set: every other row strictly within radius,
+        // independent of the dense lookup under test.
+        var expected: [64]usize = undefined;
+        var expected_count: usize = 0;
+        for (0..view.pos_x.len) |j| {
+            if (j == origin_i) continue;
+            const dx = view.pos_x[origin_i] - view.pos_x[j];
+            const dy = view.pos_y[origin_i] - view.pos_y[j];
+            if (dx * dx + dy * dy < query_radius * query_radius) {
+                expected[expected_count] = j;
+                expected_count += 1;
+            }
+        }
+
+        std.mem.sort(usize, expected[0..expected_count], {}, std.sort.asc(usize));
+        var visited_sorted = visitor.visited;
+        std.mem.sort(usize, visited_sorted[0..visitor.count], {}, std.sort.asc(usize));
+        try testing.expectEqualSlices(usize, expected[0..expected_count], visited_sorted[0..visitor.count]);
+    }
+}
+
+test "reserve sizes the dense window from cognition halo margin plus fixed visible-window slack" {
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    // halo_world_units = 2 * cognition_halo_chunks(16) * 8 tiles * 4.0 px = 1024;
+    // margin_cells = ceil(1024 / 8.0) = 128.
+    try sys.reserve(4, .{ .cell_size = 8.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
+    const expected_margin_cells: u32 = 128;
+    try testing.expectEqual(expected_margin_cells + max_expected_visible_window_cells, sys.dense_lookup.capacity_cells_x);
+    try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+}
+
+test "reserve clamps the dense window to the hard ceiling for a pathological world geometry" {
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(4, .{ .cell_size = 1.0, .chunk_size_tiles = 60000, .tile_size = 500.0 });
+    try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_x);
+    try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_y);
 }

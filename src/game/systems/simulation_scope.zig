@@ -1301,6 +1301,7 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     defer spatial_sys.deinit();
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = indices });
 
     var ai_sys = ai.AiSystem.init(allocator);
