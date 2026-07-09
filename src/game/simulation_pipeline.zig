@@ -577,9 +577,10 @@ pub const SimulationPipeline = struct {
         self.audio_controller.queueAmbient(audio, input, data, player);
     }
 
-    /// Queues collision SFX for this step's contacts through the owned audio controller.
-    pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, delta_seconds: f32) void {
-        self.audio_controller.queueCollision(audio, frame, data, delta_seconds);
+    /// Queues collision SFX for this step's contacts through the owned audio
+    /// controller. Only contacts involving `player.entity` play a sound.
+    pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player: Player, delta_seconds: f32) void {
+        self.audio_controller.queueCollision(audio, frame, data, player.entity, delta_seconds);
     }
 
     /// Flags the active jet loop to stop on resume (no command buffer at pause time).

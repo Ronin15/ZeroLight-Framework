@@ -79,11 +79,16 @@ pub const AudioController = struct {
         }
     }
 
-    /// Plays a positional collision SFX per fresh contact pair, gated by per-pair
-    /// cooldowns so a persistent contact does not spam the mixer.
-    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, delta_seconds: f32) void {
+    /// Plays a positional collision SFX per fresh contact pair involving the
+    /// player, gated by per-pair cooldowns so a persistent contact does not
+    /// spam the mixer. Contacts between two non-player entities never play a
+    /// sound: at high population counts, NPC-vs-NPC contacts dominate mass
+    /// pileups and would otherwise overload the mixer with simultaneous
+    /// collision triggers every step.
+    pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_entity: EntityId, delta_seconds: f32) void {
         self.tickCooldowns(delta_seconds);
         for (frame.contacts.mergedItems()) |contact| {
+            if (!involvesEntity(contact, player_entity)) continue;
             if (self.pairOnCooldown(contact.a, contact.b)) continue;
             const position = contactAudioPosition(data, contact) orelse continue;
             const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
@@ -157,6 +162,15 @@ pub const AudioController = struct {
         };
     }
 };
+
+/// Whether `entity` is either side of `contact`.
+fn involvesEntity(contact: CollisionContact, entity: EntityId) bool {
+    return entitiesEqual(contact.a, entity) or entitiesEqual(contact.b, entity);
+}
+
+fn entitiesEqual(a: EntityId, b: EntityId) bool {
+    return a.index == b.index and a.generation == b.generation;
+}
 
 fn contactAudioPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
     const a = data.movementBodyConst(contact.a) orelse return null;
@@ -256,4 +270,103 @@ test "collision sfx cooldowns harden: cap<=32, full evicts min-remaining, tick c
     try std.testing.expectEqual(@as(usize, 1), controller.cooldown_count);
     controller.addCooldown(mk(1, 1), mk(2, 2));
     try std.testing.expectEqual(@as(usize, 2), controller.cooldown_count);
+}
+
+fn writeContacts(frame: *SimulationFrame, contacts: []const CollisionContact) !void {
+    try frame.contacts.prepareRangeCounts(1);
+    frame.contacts.addCount(0, contacts.len);
+    try frame.contacts.prefix();
+    var writer = frame.contacts.rangeWriter(0);
+    for (contacts) |contact| writer.write(contact);
+    writer.finish();
+    frame.contacts.finishWrite();
+}
+
+fn contactFixture(a: EntityId, b: EntityId, penetration: f32) CollisionContact {
+    return .{
+        .a = a,
+        .b = b,
+        .a_movement_index = 0,
+        .b_movement_index = 0,
+        .normal_x = 1,
+        .normal_y = 0,
+        .penetration = penetration,
+    };
+}
+
+test "queueCollision plays a sound for a contact involving the player" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    const npc = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setMovementBody(npc, .{ .position = .{ .x = 10, .y = 0 } });
+
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
+    try writeContacts(&frame, &.{contactFixture(player_entity, npc, 6.0)});
+
+    var commands = AudioCommandBuffer.init(allocator, 8);
+    defer commands.deinit();
+    var controller = AudioController.init();
+    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 1), commands.len());
+    try std.testing.expectEqual(AudioAssetId.collision_sfx, commands.items()[0].play_sfx.asset);
+    try std.testing.expectEqual(@as(usize, 1), controller.cooldown_count);
+}
+
+test "queueCollision plays no sound for a contact between two non-player entities" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    const npc_a = try data.createEntity();
+    const npc_b = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setMovementBody(npc_a, .{ .position = .{ .x = 10, .y = 0 } });
+    try data.setMovementBody(npc_b, .{ .position = .{ .x = 11, .y = 0 } });
+
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
+    try writeContacts(&frame, &.{contactFixture(npc_a, npc_b, 6.0)});
+
+    var commands = AudioCommandBuffer.init(allocator, 8);
+    defer commands.deinit();
+    var controller = AudioController.init();
+    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 0), commands.len());
+    try std.testing.expectEqual(@as(usize, 0), controller.cooldown_count);
+}
+
+test "queueCollision skips non-player contacts and still plays player contacts in the same step" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    const player_partner = try data.createEntity();
+    const npc_a = try data.createEntity();
+    const npc_b = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    try data.setMovementBody(player_partner, .{ .position = .{ .x = 5, .y = 0 } });
+    try data.setMovementBody(npc_a, .{ .position = .{ .x = 10, .y = 0 } });
+    try data.setMovementBody(npc_b, .{ .position = .{ .x = 11, .y = 0 } });
+
+    var frame = SimulationFrame.init(allocator);
+    defer frame.deinit();
+    try writeContacts(&frame, &.{
+        contactFixture(npc_a, npc_b, 6.0),
+        contactFixture(player_entity, player_partner, 4.0),
+    });
+
+    var commands = AudioCommandBuffer.init(allocator, 8);
+    defer commands.deinit();
+    var controller = AudioController.init();
+    controller.queueCollision(&commands, &frame, &data, player_entity, 1.0 / 60.0);
+
+    try std.testing.expectEqual(@as(usize, 1), commands.len());
+    try std.testing.expect(!controller.pairOnCooldown(npc_a, npc_b));
+    try std.testing.expect(controller.pairOnCooldown(player_entity, player_partner));
 }

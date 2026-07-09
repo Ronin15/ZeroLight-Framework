@@ -494,7 +494,7 @@ pub const GameDemoState = struct {
         });
 
         var collision_audio_timer = StageTimer.start();
-        self.pipeline.queueCollisionAudio(context.audio, &self.simulation_frame, &self.data, context.delta_seconds);
+        self.pipeline.queueCollisionAudio(context.audio, &self.simulation_frame, &self.data, self.player, context.delta_seconds);
         collision_audio_timer.stop(context.perf, .gameplay_audio);
 
         var particle_timer = StageTimer.start();
