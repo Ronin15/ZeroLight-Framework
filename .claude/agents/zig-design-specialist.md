@@ -66,8 +66,20 @@ the game layer needs. Game states never call SDL_GPU directly.
   and enum render-depth intent — never SDL/GPU handles, live texture IDs, text leases,
   asset-loading state, input-frame state, thread state, events, or scratch. State-owned
   transient pools (e.g. particles) may own fixed-capacity SoA when the data is effect state.
+  Default persistent/gather-buffer stores to `std.MultiArrayList` (row struct, column-slice
+  accessors) per `docs/coding-standards.md` Dense SoA storage; name the exception when a
+  layout intentionally isn't row-per-index (hot/cold column split, striped/arena buffer,
+  cache-line-padded thread slots, spatial hash grid, sparse slot map).
 - **Ordered processor list**: each processor's reads, writes, output buffers, and order.
-  Later processors must see completed output from earlier ones.
+  Later processors must see completed output from earlier ones. If the design adds or
+  reorders a `SimulationPipeline` stage, name its `PipelineResource` read/write tag(s) for
+  `stageContract()` and its `stage_order` position — `zig build check` comptime-fails a stage
+  reading a resource no earlier stage writes, so leaving this out is not a valid deferral.
+- **Fixed work budgets**: any per-query/per-frame budget (search node caps, solve ceilings,
+  and similar) is a fixed constant — never derived from or scaled to world/map size, cell
+  count, portal count, or other "current scale." State the budget explicitly and, when a hard
+  case can exceed it, name the graceful-degradation path (deterministic deferral / bounded
+  retry ladder) rather than a bigger number sized to one scenario.
 - **Deferred / main-thread boundary** for structural entity/component changes, state
   transitions, SDL/GPU calls, asset loading, save/load streaming, renderer resource
   ownership. The main thread is not a dumping ground — any subsystem that scales with

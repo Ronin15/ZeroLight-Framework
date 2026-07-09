@@ -25,9 +25,10 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
 - `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — live frontier roadmap (Slice 8
-  hardening, slices 22+, priorities, suggested order); settled slices 0–7 and
-  9–17 are in `docs/framework-implementation-slices-archive.md`.
+- `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
+  priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
+  18–25E, 26–31, 34, 36) are in
+  `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
   `docs/changelogs/world.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).

@@ -105,7 +105,8 @@ since movement never moves them. Steering and pathfinding read each entity's
 `world_level` for `start_level`; level transitions at link crossings are
 committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
 by a path-view field (a `PathView.next_cell_level` field was tried and removed
-as an unused duplicate — see `docs/framework-implementation-slices.md` Slice 25E).
+as an unused duplicate — see archive Slice 25E in
+`docs/framework-implementation-slices-archive.md`).
 
 ## Stage Ordering Contract
 

@@ -33,7 +33,7 @@
 //! (not proportional to agent count or `los_checks`) -- the once-per-step
 //! cache-rebuild cost paid against this fixture's deliberately unrealistic
 //! 20,000-tile density, not a per-sample regression. See
-//! `docs/framework-implementation-slices.md`'s Slice 29 section for the full
+//! `docs/framework-implementation-slices-archive.md`'s Slice 29 section for the full
 //! before/after tables of this original fix.
 //!
 //! That residual was closed by giving `level_blocked` incremental

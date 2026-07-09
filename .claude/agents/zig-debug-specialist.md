@@ -60,7 +60,20 @@ For performance failures, identify the hot path and whether the regression is al
 repeated lookup/validation, dynamic dispatch, formatted logging, resource recreation,
 excessive GPU submissions, or frame pacing. Prefer moving work to init/asset-load/state
 transitions/explicit caches over per-frame workarounds. For multi-stage processors, isolate
-stage timing and tuner state before changing thread policy or algorithm shape.
+stage timing and tuner state before changing thread policy or algorithm shape. Two named
+regression signatures in this codebase's `std.MultiArrayList`-backed hot paths: calling
+`rows.items(.field)` inside a loop instead of caching `rows.slice()` once, and
+`rows.appendAssumeCapacity(row)` per row in a hot gather loop instead of the
+`addOneAssumeCapacity` + `set()` pattern — both measured as large Debug/Release regressions
+(`docs/coding-standards.md` Dense SoA storage). When the fix touches a `reserve` +
+`assumeCapacity` hot path, add or update its `std.testing.FailingAllocator` proof test in the
+same change — ReleaseFast strips the assert `assumeCapacity` relies on, so an unproven reserve
+is a silent-corruption risk, not just a missed optimization.
+
+A `zig build check` failure citing a `SimulationPipeline` stage reading a resource before any
+earlier stage writes it is the `stageContract()`/`PipelineResource`/`stage_order` comptime
+contract working as intended (`docs/coding-standards.md` Simulation pipeline stage ordering) —
+fix the stage's declared reads/writes or its `stage_order` position, not the contract check.
 
 ## Narrow Commands
 

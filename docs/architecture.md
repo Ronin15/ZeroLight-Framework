@@ -453,17 +453,28 @@ staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
 
 Emergent NPC behavior layers on the cognition tier. Perception, memory, and
-affect (emotion) are durable per-entity concepts that live as SoA components in
-`DataSystem` and are advanced by cognition-gated processor stages in
-`src/game/systems/`, alongside AI, steering, and pathfinding. They follow the
-same rules as every other processor: allocation-free hot paths, deterministic
-serial/threaded and scalar/SIMD parity, range-disjoint output, and explicit
-barriers. Dense per-step sensing/affect data stays in component columns or
-transient range streams; only notable transitions become low-volume domain
-events. Cross-entity classification (faction/stance), a deterministic per-entity
-RNG facility in `src/core`, and a shared per-frame spatial index are shared
-substrate these stages consume. Because they run only for in-scope cognition
-entities, their cost scales with active scope, not total entity count.
+**affect (feelings / emotion drives)** are durable per-entity concepts that live
+as SoA components in `DataSystem` and are advanced by cognition-gated processor
+stages in `src/game/systems/`, alongside AI, steering, and pathfinding. They
+follow the same rules as every other processor: allocation-free hot paths,
+deterministic serial/threaded and scalar/SIMD parity, range-disjoint output, and
+explicit barriers. Dense per-step sensing/affect data stays in component columns
+or transient range streams; only notable transitions become low-volume domain
+events (`entity_perceived` / `entity_lost`, `affect_threshold_crossed`, and
+similar). Cross-entity classification (faction/stance), a deterministic
+per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
+shared substrate these stages consume. Because they run only for in-scope
+cognition entities, their cost scales with active scope, not total entity count.
+
+**Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
+drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
+per-entity baseline, decay rate, and threshold. `AffectSystem` appraises them
+from perception/memory (optional per row) and emits rising/falling threshold
+edges only. Behavior arbitration is expected to *consume* drive columns via a
+table-driven mapping (roadmap Slice 32), not ignore them or replace them with a
+mood enum FSM. New feelings append to `AiAffectDrive` and the weight table
+(roadmap Slice 42); they do not get a second parallel emotion subsystem. See
+`docs/framework-implementation-slices.md` Emergent AI Track Overview.
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay

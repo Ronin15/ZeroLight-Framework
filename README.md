@@ -131,7 +131,7 @@ Generated build output goes under `zig-out/` and should not be committed.
 - [Rendering, Assets, And Shaders](docs/rendering-assets-shaders.md)
 - [Atlas Asset Workflow](docs/atlas-asset-workflow.md)
 - [Simulation Tiers And Pipeline](docs/simulation-tiers-and-pipeline.md)
-- [Framework Implementation Slices](docs/framework-implementation-slices.md) (frontier roadmap; settled slices 0–7 and 9–17 are in [archive](docs/framework-implementation-slices-archive.md))
+- [Framework Implementation Slices](docs/framework-implementation-slices.md) (frontier roadmap; settled slices are in [archive](docs/framework-implementation-slices-archive.md))
 - [Changelogs](docs/changelogs/) (per-branch feature summaries; latest: [world](docs/changelogs/world.md))
 - [Module Reviews](docs/reviews/) (pathfinder, GPU, and other deep dives)
 
