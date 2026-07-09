@@ -58,7 +58,7 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     for (0..count) |i| {
         const entity = try data.createEntity();
         const seek = i % 2 == 0;
-        try data.setAiAgent(entity, .{ .behavior = if (seek) .seek else .wander });
+        try data.setAiAgent(entity, .{ .active_behavior = if (seek) .pursue else .wander });
         try data.setAiAffect(entity, .{ .decay_rate_fear = 0.1, .decay_rate_curiosity = 0.1, .decay_rate_aggression = 0.1, .decay_rate_fatigue = 0.1 });
         if (i % affect_signal_stride == 0) {
             try data.setAiPerception(entity, .{ .vision_range = 100, .target_visible = true, .nearest_threat_dist = 10, .heard_stimulus = false });

@@ -193,6 +193,7 @@ pub const RunStats = struct {
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
     render_game_prep_merged_tilemap_groups: usize = 0,
+    ai_behavior_histogram: ?AiBehaviorHistogramSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -253,6 +254,19 @@ pub const RenderGamePrepPhaseSummary = struct {
     merge_ns: u64 = 0,
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
+};
+
+/// Per-behavior selection counts after one measured `ai` run, read from
+/// `AiAgentStore`'s hot `active_behavior` column post-update (Slice 32
+/// arbitration output) -- proves the utility scorer actually spreads
+/// selections across all five `AiBehavior` buckets at the measured fixture,
+/// not just wander/pursue.
+pub const AiBehaviorHistogramSummary = struct {
+    wander: usize = 0,
+    pursue: usize = 0,
+    flee: usize = 0,
+    investigate: usize = 0,
+    cohere: usize = 0,
 };
 
 pub const WorkTuningSummary = struct {
@@ -804,9 +818,15 @@ fn printValidationSummary(
     {
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
-                "workload separation_checks={} intents={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
+                "workload separation_checks={} intents={} agents={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.item_count },
             );
+            if (best.stats.ai_behavior_histogram) |histogram| {
+                std.debug.print(
+                    "behaviors wander={} pursue={} flee={} investigate={} cohere={}. ",
+                    .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere },
+                );
+            }
         } else if (std.mem.eql(u8, group_name, "pathfinding")) {
             std.debug.print(
                 "workload field_requests={} results={}. ",

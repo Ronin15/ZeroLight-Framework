@@ -52,6 +52,12 @@ pub const Metric = enum {
     ai_navigation_intents,
     ai_separation_candidate_checks,
     ai_separation_neighbor_samples,
+    perception_observers,
+    perception_sensed,
+    perception_los_checks,
+    perception_los_blocked,
+    perception_nearest_threat_found,
+    perception_candidate_checks,
     steering_navigation_intents,
     steering_selected_intents,
     steering_movement_intents,
@@ -184,6 +190,7 @@ pub const Timing = enum {
 
 pub const BatchStage = enum {
     spatial_index_build,
+    perception,
     ai_separation,
     ai_intent,
     steering,
@@ -582,6 +589,19 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
+            "perf {d:.1}s perception observers={} observers_avg={d:.1} sensed={} los_checks={} los_blocked={} nearest_found={} candidate_checks={}",
+            .{
+                elapsed_s,
+                self.metricValue(.perception_observers),
+                averagePer(self.metricValue(.perception_observers), update_count),
+                self.metricValue(.perception_sensed),
+                self.metricValue(.perception_los_checks),
+                self.metricValue(.perception_los_blocked),
+                self.metricValue(.perception_nearest_threat_found),
+                self.metricValue(.perception_candidate_checks),
+            },
+        );
+        log.debug(
             "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} entity_perceived={} entity_lost={} affect_crossed={} structural_stage={} domain_stage={}",
             .{
                 elapsed_s,
@@ -666,7 +686,7 @@ const EnabledRuntimePerfLog = struct {
             const batch_stats = self.batchValue(stage);
             if (batch_stats.calls != 0) {
                 log.debug(
-                    "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} worker_util_avg={d:.1}%",
+                    "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} wait_on_max_ms={d:.3} worker_util_avg={d:.1}%",
                     .{
                         elapsed_s,
                         field.name,
@@ -679,6 +699,7 @@ const EnabledRuntimePerfLog = struct {
                         millis(batch_stats.averageNs()),
                         millis(batch_stats.max_duration_ns),
                         millis(batch_stats.averageWaitNs()),
+                        millis(batch_stats.wait_ns_on_max_duration),
                         batch_stats.averageWorkerUtilization() * 100.0,
                     },
                 );
@@ -725,6 +746,13 @@ const BatchAggregate = struct {
     total_duration_ns: u64 = 0,
     max_duration_ns: u64 = 0,
     total_wait_ns: u64 = 0,
+    // Main-thread wait time on the single call whose *duration* was the
+    // worst seen (not an independent max across all calls) -- lets a caller
+    // tell apart "one worker got an unlucky range while siblings idled"
+    // (wait_ns_on_max_duration close to max_duration_ns) from "every worker
+    // was equally busy that step, just on a globally harder population"
+    // (wait_ns_on_max_duration small relative to max_duration_ns).
+    wait_ns_on_max_duration: u64 = 0,
     total_worker_utilization: f64 = 0,
     max_active_worker_threads: usize = 0,
 
@@ -738,7 +766,10 @@ const BatchAggregate = struct {
             self.threaded_calls += 1;
         }
         self.total_duration_ns += stats.batch_duration_ns;
-        self.max_duration_ns = @max(self.max_duration_ns, stats.batch_duration_ns);
+        if (stats.batch_duration_ns >= self.max_duration_ns) {
+            self.max_duration_ns = stats.batch_duration_ns;
+            self.wait_ns_on_max_duration = stats.main_thread_wait_ns;
+        }
         self.total_wait_ns += stats.main_thread_wait_ns;
         self.total_worker_utilization += stats.worker_utilization;
         self.max_active_worker_threads = @max(self.max_active_worker_threads, stats.active_worker_threads);

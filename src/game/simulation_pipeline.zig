@@ -124,9 +124,10 @@ fn stageContract(stage: StageId) StageContract {
         // read perception_sensed's raw columns directly.
         .ai_memory_update => .{ .reads = resources(&.{ .ai_scope_indices, .events }), .writes = resources(&.{.ai_memory}) },
         // Appraises this step's just-written perception + memory columns into drives
-        // (Slice 31); a future arbitration stage (Slice 32) is the first affect_drives reader.
+        // (Slice 31); arbitration (Slice 32), wired into ai_decide below, is the
+        // first affect_drives reader.
         .affect_update => .{ .reads = resources(&.{ .ai_scope_indices, .perception_sensed, .ai_memory }), .writes = resources(&.{ .affect_drives, .events }) },
-        .ai_decide => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index, .perception_sensed, .ai_memory }), .writes = resources(&.{.navigation_intents}) },
+        .ai_decide => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }), .writes = resources(&.{.navigation_intents}) },
         .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
         .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
@@ -244,6 +245,7 @@ pub const SimulationPipelineStats = struct {
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
         const spatial_index_stats = self.spatial_index;
+        const perception_stats = self.perception;
         const ai_stats = self.ai;
         const steering_stats = self.steering;
         const pathfinding_stats = self.pathfinding;
@@ -265,6 +267,14 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
 
         perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
+
+        perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
+        perf.recordMetric(.perception_sensed, metric(perception_stats.sensed_count));
+        perf.recordMetric(.perception_los_checks, metric(perception_stats.los_checks));
+        perf.recordMetric(.perception_los_blocked, metric(perception_stats.los_blocked));
+        perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.nearest_threat_found_count));
+        perf.recordMetric(.perception_candidate_checks, metric(perception_stats.candidate_checks));
+        perf.recordBatch(.perception, perception_stats.batch);
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
@@ -362,13 +372,14 @@ pub const SimulationPipeline = struct {
     /// AI short-term memory: decays staleness/familiarity/ring contacts for the
     /// cognition-scoped `AiPerception` + `AiMemory` subset and refreshes from
     /// this step's perception acquisition events, feeding `AiSystem`'s
-    /// memory-aware cold-seek retarget.
+    /// memory-aware cold-pursue retarget.
     ai_memory: AiMemorySystem,
     /// Emotion-drive appraisal (fear/curiosity/aggression/fatigue): appraises
     /// this step's just-refreshed `AiPerception`/`AiMemory` state (both
-    /// optional per row) plus each agent's own `AiAgent.behavior` into the
-    /// cognition-scoped `AiAffect` subset. A future arbitration slice reads
-    /// the resulting drives; this stage only appraises and decays them.
+    /// optional per row) plus each agent's own `AiAgent.active_behavior` into
+    /// the cognition-scoped `AiAffect` subset. `AiConfig.affect_slice` threads
+    /// the resulting drives into arbitration (Slice 32) one stage later; this
+    /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
     audio_controller: AudioController,
@@ -411,6 +422,13 @@ pub const SimulationPipeline = struct {
         // gather buffers on first use, same as AiSystem.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
+        // Pays every level's first-ever `level_blocked` cache build once here,
+        // alongside pathfinding's own static grid build above, instead of
+        // scattered across whichever live steps first put an observer on each
+        // level (see `PerceptionSystem.prebuildLevelCaches`'s doc comment).
+        if (config.navigation_world) |world| {
+            try perception.prebuildLevelCaches(world);
+        }
         // No reserve method: AiMemorySystem lazily ensureTotalCapacity's its
         // gather buffer on first use, same as PerceptionSystem/AiSystem.
         var ai_memory = AiMemorySystem.init(allocator);
@@ -646,7 +664,7 @@ pub const SimulationPipeline = struct {
 
         // Decays staleness/familiarity/ring contacts and refreshes from this
         // step's perception acquisition events, over the same cognition-scoped
-        // `ai_indices` population, before AI reads it for the cold-seek
+        // `ai_indices` population, before AI reads it for the cold-pursue
         // retarget below.
         var ai_memory_timer = StageTimer.start();
         const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
@@ -658,8 +676,8 @@ pub const SimulationPipeline = struct {
         // fear/curiosity/aggression/fatigue, over the same cognition-scoped
         // `ai_indices` population. Must run after both perception and
         // ai_memory (it reads their this-step hot columns) and before
-        // AI/arbitration would read the resulting drives -- arbitration does
-        // not exist yet, this is a forward seam only, not implemented here.
+        // arbitration (Slice 32), wired below via `AiConfig.affect_slice`,
+        // reads the resulting drives.
         var affect_timer = StageTimer.start();
         const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
             .scope_dense_indices = ai_indices,
@@ -671,7 +689,8 @@ pub const SimulationPipeline = struct {
         // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
         // Seeding the player's underground plane here would make them request
         // cross-level paths they cannot walk (start_level is pinned to 0), piling
-        // them at the ramp mouth. They simply seek the (x,y) above the player.
+        // them at the ramp mouth. `player_target` only ever feeds the opt-in
+        // pursue fallback below, never a goal level, so this stays a flat (x,y).
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
             pbody.previous_position
         else
@@ -681,22 +700,29 @@ pub const SimulationPipeline = struct {
         const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .step = self.scope.currentStep(),
-            .seek_target = player_target,
-            // Ties `resolveRowTarget`'s identity check to the actual entity
-            // `player_target` represents, so a cold row only retargets via
-            // memory of this same entity — not memory of some other
-            // hostile-stance target this agent glimpsed earlier.
-            .seek_entity = context.player.entity,
-            // Throttles how often the shared goal re-keys as the player moves
-            // continuously, since local separation/steering closes the small
-            // gap between path updates. Without this, the goal re-keys (and
-            // triggers one bounded escalated solve) roughly every nav cell
-            // the player crosses.
+            // Last-resort fallback (see AiConfig.focus_target's doc comment):
+            // arbitration only reaches for this when a row's own perception/
+            // memory produced no goal and its gain_pursue > 0. Most rows
+            // resolve their goal from their own sensed/remembered/felt state
+            // instead and never touch this pair.
+            .focus_target = player_target,
+            // Ties the pursue fallback's identity to the actual entity
+            // `player_target` represents, so a row falling back to this
+            // signal only ever targets this same entity.
+            .focus_entity = context.player.entity,
+            // Throttles how often the fallback target re-keys as the player
+            // moves continuously, since local separation/steering closes the
+            // small gap between path updates. Without this, the goal re-keys
+            // (and triggers one bounded escalated solve) roughly every nav
+            // cell the player crosses.
             .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
-            // Every demo agent seeks the moving player: the canonical shared goal.
-            // Declaring group mode routes them through one managed flow field
-            // toward the player's nav cell instead of N individual A* solves.
-            .nav_request_kind = .group,
+            // Ceiling only: arbitration currently resolves every behavior's
+            // goal to `.individual` (each row's goal is agent-specific), so
+            // this has no observable effect today. `.individual` is still the
+            // correct default going forward -- a future group-goal upgrade
+            // (e.g. cohere's shared quantized cell) would otherwise silently
+            // turn back on the moment it lands.
+            .nav_request_kind = .individual,
             .navigation_intents = &frame.navigation_intents,
             // Cognition halo + stagger selection. Steering inherits this scope
             // transitively: it only acts on the navigation intents AI emits here.
@@ -705,6 +731,10 @@ pub const SimulationPipeline = struct {
             // their last-known position instead of losing the goal.
             .perception_slice = data.aiPerceptionSliceConst(),
             .memory_slice = data.aiMemorySliceConst(),
+            // Emotion drives (Slice 31/32): arbitration scores each row's
+            // behaviors partly off these, so feelings can change which
+            // behavior wins independent of what's perceived/remembered.
+            .affect_slice = data.aiAffectSliceConst(),
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
@@ -966,6 +996,11 @@ fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: 
     }
 }
 
+test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
+    const contract = stageContract(.ai_decide);
+    try std.testing.expect(contract.reads.contains(.affect_drives));
+}
+
 test "pipeline updates full active player-only state through serial path" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -1055,7 +1090,7 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
-    try data.setAiAgent(npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(npc, 0);
     try data.setSimulationTier(npc, .locomotion);
     {
@@ -1121,7 +1156,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
     var player = try Player.spawn(&data);
     const wanderer = try data.createEntity();
     try data.setMovementBody(wanderer, .{ .position = .{ .x = 10, .y = 10 }, .previous_position = .{ .x = 10, .y = 10 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(wanderer, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+    try data.setAiAgent(wanderer, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 0 });
 
     var world = WorldSystem{
         .allocator = std.testing.allocator,
@@ -1210,7 +1245,7 @@ test "pipeline syncs movement previous positions" {
     try std.testing.expectEqual(synced.position.y, synced.previous_position.y);
 }
 
-test "pipeline runs ai_memory after perception and before ai, feeding memory into AI's cold-seek retarget" {
+test "pipeline runs ai_memory after perception and before ai, feeding memory into AI's cold-pursue retarget" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -1222,10 +1257,10 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     // player, so the real PerceptionSystem pass this step reports the target
     // not visible regardless of hostility.
     try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
-    try data.setAiAgent(agent, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
     try data.setAiPerception(agent, .{});
-    // Memory of the player -- the same entity the pipeline's seek_entity
-    // resolves to below -- so the identity gate in resolveRowTarget lets the
+    // Memory of the player -- the same entity the pipeline's focus_entity
+    // resolves to below -- so arbitration's memory/focus identity match lets the
     // retarget through and this still proves the ai_memory-before-ai order.
     try data.setAiMemory(agent, .{
         .last_known_target = player.entity,
@@ -1284,20 +1319,20 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     // Perception never saw the player (out of vision range) and AiMemory's
     // fresh last-known position survived AiMemorySystem's decay, so AI's
     // per-row goal reflects the memory retarget (0, 100) rather than the
-    // player's seek_target (400, 225) — the actual end-to-end proof that a
-    // cold-perception agent retargets via memory through the real pipeline.
+    // player's focus_target fallback (400, 225) — the actual end-to-end proof
+    // that a cold-perception agent retargets via memory through the real pipeline.
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), intents.len);
     try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
     try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
 }
 
-test "pipeline does not retarget a cold agent toward memory of an entity other than the current seek entity" {
+test "pipeline does not retarget a cold agent toward memory of an entity other than the current focus entity" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    var player = try Player.spawn(&data); // Spawns at (400, 225); this is the pipeline's seek_entity.
+    var player = try Player.spawn(&data); // Spawns at (400, 225); this is the pipeline's focus_entity.
 
     // A throwaway entity the agent glimpsed earlier, disconnected from the
     // player. Memory of it must not be trusted as a substitute for the live
@@ -1308,7 +1343,7 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     // player, so the real PerceptionSystem pass this step reports the target
     // not visible regardless of hostility.
     try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
-    try data.setAiAgent(agent, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 1.0 });
+    try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
     try data.setAiPerception(agent, .{});
     try data.setAiMemory(agent, .{
         .last_known_target = other_target,
@@ -1360,8 +1395,9 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     });
 
     // Memory is fresh and valid, but belongs to `other_target`, not the
-    // player the pipeline is currently seeking -- the goal must stay the
-    // live player seek_target (400, 225), not snap to (0, 100).
+    // configured `focus_target` fallback entity -- arbitration's identity
+    // check must reject it, so the goal falls through to the live player
+    // focus_target (400, 225), not snap to (0, 100).
     const intents = frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), intents.len);
     try std.testing.expectEqual(@as(f32, 400), intents[0].goal.x);
@@ -1381,14 +1417,14 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     // state (not a stale previous-step value) to move off baseline.
     const observer = try data.createEntity();
     try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(observer, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(observer, .player);
     try data.setAiPerception(observer, .{});
     try data.setAiAffect(observer, .{ .decay_rate_fear = 0.5, .decay_rate_aggression = 0.5 });
 
     const hostile = try data.createEntity();
     try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(hostile, .hostile);
 
     var world = WorldSystem{
@@ -1448,6 +1484,97 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     const affect_after = data.aiAffectConst(observer).?;
     try std.testing.expect(affect_after.fear > 0);
     try std.testing.expect(affect_after.aggression > 0);
+}
+
+test "pipeline resolves an aggressive non-player entity's pursue goal to another non-player entity, not the player" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // Push the player well outside every AiPerception's default vision_range
+    // (240) so it never becomes a perceived/fallback candidate this step --
+    // isolating the point of this test: the pursuer's goal comes from its own
+    // perceived hostile, not the pipeline's focus_target fallback.
+    const player_body = data.movementBodyPtr(player.entity).?;
+    player_body.position_x.* = 5000;
+    player_body.position_y.* = 5000;
+    player_body.previous_x.* = 5000;
+    player_body.previous_y.* = 5000;
+
+    const pursuer = try data.createEntity();
+    try data.setMovementBody(pursuer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(pursuer, .{ .active_behavior = .wander, .wander_amplitude = 0, .gain_pursue = 1.0 });
+    try data.setFaction(pursuer, .player);
+    try data.setAiPerception(pursuer, .{});
+
+    // Kept inside the 1x1, 32px-tile world below (see the LOS comment on
+    // `world.addLevel`) so the real LOS raycast doesn't fail closed on an
+    // out-of-bounds endpoint.
+    const target = try data.createEntity();
+    try data.setMovementBody(target, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(target, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(target, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
+    // observer as fail-closed (blocked), never reporting a target visible.
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // The pursuer's real perception saw `target` (close, hostile stance) this
+    // step, so arbitration resolves its pursue goal to `target`'s position --
+    // proving the pipeline no longer forces every agent's goal onto the
+    // player, even though the player-broadcast focus_target/focus_entity pair
+    // remains wired as the (unused here) opt-in fallback.
+    const intents = frame.navigation_intents.mergedItems();
+    var found = false;
+    for (intents) |intent| {
+        if (intent.entity.index != pursuer.index or intent.entity.generation != pursuer.generation) continue;
+        found = true;
+        try std.testing.expectEqual(@as(f32, 10), intent.goal.x);
+        try std.testing.expectEqual(@as(f32, 0), intent.goal.y);
+    }
+    try std.testing.expect(found);
 }
 
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -1564,7 +1691,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
-    try data.setAiAgent(dormant_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(dormant_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(dormant_npc, 0);
     // Tier must be set before overwriting position: setSimulationTier snaps
     // previous=position for non-moving tiers, which would erase the crossing
@@ -1588,7 +1715,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
-    try data.setAiAgent(active_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(active_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(active_npc, 0);
     try data.setSimulationTier(active_npc, .locomotion);
     {
@@ -1643,7 +1770,7 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     // becomes both an AI gather row and a perception gather row.
     const observer = try data.createEntity();
     try data.setMovementBody(observer, .{ .position = .{ .x = 50, .y = 50 }, .previous_position = .{ .x = 50, .y = 50 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(observer, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setAiPerception(observer, .{ .vision_range = 100 });
 
     // Locomotion-tier: `gatherAiAgentIndices` excludes it (tier.allowsCognition()
@@ -1651,7 +1778,7 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     // perception shares AI's exact scoped population rather than its own.
     const out_of_scope = try data.createEntity();
     try data.setMovementBody(out_of_scope, .{ .position = .{ .x = 60, .y = 60 }, .previous_position = .{ .x = 60, .y = 60 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(out_of_scope, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(out_of_scope, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setAiPerception(out_of_scope, .{ .vision_range = 100 });
     try data.setSimulationTier(out_of_scope, .locomotion);
 
@@ -1733,22 +1860,22 @@ test "pipeline perception events truncate instead of throwing when the shared ev
     // perception emits two events.
     const observer_a = try data.createEntity();
     try data.setMovementBody(observer_a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_a, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(observer_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(observer_a, .player);
     try data.setAiPerception(observer_a, .{});
     const hostile_a = try data.createEntity();
     try data.setMovementBody(hostile_a, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_a, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(hostile_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(hostile_a, .hostile);
 
     const observer_b = try data.createEntity();
     try data.setMovementBody(observer_b, .{ .position = .{ .x = 100, .y = 0 }, .previous_position = .{ .x = 100, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_b, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(observer_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(observer_b, .player);
     try data.setAiPerception(observer_b, .{});
     const hostile_b = try data.createEntity();
     try data.setMovementBody(hostile_b, .{ .position = .{ .x = 110, .y = 0 }, .previous_position = .{ .x = 110, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_b, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(hostile_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setFaction(hostile_b, .hostile);
 
     var world = WorldSystem{

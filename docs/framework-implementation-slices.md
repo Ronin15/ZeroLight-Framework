@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–31, 34, 36) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only.
@@ -79,8 +79,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 
 | Slice | Status | Open work (see slice section for full Checklist) |
 | --- | --- | --- |
-| **32** | **Next** | AI behavior arbitration — utility over perception/memory/emotion drives; per-agent goals; expandable weight contract |
-| **33** | Not started | Data-driven AI archetypes + debug introspection — depends on Slice 32 |
+| **33** | **Next** | Data-driven AI archetypes + debug introspection — depends on Slice 32 (landed) |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — after 32 reshapes AI loops |
 | **37** | Not started | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
@@ -89,7 +88,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **41** | Not started | World interest / affordance markers |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood |
 
-**Recently settled (archive only):** 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** 23A `expand2`→`world` merge and optional render
 micro-opts — see **Scaling Gaps** / Next Priority Tracks, not a live slice body.
 
@@ -100,25 +99,31 @@ micro-opts — see **Scaling Gaps** / Next Priority Tracks, not a live slice bod
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice section.
 
-- **Next implementation slice: 32** (behavior arbitration). It is the closed loop
-  that turns perception/memory/**emotion drives** into varied locomotion intents.
-  Without it the cognition stack is write-only: `AiAffect` drives update but
-  nothing reads them, and every agent still seeks a broadcast player target via
-  `wander`/`seek`.
-- **Emotion substrate is already landed (Slice 31)** — fear, curiosity,
-  aggression, fatigue with baselines, decay, thresholds, and
-  `affect_threshold_crossed` events. Slice 32 is the first *consumer*; Slice 42
-  is how the **feeling set and coupling grow** without rewriting AI.
-- **Then 33** (archetypes + debug) so personalities (including affect baselines
-  and future appraisal gains) and tuning are data-driven and observable —
-  required before claiming live "emergent" demo interplay.
-- **Keep systems expandable:** Slice 32 must land a reusable weight-resolution
-  and per-agent goal-resolution contract, not a second hard-coded priority
-  ladder. Emotion → behavior mapping must be **table-driven over
-  `AiAffectDrive`**, not a permanent `if (fear) flee` tree that freezes the
-  four-drive set. Do not lock agents to the player as the only goal, do not
-  replace utility with an exclusive FSM, and do not grow production APIs with
-  test-only tags.
+- **Slice 32 (behavior arbitration) is landed** — the closed loop that turns
+  perception/memory/**emotion drives** into varied locomotion intents.
+  `arbitration.zig` scores `wander`/`pursue`/`flee`/`investigate`/`cohere` via
+  a table-driven drive×behavior weight matrix, sticky-selects one, and
+  resolves a per-agent goal; the broadcast "everyone seeks the player" path is
+  gone — perception's faction-generic `nearest_threat` is the primary pursue/
+  flee signal, and the player is reachable only through an explicit, opt-in,
+  gain-gated `AiConfig.focus_target`/`focus_entity` fallback. See the archive's
+  Slice 32 entry for the full record.
+- **Emotion substrate (Slice 31) is now consumed** — fear, curiosity,
+  aggression, fatigue feed arbitration's weight table every cognition step via
+  `AiConfig.affect_slice`; `stageContract(.ai_decide)` reads `affect_drives`.
+  Slice 42 is how the **feeling set and coupling grow** without rewriting AI.
+- **Next implementation slice: 33** (archetypes + debug) so personalities
+  (including affect baselines and future appraisal gains) and tuning are
+  data-driven and observable — required before claiming live "emergent" demo
+  interplay.
+- **Keep systems expandable (standing rule, not just a 32 requirement):** the
+  weight-resolution and per-agent goal-resolution contract Slice 32 landed
+  (`scoreBehaviors`/`selectSticky`/`resolveGoal` in `arbitration.zig`) is
+  reusable by future producers, not a one-off. Emotion → behavior mapping stays
+  **table-driven over `AiAffectDrive`**, not a permanent `if (fear) flee` tree
+  that freezes the four-drive set. Do not lock agents to the player as the only
+  goal, do not replace utility with an exclusive FSM, and do not grow
+  production APIs with test-only tags.
 - **After the locomotion AI closed loop (32–33):** Slice 39 (stimulus richness),
   41 (world interest), 40 (action intents), and **42 (affect expansion)** unlock
   richer senses, non-locomotion emergence, and more feelings. Render slices
@@ -201,8 +206,8 @@ world depth, or cognition-track scope.
   passes and scope stats show typical participation stays below bench ceilings.
 - Per-entity depth alignment (archive 25E) is settled before multi-floor
   gameplay scenarios that depend on cross-level entity presence.
-- Land Slice 32 (arbitration + per-agent goals) before claiming emergent NPC
-  variety; land Slice 33 before shipping data-tuned personalities in the demo.
+- Slice 32 (arbitration + per-agent goals) is landed; land Slice 33 before
+  shipping data-tuned personalities in the demo.
 - Do not scale cognition population (archetype swarm stress) until arbitration
   is gated by the existing cognition-scope dense indices and benches report
   intent-selection cost separately from pathfinding.
@@ -271,8 +276,8 @@ by Slice 24.
 | Faction / RNG / spatial index | 26–28 | Landed | Stance table, deterministic draws, shared neighbor index |
 | Perception | 29 | Landed | Vision/hearing columns + acquire/lose events; dig stimuli only |
 | Memory | 30 | Landed | Last-known + ring + familiarity; cold-seek retarget in AI |
-| **Emotion / affect** | **31** | **Landed** | **fear / curiosity / aggression / fatigue** SoA drives, per-entity baselines/decay/thresholds, Schmitt threshold events; **unread by AI until 32** |
-| Arbitration | 32 | **Next** | Utility over 29–31 → per-agent `NavigationIntent` (must consume drives) |
+| **Emotion / affect** | **31** | **Landed** | **fear / curiosity / aggression / fatigue** SoA drives, per-entity baselines/decay/thresholds, Schmitt threshold events; **consumed by arbitration (32)** |
+| **Arbitration** | **32** | **Landed** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
 | Archetypes / debug | 33 | Open | JSON personalities + overlay (incl. drive bars / affect blocks) |
 | Stimulus ecosystem | 39 | Open | More producers/kinds so hearing is not dig-only |
 | Action intents | 40 | Open | Non-locomotion intent stream (attack/interact/use) |
@@ -289,7 +294,7 @@ by Slice 24.
 | `AiAffect` component | same + `data_system/affect.zig` | Per-drive baseline / decay_rate / threshold (cold) + live value in `[0,1]` (hot) + `above_threshold_mask` |
 | `AffectSystem` | `systems/affect.zig` | Cognition-scoped appraisal from perception + memory + agent mode; decay; threshold events |
 | `affect_threshold_crossed` | `simulation.zig` | Scalar event `{ entity, drive, rising }` — panic onset / calm, etc. |
-| Pipeline slot | `affect_update` before `ai_decide` | Correct order for a consumer; consumer not wired yet |
+| Pipeline slot | `affect_update` before `ai_decide` | Correct order for a consumer; wired to arbitration (32) via `AiConfig.affect_slice` |
 
 **Design rules that keep feelings expandable (do not regress):**
 
@@ -328,31 +333,34 @@ by Slice 24.
 6. If drive count exceeds 8: widen `above_threshold_mask` and consider packing
    drives as `[drive_count]f32` columns instead of named fields (Slice 42).
 
-**Current closed-loop gap (why 32 is next):** the pipeline order is already
+**Closed-loop status: Slice 32 landed.** The pipeline order
 `perception → ai_memory → affect → ai_decide → steering → pathfinding`
-(`simulation_pipeline.zig` `stage_order`). Perception/memory/affect write
-columns every cognition step, but `AiSystem` still:
+(`simulation_pipeline.zig` `stage_order`) is unchanged — no new `StageId` was
+added. `AiSystem`'s `ai_decide` stage now: scores `AiBehavior`'s five
+variants (`wander`/`pursue`/`flee`/`investigate`/`cohere`) via
+`arbitration.scoreBehaviors`'s table-driven drive×behavior weight matrix,
+sticky-selects one via `arbitration.selectSticky`, and resolves a per-agent
+goal via `arbitration.resolveGoal` — pursue/flee prefer perception's
+faction-generic `nearest_threat` or fresh `AiMemory` over the opt-in,
+gain-gated `AiConfig.focus_target`/`focus_entity` player fallback; investigate
+prefers heard stimuli over memory-ring contacts; cohere reads the shared
+spatial index for a friendly-neighbor mean. `game_demo_state.zig` now attaches
+`ai_perception`/`ai_memory`/`ai_affect` to a subset of demo movers
+(`demoArchetypeForIndex`: timid/aggressive/curious/cohesive archetypes) with
+sized event budgets. See `docs/framework-implementation-slices-archive.md`'s
+Slice 32 entry for the full implementation record.
 
-1. Treats `AiBehavior` as exclusive `wander` / `seek` (`data_system/types.zig`).
-2. Broadcasts one `seek_target` (the player) to every seeker, with optional
-   cold-memory retarget only when that same `seek_entity` was remembered.
-3. Never reads `AiAffect` / drive columns (Slice 31 checklist deferred item).
-4. Demo spawns attach `ai_agent` + `steering_agent` + `faction` but **not**
-   `ai_perception` / `ai_memory` / `ai_affect` (`game_demo_state.zig` comments
-   document `perception_max_events_per_step = 0` for that reason).
-
-Slice 32 closes the loop without inventing new pipeline stages downstream of
-AI. Slices 39–41 expand the *inputs and outputs* of that loop so emergence is
-not permanently limited to "chase or wander around the player after a dig."
+Slices 39–41 expand the *inputs and outputs* of that loop so emergence is not
+permanently limited to "chase or wander around the player after a dig."
 
 Sequencing rationale:
 
 - Slices 26–28 are framework foundations (landed).
 - Slices 29–31 are the composing signal stack (landed).
 - **Slice 32** is behavior arbitration — the first consumer of affect and the
-  first per-agent multi-behavior / multi-goal selector.
+  first per-agent multi-behavior / multi-goal selector (landed).
 - **Slice 33** is authoring/tuning infrastructure so the loop is data-driven
-  and observable.
+  and observable (next).
 - **Slices 39–42** are post-loop expandability: richer senses, non-locomotion
   actions, world-authored interest points, and **more/coupled feelings**. They
   must not be folded into 32 as half-wired stubs — each is a full slice with
@@ -398,302 +406,6 @@ Shared design contracts for the whole track:
     behavior graphs, BT trees, or per-entity `ArrayList` planners.
   - Downstream steering / pathfinding / movement contracts stay unchanged
     unless a later slice explicitly owns a contract change.
-## Slice 32: AI Behavior Arbitration
-
-**Status: not started — next implementation slice.**
-
-Goal: close the emergent-AI locomotion loop by selecting among composed
-behaviors (flee, pursue, investigate, cohere, wander) via **utility scores**
-over perception, memory, and **emotion drives** (`AiAffect`), resolving a
-**per-agent goal**, and emitting the existing `NavigationIntent` so steering /
-pathfinding / movement stay unchanged. Land a **reusable weight-resolution +
-sticky-selection contract** that future non-AI producers can share, without
-locking the project to "everyone seeks the player," an exclusive FSM, or a
-frozen four-feeling if-tree.
-
-### Problem (code today)
-
-- `AiBehavior` is only `{ wander, seek }` (`data_system/types.zig`).
-- `decideDir` blends seek-toward-`(tx,ty)` + wander noise; separation is a fixed
-  post-blend (`systems/ai.zig`). `priorityForBehavior` is seek=10 / wander=0.
-- `SimulationPipeline` always passes the player's previous position as
-  `AiConfig.seek_target` / `seek_entity` with `nav_request_kind = .group`.
-  Cold-memory retarget only substitutes that same entity's last-known XY.
-- `AffectSystem` runs and writes drives every cognition step, but `ai_decide`'s
-  stage contract does **not** list `affect_drives` as a read, and `AiConfig`
-  has no affect slice — drives are dead output.
-- Demo movers never attach `ai_perception` / `ai_memory` / `ai_affect`, so the
-  live app cannot exercise the stack even after unit tests pass.
-- Goal level is still pinned to surface for NPC seeks (pipeline comment):
-  out of scope for 32's primary work, but do not make the problem worse by
-  hardcoding more level-0 assumptions into new goal resolvers.
-
-### Current foundation (do not rebuild)
-
-- Pipeline stage order and barriers: perception → memory → affect → AI →
-  steering → pathfinding (`simulation_pipeline.zig`).
-- `NavigationIntent` (`simulation.zig`): entity, kind, goal_level, goal XY,
-  direct_direction, priority. Steering's highest-priority-wins selection stays
-  the multi-emitter arbitration for *streams*, separate from *behavior utility*.
-- Perception hot columns: `target_visible`, `last_seen_*`, `nearest_threat`,
-  `nearest_threat_dist`, `heard_stimulus` + XY, facing.
-- Memory: `last_known_*`, `staleness`, `familiarity`, fixed ring
-  (`ai_memory_ring_capacity = 4`).
-- Affect / emotion: four drives in `[0,1]` + baselines/decay/thresholds +
-  Schmitt mask (`AiAffect` / `AffectSystem` — Slice 31). **First consumer is this
-  slice.**
-- Spatial index + AI separation query path (Slice 28).
-- Deterministic RNG (`core/rng.zig`) with salt channels.
-- Cognition-scoped `ai_indices` gather (Slice 24).
-
-### Architecture notes — expandability first
-
-**What "arbitration" means here (and what it is not):**
-
-| Do | Do not |
-| --- | --- |
-| Score a **fixed enum** of behavior candidates from columnar signals | Build a behavior tree, GOAP planner, or dynamic graph |
-| Select one **primary** locomotion mode with sticky hysteresis | Flap every step on noisy score ties |
-| Resolve **goal XY (+ optional goal entity)** per agent from signals | Keep broadcast player seek as the only production goal path |
-| Emit one `NavigationIntent` per AI row through the existing stream | Add a new pipeline stage between AI and steering |
-| Put active mode + scores in **hot columns** for debug/tests | Emit per-step "chose X" events for every agent |
-| Expose pure `score` / `select` / `resolveGoal` helpers as a reusable contract | Hardcode another one-off priority ladder only AI understands |
-| Treat missing perception/memory/affect as **zero signal** | Require all three components or skip the agent |
-| Keep local separation as a **force modifier** after mode selection | Force cohere/separation to fight exclusive winner-take-all alone |
-| Map **emotion → behavior via a drive×behavior weight table** | `if (fear > x) return .flee` as the only permanent pattern |
-| Read live drive columns (`fear`…`fatigue`) every AI step | Ignore `AiAffect` or invent a second mood channel beside it |
-
-**Emotion consumption contract (feelings must matter, and stay additive):**
-
-- Gather optional `ConstAiAffectSlice`. Absent component → all drive
-  contributions 0 (same optional-input rule as AffectSystem's perception).
-- Maintain a **fixed compile-time weight table** (or per-agent gain columns that
-  scale a shared table), shape conceptually:
-
-  ```text
-  behavior_score[b] += sum_d( drive_value[d] * w[d][b] ) + perception/memory terms
-  ```
-
-  Default seed (tunable, not sacred):
-
-  | Drive ↓ \\ Behavior → | flee | pursue | investigate | cohere | wander |
-  | --- | --- | --- | --- | --- | --- |
-  | fear | high | low/− | 0 | 0 | small |
-  | aggression | 0/− | high | 0 | 0 | 0 |
-  | curiosity | 0 | 0 | high | 0 | small |
-  | fatigue | 0 | low/− | 0 | 0 | high |
-
-- **Adding a drive later (Slice 42)** = new enum tag + new table row (+ store
-  columns). Slice 32 code must not require a rewrite of selection control flow
-  when a fifth drive appears — only table/data growth.
-- Fatigue may also scale effective speed or wander amplitude as a continuous
-  modulator *after* selection (still table/constant driven, not a special
-  snowflake path undocumented from other drives).
-- Do **not** implement cross-drive suppression (e.g. fear kills curiosity) here
-  — that is Slice 42 coupling. Independent additive scores are enough for 32.
-- Threshold events (`affect_threshold_crossed`) are optional AI inputs; default
-  is continuous drive levels. Do not require edge events to change behavior.
-
-**Behavior set (fixed for this slice — extend by adding an enum tag + score
-term + goal resolver, not by rewriting the stage):**
-
-| `AiBehavior` | Primary goal | Utility drivers (illustrative, constants tunable) |
-| --- | --- | --- |
-| `wander` | none (direction noise only) | baseline when nothing else scores; residual wander gain |
-| `pursue` | visible `nearest_threat` else fresh memory of that threat / configured focus | aggression + threat proximity + (optional) memory freshness |
-| `flee` | point **away from** threat / last-known threat | fear + threat proximity |
-| `investigate` | heard stimulus XY, else freshest interesting ring contact | curiosity + stimulus present + low familiarity |
-| `cohere` | local neighbor center-of-mass from spatial index (bounded samples) | personality cohere gain + local density; not affect-primary |
-
-**Migration of `seek`:** rename/replace `.seek` → `.pursue` at the type level
-(finite call sites: `AiSystem`, demo spawns, affect fatigue input that reads
-`AiAgent.behavior`, tests, benches). Do not leave a dual-meaning `.seek` alias
-in production enums. Update fatigue appraisal if it keys on "active pursuit"
-to treat `.pursue` the same way `.seek` was treated.
-
-**Reusable weight-resolution contract (land in a small pure module, e.g.
-`src/game/systems/arbitration.zig` or `src/core/arbitration.zig` — prefer
-`src/game/systems/` if it imports gameplay types, else `src/core` if scores are
-only `[]const f32`):**
-
-```text
-// Conceptual API — implement with fixed arrays, no heap, no vtables:
-// scoreBehaviors(signals, personality_gains) -> [behavior_count]f32
-// selectSticky(scores, previous, commitment_remaining, sticky_bonus, min_delta)
-//     -> { index, new_commitment }
-// resolveGoal(behavior, signals) -> { goal_xy, goal_entity?, kind_hint, valid }
-```
-
-- `selectSticky`: if `commitment_remaining > 0` and previous score is within
-  `sticky_bonus` of the raw winner, keep previous; else take argmax (stable
-  index order on ties). Commitment is measured in **fixed steps**, a cold
-  tunable with a fixed default (not derived from world size).
-- This helper must be usable later by non-AI controllers (e.g. competing
-  world-mutation desires) by passing plain score arrays — no `AiSystem`
-  dependency inside the pure select function.
-- Steering's existing priority arbitration for multiple `NavigationIntent`
-  emitters stays as-is; do not merge the two mechanisms. Document the split:
-  **utility selects what an AI agent wants; stream priority selects which
-  emitter wins when multiple systems write intents for the same entity.**
-
-**`AiAgent` data shape (expand in place — no new Component tag required):**
-
-Cold / author-facing (preserved across retune like perception cold fields):
-
-- Personality gains: `gain_wander`, `gain_pursue`, `gain_flee`,
-  `gain_investigate`, `gain_cohere` (f32, validated non-negative, capped).
-- Legacy mapping: migrate `seek_weight` → `gain_pursue` (or keep
-  `seek_weight` as the pursue gain field name only if call-site churn is
-  worse — prefer clear names).
-- `wander_amplitude` retained for direction noise strength.
-- `commitment_max_steps: u16` (default e.g. 30–90 steps / 0.5–1.5s at 60Hz).
-- `sticky_bonus: f32` (default small, e.g. 0.05–0.15 on the score scale).
-
-Hot / system-written each AI step (or only when selected changes):
-
-- `active_behavior: AiBehavior`
-- `commitment_remaining: u16`
-- Optional debug-friendly: last selected score (single f32) — **not** a full
-  score vector in the component unless Slice 33 debug needs it; tests can call
-  pure scorers directly.
-
-`EntityTemplate` / structural set paths / validation update in lockstep with
-`AiAgentStore` (same pattern as other agent field expansions).
-
-**Per-agent goal resolution (replaces exclusive reliance on broadcast seek):**
-
-1. Gather optional `ConstPerceptionSlice`, `ConstAiMemorySlice`,
-   `ConstAiAffectSlice` (null slice = all zeros / absent).
-2. Build a compact per-row signal struct at gather time (threat entity + XY +
-   dist, threat visible, heard XY, last-known XY/staleness/familiarity, four
-   drives, position, spatial-index row index).
-3. Score → sticky select → resolve goal for **that** behavior:
-   - `pursue`: threat position if valid; else memory last-known if same entity
-     and fresh; else optional `AiConfig.focus_target` fallback (player) **only
-     when** personality pursue gain > 0 and no better signal — document as
-     demo/fallback, not the sole path.
-   - `flee`: invert direction from threat / last-known threat; path goal is a
-     point offset along the flee axis at a fixed flee-lead distance (constant,
-     not world-size-derived), or intent with strong `direct_direction` and a
-     nearby open cell projection left to pathfinding's existing goal
-     projection.
-   - `investigate`: stimulus XY if heard this step; else ring contact with
-     lowest age among valid entries; else wander.
-   - `cohere`: mean position of up to N spatial neighbors (reuse separation
-     query bound; do not build a second grid).
-   - `wander`: no path goal required — emit intent with direct wander
-     direction; `kind = .individual`; goal may equal current position + dir
-     step or reuse existing wander emission shape.
-4. Path request kind: prefer `.individual` when goal is agent-specific
-   (memory/stimulus/flee); allow `.group` only when many agents share an
-   identical quantized goal cell **and** the caller still opts in (do not force
-   group for the whole demo once goals diverge). Revisit demo
-   `nav_request_kind = .group` when pursue goals stop being a single player
-   cell for every agent.
-
-**Pipeline / stage contract updates:**
-
-- `stageContract(.ai_decide)` must **read** `affect_drives` (and keep reading
-  perception_sensed + ai_memory). Today it omits affect — fix the contract and
-  the causal-order tests that encode it.
-- Thread `data.aiAffectSliceConst()` (or equivalent) into `AiConfig`.
-- No new `StageId` between affect and AI; arbitration lives inside `AiSystem`
-  (or a helper it calls). Do not split a second threaded stage unless benches
-  prove scoring dominates — prefer one gather + one intent write pass first.
-
-**Events:**
-
-- Optional low-volume `behavior_changed { entity, from, to }` on sticky edge
-  only, scalar enums, capacity-capped like perception — **optional** in this
-  slice. Default ship columnar `active_behavior` only; add the event if Slice 33
-  debug or a domain reaction needs edges. Do not emit every step.
-
-**Demo / fixture wiring (minimum for a real closed loop):**
-
-- Attach `ai_perception` + `ai_memory` + `ai_affect` to a **subset** of demo
-  movers (not necessarily all 32), with distinct personality gains (timid high
-  flee, aggressive high pursue, curious high investigate).
-- Size `SimulationPipelineConfig.perception_max_events_per_step` and
-  `affect_max_events_per_step` against `demo_event_reserve` once those
-  components exist (today both are 0 because no demo entity carries them).
-- Keep some pure wanderers without perception for regression contrast.
-- Full named archetype JSON is **Slice 33** — 32 may hardcode a few
-  `DemoSpawnSpec` gain bundles in Zig.
-
-**Explicitly out of scope (do not half-wire):**
-
-- Attack / interact / use intents (Slice 40).
-- New stimulus producers beyond dig (Slice 39).
-- World interest markers / cover points (Slice 41).
-- JSON archetypes and debug overlay (Slice 33).
-- SIMD restructure of separation/`decideDir` loops (Slice 35) — write scalar-
-  correct pure functions first; structure data so 35 can pack scores later.
-- Cross-level goal_level autonomy beyond existing start_level from entity
-  level column — do not pin new resolvers worse than today; prefer leaving
-  `goal_level` as the entity's current `world_level` when the goal entity is
-  on the same level, else keep surface default with a code comment pointing at
-  a future multi-level chase slice.
-
-### Checklist
-
-- [ ] Land pure sticky weight-resolution helpers with unit tests (argmax, ties
-      by stable index, sticky hold within bonus, commitment countdown, zero
-      allocation).
-- [ ] Expand `AiBehavior` to `{ wander, pursue, flee, investigate, cohere }`;
-      migrate all `.seek` call sites; update affect fatigue "active pursuit"
-      detection if it keys on behavior.
-- [ ] Expand `AiAgent` cold gains + commitment tunables and hot
-      `active_behavior` / `commitment_remaining`; store, template, structural
-      commands, validation, tests.
-- [ ] Gather affect (+ existing perception/memory) into AI gather rows; score
-      via a **drive×behavior weight table** (plus perception/memory terms);
-      sticky-select; write hot active-behavior columns.
-- [ ] Implement per-behavior goal resolvers and direction emitters; replace
-      exclusive broadcast-seek as the only pursue path while keeping an
-      optional `focus_target` fallback for demos.
-- [ ] Update `stageContract(.ai_decide)` to read `affect_drives`; thread affect
-      slice through `SimulationPipeline` → `AiConfig`.
-- [ ] Adjust path `kind` policy so agent-specific goals do not falsely share a
-      group flow field; document when `.group` remains valid.
-- [ ] Wire a demo subset with perception/memory/affect + distinct **emotion
-      baselines/gains** (timid high fear baseline / flee weight, aggressive high
-      aggression, curious high curiosity); reserve perception/affect event
-      budgets accordingly.
-- [ ] Headless tests: each behavior's intent direction/goal shape; sticky
-      non-flapping under threshold noise; serial == threaded; missing optional
-      components degrade to wander/fallback; **identical perception/memory with
-      only affect differing changes winner**; `FailingAllocator` steady-state
-      proof on the AI update path; no steering/pathfinding API changes.
-- [ ] Benchmark: extend `src/benchmarks/ai.zig` (or add `ai-arbitration` group)
-      reporting agent count, selections per behavior histogram counters, and
-      intent count — measure at cognition-scoped scales, not only demo counts.
-- [ ] Update `docs/architecture.md` AI / pipeline paragraphs: **emotion drives
-      are consumed**; arbitration utility vs stream priority; per-agent goals;
-      table-driven drive mapping.
-
-### Acceptance checks
-
-- [ ] Same inputs → same `active_behavior`, goals, and `NavigationIntent` order
-      for serial and threaded runs.
-- [ ] Agents with high fear + visible threat emit flee-away intents; high
-      aggression pursue threat; curiosity + stimulus investigate toward stimulus;
-      cohere agents bias toward local COM; wanderers without signals keep
-      noise-driven motion.
-- [ ] **Feelings are load-bearing:** drive columns from Slice 31 measurably
-      change selection (fixture where only `AiAffect` hot values differ →
-      different winning behavior). Agents without `AiAffect` still function.
-- [ ] Emotion mapping is table/data extensible: scoring goes through a
-      drive-indexed path, not a closed `switch` that only names today's four
-      drives in a way that forbids appending a fifth without control-flow
-      rewrites (document the extension point for Slice 42).
-- [ ] Downstream steering / pathfinding / movement module APIs and merge
-      contracts unchanged (no new stages after AI).
-- [ ] Steady-state AI path allocation-free after reserve/warmup.
-- [ ] Demo subset with full cognition components runs without event-capacity
-      throws; `zig build test`, `zig build check`, `zig build verify` pass.
-- [ ] Targeted `zig build bench -- --group ai` (or `ai-arbitration`) shows
-      selection cost and does not regress separation intent counts for the
-      baseline seek-equivalent case beyond noise.
 ## Slice 33: Data-Driven AI Archetypes And Debug Introspection
 
 **Status: not started.** Depends on Slice 32's behavior set, `AiAgent` gains,
@@ -740,7 +452,13 @@ or string behavior names on the hot path.
       faction, optional perception/memory/**affect** blocks (per-drive baseline,
       decay_rate, threshold — and, once Slice 42 lands, appraisal gains),
       `AiAgent` behavior gains and wander amplitude, steering defaults,
-      sprite/asset reference by stable id.
+      sprite/asset reference by stable id. The perception block should let
+      archetypes differentiate `AiPerception`'s already-per-entity
+      `vision_range`/`hearing_range`/`fov_half_angle_radians` (e.g. a
+      keen-eyed sentry with long `vision_range`, or a blind tracker with
+      `vision_range` near 0 and a large `hearing_range`) — mechanically
+      already supported since these are cold per-entity fields, not global
+      constants; today's demo archetypes (Slice 32) just don't vary them.
 - [ ] Implement loader + strict validation tests (good file, missing field,
       out-of-range gain, unknown behavior key, unknown faction, **unknown
       affect drive key**).

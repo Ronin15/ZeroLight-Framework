@@ -321,17 +321,34 @@ pub const ConstCollisionResponseSlice = struct {
 
 pub const AiBehavior = enum {
     wander,
-    seek,
+    pursue,
+    flee,
+    investigate,
+    cohere,
 };
 
+/// Cold fields are author-facing personality tunables, preserved across a
+/// retune the same way `AiPerception`'s cold vision/FOV fields are — see
+/// `AiAgentStore.set`. Hot fields are arbitration's per-step sticky-selection
+/// output (`arbitration.zig`): written every AI step, untouched by a retune.
 pub const AiAgent = struct {
-    behavior: AiBehavior = .wander,
+    // Cold
+    gain_wander: f32 = 1.0,
+    gain_pursue: f32 = 0.0,
+    gain_flee: f32 = 0.0,
+    gain_investigate: f32 = 0.0,
+    gain_cohere: f32 = 0.0,
     wander_amplitude: f32 = 30.0,
-    seek_weight: f32 = 0.0,
+    commitment_max_steps: u16 = 0,
+    sticky_bonus: f32 = 0.0,
+    // Hot
+    active_behavior: AiBehavior = .wander,
+    commitment_remaining: u16 = 0,
+    last_score: f32 = 0.0,
 };
 
 pub const max_ai_wander_amplitude: f32 = 1000.0;
-pub const max_ai_seek_weight: f32 = 16.0;
+pub const max_ai_gain: f32 = 16.0;
 
 pub const AiAgentCommand = struct {
     entity: EntityId,
@@ -342,7 +359,25 @@ pub const ConstAiAgentSlice = struct {
     entities: []const EntityId,
     behaviors: []const AiBehavior,
     wander_amplitudes: ConstHotF32Slice,
-    seek_weights: ConstHotF32Slice,
+    gain_wanders: ConstHotF32Slice,
+    gain_pursues: ConstHotF32Slice,
+    gain_flees: ConstHotF32Slice,
+    gain_investigates: ConstHotF32Slice,
+    gain_coheres: ConstHotF32Slice,
+    commitment_max_steps: []const u16,
+    sticky_bonus: ConstHotF32Slice,
+    commitment_remaining: []const u16,
+    last_score: ConstHotF32Slice,
+};
+
+/// Mutable hot-column view for arbitration's per-step sticky-selection
+/// write-back. Cold personality tunables stay const here — they change only
+/// through `AiAgentStore.set`, mirroring `PerceptionSlice`.
+pub const AiAgentSlice = struct {
+    entities: []const EntityId,
+    active_behavior: []AiBehavior,
+    commitment_remaining: []u16,
+    last_score: []f32,
 };
 
 pub const SteeringAgent = struct {
@@ -397,7 +432,15 @@ const default_ai_perception_cos_half_fov: f32 = 0.5;
 /// sin/cos polynomial. Hot fields are written every step by PerceptionSystem
 /// and held across steps otherwise.
 pub const AiPerception = struct {
-    vision_range: f32 = 240.0,
+    // Balanced against `ai.zig`'s separation_radius (48) / cohere_radius (96)
+    // as a consistent 2x step per tier (48 -> 96 -> 192), not an arbitrary
+    // larger number: spatial-index cell-scan cost is quadratic in radius
+    // (queryNeighbors walks every cell in the radius-derived scan square,
+    // populated or not, before max_candidate_checks ever bounds per-candidate
+    // work), so the previous 240 (2.5x cohere_radius by raw distance) was a
+    // ~6x scan-area jump, not 2.5x. 192 keeps vision meaningfully longer-range
+    // than cohere/separation while keeping that per-tier ratio consistent.
+    vision_range: f32 = 192.0,
     fov_half_angle_radians: f32 = default_ai_perception_fov_half_angle_radians,
     cos_half_fov: f32 = default_ai_perception_cos_half_fov,
     hearing_range: f32 = 200.0,

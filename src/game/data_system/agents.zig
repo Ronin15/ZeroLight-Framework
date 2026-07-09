@@ -12,8 +12,9 @@ const EntityId = types.EntityId;
 const AiBehavior = types.AiBehavior;
 const AiAgent = types.AiAgent;
 const max_ai_wander_amplitude = types.max_ai_wander_amplitude;
-const max_ai_seek_weight = types.max_ai_seek_weight;
+const max_ai_gain = types.max_ai_gain;
 const ConstAiAgentSlice = types.ConstAiAgentSlice;
+const AiAgentSlice = types.AiAgentSlice;
 const SteeringAgent = types.SteeringAgent;
 const max_steering_radius = types.max_steering_radius;
 const max_steering_weight = types.max_steering_weight;
@@ -23,9 +24,14 @@ const ConstSteeringAgentSlice = types.ConstSteeringAgentSlice;
 const hotStoreCapacity = types.hotStoreCapacity;
 
 pub fn validateAiAgent(agent: AiAgent) !void {
-    if (!std.math.isFinite(agent.wander_amplitude) or !std.math.isFinite(agent.seek_weight)) return error.InvalidAiAgent;
-    if (agent.wander_amplitude < 0 or agent.seek_weight < 0) return error.InvalidAiAgent;
-    if (agent.wander_amplitude > max_ai_wander_amplitude or agent.seek_weight > max_ai_seek_weight) return error.InvalidAiAgent;
+    const gains = [_]f32{ agent.gain_wander, agent.gain_pursue, agent.gain_flee, agent.gain_investigate, agent.gain_cohere };
+    for (gains) |gain| {
+        if (!std.math.isFinite(gain) or gain < 0 or gain > max_ai_gain) return error.InvalidAiAgent;
+    }
+    if (!std.math.isFinite(agent.wander_amplitude) or agent.wander_amplitude < 0 or agent.wander_amplitude > max_ai_wander_amplitude) {
+        return error.InvalidAiAgent;
+    }
+    if (!std.math.isFinite(agent.sticky_bonus) or agent.sticky_bonus < 0) return error.InvalidAiAgent;
 }
 
 pub fn validateSteeringAgent(agent: SteeringAgent) !void {
@@ -57,9 +63,19 @@ pub fn validateSteeringAgent(agent: SteeringAgent) !void {
 
 const AiAgentRow = struct {
     entity: EntityId,
-    behavior: AiBehavior,
+    // Cold
+    gain_wander: f32,
+    gain_pursue: f32,
+    gain_flee: f32,
+    gain_investigate: f32,
+    gain_cohere: f32,
     wander_amplitude: f32,
-    seek_weight: f32,
+    commitment_max_steps: u16,
+    sticky_bonus: f32,
+    // Hot
+    active_behavior: AiBehavior,
+    commitment_remaining: u16,
+    last_score: f32,
 };
 
 const SteeringAgentRow = struct {
@@ -87,26 +103,51 @@ pub const AiAgentStore = struct {
         const index: u32 = @intCast(self.rows.len);
         self.rows.appendAssumeCapacity(.{
             .entity = entity,
-            .behavior = agent.behavior,
+            .gain_wander = agent.gain_wander,
+            .gain_pursue = agent.gain_pursue,
+            .gain_flee = agent.gain_flee,
+            .gain_investigate = agent.gain_investigate,
+            .gain_cohere = agent.gain_cohere,
             .wander_amplitude = agent.wander_amplitude,
-            .seek_weight = agent.seek_weight,
+            .commitment_max_steps = agent.commitment_max_steps,
+            .sticky_bonus = agent.sticky_bonus,
+            .active_behavior = agent.active_behavior,
+            .commitment_remaining = agent.commitment_remaining,
+            .last_score = agent.last_score,
         });
         return index;
     }
 
+    /// Updates only the cold personality tunables on an existing row. A
+    /// retune must not wipe live arbitration state, so the hot columns
+    /// (active_behavior, commitment_remaining, last_score) are left
+    /// untouched — mirrors `PerceptionStore.set`.
     pub fn set(self: *AiAgentStore, index: usize, agent: AiAgent) void {
         const s = self.rows.slice();
-        s.items(.behavior)[index] = agent.behavior;
+        s.items(.gain_wander)[index] = agent.gain_wander;
+        s.items(.gain_pursue)[index] = agent.gain_pursue;
+        s.items(.gain_flee)[index] = agent.gain_flee;
+        s.items(.gain_investigate)[index] = agent.gain_investigate;
+        s.items(.gain_cohere)[index] = agent.gain_cohere;
         s.items(.wander_amplitude)[index] = agent.wander_amplitude;
-        s.items(.seek_weight)[index] = agent.seek_weight;
+        s.items(.commitment_max_steps)[index] = agent.commitment_max_steps;
+        s.items(.sticky_bonus)[index] = agent.sticky_bonus;
     }
 
     pub fn get(self: *const AiAgentStore, index: usize) AiAgent {
         const s = self.rows.slice();
         return .{
-            .behavior = s.items(.behavior)[index],
+            .gain_wander = s.items(.gain_wander)[index],
+            .gain_pursue = s.items(.gain_pursue)[index],
+            .gain_flee = s.items(.gain_flee)[index],
+            .gain_investigate = s.items(.gain_investigate)[index],
+            .gain_cohere = s.items(.gain_cohere)[index],
             .wander_amplitude = s.items(.wander_amplitude)[index],
-            .seek_weight = s.items(.seek_weight)[index],
+            .commitment_max_steps = s.items(.commitment_max_steps)[index],
+            .sticky_bonus = s.items(.sticky_bonus)[index],
+            .active_behavior = s.items(.active_behavior)[index],
+            .commitment_remaining = s.items(.commitment_remaining)[index],
+            .last_score = s.items(.last_score)[index],
         };
     }
 
@@ -122,9 +163,30 @@ pub const AiAgentStore = struct {
         const s = self.rows.slice();
         return .{
             .entities = s.items(.entity),
-            .behaviors = s.items(.behavior),
+            .behaviors = s.items(.active_behavior),
             .wander_amplitudes = s.items(.wander_amplitude),
-            .seek_weights = s.items(.seek_weight),
+            .gain_wanders = s.items(.gain_wander),
+            .gain_pursues = s.items(.gain_pursue),
+            .gain_flees = s.items(.gain_flee),
+            .gain_investigates = s.items(.gain_investigate),
+            .gain_coheres = s.items(.gain_cohere),
+            .commitment_max_steps = s.items(.commitment_max_steps),
+            .sticky_bonus = s.items(.sticky_bonus),
+            .commitment_remaining = s.items(.commitment_remaining),
+            .last_score = s.items(.last_score),
+        };
+    }
+
+    /// Mutable view for arbitration's per-step sticky-selection write-back.
+    /// Cold personality tunables stay const here — they change only through
+    /// `AiAgentStore.set`, mirroring `PerceptionStore.slice`.
+    pub fn slice(self: *AiAgentStore) AiAgentSlice {
+        const s = self.rows.slice();
+        return .{
+            .entities = s.items(.entity),
+            .active_behavior = s.items(.active_behavior),
+            .commitment_remaining = s.items(.commitment_remaining),
+            .last_score = s.items(.last_score),
         };
     }
 
@@ -237,3 +299,73 @@ pub const SteeringAgentStore = struct {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
+
+test "validateAiAgent accepts defaults and the max_ai_gain boundary, rejects each gain individually" {
+    try validateAiAgent(.{});
+    try validateAiAgent(.{
+        .gain_wander = max_ai_gain,
+        .gain_pursue = max_ai_gain,
+        .gain_flee = max_ai_gain,
+        .gain_investigate = max_ai_gain,
+        .gain_cohere = max_ai_gain,
+    });
+
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .gain_wander = -0.1 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .gain_pursue = max_ai_gain + 1.0 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .gain_flee = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .gain_investigate = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .gain_cohere = -1.0 }));
+}
+
+test "validateAiAgent rejects out-of-range wander_amplitude and sticky_bonus" {
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .wander_amplitude = -1 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .wander_amplitude = max_ai_wander_amplitude + 1 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .wander_amplitude = std.math.nan(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = -0.01 }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = std.math.inf(f32) }));
+}
+
+test "AiAgentStore.set retunes only cold personality fields, preserving hot arbitration state" {
+    var store = AiAgentStore{};
+    defer store.deinit(std.testing.allocator);
+
+    const entity = try EntityId.init(1, 1);
+    _ = try store.append(std.testing.allocator, entity, .{ .active_behavior = .pursue, .commitment_remaining = 12, .last_score = 0.75 });
+
+    store.set(0, .{ .gain_wander = 0.2, .gain_pursue = 0.8, .wander_amplitude = 15, .commitment_max_steps = 40, .sticky_bonus = 0.05 });
+
+    const after = store.get(0);
+    try std.testing.expectEqual(@as(f32, 0.2), after.gain_wander);
+    try std.testing.expectEqual(@as(f32, 0.8), after.gain_pursue);
+    try std.testing.expectEqual(@as(f32, 15), after.wander_amplitude);
+    try std.testing.expectEqual(@as(u16, 40), after.commitment_max_steps);
+    try std.testing.expectEqual(@as(f32, 0.05), after.sticky_bonus);
+    // Hot fields from the original append are untouched by the retune.
+    try std.testing.expectEqual(AiBehavior.pursue, after.active_behavior);
+    try std.testing.expectEqual(@as(u16, 12), after.commitment_remaining);
+    try std.testing.expectEqual(@as(f32, 0.75), after.last_score);
+}
+
+test "AiAgentStore.slice exposes a mutable hot-column view aligned with sliceConst" {
+    var store = AiAgentStore{};
+    defer store.deinit(std.testing.allocator);
+
+    const first = try EntityId.init(1, 1);
+    const second = try EntityId.init(2, 1);
+    _ = try store.append(std.testing.allocator, first, .{});
+    _ = try store.append(std.testing.allocator, second, .{});
+
+    var hot = store.slice();
+    try std.testing.expectEqual(@as(usize, 2), hot.entities.len);
+    hot.active_behavior[1] = .flee;
+    hot.commitment_remaining[1] = 5;
+    hot.last_score[1] = 1.5;
+
+    const updated = store.get(1);
+    try std.testing.expectEqual(AiBehavior.flee, updated.active_behavior);
+    try std.testing.expectEqual(@as(u16, 5), updated.commitment_remaining);
+    try std.testing.expectEqual(@as(f32, 1.5), updated.last_score);
+
+    const const_slice = store.sliceConst();
+    try std.testing.expectEqual(AiBehavior.flee, const_slice.behaviors[1]);
+}

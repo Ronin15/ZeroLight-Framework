@@ -263,7 +263,7 @@ fn addAgent(data: *DataSystem, pos_x: f32, pos_y: f32, velocity_x: f32, velocity
         .velocity = .{ .x = velocity_x, .y = velocity_y },
         .speed = 40,
     });
-    try data.setAiAgent(entity, .{ .behavior = .wander });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
     try data.setFaction(entity, faction);
     return entity;
 }

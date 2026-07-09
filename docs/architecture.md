@@ -470,10 +470,16 @@ cognition entities, their cost scales with active scope, not total entity count.
 drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
 per-entity baseline, decay rate, and threshold. `AffectSystem` appraises them
 from perception/memory (optional per row) and emits rising/falling threshold
-edges only. Behavior arbitration is expected to *consume* drive columns via a
-table-driven mapping (roadmap Slice 32), not ignore them or replace them with a
-mood enum FSM. New feelings append to `AiAffectDrive` and the weight table
-(roadmap Slice 42); they do not get a second parallel emotion subsystem. See
+edges only. Behavior arbitration (`src/game/systems/arbitration.zig`, Slice
+32) consumes these drive columns directly: `scoreBehaviors` sums each drive
+against a fixed `[drive_count][behavior_count]f32` weight table (fear→flee,
+aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
+agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
+threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
+`stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
+by `affect_update`, per `stage_order`). New feelings append to
+`AiAffectDrive` and a new weight-table row (roadmap Slice 42); they do not get
+a second parallel emotion subsystem. See
 `docs/framework-implementation-slices.md` Emergent AI Track Overview.
 
 The pipeline is also the right place to compose light domain controllers for
@@ -552,15 +558,34 @@ It receives const AiAgent + movement prior-position slices and a read-only
 (`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
 index, built once from the same cognition-scoped population, that AI
 separation queries for bounded local-separation samples instead of building
-its own grid. `AiSystem` then emits threaded navigation intents through
+its own grid. Per row, `AiSystem` gathers perception/memory/affect signals
+(each independently optional; an absent component contributes zero signal)
+into `arbitration.Signals` and runs them through
+`src/game/systems/arbitration.zig`'s pure utility-arbitration chain:
+`scoreBehaviors` (the table-driven drive×behavior scoring above) picks a raw
+winner among `wander`/`pursue`/`flee`/`investigate`/`cohere`; `selectSticky`
+applies sticky hysteresis, holding the previous behavior while
+`commitment_remaining > 0` unless a challenger clears
+`sticky_bonus + min_delta`, otherwise argmaxing with ties broken by lowest
+enum index; `resolveGoal` then resolves a concrete per-agent goal for the
+selected behavior — pursue and flee prefer a visible or freshly-remembered
+hostile-faction entity (perception's faction-generic `nearest_threat`, not a
+player special case) over the opt-in `AiConfig.focus_target`/`focus_entity`
+fallback, which only applies as a last resort when the agent's pursue gain is
+nonzero and no better signal exists; investigate prefers a heard stimulus over
+the freshest `AiMemory` ring contact; cohere reads a friendly-neighbor mean
+gathered from the same shared spatial index. This utility arbitration decides
+*what* an agent wants (a behavior and a goal); it is a distinct mechanism from
+`SteeringSystem`'s stream-priority arbitration below, which decides *which*
+emitter wins when multiple systems submit a `NavigationIntent` for the same
+entity. `AiSystem` then emits threaded navigation intents through
 `SimulationFrame.navigation_intents` (count/prefix/write). Separation and
 intent emission have independent AdaptiveWorkTuner state and benchmark stats
 so each stage can remain inline or thread independently; the index build has
-its own separate tuner on `SpatialIndexSystem`. Wander amplitude and seek
-prove non-player entities emit high-level goals from persistent data rather
-than hardcoded velocities. `CollisionSystem`'s sweep-and-prune broadphase (see
-above) is intentionally not ported onto this index — it is a different,
-already-tuned algorithm, not a duplicate grid build.
+its own separate tuner on `SpatialIndexSystem`. `CollisionSystem`'s
+sweep-and-prune broadphase (see above) is intentionally not ported onto this
+index — it is a different, already-tuned algorithm, not a duplicate grid
+build.
 
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
 component data, movement slices, static obstacle data, and frame-delayed

@@ -43,6 +43,7 @@ const ConstCollisionResponseSlice = types.ConstCollisionResponseSlice;
 const AiBehavior = types.AiBehavior;
 const AiAgent = types.AiAgent;
 const ConstAiAgentSlice = types.ConstAiAgentSlice;
+const AiAgentSlice = types.AiAgentSlice;
 const SteeringAgent = types.SteeringAgent;
 const ConstSteeringAgentSlice = types.ConstSteeringAgentSlice;
 const ConstWorldLevelSlice = types.ConstWorldLevelSlice;
@@ -69,7 +70,7 @@ const AiAgentStore = agents.AiAgentStore;
 const SteeringAgentStore = agents.SteeringAgentStore;
 const validateAiAgent = agents.validateAiAgent;
 const validateSteeringAgent = agents.validateSteeringAgent;
-const max_ai_seek_weight = types.max_ai_seek_weight;
+const max_ai_gain = types.max_ai_gain;
 const max_steering_neighbor_samples = types.max_steering_neighbor_samples;
 const faction_level = @import("faction_level.zig");
 const FactionStore = faction_level.FactionStore;
@@ -636,6 +637,20 @@ pub const DataSystem = struct {
         return self.ai_agents.sliceConst();
     }
 
+    /// Dense `AiAgentStore` row index for `id`, or `null` when the entity
+    /// carries no `AiAgent` component. Mirrors `aiAffectDenseIndex`.
+    pub fn aiAgentDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.ai_agent_index orelse return null;
+        return @intCast(dense_index);
+    }
+
+    /// Mutable hot-column view for arbitration's per-step sticky-selection
+    /// write-back (active_behavior, commitment_remaining, last_score).
+    pub fn aiAgentSlice(self: *DataSystem) AiAgentSlice {
+        return self.ai_agents.slice();
+    }
+
     pub fn setSteeringAgent(self: *DataSystem, id: EntityId, agent: SteeringAgent) !void {
         try validateSteeringAgent(agent);
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
@@ -1060,7 +1075,15 @@ fn expectCollisionResponseColumnsAligned(slice: ConstCollisionResponseSlice) !vo
 fn expectAiAgentColumnsAligned(slice: ConstAiAgentSlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.behaviors.len);
     try std.testing.expectEqual(slice.entities.len, slice.wander_amplitudes.len);
-    try std.testing.expectEqual(slice.entities.len, slice.seek_weights.len);
+    try std.testing.expectEqual(slice.entities.len, slice.gain_wanders.len);
+    try std.testing.expectEqual(slice.entities.len, slice.gain_pursues.len);
+    try std.testing.expectEqual(slice.entities.len, slice.gain_flees.len);
+    try std.testing.expectEqual(slice.entities.len, slice.gain_investigates.len);
+    try std.testing.expectEqual(slice.entities.len, slice.gain_coheres.len);
+    try std.testing.expectEqual(slice.entities.len, slice.commitment_max_steps.len);
+    try std.testing.expectEqual(slice.entities.len, slice.sticky_bonus.len);
+    try std.testing.expectEqual(slice.entities.len, slice.commitment_remaining.len);
+    try std.testing.expectEqual(slice.entities.len, slice.last_score.len);
 }
 
 fn expectSteeringAgentColumnsAligned(slice: ConstSteeringAgentSlice) !void {
@@ -1381,7 +1404,7 @@ test "component masks track entity membership for system queries" {
     try data.setPrimitiveVisual(entity, testVisual());
     try data.setCollisionBounds(entity, testBounds(2));
     try data.setCollisionResponse(entity, testResponse(.solid, .dynamic, 0));
-    try data.setAiAgent(entity, .{ .behavior = .wander });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
     try data.setSteeringAgent(entity, testSteeringAgent(1));
     try std.testing.expect(data.hasComponents(entity, component_masks.render_primitive));
     try std.testing.expect(data.hasComponents(entity, component_masks.collision_bounds));
@@ -1710,14 +1733,16 @@ test "structural commands apply entity creation and component changes in order" 
             .primitive_visual = testVisualWithSize(20),
             .collision_bounds = testBounds(6),
             .collision_response = testResponse(.solid, .dynamic, 0),
-            .ai_agent = .{ .behavior = .wander, .wander_amplitude = 42.0, .seek_weight = 0.1 },
+            .ai_agent = .{ .active_behavior = .wander, .wander_amplitude = 42.0, .gain_pursue = 0.1 },
             .steering_agent = testSteeringAgent(1),
         } },
         .{ .set_movement_body = .{ .entity = existing, .body = testBody(3) } },
         .{ .set_facing = .{ .entity = existing, .facing = .{ .direction = .right } } },
         .{ .set_collision_bounds = .{ .entity = existing, .bounds = testBounds(8) } },
         .{ .set_collision_response = .{ .entity = existing, .response = testResponse(.bounce, .dynamic, 0.8) } },
-        .{ .set_ai_agent = .{ .entity = existing, .agent = .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 0.75 } } },
+        // First component-set for `existing`, so this is an append (not a retune):
+        // the given active_behavior takes effect immediately.
+        .{ .set_ai_agent = .{ .entity = existing, .agent = .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 0.75 } } },
         .{ .set_steering_agent = .{ .entity = existing, .agent = testSteeringAgent(2) } },
         .{ .set_faction = .{ .entity = existing, .faction = .hostile } },
     };
@@ -1738,8 +1763,8 @@ test "structural commands apply entity creation and component changes in order" 
     try expectAiAgentColumnsAligned(ai_slice);
     try std.testing.expectEqual(@as(usize, 2), ai_slice.entities.len);
     const existing_ai = data.aiAgentConst(existing).?;
-    try std.testing.expectEqual(AiBehavior.seek, existing_ai.behavior);
-    try std.testing.expectEqual(@as(f32, 0.75), existing_ai.seek_weight);
+    try std.testing.expectEqual(AiBehavior.pursue, existing_ai.active_behavior);
+    try std.testing.expectEqual(@as(f32, 0.75), existing_ai.gain_pursue);
     try std.testing.expectEqual(@as(f32, 14), data.steeringAgentConst(existing).?.agent_radius);
     // created one also has ai from template
     try std.testing.expect(data.aiAgentConst(data.movementBodySliceConst().entities[0]) != null or data.aiAgentConst(data.movementBodySliceConst().entities[1]) != null);
@@ -1780,20 +1805,24 @@ test "ai agent component stores dense columns, supports template create and set/
     const first = try data.createEntity();
     const second = try data.createEntity();
     const third = try data.createEntity();
-    try data.setAiAgent(first, .{ .behavior = .wander, .wander_amplitude = 12.5, .seek_weight = 0 });
-    try data.setAiAgent(second, .{ .behavior = .seek, .wander_amplitude = 0, .seek_weight = 0.9 });
-    try data.setAiAgent(third, .{ .behavior = .wander, .wander_amplitude = 99, .seek_weight = 0.1 });
-    try data.setAiAgent(first, .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 0.3 });
+    try data.setAiAgent(first, .{ .active_behavior = .wander, .wander_amplitude = 12.5, .gain_pursue = 0 });
+    try data.setAiAgent(second, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 0.9 });
+    try data.setAiAgent(third, .{ .active_behavior = .wander, .wander_amplitude = 99, .gain_pursue = 0.1 });
+    // Retune of an existing row: only cold fields (wander_amplitude, gains)
+    // change. active_behavior is hot and stays whatever the first append set.
+    try data.setAiAgent(first, .{ .active_behavior = .pursue, .wander_amplitude = 7, .gain_pursue = 0.3 });
 
     const first_agent = data.aiAgentConst(first).?;
-    try std.testing.expectEqual(AiBehavior.seek, first_agent.behavior);
+    try std.testing.expectEqual(AiBehavior.wander, first_agent.active_behavior);
     try std.testing.expectEqual(@as(f32, 7), first_agent.wander_amplitude);
-    try std.testing.expectEqual(@as(f32, 0.3), first_agent.seek_weight);
+    try std.testing.expectEqual(@as(f32, 0.3), first_agent.gain_pursue);
     try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = -0.1 }));
-    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .seek_weight = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .gain_pursue = std.math.inf(f32) }));
     try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .wander_amplitude = std.math.floatMax(f32) }));
-    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .seek_weight = max_ai_seek_weight + 1.0 }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .gain_pursue = max_ai_gain + 1.0 }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .sticky_bonus = -0.1 }));
+    try std.testing.expectError(error.InvalidAiAgent, data.setAiAgent(first, .{ .sticky_bonus = std.math.nan(f32) }));
 
     try std.testing.expect(data.destroyEntity(second));
     const slice = data.aiAgentSliceConst();
@@ -1861,7 +1890,7 @@ test "ai agent via EntityTemplate in structural create and mask queries" {
     const commands = [_]StructuralCommand{
         .{ .create_entity = .{
             .movement_body = testBody(1),
-            .ai_agent = .{ .behavior = .wander, .wander_amplitude = 55, .seek_weight = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .wander_amplitude = 55, .gain_pursue = 0 },
             .steering_agent = testSteeringAgent(1),
         } },
     };
@@ -1871,7 +1900,7 @@ test "ai agent via EntityTemplate in structural create and mask queries" {
     try std.testing.expect(data.hasComponents(entity, component_masks.ai_agent | component_masks.steering_agent | component_masks.movement_body));
     try std.testing.expect(!data.hasComponents(entity, component_masks.collision_response));
     const agent = data.aiAgentConst(entity).?;
-    try std.testing.expectEqual(AiBehavior.wander, agent.behavior);
+    try std.testing.expectEqual(AiBehavior.wander, agent.active_behavior);
     try std.testing.expectEqual(@as(f32, 55), agent.wander_amplitude);
     try std.testing.expectEqual(@as(f32, 13), data.steeringAgentConst(entity).?.agent_radius);
 }
@@ -1925,7 +1954,7 @@ test "structural commands prevalidate ai agents before mutating" {
         .{ .set_movement_body = .{ .entity = existing, .body = testBody(99) } },
         .{ .create_entity = .{
             .movement_body = testBody(2),
-            .ai_agent = .{ .behavior = .wander, .wander_amplitude = std.math.floatMax(f32), .seek_weight = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .wander_amplitude = std.math.floatMax(f32), .gain_pursue = 0 },
         } },
     };
 

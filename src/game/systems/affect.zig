@@ -5,7 +5,7 @@
 //! Emotion-drive appraisal processor: for every cognition-scoped agent that
 //! carries `AiAffect`, appraises this step's `AiPerception`/`AiMemory` state
 //! (both optional per row — a missing component contributes no signal, it
-//! never excludes the row) plus its own `AiAgent.behavior` into four
+//! never excludes the row) plus its own `AiAgent.active_behavior` into four
 //! independent drives (fear, curiosity, aggression, fatigue), decays each
 //! toward its own per-entity baseline, and emits a threshold-crossing event
 //! on a rising or falling edge. A true Schmitt trigger (each drive's bit in
@@ -135,7 +135,7 @@ const AffectGatherRow = struct {
     vision_range: f32,
     heard_stimulus_f: f32,
     familiarity: f32,
-    behavior_seek_f: f32,
+    behavior_pursue_f: f32,
 };
 
 fn appendAffectGatherRow(
@@ -290,7 +290,7 @@ pub const AffectSystem = struct {
             .vision_range = rows.items(.vision_range),
             .heard_stimulus_f = rows.items(.heard_stimulus_f),
             .familiarity = rows.items(.familiarity),
-            .behavior_seek_f = rows.items(.behavior_seek_f),
+            .behavior_pursue_f = rows.items(.behavior_pursue_f),
             .affect_slice = data.aiAffectSlice(),
             .event_ranges = self.event_ranges.items[0..range_count],
         };
@@ -300,7 +300,7 @@ pub const AffectSystem = struct {
     // scope_dense_indices (or every ai agent), keeping only rows that carry
     // both AiAgent and AiAffect. AiPerception/AiMemory are each resolved with
     // `orelse` -- a missing one packs a "no signal" default rather than
-    // excluding the row, since fatigue's own input (AiAgent.behavior) needs
+    // excluding the row, since fatigue's own input (AiAgent.active_behavior) needs
     // neither.
     fn gatherScopedIndices(
         self: *AffectSystem,
@@ -347,7 +347,7 @@ pub const AffectSystem = struct {
                 .vision_range = vision_range,
                 .heard_stimulus_f = heard_stimulus_f,
                 .familiarity = familiarity,
-                .behavior_seek_f = if (ai_agents.behaviors[i] == .seek) 1 else 0,
+                .behavior_pursue_f = if (ai_agents.behaviors[i] == .pursue) 1 else 0,
             });
         }
     }
@@ -427,7 +427,7 @@ const AffectJobContext = struct {
     vision_range: []const f32,
     heard_stimulus_f: []const f32,
     familiarity: []const f32,
-    behavior_seek_f: []const f32,
+    behavior_pursue_f: []const f32,
     affect_slice: AiAffectSlice,
     event_ranges: []AffectEventRangeSlot,
 };
@@ -658,7 +658,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
     const entities = job.entities;
-    const behavior_seek_f = job.behavior_seek_f;
+    const behavior_pursue_f = job.behavior_pursue_f;
     const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
@@ -673,13 +673,13 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const threshold = simd.gatherFloat4(s.threshold_fatigue, lanes);
         const prev = simd.gatherFloat4(s.fatigue, lanes);
 
-        // Fatigue's own input is this row's AiAgent.behavior, not
-        // perception/memory: seeking (active pursuit) raises it; wandering
+        // Fatigue's own input is this row's AiAgent.active_behavior, not
+        // perception/memory: pursuing (active pursuit) raises it; wandering
         // adds no delta, so the outer decay-toward-baseline alone pulls it
         // back down.
-        const seek_f = simd.loadFloat4(behavior_seek_f[k..]);
-        const seek_mask = simd.greaterThanFloat4(seek_f, half);
-        const delta = simd.selectFloat4(seek_mask, gain, zero);
+        const pursue_f = simd.loadFloat4(behavior_pursue_f[k..]);
+        const pursue_mask = simd.greaterThanFloat4(pursue_f, half);
+        const delta = simd.selectFloat4(pursue_mask, gain, zero);
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
@@ -689,7 +689,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     while (k < range.end) : (k += 1) {
         const index = indices[k];
         const prev = s.fatigue[index];
-        const delta: f32 = if (behavior_seek_f[k] > 0.5) gain_fatigue else 0;
+        const delta: f32 = if (behavior_pursue_f[k] > 0.5) gain_fatigue else 0;
         const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
         s.fatigue[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
@@ -812,12 +812,12 @@ test "decays toward baseline with no perception/memory present, and fatigue resp
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
-    const wanderer = try addAgentWithAffect(&data, .{ .behavior = .wander }, .{
+    const wanderer = try addAgentWithAffect(&data, .{ .active_behavior = .wander }, .{
         .baseline_fatigue = 0.1,
         .decay_rate_fatigue = 0.5,
         .fatigue = 0.9,
     });
-    const seeker = try addAgentWithAffect(&data, .{ .behavior = .seek }, .{
+    const seeker = try addAgentWithAffect(&data, .{ .active_behavior = .pursue }, .{
         .baseline_fatigue = 0.1,
         .decay_rate_fatigue = 0.5,
         .fatigue = 0.1,
@@ -904,7 +904,7 @@ test "fatigue rises under seek and decays under wander across steps" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
-    const entity = try addAgentWithAffect(&data, .{ .behavior = .seek }, .{ .decay_rate_fatigue = 0.2 });
+    const entity = try addAgentWithAffect(&data, .{ .active_behavior = .pursue }, .{ .decay_rate_fatigue = 0.2 });
 
     var sys = AffectSystem.init(testing.allocator);
     defer sys.deinit();
@@ -915,7 +915,12 @@ test "fatigue rises under seek and decays under wander across steps" {
     const seeking_fatigue = data.aiAffectConst(entity).?.fatigue;
     try testing.expect(seeking_fatigue > 0);
 
-    try data.setAiAgent(entity, .{ .behavior = .wander });
+    // Flip the hot active_behavior column directly: setAiAgent's upsert only
+    // retunes cold tunables and preserves hot arbitration state (mirrors how
+    // arbitration itself would write this, and how the perception test above
+    // flips target_visible via perceptionSlice()).
+    const agent_index = data.aiAgentDenseIndex(entity).?;
+    data.aiAgentSlice().active_behavior[agent_index] = .wander;
     for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data.aiAffectConst(entity).?.fatigue < seeking_fatigue);
 }
@@ -1090,17 +1095,17 @@ test "serial and threaded updates are byte-identical" {
 
     for (0..40) |i| {
         const visible = i % 3 == 0;
-        const seek: AiBehavior = if (i % 2 == 0) .seek else .wander;
+        const pursue: AiBehavior = if (i % 2 == 0) .pursue else .wander;
         _ = try addAgentWithPerceptionMemoryAffect(
             &data_a,
-            .{ .behavior = seek },
+            .{ .active_behavior = pursue },
             .{ .vision_range = 100, .target_visible = visible, .nearest_threat_dist = 5, .heard_stimulus = !visible },
             .{ .familiarity = 0.3 },
             .{ .baseline_fear = 0.1, .decay_rate_fear = 0.3 },
         );
         _ = try addAgentWithPerceptionMemoryAffect(
             &data_b,
-            .{ .behavior = seek },
+            .{ .active_behavior = pursue },
             .{ .vision_range = 100, .target_visible = visible, .nearest_threat_dist = 5, .heard_stimulus = !visible },
             .{ .familiarity = 0.3 },
             .{ .baseline_fear = 0.1, .decay_rate_fear = 0.3 },
@@ -1145,8 +1150,8 @@ test "an entity outside scope_dense_indices is untouched" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
-    _ = try addAgentWithAffect(&data, .{ .behavior = .seek }, .{ .decay_rate_fatigue = 0.5 });
-    _ = try addAgentWithAffect(&data, .{ .behavior = .seek }, .{ .decay_rate_fatigue = 0.5 });
+    _ = try addAgentWithAffect(&data, .{ .active_behavior = .pursue }, .{ .decay_rate_fatigue = 0.5 });
+    _ = try addAgentWithAffect(&data, .{ .active_behavior = .pursue }, .{ .decay_rate_fatigue = 0.5 });
 
     var sys = AffectSystem.init(testing.allocator);
     defer sys.deinit();
@@ -1164,7 +1169,7 @@ test "an entity outside scope_dense_indices is untouched" {
 test "serial has no steady-state allocation after warmup (FailingAllocator)" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
-    _ = try addAgentWithAffect(&data, .{ .behavior = .seek }, .{});
+    _ = try addAgentWithAffect(&data, .{ .active_behavior = .pursue }, .{});
 
     var sys = AffectSystem.init(testing.allocator);
     defer sys.deinit();
@@ -1188,8 +1193,8 @@ test "threaded update has no steady-state allocation after warmup (FailingAlloca
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
     for (0..64) |i| {
-        const seek: AiBehavior = if (i % 2 == 0) .seek else .wander;
-        _ = try addAgentWithAffect(&data, .{ .behavior = seek }, .{});
+        const pursue: AiBehavior = if (i % 2 == 0) .pursue else .wander;
+        _ = try addAgentWithAffect(&data, .{ .active_behavior = pursue }, .{});
     }
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
@@ -1229,7 +1234,7 @@ test "a tight event capacity forces a graceful drop instead of a throw" {
     for (0..2) |_| {
         _ = try addAgentWithPerceptionMemoryAffect(
             &data,
-            .{ .behavior = .seek },
+            .{ .active_behavior = .pursue },
             .{ .vision_range = 100, .target_visible = true, .nearest_threat_dist = 0 },
             .{ .familiarity = 0 },
             .{

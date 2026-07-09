@@ -112,7 +112,16 @@ fn hotStoreCapacity(min_len: usize) usize {
 // Mirrors ai.zig's max_separation_neighbors/max_separation_candidate_checks
 // shape: a small fixed candidate buffer bounded by a scan-cost ceiling.
 const max_perception_candidates: u8 = 16;
-const max_perception_candidate_checks: u16 = 128;
+// Runtime perf logging (perception_candidate_checks) measured ~32 candidate
+// visits/observer on average in a populated demo, ~94% rejected by the
+// stance filter (mostly same-faction, e.g. cohere-clustered) before ever
+// reaching sensed_count -- the query pays their dx/dy/dist2 cost regardless
+// of rejection. 64 (mirrors ai.zig's max_cohere_candidate_checks, half of
+// max_separation_candidate_checks) keeps ~2x headroom over the observed
+// average while bounding the worst case a dense same-faction cluster can
+// force onto one observer's query, instead of leaving it at 128 (~4x
+// headroom) with no measured need for that much slack.
+const max_perception_candidate_checks: u16 = 64;
 const max_perception_scratch: usize = max_perception_candidates + 1; // + player
 
 // "Moving" gate for facing derivation: 1.0 units/sec, compared against
@@ -192,6 +201,13 @@ pub const PerceptionStats = struct {
     // step timing.
     los_checks: usize = 0,
     los_blocked: usize = 0,
+    // Total spatial-index candidates visited across every observer this step,
+    // hostile-stance or not (mirrors `ai_separation_candidate_checks`) —
+    // isolates the query's own traversal cost from `sensed_count`'s
+    // post-FOV-filter selectivity signal, so a locally dense same-faction
+    // cluster that gets visited-then-rejected by the stance check is visible
+    // here even though it never reaches `sensed_count`.
+    candidate_checks: usize = 0,
     perceived_events: usize = 0,
     lost_events: usize = 0,
     dropped_events: usize = 0,
@@ -214,6 +230,14 @@ const PerceptionRangeStats = struct {
     nearest_threat_found: usize = 0,
     los_checks: usize = 0,
     los_blocked: usize = 0,
+    // Total spatial-index candidates visited across every observer this range
+    // processed, hostile-stance or not (mirrors `ai_separation_candidate_checks`
+    // in `ai.zig`) -- distinct from `sensed_count` (post-FOV survivors): this
+    // counts the query's own traversal cost before any stance/FOV filtering,
+    // so a locally dense same-faction cluster (e.g. cohere-formed) that gets
+    // visited-then-rejected shows up here even though it never reaches
+    // `sensed_count`.
+    candidate_checks: usize = 0,
 };
 
 const CandidateRow = struct {
@@ -497,6 +521,24 @@ pub const PerceptionSystem = struct {
         self.* = undefined;
     }
 
+    /// Eagerly builds every existing level's `level_blocked` cache once, at
+    /// world/state load time (mirrors `PathfindingSystem`'s one-time static
+    /// nav-grid build — same "pay it once at an accepted init cost" shape,
+    /// called from the same `SimulationPipeline.init` call site). Without
+    /// this, each level's first-ever full rebuild happens lazily, triggered
+    /// by whichever fixed step first has an observer on that level —
+    /// scattered across the live session instead of paid once up front, and
+    /// with no bound on how many distinct never-touched levels an unlucky
+    /// step's observer set could span at once. Safe to call with zero
+    /// levels (no-op) or to call again later (subsequent per-level calls are
+    /// the normal cheap "nothing changed" reuse path, not a second rebuild).
+    pub fn prebuildLevelCaches(self: *PerceptionSystem, world: *const WorldSystem) !void {
+        var level: usize = 0;
+        while (level < world.levelCount()) : (level += 1) {
+            try self.ensureLevelBlockedCache(world, @intCast(level));
+        }
+    }
+
     pub fn update(
         self: *PerceptionSystem,
         ai_agents: ConstAiAgentSlice,
@@ -552,6 +594,7 @@ pub const PerceptionSystem = struct {
             .nearest_threat_found_count = totals.nearest_threat_found,
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
+            .candidate_checks = totals.candidate_checks,
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
@@ -595,6 +638,7 @@ pub const PerceptionSystem = struct {
             .nearest_threat_found_count = totals.nearest_threat_found,
             .los_checks = totals.los_checks,
             .los_blocked = totals.los_blocked,
+            .candidate_checks = totals.candidate_checks,
             .perceived_events = merge.perceived,
             .lost_events = merge.lost,
             .dropped_events = merge.dropped,
@@ -967,6 +1011,7 @@ pub const PerceptionSystem = struct {
             totals.nearest_threat_found += slot.stats.nearest_threat_found;
             totals.los_checks += slot.stats.los_checks;
             totals.los_blocked += slot.stats.los_blocked;
+            totals.candidate_checks += slot.stats.candidate_checks;
         }
         return totals;
     }
@@ -1410,7 +1455,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
         .scratch = &scratch,
     };
     const scan_radius = spatial_index_mod.cellScanRadius(vision_range, job.spatial.cell_size);
-    _ = job.spatial.queryNeighbors(
+    const query_stats = job.spatial.queryNeighbors(
         ox,
         oy,
         self_index,
@@ -1419,6 +1464,7 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
         &visit_ctx,
         perceptionNeighborVisit,
     );
+    range_stats.candidate_checks += query_stats.candidate_checks;
 
     if (job.player_candidate) |player| {
         if (stance(observer_faction, player.faction) == .hostile) {
@@ -1650,7 +1696,7 @@ fn addAgent(
         .velocity = .{ .x = velocity_x, .y = velocity_y },
         .speed = 40,
     });
-    try data.setAiAgent(entity, .{ .behavior = .wander });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander });
     try data.setFaction(entity, faction);
     return entity;
 }
@@ -1899,6 +1945,35 @@ test "stance gating: only hostile candidates ever become nearest_threat" {
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.target_visible);
     try testing.expectEqual(threat.index, perception.nearest_threat.index);
+}
+
+test "candidate_checks counts every visited candidate, not just hostile-stance survivors" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 10, 0, .player, .{});
+    _ = try addAgent(&data, 10, 0, 0, 0, .neutral);
+    _ = try addAgent(&data, 12, 0, 0, 0, .ally);
+    _ = try addAgent(&data, 14, 0, 0, 0, .hostile);
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stats = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{});
+
+    // All 3 candidates (neutral, ally, hostile) sit within the query's scan
+    // radius and get visited -- candidate_checks must see all of them, even
+    // though only the hostile one survives the stance filter into sensed_count.
+    try testing.expect(stats.candidate_checks >= 3);
+    try testing.expectEqual(@as(usize, 1), stats.sensed_count);
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(perception.target_visible);
 }
 
 test "same-level gating skips cross-level candidates even when closest" {
@@ -2206,6 +2281,49 @@ test "ensureLevelBlockedCache self-heals once a level queried before it existed 
     try sys.ensureLevelBlockedCache(&world, 0);
     try testing.expect(sys.level_blocked.items[0].valid);
     try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 0, 0)); // real, open tile data
+}
+
+test "prebuildLevelCaches builds every existing level once, so a later per-step touch reuses rather than rebuilding" {
+    const asset_store = @import("../../assets/assets.zig").AssetStore.init(testing.allocator, testing.io, "assets");
+    var meta = try @import("../../assets/world_tileset_meta.zig").load(
+        testing.allocator,
+        asset_store,
+        @import("../../assets/manifest.zig").spriteSpec(.world_tileset).metadata_path.?,
+    );
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(testing.allocator, &meta, 1024, 1024);
+    defer world.deinit();
+    _ = try world.addLevel(1);
+    const tree = (meta.tileByName("tree_0") orelse return error.TestExpectedEqual).id;
+    const grass = (meta.tileByName("grass") orelse return error.TestExpectedEqual).id;
+    const layer0 = try world.addDenseLayer(0, 0, .obstacle, grass);
+    const layer1 = try world.addDenseLayer(1, 0, .obstacle, grass);
+
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+
+    try sys.prebuildLevelCaches(&world);
+    try testing.expect(sys.level_blocked.items[0].valid);
+    try testing.expect(sys.level_blocked.items[1].valid);
+    try testing.expect(sys.level_blocked.items[0].built_step != invalid_build_step);
+    try testing.expect(sys.level_blocked.items[1].built_step != invalid_build_step);
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 1, 2, 2));
+
+    // Mutate both levels' worlds directly, never reporting either edit as
+    // dirty (mirrors the "never reported as dirty" trick the full-rebuild
+    // fallback test above uses): if the next per-step touch silently redid a
+    // full rebuild instead of reusing the prebuilt cache, it would pick this
+    // up; if it correctly takes the cheap "nothing changed" path, it won't.
+    _ = try world.setDenseTile(layer0, 2, 2, tree);
+    _ = try world.setDenseTile(layer1, 2, 2, tree);
+
+    sys.step_counter += 1;
+    try sys.ensureLevelBlockedCache(&world, 0);
+    try sys.ensureLevelBlockedCache(&world, 1);
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 0, 2, 2));
+    try testing.expect(!lookupLevelBlocked(sys.level_blocked.items, 1, 2, 2));
 }
 
 // Shared parity check for the dirty-tracked patch/skip/fallback tests below:

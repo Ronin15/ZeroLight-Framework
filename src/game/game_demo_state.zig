@@ -14,6 +14,9 @@ const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 const manifest = @import("../assets/manifest.zig");
 const SpriteAssetId = @import("../assets/manifest.zig").SpriteAssetId;
 const AiAgent = @import("data_system.zig").AiAgent;
+const AiAffect = @import("data_system.zig").AiAffect;
+const AiMemory = @import("data_system.zig").AiMemory;
+const AiPerception = @import("data_system.zig").AiPerception;
 const AssetReference = @import("data_system.zig").AssetReference;
 const component_masks = @import("data_system.zig").component_masks;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
@@ -87,7 +90,20 @@ const DemoPopulationCapacity = struct {
     collision_trigger_capacity: usize,
     structural_reserve: usize,
     event_reserve: usize,
+    perception_event_reserve: usize,
+    affect_event_reserve: usize,
 };
+
+/// `demoArchetypeForIndex`'s fixed 8-slot cycle carries exactly 3 "full
+/// cognition" archetypes (timid/aggressive/curious -- the only ones that
+/// attach `AiPerception` + `AiAffect`; cohere reads the shared spatial index
+/// directly and needs neither). Rounds `mover_count` up to a whole cycle so
+/// this stays a safe upper bound for any population, not an exact count tied
+/// to one remainder.
+fn demoCognitionAgentCount(mover_count: usize) usize {
+    const whole_cycles = (mover_count + demo_archetype_cycle_len - 1) / demo_archetype_cycle_len;
+    return whole_cycles * demo_cognition_archetypes_per_cycle;
+}
 
 fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // Matches the historical 24/32 == 0.75 surface/total split.
@@ -115,12 +131,17 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // plane-traversal fall (1) and dig-mining event (1), plus up to `structural_reserve`
     // structural-commit events (tier changes / create / destroy), plus the post-commit
     // nav-invalidation headroom (1) already tracked separately by
-    // `applyStructuralCommandsAndPostCommitEvents`. No term for perception's
-    // `entity_perceived`/`entity_lost` events: no demo entity carries `AiPerception`, and
-    // `perception_max_events_per_step` is set to 0 below. Likewise no term for affect's
-    // `affect_threshold_crossed` events: no demo entity carries `AiAffect` yet, and
-    // `affect_max_events_per_step` is set to 0 below.
-    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1;
+    // `applyStructuralCommandsAndPostCommitEvents`. Plus perception's
+    // `entity_perceived`/`entity_lost` pair (at most 2 per cognition agent per step: an
+    // identity swap emits both) and affect's `affect_threshold_crossed` (at most 1 per
+    // drive per step, 4 drives, per cognition agent) for the `demoArchetypeForIndex`
+    // subset that now carries `AiPerception`/`AiAffect` — see
+    // `demoCognitionAgentCount`/`perception_max_events_per_step`/
+    // `affect_max_events_per_step` below.
+    const cognition_agents = demoCognitionAgentCount(mover_count);
+    const perception_event_reserve = cognition_agents * 2;
+    const affect_event_reserve = cognition_agents * 4;
+    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve;
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -130,6 +151,8 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
         .collision_trigger_capacity = collision_trigger_capacity,
         .structural_reserve = structural_reserve,
         .event_reserve = event_reserve,
+        .perception_event_reserve = perception_event_reserve,
+        .affect_event_reserve = affect_event_reserve,
     };
 }
 
@@ -397,12 +420,13 @@ pub const GameDemoState = struct {
             .navigation_world = &world,
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
-            // No demo entity carries `AiPerception` yet. A state that wires
-            // it up must size this against `pop_cap.event_reserve`.
-            .perception_max_events_per_step = 0,
-            // No demo entity carries `AiAffect` yet either. A state that
-            // wires it up must size this against `pop_cap.event_reserve`.
-            .affect_max_events_per_step = 0,
+            // The `demoArchetypeForIndex` cognition subset (timid/aggressive/curious)
+            // carries `AiPerception`; sized against `pop_cap.event_reserve`'s own
+            // `perception_event_reserve` term (see `demoCognitionAgentCount`).
+            .perception_max_events_per_step = pop_cap.perception_event_reserve,
+            // Same cognition subset also carries `AiAffect`; sized against
+            // `pop_cap.event_reserve`'s `affect_event_reserve` term.
+            .affect_max_events_per_step = pop_cap.affect_event_reserve,
         });
         errdefer pipeline.deinit();
 
@@ -610,6 +634,9 @@ const DemoSpawnSpec = struct {
     use_template: bool = false,
     speed: f32 = 42,
     behavior: ?AiAgent = null,
+    perception: ?AiPerception = null,
+    memory: ?AiMemory = null,
+    affect: ?AiAffect = null,
     faction: Faction = .hostile,
 };
 
@@ -631,6 +658,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
+        const archetype = demoArchetypeForIndex(index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = 96 + @as(f32, @floatFromInt(col)) * 96,
@@ -642,7 +670,11 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
             .depth = .actor,
             .use_template = index == 3 or index == 7,
             .speed = if (index % 5 == 0) 0 else 42,
-            .behavior = demoBehaviorForIndex(index),
+            .behavior = archetype.behavior,
+            .perception = archetype.perception,
+            .memory = archetype.memory,
+            .affect = archetype.affect,
+            .faction = archetype.faction,
         };
         entities[index] = try spawnDemoMover(data, world, spec, index);
     }
@@ -653,6 +685,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const underground_index = index - pop_cap.surface_movers;
         const tile = world.tile_size;
         const size: math.Vec2 = .{ .x = 22, .y = 22 };
+        const archetype = demoArchetypeForIndex(index);
         const spec = if (underground_enabled) blk: {
             const level = undergroundSpawnLevelForIndex(world, underground_index, pop_cap.underground_movers);
             const cell = undergroundSpawnCellForIndex(underground_index);
@@ -668,7 +701,11 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
                 .depth = .actor,
                 .world_level = level,
                 .speed = 48,
-                .behavior = .{ .behavior = .seek, .wander_amplitude = 5, .seek_weight = 1.4 },
+                .behavior = archetype.behavior,
+                .perception = archetype.perception,
+                .memory = archetype.memory,
+                .affect = archetype.affect,
+                .faction = archetype.faction,
             };
         } else blk: {
             const extra_col = underground_index % 4;
@@ -683,7 +720,11 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
                 .color = demoColorForIndex(index),
                 .depth = .actor,
                 .speed = 44,
-                .behavior = .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.3 },
+                .behavior = archetype.behavior,
+                .perception = archetype.perception,
+                .memory = archetype.memory,
+                .affect = archetype.affect,
+                .faction = archetype.faction,
             };
         };
         entities[index] = try spawnDemoMover(data, world, spec, index);
@@ -709,6 +750,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
+        const archetype = demoArchetypeForIndex(index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * step_x,
@@ -720,7 +762,11 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
             .depth = .actor,
             .use_template = index == 3 or index == 7,
             .speed = if (index % 5 == 0) 0 else 42,
-            .behavior = demoBehaviorForIndex(index),
+            .behavior = archetype.behavior,
+            .perception = archetype.perception,
+            .memory = archetype.memory,
+            .affect = archetype.affect,
+            .faction = archetype.faction,
         };
         entities[index] = try spawnDemoMover(data, world, spec, index);
     }
@@ -737,6 +783,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const index = pop_cap.surface_movers + underground_index;
         const col = underground_index % underground_cols;
         const row = underground_index / underground_cols;
+        const archetype = demoArchetypeForIndex(index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * underground_step_x,
@@ -747,7 +794,11 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
             .color = demoColorForIndex(index),
             .depth = .actor,
             .speed = 44,
-            .behavior = .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.3 },
+            .behavior = archetype.behavior,
+            .perception = archetype.perception,
+            .memory = archetype.memory,
+            .affect = archetype.affect,
+            .faction = archetype.faction,
         };
         entities[index] = try spawnDemoMover(data, world, spec, index);
     }
@@ -805,7 +856,10 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
                 .collision_bounds = .{ .size = spec.size },
                 .collision_response = .{ .mode = .bounce, .mobility = .dynamic, .restitution = 1 },
                 .world_level = spec.world_level,
-                .ai_agent = spec.behavior orelse .{ .behavior = .seek, .wander_amplitude = 6, .seek_weight = 1.35 },
+                .ai_agent = spec.behavior orelse .{ .active_behavior = .pursue, .wander_amplitude = 6, .gain_pursue = 1.35 },
+                .ai_perception = spec.perception,
+                .ai_memory = spec.memory,
+                .ai_affect = spec.affect,
                 .steering_agent = demoSteeringAgent(spec.size),
                 .faction = spec.faction,
             },
@@ -840,6 +894,9 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
             try data.setAiAgent(e, behavior);
             try data.setSteeringAgent(e, demoSteeringAgent(spec.size));
         }
+        if (spec.perception) |perception| try data.setAiPerception(e, perception);
+        if (spec.memory) |memory| try data.setAiMemory(e, memory);
+        if (spec.affect) |affect| try data.setAiAffect(e, affect);
         break :blk e;
     };
 
@@ -868,12 +925,77 @@ fn demoColorForIndex(index: usize) config.Color {
     return .{ .r = 0.35 + hue * 0.5, .g = 0.45 + (1 - hue) * 0.4, .b = 0.55 + hue * 0.35, .a = 1.0 };
 }
 
-fn demoBehaviorForIndex(index: usize) ?AiAgent {
-    return switch (index % 5) {
-        0 => .{ .behavior = .wander, .wander_amplitude = 58, .seek_weight = 0 },
-        1, 3 => .{ .behavior = .seek, .wander_amplitude = 7, .seek_weight = 1.55 },
-        4 => null,
-        else => .{ .behavior = .seek, .wander_amplitude = 4, .seek_weight = 1.2 },
+/// Full component bundle for one demo mover's personality. `behavior == null`
+/// means no `AiAgent` at all (a pure physics/collision body); `perception`/
+/// `memory`/`affect` are independently optional so an entity can carry
+/// `AiAgent` without full cognition (arbitration treats an absent component
+/// as zero signal, per `arbitration.zig`).
+const DemoArchetype = struct {
+    behavior: ?AiAgent,
+    perception: ?AiPerception = null,
+    memory: ?AiMemory = null,
+    affect: ?AiAffect = null,
+    faction: Faction = .hostile,
+};
+
+/// Length of `demoArchetypeForIndex`'s fixed personality cycle.
+const demo_archetype_cycle_len: usize = 8;
+/// Count of cycle slots that attach `AiPerception` + `AiAffect` (timid,
+/// aggressive, curious) — kept in sync with the switch below by
+/// `demoCognitionAgentCount`'s doc comment; update both together.
+const demo_cognition_archetypes_per_cycle: usize = 3;
+
+/// Hardcoded personality archetypes for the demo (full data-driven archetype
+/// JSON is Slice 33). A subset of demo movers gets full cognition
+/// (`AiPerception` + `AiMemory` + `AiAffect`) with a distinct emotion
+/// baseline and gain profile each:
+///
+/// - `timid` (index 3, `.ally` faction): high `baseline_fear` / `gain_flee`.
+///   `.ally` faction makes the `.hostile`-faction majority (including
+///   `aggressive`) a genuine perceived threat, so fear/flee has a real
+///   non-player source, not just the demo `focus_target` fallback.
+/// - `aggressive` (index 4): high `baseline_aggression` / `gain_pursue`.
+///   Perceives `timid`'s `.ally` faction as hostile, so it can chase a
+///   non-player target purely from perception.
+/// - `curious` (index 5): high `baseline_curiosity` / `gain_investigate`,
+///   reacts to heard dig stimuli.
+/// - `cohesive` (index 6): high `gain_cohere` only -- cohere's goal comes
+///   from the shared spatial index (`ai.zig`'s neighbor-mean gather), not
+///   perception/memory/affect, so no cognition components are needed.
+///
+/// The remaining slots keep pre-arbitration-style contrast groups: a
+/// wander-only `AiAgent` with zero pursue gain (index 0), two
+/// `focus_target`-fallback pursuers with no cognition components (indices 1
+/// and 7) that only ever reach the player through arbitration's documented
+/// last-resort fallback, and a pure wanderer with no `AiAgent` at all (index
+/// 2). Indices 0/1 intentionally keep a real `AiAgent` (never `null`): a
+/// handful of tests pin `test_squares[0]`/`[1]`/`[3]` as "the AI squares".
+fn demoArchetypeForIndex(index: usize) DemoArchetype {
+    return switch (index % demo_archetype_cycle_len) {
+        0 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 58, .gain_pursue = 0 } },
+        1 => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 4, .gain_pursue = 1.2 } },
+        2 => .{ .behavior = null },
+        3 => .{
+            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 20, .gain_flee = 2.0, .gain_pursue = 0 },
+            .perception = .{},
+            .memory = .{},
+            .affect = .{ .baseline_fear = 0.65 },
+            .faction = .ally,
+        },
+        4 => .{
+            .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 6, .gain_pursue = 2.0 },
+            .perception = .{},
+            .memory = .{},
+            .affect = .{ .baseline_aggression = 0.65 },
+        },
+        5 => .{
+            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 15, .gain_investigate = 2.0 },
+            .perception = .{},
+            .memory = .{},
+            .affect = .{ .baseline_curiosity = 0.65 },
+        },
+        6 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 10, .gain_cohere = 2.0 } },
+        else => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 7, .gain_pursue = 1.55 } },
     };
 }
 
@@ -1672,7 +1794,8 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
     defer audio.deinit();
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
 
-    // Record pre positions for sample ai squares (ai on 0=wander/1=seek/3=template-seek per 8-square spawn mix with pronounced behaviors; ai on 4/5/7 also).
+    // Record pre positions for sample ai squares (see demoArchetypeForIndex's 8-slot
+    // cycle: 0=wander agent, 1=pursue agent, 3=timid via the template spawn path).
     const ai0 = demo.test_squares[0];
     const ai1 = demo.test_squares[1];
     const ai3 = demo.test_squares[3];
@@ -1867,13 +1990,15 @@ test "demo event capacity covers every NPC falling plus player fall, mining, str
     // the same step: `applyNpcPlaneTraversal` walks every AI agent and can emit up
     // to `default_demo_mover_count` fall events, plus the player's own plane-traversal
     // fall (1) and dig-mining event (1), plus up to the derived structural reserve
-    // structural-commit events, plus the post-commit nav-invalidation headroom (1).
+    // structural-commit events, plus the post-commit nav-invalidation headroom (1),
+    // plus the `demoArchetypeForIndex` cognition subset's worst-case perception
+    // (2/agent) and affect (4/agent) events.
     //
-    // The 83 below is a hard-coded expectation, not re-derived from
+    // The 155 below is a hard-coded expectation, not re-derived from
     // deriveDemoPopulationCapacity: re-deriving it here would make this assertion pass
     // trivially even if that formula drifted, since both sides would drift together.
     // A literal catches that.
-    const worst_case_event_count: usize = 83;
+    const worst_case_event_count: usize = 155;
     try std.testing.expectEqual(worst_case_event_count, deriveDemoPopulationCapacity(default_demo_mover_count).event_reserve);
 
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;

@@ -81,6 +81,37 @@ pub const SpatialCellRange = struct {
     end: usize,
 };
 
+/// Cheap, non-cryptographic hash for a `SpatialCell` (two `i32`s). A prior
+/// version of `CellLookup` used `std.AutoHashMapUnmanaged`, which hashes
+/// struct keys via `Wyhash` — a streaming hash designed for variable-length
+/// data. Profiling this query under real gameplay load showed `Wyhash.hash`/
+/// `.init` was the majority of `queryNeighbors`' own cost: the per-call
+/// streaming setup dominated when paid on every one of up to ~169 scanned
+/// cells per observer, most of them misses. This context replaces it with a
+/// fixed handful of multiplies/shifts (splitmix64-style finalizer over a
+/// combine of the two coordinates) — no streaming state, no per-byte loop.
+const SpatialCellHashContext = struct {
+    pub fn hash(_: SpatialCellHashContext, cell: SpatialCell) u64 {
+        const x: u64 = @as(u32, @bitCast(cell.x));
+        const y: u64 = @as(u32, @bitCast(cell.y));
+        var h = x *% 0x9E3779B185EBCA87;
+        h ^= y *% 0xC2B2AE3D27D4EB4F;
+        h ^= h >> 29;
+        h *%= 0xBF58476D1CE4E5B9;
+        h ^= h >> 32;
+        return h;
+    }
+
+    pub fn eql(_: SpatialCellHashContext, a: SpatialCell, b: SpatialCell) bool {
+        return a.x == b.x and a.y == b.y;
+    }
+};
+
+/// O(1) average-case populated-cell lookup, keyed by `SpatialCell`. See
+/// `SpatialCellHashContext`'s doc comment for why this uses a custom context
+/// instead of `std.AutoHashMapUnmanaged`.
+pub const CellLookup = std.HashMapUnmanaged(SpatialCell, SpatialCellRange, SpatialCellHashContext, std.hash_map.default_max_load_percentage);
+
 pub const SpatialIndexConfig = struct {
     /// World-unit size of one grid cell. Callers that share a population (AI
     /// today) must agree on this with their query's `cellScanRadius` call.
@@ -128,6 +159,11 @@ pub const SpatialIndexView = struct {
     pos_y: []const f32,
     entries: []const SpatialEntry,
     ranges: []const SpatialCellRange,
+    // O(1) populated-cell lookup, built alongside `ranges` from the exact same
+    // data (see `SpatialIndexSystem.buildEntriesAndRanges`). `ranges` itself
+    // stays (existing parity tests read it directly); this is a second,
+    // redundant index over the same rows purely for query-time lookup.
+    cell_lookup: CellLookup,
     cell_size: f32,
 
     /// Scans the `cell_scan_radius` block of cells around `(origin_x, origin_y)`
@@ -159,7 +195,7 @@ pub const SpatialIndexView = struct {
         while (cell_y <= own_cell.y + cell_scan_radius) : (cell_y += 1) {
             var cell_x = own_cell.x - cell_scan_radius;
             while (cell_x <= own_cell.x + cell_scan_radius) : (cell_x += 1) {
-                const range = findCellRange(self.ranges, .{ .x = cell_x, .y = cell_y }) orelse continue;
+                const range = self.cell_lookup.get(.{ .x = cell_x, .y = cell_y }) orelse continue;
                 for (self.entries[range.start..range.end]) |entry| {
                     if (self_index) |self_i| {
                         if (entry.index == self_i) continue;
@@ -209,6 +245,9 @@ pub const SpatialIndexSystem = struct {
     rows: std.MultiArrayList(SpatialIndexRow) = .{},
     entries: std.ArrayList(SpatialEntry) = .empty,
     ranges: std.ArrayList(SpatialCellRange) = .empty,
+    // O(1) query-time index over the same populated cells as `ranges` --
+    // rebuilt alongside `ranges` every step, not a separate source of truth.
+    cell_lookup: CellLookup = .empty,
     gather_ranges: RowRangeSlotList = .empty,
     build_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     cell_size: f32 = 32.0,
@@ -223,20 +262,23 @@ pub const SpatialIndexSystem = struct {
     pub fn deinit(self: *SpatialIndexSystem) void {
         for (self.gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
         self.gather_ranges.deinit(self.allocator);
+        self.cell_lookup.deinit(self.allocator);
         self.ranges.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         self.rows.deinit(self.allocator);
         self.* = undefined;
     }
 
-    /// Pre-sizes `rows`/`entries`/`ranges` to `capacity` movement bodies (worst
-    /// case: one entity per cell) so the per-step build is allocation-free
-    /// after init. The threaded per-range gather slots still warm on their
-    /// first threaded step, same as `SimulationScopeSystem.reserve`.
+    /// Pre-sizes `rows`/`entries`/`ranges`/`cell_lookup` to `capacity`
+    /// movement bodies (worst case: one entity per cell) so the per-step
+    /// build is allocation-free after init. The threaded per-range gather
+    /// slots still warm on their first threaded step, same as
+    /// `SimulationScopeSystem.reserve`.
     pub fn reserve(self: *SpatialIndexSystem, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(capacity));
         try self.entries.ensureTotalCapacity(self.allocator, capacity);
         try self.ranges.ensureTotalCapacity(self.allocator, capacity);
+        try self.cell_lookup.ensureTotalCapacity(self.allocator, @intCast(capacity));
     }
 
     /// Read-only snapshot of the most recently built index.
@@ -247,6 +289,7 @@ pub const SpatialIndexSystem = struct {
             .pos_y = slice.items(.pos_y),
             .entries = self.entries.items,
             .ranges = self.ranges.items,
+            .cell_lookup = self.cell_lookup,
             .cell_size = self.cell_size,
         };
     }
@@ -336,6 +379,7 @@ pub const SpatialIndexSystem = struct {
         self.rows.clearRetainingCapacity();
         self.entries.clearRetainingCapacity();
         self.ranges.clearRetainingCapacity();
+        self.cell_lookup.clearRetainingCapacity();
     }
 
     fn mergeRowRanges(self: *SpatialIndexSystem, slots: []RowRangeSlot) !void {
@@ -398,6 +442,7 @@ pub const SpatialIndexSystem = struct {
 
         try self.ranges.ensureTotalCapacity(self.allocator, n);
         self.ranges.clearRetainingCapacity();
+        try self.cell_lookup.ensureTotalCapacity(self.allocator, @intCast(n));
         var entry_index: usize = 0;
         while (entry_index < self.entries.items.len) {
             const cell = self.entries.items[entry_index].cell;
@@ -405,7 +450,11 @@ pub const SpatialIndexSystem = struct {
             while (entry_index < self.entries.items.len and cellsEqual(self.entries.items[entry_index].cell, cell)) {
                 entry_index += 1;
             }
-            self.ranges.appendAssumeCapacity(.{ .cell = cell, .start = start, .end = entry_index });
+            const range = SpatialCellRange{ .cell = cell, .start = start, .end = entry_index };
+            self.ranges.appendAssumeCapacity(range);
+            // Populated cells are unique by construction (grouped by equal
+            // `cell` above), so this never overwrites an existing entry.
+            self.cell_lookup.putAssumeCapacity(cell, range);
         }
     }
 };
@@ -433,22 +482,6 @@ fn cellLessThan(lhs: SpatialCell, rhs: SpatialCell) bool {
 fn entryLessThan(_: void, lhs: SpatialEntry, rhs: SpatialEntry) bool {
     if (!cellsEqual(lhs.cell, rhs.cell)) return cellLessThan(lhs.cell, rhs.cell);
     return lhs.index < rhs.index;
-}
-
-fn findCellRange(ranges: []const SpatialCellRange, cell: SpatialCell) ?SpatialCellRange {
-    var low: usize = 0;
-    var high: usize = ranges.len;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        const mid_cell = ranges[mid].cell;
-        if (cellsEqual(mid_cell, cell)) return ranges[mid];
-        if (cellLessThan(mid_cell, cell)) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    return null;
 }
 
 // ---- Threaded gather ----------------------------------------------------------
@@ -606,14 +639,21 @@ fn serialBatch(count: usize) BatchStats {
 
 const testing = std.testing;
 
+// `cell_lookup` is caller-owned (the test calls `defer cell_lookup.deinit(...)`)
+// since `SpatialIndexView.cell_lookup` only holds a shallow copy referencing
+// the same backing buckets -- the real allocation must outlive the view.
 fn makeFixtureView(
     pos_x: []const f32,
     pos_y: []const f32,
     entries: []const SpatialEntry,
     ranges: []const SpatialCellRange,
+    cell_lookup: *CellLookup,
     cell_size: f32,
-) SpatialIndexView {
-    return .{ .pos_x = pos_x, .pos_y = pos_y, .entries = entries, .ranges = ranges, .cell_size = cell_size };
+) !SpatialIndexView {
+    cell_lookup.clearRetainingCapacity();
+    try cell_lookup.ensureTotalCapacity(testing.allocator, @intCast(ranges.len));
+    for (ranges) |range| cell_lookup.putAssumeCapacity(range.cell, range);
+    return .{ .pos_x = pos_x, .pos_y = pos_y, .entries = entries, .ranges = ranges, .cell_lookup = cell_lookup.*, .cell_size = cell_size };
 }
 
 const RecordingVisitor = struct {
@@ -647,7 +687,9 @@ test "queryNeighbors visits candidates in ascending stored order, excludes self 
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 4 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 5 }};
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, 10.0);
+    var cell_lookup: CellLookup = .empty;
+    defer cell_lookup.deinit(testing.allocator);
+    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
 
     var visitor = RecordingVisitor{};
     const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 5.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
@@ -672,7 +714,9 @@ test "queryNeighbors stops at max_candidate_checks before processing the tipping
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 3 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 4 }};
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, 10.0);
+    var cell_lookup: CellLookup = .empty;
+    defer cell_lookup.deinit(testing.allocator);
+    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
 
     var visitor = RecordingVisitor{};
     const stats = view.queryNeighbors(0, 0, 0, 1, .{ .radius = 100.0, .max_candidate_checks = 1 }, &visitor, RecordingVisitor.record);
@@ -690,7 +734,9 @@ test "queryNeighbors with no self_index scans every entry including index 0" {
         .{ .cell = .{ .x = 0, .y = 0 }, .index = 1 },
     };
     const ranges = [_]SpatialCellRange{.{ .cell = .{ .x = 0, .y = 0 }, .start = 0, .end = 2 }};
-    const view = makeFixtureView(&pos_x, &pos_y, &entries, &ranges, 10.0);
+    var cell_lookup: CellLookup = .empty;
+    defer cell_lookup.deinit(testing.allocator);
+    const view = try makeFixtureView(&pos_x, &pos_y, &entries, &ranges, &cell_lookup, 10.0);
 
     var visitor = RecordingVisitor{};
     _ = view.queryNeighbors(5, 0, null, 1, .{ .radius = 100.0, .max_candidate_checks = 128 }, &visitor, RecordingVisitor.record);
@@ -711,7 +757,7 @@ const SpatialTestFixture = struct {
                 .y = @as(f32, @floatFromInt(i / 23)) * 5.0 - 20.0,
             };
             try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 20 });
-            try data.setAiAgent(entity, .{ .behavior = .wander });
+            try data.setAiAgent(entity, .{ .active_behavior = .wander });
         }
         return .{ .data = data };
     }
