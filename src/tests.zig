@@ -17,6 +17,7 @@ comptime {
     _ = @import("assets/sprite_atlas_meta.zig");
     _ = @import("app/audio.zig");
     _ = @import("app/frame_pacer.zig");
+    _ = @import("app/gamepad.zig");
     _ = @import("app/input.zig");
     _ = @import("app/input_router.zig");
     _ = @import("app/pause_controller.zig");

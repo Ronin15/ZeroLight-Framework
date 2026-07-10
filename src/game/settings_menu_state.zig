@@ -87,8 +87,7 @@ pub const SettingsMenuState = struct {
     }
 
     pub fn handleEvent(self: *SettingsMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
-        if (event.type != c.SDL_EVENT_KEY_DOWN or event.key.repeat) return false;
-        const action = inputFile.actionForKey(event.key.key) orelse return false;
+        const action = inputFile.actionForPressEvent(event) orelse return false;
         switch (action) {
             .menuUp => {
                 self.changeSelection(-1);
@@ -319,6 +318,32 @@ test "settings handleEvent uses named input actions" {
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }
 
+test "settings handleEvent uses named gamepad input actions identically to keyboard" {
+    var runtime_settings = RuntimeAudioSettings.init(.{});
+    var settings = SettingsMenuState.init(&runtime_settings, 800, 450);
+    defer settings.deinit();
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    var up = gamepadButtonEventForAction(.menuUp);
+    try std.testing.expect(try settings.handleEvent(&up, &transitions));
+    try std.testing.expectEqual(@as(usize, 3), settings.selected);
+
+    var down = gamepadButtonEventForAction(.menuDown);
+    try std.testing.expect(try settings.handleEvent(&down, &transitions));
+    try std.testing.expectEqual(@as(usize, 0), settings.selected);
+
+    var right = gamepadButtonEventForAction(.menuRight);
+    try std.testing.expect(try settings.handleEvent(&right, &transitions));
+    try std.testing.expectEqual(@as(i32, 1), settings.pending_adjust);
+
+    settings.selected = 3;
+    var confirm = gamepadButtonEventForAction(.resumeGame);
+    try std.testing.expect(try settings.handleEvent(&confirm, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+}
+
 test "settings failed audio command leaves runtime value unchanged" {
     var runtime_settings = RuntimeAudioSettings.init(.{});
     var settings = SettingsMenuState.init(&runtime_settings, 800, 450);
@@ -365,6 +390,24 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
                 .raw = 0,
                 .down = true,
                 .repeat = false,
+            } };
+        }
+    }
+    unreachable;
+}
+
+fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
+    for (inputFile.default_gamepad_bindings) |binding| {
+        if (binding.action == action) {
+            return c.SDL_Event{ .gbutton = .{
+                .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+                .reserved = 0,
+                .timestamp = 0,
+                .which = 0,
+                .button = @intCast(binding.button),
+                .down = true,
+                .padding1 = 0,
+                .padding2 = 0,
             } };
         }
     }

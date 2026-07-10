@@ -50,13 +50,51 @@ pub const default_key_bindings = [_]KeyBinding{
     .{ .key = c.SDLK_F, .action = .digDown },
 };
 
+pub const GamepadButtonBinding = struct {
+    button: c.SDL_GamepadButton,
+    action: Action,
+};
+
+pub const default_gamepad_bindings = [_]GamepadButtonBinding{
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_UP, .action = .menuUp },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_DOWN, .action = .menuDown },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_LEFT, .action = .menuLeft },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT, .action = .menuRight },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_SOUTH, .action = .resumeGame },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_EAST, .action = .quit },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_START, .action = .pause },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_WEST, .action = .digHole },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_NORTH, .action = .digRamp },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, .action = .digDown },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_BACK, .action = .toggleDebugOverlay },
+};
+
+/// Radial deadzone applied to the raw left-stick axes before they contribute
+/// to `movementVector`. ~8000/32767, SDL's own documented center noise band.
+const gamepad_stick_deadzone: f32 = 0.24;
+const gamepad_stick_axis_max: f32 = 32767.0;
+
 pub const InputState = struct {
     held_actions: ActionFlags = .{},
+    gamepad_stick_x_raw: i16 = 0,
+    gamepad_stick_y_raw: i16 = 0,
 
     pub fn releaseMovement(self: *InputState) void {
         inline for (movement_actions) |action| {
             self.held_actions.set(action, false);
         }
+        self.gamepad_stick_x_raw = 0;
+        self.gamepad_stick_y_raw = 0;
+    }
+
+    /// Releases held movement plus dig actions and stick deflection for the
+    /// gamepad-disconnect path, which covers a dig button held at the moment
+    /// of unplug (it would otherwise never see a button-up event).
+    pub fn releaseGamepadInput(self: *InputState) void {
+        self.releaseMovement();
+        self.held_actions.set(.digHole, false);
+        self.held_actions.set(.digRamp, false);
+        self.held_actions.set(.digDown, false);
     }
 
     pub fn handleEvent(self: *InputState, event: *const c.SDL_Event) void {
@@ -79,13 +117,24 @@ pub const InputState = struct {
         self.held_actions.set(action, value);
     }
 
+    /// Sets whichever of the raw left-stick axes is non-null. The router calls
+    /// this once per axis-motion event since SDL delivers X/Y separately.
+    pub fn handleGamepadAxis(self: *InputState, raw_x: ?i16, raw_y: ?i16) void {
+        if (raw_x) |x| self.gamepad_stick_x_raw = x;
+        if (raw_y) |y| self.gamepad_stick_y_raw = y;
+    }
+
     pub fn movementVector(self: *const InputState) math.Vec2 {
         var direction = math.Vec2{};
         if (self.isHeld(.moveLeft)) direction.x -= 1;
         if (self.isHeld(.moveRight)) direction.x += 1;
         if (self.isHeld(.moveUp)) direction.y -= 1;
         if (self.isHeld(.moveDown)) direction.y += 1;
-        return direction;
+        const stick = deadzonedStick(self.gamepad_stick_x_raw, self.gamepad_stick_y_raw);
+        return .{
+            .x = math.clamp(direction.x + stick.x, -1, 1),
+            .y = math.clamp(direction.y + stick.y, -1, 1),
+        };
     }
 };
 
@@ -110,6 +159,12 @@ pub const FrameCommands = struct {
 
     pub fn wasPressed(self: *const FrameCommands, action: Action) bool {
         return self.pressed_actions.get(action);
+    }
+
+    /// Latches a one-frame command action, mirroring `InputState.setHeld`.
+    pub fn press(self: *FrameCommands, action: Action) void {
+        if (!isCommandAction(action)) return;
+        self.pressed_actions.set(action, true);
     }
 };
 
@@ -139,6 +194,41 @@ pub fn actionForKey(key: c.SDL_Keycode) ?Action {
         if (binding.key == key) return binding.action;
     }
     return null;
+}
+
+pub fn actionForGamepadButton(button: c.SDL_GamepadButton) ?Action {
+    for (default_gamepad_bindings) |binding| {
+        if (binding.button == button) return binding.action;
+    }
+    return null;
+}
+
+/// Resolves the `Action` a fresh (non-repeat) key-down or gamepad button-down
+/// event maps to, if any. Shared by menu states so they consume keyboard and
+/// gamepad presses through one code path.
+pub fn actionForPressEvent(event: *const c.SDL_Event) ?Action {
+    return switch (event.type) {
+        c.SDL_EVENT_KEY_DOWN => if (event.key.repeat) null else actionForKey(event.key.key),
+        c.SDL_EVENT_GAMEPAD_BUTTON_DOWN => actionForGamepadButton(@intCast(event.gbutton.button)),
+        else => null,
+    };
+}
+
+fn axisToUnit(raw: i16) f32 {
+    return @as(f32, @floatFromInt(raw)) / gamepad_stick_axis_max;
+}
+
+/// Converts raw left-stick axes to a normalized `Vec2` using a scaled radial
+/// deadzone: magnitude within `gamepad_stick_deadzone` reports zero, and the
+/// remaining `[deadzone, 1]` range is rescaled to `[0, 1]` so a corner-pushed
+/// stick reports magnitude ~=1, not the raw unscaled diagonal value.
+fn deadzonedStick(raw_x: i16, raw_y: i16) math.Vec2 {
+    const unit = math.Vec2{ .x = axisToUnit(raw_x), .y = axisToUnit(raw_y) };
+    const magnitude = math.length(unit);
+    if (magnitude <= gamepad_stick_deadzone) return .{};
+    const scaled = @min((magnitude - gamepad_stick_deadzone) / (1.0 - gamepad_stick_deadzone), 1.0);
+    const ratio = scaled / magnitude;
+    return .{ .x = unit.x * ratio, .y = unit.y * ratio };
 }
 
 const ActionFlags = struct {
@@ -292,6 +382,7 @@ test "input can release held movement when gameplay is paused" {
     input.setHeld(.moveRight, true);
     input.setHeld(.moveUp, true);
     input.setHeld(.moveDown, true);
+    input.handleGamepadAxis(12000, -8000);
 
     input.releaseMovement();
 
@@ -299,4 +390,122 @@ test "input can release held movement when gameplay is paused" {
     try std.testing.expect(!input.isHeld(.moveRight));
     try std.testing.expect(!input.isHeld(.moveUp));
     try std.testing.expect(!input.isHeld(.moveDown));
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
+}
+
+test "releaseGamepadInput clears movement, dig, and stick state together" {
+    var input = InputState{};
+    input.setHeld(.moveRight, true);
+    input.setHeld(.digHole, true);
+    input.setHeld(.digRamp, true);
+    input.setHeld(.digDown, true);
+    input.handleGamepadAxis(20000, 20000);
+
+    input.releaseGamepadInput();
+
+    try std.testing.expect(!input.isHeld(.moveRight));
+    try std.testing.expect(!input.isHeld(.digHole));
+    try std.testing.expect(!input.isHeld(.digRamp));
+    try std.testing.expect(!input.isHeld(.digDown));
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
+}
+
+test "actionForGamepadButton resolves every default binding and rejects unmapped buttons" {
+    try std.testing.expectEqual(Action.menuUp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_UP).?);
+    try std.testing.expectEqual(Action.menuDown, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_DOWN).?);
+    try std.testing.expectEqual(Action.menuLeft, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_LEFT).?);
+    try std.testing.expectEqual(Action.menuRight, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT).?);
+    try std.testing.expectEqual(Action.resumeGame, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_SOUTH).?);
+    try std.testing.expectEqual(Action.quit, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_EAST).?);
+    try std.testing.expectEqual(Action.pause, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_START).?);
+    try std.testing.expectEqual(Action.digHole, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_WEST).?);
+    try std.testing.expectEqual(Action.digRamp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_NORTH).?);
+    try std.testing.expectEqual(Action.digDown, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER).?);
+    try std.testing.expectEqual(Action.toggleDebugOverlay, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_BACK).?);
+    try std.testing.expectEqual(@as(?Action, null), actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_GUIDE));
+}
+
+fn gamepadButtonEvent(event_type: u32, button: c.SDL_GamepadButton, down: bool) c.SDL_Event {
+    return c.SDL_Event{ .gbutton = .{
+        .type = event_type,
+        .reserved = 0,
+        .timestamp = 0,
+        .which = 0,
+        .button = @intCast(button),
+        .down = down,
+        .padding1 = 0,
+        .padding2 = 0,
+    } };
+}
+
+test "actionForPressEvent resolves keyboard and gamepad press shapes" {
+    var key_down = c.SDL_Event{ .key = .{
+        .type = c.SDL_EVENT_KEY_DOWN,
+        .reserved = 0,
+        .timestamp = 0,
+        .windowID = 0,
+        .which = 0,
+        .scancode = 0,
+        .key = c.SDLK_A,
+        .mod = 0,
+        .raw = 0,
+        .down = true,
+        .repeat = false,
+    } };
+    try std.testing.expectEqual(Action.moveLeft, actionForPressEvent(&key_down).?);
+
+    var key_repeat = key_down;
+    key_repeat.key.repeat = true;
+    try std.testing.expectEqual(@as(?Action, null), actionForPressEvent(&key_repeat));
+
+    var key_up = key_down;
+    key_up.type = c.SDL_EVENT_KEY_UP;
+    try std.testing.expectEqual(@as(?Action, null), actionForPressEvent(&key_up));
+
+    var gamepad_down = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_GAMEPAD_BUTTON_SOUTH, true);
+    try std.testing.expectEqual(Action.resumeGame, actionForPressEvent(&gamepad_down).?);
+
+    var gamepad_unmapped = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_GAMEPAD_BUTTON_GUIDE, true);
+    try std.testing.expectEqual(@as(?Action, null), actionForPressEvent(&gamepad_unmapped));
+}
+
+test "deadzonedStick zeroes small deflection and normalizes full deflection" {
+    const inside_deadzone = deadzonedStick(4000, -3000);
+    try std.testing.expectEqual(@as(f32, 0), inside_deadzone.x);
+    try std.testing.expectEqual(@as(f32, 0), inside_deadzone.y);
+
+    const single_axis_max = deadzonedStick(32767, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), math.length(single_axis_max), 0.01);
+    try std.testing.expect(single_axis_max.x > 0.99);
+    try std.testing.expectEqual(@as(f32, 0), single_axis_max.y);
+
+    // Both axes pushed to the corner: scaled radial deadzone reports
+    // magnitude ~=1, NOT the raw sqrt(2) diagonal magnitude.
+    const corner: i16 = 23170; // 32767 / sqrt(2)
+    const diagonal_max = deadzonedStick(corner, corner);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), math.length(diagonal_max), 0.02);
+}
+
+test "movementVector combines keyboard and gamepad stick input" {
+    var keyboard_only = InputState{};
+    keyboard_only.setHeld(.moveRight, true);
+    keyboard_only.setHeld(.moveUp, true);
+    const keyboard_movement = keyboard_only.movementVector();
+    try std.testing.expectEqual(@as(f32, 1), keyboard_movement.x);
+    try std.testing.expectEqual(@as(f32, -1), keyboard_movement.y);
+
+    var same_axis = InputState{};
+    same_axis.setHeld(.moveRight, true);
+    same_axis.handleGamepadAxis(32767, null);
+    const same_axis_movement = same_axis.movementVector();
+    try std.testing.expectEqual(@as(f32, 1), same_axis_movement.x);
+
+    var independent_axes = InputState{};
+    independent_axes.setHeld(.moveRight, true);
+    independent_axes.handleGamepadAxis(null, 32767);
+    const independent_movement = independent_axes.movementVector();
+    try std.testing.expectEqual(@as(f32, 1), independent_movement.x);
+    try std.testing.expect(independent_movement.y > 0.99);
 }

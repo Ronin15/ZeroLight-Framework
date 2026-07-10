@@ -14,8 +14,9 @@ game-specific behavior under `src/game/`.
   pause controller, input, debug overlay, and thread system.
 - `src/app/audio.zig` owns SDL3_mixer lifecycle, app-level audio tracks,
   loaded audio assets, bus gains, and the fixed-step audio command buffer.
-- `src/app/input.zig` owns named actions, held gameplay input, and one-frame app/debug commands.
+- `src/app/input.zig` owns named actions, keyboard and default gamepad button bindings, held gameplay input (including analog left-stick movement), and one-frame app/debug commands.
 - `src/app/input_router.zig` applies state-policy action contexts before input mutates `InputState` or `FrameCommands`.
+- `src/app/gamepad.zig` owns single active-gamepad device lifecycle: first-connected-wins adoption, hot-plug add/remove reaction, and fallback-to-next-device (or keyboard) on disconnect.
 - `src/app/time_loop.zig` keeps simulation fixed at 60Hz.
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
@@ -266,12 +267,15 @@ cooldowns — is the pipeline-owned `AudioController`; the gameplay state passes
 borrowed command buffer through the pipeline at its input/contact seams and holds
 no audio-policy state.
 
-Raw keyboard input maps to named actions in `src/app/input.zig`.
-`input_router.zig` applies the active state stack's action contexts before
-mutating held gameplay actions in `InputState` or one-frame UI/app/debug
-commands in `FrameCommands`. State `handleEvent` methods still receive raw SDL
-events according to stack policy, so named-action routing and raw event handling
-stay separate.
+Raw keyboard and gamepad input map to named actions in `src/app/input.zig`;
+`src/app/gamepad.zig` owns the single-active-device lifecycle that decides
+which `*SDL_Gamepad` (if any) supplies gamepad-sourced events. `input_router.zig`
+applies the active state stack's action contexts before mutating held gameplay
+actions in `InputState` or one-frame UI/app/debug commands in `FrameCommands`,
+treating keyboard key events and gamepad button events through the same
+policy/latch path, and gating analog left-stick axis motion on the `.gameplay`
+context. State `handleEvent` methods still receive raw SDL events according to
+stack policy, so named-action routing and raw event handling stay separate.
 
 State policies decide whether lower states receive updates, events, or render
 passes. Transitions are queued through `StateTransitions` and applied after the

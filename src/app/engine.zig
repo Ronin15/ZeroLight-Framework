@@ -15,6 +15,7 @@ const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
 const MainMenuState = @import("../game/main_menu_state.zig").MainMenuState;
 const SettingsMenuState = @import("../game/settings_menu_state.zig").SettingsMenuState;
 const frame_pacer = @import("frame_pacer.zig");
+const GamepadManager = @import("gamepad.zig").GamepadManager;
 const input_router = @import("input_router.zig");
 const log = @import("../core/logging.zig").app;
 const Action = @import("input.zig").Action;
@@ -59,6 +60,7 @@ pub const Engine = struct {
     pause: PauseController,
     input: InputState = .{},
     commands: FrameCommands = .{},
+    gamepad: GamepadManager = .{},
     running: bool = true,
     swapchain_blocked: bool = false,
 
@@ -72,9 +74,13 @@ pub const Engine = struct {
         const window_title = try allocator.dupeZ(u8, app_config.window_title);
         defer allocator.free(window_title);
 
-        const sdl_flags = c.SDL_INIT_VIDEO | if (app_config.audio.enabled) c.SDL_INIT_AUDIO else 0;
+        const sdl_flags = c.SDL_INIT_VIDEO | c.SDL_INIT_GAMEPAD | if (app_config.audio.enabled) c.SDL_INIT_AUDIO else 0;
         var sdl_context = try sdl.SdlContext.init(sdl_flags);
         errdefer sdl_context.deinit();
+
+        var gamepad_manager = GamepadManager.init();
+        gamepad_manager.openInitial();
+        errdefer gamepad_manager.deinit();
 
         const logical_size = app_config.resolution_policy.logical_size;
         var window = try sdl.Window.create(
@@ -162,6 +168,7 @@ pub const Engine = struct {
                 @floatFromInt(logical_size.width),
                 @floatFromInt(logical_size.height),
             ),
+            .gamepad = gamepad_manager,
         };
     }
 
@@ -180,6 +187,7 @@ pub const Engine = struct {
         self.audio_commands.deinit();
         self.audio_service.deinit();
         self.window.deinit();
+        self.gamepad.deinit();
         self.sdl_context.deinit();
     }
 
@@ -215,6 +223,11 @@ pub const Engine = struct {
                 c.SDL_EVENT_QUIT => {
                     log.debug("quit requested by SDL event", .{});
                     self.running = false;
+                },
+                c.SDL_EVENT_GAMEPAD_ADDED, c.SDL_EVENT_GAMEPAD_REMOVED => {
+                    if (self.gamepad.handleDeviceEvent(&event) == .disconnected) {
+                        self.input.releaseGamepadInput();
+                    }
                 },
                 else => {},
             }

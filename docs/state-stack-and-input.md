@@ -181,13 +181,100 @@ to `events_below`; input routing only decides whether named actions mutate
 `InputState` or `FrameCommands`.
 
 Menu states (e.g. main menu as an opaque screen, settings as a modal overlay)
-receive raw key-down events in `handleEvent`, translate them through
-`input.actionForKey(...)`, and act on named `Action` values for confirm, back,
-and navigation. Settings-style modal states use `context.transitions.pop()`;
-quit rows use `quit()`. Main menu Start installs an opaque owned `LoadingState`
-with `replaceOwnedState(...)`, and `LoadingState` later queues
-`replaceOwnedGameplay(...)` after constructing gameplay from
-`UpdateContext.runtime_assets`. When a state returns `true` from `handleEvent`,
-`Engine` does not route that same event into global `FrameCommands`, so menu
-Enter/Escape handling does not also resume/pause/quit through the app command
-path.
+receive raw key-down or gamepad-button-down events in `handleEvent`, translate
+them through `input.actionForPressEvent(...)` (resolves either shape to a
+named `Action` in one call), and act on named `Action` values for confirm,
+back, and navigation. Settings-style modal states use
+`context.transitions.pop()`; quit rows use `quit()`. Main menu Start installs
+an opaque owned `LoadingState` with `replaceOwnedState(...)`, and
+`LoadingState` later queues `replaceOwnedGameplay(...)` after constructing
+gameplay from `UpdateContext.runtime_assets`. When a state returns `true` from
+`handleEvent`, `Engine` does not route that same event into global
+`FrameCommands`, so menu Enter/Escape handling does not also resume/pause/quit
+through the app command path.
+
+## Gamepad
+
+`Engine` requests `SDL_INIT_GAMEPAD` unconditionally alongside video (and audio
+when enabled) — `SDL_INIT_GAMEPAD` implies `SDL_INIT_JOYSTICK`, so no separate
+flag is needed. `src/app/gamepad.zig`'s `GamepadManager` owns device lifecycle:
+at most one `*SDL_Gamepad` handle is open at a time (single active gamepad,
+matching this framework's single-player scope; no simultaneous
+multi-controller merging).
+
+Lifecycle policy:
+
+- **First-connected-wins**: `openInitial()` (called once from `Engine.init`
+  after SDL init) adopts the first already-connected device, if any.
+  `SDL_EVENT_GAMEPAD_ADDED` only adopts a new device when nothing is currently
+  active.
+- **Hot-plug disconnect**: `SDL_EVENT_GAMEPAD_REMOVED` only reacts when the
+  removed device is the currently active one. On disconnect, the manager
+  closes it and immediately tries to open a fallback from any other
+  already-connected device (first-available-wins); if none is available, input
+  falls back to keyboard only. Either way, `Engine.handleEvents` calls
+  `InputState.releaseGamepadInput()` on disconnect so movement, held dig
+  actions, and stick deflection cannot get stuck mid-press across the unplug.
+- Plugging in a second controller while one is already active does not steal
+  input from the first — it is simply ignored until the active device
+  disconnects.
+
+The three adoption/fallback decisions
+(`shouldAdopt`/`isActiveDevice`/`pickFallback`) are pure functions unit-tested
+against synthetic `SDL_JoystickID` values; the `SDL_OpenGamepad`/
+`SDL_GetGamepads` glue itself is not unit-testable without real or virtual
+hardware (same posture as the display-gated `gpu-smoke` probe).
+
+### Default gamepad bindings
+
+Gamepad buttons reuse the exact same `Action` enum and `InputRoutingPolicy`
+machinery as keyboard — there is no separate gamepad routing surface.
+`input_router.zig` resolves `SDL_EVENT_GAMEPAD_BUTTON_DOWN`/`_UP` through
+`actionForGamepadButton` and routes it through the same `routeAction` helper
+keyboard events use, so policy gating, held-vs-one-frame classification, and
+repeat handling (gamepad buttons never repeat — SDL does not synthesize repeat
+events for them) all behave identically to keyboard. This slice ships default
+bindings only; there is no rebind UI yet.
+
+`default_gamepad_bindings` in `src/app/input.zig`:
+
+- D-Pad Up -> `menuUp`
+- D-Pad Down -> `menuDown`
+- D-Pad Left -> `menuLeft`
+- D-Pad Right -> `menuRight`
+- South (A / Cross) -> `resumeGame`
+- East (B / Circle) -> `quit`
+- Start -> `pause`
+- West (X / Square) -> `digHole`
+- North (Y / Triangle) -> `digRamp`
+- Right Shoulder -> `digDown`
+- Back -> `toggleDebugOverlay`
+
+### Analog left-stick movement
+
+The left stick drives true continuous, variable-speed movement — not a
+digital d-pad-style boolean synthesis. `input_router.zig` gates
+`SDL_EVENT_GAMEPAD_AXIS_MOTION` on `InputRoutingPolicy.allowsContext(.gameplay)`
+(all move actions are `.gameplay`, so no per-axis `Action` mapping is needed)
+and forwards only `SDL_GAMEPAD_AXIS_LEFTX`/`_LEFTY` to
+`InputState.handleGamepadAxis`; other axes (right stick, triggers) are a
+no-op.
+
+Raw axis values feed a **scaled radial deadzone**
+(`gamepad_stick_deadzone = 0.24`, roughly SDL's own documented center noise
+band): a stick magnitude at or below the deadzone reports zero, and the
+remaining `[deadzone, 1]` range is rescaled to `[0, 1]` so a corner-pushed
+stick still reports magnitude ~=1 instead of the raw unscaled diagonal value.
+
+`InputState.movementVector()` adds the deadzoned stick vector to the keyboard
+digital direction, then clamps each axis independently to `[-1, 1]`. The
+combined vector's *length* is intentionally not clamped to 1: keyboard-only
+diagonal movement has always been exactly sqrt(2) in this framework (unchanged
+by this slice — normalizing it now would be an unrequested gameplay-feel
+change), and gamepad-only diagonal is already <=1 by construction from the
+deadzone normalization above. The only new edge case — both devices pushing
+the same axis at once — is capped by the per-axis clamp at the same sqrt(2)
+ceiling keyboard-only input already produced, so nothing regresses.
+`InputState.releaseMovement()` (and the pause-controller call sites that
+already invoke it) also zero the raw stick fields, so a paused/blocked
+gameplay context cannot leave stale deflection to snap back in on resume.

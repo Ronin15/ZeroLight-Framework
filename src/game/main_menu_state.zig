@@ -67,8 +67,7 @@ pub const MainMenuState = struct {
     }
 
     pub fn handleEvent(self: *MainMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
-        if (event.type != c.SDL_EVENT_KEY_DOWN or event.key.repeat) return false;
-        const action = inputFile.actionForKey(event.key.key) orelse return false;
+        const action = inputFile.actionForPressEvent(event) orelse return false;
         switch (action) {
             .menuUp => {
                 self.changeSelection(-1);
@@ -230,6 +229,27 @@ test "main menu handleEvent uses named input actions" {
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }
 
+test "main menu handleEvent uses named gamepad input actions identically to keyboard" {
+    var menu = MainMenuState.init(std.testing.allocator, 800, 450, .{});
+    defer menu.deinit();
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    var up = gamepadButtonEventForAction(.menuUp);
+    try std.testing.expect(try menu.handleEvent(&up, &transitions));
+    try std.testing.expectEqual(@as(usize, 2), menu.selected);
+
+    var down = gamepadButtonEventForAction(.menuDown);
+    try std.testing.expect(try menu.handleEvent(&down, &transitions));
+    try std.testing.expectEqual(@as(usize, 0), menu.selected);
+
+    menu.selected = 2;
+    var confirm = gamepadButtonEventForAction(.resumeGame);
+    try std.testing.expect(try menu.handleEvent(&confirm, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+}
+
 test "main menu owns runtime audio settings for settings modals" {
     var menu = MainMenuState.init(std.testing.allocator, 800, 450, .{
         .master_gain = 0.7,
@@ -264,6 +284,24 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
                 .raw = 0,
                 .down = true,
                 .repeat = false,
+            } };
+        }
+    }
+    unreachable;
+}
+
+fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
+    for (inputFile.default_gamepad_bindings) |binding| {
+        if (binding.action == action) {
+            return c.SDL_Event{ .gbutton = .{
+                .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+                .reserved = 0,
+                .timestamp = 0,
+                .which = 0,
+                .button = @intCast(binding.button),
+                .down = true,
+                .padding1 = 0,
+                .padding2 = 0,
             } };
         }
     }
