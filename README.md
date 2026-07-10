@@ -2,8 +2,7 @@
 
 A lean 2D game framework built with **Zig 0.16**, **SDL3**, and **SDL_GPU**.
 It targets predictable runtime flow, data-oriented gameplay, and a clear split
-between app coordination, rendering, assets, and simulation — without hiding
-the hard parts of a real-time game behind convenience APIs.
+between app coordination, rendering, assets, and simulation.
 
 The project is actively growing toward large procedural worlds, scoped
 simulation, emergent AI, and production-friendly asset workflows. See
