@@ -6,7 +6,7 @@ Range: `main..ai_update`
 
 Base: `e6ed17b` (`Merge pull request #8 from Ronin15/expand2`)
 
-Tip: `a26487d` (`branch review and fixes`)
+Tip: `94e1443` (`review fixes`)
 
 ## Summary
 
@@ -27,6 +27,20 @@ most notably a compile-time-enforced `SimulationPipeline` stage-ordering
 contract and localized (rather than whole-level) nav invalidation for
 entity-driven obstacle changes — plus a benchmark-suite expansion and a fix
 to keep `zig build test` fast as gameplay fixtures grew.
+
+On top of that foundation, Slice 32 (AI Behavior Arbitration) closes the
+emergent-AI locomotion loop: a new pure `arbitration.zig` module scores
+`wander`/`pursue`/`flee`/`investigate`/`cohere` from a table-driven
+drive×behavior weight matrix over perception, memory, and the Slice 31 affect
+drives, sticky-selects one, and resolves a per-agent goal — the broadcast
+"everyone seeks the player" path is gone. Profiling the resulting perception
+cost at 2,048 cognition-enabled entities found `SpatialIndexSystem`'s
+hashmap-backed cell lookup was the bottleneck; it was replaced with a
+direct-indexed, camera-relative dense grid queried via 4-wide SIMD occupancy
+checks. A follow-on review pass fixed a fatigue-drive gap (only `pursue`
+raised fatigue; `flee` now does too, matching arbitration's exertion model)
+and hardened the dense-window bound to survive `ReleaseFast`'s stripped
+asserts with a clamp instead of relying on a debug-only invariant.
 
 The branch keeps the durable direction from `world`: persistent gameplay facts
 stay in `DataSystem`, per-step communication stays in typed `SimulationFrame`
@@ -118,6 +132,32 @@ path carries a `FailingAllocator` proof rather than a comment.
   agent could snap toward a remembered position belonging to the wrong
   entity, a pathfinding tier-0 budget clamp gap, and a perception cache
   false-sharing/self-healing hardening pass — see "Branch Review Pass" below.
+- Landed Slice 32, AI Behavior Arbitration: `src/game/systems/arbitration.zig`
+  scores `wander`/`pursue`/`flee`/`investigate`/`cohere` via a table-driven
+  drive×behavior weight matrix (fear→flee, aggression→pursue,
+  curiosity→investigate), sticky-selects one with hysteresis, and resolves a
+  per-agent goal — closing the loop from Slice 31's previously-dead affect
+  drives into actual locomotion choices. The old broadcast "every agent seeks
+  the player" path is gone: perception's faction-generic `nearest_threat` is
+  now the primary pursue/flee signal, with the player reachable only through
+  an explicit, opt-in, gain-gated `focus_target` fallback.
+- Replaced `SpatialIndexSystem`'s hashmap-backed populated-cell lookup
+  (`CellLookup`) with a direct-indexed, camera-relative `DenseCellLookup`
+  grid queried 4 cells at a time via new `simd.loadUint4`/`equalUint4`
+  helpers — found while profiling perception cost at 2,048 cognition-enabled
+  entities. See "Spatial Index Dense-Window SIMD Rewrite" below.
+- Fixed a demo audio regression at higher NPC counts: `AudioController
+  .queueCollision` now only plays a sound for contacts involving the player
+  entity, since NPC-vs-NPC pileups at scale were spamming the mixer with
+  simultaneous collision triggers every step that no longer serve a purpose
+  once Slice 32 gives agents real reasons to cluster.
+- A review pass on Slice 32 fixed a fatigue-drive gap (`AffectSystem` only
+  raised fatigue on `pursue`; `flee` is equally exertive per arbitration's
+  weight table and now raises it too) and replaced a `std.debug.assert`-only
+  guard on the dense spatial-index window's bounding box with an
+  unconditional clamp-and-skip, since this project ships `ReleaseFast` and an
+  assert-only guard would silently corrupt `dense_lookup` in the shipped
+  build if the window-sizing assumption were ever violated.
 
 ## AI Perception, Memory, And Affect (Slices 26–31)
 
@@ -200,6 +240,129 @@ path carries a `FailingAllocator` proof rather than a comment.
   `above_threshold_mask` per drive) so a value hovering at threshold cannot
   refire the same edge twice. Arbitration that consumes these drives is
   deferred to Slice 32.
+
+## AI Behavior Arbitration (Slice 32)
+
+- New pure module `src/game/systems/arbitration.zig` (zero-alloc, no
+  vtables, no dependency on `AiSystem`/pipeline/spatial index) implements
+  three helpers: `scoreBehaviors` sums a `[drive_count][behavior_count]f32`
+  weight table (dimensioned off `@typeInfo(AiAffectDrive)`) scaled by the
+  agent's own personality gains, plus small perception/memory bonus terms;
+  `selectSticky` holds the previous behavior while `commitment_remaining >
+  0` unless a challenger clears `sticky_bonus + min_delta`, otherwise
+  argmaxes with ties broken by lowest enum index; `resolveGoal` resolves a
+  concrete goal per behavior (pursue/flee toward or away from a visible or
+  remembered threat, investigate toward a heard stimulus or the freshest
+  memory-ring contact, cohere toward a local friendly-neighbor mean read
+  from the shared spatial index).
+- `AiBehavior` expanded from `{wander, seek}` to `{wander, pursue, flee,
+  investigate, cohere}`; `.seek` has no remaining production call sites.
+  `AiAgent` gained cold `gain_wander`/`gain_pursue`/`gain_flee`/
+  `gain_investigate`/`gain_cohere`/`wander_amplitude`/
+  `commitment_max_steps`/`sticky_bonus` tunables (validated non-negative,
+  capped by `max_ai_gain`) and hot `active_behavior`/`commitment_remaining`/
+  `last_score` columns for debug/test observability.
+- `AiSystem` gathers `arbitration.Signals` per row and runs the scoring
+  chain **inside** the already-threaded `writeAiIntentsJob`/
+  `writeAiSeparationJob` range jobs rather than as a new pipeline stage;
+  `updateSerial` dispatches the same job functions through a single
+  full-range call, so serial and threaded selection share one code path by
+  construction. Cohere's neighbor-mean gather rides the existing
+  separation-stage `queryNeighbors` call against the shared spatial index
+  (Slice 28), filtered to friendly stance — no second grid.
+- The player-broadcast path is gone: `simulation_pipeline.zig`'s production
+  `self.ai.update(...)` call no longer forces `nav_request_kind = .group` or
+  a single shared `seek_target`. Perception's `nearest_threat` (already
+  faction-generic via `stance()`) is pursue/flee's primary signal, fresh
+  `AiMemory` is the second tier, and the renamed `AiConfig.focus_target`/
+  `focus_entity` (fed from the player) is an explicit, opt-in,
+  `gain_pursue > 0`-gated last-resort fallback only. Path-request `kind` is
+  now a ceiling, not a broadcast: `resolveGoal`'s `kind_hint` (currently
+  always `.individual`) wins over `AiConfig.nav_request_kind`, which
+  defaults to `.individual` in production.
+- `stageContract(.ai_decide)` now reads `affect_drives` (written one stage
+  earlier by `affect_update`); `AiConfig.affect_slice` threads
+  `data.aiAffectSliceConst()` into the AI stage, making Slice 31's emotion
+  drives load-bearing for the first time.
+- `game_demo_state.zig` attaches `ai_perception`/`ai_memory`/`ai_affect` to
+  a subset of demo movers via an 8-slot `demoArchetypeForIndex` cycle:
+  `timid` (high `baseline_fear`/`gain_flee`, `.ally` faction), `aggressive`
+  (high `baseline_aggression`/`gain_pursue`), `curious` (high
+  `baseline_curiosity`/`gain_investigate`), and `cohesive` (`gain_cohere`
+  only, no cognition components), alongside preserved wander/fallback-pursue
+  contrast groups. `timid`'s `.ally` faction is deliberate — it gives
+  `aggressive` a real non-player hostile target to pursue and `timid` a real
+  non-player threat to flee, so the demo exercises agents reacting to each
+  other, not just the player.
+- Bench group `ai` (`src/benchmarks/ai.zig`) now cycles a 5-archetype
+  fixture (one per `AiBehavior`) and reports a per-behavior selection
+  histogram plus intent count alongside timing at 1,024–50,000-agent scale;
+  all five buckets populate at every scale with no throughput regression
+  from the pre-arbitration baseline.
+- Review-pass fix: `AffectSystem`'s fatigue column keyed its exertion delta
+  off `active_behavior == .pursue` only (`behavior_pursue_f`). Arbitration's
+  own fatigue weight-table row treats `pursue` and `flee` as equally
+  exertive, so a fleeing agent's fatigue was decaying instead of rising.
+  Renamed to `behavior_exertion_f` and widened the gate to `pursue or
+  flee`; new test `"fatigue rises under flee just like pursue..."` pins the
+  parity.
+- Deferred by design, not half-wired: attack/interact intents (Slice 40),
+  new stimulus producers beyond dig (Slice 39), world interest markers
+  (Slice 41), JSON archetypes and a debug overlay (Slice 33), and the SIMD
+  restructure of the separation/`decideDir` loops themselves (Slice 35) —
+  this slice's arbitration math is scalar-correct by design, with data
+  already shaped (`[behavior_count]f32` scores, per-drive weight rows) for
+  35 to pack later. The optional `behavior_changed{entity, from, to}` event
+  also stays unbuilt until Slice 33's debug overlay or a domain reaction
+  actually needs it.
+
+## Spatial Index Dense-Window SIMD Rewrite
+
+- Diagnosing perception cost at 2,048 cognition-enabled entities pointed at
+  `SpatialIndexSystem.queryNeighbors`' populated-cell lookup. The prior
+  `CellLookup` (`std.HashMapUnmanaged(SpatialCell, SpatialCellRange, ...)`
+  with a custom splitmix64-style hash) was replaced with `DenseCellLookup`:
+  a row-major dense grid over a bounded, camera-relative window, re-anchored
+  every build to that step's own populated-cell bounding box (not absolute
+  world coordinates) so a fixed-size buffer represents any camera position
+  without growing.
+- Row-major layout makes consecutive `cell.x` values at a fixed `cell.y`
+  land on consecutive flat indices, so `queryNeighbors` scans 4 cells per
+  row at a time with a plain contiguous load (new `simd.loadUint4`) and
+  tests all 4 for "unpopulated" (`start == end`) with one compare (new
+  `simd.equalUint4`/`Uint4`), instead of one hashmap probe per cell. Each
+  populated lane still finishes scalarly in the same ascending order as
+  before, so entry-visit order and existing determinism guarantees are
+  unchanged; a row's x-span is clipped to the window bounds up front so the
+  batch loop never reads outside `starts`/`ends`, and a clipped span not a
+  multiple of 4 finishes with a scalar tail.
+- The window is sized in `SpatialIndexSystem.reserve` (now taking a
+  `DenseWindowGeometry` alongside the existing capacity) from the
+  cognition-halo margin plus a fixed assumed visible-region span
+  (`max_expected_visible_window_cells = 256`), clamped to a hard ceiling
+  (`max_dense_window_side_cells = 4096`) sized for a documented future
+  camera-zoom range this genre is expected to need, not just today's
+  hardcoded zoom=1.0. `simulation_pipeline.zig` now threads
+  `chunk_size_tiles`/`tile_size` from the loaded `WorldSystem` into that
+  geometry at construction time.
+- `runtime_perf_log.zig` gained a `perception` batch stage and six new
+  metrics (`perception_observers`/`_sensed`/`_los_checks`/`_los_blocked`/
+  `_nearest_threat_found`/`_candidate_checks`) plus a per-batch-stage
+  `wait_ns_on_max_duration` field, distinguishing "one worker got an unlucky
+  range while siblings idled" from "every worker was equally busy on a
+  globally harder population" — the instrumentation that identified the
+  hashmap bottleneck in the first place.
+- Review-pass hardening: the dense window's bounding box fitting inside its
+  reserved capacity had been enforced with `std.debug.assert`, which
+  `ReleaseFast` strips — a violation in a shipped build would have silently
+  corrupted `dense_lookup.starts`/`ends`. The write loop now unconditionally
+  clamps the window and skips any cell that falls outside it in every build
+  mode, so a violation degrades to a per-step correctness gap (a cell
+  temporarily missing from spatial queries) rather than memory corruption;
+  `entries`/`ranges` themselves are unaffected since they don't share the
+  fixed-capacity buffer. New test:
+  `"buildEntriesAndRanges clamps the dense window and skips out-of-window
+  cells instead of writing past reserved capacity"`.
 
 ## Pathfinding Hardening
 
@@ -378,7 +541,20 @@ path carries a `FailingAllocator` proof rather than a comment.
   landed with full acceptance-history detail, and split remaining frontier
   work into Slices 32–33 (behavior arbitration, data-driven archetypes),
   35 (AI/steering hot-loop SIMD restructure), 37 (dense render-window ceiling
-  raise), and 38 (elevation above the surface).
+  raise), and 38 (elevation above the surface). A later pass moved Slice 32
+  itself to the archive as landed and re-pointed the frontier doc's
+  Suggested Order at Slice 33.
+- `docs/architecture.md`'s AI/pipeline paragraphs were rewritten for Slice
+  32: emotion drives are now described as consumed (not merely tracked),
+  with the `scoreBehaviors`/`selectSticky`/`resolveGoal` chain and the
+  distinction between AI's *utility* arbitration (what an agent wants) and
+  `SteeringSystem`'s *stream-priority* arbitration (which emitter wins)
+  spelled out explicitly.
+- Added `AGENTS.md` as a tool-agnostic mirror of `CLAUDE.md`'s source-of-truth
+  index for non-Claude agent tooling, added `.cursor/` agent/rule/skill
+  definitions mirroring the existing `.claude/agents/*.md` set, refreshed
+  the `.claude/agents/*.md` subagent definitions, and consolidated
+  `README.md`.
 
 ## Branch Review Pass (`a26487d`)
 
@@ -447,14 +623,21 @@ fixes already covered above:
 
 ## Follow-Up Work Left Explicit
 
-- Slice 32 (behavior arbitration) and Slice 33 (data-driven archetypes/
-  debug) are the next emergent-AI track slices; affect's threshold-crossing
-  events have no consumer until 32 lands.
+- Slice 32 (behavior arbitration) is landed; Slice 33 (data-driven
+  archetypes + debug introspection) is the next emergent-AI track slice.
+  Cohere's `.group` path-kind upgrade for agents sharing a quantized goal
+  cell and the optional `behavior_changed{entity, from, to}` event are
+  documented extension points in `arbitration.zig`, deliberately not built
+  until Slice 33's debug overlay or a domain reaction needs them. Growing
+  the feeling set (new drives/coupling) is Slice 42 — append a weight-table
+  row, no control-flow rewrite.
 - `memory_expired` (Slice 30) is defined but not yet reacted to; no current
   system needs it.
-- Slice 35 (AI/steering hot-loop SIMD restructure) remains open; Slice 34's
-  reverted batched lerp is a cautionary data point for any future dynamic-
-  record vectorization attempt in that area.
+- Slice 35 (AI/steering hot-loop SIMD restructure) remains open, now that
+  Slice 32 has shaped `arbitration.zig`'s data
+  (`[behavior_count]f32` scores, per-drive weight rows) for it to pack;
+  Slice 34's reverted batched lerp is a cautionary data point for any future
+  dynamic-record vectorization attempt in that area.
 - Slice 37 (dense render-window ceiling raise, 32→128, with shader/host
   layer-count sync hardening) and Slice 38 (elevation above the surface,
   depends on 37) remain not started.
@@ -494,3 +677,11 @@ fixes already covered above:
 - `107dd03` test seperation from demo state
 - `f8b6e6b` changelog and documentation update
 - `a26487d` branch review and fixes
+- `26cea7e` docs: changelog for branch review pass (a26487d)
+- `51cbc49` updated claude skills and updated guidance documentation
+- `b31a2a5` cursor project tooling added.
+- `8937161` readme consolidated
+- `1e8dd07` slice 32 comitted peception time needs SIMD cell checks or further optimization
+- `89bae91` audio fix for constant colliding npcs not needed anymore
+- `df0f9c8` Slice 32 optimizations at 2048 entities
+- `94e1443` review fixes
