@@ -10,6 +10,7 @@ const log = @import("../core/logging.zig").platform;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
+const TilemapWindowLayers = Renderer.TilemapWindowLayers;
 const Position = @import("../render/renderer.zig").Position;
 const Uv = @import("../render/renderer.zig").Uv;
 const VertexColor = @import("../render/renderer.zig").VertexColor;
@@ -46,12 +47,27 @@ pub fn main(init: std.process.Init) !void {
     var renderer = try Renderer.init(init.gpa, window.handle, assets, app_config);
     defer renderer.deinit();
 
-    const tiles = [_]u32{ 1, 1, 1, 1 };
+    // Two 2x2 layers concatenated in one combined buffer: a topmost layer with
+    // one dug hole (invalid_tile_id) and a fully solid layer beneath it. This
+    // exercises the fragment shader's multi-layer compositing loop (a real
+    // GPU read at layer_offsets[1] beyond the first uvec4 lane, not just the
+    // single-layer pass-through) end to end, not just the trivial 1-layer case.
+    const invalid_tile_id: u32 = 65535;
+    const tiles = [_]u32{
+        1, 1, invalid_tile_id, 1, // topmost layer, offset 0: one hole
+        1, 1, 1, 1, // bottom layer, offset 4: solid, revealed through the hole
+    };
     const tile_params = TilemapParams{
-        .grid = .{ 16.0, 2.0, 2.0, 65535.0 },
+        .grid = .{ 16.0, 2.0, 2.0, @floatFromInt(invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
     };
     const tile_data = try renderer.createTileDataBuffer(&tiles, tile_params);
+
+    // Pre-existing gap unrelated to this smoke test's tilemap coverage: every
+    // sprite submit path requires reserving capacity first (see
+    // Renderer.reserveSpriteCommands doc), or the Debug-only high-water assert
+    // in ensureFrameBatchCapacity trips on the very first submitted rect.
+    try renderer.reserveSpriteCommands(1);
 
     try renderer.reserveStaticGeometry(6, 1);
     renderer.beginStaticGeometry();
@@ -67,11 +83,17 @@ pub fn main(init: std.process.Init) !void {
         .uvs = &tile_uvs,
         .colors = &tile_colors,
     });
+    // Topmost-first: the holed layer at offset 0, the solid layer at offset 4.
+    var window_layers = TilemapWindowLayers{};
+    window_layers.count = 2;
+    window_layers.offsets[0] = 0;
+    window_layers.offsets[1] = 4;
     try renderer.appendStaticTilemapSpan(
         renderer.white_texture,
         RenderOrder.world(@intFromEnum(SmokeDepth.test_tilemap)),
         .{ .positions = &tile_positions, .uvs = &tile_uvs, .colors = &tile_colors },
         tile_data,
+        window_layers,
     );
 
     renderer.beginFrame(app_config.clear_color);

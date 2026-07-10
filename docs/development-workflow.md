@@ -207,6 +207,13 @@ generated-output rules live in `docs/coding-standards.md`.
 
 ## Benchmarks
 
+`zig build bench` pins its own default log level to `warn` regardless of
+optimize mode (Debug included), rather than inheriting the game's `auto`
+default — per-case debug logging (e.g. `ThreadSystem` re-init chatter) adds
+real overhead across many bench cases/items and isn't useful in a benchmark
+table. Pass `-Dlog-level=debug` to override this explicitly for
+troubleshooting.
+
 `zig build bench` runs non-interactive CPU benchmarks for movement bodies,
 transient particle rows, AI agents, steering agents, dense collision bodies,
 sparse collision bodies, collision-response contacts, scoped simulation gathers,

@@ -62,7 +62,7 @@ pub fn loadTestWorldMeta(allocator: std.mem.Allocator) !WorldTilesetMeta {
 }
 
 pub fn requireTestTile(meta: *const WorldTilesetMeta, name: []const u8) !TileId {
-    return (meta.tileByName(name) orelse return error.TestExpectedEqual).id;
+    return (meta.tileByName(name) orelse return error.UnknownTestTile).id;
 }
 
 // Capacity tuned for the abstract tier: small chunks so a modest world spans

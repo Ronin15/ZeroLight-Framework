@@ -7,7 +7,9 @@ const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const math = @import("../core/math.zig");
+const AiBehavior = @import("../game/data_system.zig").AiBehavior;
 const DataSystem = @import("../game/data_system.zig").DataSystem;
+const EntityId = @import("../game/data_system.zig").EntityId;
 const AiStats = @import("../game/systems/ai.zig").AiStats;
 const AiSystem = @import("../game/systems/ai.zig").AiSystem;
 const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alignment_items;
@@ -19,6 +21,16 @@ const suite = @import("suite.zig");
 const delta_seconds: f32 = 1.0 / 60.0;
 const intent_seed: u64 = 0x0a17_b0a7;
 
+// Fixed 5-slot archetype cycle (one slot per `AiBehavior`), so the
+// arbitration selection histogram exercises every bucket instead of
+// collapsing to a wander/pursue split. Mirrors `game_demo_state.zig`'s
+// `demoArchetypeForIndex` at bench scale, but sets hot perception columns
+// directly (no `PerceptionSystem`/`AffectSystem` run) the same way
+// `affect.zig`'s bench sets `AiPerception` hot fields straight into the
+// fixture -- this bench isolates arbitration + intent-emission cost, not the
+// upstream cognition stages.
+const behavior_archetype_cycle_len: usize = 5;
+
 pub const group = suite.BenchmarkGroup{
     .name = "ai",
     .defaultItemCounts = defaultItemCounts,
@@ -28,6 +40,11 @@ pub const group = suite.BenchmarkGroup{
 const Fixture = struct {
     data: DataSystem,
     frame: SimulationFrame,
+    // Backs `AiConfig.focus_entity` -- `resolveGoal`'s pursue fallback checks
+    // the *entity*, not just the position (`Signals.focus_target`), so a
+    // config with only `.focus_target` set and no `.focus_entity` never
+    // resolves the fallback tier at all.
+    focus_entity: EntityId,
 
     fn deinit(self: *Fixture) void {
         self.frame.deinit();
@@ -47,6 +64,13 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
     errdefer frame.deinit();
     try frame.reserveStreams(suite.rangeCount(count, ai_range_alignment_items), 0, count, 0, 0, 0);
 
+    // Marker entities for flee's `nearest_threat` id and pursue's opt-in
+    // `focus_target` fallback id: only their validity matters here (no
+    // movement/AI components of their own), never queried by the spatial
+    // index.
+    const threat_marker = try data.createEntity();
+    const focus_entity = try data.createEntity();
+
     for (0..count) |index| {
         const entity = try data.createEntity();
         const position = math.Vec2{
@@ -59,14 +83,55 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             .velocity = .{},
             .speed = 35.0 + @as(f32, @floatFromInt(index % 17)),
         });
-        try data.setAiAgent(entity, .{
-            .behavior = if (index % 3 == 0) .wander else .seek,
-            .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
-            .seek_weight = if (index % 3 == 0) 0.0 else 0.4 + @as(f32, @floatFromInt(index % 7)) * 0.1,
-        });
+        // Uniform faction so cohere's friendly-neighbor spatial query always
+        // has candidates nearby, regardless of which archetype slot lands
+        // next to it in the grid.
+        try data.setFaction(entity, .ally);
+        const wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29));
+
+        switch (index % behavior_archetype_cycle_len) {
+            0 => try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude }),
+            1 => try data.setAiAgent(entity, .{
+                .active_behavior = .pursue,
+                .wander_amplitude = wander_amplitude,
+                .gain_pursue = 0.4 + @as(f32, @floatFromInt(index % 7)) * 0.1,
+            }),
+            2 => {
+                try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude, .gain_flee = 1.5 });
+                try data.setAiPerception(entity, .{
+                    .target_visible = true,
+                    .nearest_threat = threat_marker,
+                    .last_seen_x = position.x - 40.0,
+                    .last_seen_y = position.y,
+                });
+            },
+            3 => {
+                try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude, .gain_investigate = 1.5 });
+                try data.setAiPerception(entity, .{
+                    .heard_stimulus = true,
+                    .heard_stimulus_x = position.x,
+                    .heard_stimulus_y = position.y + 20.0,
+                });
+            },
+            else => try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude, .gain_cohere = 1.5 }),
+        }
     }
 
-    return .{ .data = data, .frame = frame };
+    return .{ .data = data, .frame = frame, .focus_entity = focus_entity };
+}
+
+fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSummary {
+    var histogram = suite.AiBehaviorHistogramSummary{};
+    for (behaviors) |behavior| {
+        switch (behavior) {
+            .wander => histogram.wander += 1,
+            .pursue => histogram.pursue += 1,
+            .flee => histogram.flee += 1,
+            .investigate => histogram.investigate += 1,
+            .cohere => histogram.cohere += 1,
+        }
+    }
+    return histogram;
 }
 
 pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {
@@ -99,6 +164,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer spatial_sys.deinit();
     const ai_slice = fixture.data.aiAgentSliceConst();
     const movement_slice = fixture.data.movementBodySliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &fixture.data, .{});
     const spatial_view = spatial_sys.view();
 
@@ -128,6 +194,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     stats.candidate_pairs = last_ai_stats.separation_candidate_checks;
     stats.output_count = last_ai_stats.intent_count;
     stats.secondary_batch = suite.batchSummaryFromBatch(last_ai_stats.intent_batch);
+    stats.ai_behavior_histogram = behaviorHistogram(fixture.data.aiAgentSliceConst().behaviors);
     if (case.adaptive) {
         stats.work_tuning = suite.workTuningSummary(system.separation_tuner.report(), separation_settled_before_measurement);
         stats.secondary_work_tuning = suite.workTuningSummary(system.intent_tuner.report(), intent_settled_before_measurement);
@@ -142,7 +209,9 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
     if (!case.usesThreadSystem()) {
         return try system.updateSerial(ai_slice, movement_slice, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
             .intent_seed = intent_seed,
-            .seek_target = benchmarkSeekTarget(),
+            .focus_target = benchmarkSeekTarget(),
+            .focus_entity = fixture.focus_entity,
+            .perception_slice = fixture.data.aiPerceptionSliceConst(),
         });
     }
 
@@ -151,7 +220,9 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
         .max_worker_threads = case.maxWorkerThreads(),
         .adaptive = case.adaptive,
         .intent_seed = intent_seed,
-        .seek_target = benchmarkSeekTarget(),
+        .focus_target = benchmarkSeekTarget(),
+        .focus_entity = fixture.focus_entity,
+        .perception_slice = fixture.data.aiPerceptionSliceConst(),
     });
 }
 

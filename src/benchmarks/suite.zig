@@ -192,6 +192,8 @@ pub const RunStats = struct {
     render_game_prep_sparse_submitted: usize = 0,
     render_game_prep_dynamic_records: usize = 0,
     render_game_prep_static_groups: usize = 0,
+    render_game_prep_merged_tilemap_groups: usize = 0,
+    ai_behavior_histogram: ?AiBehaviorHistogramSummary = null,
 
     pub fn skipped(reason: []const u8) RunStats {
         return .{
@@ -252,6 +254,19 @@ pub const RenderGamePrepPhaseSummary = struct {
     merge_ns: u64 = 0,
     snapshot_ns: u64 = 0,
     vertex_emit_ns: u64 = 0,
+};
+
+/// Per-behavior selection counts after one measured `ai` run, read from
+/// `AiAgentStore`'s hot `active_behavior` column post-update (Slice 32
+/// arbitration output) -- proves the utility scorer actually spreads
+/// selections across all five `AiBehavior` buckets at the measured fixture,
+/// not just wander/pursue.
+pub const AiBehaviorHistogramSummary = struct {
+    wander: usize = 0,
+    pursue: usize = 0,
+    flee: usize = 0,
+    investigate: usize = 0,
+    cohere: usize = 0,
 };
 
 pub const WorkTuningSummary = struct {
@@ -641,6 +656,9 @@ fn itemLabel(group_name: []const u8) []const u8 {
     if (std.mem.eql(u8, group_name, "movement")) return "movement bodies";
     if (std.mem.eql(u8, group_name, "particles")) return "particle rows";
     if (std.mem.eql(u8, group_name, "ai")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "ai-memory")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "ai-affect")) return "AI agents";
+    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) return "perception agents";
     if (std.mem.eql(u8, group_name, "pathfinding")) return "path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-open")) return "cached open path requests";
     if (std.mem.eql(u8, group_name, "pathfinding-cache-detour")) return "cached detour path requests";
@@ -800,9 +818,15 @@ fn printValidationSummary(
     {
         if (std.mem.eql(u8, group_name, "ai")) {
             std.debug.print(
-                "workload separation_checks={} intents={}. ",
-                .{ best.stats.candidate_pairs, best.stats.output_count },
+                "workload separation_checks={} intents={} agents={}. ",
+                .{ best.stats.candidate_pairs, best.stats.output_count, best.stats.item_count },
             );
+            if (best.stats.ai_behavior_histogram) |histogram| {
+                std.debug.print(
+                    "behaviors wander={} pursue={} flee={} investigate={} cohere={}. ",
+                    .{ histogram.wander, histogram.pursue, histogram.flee, histogram.investigate, histogram.cohere },
+                );
+            }
         } else if (std.mem.eql(u8, group_name, "pathfinding")) {
             std.debug.print(
                 "workload field_requests={} results={}. ",
@@ -847,7 +871,7 @@ fn printValidationSummary(
             const render_game_prep_focus = adaptive orelse best;
             const focus_label = if (adaptive != null) "production_adaptive" else "render_game_prep_focus";
             std.debug.print(
-                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}. ",
+                "{s}={s} workload vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}. ",
                 .{
                     focus_label,
                     render_game_prep_focus.case.name,
@@ -858,6 +882,7 @@ fn printValidationSummary(
                     render_game_prep_focus.stats.render_game_prep_sparse_submitted,
                     render_game_prep_focus.stats.render_game_prep_dynamic_records,
                     render_game_prep_focus.stats.render_game_prep_static_groups,
+                    render_game_prep_focus.stats.render_game_prep_merged_tilemap_groups,
                 },
             );
             if (render_game_prep_focus.stats.render_game_prep_phases) |phases| {
@@ -1065,6 +1090,13 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
     if (std.mem.eql(u8, group_name, "steering")) {
         return std.fmt.bufPrint(buffer, "avoidance_checks={} samples={} intents={}", .{ stats.candidate_pairs, stats.sample_count, stats.output_count }) catch "workload";
     }
+    if (std.mem.eql(u8, group_name, "perception") or std.mem.startsWith(u8, group_name, "perception-")) {
+        return std.fmt.bufPrint(
+            buffer,
+            "sensed={} los_checks={} los_blocked={} found={} events={} dropped_events={}",
+            .{ stats.sample_count, stats.candidate_pairs, stats.deferred_count, stats.output_count, stats.fallback_deferred_count, stats.cache_evictions },
+        ) catch "workload";
+    }
     if (std.mem.eql(u8, group_name, "render-prep")) {
         if (stats.render_prep_phases) |phases| {
             return std.fmt.bufPrint(
@@ -1088,7 +1120,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         if (stats.render_game_prep_phases) |phases| {
             return std.fmt.bufPrint(
                 buffer,
-                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
+                "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={} phases entity_collect={f} merge={f} snapshot={f} vertex={f}",
                 .{
                     stats.candidate_pairs,
                     stats.output_count,
@@ -1097,6 +1129,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
                     stats.render_game_prep_sparse_submitted,
                     stats.render_game_prep_dynamic_records,
                     stats.render_game_prep_static_groups,
+                    stats.render_game_prep_merged_tilemap_groups,
                     formatDuration(phases.entity_collect_ns),
                     formatDuration(phases.merge_ns),
                     formatDuration(phases.snapshot_ns),
@@ -1106,7 +1139,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
         }
         return std.fmt.bufPrint(
             buffer,
-            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={}",
+            "vertices={} sprites={} skipped={} merged_groups={} sparse={} dynamic_records={} static_groups={} merged_tilemap_groups={}",
             .{
                 stats.candidate_pairs,
                 stats.output_count,
@@ -1115,6 +1148,7 @@ fn formatWorkloadInto(buffer: []u8, group_name: []const u8, stats: RunStats) []c
                 stats.render_game_prep_sparse_submitted,
                 stats.render_game_prep_dynamic_records,
                 stats.render_game_prep_static_groups,
+                stats.render_game_prep_merged_tilemap_groups,
             },
         ) catch "workload";
     }

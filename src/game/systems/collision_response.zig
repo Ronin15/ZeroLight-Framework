@@ -54,6 +54,14 @@ pub const CollisionResponseStats = struct {
     trigger_count: usize = 0,
 };
 
+/// Worst-case `collision_triggers` stream capacity for a given `contact_capacity` — this
+/// module's own domain knowledge (a trigger event requires an underlying contact, so
+/// trigger count can never exceed contact count), not a ratio a caller sizing
+/// `SimulationFrame.reserveStreams` should independently guess.
+pub fn estimateTriggerCapacity(contact_capacity: usize) usize {
+    return contact_capacity;
+}
+
 pub const CollisionResponseSystem = struct {
     allocator: std.mem.Allocator,
     intent_rows: std.MultiArrayList(IntentRow) = .{},

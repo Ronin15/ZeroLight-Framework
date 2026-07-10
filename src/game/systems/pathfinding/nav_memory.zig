@@ -15,6 +15,29 @@ const PortalNode = types.PortalNode;
 const AbstractEdge = types.AbstractEdge;
 const chunk_edge_floor = types.chunk_edge_floor;
 const default_edge_slack = types.default_edge_slack;
+const open_heap_headroom_factor = types.open_heap_headroom_factor;
+const scratch = @import("scratch.zig");
+const SearchCellRow = scratch.SearchCellRow;
+const AbstractSlotRow = scratch.AbstractSlotRow;
+const GroupField = @import("group_field.zig").GroupField;
+
+// Sum of a MultiArrayList row struct's field sizes: each field lives in its own SoA
+// array (no cross-field struct padding), so this is exactly the per-row resident byte
+// cost — no import cycle (scratch.zig does not import this module).
+fn multiArrayRowBytes(comptime Row: type) usize {
+    var total: usize = 0;
+    for (std.meta.fields(Row)) |field| total += @sizeOf(field.type);
+    return total;
+}
+
+// Element size of a `std.ArrayList(T)`-typed field, extracted from its `items: []T` slice
+// field rather than hand-counted, so a field whose element type changes fails to compile
+// here instead of silently under/over-counting the gate.
+fn arrayListElemBytes(comptime Container: type, comptime field_name: []const u8) usize {
+    const List = @FieldType(Container, field_name);
+    const Elem = @typeInfo(@FieldType(List, "items")).pointer.child;
+    return @sizeOf(Elem);
+}
 
 pub const NavMemoryBudget = struct {
     max_bytes: usize,
@@ -29,6 +52,11 @@ pub const NavMemoryBudget = struct {
     max_cached_results: usize,
     max_solved_requests_per_step: usize,
     max_stitched_path_cells: usize,
+    // Escalated (tier-1) abstract-search node ceiling — a fixed capacity constant, never
+    // derived from world/graph size. Counted here (AbstractScratch's per-participant
+    // slot table + open heap + corridor buffers) so it is gated by max_bytes exactly
+    // like every other reserve-config term, not silently excluded.
+    max_abstract_nodes: usize,
     // Abstract chunk-portal graph sizing. Per-slot buffers are geometrically sized to the
     // chunk-stable slot space (4*ct slots per chunk plus interior link tails); the edge
     // arena grows to a measured, slack-padded size at the init build. The gate uses a
@@ -41,16 +69,23 @@ pub const NavMemoryBudget = struct {
     // without the pathological per-chunk pairwise (O(cells)) term.
     const abstract_degree: usize = 8;
 
-    // Per SearchScratch direct per-cell entry: slot_g/slot_parent/slot_stamp
-    // (3 x u32) plus slot_closed (bool). The direct array is indexed by cell_index,
-    // so there is no separate slot_cell column.
-    const scratch_slot_bytes: usize = 3 * @sizeOf(u32) + 1;
+    // Per SearchScratch direct per-cell entry: SearchCellRow's fields (g/parent/stamp u32 +
+    // closed bool), one per cell_index in a MultiArrayList (no separate slot_cell column).
+    // Derived from the real row struct (scratch.zig) so a field added there is counted
+    // automatically instead of silently under-counting this gate.
+    const scratch_slot_bytes: usize = multiArrayRowBytes(SearchCellRow);
     // EdgeScratch (u32 from + AbstractEdge) and the compacted CSR edge entry
     // (AbstractEdge). Both buffers are reserved to the edge worst case.
     const edge_scratch_bytes: usize = @sizeOf(u32) + @sizeOf(AbstractEdge);
     const portal_edge_bytes: usize = @sizeOf(AbstractEdge);
     // PortalNode (u16 level + u32 cell_index + u32 chunk), including alignment padding.
     const portal_node_bytes: usize = @sizeOf(PortalNode);
+    // AbstractScratch's per-slot MultiArrayList row, derived from the real AbstractSlotRow
+    // struct (scratch.zig) so an added field is counted automatically.
+    const abstract_slot_bytes: usize = multiArrayRowBytes(AbstractSlotRow);
+    // Parallel corridor/corridor_link reconstruction buffers: one usize ref plus one bool
+    // flag per entry.
+    const abstract_corridor_bytes: usize = @sizeOf(usize) + 1;
 
     // Saturating estimate of total nav memory. An overflowing term clamps to
     // maxInt so the gate rejects rather than wrapping to a small value.
@@ -75,6 +110,18 @@ pub const NavMemoryBudget = struct {
             (self.max_explored_nodes *| @sizeOf(OpenNode)) +|
             (@max(self.max_explored_nodes, self.max_stored_path_cells) *| @sizeOf(u32));
         const scratch_bytes = self.worker_participant_count *| per_participant_scratch_bytes;
+        // Per-participant abstract-tier (AbstractScratch) search state, mirroring its
+        // reserve() sizing exactly: a slot_capacity = max(16, 2x) open-addressed table,
+        // an open-heap-headroom-factor-sized open heap of OpenNode, and the
+        // corridor/corridor_link reconstruction buffers. Each participant owns a
+        // disjoint AbstractScratch, so this is counted per participant like the local
+        // A* scratch above.
+        const abstract_slot_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| 2);
+        const abstract_open_capacity = @max(@as(usize, 16), self.max_abstract_nodes *| open_heap_headroom_factor);
+        const per_participant_abstract_bytes = (abstract_slot_capacity *| abstract_slot_bytes) +|
+            (abstract_open_capacity *| @sizeOf(OpenNode)) +|
+            (self.max_abstract_nodes *| abstract_corridor_bytes);
+        const abstract_scratch_bytes = self.worker_participant_count *| per_participant_abstract_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.
@@ -87,7 +134,7 @@ pub const NavMemoryBudget = struct {
         // portals/edges are estimated from border structure, not a per-cell worst case).
         const abstract_bytes = self.abstractGraphBytes(width, height, levels);
         return static_bytes +| group_registry_bytes +|
-            scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
+            scratch_bytes +| abstract_scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
             abstract_bytes;
     }
 
@@ -134,24 +181,55 @@ pub const NavMemoryBudget = struct {
 // bucket-queue links bucket_next/bucket_prev(u32) + queued_stamp(u32).
 pub const default_group_field_bytes_per_cell: usize = @sizeOf(u32) + 1 + 4 * @sizeOf(u32);
 
-// Auto-sizes max_nav_memory_bytes to the next power of two above the required
-// bytes for the given capacity/world dimensions, so callers get a working
-// ceiling without hand-tuning it.
-pub fn autoSizedMaxNavMemoryBytes(capacity: types.PathfindingCapacity, level_count: usize, width: usize, height: usize) usize {
-    const budget = NavMemoryBudget{
-        .max_bytes = std.math.maxInt(usize),
+comptime {
+    // GroupField's per-cell arrays aren't grouped into one dedicated row struct (they sit
+    // alongside non-per-cell fields like state/key/generation), so the sum above can't be
+    // fully auto-derived the way multiArrayRowBytes derives a MultiArrayList row. Instead,
+    // pin each named field's element size explicitly: a field rename/removal fails to
+    // compile here, and a changed element type changes this sum, so an unmatched hand
+    // count in the constant above fails loud instead of silently under-counting the gate.
+    const derived = arrayListElemBytes(GroupField, "costs") +
+        arrayListElemBytes(GroupField, "flow_dir") +
+        arrayListElemBytes(GroupField, "stamps") +
+        arrayListElemBytes(GroupField, "bucket_next") +
+        arrayListElemBytes(GroupField, "bucket_prev") +
+        arrayListElemBytes(GroupField, "queued_stamp");
+    if (derived != default_group_field_bytes_per_cell) {
+        @compileError("default_group_field_bytes_per_cell drifted from GroupField's real per-cell fields");
+    }
+}
+
+// The single NavMemoryBudget constructor shared by the rebuild gate, the
+// auto-sizer, and tests. Counts the ELASTIC CEILING caps (deriveCapacity at
+// max_agent_budget), not the live derived values: the safe-point elastic resize
+// can grow the result cache and worker pools to the ceiling later WITHOUT
+// re-running the gate, so admission must already cover that worst case.
+pub fn budgetForCapacity(capacity: types.PathfindingCapacity, level_count: usize, link_count: usize) NavMemoryBudget {
+    const ceiling = types.deriveCapacity(capacity, @max(types.min_capacity_floor, capacity.max_agent_budget));
+    return .{
+        .max_bytes = capacity.max_nav_memory_bytes,
         .level_count = level_count,
         .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
-        .max_group_fields = capacity.max_group_fields,
-        .max_explored_nodes = capacity.max_explored_nodes,
-        .max_stored_path_cells = capacity.max_stored_path_cells,
-        .worker_participant_count = @max(@as(usize, 1), capacity.worker_participant_count),
-        .max_cached_results = capacity.max_cached_results,
-        .max_solved_requests_per_step = capacity.max_solved_requests_per_step,
-        .max_stitched_path_cells = capacity.max_stitched_path_cells,
-        .chunk_tiles = capacity.nav_chunk_tiles,
-        .link_count = 0,
+        .max_group_fields = ceiling.max_group_fields,
+        .max_explored_nodes = ceiling.max_explored_nodes,
+        .max_stored_path_cells = ceiling.max_stored_path_cells,
+        .worker_participant_count = @max(@as(usize, 1), ceiling.worker_participant_count),
+        .max_cached_results = ceiling.max_cached_results,
+        .max_solved_requests_per_step = ceiling.max_solved_requests_per_step,
+        .max_stitched_path_cells = ceiling.max_stitched_path_cells,
+        .max_abstract_nodes = ceiling.max_abstract_nodes,
+        .chunk_tiles = @max(@as(usize, 1), ceiling.nav_chunk_tiles),
+        .link_count = link_count,
     };
+}
+
+// Auto-sizes max_nav_memory_bytes to the next power of two above the required
+// bytes for the given capacity/world dimensions and inter-level link count, so
+// callers get a working ceiling without hand-tuning it. Shares budgetForCapacity
+// with the rebuild gate, so an auto-sized ceiling always admits the rebuild —
+// including a later elastic growth to the max_agent_budget-derived caps.
+pub fn autoSizedMaxNavMemoryBytes(capacity: types.PathfindingCapacity, level_count: usize, width: usize, height: usize, link_count: usize) usize {
+    const budget = budgetForCapacity(capacity, level_count, link_count);
     const required = budget.requiredBytes(width, height);
     // ceilPowerOfTwo asserts its input is non-zero before it can reach the
     // error.Overflow path, so a degenerate zero-sized capacity/world would
@@ -196,6 +274,7 @@ fn testBudget(max_bytes: usize) NavMemoryBudget {
         .max_cached_results = 256,
         .max_solved_requests_per_step = 512,
         .max_stitched_path_cells = 256,
+        .max_abstract_nodes = 4096,
         .chunk_tiles = 16,
         .link_count = 0,
     };
@@ -230,7 +309,57 @@ test "autoSizedMaxNavMemoryBytes returns a sane floor for degenerate zero-sized 
         .max_explored_nodes = 0,
         .max_stored_path_cells = 0,
         .max_stitched_path_cells = 0,
+        .max_abstract_nodes = 0,
     };
-    const result = autoSizedMaxNavMemoryBytes(capacity, 1, 0, 0);
+    const result = autoSizedMaxNavMemoryBytes(capacity, 1, 0, 0, 0);
     try std.testing.expect(result >= 1);
+}
+
+test "nav memory gate admits by elastic ceiling caps so later growth stays budgeted" {
+    // A ceiling sized to the FLOOR-derived caps must fail admission when the
+    // max_agent_budget-derived ceiling caps need more: the elastic resize grows the
+    // result cache and worker pools to the ceiling later WITHOUT re-running the gate,
+    // so floor-only admission would let growth allocate past max_nav_memory_bytes.
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 1 << 16;
+    var floor_view = capacity;
+    floor_view.max_agent_budget = types.min_capacity_floor;
+    const floor_required = budgetForCapacity(floor_view, 1, 0).requiredBytes(4, 4);
+    const ceiling_required = budgetForCapacity(capacity, 1, 0).requiredBytes(4, 4);
+    try std.testing.expect(ceiling_required > floor_required);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    capacity.max_nav_memory_bytes = floor_required;
+    try system.reserve(capacity);
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, system.rebuildStaticNavGrid(&data, 128, 128, 32));
+}
+
+test "autoSizedMaxNavMemoryBytes covers the gate's ceiling caps and counts level links" {
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 4096;
+    // The auto-sized ceiling must admit the exact budget the rebuild gate checks,
+    // including elastic-ceiling caps and the real link count.
+    var budget = budgetForCapacity(capacity, 2, 4);
+    budget.max_bytes = autoSizedMaxNavMemoryBytes(capacity, 2, 512, 512, 4);
+    try budget.check(512, 512);
+    // Links contribute to the estimate rather than being hardcoded to zero.
+    const without_links = budgetForCapacity(capacity, 2, 0).requiredBytes(512, 512);
+    const with_links = budgetForCapacity(capacity, 2, 64).requiredBytes(512, 512);
+    try std.testing.expect(with_links > without_links);
+}
+
+test "requiredBytes counts AbstractScratch memory: a bigger max_abstract_nodes raises the estimate" {
+    // Pins that the abstract-tier per-participant scratch (slot table + open heap +
+    // corridor buffers, mirroring AbstractScratch.reserve's own sizing) is actually
+    // included in requiredBytes, not silently excluded — a real memory-safety gate must
+    // account for every buffer a rebuild reserves, including this one.
+    var small = testBudget(std.math.maxInt(usize));
+    small.max_abstract_nodes = 64;
+    var large = testBudget(std.math.maxInt(usize));
+    large.max_abstract_nodes = 8192;
+    try std.testing.expect(large.requiredBytes(256, 256) > small.requiredBytes(256, 256));
 }

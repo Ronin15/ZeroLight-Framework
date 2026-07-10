@@ -16,6 +16,7 @@ const StitchedCell = types.StitchedCell;
 const PathResult = types.PathResult;
 const PathfindingStats = types.PathfindingStats;
 const setLen = types.setLen;
+const shouldShrinkCapacity = types.shouldShrinkCapacity;
 const hashPathKey = types.hashPathKey;
 const keysEqual = types.keysEqual;
 const emptyKey = types.emptyKey;
@@ -31,8 +32,14 @@ const waypoint_hint_window: usize = 8;
 // Generic fixed-capacity, open-addressed (linear-probe) table keyed by PathQueryKey with
 // back-shift deletion. Full tables drop new inserts instead of allocating during the
 // fixed-step update. Backs both the pending/negative KeySet (Payload = void) and the
-// group-key -> requests-index map (Payload = u16), so the probe walk and the subtle
-// back-shift compaction live in exactly one place.
+// group-key -> requests-index map (Payload = u16). ResultCache below re-implements this
+// same probe-walk/back-shift shape rather than composing over this table, because its
+// slots also carry per-entry path/stitched cell stripes ProbeTable has no notion of; the
+// two copies are kept in sync by hand, not shared code.
+//
+// The physical slot array is 2x the LOGICAL capacity (inserts stop at logical), so
+// occupancy never exceeds 50% and every probe chain — hit or miss — terminates at an
+// empty slot instead of degenerating to an O(capacity) scan when the table fills.
 fn ProbeTable(comptime Payload: type) type {
     return struct {
         const Self = @This();
@@ -43,6 +50,8 @@ fn ProbeTable(comptime Payload: type) type {
         };
         slots: std.ArrayList(Slot) = .empty,
         len: usize = 0,
+        // Insert ceiling; slots.items.len is 2x this for probe headroom.
+        logical_capacity: usize = 0,
 
         fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.slots.deinit(allocator);
@@ -50,10 +59,17 @@ fn ProbeTable(comptime Payload: type) type {
         }
 
         fn reserve(self: *Self, allocator: std.mem.Allocator, capacity: usize) !void {
+            const physical = capacity *| 2;
             // Free the backing on a shrink so an elastic down-resize releases memory; the
             // probe positions depend on capacity, so a resized table is always rebuilt.
-            if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
-            try setLen(&self.slots, allocator, capacity);
+            if (shouldShrinkCapacity(self.slots.capacity, physical)) self.slots.shrinkAndFree(allocator, 0);
+            try setLen(&self.slots, allocator, physical);
+            // Zeroed immediately after growing (not deferred to clear() below): setLen
+            // leaves new slots' `occupied` uninitialized, and a later fallible step added
+            // to this function in the future could otherwise leave that memory exposed to
+            // a recoverable-OOM caller. Harmless no-op today since nothing fallible follows.
+            for (self.slots.items) |*slot| slot.occupied = false;
+            self.logical_capacity = capacity;
             self.clear();
         }
 
@@ -70,7 +86,9 @@ fn ProbeTable(comptime Payload: type) type {
                 const index = (start + probe) % capacity;
                 const slot = self.slots.items[index];
                 if (slot.occupied and keysEqual(slot.key, key)) return index;
-                if (!slot.occupied and self.len < capacity) return null;
+                // Chains are contiguous (back-shift deletion) and the table is never
+                // more than half full, so the first empty slot ends this key's chain.
+                if (!slot.occupied) return null;
             }
             return null;
         }
@@ -81,7 +99,7 @@ fn ProbeTable(comptime Payload: type) type {
         }
 
         // Inserts key with payload, or updates the payload if key is already present.
-        // Returns false only when the table is full and key is absent.
+        // Returns false only when the table is logically full and key is absent.
         fn put(self: *Self, key: PathQueryKey, payload: Payload) bool {
             const capacity = self.slots.items.len;
             if (capacity == 0) return false;
@@ -93,7 +111,8 @@ fn ProbeTable(comptime Payload: type) type {
                     slot.payload = payload;
                     return true;
                 }
-                if (!slot.occupied and self.len < capacity) {
+                if (!slot.occupied) {
+                    if (self.len >= self.logical_capacity) return false;
                     slot.* = .{ .occupied = true, .key = key, .payload = payload };
                     self.len += 1;
                     return true;
@@ -178,9 +197,9 @@ pub const KeySet = struct {
 };
 
 // Fixed-capacity linear-probe map from goal key to group_requests slot index.
-// Enables O(1) lookup in recordGroupRequest instead of an O(N) linear scan.
-// Stripe index = fallback_index is not relevant here; this maps keys to the
-// dense ArrayList index in group_requests (stable until a swapRemove).
+// Enables O(1) lookup in recordGroupRequest instead of an O(N) linear scan. Maps a key to
+// the dense ArrayList index in group_requests, stable until a swapRemove touches it (see
+// updateIndex).
 pub const GroupKeyMap = struct {
     table: ProbeTable(u16) = .{},
 
@@ -202,12 +221,15 @@ pub const GroupKeyMap = struct {
         return group_index;
     }
 
-    // Maps key → group_requests index. Returns false when the map is full.
+    // Maps key → group_requests index. Returns false when the map is full. group_index
+    // fits u16: group_requests is capped at max_solved_requests_per_step, itself clamped
+    // to default_max_solves_per_frame (512), far under u16's range.
     pub fn insert(self: *GroupKeyMap, key: PathQueryKey, group_index: usize) bool {
         return self.table.put(key, @intCast(group_index));
     }
 
-    // Updates the stored index for a key that moved due to a swapRemove.
+    // Updates the stored index for a key that moved due to a swapRemove. See insert for
+    // why new_group_index always fits u16.
     pub fn updateIndex(self: *GroupKeyMap, key: PathQueryKey, new_group_index: usize) void {
         self.table.update(key, @intCast(new_group_index));
     }
@@ -217,27 +239,39 @@ pub const GroupKeyMap = struct {
     }
 };
 
-// Goal-keyed cache. Each slot owns a fixed path buffer so a moving agent can
+// Goal-keyed cache. Each entry owns a fixed path buffer so a moving agent can
 // derive a forward waypoint from its current cell against the stored path.
 //
-// SoA layout: the probe-hot {occupied, key} slots stay dense so a linear-probe scan
-// (slotIndex/findOrEvictSlot) never drags the cold TTL/length payload across cache
-// lines. The cold payload (stamp + path/stitched lengths + level) is a parallel array
-// indexed by the same slot, alongside the per-slot path/stitched cell stripes.
+// SoA layout: the probe-hot {occupied, key, payload_index} slots stay dense so a
+// linear-probe scan (slotIndex/findOrEvictSlot) never drags the cold TTL/length
+// payload across cache lines. The physical probe table is 2x the logical capacity
+// (occupancy never exceeds 50%, so every probe chain ends at an empty slot), while
+// the cold payload and the per-entry path/stitched cell stripes stay at logical
+// capacity, reached through the slot's payload_index. The indirection also lets
+// back-shift deletion move only the small probe slot — never the cell stripes.
 pub const ResultCache = struct {
     slots: std.ArrayList(ProbeSlot) = .empty,
     payloads: std.ArrayList(SlotPayload) = .empty,
     path_cells: std.ArrayList(u32) = .empty,
     path_stride: usize = 0,
-    // Per-slot full stitched (level,cell) corridor path: one obstacle-aware, mostly
-    // grid-adjacent path per slot (the level changes only across an inter-level
+    // Per-entry full stitched (level,cell) corridor path: one obstacle-aware, mostly
+    // grid-adjacent path per entry (the level changes only across an inter-level
     // link). Walked per-agent on its current level exactly like a plain A* path.
     stitched: std.ArrayList(StitchedCell) = .empty,
     stitched_stride: usize = 0,
+    // Unclaimed payload/stripe indices (stack). Every occupied probe slot owns a
+    // distinct payload_index, so this holds exactly logical_capacity - len entries.
+    free_payload_indices: std.ArrayList(u32) = .empty,
+    // Pre-reserved key scratch for evictCrossing's collect-then-remove sweep.
+    evict_scratch: std.ArrayList(PathQueryKey) = .empty,
+    // Insert ceiling; slots.items.len is 2x this for probe headroom.
+    logical_capacity: usize = 0,
     len: usize = 0,
     next_evict: usize = 0,
 
     pub fn deinit(self: *ResultCache, allocator: std.mem.Allocator) void {
+        self.evict_scratch.deinit(allocator);
+        self.free_payload_indices.deinit(allocator);
         self.stitched.deinit(allocator);
         self.path_cells.deinit(allocator);
         self.payloads.deinit(allocator);
@@ -245,11 +279,12 @@ pub const ResultCache = struct {
         self.* = undefined;
     }
 
-    // Reconstructs the full PathResult for a slot from its hot key and cold payload.
+    // Reconstructs the full PathResult for a probe slot from its hot key and cold payload.
     pub fn resultAt(self: *const ResultCache, index: usize) PathResult {
-        const payload = self.payloads.items[index];
+        const slot = self.slots.items[index];
+        const payload = self.payloads.items[slot.payload_index];
         return .{
-            .key = self.slots.items[index].key,
+            .key = slot.key,
             .path_len = payload.path_len,
             .path_level = payload.path_level,
             .stitched_len = payload.stitched_len,
@@ -259,61 +294,81 @@ pub const ResultCache = struct {
     pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, path_stride: usize, stitched_stride: usize) !void {
         // Totals computed from locals; strides are committed to self only after all
         // allocations succeed so a mid-reserve OOM never leaves mismatched strides.
+        const physical = capacity *| 2;
         const total_cells = capacity *| path_stride;
         const total_stitched = capacity *| stitched_stride;
         // Free the backing on a shrink so an elastic down-resize releases memory; slot
-        // probe positions and per-slot strides depend on capacity, so a resized cache
+        // probe positions and per-entry strides depend on capacity, so a resized cache
         // is always rebuilt (the goal-keyed entries re-solve on next request).
-        if (capacity < self.slots.capacity) self.slots.shrinkAndFree(allocator, 0);
-        if (capacity < self.payloads.capacity) self.payloads.shrinkAndFree(allocator, 0);
-        if (total_cells < self.path_cells.capacity) self.path_cells.shrinkAndFree(allocator, 0);
-        if (total_stitched < self.stitched.capacity) self.stitched.shrinkAndFree(allocator, 0);
-        try setLen(&self.slots, allocator, capacity);
+        if (shouldShrinkCapacity(self.slots.capacity, physical)) self.slots.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.payloads.capacity, capacity)) self.payloads.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.path_cells.capacity, total_cells)) self.path_cells.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.stitched.capacity, total_stitched)) self.stitched.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.free_payload_indices.capacity, capacity)) self.free_payload_indices.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.evict_scratch.capacity, capacity)) self.evict_scratch.shrinkAndFree(allocator, 0);
+        try setLen(&self.slots, allocator, physical);
+        // Zeroed immediately (not deferred to clear() below): setLen leaves new slots'
+        // `occupied` uninitialized, and any of the further allocations below can still
+        // fail — a recoverable-OOM caller must never read stale/undefined occupancy off
+        // an abandoned mid-reserve table.
+        for (self.slots.items) |*slot| slot.occupied = false;
         try setLen(&self.payloads, allocator, capacity);
         try setLen(&self.path_cells, allocator, total_cells);
         @memset(self.path_cells.items, no_cell);
         try setLen(&self.stitched, allocator, total_stitched);
         @memset(self.stitched.items, .{ .level = 0, .cell = no_cell });
-        // All allocations succeeded; safe to commit the new strides.
+        try self.free_payload_indices.ensureTotalCapacity(allocator, capacity);
+        try self.evict_scratch.ensureTotalCapacity(allocator, capacity);
+        // All allocations succeeded; safe to commit the new strides and capacity.
         self.path_stride = path_stride;
         self.stitched_stride = stitched_stride;
+        self.logical_capacity = capacity;
         self.clear();
     }
 
     pub fn clear(self: *ResultCache) void {
         for (self.slots.items) |*slot| slot.occupied = false;
+        self.free_payload_indices.clearRetainingCapacity();
+        for (0..self.logical_capacity) |payload_index| {
+            self.free_payload_indices.appendAssumeCapacity(@intCast(payload_index));
+        }
         self.len = 0;
         self.next_evict = 0;
     }
 
     // Evicts only cached paths crossing a changed span; paths clear of the edited cells
     // survive and keep serving hits. Matches on the stored corridor (or plain) cells.
-    // Removal uses back-shift deletion (removeAt), which can relocate later entries to
-    // keep probe chains gap-free, so we restart the scan after each eviction rather than
-    // iterate-while-mutating. Evictions are rare/bounded, so the restart cost is fine.
+    // One read-only pass collects the crossing keys into pre-reserved scratch, then
+    // removes them by key: back-shift relocation during removal can therefore never
+    // skip or double-visit an entry, without restarting the scan per eviction.
     pub fn evictCrossing(self: *ResultCache, graph: *const NavGraph, spans: []const ChangedSpan) void {
         if (spans.len == 0) return;
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (self.slots.items, 0..) |slot, slot_index| {
-                if (!slot.occupied) continue;
-                if (self.crossesSpans(graph, slot_index, self.payloads.items[slot_index], spans)) {
-                    self.removeAt(slot_index);
-                    changed = true;
-                    break;
-                }
+        self.evict_scratch.clearRetainingCapacity();
+        for (self.slots.items, 0..) |slot, slot_index| {
+            if (!slot.occupied) continue;
+            if (self.crossesSpans(graph, slot_index, self.payloads.items[slot.payload_index], spans)) {
+                // At most len (<= logical_capacity) occupied slots exist, matching the
+                // scratch reserve.
+                self.evict_scratch.appendAssumeCapacity(slot.key);
             }
         }
+        for (self.evict_scratch.items) |key| self.remove(key);
+    }
+
+    fn remove(self: *ResultCache, key: PathQueryKey) void {
+        const index = self.slotIndex(key) orelse return;
+        self.removeAt(index);
     }
 
     // Back-shift deletion for the open-addressed slot table. Clearing a slot in the middle
     // of a probe run would strand later keys behind the gap (lookups early-terminate on the
     // first truly-empty slot), so we pull up any following entry whose home position lets it
-    // fill the hole, moving its slot struct AND its per-slot path/stitched payload together.
-    // Keeps every probe chain contiguous, which is what the `len < capacity` early-out relies on.
+    // fill the hole. Only the small probe slot moves — its payload_index travels with it,
+    // so the cold payload and cell stripes never move. Keeps every probe chain contiguous,
+    // which is what the empty-slot probe early-out relies on.
     fn removeAt(self: *ResultCache, index: usize) void {
         const capacity = self.slots.items.len;
+        self.free_payload_indices.appendAssumeCapacity(self.slots.items[index].payload_index);
         self.slots.items[index].occupied = false;
         self.len -= 1;
         var hole = index;
@@ -328,25 +383,8 @@ pub const ResultCache = struct {
             // otherwise it can move up to fill the hole without becoming unreachable.
             if (inCyclicRange(hole, probe, home)) continue;
             self.slots.items[hole] = slot;
-            self.payloads.items[hole] = self.payloads.items[probe];
-            self.moveSlotCells(probe, hole);
             self.slots.items[probe].occupied = false;
             hole = probe;
-        }
-    }
-
-    // Copies a slot's path and stitched cell stripes from one index to another (back-shift
-    // move). The {occupied,key} slot and the cold payload are moved by the caller.
-    fn moveSlotCells(self: *ResultCache, from: usize, to: usize) void {
-        if (self.path_stride != 0) {
-            const fb = from * self.path_stride;
-            const tb = to * self.path_stride;
-            @memcpy(self.path_cells.items[tb .. tb + self.path_stride], self.path_cells.items[fb .. fb + self.path_stride]);
-        }
-        if (self.stitched_stride != 0) {
-            const fb = from * self.stitched_stride;
-            const tb = to * self.stitched_stride;
-            @memcpy(self.stitched.items[tb .. tb + self.stitched_stride], self.stitched.items[fb .. fb + self.stitched_stride]);
         }
     }
 
@@ -370,13 +408,16 @@ pub const ResultCache = struct {
         return false;
     }
 
+    // `slot_index` is the PROBE slot index (as returned by slotIndex/freshSlotIndex),
+    // not a payload index; both slices translate through the slot's payload_index so
+    // callers never need to know the indirection exists.
     pub fn pathSlice(self: *const ResultCache, slot_index: usize, path_len: usize) []const u32 {
-        const base = slot_index * self.path_stride;
+        const base: usize = @as(usize, self.slots.items[slot_index].payload_index) * self.path_stride;
         return self.path_cells.items[base .. base + @min(path_len, self.path_stride)];
     }
 
     pub fn stitchedSlice(self: *const ResultCache, slot_index: usize, stitched_len: usize) []const StitchedCell {
-        const base = slot_index * self.stitched_stride;
+        const base: usize = @as(usize, self.slots.items[slot_index].payload_index) * self.stitched_stride;
         return self.stitched.items[base .. base + @min(stitched_len, self.stitched_stride)];
     }
 
@@ -388,7 +429,10 @@ pub const ResultCache = struct {
             const index = (start + probe) % capacity;
             const slot = self.slots.items[index];
             if (slot.occupied and keysEqual(slot.key, key)) return index;
-            if (!slot.occupied and self.len < capacity) return null;
+            // Physical capacity is 2x logical_capacity, so len never reaches capacity;
+            // chains are contiguous (back-shift deletion), so the first empty slot ends
+            // this key's chain whether present or absent.
+            if (!slot.occupied) return null;
         }
         return null;
     }
@@ -405,7 +449,8 @@ pub const ResultCache = struct {
     // is served a path older than the TTL forever. ttl 0 disables expiry.
     pub fn freshSlotIndex(self: *const ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?usize {
         const index = self.slotIndex(key) orelse return null;
-        if (ttl != 0 and (step -% self.payloads.items[index].stamp) >= ttl) return null;
+        const payload_index = self.slots.items[index].payload_index;
+        if (ttl != 0 and (step -% self.payloads.items[payload_index].stamp) >= ttl) return null;
         return index;
     }
 
@@ -413,7 +458,8 @@ pub const ResultCache = struct {
     // re-solves it against current geometry. ttl 0 disables expiry.
     pub fn findFresh(self: *ResultCache, key: PathQueryKey, step: u32, ttl: u32) ?PathResult {
         const index = self.slotIndex(key) orelse return null;
-        if (ttl != 0 and (step -% self.payloads.items[index].stamp) >= ttl) {
+        const payload_index = self.slots.items[index].payload_index;
+        if (ttl != 0 and (step -% self.payloads.items[payload_index].stamp) >= ttl) {
             self.removeAt(index);
             return null;
         }
@@ -425,13 +471,12 @@ pub const ResultCache = struct {
     // is only downsampled when it exceeds the stride; the stitched path is bounded at
     // the solve side and stored whole, so its consecutive cells stay traversable.
     pub fn put(self: *ResultCache, key: PathQueryKey, path: []const u32, stitched: []const StitchedCell, path_level: u16, step: u32, stats: *PathfindingStats) void {
-        const capacity = self.slots.items.len;
-        if (capacity == 0 or self.path_stride == 0) return;
+        if (self.logical_capacity == 0 or self.path_stride == 0) return;
         const slot_index = self.findOrEvictSlot(key, stats);
-        const stored_len = self.writePath(slot_index, path);
-        const stitched_len = self.writeStitched(slot_index, stitched);
-        self.slots.items[slot_index] = .{ .occupied = true, .key = key };
-        self.payloads.items[slot_index] = .{
+        const payload_index = self.slots.items[slot_index].payload_index;
+        const stored_len = self.writePath(payload_index, path);
+        const stitched_len = self.writeStitched(payload_index, stitched);
+        self.payloads.items[payload_index] = .{
             .stamp = step,
             .path_len = @intCast(stored_len),
             .path_level = path_level,
@@ -439,14 +484,23 @@ pub const ResultCache = struct {
         };
     }
 
-    fn writeStitched(self: *ResultCache, slot_index: usize, stitched: []const StitchedCell) usize {
+    fn writeStitched(self: *ResultCache, payload_index: u32, stitched: []const StitchedCell) usize {
         if (self.stitched_stride == 0) return 0;
-        const base = slot_index * self.stitched_stride;
-        const copy_len = @min(stitched.len, self.stitched_stride);
-        @memcpy(self.stitched.items[base .. base + copy_len], stitched[0..copy_len]);
-        return copy_len;
+        // Holds by construction, not by convention: stitchCorridor's cap and this stride
+        // both trace back to the same capacity.max_stitched_path_cells (via
+        // recordStitched's worker-pool stride), so a stitched corridor is genuinely
+        // "stored whole" here, never truncated. Assert rather than @min-and-truncate so a
+        // future drift between the two fails loud (a silent truncation would dead-end the
+        // agent at the cut point and under-evict on a later edit past it).
+        std.debug.assert(stitched.len <= self.stitched_stride);
+        const base: usize = @as(usize, payload_index) * self.stitched_stride;
+        @memcpy(self.stitched.items[base .. base + stitched.len], stitched);
+        return stitched.len;
     }
 
+    // Finds key's existing probe slot, or claims/evicts one and assigns it a payload_index
+    // (leaving the payload contents for the caller to overwrite). Returns the PROBE slot
+    // index, not the payload index.
     fn findOrEvictSlot(self: *ResultCache, key: PathQueryKey, stats: *PathfindingStats) usize {
         const capacity = self.slots.items.len;
         std.debug.assert(capacity != 0); // callers guard this; assert before `% capacity`
@@ -455,41 +509,48 @@ pub const ResultCache = struct {
             const index = (start + probe) % capacity;
             const slot = self.slots.items[index];
             if (slot.occupied and keysEqual(slot.key, key)) return index;
-            if (!slot.occupied and self.len < capacity) {
+            if (!slot.occupied) {
+                if (self.len < self.logical_capacity) {
+                    const payload_index = self.free_payload_indices.pop().?;
+                    self.slots.items[index] = .{ .occupied = true, .key = key, .payload_index = payload_index };
+                    self.len += 1;
+                    return index;
+                }
+                // Logically full (every payload slot owned) but the physical probe table is
+                // never more than 50% occupied, so an empty PHYSICAL slot exists (this one)
+                // without an available payload. Evict a round-robin victim — skipping empty
+                // physical slots, since occupancy is sparse — to free its payload_index, then
+                // claim this empty physical slot for the new key.
+                while (!self.slots.items[self.next_evict].occupied) {
+                    self.next_evict = (self.next_evict + 1) % capacity;
+                }
+                const victim = self.next_evict;
+                self.next_evict = (self.next_evict + 1) % capacity;
+                stats.cache_evictions += 1;
+                self.removeAt(victim);
+                const payload_index = self.free_payload_indices.pop().?;
+                self.slots.items[index] = .{ .occupied = true, .key = key, .payload_index = payload_index };
                 self.len += 1;
                 return index;
             }
         }
-        // Table full: evict a victim (round-robin) with back-shift, then place the new key
-        // at its proper probe position so it stays reachable once the table later drops
-        // below capacity (a victim written at next_evict could otherwise sit off its chain).
-        const victim = self.next_evict;
-        self.next_evict = (self.next_evict + 1) % capacity;
-        stats.cache_evictions += 1;
-        self.removeAt(victim);
-        const start_new = hashPathKey(key) % capacity;
-        for (0..capacity) |probe| {
-            const index = (start_new + probe) % capacity;
-            if (!self.slots.items[index].occupied) {
-                self.len += 1;
-                return index;
-            }
-        }
-        unreachable; // removeAt freed exactly one slot
+        unreachable; // physical capacity is 2x logical_capacity; an empty slot always exists
     }
 
-    fn writePath(self: *ResultCache, slot_index: usize, path: []const u32) usize {
-        const base = slot_index * self.path_stride;
+    fn writePath(self: *ResultCache, payload_index: u32, path: []const u32) usize {
+        const base: usize = @as(usize, payload_index) * self.path_stride;
         const dst = self.path_cells.items[base .. base + self.path_stride];
         // One shared contract with the worker solve buffer: copy when it fits, else
         // stride-downsample so the stored path still spans start->goal.
         return types.downsamplePathInto(dst, path);
     }
 };
-// Probe-hot slot: only the fields a linear-probe scan touches (occupancy + key).
+// Probe-hot slot: the fields a linear-probe scan touches (occupancy + key), plus the
+// indirection to this entry's payload/cell-stripe slot in the logical-capacity arrays.
 pub const ProbeSlot = struct {
     occupied: bool = false,
     key: PathQueryKey = emptyKey(0),
+    payload_index: u32 = 0,
 };
 
 // Cold per-slot payload, parallel to ProbeSlot. Read only on a hit / TTL check, so it
@@ -770,6 +831,72 @@ test "pathfinding result cache evicts deterministically and stores paths" {
     try std.testing.expectEqual(@as(u32, 3), stored[0]);
 }
 
+test "pathfinding result cache stays correct at full logical occupancy" {
+    // Every absent-key probe on a full table must still terminate (the physical table is
+    // never more than 50% occupied), and inserting past logical capacity must still evict
+    // exactly one entry via the round-robin victim rather than corrupting the table.
+    var stats = PathfindingStats{};
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    const capacity = 8;
+    try cache.reserve(std.testing.allocator, capacity, 4, 8);
+
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        cache.put(key, &.{@intCast(i)}, &.{}, 0, 0, &stats);
+    }
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        try std.testing.expect(cache.find(key) != null);
+    }
+    // An absent key (never inserted) must resolve to a miss, not loop or misread a
+    // neighboring slot's payload.
+    var absent = emptyKey(1);
+    absent.goal.x = capacity + 100;
+    try std.testing.expect(cache.find(absent) == null);
+
+    // One more insert past logical capacity evicts exactly one victim; every other key
+    // stays resolvable.
+    var overflow_key = emptyKey(1);
+    overflow_key.goal.x = capacity;
+    cache.put(overflow_key, &.{99}, &.{}, 0, 0, &stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.cache_evictions);
+    try std.testing.expect(cache.find(overflow_key) != null);
+    var survivors: usize = 0;
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        if (cache.find(key) != null) survivors += 1;
+    }
+    try std.testing.expectEqual(capacity - 1, survivors);
+}
+
+test "pathfinding fixed-capacity key set stays correct at full logical occupancy" {
+    var keys = KeySet{};
+    defer keys.deinit(std.testing.allocator);
+    const capacity = 8;
+    try keys.reserve(std.testing.allocator, capacity);
+
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        try std.testing.expect(keys.insert(key));
+    }
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        try std.testing.expect(keys.contains(key));
+    }
+    // A logically-full set rejects a new key (no eviction: KeySet is fixed-capacity,
+    // unlike ResultCache) but every absent-key probe still terminates.
+    var overflow_key = emptyKey(1);
+    overflow_key.goal.x = capacity;
+    try std.testing.expect(!keys.insert(overflow_key));
+    try std.testing.expect(!keys.contains(overflow_key));
+}
+
 // Minimal single-level NavGraph for cache-eviction/waypoint tests: only the grid
 // dimensions are read (cellInSpans / waypointFromStitched), so an empty-backed grid
 // of the requested size suffices. Caller must deinit the returned graph's level list.
@@ -801,6 +928,91 @@ test "pathfinding result cache evicts only paths crossing an edited span" {
 
     try std.testing.expect(cache.find(crossing) == null); // crossed (2,0) -> evicted
     try std.testing.expect(cache.find(clear) != null); // clear of the edit -> still served
+}
+
+test "pathfinding result cache evicts every crossing entry in one bulk edit without a restart per eviction" {
+    // A single evictCrossing call with several crossing entries exercises the
+    // collect-then-remove sweep under back-shift relocation: every crossing entry must
+    // be evicted (none skipped/double-visited because an earlier removal shifted a
+    // later entry), and every clear entry must survive.
+    var stats = PathfindingStats{};
+    var graph = try makeTestGraph(std.testing.allocator, 10, 10);
+    defer graph.levels.deinit(std.testing.allocator);
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    const capacity = 8;
+    try cache.reserve(std.testing.allocator, capacity, 8, 8);
+
+    // Even-indexed entries cross row 0 (the edited span); odd-indexed sit clear on row 5.
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        if (i % 2 == 0) {
+            cache.put(key, &.{ 0, 1, @as(u32, @intCast(2 + i)) }, &.{}, 0, 0, &stats);
+        } else {
+            cache.put(key, &.{ 50, 51, @as(u32, @intCast(52 + i)) }, &.{}, 0, 0, &stats);
+        }
+    }
+
+    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 0, .max_x = 1, .min_y = 0, .max_y = 0 } }};
+    cache.evictCrossing(&graph, &spans);
+
+    for (0..capacity) |i| {
+        var key = emptyKey(1);
+        key.goal.x = @intCast(i);
+        if (i % 2 == 0) {
+            try std.testing.expect(cache.find(key) == null); // crossing -> evicted
+        } else {
+            try std.testing.expect(cache.find(key) != null); // clear -> survives
+        }
+    }
+}
+
+test "pathfinding result cache evicts a stitched corridor only when a span matches its cell's own level" {
+    // The stitched branch of crossesSpans checks (level, cell) per stored StitchedCell, not
+    // cell alone: an edit on level 0 must evict a corridor whose level-0 run touches it, but
+    // must NOT evict an otherwise-identical corridor that only touches that cell on level 1.
+    var stats = PathfindingStats{};
+    var graph = NavGraph{ .allocator = std.testing.allocator, .width = 10, .height = 10 };
+    defer graph.levels.deinit(std.testing.allocator);
+    try graph.levels.append(std.testing.allocator, NavGrid{ .width = 10, .height = 10, .cell_size = 1 });
+    try graph.levels.append(std.testing.allocator, NavGrid{ .level = 1, .width = 10, .height = 10, .cell_size = 1 });
+
+    var cache = ResultCache{};
+    defer cache.deinit(std.testing.allocator);
+    try cache.reserve(std.testing.allocator, 4, 4, 8);
+
+    // Same cell sequence, different levels: only the level-0 corridor should be considered
+    // crossing an edit scoped to level 0.
+    var on_level0 = emptyKey(1);
+    on_level0.goal.x = 1;
+    cache.put(on_level0, &.{}, &.{
+        .{ .level = 0, .cell = 0 },
+        .{ .level = 0, .cell = 1 },
+        .{ .level = 0, .cell = 2 },
+    }, 0, 0, &stats);
+    var on_level1 = emptyKey(1);
+    on_level1.goal.x = 2;
+    cache.put(on_level1, &.{}, &.{
+        .{ .level = 1, .cell = 0 },
+        .{ .level = 1, .cell = 1 },
+        .{ .level = 1, .cell = 2 },
+    }, 1, 0, &stats);
+    // A cross-level corridor: its level-0 prefix touches the edit, its level-1 tail does not.
+    var mixed = emptyKey(1);
+    mixed.goal.x = 3;
+    cache.put(mixed, &.{}, &.{
+        .{ .level = 0, .cell = 1 },
+        .{ .level = 1, .cell = 5 },
+        .{ .level = 1, .cell = 6 },
+    }, 0, 0, &stats);
+
+    const spans = [_]ChangedSpan{.{ .level = 0, .span = .{ .min_x = 1, .max_x = 1, .min_y = 0, .max_y = 0 } }};
+    cache.evictCrossing(&graph, &spans);
+
+    try std.testing.expect(cache.find(on_level0) == null); // level-0 cell 1 crossed -> evicted
+    try std.testing.expect(cache.find(on_level1) != null); // same cell id, but level 1 -> survives
+    try std.testing.expect(cache.find(mixed) == null); // its level-0 prefix crossed -> evicted
 }
 
 test "pathfinding result cache evicts a downsampled path edited between stored samples" {

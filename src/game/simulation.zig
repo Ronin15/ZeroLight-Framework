@@ -19,8 +19,10 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const StructuralChange = @import("data_system.zig").StructuralChange;
+const ObstacleWorldRect = @import("data_system.zig").ObstacleWorldRect;
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralPlanScratch = @import("data_system.zig").StructuralPlanScratch;
+const AiAffectDrive = @import("data_system.zig").AiAffectDrive;
 
 pub const SimulationPhase = enum {
     idle,
@@ -71,12 +73,36 @@ pub const ComponentChangedEvent = struct {
     component: Component,
     was_static_navigation_obstacle: bool = false,
     is_static_navigation_obstacle: bool = false,
+    // World-space obstacle rect before/after this change, when the entity was/is a static
+    // navigation obstacle. Lets the post-commit nav reaction localize invalidation to the
+    // covered nav cells instead of the whole level.
+    old_obstacle_world_rect: ?ObstacleWorldRect = null,
+    new_obstacle_world_rect: ?ObstacleWorldRect = null,
 };
 
 pub const EntityDestroyedEvent = struct {
     entity: EntityId,
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool = false,
+    // World-space obstacle rect at destroy time, when the entity was a static navigation
+    // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
+    obstacle_world_rect: ?ObstacleWorldRect = null,
+};
+
+pub const EntityPerceivedEvent = struct {
+    observer: EntityId,
+    target: EntityId,
+};
+
+pub const EntityLostEvent = struct {
+    observer: EntityId,
+    target: EntityId,
+};
+
+pub const AffectThresholdCrossedEvent = struct {
+    entity: EntityId,
+    drive: AiAffectDrive,
+    rising: bool,
 };
 
 pub const SimulationEventPayload = union(enum) {
@@ -86,6 +112,9 @@ pub const SimulationEventPayload = union(enum) {
     world_tile_changed: WorldTileChangedEvent,
     world_obstacle_changed: WorldObstacleChangedEvent,
     nav_region_invalidated: NavRegionInvalidatedEvent,
+    entity_perceived: EntityPerceivedEvent,
+    entity_lost: EntityLostEvent,
+    affect_threshold_crossed: AffectThresholdCrossedEvent,
 };
 
 pub const SimulationEvent = struct {
@@ -102,6 +131,9 @@ pub const SimulationEventStats = struct {
     world_tile_changed: usize = 0,
     world_obstacle_changed: usize = 0,
     nav_region_invalidated: usize = 0,
+    entity_perceived: usize = 0,
+    entity_lost: usize = 0,
+    affect_threshold_crossed: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
 
@@ -118,6 +150,9 @@ pub const SimulationEventStats = struct {
             .world_tile_changed => self.world_tile_changed += 1,
             .world_obstacle_changed => self.world_obstacle_changed += 1,
             .nav_region_invalidated => self.nav_region_invalidated += 1,
+            .entity_perceived => self.entity_perceived += 1,
+            .entity_lost => self.entity_lost += 1,
+            .affect_threshold_crossed => self.affect_threshold_crossed += 1,
         }
     }
 
@@ -129,6 +164,9 @@ pub const SimulationEventStats = struct {
         self.world_tile_changed += produced.world_tile_changed;
         self.world_obstacle_changed += produced.world_obstacle_changed;
         self.nav_region_invalidated += produced.nav_region_invalidated;
+        self.entity_perceived += produced.entity_perceived;
+        self.entity_lost += produced.entity_lost;
+        self.affect_threshold_crossed += produced.affect_threshold_crossed;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
@@ -142,6 +180,9 @@ pub const SimulationEventStats = struct {
         perf.recordMetric(.simulation_events_world_tile_changed, metric(self.world_tile_changed));
         perf.recordMetric(.simulation_events_world_obstacle_changed, metric(self.world_obstacle_changed));
         perf.recordMetric(.simulation_events_nav_region_invalidated, metric(self.nav_region_invalidated));
+        perf.recordMetric(.simulation_events_entity_perceived, metric(self.entity_perceived));
+        perf.recordMetric(.simulation_events_entity_lost, metric(self.entity_lost));
+        perf.recordMetric(.simulation_events_affect_threshold_crossed, metric(self.affect_threshold_crossed));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
     }
@@ -400,6 +441,19 @@ pub const CollisionContact = struct {
 /// cross-plane link to climb up.
 pub const DigIntent = enum { none, hole, ramp, down };
 
+pub const StimulusKind = enum { dig };
+
+/// A transient per-step positional stimulus AI hearing can sense. Cleared
+/// every step, so it carries no entity identity and is not a
+/// `SimulationEvent`. `intensity` is unused until a second producer exists to
+/// calibrate a falloff.
+pub const WorldStimulus = struct {
+    position: math.Vec2,
+    intensity: f32,
+    kind: StimulusKind,
+    level: u16,
+};
+
 pub const SimulationFrame = struct {
     allocator: std.mem.Allocator,
     phase: SimulationPhase = .idle,
@@ -415,6 +469,7 @@ pub const SimulationFrame = struct {
     contacts: RangeOutputStream(CollisionContact),
     collision_triggers: RangeOutputStream(CollisionTriggerEvent),
     structural_commands: RangeOutputStream(StructuralCommand),
+    stimuli: RangeOutputStream(WorldStimulus),
     structural_plan_scratch: StructuralPlanScratch,
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
@@ -430,6 +485,7 @@ pub const SimulationFrame = struct {
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
             .collision_triggers = RangeOutputStream(CollisionTriggerEvent).init(allocator),
             .structural_commands = RangeOutputStream(StructuralCommand).init(allocator),
+            .stimuli = RangeOutputStream(WorldStimulus).init(allocator),
             .structural_plan_scratch = StructuralPlanScratch.init(allocator),
         };
     }
@@ -437,6 +493,7 @@ pub const SimulationFrame = struct {
     pub fn deinit(self: *SimulationFrame) void {
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
+        self.stimuli.deinit();
         self.structural_commands.deinit();
         self.collision_triggers.deinit();
         self.contacts.deinit();
@@ -461,6 +518,7 @@ pub const SimulationFrame = struct {
         self.contacts.clearRetainingCapacity();
         self.collision_triggers.clearRetainingCapacity();
         self.structural_commands.clearRetainingCapacity();
+        self.stimuli.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
         self.structural_changes_scratch.clearRetainingCapacity();
     }
@@ -481,6 +539,20 @@ pub const SimulationFrame = struct {
         try self.contacts.reserve(range_count, contact_capacity);
         try self.collision_triggers.reserve(range_count, collision_trigger_capacity);
         try self.structural_commands.reserve(range_count, structural_command_capacity);
+    }
+
+    /// Single-value append for main-thread producers (dig is not threaded).
+    /// `stimuli` is not part of `reserveStreams`: its per-step count is a fixed
+    /// producer invariant (dig emits at most one), not scene-scale-dependent,
+    /// so it grows lazily on first use like `PerceptionSystem`'s own buffers.
+    pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
+        const first_range = try self.stimuli.appendRangeCounts(1);
+        self.stimuli.addCount(first_range, 1);
+        try self.stimuli.prefixAppendedRanges(first_range);
+        var writer = self.stimuli.rangeWriter(first_range);
+        writer.write(stimulus);
+        writer.finish();
+        self.stimuli.finishWrite();
     }
 
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
@@ -534,6 +606,7 @@ pub const SimulationFrame = struct {
                         .entity = destroyed.entity,
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
+                        .obstacle_world_rect = destroyed.obstacle_world_rect,
                     } },
                 },
                 .component_changed => |changed| .{
@@ -543,6 +616,8 @@ pub const SimulationFrame = struct {
                         .component = changed.component,
                         .was_static_navigation_obstacle = changed.was_static_navigation_obstacle,
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
+                        .old_obstacle_world_rect = changed.old_obstacle_world_rect,
+                        .new_obstacle_world_rect = changed.new_obstacle_world_rect,
                     } },
                 },
             });
@@ -1093,6 +1168,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     defer frame.deinit();
 
     try frame.reserveStreams(2, 2, 2, 2, 2, 1);
+    try frame.stimuli.reserve(2, 2);
 
     const original_allocator = frame.allocator;
     const original_events_allocator = frame.events.stream.allocator;
@@ -1100,6 +1176,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     const original_intents_allocator = frame.intents.allocator;
     const original_triggers_allocator = frame.collision_triggers.allocator;
     const original_commands_allocator = frame.structural_commands.allocator;
+    const original_stimuli_allocator = frame.stimuli.allocator;
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const fail = failing_allocator.allocator();
     frame.allocator = fail;
@@ -1108,6 +1185,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.intents.allocator = fail;
     frame.collision_triggers.allocator = fail;
     frame.structural_commands.allocator = fail;
+    frame.stimuli.allocator = fail;
     defer {
         frame.allocator = original_allocator;
         frame.events.stream.allocator = original_events_allocator;
@@ -1115,6 +1193,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
         frame.intents.allocator = original_intents_allocator;
         frame.collision_triggers.allocator = original_triggers_allocator;
         frame.structural_commands.allocator = original_commands_allocator;
+        frame.stimuli.allocator = original_stimuli_allocator;
     }
 
     try frame.events.prepareRangeCounts(2);
@@ -1211,10 +1290,66 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     command_writer.finish();
     frame.structural_commands.finishWrite();
 
+    try frame.stimuli.prepareRangeCounts(2);
+    frame.stimuli.addCount(0, 1);
+    try frame.stimuli.prefix();
+    var stimulus_writer = frame.stimuli.rangeWriter(0);
+    stimulus_writer.write(.{ .position = .{ .x = 5, .y = 6 }, .intensity = 1, .kind = .dig, .level = 0 });
+    stimulus_writer.finish();
+    stimulus_writer = frame.stimuli.rangeWriter(1);
+    stimulus_writer.finish();
+    frame.stimuli.finishWrite();
+
     try std.testing.expectEqual(@as(usize, 2), frame.events.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.navigation_intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.intents.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 2), frame.contacts.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
     try std.testing.expectEqual(@as(usize, 1), frame.structural_commands.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems reflects it immediately" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 1 });
+
+    const merged = frame.stimuli.mergedItems();
+    try std.testing.expectEqual(@as(usize, 2), merged.len);
+    try std.testing.expectEqual(@as(f32, 1), merged[0].position.x);
+    try std.testing.expectEqual(@as(f32, 2), merged[0].position.y);
+    try std.testing.expectEqual(@as(u16, 0), merged[0].level);
+    try std.testing.expectEqual(@as(f32, 3), merged[1].position.x);
+    try std.testing.expectEqual(@as(f32, 4), merged[1].position.y);
+    try std.testing.expectEqual(@as(u16, 1), merged[1].level);
+}
+
+test "SimulationFrame.clearRetainingCapacity clears stimuli" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+
+    frame.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame.appendStimulus has no steady-state allocation after warmup (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    // Warm up: sizes stimuli's counts/offsets/write_offsets/values to one step's use.
+    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    frame.clearRetainingCapacity();
+
+    const original_allocator = frame.stimuli.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    frame.stimuli.allocator = failing_allocator.allocator();
+    defer frame.stimuli.allocator = original_allocator;
+
+    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }

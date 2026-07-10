@@ -8,6 +8,7 @@
 //! publish pipeline (serial and threaded), delegating solves to solve.zig.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../../core/math.zig");
 const logging = @import("../../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -24,11 +25,11 @@ const SimulationEvent = @import("../../simulation.zig").SimulationEvent;
 const NavInvalidationReason = @import("../../simulation.zig").NavInvalidationReason;
 const StructuralCommand = @import("../../data_system.zig").StructuralCommand;
 const EntityTemplate = @import("../../data_system.zig").EntityTemplate;
+const ObstacleWorldRect = @import("../../data_system.zig").ObstacleWorldRect;
 const NavGraph = @import("nav_graph.zig").NavGraph;
 const NavUpdateThreads = @import("nav_graph.zig").NavUpdateThreads;
 const NavGrid = @import("nav_grid.zig").NavGrid;
-const NavMemoryBudget = @import("nav_memory.zig").NavMemoryBudget;
-const default_group_field_bytes_per_cell = @import("nav_memory.zig").default_group_field_bytes_per_cell;
+const nav_memory = @import("nav_memory.zig");
 const GroupField = @import("group_field.zig").GroupField;
 const SearchScratch = @import("scratch.zig").SearchScratch;
 const ResultCache = @import("caches.zig").ResultCache;
@@ -64,12 +65,17 @@ const no_cell = types.no_cell;
 const min_capacity_floor = types.min_capacity_floor;
 const cached_results_per_agent = types.cached_results_per_agent;
 const default_max_solves_per_frame = types.default_max_solves_per_frame;
+const deriveCapacity = types.deriveCapacity;
 const default_cells_per_group_agent = types.default_cells_per_group_agent;
 const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
-const budget_exhausted_rotate_after = types.budget_exhausted_rotate_after;
-const budget_exhausted_drop_after = types.budget_exhausted_drop_after;
+
+// Level entity-driven static-obstacle nav events resolve against: only level 0 sources
+// DataSystem collision bodies (NavGrid.markStaticBodies' own invariant — the demo's
+// entities live on the ground floor). Named once here so a future entity-level feature
+// changes one site instead of a hardcoded 0 re-derived independently at every call.
+const entity_nav_level: u16 = 0;
 
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
@@ -119,6 +125,9 @@ pub const PathfindingSystem = struct {
     // (a dropped cell would leave the graph stale against the world). Reserved at capacity
     // so typical steps are allocation-free; a large step does one bounded amortized grow.
     nav_dirty_edits: std.ArrayList(NavCellEdit) = .empty,
+    // Entity-driven obstacle-rect edits for this step, already resolved to nav-cell spans (see
+    // markNavObstacleRectDirty). Bounded/reserved and cleared alongside nav_dirty_edits.
+    nav_dirty_cell_spans: std.ArrayList(types.ChangedSpan) = .empty,
     // Levels to remask + repatch in full this step (deduped). Used when a change cannot be
     // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
     // longer resolvable from the entity — so the whole level is re-derived from the world.
@@ -190,6 +199,7 @@ pub const PathfindingSystem = struct {
         self.affected_levels.deinit(self.allocator);
         self.nav_changed_spans.deinit(self.allocator);
         self.nav_dirty_levels.deinit(self.allocator);
+        self.nav_dirty_cell_spans.deinit(self.allocator);
         self.nav_dirty_edits.deinit(self.allocator);
         self.worker_stitched_pool.deinit(self.allocator);
         self.worker_path_pool.deinit(self.allocator);
@@ -207,29 +217,6 @@ pub const PathfindingSystem = struct {
         self.pending.deinit(self.allocator);
         self.graph.deinit();
         self.* = undefined;
-    }
-
-    // Derives the per-step/memory caps from an agent count, clamped to [floor,
-    // max_agent_budget ceiling]. Population scales the QUEUE and CACHE (frame/pending
-    // requests, 4n cached results) so every agent can be queued and every path
-    // cached. Per-frame A* SOLVE work does NOT scale with population: the solve and
-    // fallback budgets are pinned to a fixed amortization ceiling (clamped down to
-    // the population so a tiny crowd caps low), so frame time stays bounded as the
-    // army grows. Algorithm/memory sizing (scratch, path strides, chunk size, group
-    // field count) is left untouched.
-    fn deriveCapacity(base: PathfindingCapacity, agent_count: usize) PathfindingCapacity {
-        var cap = base;
-        const clamped = std.math.clamp(agent_count, min_capacity_floor, @max(min_capacity_floor, base.max_agent_budget));
-        cap.max_frame_requests = clamped;
-        cap.max_pending_requests = clamped;
-        cap.max_cached_results = clamped *| cached_results_per_agent;
-        // Per-frame solve/fallback amortization ceiling, clamped down to the population
-        // (fallback <= solves). Independent of crowd size so a diverse-goal burst spreads
-        // across frames; the adaptive tuner threads the work under it.
-        const solve_ceiling = @min(default_max_solves_per_frame, clamped);
-        cap.max_solved_requests_per_step = solve_ceiling;
-        cap.max_fallback_requests_per_step = solve_ceiling;
-        return cap;
     }
 
     // See default_cells_per_group_agent for the model. Capped by max_agent_budget (the
@@ -250,11 +237,11 @@ pub const PathfindingSystem = struct {
         try self.applyDerivedCapacity(capacity, min_capacity_floor);
     }
 
-    // Sizes every pool from caps derived for `agent_count`. Used by reserve() at init
-    // and by adjustCapacityForAgentCount() at the safe point. ArrayList pools grow
-    // amortized and shrink-and-free; the open-addressed caches are re-reserved (which
-    // wipes them — reconstructable, and resizes are rare under hysteresis). The
-    // caller is responsible for preserving any live cross-step state across the wipe.
+    // Sizes every pool from caps derived for `agent_count`. Used by reserve() at init and
+    // by adjustCapacityForAgentCount() at the safe point. ArrayList pools grow amortized
+    // and shrink-and-free; the open-addressed caches are re-reserved (which wipes them —
+    // reconstructable, and resizes are rare under hysteresis). The caller is responsible
+    // for preserving any live cross-step state across the wipe.
     fn applyDerivedCapacity(self: *PathfindingSystem, base: PathfindingCapacity, agent_count: usize) !void {
         const capacity = deriveCapacity(base, agent_count);
         self.capacity = capacity;
@@ -267,21 +254,28 @@ pub const PathfindingSystem = struct {
         // Sized to the solve window: at most one front-window entry per solved slot can be
         // rotated to the back in a single compaction.
         try resizeArrayList(PendingRequest, &self.rotate_back_scratch, self.allocator, capacity.max_solved_requests_per_step);
+        // Logical capacity only: every ProbeTable/ResultCache reserve internally doubles
+        // physical slots for probe headroom, so callers pass the true entry-count ceiling,
+        // never a caller-side multiplier (one load-factor policy, not two stacked).
         try self.completed.reserve(self.allocator, capacity.max_cached_results, capacity.max_stored_path_cells, capacity.max_stitched_path_cells);
         try self.unavailable.reserve(self.allocator, capacity.max_cached_results);
-        try self.pending_keys.reserve(self.allocator, capacity.max_pending_requests * 2);
+        try self.pending_keys.reserve(self.allocator, capacity.max_pending_requests);
         try self.group_fields.ensureTotalCapacity(self.allocator, capacity.max_group_fields);
         while (self.group_fields.items.len < capacity.max_group_fields) {
             self.group_fields.appendAssumeCapacity(.{});
         }
         try resizeArrayList(GroupRequestTally, &self.group_requests, self.allocator, capacity.max_solved_requests_per_step);
-        // 2x load factor so linear probing stays fast at full group_requests occupancy.
-        try self.group_key_map.reserve(self.allocator, capacity.max_solved_requests_per_step * 2);
+        try self.group_key_map.reserve(self.allocator, capacity.max_solved_requests_per_step);
         // Pre-reserve the changed-span scratch so steady-path scoped eviction is alloc-free.
         try self.nav_changed_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
         // Pre-reserve the dirty nav-cell buffer to the same steady-path high-water; it still
         // grows (never drops) for an unusually large structural step.
         try self.nav_dirty_edits.ensureTotalCapacity(self.allocator, capacity.max_frame_requests);
+        // 2x nav_dirty_edits's bound: reactToPostCommitNavEvents's component_changed handling
+        // appends up to two spans per structural change (old_obstacle_world_rect and
+        // new_obstacle_world_rect) whenever a moving entity stays a static nav obstacle
+        // across the change, not just one.
+        try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests * 2);
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -355,14 +349,21 @@ pub const PathfindingSystem = struct {
         try self.applyDerivedCapacity(self.capacity, agent_count);
 
         // Restore live deferred work (dropping any beyond the new, smaller capacity),
-        // rebuild pending_keys to match, and restore the surviving group tally.
+        // rebuild pending_keys to match, and restore the surviving group tally. Clamped to
+        // the LOGICAL caps applyDerivedCapacity just installed (self.capacity.*), not the
+        // ArrayList's own physical .capacity: the allocator's size-class rounding can hand
+        // back a physical capacity well above the requested logical one, and pending_keys/
+        // group_key_map were reserved to the exact logical cap — retaining more entries in
+        // `pending`/`group_requests` than that would silently drop their dedup registration
+        // (a live entry that reads back `.missing` instead of `.pending`, inviting a
+        // duplicate accept) while resize_dropped undercounts the real loss.
         self.pending.clearRetainingCapacity();
-        const keep_pending = @min(self.resize_pending_snapshot.items.len, self.pending.capacity);
+        const keep_pending = @min(self.resize_pending_snapshot.items.len, self.capacity.max_pending_requests);
         self.pending.appendSliceAssumeCapacity(self.resize_pending_snapshot.items[0..keep_pending]);
         self.pending_keys.clear();
         for (self.pending.items) |pending_request| _ = self.pending_keys.insert(pending_request.key);
         self.group_requests.clearRetainingCapacity();
-        const keep_group = @min(self.resize_group_snapshot.items.len, self.group_requests.capacity);
+        const keep_group = @min(self.resize_group_snapshot.items.len, self.capacity.max_solved_requests_per_step);
         self.group_requests.appendSliceAssumeCapacity(self.resize_group_snapshot.items[0..keep_group]);
         // Rebuild the group key map to match the restored group_requests entries.
         self.group_key_map.clear();
@@ -391,20 +392,9 @@ pub const PathfindingSystem = struct {
         }
         const level_count: usize = if (world) |world_system| @max(@as(usize, 1), world_system.levelCount()) else 1;
         const link_count: usize = if (world) |world_system| world_system.levelLinks().len else 0;
-        const budget = NavMemoryBudget{
-            .max_bytes = self.capacity.max_nav_memory_bytes,
-            .level_count = level_count,
-            .group_field_bytes_per_cell = default_group_field_bytes_per_cell,
-            .max_group_fields = self.capacity.max_group_fields,
-            .max_explored_nodes = self.capacity.max_explored_nodes,
-            .max_stored_path_cells = self.capacity.max_stored_path_cells,
-            .worker_participant_count = @max(@as(usize, 1), self.capacity.worker_participant_count),
-            .max_cached_results = self.capacity.max_cached_results,
-            .max_solved_requests_per_step = self.capacity.max_solved_requests_per_step,
-            .max_stitched_path_cells = self.capacity.max_stitched_path_cells,
-            .chunk_tiles = @max(@as(usize, 1), self.capacity.nav_chunk_tiles),
-            .link_count = link_count,
-        };
+        // Gates against the elastic-CEILING caps (see budgetForCapacity), so a later
+        // adjustCapacityForAgentCount growth can never reserve past the admitted budget.
+        const budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
         try self.graph.rebuild(data, world, bounds_width, bounds_height, cell_size, self.capacity.nav_chunk_tiles, budget, thread_system);
         // The init per-level builds (inside rebuild) grow each level's portal/edge
         // buffers to their real size; clearRetainingCapacity keeps that high-water mark.
@@ -450,17 +440,18 @@ pub const PathfindingSystem = struct {
     pub fn applyNavUpdates(
         self: *PathfindingSystem,
         data: *const DataSystem,
-        world: ?*const WorldSystem,
+        world: *const WorldSystem,
         edits: []const NavCellEdit,
     ) !NavUpdateStats {
-        return self.applyNavUpdatesImpl(data, world, edits, &.{}, null);
+        return self.applyNavUpdatesImpl(data, world, edits, &.{}, &.{}, null);
     }
 
     fn applyNavUpdatesImpl(
         self: *PathfindingSystem,
         data: *const DataSystem,
-        world: ?*const WorldSystem,
+        world: *const WorldSystem,
         edits: []const NavCellEdit,
+        cell_edits: []const types.ChangedSpan,
         full_level_ids: []const u16,
         thread_system: ?*ThreadSystem,
     ) !NavUpdateStats {
@@ -481,6 +472,7 @@ pub const PathfindingSystem = struct {
             data,
             world,
             edits,
+            cell_edits,
             full_level_ids,
             &self.affected_levels,
             self.capacity.nav_full_relabel_level_threshold,
@@ -498,13 +490,7 @@ pub const PathfindingSystem = struct {
                 self.completed.clear();
             } else {
                 // Incremental edit: evict only cached paths that cross the changed cells.
-                // When world is null the span derivation cannot run, so drop the entire
-                // completed cache to avoid serving stale paths through now-blocked cells.
-                if (world != null) {
-                    try self.evictCachedPathsCrossingEdits(world, edits);
-                } else {
-                    self.completed.clear();
-                }
+                try self.evictCachedPathsCrossingEdits(world, edits, cell_edits);
             }
             // Short-lived pending/unavailable/group state is dropped and rebuilt.
             self.clearRequestStateKeepingCompleted();
@@ -517,6 +503,7 @@ pub const PathfindingSystem = struct {
     // an error path that skips the apply never leaks stale edits into the next step.
     pub fn clearNavDirty(self: *PathfindingSystem) void {
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_cell_spans.clearRetainingCapacity();
         self.nav_dirty_levels.clearRetainingCapacity();
     }
 
@@ -525,6 +512,16 @@ pub const PathfindingSystem = struct {
     // dropped cell would leave the nav graph stale against the world.
     pub fn markNavDirty(self: *PathfindingSystem, level: u16, x: u16, y: u16) !void {
         try self.nav_dirty_edits.append(self.allocator, .{ .level = level, .x = x, .y = y });
+    }
+
+    // Records one entity-driven static-obstacle world-space rect for the next incremental
+    // update, resolved to a nav-cell span immediately so the buffered batch never re-derives
+    // it from a stale entity. A no-op when `level` has no built grid. Grows the buffer rather
+    // than dropping, matching markNavDirty.
+    pub fn markNavObstacleRectDirty(self: *PathfindingSystem, level: u16, rect: ObstacleWorldRect) !void {
+        const grid = self.graph.grid(level) orelse return;
+        const span = grid.cellSpanForWorldRect(rect.min_x, rect.min_y, rect.max_x, rect.max_y);
+        try self.nav_dirty_cell_spans.append(self.allocator, .{ .level = level, .span = span });
     }
 
     // Marks a whole level for re-derivation next update. Use when a change cannot be reduced to
@@ -537,17 +534,30 @@ pub const PathfindingSystem = struct {
         try self.nav_dirty_levels.append(self.allocator, level);
     }
 
-    // Whether any dirty nav cell or whole-level request is buffered for this step.
-    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
-        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    // Defensive fallback for reactToPostCommitNavEvents: an entity-driven obstacle event that
+    // invalidates navigation but carries no resolvable world-space rect. Should be unreachable
+    // (isStaticNavigationObstacle requires movement_body + collision_bounds + collision_response,
+    // exactly what staticObstacleWorldRect needs), so this is loud rather than a silent whole-level
+    // rebuild, matching the edge-cap-fallback warn pattern in nav_graph.zig.
+    fn markNavLevelDirtyWithFallbackWarn(self: *PathfindingSystem, level: u16) !void {
+        if (comptime logging.enabled(.warn) and !builtin.is_test)
+            logging.game.warn("nav obstacle invalidation with no resolvable world rect; falling back to whole-level dirty (level {})", .{level});
+        try self.markNavLevelDirty(level);
     }
 
-    // Applies the buffered dirty nav cells (and whole-level requests) as one incremental update,
-    // then clears the buffers. Returns zero stats when nothing is buffered. A non-null
-    // thread_system lets the chunk patch thread (tuner-gated); null keeps it serial.
-    pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: ?*const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_levels.items, thread_system);
+    // Whether any dirty nav cell, obstacle rect, or whole-level request is buffered for this step.
+    pub fn hasPendingNavUpdates(self: *const PathfindingSystem) bool {
+        return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_cell_spans.items.len != 0 or self.nav_dirty_levels.items.len != 0;
+    }
+
+    // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
+    // incremental update, then clears the buffers. Returns zero stats when nothing is
+    // buffered. A non-null thread_system lets the chunk patch thread (tuner-gated); null keeps
+    // it serial.
+    pub fn applyBufferedNavUpdates(self: *PathfindingSystem, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
+        const stats = try self.applyNavUpdatesImpl(data, world, self.nav_dirty_edits.items, self.nav_dirty_cell_spans.items, self.nav_dirty_levels.items, thread_system);
         self.nav_dirty_edits.clearRetainingCapacity();
+        self.nav_dirty_cell_spans.clearRetainingCapacity();
         self.nav_dirty_levels.clearRetainingCapacity();
         return stats;
     }
@@ -556,12 +566,18 @@ pub const PathfindingSystem = struct {
     // into dirty nav cells, folds them into the existing nav graph incrementally (affected levels
     // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
     // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
-    // changes carry no resolvable cell, so level 0 (the only level sourcing collision bodies) is
-    // marked whole-level dirty. Returns the batch stats (zero when nothing was pending).
+    // changes resolve their carried world-space rect to a nav-cell span and patch only the
+    // affected chunks, same as tile edits. Returns the batch stats (zero when nothing was pending).
+    //
+    // Deliberately does NOT clear the dirty buffers at entry: applyBufferedNavUpdates only
+    // clears them after a successful apply (see its doc comment), so an error here (e.g. this
+    // function's own `try` on ensureCanAppend, or a propagated applyNavUpdatesImpl failure)
+    // leaves this step's marks in the buffer for the NEXT call's marking pass to union with and
+    // retry — matching the buffer's own "grows rather than drops" contract across a failed step,
+    // not just within one. Re-applying an already-applied cell is always safe (a nav-cell edit
+    // re-derives its blocked state from current data/world, never from a stale snapshot), so the
+    // union is never wrong, only possibly redundant.
     pub fn reactToPostCommitNavEvents(self: *PathfindingSystem, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem, thread_system: ?*ThreadSystem) !NavUpdateStats {
-        // Clear first so a skipped apply never leaks stale edits into the next step.
-        self.clearNavDirty();
-        var entity_obstacle_change = false;
         for (frame.events.mergedItems()) |event| {
             if (event.stage != .structural_commit) continue;
             if (!eventInvalidatesNavigation(event)) continue;
@@ -576,10 +592,28 @@ pub const PathfindingSystem = struct {
                         }
                     }
                 },
-                else => entity_obstacle_change = true,
+                .entity_destroyed => |destroyed| {
+                    if (destroyed.obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                    } else {
+                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                    }
+                },
+                .component_changed => |changed| {
+                    if (changed.old_obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                    } else if (changed.was_static_navigation_obstacle) {
+                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                    }
+                    if (changed.new_obstacle_world_rect) |rect| {
+                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                    } else if (changed.is_static_navigation_obstacle) {
+                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                    }
+                },
+                else => {},
             }
         }
-        if (entity_obstacle_change) try self.markNavLevelDirty(0);
 
         if (!self.hasPendingNavUpdates()) return .{};
         try frame.events.ensureCanAppend(1);
@@ -646,24 +680,33 @@ pub const PathfindingSystem = struct {
             template.collision_bounds != null;
     }
 
-    // Evicts cached paths crossing this batch's changed-cell spans.
-    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: ?*const WorldSystem, edits: []const NavCellEdit) !void {
-        const world_system = world orelse return;
-        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len);
+    // Evicts cached paths crossing this batch's changed-cell spans (tile edits plus
+    // entity-driven obstacle-rect edits, already resolved to nav-cell spans).
+    fn evictCachedPathsCrossingEdits(self: *PathfindingSystem, world: *const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan) !void {
+        try self.nav_changed_spans.ensureTotalCapacity(self.allocator, edits.len + cell_edits.len);
         self.nav_changed_spans.clearRetainingCapacity();
         for (edits) |edit| {
             const grid = self.graph.grid(edit.level) orelse continue;
-            const span = grid.navSpanForTile(world_system, edit) orelse continue;
-            // One-cell halo: also evict paths running ALONGSIDE the change so an agent
-            // beside a newly-opened cell re-solves into the opening.
-            self.nav_changed_spans.appendAssumeCapacity(.{ .level = edit.level, .span = .{
-                .min_x = span.min_x -| 1,
-                .min_y = span.min_y -| 1,
-                .max_x = @min(span.max_x + 1, grid.width - 1),
-                .max_y = @min(span.max_y + 1, grid.height - 1),
-            } });
+            const span = grid.navSpanForTile(world, edit) orelse continue;
+            self.appendChangedSpanWithHalo(edit.level, span, grid.width, grid.height);
+        }
+        for (cell_edits) |edit| {
+            const grid = self.graph.grid(edit.level) orelse continue;
+            self.appendChangedSpanWithHalo(edit.level, edit.span, grid.width, grid.height);
         }
         self.completed.evictCrossing(&self.graph, self.nav_changed_spans.items);
+    }
+
+    // One-cell halo: also evicts paths running ALONGSIDE the change so an agent beside a
+    // newly-opened cell re-solves into the opening. Shared by the tile-edit and entity-driven
+    // cell-edit passes above.
+    fn appendChangedSpanWithHalo(self: *PathfindingSystem, level: u16, span: types.NavSpan, grid_width: usize, grid_height: usize) void {
+        self.nav_changed_spans.appendAssumeCapacity(.{ .level = level, .span = .{
+            .min_x = span.min_x -| 1,
+            .min_y = span.min_y -| 1,
+            .max_x = @min(span.max_x + 1, grid_width - 1),
+            .max_y = @min(span.max_y + 1, grid_height - 1),
+        } });
     }
 
     fn dropGroupFields(self: *PathfindingSystem) void {
@@ -713,18 +756,18 @@ pub const PathfindingSystem = struct {
     // their stored cells index into (start level for cross-level corridors).
     fn statusForKeyAndStart(self: *const PathfindingSystem, key: PathQueryKey, start_level: u16, start_index: usize, waypoint_hint: ?*u32) PathView {
         if (self.findGroupField(key)) |field| {
-            if (field.state == .ready) {
-                // The group field is built on the goal level. Sample at the agent's
-                // cell when it is on that level; otherwise the field is not its
-                // refinement (a cross-level agent uses the individual corridor).
-                if (start_level == key.goal_level) {
-                    if (self.graph.grid(key.goal_level)) |goal_grid| {
-                        if (field.sample(goal_grid, start_index)) |waypoint| {
-                            return .{ .status = .available, .next_waypoint = waypoint, .path_len = 2 };
-                        }
+            if (field.state == .ready and start_level == key.goal_level) {
+                // The group field is built on the goal level; sample at the agent's cell.
+                if (self.graph.grid(key.goal_level)) |goal_grid| {
+                    if (field.sample(goal_grid, start_index)) |waypoint| {
+                        return .{ .status = .available, .next_waypoint = waypoint, .path_len = 2 };
                     }
-                    return .{ .status = .unavailable };
                 }
+                // Sample miss (or no grid): the field simply does not cover this cell (e.g. a
+                // same-level but different-component agent) — not a definitive negative. Fall
+                // through to the individual cache/pending/negative-cache path below, mirroring
+                // the cross-level agent's exemption: an individual abstract-corridor solve may
+                // still reach the goal via a link this level-local field never routes through.
             }
         }
         if (self.completed.freshSlotIndex(key, self.step_counter, types.default_cache_ttl_steps)) |slot| {
@@ -782,6 +825,11 @@ pub const PathfindingSystem = struct {
         var group_timer = PhaseTimer.begin();
         self.serviceGroupFields(stats);
         stats.group_service_ns = group_timer.lap();
+        // Diagnostic only: how many DISTINCT group keys were tallied this step, after
+        // decay/compaction. Distinguishes "one goal whose build never catches up" (this
+        // stays 1) from "several competing goals thrashing the group_fields slot table"
+        // (this stays near/above max_group_fields) when reading a live capture.
+        stats.distinct_group_keys = self.group_requests.items.len;
         return self.effectiveSolveLimit(config);
     }
 
@@ -806,6 +854,15 @@ pub const PathfindingSystem = struct {
         stats.publish_ns = publish_timer.lap();
         stats.pending_requests = self.pending.items.len;
         stats.deferred_requests = self.pending.items.len;
+        // Aggregate this step's worst per-worker stitch segment usage (see
+        // SearchScratch.max_stitch_segments_used), then clear each worker's counter so
+        // next step's aggregation reflects only next step's solves.
+        for (self.scratch_slots.items) |*scratch| {
+            if (scratch.max_stitch_segments_used > stats.max_stitch_segments_observed) {
+                stats.max_stitch_segments_observed = scratch.max_stitch_segments_used;
+            }
+            scratch.max_stitch_segments_used = 0;
+        }
     }
 
     pub fn update(self: *PathfindingSystem, requests: *const RangeOutputStream(PathRequest), agent_count: usize, thread_system: *ThreadSystem, config: PathfindingConfig) !PathfindingStats {
@@ -821,15 +878,16 @@ pub const PathfindingSystem = struct {
             }
             // The configured participant count sized the per-cell scratch at the nav
             // build. In a correct configuration scratch is sized to participantSlotCount
-            // (the app/bench reserve with it), so the clamp below is a no-op. A debug
-            // build asserts that contract loudly to catch a reserve/thread-system
-            // mismatch during development; a release build silently clamps the worker
-            // fan-out to the reserved scratch (below) so worker indices stay in range and
-            // pathfinding degrades to fewer workers rather than failing the frame. The warn
-            // is dropped: it sat on the per-fixed-step path and would spam every step under
-            // a misconfiguration whose inputs are step-invariant. Scratch is never grown
-            // past the memory-budgeted count, and the solve loop stays allocation-free.
-            std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
+            // (the app/bench reserve with it), so the clamp below is a no-op. A Debug-gated
+            // assert (never lowered to `unreachable` in ReleaseFast, unlike a plain
+            // std.debug.assert) catches a reserve/thread-system mismatch loudly during
+            // development; a release build silently clamps the worker fan-out to the
+            // reserved scratch (below) so worker indices stay in range and pathfinding
+            // degrades to fewer workers rather than failing the frame. The warn is dropped:
+            // it sat on the per-fixed-step path and would spam every step under a
+            // misconfiguration whose inputs are step-invariant. Scratch is never grown past
+            // the memory-budgeted count, and the solve loop stays allocation-free.
+            if (builtin.mode == .Debug) std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
             const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
             const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
                 @min(requested, max_workers_for_scratch)
@@ -856,11 +914,20 @@ pub const PathfindingSystem = struct {
         var solve_timer = PhaseTimer.begin();
         self.prepareSolvePhase(solve_count, self.effectiveFallbackLimit(config), &stats);
         if (self.fallback_indices.items.len != 0) {
-            if (self.scratch_slots.items.len == 0) return error.PathfindingScratchCapacityExceeded;
-            self.resetSolvedPaths();
-            const scratch = &self.scratch_slots.items[0];
-            for (self.fallback_indices.items, 0..) |pending_index, path_slot| {
-                self.solve_results.items[pending_index] = solveOne(self, pending_index, scratch, path_slot);
+            // Mirrors the threaded path's misconfiguration contract (see update()'s
+            // Debug-gated assert): reserve() always provisions at least one scratch slot
+            // (applyDerivedCapacity's @max(1, ...)), so an empty scratch_slots here means
+            // this was called before reserve() — a caller bug, not a runtime condition.
+            // Debug-gated assert catches it loudly in development; a release build
+            // degrades gracefully (every fallback entry stays .deferred and is retried
+            // once initialized) instead of an OOB scratch read or a one-off named error.
+            if (builtin.mode == .Debug) std.debug.assert(self.scratch_slots.items.len != 0);
+            if (self.scratch_slots.items.len != 0) {
+                self.resetSolvedPaths();
+                const scratch = &self.scratch_slots.items[0];
+                for (self.fallback_indices.items, 0..) |pending_index, path_slot| {
+                    self.solve_results.items[pending_index] = solveOne(self, pending_index, scratch, path_slot);
+                }
             }
         }
         stats.fallback_batch = .{
@@ -901,17 +968,31 @@ pub const PathfindingSystem = struct {
             if (prepared.kind == .group) {
                 self.recordGroupRequest(prepared.key);
                 // A ready group field is the authoritative answer ONLY for members
-                // already on the goal level: the field is built on the goal level
-                // and an off-level member cannot sample it. A ready field for an
-                // off-level member must NOT short-circuit, or that member would stall
-                // forever; it falls through to individual cross-level acceptance and
-                // gets its own corridor across the link.
+                // already on the goal level AND actually covered by it: the field is
+                // built on the goal level and an off-level member cannot sample it. A
+                // ready field for an off-level member must NOT short-circuit, or that
+                // member would stall forever; it falls through to individual
+                // cross-level acceptance and gets its own corridor across the link.
+                // Same-level members must ALSO verify the field can sample their own
+                // cell (not just that the field is ready): a different chunk-local
+                // component reads as a sample miss, not "serviced" — short-circuiting
+                // it anyway would drop the request with no individual solve ever
+                // queued, matching statusForKeyAndStart's mirrored fall-through.
                 if (prepared.start_level == prepared.key.goal_level) {
                     if (self.findGroupField(prepared.key)) |field| {
                         if (field.state == .ready) {
-                            stats.group_field_samples += 1;
-                            stats.duplicate_requests += 1;
-                            continue;
+                            const sampled = if (self.graph.grid(prepared.key.goal_level)) |goal_grid|
+                                if (goal_grid.indexForCell(prepared.start)) |start_index|
+                                    field.sample(goal_grid, start_index) != null
+                                else
+                                    false
+                            else
+                                false;
+                            if (sampled) {
+                                stats.group_field_samples += 1;
+                                stats.duplicate_requests += 1;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1036,6 +1117,17 @@ pub const PathfindingSystem = struct {
         // goal crossed into a new nav cell. Rebuild only if throttle elapsed.
         if (self.staleGroupSlot(key)) |slot_index| {
             const field = &self.group_fields.items[slot_index];
+            // An in-progress build is NEVER interrupted by a rekey, regardless of the
+            // throttle: restarting it discards every cell it has already flooded for no
+            // benefit (the caller still gets a stale-but-progressing field either way),
+            // and a build whose natural completion time exceeds the throttle window would
+            // otherwise restart forever without ever reaching `.ready` — a permanent
+            // stall, not a transient staleness. The field keeps advancing every step via
+            // serviceGroupFields' own "still building" loop regardless of this early-out.
+            if (field.state == .building) {
+                stats.group_field_rebuild_throttled += 1;
+                return;
+            }
             const elapsed = self.step_counter -% field.last_build_step;
             if (elapsed < self.capacity.group_field_rebuild_min_steps) {
                 // Throttled: keep the slightly stale field for general direction.
@@ -1061,7 +1153,7 @@ pub const PathfindingSystem = struct {
 
     fn buildGroupSlot(self: *PathfindingSystem, field: *GroupField, key: PathQueryKey, goal_index: usize, stats: *PathfindingStats) void {
         const grid = self.graph.grid(key.goal_level) orelse return;
-        if (field.beginBuild(grid, key, goal_index, self.step_counter)) {
+        if (field.beginBuild(grid, key, goal_index, self.step_counter, self.capacity.group_field_max_cells)) {
             _ = field.expand(grid, self.capacity.group_field_build_budget);
             field.fresh_this_step = true;
             stats.group_fields_built += 1;
@@ -1113,22 +1205,29 @@ pub const PathfindingSystem = struct {
         const capacity = self.prepared_requests.capacity;
         const limit = @min(requests.len, capacity);
         stats.dropped_requests += requests.len - limit;
-        // Clamp levels to the built range so a stray level never indexes out of
-        // bounds; an unknown level resolves to level 0's mask (fail-safe).
+        // Reject (drop, never clamp) an out-of-range level: the query path
+        // (statusForWorld -> NavGraph.grid) already rejects the same condition as
+        // unavailable, so clamping here would accept and solve/cache a request against
+        // level 0 that the requester's own later query can never read back (it queries
+        // its real, still out-of-range level and gets unavailable) — a wasted solve that
+        // silently burns a fallback slot every step. Matching the query path's rejection
+        // means the caller sees dropped_requests reflect the real, unusable request.
         const level_count: u16 = @intCast(self.graph.levelCount());
         for (requests[0..limit]) |request| {
-            const goal_level = if (request.goal_level < level_count) request.goal_level else 0;
-            const start_level = if (request.start_level < level_count) request.start_level else 0;
-            const goal_grid = self.graph.grid(goal_level).?;
-            const start_grid = self.graph.grid(start_level).?;
+            if (request.goal_level >= level_count or request.start_level >= level_count) {
+                stats.dropped_requests += 1;
+                continue;
+            }
+            const goal_grid = self.graph.grid(request.goal_level).?;
+            const start_grid = self.graph.grid(request.start_level).?;
             self.prepared_requests.appendAssumeCapacity(.{
                 .entity = request.entity,
                 .kind = request.kind,
-                .start_level = start_level,
+                .start_level = request.start_level,
                 .key = .{
                     .nav_version = self.graph.version,
                     .agent_class = request.agent_class,
-                    .goal_level = goal_level,
+                    .goal_level = request.goal_level,
                     .goal = goal_grid.worldToCellClamped(request.goal),
                 },
                 .start = start_grid.worldToCellClamped(request.start),
@@ -1177,14 +1276,28 @@ pub const PathfindingSystem = struct {
     // from a sequential scan of 0..solve_count, so the list is strictly increasing and
     // every entry is distinct. Concurrent solveFallbackJob writes use these as
     // solve_results indices; disjointness of those writes depends on this uniqueness.
+    // A tier-1 (escalated) request is additionally capped at max_escalated_solves_per_step
+    // admissions this step, since tier-1 uses the larger derived abstract-node/stitched-cell
+    // ceiling and is the expensive attempt; a tier-1-ready request past the cap is simply
+    // skipped (stays .deferred, so compactPendingAfterSolve leaves it in place to retry next
+    // step) without consuming a fallback_limit slot, so tier-0 requests keep filling the rest.
     fn prepareFallbackIndices(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
+        var escalated_admitted: usize = 0;
         for (self.solve_results.items[0..solve_count], 0..) |result, pending_index| {
-            if (result == .deferred) {
-                if (self.fallback_indices.items.len < fallback_limit) {
-                    self.fallback_indices.appendAssumeCapacity(pending_index);
-                } else {
-                    stats.fallback_deferred_requests += 1;
+            if (result != .deferred) continue;
+            const is_escalated = self.pending.items[pending_index].tier != 0;
+            if (is_escalated and escalated_admitted >= self.capacity.max_escalated_solves_per_step) {
+                stats.escalated_deferred += 1;
+                continue;
+            }
+            if (self.fallback_indices.items.len < fallback_limit) {
+                self.fallback_indices.appendAssumeCapacity(pending_index);
+                if (is_escalated) {
+                    escalated_admitted += 1;
+                    stats.escalated_solves += 1;
                 }
+            } else {
+                stats.fallback_deferred_requests += 1;
             }
         }
     }
@@ -1210,6 +1323,11 @@ pub const PathfindingSystem = struct {
                 .budget_exhausted => {
                     stats.budget_exhausted += 1;
                 },
+                // Start-side failure: dropped in compactPendingAfterSolve without
+                // negative-caching; the next status query falls through to `.missing`.
+                .start_invalid => {
+                    stats.start_invalid_dropped += 1;
+                },
                 .deferred => continue,
             }
         }
@@ -1217,13 +1335,19 @@ pub const PathfindingSystem = struct {
     }
 
     // Compacts pending after a solve. Solved entries (available/unavailable) are removed.
-    // Deferred entries (not attempted this frame) keep their front order. A budget-exhausted
-    // entry is aged: kept in front until rotate threshold, then rotated to the BACK so the
-    // untouched tail reaches the solve window, then demoted to a hard negative once it has
-    // never fit the per-solve budget across enough retries. Solve-window writes target
-    // indices <= their source, so the in-place rewrite never clobbers an unread entry; the
-    // rotated copies live in rotate_back_scratch. pending_keys is updated in-place: keys for
-    // solved/dropped entries are removed individually; deferred, rotating, and tail keys stay.
+    // Deferred entries (not attempted this frame, including a tier-1-ready request skipped
+    // by the escalated-solve cap) keep their front order. A budget-exhausted entry follows
+    // the two-tier ladder: tier 0 (the cheap, fixed-budget attempt) promotes to tier 1 and
+    // rotates to the BACK of pending exactly once, so the untouched tail reaches the solve
+    // window before the promoted entry retries at the larger — but still fixed, never
+    // derived from world/graph size — tier-1 budget; a budget-exhausted AT tier 1 drops the
+    // entry WITHOUT negative-caching (it does not fit either fixed budget, which is not the
+    // same as a definitive "no path exists") — worst case exactly two solve attempts per
+    // request, never an unbounded retry storm and never a false `.unavailable`. Solve-window
+    // writes target indices <= their source, so the in-place rewrite never clobbers an
+    // unread entry; the rotated copies live in rotate_back_scratch. pending_keys is updated
+    // in-place: keys for solved/dropped entries are removed individually; deferred,
+    // rotating, and tail keys stay.
     fn compactPendingAfterSolve(self: *PathfindingSystem, solve_count: usize, stats: *PathfindingStats) void {
         if (solve_count == 0) return;
         self.rotate_back_scratch.clearRetainingCapacity();
@@ -1236,23 +1360,34 @@ pub const PathfindingSystem = struct {
                 },
                 .budget_exhausted => |key| {
                     var request = self.pending.items[pending_index];
-                    request.retries +|= 1;
-                    if (request.retries >= budget_exhausted_drop_after) {
-                        // Chronic spiller: a request that never fits the per-solve budget.
-                        // Negative-cache it so it stops consuming a solve slot every frame.
-                        if (!self.unavailable.insert(key)) stats.cache_evictions += 1;
-                        stats.unavailable_results += 1;
-                        self.pending_keys.remove(key);
-                    } else if (request.retries >= budget_exhausted_rotate_after) {
-                        // Entry moves to the back of pending; key stays in pending_keys.
+                    if (request.tier == 0) {
+                        // First (tier-0) attempt exhausted its small fixed attempt cap: promote
+                        // to tier 1 and rotate to the back so the untouched tail makes progress
+                        // before this entry retries at the larger (still fixed, not derived
+                        // from world/graph size) tier-1 budget.
+                        request.tier = 1;
                         self.rotate_back_scratch.appendAssumeCapacity(request);
                     } else {
-                        self.pending.items[write_index] = request;
-                        write_index += 1;
+                        // Tier 1 (the larger fixed ceiling) still exhausted: this is NOT a
+                        // definitive negative — it only means the request did not fit either
+                        // fixed budget, not that no path exists (`unavailable` is reserved for
+                        // structural negatives: disconnected component, no corridor). Drop it
+                        // from pending WITHOUT negative-caching, so the next status query falls
+                        // through to `.missing` (statusForKeyAndStart's fallthrough) rather than
+                        // a false "no path". The caller (steering) already treats `.missing` the
+                        // same as `.pending`/`.unavailable` for movement (direct-fallback steering
+                        // toward the goal, see steering.zig's directionFromPathStatus) and
+                        // re-requests after its own replan cooldown, so a genuinely-hard case
+                        // costs at most two solve attempts per replan cycle, not a permanent
+                        // wrong answer or an unbounded retry storm.
+                        stats.escalated_dropped += 1;
+                        self.pending_keys.remove(key);
                     }
                 },
                 else => {
-                    // available/unavailable: solved and removed from pending.
+                    // available/unavailable/start_invalid: removed from pending. A
+                    // start_invalid entry was never negative-cached, so its next
+                    // status query is `.missing` and the caller may re-request.
                     self.pending_keys.remove(self.pending.items[pending_index].key);
                 },
             }
@@ -1274,7 +1409,6 @@ pub const PathfindingSystem = struct {
 // Tests
 // ----------------------------------------------------------------------------
 
-const builtin = @import("builtin");
 const GridCell = types.GridCell;
 const PathStatus = types.PathStatus;
 const GroupFieldState = @import("group_field.zig").GroupFieldState;
@@ -1310,6 +1444,41 @@ test "pathfinding individual solve produces deterministic available path and way
     try std.testing.expect(view.path_len >= 2);
 }
 
+test "pathfinding blocked start drops without poisoning the goal for other agents" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // A static body covers cell (0,0), so an agent standing there has a blocked start.
+    _ = try addNavBody(&data, .{ .x = 8, .y = 8 }, .{ .x = 8, .y = 8 }, true);
+    const blocked_agent = try addNavBody(&data, .{ .x = 8, .y = 8 }, .{ .x = 8, .y = 8 }, false);
+    const open_agent = try addNavBody(&data, .{ .x = 40, .y = 40 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 128, 128, 32);
+
+    // The blocked agent requests first: a start-side drop, never a goal negative.
+    var blocked_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer blocked_stream.deinit();
+    try appendPathRequest(&blocked_stream, .{ .entity = blocked_agent, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
+    const blocked_stats = try system.updateSerial(&blocked_stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), blocked_stats.start_invalid_dropped);
+    try std.testing.expectEqual(@as(usize, 0), blocked_stats.unavailable_results);
+
+    // The goal must read missing (retryable) from an open start, not unavailable.
+    const probe = system.statusForWorld(0, .{ .x = 40, .y = 40 }, 0, .{ .x = 96, .y = 96 }, .default, null);
+    try std.testing.expectEqual(PathStatus.missing, probe.status);
+
+    // The open agent's request for the SAME goal succeeds on the next step.
+    var open_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer open_stream.deinit();
+    try appendPathRequest(&open_stream, .{ .entity = open_agent, .start = .{ .x = 40, .y = 40 }, .goal = .{ .x = 96, .y = 96 } });
+    const open_stats = try system.updateSerial(&open_stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), open_stats.available_results);
+    const view = system.statusForWorld(0, .{ .x = 40, .y = 40 }, 0, .{ .x = 96, .y = 96 }, .default, null);
+    try std.testing.expectEqual(PathStatus.available, view.status);
+}
+
 test "pathfinding zero fallback budget leaves an empty fallback list without panicking" {
     // A zero fallback budget with pending work yields an empty fallback_indices, which
     // must not panic the strict-increase verification slice (items[1..]) in either path.
@@ -1319,7 +1488,15 @@ test "pathfinding zero fallback budget leaves an empty fallback list without pan
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    try system.reserve(baselineCapacity());
+    // worker_participant_count=4 (workers + main) matches the threaded section's real
+    // ThreadSystem below (max_worker_threads=2 -> up to 3 participants): reserving at
+    // baselineCapacity's serial default (1) would violate update()'s reserve/thread-system
+    // assert, but this test's zero fallback budget happens to keep fallback_indices empty
+    // every call, skipping that assert entirely and masking the mismatch instead of
+    // genuinely satisfying the contract.
+    var capacity = baselineCapacity();
+    capacity.worker_participant_count = 4;
+    try system.reserve(capacity);
     try system.rebuildStaticNavGrid(&data, 128, 128, 32);
 
     var serial_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
@@ -1438,6 +1615,34 @@ test "pathfinding rejects disconnected goals" {
     try std.testing.expectEqual(PathStatus.unavailable, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, .{ .x = 128, .y = 8 }, .default, null).status);
 }
 
+test "pathfinding drops an out-of-range level request instead of clamping and solving a goal it can never read back" {
+    // The query path (statusForWorld -> NavGraph.grid) rejects an out-of-range level as
+    // unavailable; the accept path must match that rejection instead of silently clamping
+    // to level 0 and burning a solve on a goal the requester's own later query (against its
+    // real, still out-of-range level) can never observe.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    // Single-level grid: level 1 is out of range.
+    try system.rebuildStaticNavGrid(&data, 128, 128, 32);
+    try std.testing.expectEqual(@as(usize, 1), system.graph.levelCount());
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .goal_level = 1, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 96, .y = 96 } });
+
+    const stats = try system.updateSerial(&stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), stats.dropped_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.accepted_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.available_results);
+    try std.testing.expectEqual(@as(usize, 0), stats.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.items.len);
+}
+
 test "pathfinding deferred_requests equals post-compaction pending in both update paths" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1532,6 +1737,91 @@ test "pathfinding group mode builds one shared field sampled by all agents" {
 
     const view = system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, view.status);
+}
+
+test "pathfinding same-level group agent falls through on a field-sample miss instead of a hard unavailable" {
+    // A ready field does not cover every same-level cell (e.g. one blocked by a body added
+    // after the field built): a sample miss there must fall through to the individual
+    // cache/pending/negative-cache path, exactly like an off-level member already does —
+    // never a blind `.unavailable` that starves the agent of any real solve attempt.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const c = try addNavBody(&data, .{ .x = 64, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    // A cell the field will never reach: a static body wholly covering it, present from
+    // the initial build so no mid-test incremental rebuild is needed.
+    _ = try addNavBody(&data, .{ .x = 224, .y = 224 }, .{ .x = 32, .y = 32 }, true);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(3, 3);
+    const goal = math.Vec2{ .x = 200, .y = 200 };
+    try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+    try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+    try appendPathRequest(&stream, .{ .entity = c, .kind = .group, .start = .{ .x = 72, .y = 8 }, .goal = goal });
+
+    // Builds and readies the shared field (mirrors "pathfinding group mode builds one
+    // shared field sampled by all agents").
+    _ = try system.updateSerial(&stream, 8, .{});
+    var ready_field_count: usize = 0;
+    for (system.group_fields.items) |field| {
+        if (field.state == .ready) ready_field_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ready_field_count);
+
+    // Clear the goal-keyed cache the first step's individual fallback solve populated, and
+    // simulate an in-flight solve for it, so the only remaining fallthrough signal is
+    // pending_keys — isolating the field-sample-miss branch from the unrelated cache hit.
+    system.completed.clear();
+    const key = system.graph.keyForWorld(0, goal, .default).?;
+    _ = system.pending_keys.insert(key);
+
+    const blocked_start = math.Vec2{ .x = 240, .y = 240 };
+    const view = system.statusForWorld(0, blocked_start, 0, goal, .default, null);
+    try std.testing.expectEqual(PathStatus.pending, view.status);
+}
+
+test "pathfinding warmed group-field request/sample step is allocation-free" {
+    // Mirrors the first step of "pathfinding group mode builds one shared field sampled by
+    // all agents": once the field reaches .ready, every subsequent step's
+    // recordGroupRequest/serviceGroupFields/ensureGroupField/sample path must not allocate —
+    // it was previously uncovered by any FailingAllocator proof.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const c = try addNavBody(&data, .{ .x = 64, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(3, 3);
+    const goal = math.Vec2{ .x = 200, .y = 200 };
+    try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal });
+    try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal });
+    try appendPathRequest(&stream, .{ .entity = c, .kind = .group, .start = .{ .x = 72, .y = 8 }, .goal = goal });
+
+    // Unmeasured warm-up step: builds the field to .ready (allocation is expected here).
+    const first_stats = try system.updateSerial(&stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), first_stats.group_fields_built);
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    const second_stats = try system.updateSerial(&stream, 8, .{});
+    system.allocator = original;
+
+    try std.testing.expectEqual(@as(usize, 0), second_stats.group_fields_built);
+    try std.testing.expectEqual(@as(usize, 3), second_stats.group_field_samples);
 }
 
 test "pathfinding skips the group flow field below the agent threshold" {
@@ -2486,9 +2776,11 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
     var capacity = abstractCapacity();
-    // A tiny abstract node budget saturates the open/slot table before the search
-    // can reach the goal-level portal, even though a corridor exists.
-    capacity.max_abstract_nodes = 1;
+    // A tiny tier-0 abstract-node ATTEMPT cap saturates the search before it can reach
+    // the goal-level portal, even though a corridor exists. max_abstract_nodes itself is
+    // NOT the right knob here — it is the fixed tier-1 ceiling, large enough that this
+    // tiny world's first attempt would heal long before it saturates.
+    capacity.tier0_abstract_node_cap = 1;
     try system.reserve(capacity);
     try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
 
@@ -2509,6 +2801,224 @@ test "pathfinding abstract saturation returns pending, not a cached unavailable"
     try std.testing.expectEqual(@as(usize, 1), stats.pending_requests);
     const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
     try std.testing.expectEqual(PathStatus.pending, view.status);
+    // The two-tier ladder: the FIRST (tier-0) exhaustion promotes to tier 1 immediately
+    // (not retried at tier 0 repeatedly).
+    try std.testing.expectEqual(@as(u8, 1), system.pending.items[0].tier);
+}
+
+// tier0_stitched_cell_cap and max_stitched_path_cells (the fixed tier-1 ceiling) are
+// independently settable fields, but stitched_scratch is physically reserved to
+// max_stitched_path_cells only (SearchScratch.reserve) — never to the tier-0 field. If a
+// caller tunes tier0_stitched_cell_cap ABOVE the tier-1 ceiling, solveOne must clamp the
+// tier-0 attempt cap down to the physical size rather than handing stitchCorridor a
+// logical cap the reserved buffer cannot back (an unguarded appendAssumeCapacity past the
+// buffer's real capacity is exactly the "unproven reserve" hazard this repo's coding
+// standards call out for ReleaseFast, which strips the backing assert). This pins that a
+// deliberately-inverted config (tier0 far above tier1) still resolves cleanly instead of
+// tripping the reserve invariant.
+test "pathfinding tier0_stitched_cell_cap above the tier-1 ceiling still solves cleanly" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const built = try buildCorridorWorld(&meta, &.{5});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = abstractCapacity();
+    // Deliberately inverted: far above the fixed tier-1 ceiling (abstractCapacity's own
+    // max_stitched_path_cells override).
+    capacity.tier0_stitched_cell_cap = 5000;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
+
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const stats = try solveStep(&system, requester, .{ .x = 16, .y = 176 }, .{ .x = 336, .y = 176 });
+    try std.testing.expectEqual(@as(usize, 1), stats.available_results);
+    try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
+}
+
+// tier0_abstract_node_cap and max_abstract_nodes (the fixed tier-1 ceiling) are
+// independently settable fields, but AbstractScratch.reserve physically sizes
+// slot_capacity from max_abstract_nodes only (max(16, max_abstract_nodes * 2)) —
+// never from the tier-0 field. If a caller tunes tier0_abstract_node_cap ABOVE the
+// tier-1 ceiling, solveOne must clamp the tier-0 attempt cap down to the tier-1
+// ceiling rather than handing abstractCorridor a logical budget the physical slot
+// table cannot back (nodes_used would race past slot_capacity via slotFor's
+// linear-probe loop, saturating far short of the configured cap instead of via the
+// intended budget check). This pins that a deliberately-inverted config (tier0 far
+// above tier1) still resolves cleanly instead of tripping that asymmetry.
+test "pathfinding tier0_abstract_node_cap above the tier-1 ceiling still solves cleanly" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const built = try buildCorridorWorld(&meta, &.{5});
+    var world = built.world;
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = abstractCapacity();
+    // Deliberately inverted: far above the fixed tier-1 ceiling (abstractCapacity's own
+    // max_abstract_nodes default).
+    capacity.tier0_abstract_node_cap = 500_000;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
+
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false);
+    const stats = try solveStep(&system, requester, .{ .x = 16, .y = 176 }, .{ .x = 336, .y = 176 });
+    try std.testing.expectEqual(@as(usize, 1), stats.available_results);
+    try std.testing.expectEqual(@as(usize, 0), stats.budget_exhausted);
+}
+
+// A tier-1 (already-escalated) budget_exhausted drops the request WITHOUT
+// negative-caching: it does not fit either fixed budget, which is not the same as a
+// definitive "no path exists" (unavailable is reserved for structural negatives). The
+// next query falls through to `.missing` (retryable — steering re-requests after its own
+// cooldown) rather than a permanent false negative, and the request cost at most two
+// solve attempts, never an unbounded retry storm. Forces both tiers to exhaust via
+// explicit PathfindingCapacity overrides (tier0_abstract_node_cap for the first attempt,
+// then a direct post-rebuild shrink of the live max_abstract_nodes for the second) on the
+// SAME small fixture as the tier-0 promotion test above — not the full production map.
+test "pathfinding tier-1 budget_exhausted drops to missing (not a false unavailable) after exactly two attempts" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    try world.addLevelLink(.{
+        .kind = .stair,
+        .level_a = 0,
+        .cell_a = .{ .x = 10, .y = 10 },
+        .level_b = 1,
+        .cell_b = .{ .x = 2, .y = 2 },
+        .traversal_cost = 5,
+        .bidirectional = true,
+    });
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = abstractCapacity();
+    capacity.tier0_abstract_node_cap = 1;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{
+        .entity = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 4 }, false),
+        .start_level = 0,
+        .goal_level = 1,
+        .start = .{ .x = 16, .y = 16 },
+        .goal = .{ .x = 304, .y = 304 },
+    });
+
+    // Attempt 1 (tier 0): exhausts and promotes to tier 1.
+    const first = try system.updateSerial(&stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), first.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), system.pending.items.len);
+    try std.testing.expectEqual(@as(u8, 1), system.pending.items[0].tier);
+
+    // Force the SECOND (tier-1) attempt to also exhaust: max_abstract_nodes is the fixed
+    // tier-1 ceiling, read fresh from live capacity on every tier-1 attempt, so shrinking
+    // it here — after the rebuild already sized the (larger) physical scratch — is a
+    // safe, purely LOGICAL cap tightening for the test, not an undersized-buffer hazard.
+    system.capacity.max_abstract_nodes = 1;
+
+    // Attempt 2 (tier 1): exhausts again -> dropped, NOT negative-cached.
+    const second = try system.updateSerial(&stream, 8, .{});
+    try std.testing.expectEqual(@as(usize, 1), second.budget_exhausted);
+    try std.testing.expectEqual(@as(usize, 1), second.escalated_dropped);
+    try std.testing.expectEqual(@as(usize, 0), second.unavailable_results);
+    try std.testing.expectEqual(@as(usize, 0), second.pending_requests);
+    try std.testing.expectEqual(@as(usize, 0), system.pending.items.len);
+    // Exactly two solve attempts total across the two steps (never the old 32-retry storm).
+    try std.testing.expectEqual(@as(usize, 2), first.budget_exhausted + second.budget_exhausted);
+
+    // Dropped, not negative-cached: the next query reads .missing (retryable), never a
+    // false definitive .unavailable for a goal that may genuinely be reachable.
+    const view = system.statusForWorld(0, .{ .x = 16, .y = 16 }, 1, .{ .x = 304, .y = 304 }, .default, null);
+    try std.testing.expectEqual(PathStatus.missing, view.status);
+}
+
+// max_escalated_solves_per_step caps how many tier-1-ready pending requests are admitted
+// into one step's solve batch; the rest simply wait for a later step (still pending, tier
+// unchanged) rather than all attempting the expensive escalated solve in the same step.
+test "pathfinding max_escalated_solves_per_step caps tier-1 admission to exactly N per step" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester_a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const requester_b = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const requester_c = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const requester_d = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_escalated_solves_per_step = 2;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    // Four distinct, trivially-reachable requests, accepted into pending WITHOUT solving
+    // this step (a zero fallback budget defers every one), so all four land in `pending`
+    // at the default tier 0.
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester_a, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 40, .y = 8 } });
+    try appendPathRequest(&stream, .{ .entity = requester_b, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 72, .y = 8 } });
+    try appendPathRequest(&stream, .{ .entity = requester_c, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 104, .y = 8 } });
+    try appendPathRequest(&stream, .{ .entity = requester_d, .start = .{ .x = 8, .y = 8 }, .goal = .{ .x = 136, .y = 8 } });
+    _ = try system.updateSerial(&stream, 8, .{ .max_fallback_requests_per_step = 0 });
+    try std.testing.expectEqual(@as(usize, 4), system.pending.items.len);
+
+    // Promote every pending entry to tier 1 (as if each had already spilled once).
+    for (system.pending.items) |*pending_request| pending_request.tier = 1;
+
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    const stats = try system.updateSerial(&empty, 8, .{});
+    try std.testing.expectEqual(@as(usize, 2), stats.escalated_solves);
+    try std.testing.expectEqual(@as(usize, 2), stats.escalated_deferred);
+    // The two admitted tier-1 requests solved trivially (short, same-level, open goals);
+    // the other two waited out this step and are still pending at tier 1.
+    try std.testing.expectEqual(@as(usize, 2), system.pending.items.len);
+    for (system.pending.items) |pending_request| {
+        try std.testing.expectEqual(@as(u8, 1), pending_request.tier);
+    }
+}
+
+// max_abstract_nodes/max_stitched_path_cells (the tier-1 ceiling) are FIXED constants —
+// never derived from or scaled to world/graph size (see their doc comments in types.zig).
+// Pins that reserve() with no override lands on those fixed defaults regardless of world
+// size, i.e. two systems built over different-sized worlds get the IDENTICAL tier-1
+// budget, not one scaled to its own map.
+test "pathfinding tier-1 abstract/stitched budgets are fixed constants, not scaled to world size" {
+    var small_data = DataSystem.init(std.testing.allocator);
+    defer small_data.deinit();
+    var small = PathfindingSystem.init(std.testing.allocator);
+    defer small.deinit();
+    try small.reserve(baselineCapacity());
+    try small.rebuildStaticNavGrid(&small_data, 256, 256, 32);
+
+    var large_data = DataSystem.init(std.testing.allocator);
+    defer large_data.deinit();
+    var large = PathfindingSystem.init(std.testing.allocator);
+    defer large.deinit();
+    try large.reserve(baselineCapacity());
+    try large.rebuildStaticNavGrid(&large_data, 2048, 2048, 32);
+
+    try std.testing.expectEqual(types.default_tier1_abstract_node_cap, small.capacity.max_abstract_nodes);
+    try std.testing.expectEqual(types.default_tier1_stitched_cell_cap, small.capacity.max_stitched_path_cells);
+    try std.testing.expectEqual(small.capacity.max_abstract_nodes, large.capacity.max_abstract_nodes);
+    try std.testing.expectEqual(small.capacity.max_stitched_path_cells, large.capacity.max_stitched_path_cells);
 }
 
 test "pathfinding chunk-local portal seeding scans only the start chunk's local component" {
@@ -2690,15 +3200,21 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     const view_before = system.statusForWorld(0, start, 0, goal, .default, null);
     try std.testing.expectEqual(PathStatus.available, view_before.status);
 
-    // The cached path must cross the wall through the near gap (row 3): some stored
-    // path cell sits on the wall column at row 3.
-    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 3));
-    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 9));
+    // The cached path must cross the wall through exactly one of the two gaps: which one
+    // the abstract search prefers is a cost-estimate detail (consolidated boundary portals
+    // change the abstract graph's cost landscape without changing which corridors exist),
+    // not the invariant under test — the invariant is that blocking whichever gap was used
+    // forces a reroute through the other.
+    const used_near = cachedPathTouchesCell(&system, start, goal, 5, 3);
+    const used_far = cachedPathTouchesCell(&system, start, goal, 5, 9);
+    try std.testing.expect(used_near != used_far);
+    const used_row: u16 = if (used_near) 3 else 9;
+    const other_row: u16 = if (used_near) 9 else 3;
 
     const version_before = system.graph.version;
 
-    // Flip the near gap (5,3) to a tree (now blocking) via the world tile API.
-    const changed = (try world.setDenseTile(built.wall_layer, 5, 3, tree)) orelse return error.TestExpectedEqual;
+    // Flip the gap the path actually used to a tree (now blocking) via the world tile API.
+    const changed = (try world.setDenseTile(built.wall_layer, 5, used_row, tree)) orelse return error.TestExpectedEqual;
     try std.testing.expect(changed.old_blocks_movement != changed.new_blocks_movement);
     const nav_stats = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
@@ -2706,16 +3222,16 @@ test "pathfinding incremental update reroutes when a corridor gap is flipped to 
     // A pure incremental dig keeps nav_version stable; invalidation is scoped.
     try std.testing.expectEqual(@as(usize, 0), nav_stats.version_bumps);
     try std.testing.expect(system.graph.version == version_before);
-    // The cached path crossed the now-blocked cell (5,3), so it was evicted: missing.
+    // The cached path crossed the now-blocked gap, so it was evicted: missing.
     try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, start, 0, goal, .default, null).status);
 
-    // Next solve produces a DIFFERENT path that avoids the now-blocked near gap and
-    // routes through the far gap (row 9).
+    // Next solve produces a DIFFERENT path that avoids the now-blocked gap and routes
+    // through the other one.
     const after = try solveStep(&system, requester, start, goal);
     try std.testing.expectEqual(@as(usize, 1), after.available_results);
     try std.testing.expectEqual(PathStatus.available, system.statusForWorld(0, start, 0, goal, .default, null).status);
-    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, 3));
-    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, 9));
+    try std.testing.expect(!cachedPathTouchesCell(&system, start, goal, 5, used_row));
+    try std.testing.expect(cachedPathTouchesCell(&system, start, goal, 5, other_row));
 }
 
 // Returns whether the cached completed (or stitched) path for the goal includes the
@@ -2971,6 +3487,50 @@ test "pathfinding buffered nav updates grow without dropping and clear after app
     try std.testing.expect(!system.hasPendingNavUpdates());
 }
 
+test "reactToPostCommitNavEvents preserves buffered marks across a failed apply instead of dropping them" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 128, 128);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 128, 128, 32, null);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    // A real committed tile edit that blocks movement.
+    const changed = (try world.setDenseTile(obstacle, 2, 2, tree)) orelse return error.TestExpectedEqual;
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_tile_changed = changed } });
+    // Cap the events stream at its current size so this call's own ensureCanAppend(1) (for the
+    // nav_region_invalidated event it would emit) fails deterministically, WITHOUT ever reaching
+    // applyBufferedNavUpdates.
+    frame.events.setCapacityLimit(frame.events.mergedItems().len);
+
+    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, &data, &world, null));
+    // The mark from this failed call must survive: no entry-clear on the next call may drop a
+    // pending edit the world already committed but the nav graph has not yet learned about.
+    try std.testing.expect(system.hasPendingNavUpdates());
+    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
+
+    // Next step: no new committed events, room to append again. The leftover mark from the
+    // failed step must still reach the graph.
+    frame.events.setCapacityLimit(null);
+    frame.beginStep();
+    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    try std.testing.expect(!system.hasPendingNavUpdates());
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
+}
+
 test "pathfinding incremental update is allocation-free at steady state (within init high-water mark)" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3133,6 +3693,14 @@ test "pathfinding incremental update expands beyond init high-water mark with bo
             try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
         }
     }
+    // Border-run consolidation (nav_graph.zig's discoverChunkPortals) means the opened
+    // block no longer produces enough edges on its own to exceed chunk_edge_floor, so this
+    // scenario alone would land within the (still-zero-derived) window rather than forcing
+    // the growth this test exercises. Force it directly instead, the same way
+    // "compactChunkEdges zeroes the chunk's edge counts on overflow..." does — the point
+    // under test is the growth/no-further-allocation CONTRACT, not this specific
+    // geometry's edge count.
+    for (system.graph.chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 1), stats.version_bumps);
@@ -3354,6 +3922,86 @@ test "pathfinding capacity stays unchanged across a steady-state solve" {
     }
 }
 
+test "pathfinding capacity shrink preserves surviving pending keys/tiers and counts the rest as dropped" {
+    // Live deferred (never-solved) pending requests must survive a resize with their key and
+    // tier intact, and pending_keys must be rebuilt to match exactly the survivors — a drop
+    // past the new smaller capacity is real lost work and must be counted via resize_dropped,
+    // not silently discarded. Previously uncovered by any test.
+    //
+    // pending_count is deliberately large (not derived from min_capacity_floor): resizeArrayList
+    // shrinks-and-frees to 0 then re-reserves the floor capacity, and the allocator's own
+    // size-class rounding can hand back a live capacity well above the requested floor. A large
+    // pending_count guarantees an actual truncation regardless of that rounding, so the test
+    // reads the real post-resize survivor count rather than asserting one derived in advance.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const pending_count = 200;
+    var requesters: [pending_count]EntityId = undefined;
+    for (0..pending_count) |i| {
+        requesters[i] = try addNavBody(&data, .{ .x = @floatFromInt(i * 16), .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = pending_count;
+    capacity.capacity_shrink_window = 2;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 8192, 8192, 32);
+
+    // Zero fallback budget (a per-call PathfindingConfig override, NOT PathfindingCapacity —
+    // deriveCapacity unconditionally overwrites the capacity-level field every step): every
+    // accepted request stays .deferred (never solved), so all pending_count entries remain
+    // live across every subsequent step, matching "pathfinding zero fallback budget leaves an
+    // empty fallback list without panicking"'s pattern.
+    const no_fallback = PathfindingConfig{ .max_fallback_requests_per_step = 0 };
+
+    // Distinct goals so every request is its own pending entry (no goal-keyed dedup).
+    var fill_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer fill_stream.deinit();
+    try fill_stream.reserve(pending_count, pending_count);
+    var goals: [pending_count]math.Vec2 = undefined;
+    for (0..pending_count) |i| {
+        goals[i] = .{ .x = 8 + @as(f32, @floatFromInt(i)) * 32, .y = 4000 };
+        try appendPathRequest(&fill_stream, .{ .entity = requesters[i], .start = .{ .x = 8, .y = 8 }, .goal = goals[i] });
+    }
+    // Grows capacity to pending_count in the same step the requests are accepted, so nothing
+    // is dropped here — the snapshot taken by this grow is of the still-empty queue.
+    const fill_stats = try system.updateSerial(&fill_stream, pending_count, no_fallback);
+    try std.testing.expectEqual(@as(usize, pending_count), fill_stats.accepted_requests);
+    try std.testing.expectEqual(@as(usize, pending_count), system.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fill_stats.dropped_requests);
+
+    // Sustained low load (agent_count 1, no new requests) shrinks the derived capacity to the
+    // floor once the hysteresis window elapses.
+    var empty_stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty_stream.deinit();
+    var last_stats: PathfindingStats = undefined;
+    for (0..capacity.capacity_shrink_window) |_| {
+        last_stats = try system.updateSerial(&empty_stream, 1, no_fallback);
+    }
+    try std.testing.expectEqual(min_capacity_floor, system.effective_agent_capacity);
+    // Survivors are clamped to the LOGICAL floor cap (min_capacity_floor), not pending's
+    // physical (allocator-rounded) ArrayList capacity, which can run well above it — the
+    // exact bug this test was written to catch: pending_keys is reserved to the logical cap,
+    // so retaining more than that would silently break dedup for the excess entries.
+    const survivor_count = system.pending.items.len;
+    try std.testing.expectEqual(min_capacity_floor, survivor_count);
+    try std.testing.expectEqual(pending_count - survivor_count, last_stats.dropped_requests);
+
+    // The surviving entries (snapshot order, so the first survivor_count original requests)
+    // keep their key and tier intact; pending_keys is rebuilt to match exactly them.
+    for (0..survivor_count) |i| {
+        try std.testing.expectEqual(@as(u8, 0), system.pending.items[i].tier);
+        try std.testing.expect(system.pending_keys.contains(system.pending.items[i].key));
+        try std.testing.expectEqual(PathStatus.pending, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goals[i], .default, null).status);
+    }
+    // The dropped entries' goals now read missing (retryable), never a stale "still pending".
+    for (survivor_count..pending_count) |i| {
+        try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goals[i], .default, null).status);
+    }
+}
+
 test "pathfinding group-field threshold derives from grid size, not population" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -3410,4 +4058,91 @@ test "pathfinding group-field threshold floors on a tiny grid and caps by popula
     try capped.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
     try capped.rebuildStaticNavGrid(&data, 1024, 1024, 32);
     try std.testing.expectEqual(@as(usize, 8), capped.groupFieldThreshold());
+}
+
+// A full-height wall with a single far gap forces the longest possible detour — the
+// shape of the reported water/lake FPS-collapse bug. Runs the SAME scenario at two
+// scales against the corrected fixed-budget two-tier ladder, asserting a DIFFERENT
+// expected outcome at each: the reported bug's exact scale must solve cleanly, and a
+// genuinely harder one must gracefully degrade — proving graceful degradation actually
+// triggers rather than the fixed tier-1 budget happening to be big enough for every case.
+// Either way, never more than 2 solve attempts (never the old unbounded retry storm).
+fn runLakeDetourScenario(system: *PathfindingSystem, side: usize, gap_offset: usize) !PathfindingStats {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const requester = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const wall_x: usize = side / 2;
+    const gap_y: usize = side - gap_offset;
+    for (0..side) |y| {
+        if (y == gap_y) continue;
+        _ = try addNavBody(&data, .{ .x = @as(f32, @floatFromInt(wall_x)) * 32.0, .y = @as(f32, @floatFromInt(y)) * 32.0 }, .{ .x = 32, .y = 32 }, true);
+    }
+    const extent = @as(f32, @floatFromInt(side)) * 32.0;
+    try system.rebuildStaticNavGrid(&data, extent, extent, 32);
+
+    const start = math.Vec2{ .x = 8, .y = 8 * 32.0 + 8 };
+    const goal = math.Vec2{ .x = @as(f32, @floatFromInt(side - 1)) * 32.0 + 8, .y = 8 * 32.0 + 8 };
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try appendPathRequest(&stream, .{ .entity = requester, .start = start, .goal = goal });
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+
+    var total_attempts: usize = 0;
+    var frame: usize = 0;
+    while (frame < 5) : (frame += 1) {
+        const stats = try system.updateSerial(if (frame == 0) &stream else &empty, 8, .{});
+        total_attempts += stats.budget_exhausted;
+        if (stats.available_results != 0 or stats.escalated_dropped != 0) {
+            var result = stats;
+            result.budget_exhausted = total_attempts;
+            return result;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "pathfinding lake detour: reported-bug scale solves, a harder scale degrades gracefully, both bounded to 2 attempts" {
+    var reported_scale = PathfindingSystem.init(std.testing.allocator);
+    defer reported_scale.deinit();
+    var reported_capacity = baselineCapacity();
+    reported_capacity.max_agent_budget = 64;
+    try reported_scale.reserve(reported_capacity);
+    const reported = try runLakeDetourScenario(&reported_scale, 256, 5);
+    try std.testing.expectEqual(@as(usize, 1), reported.available_results);
+    try std.testing.expectEqual(@as(usize, 0), reported.escalated_dropped);
+    try std.testing.expect(reported.budget_exhausted <= 2);
+
+    // Was 512 before nav_graph.zig's discoverChunkPortals consolidated per-cell portals
+    // into one per contiguous open boundary run: the abstract graph is now far sparser
+    // (each fixed abstract-node budget covers much more physical distance per node
+    // explored), so 512 no longer exhausts the tier-1 budget — this scale is retuned to
+    // the smallest that still genuinely degrades under the new, sparser graph.
+    var harder_scale = PathfindingSystem.init(std.testing.allocator);
+    defer harder_scale.deinit();
+    var harder_capacity = baselineCapacity();
+    harder_capacity.max_agent_budget = 64;
+    try harder_scale.reserve(harder_capacity);
+    const harder = try runLakeDetourScenario(&harder_scale, 1024, 5);
+    try std.testing.expectEqual(@as(usize, 0), harder.available_results);
+    try std.testing.expectEqual(@as(usize, 1), harder.escalated_dropped);
+    try std.testing.expect(harder.budget_exhausted <= 2);
+}
+
+// The reported-bug-scale detour above solves cleanly under the default segment cap
+// (its corridor needs more than one stitched segment, but comfortably under
+// default_max_stitch_segments). Forcing max_stitch_segments down to 1 must make that
+// SAME scale degrade the same graceful way the untouched harder (512) scale degrades
+// above — proving max_stitch_segments is a genuine, independently-enforced ceiling on
+// stitching work, not merely inferred from the abstract-node or stitched-cell budgets.
+test "pathfinding max_stitch_segments bounds stitching independent of corridor length" {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 64;
+    capacity.max_stitch_segments = 1;
+    try system.reserve(capacity);
+    const result = try runLakeDetourScenario(&system, 256, 5);
+    try std.testing.expectEqual(@as(usize, 0), result.available_results);
+    try std.testing.expectEqual(@as(usize, 1), result.escalated_dropped);
 }

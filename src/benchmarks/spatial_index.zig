@@ -54,9 +54,9 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             .speed = 35.0 + @as(f32, @floatFromInt(index % 17)),
         });
         try data.setAiAgent(entity, .{
-            .behavior = if (index % 3 == 0) .wander else .seek,
+            .active_behavior = if (index % 3 == 0) .wander else .pursue,
             .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
-            .seek_weight = if (index % 3 == 0) 0.0 else 0.4 + @as(f32, @floatFromInt(index % 7)) * 0.1,
+            .gain_pursue = if (index % 3 == 0) 0.0 else 0.4 + @as(f32, @floatFromInt(index % 7)) * 0.1,
         });
     }
 
@@ -70,7 +70,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer fixture.deinit();
     var system = SpatialIndexSystem.init(allocator);
     defer system.deinit();
-    try system.reserve(item_count);
+    try system.reserve(item_count, .{});
     if (suite.adaptiveTunerForCase(case, spatial_index_range_alignment_items)) |tuner| {
         system.build_tuner = tuner;
     }

@@ -81,10 +81,14 @@ pub fn build(b: *std.Build) void {
     const system_sdl = b.option(bool, "system-sdl", "Use system SDL libraries instead of pinned Zig package SDL on Windows") orelse (target.result.os.tag != .windows);
     const sdl_root = b.option([]const u8, "sdl-root", "Custom Windows SDL root containing SDL3-* directories");
     const debug_overlay = b.option(bool, "debug-overlay", "Enable debug overlay rendering") orelse true;
-    const log_level = parseLogLevel(
-        b.option([]const u8, "log-level", "Log level: auto, err, warn, info, or debug") orelse "auto",
-        optimize,
-    );
+    const log_level_arg = b.option([]const u8, "log-level", "Log level: auto, err, warn, info, or debug") orelse "auto";
+    const log_level = parseLogLevel(log_level_arg, optimize);
+    // Benchmarks default quieter than the game (auto -> .warn regardless of optimize mode):
+    // per-case debug logging (e.g. ThreadSystem re-init chatter, once per benchmark case that
+    // uses threads) adds real overhead across the many cases/items a bench run sweeps and isn't
+    // useful for reading a benchmark table. An explicit -Dlog-level=debug still overrides this
+    // for bench troubleshooting, same as it does for the game build.
+    const bench_log_level = parseLogLevel(log_level_arg, .ReleaseFast);
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
     const force_llvm_lld = forceLlvmLldForTarget(target);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
@@ -104,7 +108,7 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption([]const u8, "asset_root", asset_root);
     benchBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(log_level));
+    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into Zig's package cache");

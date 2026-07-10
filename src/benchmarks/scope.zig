@@ -135,9 +135,9 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
         });
         try data.setCollisionBounds(entity, .{ .size = .{ .x = 12, .y = 12 } });
         try data.setAiAgent(entity, .{
-            .behavior = if (index % 3 == 0) .wander else .seek,
+            .active_behavior = if (index % 3 == 0) .wander else .pursue,
             .wander_amplitude = 6.0 + @as(f32, @floatFromInt(index % 29)),
-            .seek_weight = if (index % 3 == 0) 0.0 else 0.5,
+            .gain_pursue = if (index % 3 == 0) 0.0 else 0.5,
         });
         // Spread the population across depth/levels too (forward-looking: NPCs are
         // level 0 today). The cube LOD distance weights one level as a full band, so
@@ -167,6 +167,7 @@ pub fn runCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options,
     defer scope.deinit();
     var spatial_index = SpatialIndexSystem.init(allocator);
     defer spatial_index.deinit();
+    try spatial_index.reserve(item_count, .{});
     var ai = AiSystem.init(allocator);
     defer ai.deinit();
     var collision = CollisionSystem.init(allocator);
@@ -329,7 +330,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     if (!ctx.case.usesThreadSystem()) {
         _ = try ctx.ai.updateSerial(ai_slice, move_slice_const, spatial_view, &fixture.data, &fixture.frame, delta_seconds, .{
             .intent_seed = intent_seed,
-            .seek_target = .{ .x = 480, .y = 270 },
+            .focus_target = .{ .x = 480, .y = 270 },
             .scope_dense_indices = ai_indices,
         });
         _ = try ctx.collision.updateSerialScoped(&fixture.data, &fixture.contacts, collision_indices);
@@ -345,7 +346,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
         .intent_seed = intent_seed,
-        .seek_target = .{ .x = 480, .y = 270 },
+        .focus_target = .{ .x = 480, .y = 270 },
         .scope_dense_indices = ai_indices,
     });
     _ = try ctx.collision.update(&fixture.data, &fixture.contacts, thread_system.?, .{

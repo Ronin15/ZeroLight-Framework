@@ -40,9 +40,9 @@ game-specific behavior under `src/game/`.
   for levels, dense layers, sparse tiles, catalog source rects, and chunk
   visibility.
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
-  movement, visual, collision, agents, faction_level, structural, system) and
-  owns state-local persistent entity data in dense SoA stores for gameplay,
-  collision, and render systems.
+  movement, visual, collision, agents, faction_level, perception, memory,
+  affect, structural, system) and owns state-local persistent entity data in
+  dense SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -58,6 +58,20 @@ game-specific behavior under `src/game/`.
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
   serial or threaded SIMD-aware ranges.
+- `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
+  pipeline-shared per-step uniform grid built once from the cognition-scoped
+  population and read by AI separation and perception.
+- `src/game/systems/perception.zig` owns `PerceptionSystem`: vision
+  (range/FOV/LOS/faction-stance gating) and hearing (transient world
+  stimuli), emitting `entity_perceived`/`entity_lost` events on acquire/lose
+  transitions and reacting to post-commit world edits to keep its per-level
+  LOS-blocked cache incrementally patched.
+- `src/game/systems/ai_memory.zig` owns `AiMemorySystem`: decays last-known-
+  target position, a fixed-capacity recent-contact ring, and spatial
+  familiarity, and refreshes state from perception's acquisition events.
+- `src/game/systems/affect.zig` owns `AffectSystem`: appraises perception and
+  memory into four independent per-entity mood drives (fear, curiosity,
+  aggression, fatigue) and emits threshold-crossing events.
 - `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
 - `src/game/systems/steering.zig` consumes navigation intents and path status,
   then emits final NPC movement intents with local avoidance.
@@ -84,6 +98,9 @@ game-specific behavior under `src/game/`.
 - Sprite and audio startup assets are declared in `src/assets/manifest.zig` and
   live under the same traversal-safe asset root.
 - `src/core/math.zig` and `src/core/simd.zig` contain small shared math and portable SIMD helpers.
+- `src/core/rng.zig` provides a deterministic, stateless, seeded per-entity RNG
+  facility (`mix64`/`uniformF32`/`boundedU32`/`unitVec2`) for reproducible
+  gameplay randomness (AI wander, etc.).
 - `src/core/logging.zig` owns scoped logging categories and build-option-driven log filtering.
 - `src/root.zig` stays minimal for math aliases and compile coverage.
 - `src/tests.zig` imports reusable modules so `zig build test` covers their tests and compile-time contracts.
@@ -173,23 +190,32 @@ Sprite prep emits presentation-independent world/logical or drawable positions;
 the acquired swapchain interval stays focused on acquired-size presentation
 uniforms, copy-pass upload, render-pass encoding, and submit.
 
-Dense world floors use retained per-layer tile-data storage buffers (Slice 23A):
-partial dig uploads always use `cycle=false`; vertex ring buffers alone use
-`cycle=true` on the final upload in a batched copy pass. Multi-level compositing
-requires back-to-front dense-layer depth order at submit and in `mergeDrawList`.
-Dense floor submit uses a vertical render window (`DenseLayerRenderWindow`:
-six levels below the player, skipping floors above `active_level` so the slice
-follows player level transitions) so draw count
-stays bounded at the surface; all authored layers still retain GPU tile-data
-buffers (Slice 23B). Sparse tiles cull by camera chunk visibility separately.
+Dense world floors use one combined per-world tile-data storage buffer
+(layer-offset indexed, Slice 36), not one buffer per layer: partial dig
+uploads always use `cycle=false`; vertex ring buffers alone use `cycle=true`
+on the final upload in a batched copy pass. Multi-level compositing requires
+back-to-front dense-layer depth order at submit and in `mergeDrawList`. Dense
+floor submit uses a vertical render window (`DenseLayerRenderWindow`,
+`levels_below` default 6, widened to the full authored underground stack in
+the procedural demo world since Slice 36 removed draw count's dependency on
+window depth) so the in-window layer set stays bounded; all authored layers
+still retain data in the combined GPU buffer. Sparse tiles cull by camera
+chunk visibility separately.
 Dynamic entities collect from movement-body dense rows (Slice 24B): scope
 columns and `renderCollectIndicesForMovement` align on `movement_index`; render
 visibility is camera chunk + AABB only (simulation tier does not gate draw).
-Dense floor submit uses a per-layer full-world quad inside the 23B window (GPU
-clips; not camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
+Dense floor submit buckets the in-window layer set into a small bounded
+number of composite draws (`partitionDenseCompositeBuckets`, cut only at true
+depth-interleave points where a dynamic entity, particle, or sparse tile
+needs to render between two dense layers this frame; capped by
+`Renderer.k_max_dense_composite_draws`), not one draw per layer; the
+fragment shader loops a bounded topmost-first window of layers per pixel and
+stops at the first opaque cell (GPU clips full-world quads; not
+camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` component in `DataSystem`
 as the gameplay/nav/render authority; `setWorldLevel` syncs `scope.level` for
 cube LOD. Player floor policy stays on `Player.current_level` for digging.
-See `docs/rendering-assets-shaders.md` and slices 23B/24B in
+See `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section (source
+of truth for the composite-draw/shader-loop detail) and slice 36 in
 `docs/framework-implementation-slices.md`.
 
 Simulation LOD and render visibility are separate policies: tier, halos, and scope
@@ -365,17 +391,29 @@ The current gameplay fixed-step pipeline is:
 
 1. Clear `SimulationFrame` and mark the step active.
 2. Apply main-thread player input and queue fixed-step audio commands.
-3. `SimulationPipeline` builds the shared `SpatialIndexSystem` from the
-   cognition-scoped population, then runs AI decision output (querying that
-   index for separation), steering, and frame-delayed pathfinding.
-4. `SimulationPipeline` applies merged AI movement intents.
-5. `SimulationPipeline` runs movement over dense `DataSystem` movement slices.
-6. `SimulationPipeline` clamps bounds, generates collision contacts, and applies collision response.
-7. Queue contact audio, emit/update transient particles, and merge outputs.
-8. Commit deferred structural commands to `DataSystem`.
-9. Update the state-owned follow camera and visible world chunks.
-10. Render current `WorldSystem`, `DataSystem`, and particle state with
-    interpolation.
+3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
+   "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
+   `docs/simulation-tiers-and-pipeline.md` for the full contract):
+   `dig_world_edit` (author world-tile edits from player digging) →
+   `scope_advance_and_ai_gather` → `spatial_index_build` (shared
+   `SpatialIndexSystem`, Slice 28) → `perception_update` (vision/hearing,
+   Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
+   `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
+   `apply_ai_movement_intents` → `movement_scope_gather` →
+   `movement_integrate` → `bounds_and_tile_gate` →
+   `collision_scope_gather` → `collision_detect` → `collision_respond` →
+   `plane_traversal` (ramp/fall/carve/snap) → `tier_policy` (deferred
+   `set_simulation_tier` commands).
+4. Queue contact audio, emit/update transient particles, and merge outputs.
+5. Update the state-owned follow camera and visible world chunks.
+6. Commit deferred structural commands to `DataSystem`, then run the
+   pipeline's post-commit reactions
+   (`SimulationPipeline.reactToPostCommitNavEvents` and
+   `.reactToPostCommitPerceptionEvents`, both independent side effects on
+   disjoint state reacting to the same committed event stream) so nav and
+   perception caches patch from this step's world edits.
+7. Render current `WorldSystem`, `DataSystem`, and particle state with
+   interpolation.
 
 `SimulationPipeline` owns the reusable fixed-step simulation systems, concrete
 stage order, scope stats, budgets, and processor handoff for one gameplay state
@@ -415,17 +453,34 @@ staggered/reduced-cadence groups enter those tiered stages for the current
 fixed step.
 
 Emergent NPC behavior layers on the cognition tier. Perception, memory, and
-affect (emotion) are durable per-entity concepts that live as SoA components in
-`DataSystem` and are advanced by cognition-gated processor stages in
-`src/game/systems/`, alongside AI, steering, and pathfinding. They follow the
-same rules as every other processor: allocation-free hot paths, deterministic
-serial/threaded and scalar/SIMD parity, range-disjoint output, and explicit
-barriers. Dense per-step sensing/affect data stays in component columns or
-transient range streams; only notable transitions become low-volume domain
-events. Cross-entity classification (faction/stance), a deterministic per-entity
-RNG facility in `src/core`, and a shared per-frame spatial index are shared
-substrate these stages consume. Because they run only for in-scope cognition
-entities, their cost scales with active scope, not total entity count.
+**affect (feelings / emotion drives)** are durable per-entity concepts that live
+as SoA components in `DataSystem` and are advanced by cognition-gated processor
+stages in `src/game/systems/`, alongside AI, steering, and pathfinding. They
+follow the same rules as every other processor: allocation-free hot paths,
+deterministic serial/threaded and scalar/SIMD parity, range-disjoint output, and
+explicit barriers. Dense per-step sensing/affect data stays in component columns
+or transient range streams; only notable transitions become low-volume domain
+events (`entity_perceived` / `entity_lost`, `affect_threshold_crossed`, and
+similar). Cross-entity classification (faction/stance), a deterministic
+per-entity RNG facility in `src/core`, and a shared per-frame spatial index are
+shared substrate these stages consume. Because they run only for in-scope
+cognition entities, their cost scales with active scope, not total entity count.
+
+**Emotion model (Slice 31 substrate):** `AiAffect` stores independent scalar
+drives (`fear`, `curiosity`, `aggression`, `fatigue`) in `[0, 1]`, each with
+per-entity baseline, decay rate, and threshold. `AffectSystem` appraises them
+from perception/memory (optional per row) and emits rising/falling threshold
+edges only. Behavior arbitration (`src/game/systems/arbitration.zig`, Slice
+32) consumes these drive columns directly: `scoreBehaviors` sums each drive
+against a fixed `[drive_count][behavior_count]f32` weight table (fear→flee,
+aggression→pursue, curiosity→investigate, fatigue→wander), scaled by the
+agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
+threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
+`stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
+by `affect_update`, per `stage_order`). New feelings append to
+`AiAffectDrive` and a new weight-table row (roadmap Slice 42); they do not get
+a second parallel emotion subsystem. See
+`docs/framework-implementation-slices.md` Emergent AI Track Overview.
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay
@@ -476,21 +531,61 @@ components, computes aligned correction columns with `src/core/simd.zig`, and
 applies sparse movement writes deterministically on the main thread before
 structural commands commit.
 
+`PerceptionSystem` (`src/game/systems/perception.zig`, Slice 29) runs over the
+cognition-scoped `AiPerception` subset right after the shared spatial index is
+built, reusing the same `SpatialIndexView` `AiSystem` consumes rather than
+building its own grid. Vision applies range/FOV/line-of-sight gating (faction
+stance and same-level checks included); LOS blocked-tile lookups are O(1)
+against `PerceptionSystem.level_blocked`, a per-level bitmap kept current by a
+skip/patch/rebuild decision driven by post-commit `world_tile_changed`/
+`world_obstacle_changed` events rather than an unconditional per-step rebuild,
+and `hasLineOfSight` itself walks every grid cell a ray's segment actually
+crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
+into the same per-agent pass as a same-level squared-distance check against
+`SimulationFrame.stimuli`, a transient per-step positional buffer that
+`DigController` is the sole producer for. Dense per-step results (visibility,
+last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
+hot columns; only acquisition/loss transitions emit low-volume
+`entity_perceived`/`entity_lost` domain events, capped per step by
+`SimulationPipelineConfig.perception_max_events_per_step` (caller-sized
+against the pipeline's real per-step event capacity, not a floating library
+default) with drops surfaced through event stats rather than an unhandled
+capacity error.
+
 `AiSystem` (first AI processor) is a decision emitter over ai_agent entities.
 It receives const AiAgent + movement prior-position slices and a read-only
 `SpatialIndexView` from the pipeline-owned `SpatialIndexSystem`
 (`src/game/systems/spatial_index.zig`, Slice 28) — the shared per-step spatial
 index, built once from the same cognition-scoped population, that AI
 separation queries for bounded local-separation samples instead of building
-its own grid. `AiSystem` then emits threaded navigation intents through
+its own grid. Per row, `AiSystem` gathers perception/memory/affect signals
+(each independently optional; an absent component contributes zero signal)
+into `arbitration.Signals` and runs them through
+`src/game/systems/arbitration.zig`'s pure utility-arbitration chain:
+`scoreBehaviors` (the table-driven drive×behavior scoring above) picks a raw
+winner among `wander`/`pursue`/`flee`/`investigate`/`cohere`; `selectSticky`
+applies sticky hysteresis, holding the previous behavior while
+`commitment_remaining > 0` unless a challenger clears
+`sticky_bonus + min_delta`, otherwise argmaxing with ties broken by lowest
+enum index; `resolveGoal` then resolves a concrete per-agent goal for the
+selected behavior — pursue and flee prefer a visible or freshly-remembered
+hostile-faction entity (perception's faction-generic `nearest_threat`, not a
+player special case) over the opt-in `AiConfig.focus_target`/`focus_entity`
+fallback, which only applies as a last resort when the agent's pursue gain is
+nonzero and no better signal exists; investigate prefers a heard stimulus over
+the freshest `AiMemory` ring contact; cohere reads a friendly-neighbor mean
+gathered from the same shared spatial index. This utility arbitration decides
+*what* an agent wants (a behavior and a goal); it is a distinct mechanism from
+`SteeringSystem`'s stream-priority arbitration below, which decides *which*
+emitter wins when multiple systems submit a `NavigationIntent` for the same
+entity. `AiSystem` then emits threaded navigation intents through
 `SimulationFrame.navigation_intents` (count/prefix/write). Separation and
 intent emission have independent AdaptiveWorkTuner state and benchmark stats
 so each stage can remain inline or thread independently; the index build has
-its own separate tuner on `SpatialIndexSystem`. Wander amplitude and seek
-prove non-player entities emit high-level goals from persistent data rather
-than hardcoded velocities. `CollisionSystem`'s sweep-and-prune broadphase (see
-above) is intentionally not ported onto this index — it is a different,
-already-tuned algorithm, not a duplicate grid build.
+its own separate tuner on `SpatialIndexSystem`. `CollisionSystem`'s
+sweep-and-prune broadphase (see above) is intentionally not ported onto this
+index — it is a different, already-tuned algorithm, not a duplicate grid
+build.
 
 `SteeringSystem` consumes `NavigationIntent` rows, dense `SteeringAgent`
 component data, movement slices, static obstacle data, and frame-delayed
@@ -541,7 +636,25 @@ for per-worker scratch that is O(cells) (the grid is world-bounded, so this is a
 cost the build-time memory gate counts). `max_explored_nodes` stays the node BUDGET:
 an explicit per-solve expansion counter caps how many distinct cells one solve may
 stamp. Hitting that local node budget or saturating the abstract scratch returns
-`pending` and increments `path_budget_exhausted`. A blocked
+`pending` and increments `path_budget_exhausted`. Abstract/stitched-corridor work
+follows a two-tier attempt ladder (`PendingRequest.tier`) rather than retrying a
+budget-exhausted query at unchanged cost: a cheap tier-0 attempt uses the small fixed
+`tier0_abstract_node_cap`/`tier0_stitched_cell_cap`; exhausting it promotes the
+request to tier 1 exactly once, which retries against `max_abstract_nodes`/
+`max_stitched_path_cells` — a larger but still FIXED ceiling (`default_tier1_*` in
+`types.zig`), deliberately never derived from or scaled to world/graph size: per-query
+work stays bounded independent of world size, matching this module's other
+"independent of total cell count" invariants (portals scale with border-cell density,
+so a size-derived budget would have little margin on a larger or more-obstructed map
+and would silently depend on which map happens to be loaded). A tier-1 exhaustion
+drops the request WITHOUT negative-caching — it does not fit either fixed budget,
+which is not the same as a definitive "no path exists" — so the next query falls
+through to `.missing` (retryable after the caller's own replan cooldown) rather than a
+false `unavailable`. A request therefore costs at most two solve attempts per replan
+cycle, never an unbounded retry storm and never a permanently wrong negative. Per-step
+`max_escalated_solves_per_step` additionally bounds how many tier-1 (expensive)
+attempts one fixed step admits, so several simultaneously-stuck agents cannot
+stack their escalated cost into a single frame. A blocked
 goal projects to the nearest open cell on the goal level
 (`path_goal_projected`); `unavailable` is reserved for definitive negatives
 (disconnected component, no open cell near the goal, or no corridor across levels). Oversized worlds fail
@@ -616,11 +729,20 @@ capacity preflight. Cell-localizable edits — blocking `world_tile_changed` /
 `world_obstacle_changed` changes (only when `old_blocks_movement !=
 new_blocks_movement`) — are forwarded to the system-owned dirty buffer via
 `pipeline.markNavDirty` (one entry per changed cell). Entity-driven obstacle changes
-do NOT carry a resolvable cell (a destroyed entity's footprint is gone), so they
-forward `pipeline.markNavLevelDirty(0)` instead — a whole-level dirty request that
-re-derives every chunk on level 0 (the only level sourcing collision bodies) from the
-world. `pipeline.applyNavUpdates` coalesces the buffered work to the set of touched
-chunks (or every chunk on a whole-level-dirty level), RE-DERIVES each touched chunk's
+(`component_changed` on `movement_body`/`collision_bounds`/`collision_response`, and
+`entity_destroyed`) instead carry an optional `ObstacleWorldRect` — the changed
+entity's world-space collision AABB, before and/or after the change, when it was/is a
+static navigation obstacle. `PathfindingSystem` resolves that rect to a nav-cell span
+via `markNavObstacleRectDirty` and patches only the affected chunks, the same
+incremental mechanism tile edits already use, instead of invalidating the whole level.
+`pipeline.markNavLevelDirty(0)` — a whole-level dirty request that re-derives every
+chunk on level 0 (the only level sourcing collision bodies) from the world — is only a
+defensive fallback for the (stated-unreachable) case where the carried rect is null:
+`isStaticNavigationObstacle` requires the same components the rect is derived from, so
+that fallback logs a warn rather than silently rebuilding the whole level.
+`pipeline.applyNavUpdates` coalesces the buffered work to the set of touched chunks
+(resolved obstacle-rect spans, plus every chunk on any whole-level-dirty level),
+RE-DERIVES each touched chunk's
 blocked mask from the world WHOLE-CHUNK (so a coalesced rect, a large multi-actor
 batch, or a cell-less entity change can never leave a cell stale against the world),
 recomputes those chunks' components, and patches the chunk-portal abstract graph once

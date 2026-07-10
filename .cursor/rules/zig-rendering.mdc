@@ -1,0 +1,17 @@
+---
+description: SDL_GPU render boundary and resource lifetime rules
+globs: src/render/**/*.zig
+alwaysApply: false
+---
+
+# Rendering (ZeroLight-Framework)
+
+Read `docs/rendering-assets-shaders.md` and @AGENTS.md before editing.
+
+- `Renderer` is the facade — game code does not import `src/render/gpu/*`
+- Pair GPU resource create/destroy; `errdefer` on partial init
+- `SpriteBatch` consumes pre-sorted ordered streams — not a fallback sorter
+- Do not hold swapchain acquisition across substantial CPU prep
+- Per-frame render path: no avoidable allocation, string lookup, or hash-map dispatch
+- Persist stable asset IDs; resolve to texture IDs at render-prep boundary only
+- Hot/frame-adjacent paths: no logging in release (comptime-gate or omit)

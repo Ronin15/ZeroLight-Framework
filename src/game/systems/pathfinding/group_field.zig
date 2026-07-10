@@ -17,6 +17,7 @@ const no_cell = types.no_cell;
 const neighbor_dirs = types.neighbor_dirs;
 const oppositeDirIndex = types.oppositeDirIndex;
 const setLen = types.setLen;
+const shouldShrinkCapacity = types.shouldShrinkCapacity;
 const GridCell = types.GridCell;
 const PathQueryKey = types.PathQueryKey;
 const emptyKey = types.emptyKey;
@@ -44,6 +45,22 @@ pub const GroupField = struct {
     current_distance: u32 = 0,
     // Set when (re)built this step so reuse is not double-counted in the same step.
     fresh_this_step: bool = false,
+    // Distinct cells ever pushed (given a cost) during the CURRENT build, persisting
+    // across multiple budgeted expand() calls; reset in beginBuild. Bounds the flood
+    // to max_cells regardless of world size — see max_cells' doc comment.
+    pushed_count: usize = 0,
+    // Fixed per-build cap on total distinct cells the flood may cover, set once in
+    // beginBuild from the caller's config. Without this, the flood covers the WHOLE
+    // reachable component from the goal — for an open world that is the whole grid,
+    // so build cost (and therefore group_service_ns) scales with WORLD SIZE, which
+    // violates this project's "per-query work budgets are fixed constants, never
+    // derived from or scaled to world size" rule (see coding-standards.md and the
+    // similar fixed budgets elsewhere in this package, e.g. max_abstract_nodes).
+    // A cell past the cap is simply never reached this build: sample() returns null
+    // for it (stamp never set), which the caller already treats as "field does not
+    // cover this cell" and falls through to an individual solve — never a false
+    // unavailable, just a bounded-radius shared-goal hint instead of a whole-map one.
+    max_cells: usize = std.math.maxInt(usize),
     // Integration cost-to-goal and per-cell flow direction (index into neighbor_dirs,
     // or no_flow). stamps gate costs/flow_dir to the current build without a clear.
     costs: std.ArrayList(u32) = .empty,
@@ -73,19 +90,19 @@ pub const GroupField = struct {
     pub fn reserve(self: *GroupField, allocator: std.mem.Allocator, cell_count: usize) !void {
         // Mark empty first so a partial failure leaves the field refusing to serve paths.
         self.state = .empty;
-        if (cell_count < self.costs.capacity) self.costs.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.costs.capacity, cell_count)) self.costs.shrinkAndFree(allocator, 0);
         try setLen(&self.costs, allocator, cell_count);
-        if (cell_count < self.flow_dir.capacity) self.flow_dir.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.flow_dir.capacity, cell_count)) self.flow_dir.shrinkAndFree(allocator, 0);
         try setLen(&self.flow_dir, allocator, cell_count);
-        if (cell_count < self.stamps.capacity) self.stamps.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.stamps.capacity, cell_count)) self.stamps.shrinkAndFree(allocator, 0);
         try setLen(&self.stamps, allocator, cell_count);
-        if (group_field_buckets < self.buckets.capacity) self.buckets.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.buckets.capacity, group_field_buckets)) self.buckets.shrinkAndFree(allocator, 0);
         try setLen(&self.buckets, allocator, group_field_buckets);
-        if (cell_count < self.bucket_next.capacity) self.bucket_next.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.bucket_next.capacity, cell_count)) self.bucket_next.shrinkAndFree(allocator, 0);
         try setLen(&self.bucket_next, allocator, cell_count);
-        if (cell_count < self.bucket_prev.capacity) self.bucket_prev.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.bucket_prev.capacity, cell_count)) self.bucket_prev.shrinkAndFree(allocator, 0);
         try setLen(&self.bucket_prev, allocator, cell_count);
-        if (cell_count < self.queued_stamp.capacity) self.queued_stamp.shrinkAndFree(allocator, 0);
+        if (shouldShrinkCapacity(self.queued_stamp.capacity, cell_count)) self.queued_stamp.shrinkAndFree(allocator, 0);
         try setLen(&self.queued_stamp, allocator, cell_count);
         @memset(self.costs.items, unreachable_cost);
         @memset(self.flow_dir.items, no_flow);
@@ -136,26 +153,35 @@ pub const GroupField = struct {
         if (next != no_cell) self.bucket_prev.items[next] = prev;
     }
 
-    pub fn beginBuild(self: *GroupField, grid: *const NavGrid, key: PathQueryKey, goal_index: usize, step: u32) bool {
+    pub fn beginBuild(self: *GroupField, grid: *const NavGrid, key: PathQueryKey, goal_index: usize, step: u32, max_cells: usize) bool {
         self.key = key;
         self.goal_index = goal_index;
         self.last_build_step = step;
         self.nextGeneration();
         @memset(self.buckets.items, no_cell);
         self.current_distance = 0;
+        // At least 1 so the goal cell itself always gets pushed below; a caller passing
+        // 0 would otherwise silently produce a field that never covers even its own goal.
+        self.max_cells = @max(@as(usize, 1), max_cells);
+        self.pushed_count = 0;
         if (grid.isBlockedIndex(goal_index)) {
             self.state = .empty;
             return false;
         }
         self.setCost(goal_index, 0, no_flow);
         self.bucketPush(goal_index, 0);
+        self.pushed_count = 1;
         self.state = .building;
         return true;
     }
 
     /// Expands at most `budget` cells of the integration via Dial's monotone bucket
-    /// queue. Returns true when the field finished. The distance cursor advances only
-    /// forward, so the build resumes correctly across budgeted frames.
+    /// queue, never pushing past max_cells total distinct cells for this whole build
+    /// (set in beginBuild) regardless of how much of the grid is still reachable.
+    /// Returns true when the field finished (queue drained OR the cap was reached — both
+    /// leave every pushed cell's flow direction final; see max_cells' doc comment for what
+    /// a capped-out cell resolves to). The distance cursor advances only forward, so the
+    /// build resumes correctly across budgeted frames.
     pub fn expand(self: *GroupField, grid: *const NavGrid, budget: usize) bool {
         std.debug.assert(budget != 0); // a zero budget makes no progress and never reaches .ready
         var expansions: usize = 0;
@@ -182,10 +208,17 @@ pub const GroupField = struct {
                 const step_cost = if (dir.diagonal) diagonal_cost else cardinal_cost;
                 const candidate = current_cost + step_cost;
                 const existing = self.cost(next_index);
+                // A genuinely NEW cell (never costed this build) past the fixed cap is left
+                // unreached rather than pushed — bounds total flood extent to max_cells
+                // independent of world size. An already-costed cell's cost IMPROVEMENT is
+                // never blocked by the cap: it was already counted in pushed_count once and
+                // relaxing it again does not grow the flood's footprint.
+                if (existing == unreachable_cost and self.pushed_count >= self.max_cells) continue;
                 if (candidate < existing) {
                     if (existing != unreachable_cost and self.queued_stamp.items[next_index] == self.generation) {
                         self.bucketUnlink(next_index, existing);
                     }
+                    if (existing == unreachable_cost) self.pushed_count += 1;
                     self.setCost(next_index, candidate, oppositeDirIndex(dir_index));
                     self.bucketPush(next_index, candidate);
                 } else if (candidate == existing) {
@@ -241,7 +274,13 @@ pub const GroupField = struct {
         return grid.indexForCell(.{ .x = x + neighbor.x, .y = y + neighbor.y }) orelse next_index;
     }
 
-    /// Samples the flow direction at `cell_index`, returning the stepped waypoint.
+    /// Samples the flow direction at `cell_index`, returning the stepped waypoint. Answers
+    /// for a `.building` field too (not just `.ready`): Dial's monotone integration costs
+    /// cells in non-decreasing distance order, so an already-costed cell's flow direction
+    /// is final the moment it is set, even mid-build — a provisional-but-correct partial
+    /// answer, never a stale or cyclic one. Both current production callers happen to gate
+    /// on `.ready` first (a conservative choice, not a requirement this function imposes),
+    /// so `.building` is reachable only by a future caller choosing to sample early.
     pub fn sample(self: *const GroupField, grid: *const NavGrid, cell_index: usize) ?math.Vec2 {
         if (self.state != .ready and self.state != .building) return null;
         if (self.stamps.items[cell_index] != self.generation) return null;
@@ -300,6 +339,91 @@ fn referenceFlowField(allocator: std.mem.Allocator, grid: *const NavGrid, goal_i
     }
 }
 
+test "GroupField generation wraparound clears both stamps and queued_stamp" {
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    try grid.prepare(std.testing.allocator, 0, 8, 8, default_cell_size, default_nav_chunk_tiles);
+    grid.buildComponents();
+
+    var field = GroupField{};
+    defer field.deinit(std.testing.allocator);
+    try field.reserve(std.testing.allocator, grid.cellCount());
+
+    const goal_index = 3 * grid.width + 3;
+    // Force the wraparound on the NEXT beginBuild(): nextGeneration's +%= 1 brings this to
+    // exactly maxInt (no wrap yet), so this first build's cells stamp at generation maxInt.
+    field.generation = std.math.maxInt(u32) - 1;
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1, grid.cellCount()));
+    var guard: usize = 0;
+    while (field.state == .building and guard < grid.cellCount() + 8) : (guard += 1) {
+        _ = field.expand(&grid, 8);
+    }
+    try std.testing.expectEqual(GroupFieldState.ready, field.state);
+    try std.testing.expectEqual(std.math.maxInt(u32), field.generation);
+    // A cell reachable from the goal was actually costed at the wrapped-around generation.
+    const some_cell = goal_index + 1;
+    try std.testing.expectEqual(field.generation, field.stamps.items[some_cell]);
+    try std.testing.expect(field.cost(some_cell) != unreachable_cost);
+
+    // Rebuilding for a different goal wraps generation back to 1 (nextGeneration's guard)
+    // and must clear BOTH stamps and queued_stamp so no stale cell aliases the new build.
+    const other_goal = 5 * grid.width + 5;
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), other_goal, 2, grid.cellCount()));
+    try std.testing.expectEqual(@as(u32, 1), field.generation);
+    // The previously-costed cell no longer reads as costed THIS generation: cost() gates on
+    // stamps, and a live sample must also read null unless this build re-costs it — proving
+    // stamps were actually cleared, not left aliasing generation 1 by coincidence.
+    try std.testing.expectEqual(unreachable_cost, field.cost(some_cell));
+    guard = 0;
+    while (field.state == .building and guard < grid.cellCount() + 8) : (guard += 1) {
+        _ = field.expand(&grid, 8);
+    }
+    try std.testing.expectEqual(GroupFieldState.ready, field.state);
+    // Every live cell (goal_index's old value included) now reflects ONLY this build.
+    try std.testing.expectEqual(@as(u32, 0), field.cost(other_goal));
+}
+
+test "GroupField build cost is bounded by max_cells independent of world size" {
+    // The actual fix under test: without a cap, a build floods the WHOLE reachable
+    // component from the goal, so cost scales with world size. A fixed max_cells must
+    // stop the flood at a constant cell count regardless of how much open grid remains,
+    // and cells past the cap must read as uncovered (sample() null) rather than crash,
+    // corrupt, or silently claim a wrong direction.
+    var grid = NavGrid{};
+    defer grid.deinit(std.testing.allocator);
+    // A large, fully open grid: with no cap this would flood all 4096 cells from the
+    // corner goal in a handful of steps; capped at 10, it must stop far short of that.
+    try grid.prepare(std.testing.allocator, 0, 64, 64, default_cell_size, default_nav_chunk_tiles);
+    grid.buildComponents();
+
+    var field = GroupField{};
+    defer field.deinit(std.testing.allocator);
+    try field.reserve(std.testing.allocator, grid.cellCount());
+
+    const goal_index = 0; // corner: every neighbor is a genuinely new, reachable cell
+    const max_cells: usize = 10;
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1, max_cells));
+    // A budget far larger than max_cells proves the CAP (not the per-step budget) is what
+    // stops the flood.
+    var guard: usize = 0;
+    while (field.state == .building and guard < grid.cellCount() + 8) : (guard += 1) {
+        _ = field.expand(&grid, 1000);
+    }
+    try std.testing.expectEqual(GroupFieldState.ready, field.state);
+    try std.testing.expectEqual(max_cells, field.pushed_count);
+
+    var covered: usize = 0;
+    for (0..grid.cellCount()) |i| {
+        if (field.stamps.items[i] == field.generation) covered += 1;
+    }
+    try std.testing.expectEqual(max_cells, covered);
+    // A cell far outside the capped radius was never reached: sample() reads it as
+    // uncovered (null), not as a corrupted/default direction — the caller's existing
+    // fallthrough-to-individual-solve contract stays intact.
+    const far_cell = grid.cellCount() - 1;
+    try std.testing.expect(field.sample(&grid, far_cell) == null);
+}
+
 test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra field" {
     const allocator = std.testing.allocator;
     var grid = NavGrid{};
@@ -322,7 +446,7 @@ test "pathfinding group flow field (Dial's) equals a reference heap Dijkstra fie
     var field = GroupField{};
     defer field.deinit(allocator);
     try field.reserve(allocator, cell_count);
-    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1));
+    try std.testing.expect(field.beginBuild(&grid, emptyKey(1), goal_index, 1, grid.cellCount()));
     // Build in tiny budgeted chunks so the cross-frame resume path is exercised too.
     var guard: usize = 0;
     while (field.state == .building and guard < cell_count + 8) : (guard += 1) {

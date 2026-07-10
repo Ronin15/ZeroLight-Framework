@@ -5,12 +5,15 @@
 const std = @import("std");
 const logging = @import("../core/logging.zig");
 const ai = @import("ai.zig");
+const ai_memory = @import("ai_memory.zig");
+const affect = @import("affect.zig");
 const collision = @import("collision.zig");
 const collision_response = @import("collision_response.zig");
 const movement = @import("movement.zig");
 const nav_update = @import("nav_update.zig");
 const particles = @import("particles.zig");
 const pathfinding = @import("pathfinding.zig");
+const perception = @import("perception.zig");
 const render_prep = @import("render_prep.zig");
 const render_game_prep = @import("render_game_prep.zig");
 const scope = @import("scope.zig");
@@ -24,6 +27,8 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     movement.group,
     particles.group,
     ai.group,
+    ai_memory.group,
+    affect.group,
     collision.group,
     collision.sparse_group,
     collision_response.solid_group,
@@ -38,19 +43,25 @@ const benchmark_groups = [_]suite.BenchmarkGroup{
     pathfinding.fallback_unreachable_group,
     pathfinding.hard_fallback_group,
     pathfinding.hard_fallback_budget_group,
+    pathfinding.escalated_detour_group,
+    pathfinding.group_field_detour_group,
+    pathfinding.group_field_detour_moving_group,
+    pathfinding.group_field_detour_moving_hysteresis_group,
     pathfinding.query_group,
     nav_update.group,
     nav_update.multichunk_group,
+    nav_update.entity_obstacle_group,
     render_prep.group,
     render_game_prep.group,
-    render_game_prep.dense_8_surface_group,
-    render_game_prep.dense_8_deep_group,
-    render_game_prep.dense_16_surface_group,
-    render_game_prep.dense_16_deep_group,
-    render_game_prep.dense_32_surface_group,
-    render_game_prep.dense_32_deep_group,
+    render_game_prep.dense_surface_group,
+    render_game_prep.dense_deep_group,
     scope.group,
     spatial_index.group,
+    perception.group,
+    perception.los_dense_group,
+    perception.scattered_dense_index_group,
+    perception.cache_full_rebuild_group,
+    perception.cache_patch_group,
     steering.group,
 };
 
@@ -77,6 +88,6 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // nav_update reuses one world+nav fixture per variant across all cases/counts; free them here.
-    defer nav_update.deinitCaches(init.gpa);
+    defer nav_update.deinitCaches();
     try suite.runAll(init.gpa, init.io, &benchmark_groups, options);
 }

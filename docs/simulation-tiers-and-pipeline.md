@@ -62,7 +62,22 @@ passes the borrowed audio command buffer through the pipeline-owned
 advance and the tier/halo/stagger gathers that select which entities enter each
 stage; chunk columns are derived in-pass by the movement processor, not a separate
 recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
-from that same cognition-scoped population for AI separation queries, then owns
+from that same cognition-scoped population for AI separation queries, runs the
+**perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
+`AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
+writing sensed state to `PerceptionStore`), then the **memory stage**
+(`AiMemorySystem`, Slice 30) over the cognition-scoped `AiPerception`+`AiMemory`
+subset (decaying staleness/familiarity/ring contacts and refreshing from this
+step's perception-acquisition events; decay is itself scope-gated through the
+same cognition-scope dense-index list, so an entity demoted out of the
+cognition halo simply stops being gathered — its memory row freezes rather
+than decaying, and resumes cleanly on resync, with no separate freeze
+mechanism needed), then the **affect stage**
+(`AffectSystem`, Slice 31) over the cognition-scoped `AiAffect` subset
+(appraising this step's just-written perception/memory state, both
+independently optional per row, plus each agent's own `AiAgent.behavior`, into
+four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
+baselines), then owns
 AI navigation-intent production, steering/path status, pathfinding, sparse
 movement-intent application, movement, bounds clamp, player-vs-world-tile
 gating, collision detection, and collision response — AI, movement, and
@@ -90,7 +105,50 @@ since movement never moves them. Steering and pathfinding read each entity's
 `world_level` for `start_level`; level transitions at link crossings are
 committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
 by a path-view field (a `PathView.next_cell_level` field was tried and removed
-as an unused duplicate — see `docs/framework-implementation-slices.md` Slice 25E).
+as an unused duplicate — see archive Slice 25E in
+`docs/framework-implementation-slices-archive.md`).
+
+## Stage Ordering Contract
+
+`SimulationPipeline` (`src/game/simulation_pipeline.zig`) checks its own stage
+order at comptime so a future reorder or inserted stage that reads a resource
+before it is written fails the build instead of silently corrupting behavior.
+
+- `PipelineResource` is the coarse set of per-step resources stages read or
+  write (navigation intents, movement intents, path requests, contacts,
+  movement body state, and similar). Some tags bundle several SoA columns one
+  system owns together rather than tracking every field.
+- `StageId` names each concrete stage in `update()`.
+- `stageContract(stage)` declares each stage's reads and writes over
+  `PipelineResource`.
+- `stage_order` is the concrete order `update()` runs stages in.
+- A `comptime` block walks `stage_order`, accumulating the resources written
+  so far, and fails the build (`@compileError`) if any stage's declared reads
+  are not a subset of what an earlier stage already wrote.
+- Not every real ordering dependency is expressible as a `PipelineResource`
+  read/write — two stages can depend on call order while sharing no tracked
+  resource. Those dependencies are proven by targeted causal-effect tests
+  co-located in `simulation_pipeline.zig`: each sets up a scenario where the
+  wrong order would produce an observably different result and asserts the
+  correct one. See "pipeline commits the dig stage's world edit before plane
+  traversal reads it in the same step", "pipeline runs ai_memory after
+  perception and before ai, feeding memory into AI's cold-seek retarget", and
+  "pipeline runs affect after perception and ai_memory, before ai" for the
+  pattern.
+
+Checklist for adding or reordering a stage:
+
+1. Add the `PipelineResource` tag(s) it reads/writes, if none of the existing
+   tags already cover them.
+2. Insert its `StageId` into `stage_order` at the position its real
+   dependencies require.
+3. Add its `stageContract()` arm.
+4. Add the real call in `update()` at the position `stage_order` requires. If
+   the dependency isn't expressible via `PipelineResource`, add a
+   causal-effect test proving the real call order.
+5. `zig build check` fails at comptime if a `PipelineResource` dependency is
+   missing; a causal-effect test fails if the stages run out of order for a
+   dependency the comptime check can't see.
 
 ## Range Output Streams
 
@@ -121,6 +179,14 @@ part of the contract: count and write phases must stay consistent.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
 - `structural_commands`: deferred entity/component changes.
+- `stimuli`: transient per-step positional stimuli AI hearing can sense (e.g.
+  dig noise), read by `PerceptionSystem`. Cleared every `beginStep` and never
+  promoted to an event, since a stimulus carries no stable entity identity to
+  transition against. Appended via a dedicated `appendStimulus` single-value
+  helper rather than the batch `reserveStreams`/`reservePathRequests`
+  pattern: its per-step count is a fixed producer invariant (at most one,
+  from `DigController`), not scene-scale-dependent, so it grows lazily on
+  first use like `PerceptionSystem`'s own gather buffers.
 
 High-volume data should stay in its specialized stream. Do not collapse
 contacts, movement intents, navigation intents, path requests, render-prep
@@ -144,6 +210,8 @@ Current event payloads are:
 - `world_tile_changed`
 - `world_obstacle_changed`
 - `nav_region_invalidated`
+- `entity_perceived` / `entity_lost` (Slice 29 perception acquire/lose transitions)
+- `affect_threshold_crossed` (Slice 31 drive rising/falling-edge transitions)
 
 Current event stages are:
 
@@ -159,6 +227,15 @@ tile and obstacle flags. They wake explicit reaction points such as pathfinding
 or future world-collision refreshes; they are not immediate callbacks from
 `WorldSystem`.
 
+Entity-driven obstacle events (`component_changed` on `movement_body`/
+`collision_bounds`/`collision_response`, and `entity_destroyed`) also carry an
+optional `ObstacleWorldRect` — the changed entity's world-space collision AABB,
+before and/or after the change, when it was/is a static navigation obstacle.
+Pathfinding resolves that rect to a nav-cell span (`markNavObstacleRectDirty`)
+and patches only the affected chunks, the same incremental mechanism tile edits
+already use, instead of invalidating the whole level. A null rect (component
+data insufficient to derive one) falls back to a whole-level nav dirty mark.
+
 `appendRequired` fails if the configured event capacity cannot hold the event.
 `appendDiagnostic` drops on capacity failure and increments dropped stats. Use
 required events for data needed to keep downstream state correct; use
@@ -166,12 +243,12 @@ diagnostic events only for optional observability.
 
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,
-or future perception, memory, and affect state — belong in component columns or
-transient range streams; only state transitions (such as acquiring or losing a
-target, or a drive crossing a threshold) become events. This keeps the event
-stream bounded and the per-frame data path allocation-free. New signal payloads
-must still follow the scalar-only rule above and emit through the per-range
-writers so merge order stays deterministic.
+or perception/memory/affect state — belong in component columns or transient
+range streams; only state transitions (such as acquiring or losing a target,
+or a drive crossing a threshold) become events. This keeps the event stream
+bounded and the per-frame data path allocation-free. New signal payloads must
+still follow the scalar-only rule above and emit through the per-range writers
+so merge order stays deterministic.
 
 ## Structural Commands
 
@@ -192,6 +269,25 @@ Commit behavior:
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.
+
+## Post-Commit Reactions
+
+After structural commit and event publication, `GameDemoState` calls two
+independent `SimulationPipeline` reactions against the same committed event
+stream:
+
+- `reactToPostCommitNavEvents` delegates to `PathfindingSystem`, interpreting
+  nav-invalidating committed events (`world_tile_changed`,
+  `world_obstacle_changed`, entity-driven obstacle changes) into dirty nav
+  cells, applying the incremental nav-graph patch, and emitting
+  `nav_region_invalidated`.
+- `reactToPostCommitPerceptionEvents` delegates to `PerceptionSystem`,
+  recording localized dirty rects from the same `world_tile_changed`/
+  `world_obstacle_changed` events to incrementally patch its per-level
+  LOS-blocked bitmap cache. It emits no event of its own.
+
+Both reactions are side effects on fully disjoint state, so call order
+between them does not matter.
 
 ## Current Integration
 

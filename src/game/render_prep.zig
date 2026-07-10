@@ -21,10 +21,19 @@ const TextureId = @import("../render/resources.zig").TextureId;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
+const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
+const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const manifest = @import("../assets/manifest.zig");
 const WorldDepth = @import("render_depth.zig").WorldDepth;
 const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const level_z_step = @import("world_system.zig").level_z_step;
+const k_max_dense_submit_stack_cap = @import("world_system.zig").k_max_dense_submit_stack_cap;
+// Test-only: constructs a headless CPU-only SpriteBatch/DrawGroup fixture for a
+// Renderer built without a live GPU device. Mirrors world_system.zig's existing
+// direct sprite_batch.zig import for the same CPU-only-parity reason.
+const sprite_batch = @import("../render/sprite_batch.zig");
+const mergeDrawList = @import("../render/renderer.zig").mergeDrawList;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
@@ -339,8 +348,13 @@ pub fn ensureScenePrepCapacity(prep: *DynamicScenePrep, scene: GameplayScene) !v
 
 /// Peak retained static tilemap geometry for the world's dense render window.
 /// Grow-only; safe to call each gameplay frame before dense layer submit.
+/// Sourced from `maxDenseSubmitDrawCount()` — the worst-case composite-draw
+/// bound (`Renderer.k_max_dense_composite_draws`), not the raw in-window layer
+/// count — since `submitStaticDenseGeometry` now issues at most one
+/// `appendStaticTilemapSpan` per interleave-partitioned bucket rather than one
+/// per dense layer.
 pub fn staticGeometryCapacity(scene: GameplayScene) struct { vertex_capacity: usize, span_capacity: usize } {
-    const span_capacity = scene.world.maxDenseSubmitLayerCount();
+    const span_capacity = scene.world.maxDenseSubmitDrawCount();
     return .{
         .vertex_capacity = span_capacity * 6,
         .span_capacity = span_capacity,
@@ -392,6 +406,7 @@ pub fn collectDynamicRecords(
     const player_entity = scene.player_entity;
     const player_entity_index = player_entity.index;
     const player_entity_generation = player_entity.generation;
+    const max_world_level: u16 = scene.world.maxLevelIndex();
     // Movement-body dense rows are the collect anchor: scope columns (tier/chunk)
     // align with movement_index; has_primitive_visual skips movement-only rows
     // before the deferred slot resolve in renderCollectIndicesForMovement.
@@ -399,7 +414,11 @@ pub fn collectDynamicRecords(
         const is_player = entity.index == player_entity_index and entity.generation == player_entity_generation;
         if (!is_player) {
             const entity_level = scene.data.worldLevelConst(entity) orelse 0;
-            if (entity_level != scene.player_level) continue;
+            // Window membership (not exact equality) so an entity that fell to a
+            // deeper in-window level (e.g. through a dug hole) still renders, at
+            // its own real depth — matches the dense-layer window this frame
+            // already composites via WorldSystem.collectDenseSubmitLayers.
+            if (!scene.world.render_window.levelInWindow(scene.player_level, entity_level, max_world_level)) continue;
         }
         if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
         if (!movement.has_primitive_visual[movement_index]) continue;
@@ -504,10 +523,15 @@ fn submitLayeredWorld(
     runtime_assets: *const RuntimeAssets,
 ) !void {
     try scene.world.ensureRenderDepthIndex();
-    try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level);
+
+    var interleave_scratch: [k_max_dense_submit_stack_cap]i32 = undefined;
+    const interleave_depths = try collectDenseInterleaveDepths(scene, prep, &interleave_scratch);
+
+    try scene.world.submitStaticDenseGeometry(renderer, runtime_assets, scene.player_level, interleave_depths);
     try scene.world.flushDenseTileEdits(renderer);
 
-    var sparse_depth = scene.world.firstVisibleSparseDepth();
+    var sparse_index: usize = 0;
+    var sparse_depth = nextSparseDepth(scene, &sparse_index);
     var dynamic_span_index: usize = 0;
     var dynamic_depth = nextDynamicDepth(prep, &dynamic_span_index);
     while (mergeNextSource(sparse_depth, dynamic_depth)) |source| {
@@ -515,7 +539,7 @@ fn submitLayeredWorld(
             .sparse => {
                 const depth = sparse_depth.?;
                 try scene.world.submitVisibleSparseAtDepth(renderer, runtime_assets, depth);
-                sparse_depth = scene.world.nextVisibleSparseDepthAfter(depth);
+                sparse_depth = nextSparseDepth(scene, &sparse_index);
             },
             .dynamic => {
                 const dynamic_range = prep.depth_spans.items[dynamic_span_index - 1];
@@ -528,6 +552,115 @@ fn submitLayeredWorld(
             },
         }
     }
+}
+
+/// Gathers this frame's dense-composite-draw cut points: `active_level`'s own
+/// actor depth (always included — this is what makes the common case behave
+/// exactly like before the dense stack was collapsed to composite draws),
+/// every distinct dynamic depth this frame (`prep.depthSpans()`, NOT bounded to
+/// `k_max_dense_submit_stack_cap` candidates), and every registered sparse-tile
+/// depth anywhere in the world (walked by index via
+/// `sparseDepthRangeCount`/`sparseDepthRangeAt`, closing the gap a sparse tile
+/// at any in-window level could otherwise fall through — `submitLayeredWorld`
+/// walks the same indexed sequence again for the actual merge/submit pass, so
+/// this only ever reads the already-computed `sparse_depth_ranges`, never
+/// rescans it) — also not bounded, since `WorldSystem.addSparseTile` takes an
+/// arbitrary caller-supplied depth.
+///
+/// `WorldSystem.partitionDenseCompositeBuckets` never needs more than one
+/// candidate per **gap** between two adjacent submitted dense layers to place
+/// a cut there, and the number of gaps is `submit_count - 1`, hard-bounded by
+/// `k_max_dense_submit_stack_cap - 1` regardless of how many raw candidate
+/// depths this frame's dynamic/sparse content produces. So candidates are
+/// deduplicated by which gap they would cut (`interleaveGapIndex`, matching
+/// the partition function's own boundary rule), not by raw depth value —
+/// dropping same-gap duplicates costs nothing since only the first
+/// representative per gap is ever consulted. Filters to the dense window's own
+/// depth span first (a depth outside it, or at/below the deepest submitted
+/// layer, cannot cut anything; the span itself is `denseWindowDepthSpan`'s
+/// cached value, recomputed only on a real structural/level/window change).
+/// `scratch` is a fixed stack buffer sized to the submit-stack cap, so this
+/// stays allocation-free every frame; the gap bound proves it can never
+/// overflow. Returns the sorted, deduplicated slice
+/// `submitStaticDenseGeometry` partitions on.
+fn collectDenseInterleaveDepths(
+    scene: GameplayScene,
+    prep: *const DynamicScenePrep,
+    scratch: *[k_max_dense_submit_stack_cap]i32,
+) error{TooManyDenseLayers}![]const i32 {
+    const span = (try scene.world.denseWindowDepthSpan(scene.player_level)) orelse return scratch[0..0];
+    const layer_depths = scene.world.denseWindowLayerDepths();
+    var gap_filled: [k_max_dense_interleave_gaps]bool = [_]bool{false} ** k_max_dense_interleave_gaps;
+    var count: usize = 0;
+
+    appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.activeLevelActorDepth(scene.player_level), span);
+    for (prep.depthSpans()) |range| {
+        appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, range.depth, span);
+    }
+    for (0..scene.world.sparseDepthRangeCount()) |index| {
+        appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.sparseDepthRangeAt(index), span);
+    }
+
+    const collected = scratch[0..count];
+    std.mem.sort(i32, collected, {}, std.sort.asc(i32));
+    return collected;
+}
+
+/// Max gaps between adjacent submitted dense layers this frame: one fewer than
+/// the submit-stack cap, since a gap sits between two layers.
+const k_max_dense_interleave_gaps = k_max_dense_submit_stack_cap - 1;
+
+/// Finds which gap between two adjacent entries of `layer_depths` (ascending,
+/// `WorldSystem.denseWindowLayerDepths`) `depth` would cut, mirroring
+/// `WorldSystem.partitionDenseCompositeBuckets`'s own boundary rule
+/// (`layer_depths[i - 1] < depth <= layer_depths[i]`). Returns null when
+/// `depth` cannot cut any boundary — at or below the deepest submitted layer,
+/// nothing sits beneath it in-window to sandwich against.
+fn interleaveGapIndex(layer_depths: []const i32, depth: i32) ?usize {
+    var i: usize = 1;
+    while (i < layer_depths.len) : (i += 1) {
+        if (depth > layer_depths[i - 1] and depth <= layer_depths[i]) return i - 1;
+    }
+    return null;
+}
+
+/// Advances the sparse-tile merge cursor by index into `sparse_depth_ranges`
+/// (ascending, already deduplicated by `ensureRenderDepthIndex`), shared with
+/// `collectDenseInterleaveDepths`'s own indexed walk over the same list so
+/// neither pass needs `nextVisibleSparseDepthAfter`'s rescan-from-start cursor.
+fn nextSparseDepth(scene: GameplayScene, index: *usize) ?i32 {
+    if (index.* >= scene.world.sparseDepthRangeCount()) return null;
+    const depth = scene.world.sparseDepthRangeAt(index.*);
+    index.* += 1;
+    return depth;
+}
+
+/// Appends `depth` to `scratch[0..count]` once per gap it could cut between
+/// two adjacent submitted dense layers (`interleaveGapIndex`). Silently drops
+/// `depth` when it falls outside `span` or cannot cut any gap (at/below the
+/// deepest submitted layer) — genuinely benign, since neither case can ever
+/// place a bucket boundary. Also silently drops a second (or later) candidate
+/// for a gap that already has a representative — redundant, not a capacity
+/// loss, since `partitionDenseCompositeBuckets` only consults one candidate
+/// per gap. `scratch` overflowing is unreachable here: gaps are bounded by
+/// `k_max_dense_interleave_gaps`, which is always `<= scratch.len`, so the
+/// assert documents a build invariant rather than a runtime condition to
+/// degrade around.
+fn appendInterleaveDepth(
+    scratch: *[k_max_dense_submit_stack_cap]i32,
+    count: *usize,
+    gap_filled: *[k_max_dense_interleave_gaps]bool,
+    layer_depths: []const i32,
+    depth: i32,
+    span: WorldSystem.DenseWindowDepthSpan,
+) void {
+    if (depth < span.min or depth > span.max) return;
+    const gap_index = interleaveGapIndex(layer_depths, depth) orelse return;
+    if (gap_filled[gap_index]) return;
+    gap_filled[gap_index] = true;
+    std.debug.assert(count.* < scratch.len);
+    scratch[count.*] = depth;
+    count.* += 1;
 }
 
 fn nextDynamicDepth(prep: *const DynamicScenePrep, span_index: *usize) ?i32 {
@@ -842,6 +975,60 @@ test "sprite command capacity sums sparse reserve visuals player and ui headroom
     );
 }
 
+test "static geometry capacity tracks maxDenseSubmitDrawCount and stays flat across levels_below" {
+    var world_shallow = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+        .render_window = .{ .levels_below = 0 },
+    };
+    defer world_shallow.deinit();
+
+    var world_deep = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+        .render_window = .{ .levels_below = 40 },
+    };
+    defer world_deep.deinit();
+
+    // maxDenseSubmitLayerCount (the old, over-provisioned reservation source)
+    // grows with window depth...
+    try std.testing.expect(world_deep.maxDenseSubmitLayerCount() > world_shallow.maxDenseSubmitLayerCount());
+
+    const scene_shallow = GameplayScene{
+        .data = undefined,
+        .world = &world_shallow,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
+    };
+    const scene_deep = GameplayScene{
+        .data = undefined,
+        .world = &world_deep,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
+    };
+
+    const capacity_shallow = staticGeometryCapacity(scene_shallow);
+    const capacity_deep = staticGeometryCapacity(scene_deep);
+
+    // ...but staticGeometryCapacity now sources its span/vertex count from
+    // maxDenseSubmitDrawCount(), the fixed composite-draw bound, so it stays
+    // identical regardless of levels_below.
+    try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, capacity_shallow.span_capacity);
+    try std.testing.expectEqual(capacity_shallow.span_capacity, capacity_deep.span_capacity);
+    try std.testing.expectEqual(capacity_shallow.span_capacity * 6, capacity_shallow.vertex_capacity);
+    try std.testing.expectEqual(capacity_deep.span_capacity * 6, capacity_deep.vertex_capacity);
+}
+
 test "collect dynamic records after structural growth stays within reserve and allocates only on warmup" {
     const created_visual_count = 528;
     var data = DataSystem.init(std.testing.allocator);
@@ -941,6 +1128,130 @@ test "collect dynamic records after structural growth stays within reserve and a
     try std.testing.expectEqual(expected_record_count, prep.orderedRecords().len);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "collect dynamic records includes an entity that fell to a level within the render window" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+
+    // Entity fell through a dug hole: DigController's applyEntityPlaneTraversal
+    // moves it to level 1 via setWorldLevel while the player stays at level 0.
+    const fallen_entity = try data.createEntity();
+    try data.setMovementBody(fallen_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(fallen_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(fallen_entity, 1);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addLevel(-level_z_step);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = -1, .min_y = -1, .max_x = 256, .max_y = 256 };
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+
+    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
+}
+
+test "collect dynamic records excludes an entity beyond the render window depth" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(player_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+
+    // In-window boundary: default DenseLayerRenderWindow.levels_below is 6, so a
+    // level-6 fall is the deepest still-visible level from player_level 0.
+    const in_window_entity = try data.createEntity();
+    try data.setMovementBody(in_window_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(in_window_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(in_window_entity, 6);
+
+    // One level deeper (7) falls outside the window and must stay excluded —
+    // this is not a blanket "render every level" regression of the original
+    // teleport-bug this gate was guarding against.
+    const out_of_window_entity = try data.createEntity();
+    try data.setMovementBody(out_of_window_entity, .{ .position = .{}, .previous_position = .{} });
+    try data.setPrimitiveVisual(out_of_window_entity, .{
+        .size = .{ .x = 1, .y = 1 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    try data.setWorldLevel(out_of_window_entity, 7);
+
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = 1 });
+    defer particles.deinit();
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    for (0..8) |_| _ = try world.addLevel(0);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 256, .h = 256 }, 0);
+
+    var runtime_assets = RuntimeAssets.init(std.testing.allocator);
+    const scene = GameplayScene{
+        .data = &data,
+        .world = &world,
+        .player_entity = player_entity,
+        .player_level = 0,
+        .particles = &particles,
+        .overscan_chunks = 0,
+    };
+    const visible = VisibleWorldRect{ .min_x = -1, .min_y = -1, .max_x = 256, .max_y = 256 };
+
+    var prep = DynamicScenePrep.init(std.testing.allocator);
+    defer prep.deinit();
+    try collectDynamicRecords(&prep, scene, visible, &runtime_assets, 1.0);
+
+    // Player + the level-6 entity only; the level-7 entity is dropped.
+    try std.testing.expectEqual(@as(usize, 2), prep.orderedRecords().len);
 }
 
 fn setSpriteAvailableForTest(runtime_assets: *RuntimeAssets, id: manifest.SpriteAssetId, texture: TextureId) void {
@@ -1091,4 +1402,163 @@ test "visible world rect uses half-open point containment" {
     try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 19.9 }));
     try std.testing.expect(!rect.containsPoint(.{ .x = 110, .y = 20 }));
     try std.testing.expect(!rect.containsPoint(.{ .x = 10, .y = 120 }));
+}
+
+fn testWorldTilesetMeta() !WorldTilesetMeta {
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    return try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+}
+
+test "a visible sparse tile at a deeper in-window level produces a second dense composite draw group" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+
+    // `initDemoFromMeta` is the smallest public constructor that builds a real
+    // catalog (`buildCatalog` itself is private); it creates level 0 with its
+    // own grass floor and a couple of surface obstacle tiles, which this test
+    // extends with a second, deeper level below it.
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
+    defer world.deinit();
+
+    const grass = try world.requireTileByName(&meta, "grass");
+    const tree = try world.requireTileByName(&meta, "tree_0");
+    const level1 = try world.addLevel(-level_z_step);
+    _ = try world.addDenseLayer(level1, 0, .floor, grass);
+    // A sparse tile on the deeper, non-active level: the gap this slice closes.
+    // Neither `active_level` special-casing nor the old per-layer-draw design
+    // needed this; the general interleave-point rule is what must catch it.
+    _ = try world.addSparseTile(level1, 0, 0, tree, 0, .effect);
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 128, .h = 128 }, 0);
+    // Fake the combined GPU tile-data buffer so submitStaticDenseGeometry skips
+    // the real GPU upload (unavailable headless), mirroring world_system.zig's
+    // "setDenseTile queues a GPU cell edit only once the combined buffer exists".
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+
+    // Headless Renderer: device/pipeline/sampler are never dereferenced by the
+    // CPU-only static-geometry path this test exercises. Mirrors renderer.zig's
+    // own headless test fixtures.
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.static_positions.deinit(allocator);
+    defer renderer.static_uvs.deinit(allocator);
+    defer renderer.static_colors.deinit(allocator);
+    defer renderer.static_groups.deinit(allocator);
+    defer renderer.draw_list.deinit(allocator);
+
+    var prep = DynamicScenePrep.init(allocator);
+    defer prep.deinit();
+
+    const scene = GameplayScene{
+        .data = undefined,
+        .world = &world,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
+    };
+
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+
+    try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
+    try std.testing.expectEqual(sprite_batch.Material.tilemap, renderer.static_groups.items[0].material);
+    try std.testing.expectEqual(sprite_batch.Material.tilemap, renderer.static_groups.items[1].material);
+    // The deeper level (holding the sparse tile) composites first (further
+    // back); the shallower level composites last (in front) — the sparse tile's
+    // own dynamic draw sits between them in the merged list.
+    try std.testing.expect(renderer.static_groups.items[0].order.depth < renderer.static_groups.items[1].order.depth);
+
+    var merged: std.ArrayListUnmanaged(sprite_batch.DrawGroup) = .empty;
+    defer merged.deinit(allocator);
+    try mergeDrawList(&merged, allocator, renderer.static_groups.items, &.{});
+    try std.testing.expectEqual(@as(usize, 2), merged.items.len);
+}
+
+test "dense composite bucketing keeps every needed cut regardless of how many redundant interleave candidates exist" {
+    const allocator = std.testing.allocator;
+    var meta = try testWorldTilesetMeta();
+    defer meta.deinit();
+
+    // Surface level (0) plus `k_max_dense_submit_stack_cap - 1` deeper levels:
+    // exactly the worst-case submitted-layer count, giving
+    // `k_max_dense_submit_stack_cap - 1` gaps between adjacent submitted layers.
+    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    var extra_level_index: u16 = 1;
+    while (extra_level_index < k_max_dense_submit_stack_cap) : (extra_level_index += 1) {
+        const level = try world.addLevel(-@as(i32, @intCast(extra_level_index)) * level_z_step);
+        _ = try world.addDenseLayer(level, 0, .floor, grass);
+    }
+    world.render_window = .{ .levels_below = k_max_dense_submit_stack_cap };
+
+    const num_gaps = k_max_dense_submit_stack_cap - 1;
+    // Feed 3 candidates per gap (2 dynamic, 1 sparse) — 3x this frame's real
+    // gap count and, summed across gaps, far more raw distinct depths than the
+    // fixed 32-slot scratch buffer could ever hold under a value-keyed dedup.
+    var prep = DynamicScenePrep.init(allocator);
+    defer prep.deinit();
+    try prep.depth_spans.ensureTotalCapacity(allocator, 2 * num_gaps);
+    for (0..num_gaps) |gap_index| {
+        // Gap `gap_index` sits between the submitted layer at level
+        // `k_max_dense_submit_stack_cap - 1 - gap_index` and the next
+        // shallower one; its own depth is `level_base_z - 2` (.floor band).
+        const deeper_level_index: i32 = @intCast(k_max_dense_submit_stack_cap - 1 - gap_index);
+        const gap_start_depth = -deeper_level_index * level_z_step - 2;
+        prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 4 });
+        prep.depth_spans.appendAssumeCapacity(.{ .start = 0, .end = 0, .depth = gap_start_depth + 10 });
+        _ = try world.addSparseTile(0, 0, 0, grass, gap_start_depth + 13, .effect);
+    }
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0);
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    var runtime_assets = RuntimeAssets.init(allocator);
+    setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+
+    var renderer = Renderer{
+        .allocator = allocator,
+        .device = undefined,
+        .window = undefined,
+        .pipeline = undefined,
+        .tilemap_pipeline = undefined,
+        .sampler = undefined,
+        .vertex_streams = undefined,
+        .batch_capacity_vertices = 0,
+        .batch = sprite_batch.SpriteBatch.init(allocator),
+    };
+    defer renderer.batch.deinit();
+    defer renderer.static_positions.deinit(allocator);
+    defer renderer.static_uvs.deinit(allocator);
+    defer renderer.static_colors.deinit(allocator);
+    defer renderer.static_groups.deinit(allocator);
+    defer renderer.draw_list.deinit(allocator);
+
+    const scene = GameplayScene{
+        .data = undefined,
+        .world = &world,
+        .player_entity = try EntityId.init(0, 1),
+        .player_level = 0,
+        .particles = undefined,
+        .overscan_chunks = 0,
+    };
+
+    // Must not error (TooManyDenseLayers would mean a needed gap overflowed
+    // the fixed scratch buffer) and must produce one composite draw per
+    // submitted layer, proving every one of the `num_gaps` cuts survived
+    // despite 3x as many raw candidate depths feeding the collector.
+    try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
+    try std.testing.expectEqual(k_max_dense_submit_stack_cap, renderer.static_groups.items.len);
 }

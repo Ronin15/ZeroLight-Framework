@@ -492,6 +492,18 @@ pub const CollisionSystem = struct {
         return @min(sorted_count, @max(simd.lane_count, estimated_capacity));
     }
 
+    /// Worst-case narrow-phase CONTACT stream capacity for a given body count — the
+    /// collision system's own domain knowledge, not something a caller (e.g. a game
+    /// state sizing `SimulationPipeline.init`'s `contact_capacity`) should independently
+    /// guess a ratio for. Narrow-phase contacts are a SUBSET of broadphase candidate
+    /// pairs (a contact requires actual overlap; a broadphase candidate only requires
+    /// AABB adjacency), so this reuses the same estimate this module already trusts for
+    /// its own broadphase scratch sizing (`estimateBroadphasePairCapacity`) rather than
+    /// inventing a second, independent multiplier.
+    pub fn estimateContactCapacity(body_count: usize) usize {
+        return estimateBroadphasePairCapacity(body_count, body_count);
+    }
+
     fn growBroadphaseRangeBuffersIfNeeded(self: *CollisionSystem, range_count: usize) !bool {
         var grew = false;
         for (self.broadphase_ranges.items[0..range_count]) |*slot| {

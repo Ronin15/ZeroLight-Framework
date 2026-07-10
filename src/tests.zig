@@ -24,14 +24,13 @@ comptime {
     _ = @import("app/state.zig");
     _ = @import("app/thread_system.zig");
     _ = @import("app/time_loop.zig");
-    // Benchmark workloads and production world builds run via `zig build bench` only;
-    // benchmarks/pathfinding.zig and benchmarks/render_game_prep.zig are exceptions
-    // because their fixtures carry correctness invariants (hard-fallback service
-    // ceiling; expectedBenchCollectedRecords) that a benchmark run alone won't
-    // reliably catch a regression in.
+    // Benchmark workloads and fixture-driven benchmark cases run via `zig build bench`
+    // only — `zig build test` must never execute benchmark code (fixture builds, timed
+    // iterations, adaptive tuning). suite.zig is the one exception: it is the harness
+    // itself, and its tests cover only its own pure utility logic (arg parsing,
+    // formatting, alignment math) against hand-built stubs, never a real fixture or
+    // timed benchmark run.
     _ = @import("benchmarks/suite.zig");
-    _ = @import("benchmarks/pathfinding.zig");
-    _ = @import("benchmarks/render_game_prep.zig");
     _ = @import("core/math.zig");
     _ = @import("core/logging.zig");
     _ = @import("core/rng.zig");
@@ -52,11 +51,15 @@ comptime {
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/world_system.zig");
     _ = @import("game/systems/ai.zig");
+    _ = @import("game/systems/ai_memory.zig");
+    _ = @import("game/systems/affect.zig");
+    _ = @import("game/systems/arbitration.zig");
     _ = @import("game/systems/collision.zig");
     _ = @import("game/systems/collision_response.zig");
     _ = @import("game/systems/movement.zig");
     _ = @import("game/systems/pathfinding.zig");
     _ = @import("game/systems/particle.zig");
+    _ = @import("game/systems/perception.zig");
     _ = @import("game/systems/simulation_scope.zig");
     _ = @import("game/systems/spatial_index.zig");
     _ = @import("game/systems/steering.zig");

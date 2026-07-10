@@ -1268,17 +1268,17 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     // Three cognition agents: one selected, two filtered out for different reasons.
     const selected = try data.createEntity();
     try data.setMovementBody(selected, .{ .position = .{ .x = 100, .y = 100 }, .speed = 40 });
-    try data.setAiAgent(selected, .{ .behavior = .wander });
+    try data.setAiAgent(selected, .{ .active_behavior = .wander });
     try data.setSimulationMetadata(selected, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .stagger_phase = 0 });
 
     const out_of_halo = try data.createEntity();
     try data.setMovementBody(out_of_halo, .{ .position = .{ .x = 200, .y = 100 }, .speed = 40 });
-    try data.setAiAgent(out_of_halo, .{ .behavior = .wander });
+    try data.setAiAgent(out_of_halo, .{ .active_behavior = .wander });
     try data.setSimulationMetadata(out_of_halo, .{ .tier = .cognition, .chunk = .{ .x = 30, .y = 30 }, .stagger_phase = 0 });
 
     const wrong_phase = try data.createEntity();
     try data.setMovementBody(wrong_phase, .{ .position = .{ .x = 120, .y = 120 }, .speed = 40 });
-    try data.setAiAgent(wrong_phase, .{ .behavior = .wander });
+    try data.setAiAgent(wrong_phase, .{ .active_behavior = .wander });
     try data.setSimulationMetadata(wrong_phase, .{ .tier = .cognition, .chunk = .{ .x = 1, .y = 1 }, .stagger_phase = 1 });
 
     var sys = SimulationScopeSystem.init(allocator);
@@ -1301,6 +1301,7 @@ test "scoped AI emits navigation intents only for in-halo, on-phase agents" {
     defer spatial_sys.deinit();
     const ai_slice = data.aiAgentSliceConst();
     const movement_slice = data.movementBodySliceConst();
+    try spatial_sys.reserve(ai_slice.entities.len, .{});
     _ = try spatial_sys.buildSerial(ai_slice, movement_slice, &data, .{ .scope_dense_indices = indices });
 
     var ai_sys = ai.AiSystem.init(allocator);
@@ -1396,7 +1397,7 @@ fn fillParityPopulation(data: *DataSystem, count: usize) !void {
         const chunk_x: i32 = @intCast(index % 20);
         try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
-        try data.setAiAgent(e, .{ .behavior = if (index % 2 == 0) .seek else .wander });
+        try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
         // Levels 0–4 fan the cube distance across all four tiers (level 4 reaches the
         // dormant band), so the movement/collision gathers leave the full-active fast
         // path and actually scan, and the AI gather/tier policy see real work.
@@ -1509,7 +1510,7 @@ test "real worker threads match serial across every scope pass" {
         const e = try data.createEntity();
         try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
-        try data.setAiAgent(e, .{ .behavior = if (index % 2 == 0) .seek else .wander });
+        try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
         try data.setSimulationMetadata(e, .{ .tier = @enumFromInt(index % 4), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = @intCast(index % cognition_stagger_n) });
     }
 
@@ -1582,7 +1583,7 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
         const e = try data.createEntity();
         try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
-        try data.setAiAgent(e, .{ .behavior = if (index % 2 == 0) .seek else .wander });
+        try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
         try data.setSimulationMetadata(e, .{
             .tier = @enumFromInt(index % 4),
             .chunk = .{ .x = @intCast(index % 20), .y = 0 },

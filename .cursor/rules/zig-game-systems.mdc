@@ -1,0 +1,19 @@
+---
+description: Hot-path and simulation contracts for game-layer Zig code
+globs: src/game/**/*.zig
+alwaysApply: false
+---
+
+# Game Systems (ZeroLight-Framework)
+
+Read @AGENTS.md and `docs/coding-standards.md` before editing.
+
+- `DataSystem` owns persistent gameplay SoA — not SDL/GPU/thread/input services
+- `SimulationPipeline` stage changes need `stageContract()`, `stage_order`, and `update()` call in one change
+- `MultiArrayList`: `rows.slice()` once per stage; never `rows.items(.field)` in loops
+- Hot gathers: `addOneAssumeCapacity` + `set()`, not per-row `appendAssumeCapacity(row)`
+- Per-frame/query budgets are fixed constants — never derived from world/map size
+- `reserve` + `assumeCapacity` requires a `FailingAllocator` proof test in the same change
+- Vector/named math via `src/core/simd.zig` and `src/core/math.zig` only
+- Structural commits, SDL/GPU, and asset load stay on deferred/main-thread boundaries
+- No test-only enum tags, marker fields, or fixture hooks in production APIs

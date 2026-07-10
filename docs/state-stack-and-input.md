@@ -59,6 +59,11 @@ pub const MyState = struct {
 
 Return `true` from `handleEvent` when the state consumes an event.
 
+`onPause` is required; `onResume` is optional (`src/app/state.zig`'s adapter
+calls it only when `@hasDecl(T, "onResume")`). Only gameplay-owning states
+like `GameDemoState` implement `onResume`; pure UI states typically implement
+`onPause` alone.
+
 ## Transitions
 
 Use `StateTransitions` from inside a state when a change should happen after the
@@ -162,6 +167,7 @@ by `FrameCommands` (not held movement).
 Default bindings are:
 
 - WASD for movement
+- E/Q/F for dig hole/ramp/down
 - Arrow keys for menu navigation (up/down/left/right)
 - P for pause or resume
 - Enter or Space for resume (also used as confirm/activate inside menus)

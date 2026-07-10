@@ -25,9 +25,10 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
 - `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — live frontier roadmap (Slice 8
-  hardening, slices 22+, priorities, suggested order); settled slices 0–7 and
-  9–17 are in `docs/framework-implementation-slices-archive.md`.
+- `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
+  priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
+  18–25E, 26–31, 34, 36) are in
+  `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
   `docs/changelogs/world.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
@@ -56,12 +57,12 @@ boundaries just to make a local change easier.
   `player.zig`, pipeline-owned controllers
   `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
   and `systems/` (movement, ai, steering, collision, collision_response, particle,
-  and the `pathfinding/` subpackage fronted by `pathfinding.zig`). The
-  `PathfindingSystem` owns nav-invalidation classification and the post-commit nav
-  reaction; the state only invokes it via the pipeline.
+  perception, and the `pathfinding/` subpackage fronted by `pathfinding.zig`).
+  The `PathfindingSystem` owns nav-invalidation classification and the
+  post-commit nav reaction; the state only invokes it via the pipeline.
 - `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
   GPU smoke probe. `src/benchmarks/` — CPU gameplay, pathfinding, nav-update,
-  scope, and render-prep benchmarks.
+  scope, perception, and render-prep benchmarks.
 
 ## Working Rules
 
@@ -77,6 +78,20 @@ boundaries just to make a local change easier.
   missed optimization. Avoid per-frame string lookups, hash-map dispatch,
   broad dynamic dispatch, formatted logging, and resource churn unless the
   cost is measured, bounded, and isolated.
+- **Per-query/per-frame work budgets (search node caps, solve ceilings, and
+  similar) must be fixed constants — never derived from or scaled to world
+  size, map size, cell count, portal count, or any other measured "current
+  scale."** Worlds vary in size; a budget that scales with it means
+  correctness/performance silently depends on which map happens to be loaded.
+  This is a load-bearing, explicitly tested invariant in several modules (grep
+  for `independent of` and `regardless of world size` before touching a
+  budget/capacity constant — e.g. `src/game/systems/pathfinding/`'s abstract
+  A* node budget and `nav_graph.zig`'s incremental-dig chunk-patch tests). When
+  a fixed budget is chronically insufficient for a hard case, the fix is
+  graceful degradation (deterministic deferral / a bounded retry ladder that
+  gives up cleanly) or an algorithmic change that keeps the SAME fixed budget
+  sufficient — never a bigger number picked because one particular map needed
+  it.
 - Threaded writes into a shared buffer must be partitioned (disjoint
   per-worker/per-range slots) and reserved before dispatch, never after or
   during. Allocators are explicit fields set at `init`, never a global reached
@@ -92,6 +107,15 @@ boundaries just to make a local change easier.
 - Treat implementation slices as full features: runtime behavior, docs, tests,
   and acceptance checks all integrated before marking complete.
 - Never edit generated output: `zig-out/` and `.zig-cache/`.
+- **Tests only: keep `WorldSystem`/`DataSystem` test fixtures at the smallest
+  size that still exercises the behavior under test** — do not build out a
+  full/large game world per test. `chunksX`/`chunksY` is `ceilDiv(width,
+  chunk_size_tiles)`, so a `1x1` (or otherwise minimal) `WorldSystem` still
+  yields exactly one real chunk, enough for chunk-gate/visibility tests
+  without a bigger tile grid. Reserve a larger populated world for the one
+  test that specifically needs structural growth/capacity behavior at scale
+  (e.g. a `FailingAllocator` reserve-proof test). Fast, small fixtures keep
+  `zig build test` fast as the suite grows.
 
 ## Build & Validation Commands
 
@@ -130,3 +154,25 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 - Always run a targeted benchmark with `zig build bench -- --group <name>`
   (optionally `--case`/`--items`) unless explicitly told to run the full suite.
   Do not run the whole `zig build bench` and filter its output.
+- **`zig build bench` is for perf and OOM/leak-sweep checks; `zig build test`
+  is for fast contract/correctness checks only.** Never measure or report
+  performance/timing by hand-rolling a timer inside a `zig build test` test —
+  not even temporarily, not even with `-Doptimize=ReleaseFast`. All
+  performance numbers must come from `zig build bench`, which already
+  provides warmup, repeated iterations, and adaptive-settle statistics
+  (`src/benchmarks/suite.zig`) that a one-off timed test block does not.
+  **Test code must never call into `src/benchmarks/*.zig` functions at all**
+  — not just to avoid hand-timing: a benchmark file's fixture builders
+  (`createFixture`, `initFixture`, etc.) and case runners build large
+  synthetic fixtures meant for throughput measurement, not fast correctness
+  checks, and calling them from `zig build test` makes the whole suite slow
+  even without any timing code in the test itself. The one exception is
+  `suite.zig`'s own tests, which cover only its pure utility logic (arg
+  parsing, formatting, alignment math) against hand-built stubs, never a real
+  fixture. If a correctness property belongs to production code, test it in
+  the owning production module with a small hand-built fixture; if it's
+  benchmark-fixture-specific (e.g. does this fixture shape still assert
+  correctly), rely on the module's own internal `std.debug.assert` firing
+  during an actual `zig build bench` run instead of wrapping it in a test. If
+  a perf question needs answering and no benchmark case covers it yet, add or
+  extend one under `src/benchmarks/` and run it via `zig build bench`.

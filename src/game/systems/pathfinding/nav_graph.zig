@@ -126,7 +126,7 @@ pub const NavLevelGraph = struct {
     }
 
     // Live portal nodes summed across the level's per-chunk order windows.
-    pub fn liveCount(self: *const NavLevelGraph) usize {
+    fn liveCount(self: *const NavLevelGraph) usize {
         var count: usize = 0;
         for (self.chunk_order_len.items) |len| count += len;
         return count;
@@ -185,7 +185,7 @@ const ChunkRemaskScratch = struct {
 // `adaptive`/`items_per_range` are control knobs: production runs adaptive (tuner decides), but
 // the benchmark can pin a FIXED range partition so the adaptive tuner is measured against fixed
 // controls (the shared bench theme).
-pub const NavStageThreads = struct {
+const NavStageThreads = struct {
     thread_system: *ThreadSystem,
     tuner: *AdaptiveWorkTuner,
     adaptive: bool = true,
@@ -216,7 +216,7 @@ pub const NavUpdateThreads = struct {
 // so chunk patches run race-free and the threaded result is byte-identical to the serial one.
 const NavPatchJob = struct {
     graph: *NavGraph,
-    world: ?*const WorldSystem,
+    world: *const WorldSystem,
     level: u16,
     chunks: []const u32,
 };
@@ -546,12 +546,12 @@ pub const NavGraph = struct {
     // (Re)builds the chunk-stable slot geometry and every level's full abstract graph from
     // the current masks/components. Used by the init rebuild and by the edge-cap fallback;
     // it re-measures per-chunk edge caps from the current topology, so it never overflows.
-    pub fn buildAbstractGraphs(self: *NavGraph, world: ?*const WorldSystem) !void {
+    fn buildAbstractGraphs(self: *NavGraph, world: ?*const WorldSystem) !void {
         try self.computePortalGeometry(world);
         // Pass 1: build portals/order/labels and fill each level's edge_scratch (retained
         // per level so pass 2 can drain it after the shared edge caps are known).
         for (0..self.levels.items.len) |level_index| {
-            try self.buildLevelInit(@intCast(level_index), world, 0);
+            try self.buildLevelInit(@intCast(level_index), world);
         }
         // Size per-chunk edge windows from the measured per-chunk max count across levels.
         try self.computeEdgeCaps();
@@ -569,9 +569,17 @@ pub const NavGraph = struct {
     // bounded by the edit's chunk footprint, not the level size — a single-chunk dig stops
     // scaling with the world. The global link_edges array is rebuilt once (O(links)); a
     // link's liveness toggle needs no per-chunk rebuild because liveness is enforced only
-    // when emitting link_edges. Bumps `version` once so every goal-keyed cache/pending
-    // entry keyed on the old version re-solves. `affected_levels` is caller-owned
-    // pre-reserved scratch (sized to level count).
+    // when emitting link_edges. `version` stays stable on the common incremental-patch
+    // path — node slots are geometry-stable, so old goal-keyed cache/pending entries
+    // still index correctly and the caller scope-evicts only the edited cells instead.
+    // `version` bumps only on a full relabel or an edge-cap-overflow fallback rebuild
+    // (stats.version_bumps), where node identities can actually change and every
+    // goal-keyed entry must re-solve. `affected_levels` is caller-owned pre-reserved
+    // scratch (sized to level count), but this function grows/frees it with `self.allocator`
+    // (the graph's own), not a caller-supplied one — the caller MUST deinit it with the
+    // same allocator instance passed to this NavGraph, or the alloc/free pair mismatches.
+    // PathfindingSystem satisfies this because it constructs itself and its NavGraph from
+    // one shared allocator.
     //
     // Allocation contract: allocation-free at steady state — the abstract buffers are reused
     // at the prior build's high-water capacity, and the slot/order arrays are geometrically
@@ -583,15 +591,16 @@ pub const NavGraph = struct {
     pub fn applyNavUpdates(
         self: *NavGraph,
         data: *const DataSystem,
-        world: ?*const WorldSystem,
+        world: *const WorldSystem,
         edits: []const NavCellEdit,
+        cell_edits: []const types.ChangedSpan,
         full_level_ids: []const u16,
         affected_levels: *std.ArrayList(bool),
         full_relabel_level_threshold: usize,
         update_threads: ?NavUpdateThreads,
     ) !NavUpdateStats {
         var stats = NavUpdateStats{};
-        if ((edits.len == 0 and full_level_ids.len == 0) or !self.valid()) return stats;
+        if ((edits.len == 0 and cell_edits.len == 0 and full_level_ids.len == 0) or !self.valid()) return stats;
         // Each stage runs through its own tuner (remask/re-flood vs. abstract patch).
         const remask_threads: ?NavStageThreads = if (update_threads) |t| t.remask() else null;
         const patch_threads: ?NavStageThreads = if (update_threads) |t| t.patch() else null;
@@ -611,6 +620,15 @@ pub const NavGraph = struct {
                 affected_level_count += 1;
             }
         }
+        // Entity-driven obstacle changes: a world-space rect already resolved to a nav-cell
+        // span (see PathfindingSystem.markNavObstacleRectDirty), so no tile lookup is needed.
+        for (cell_edits) |edit| {
+            if (@as(usize, edit.level) >= level_count) continue;
+            if (!affected_levels.items[edit.level]) {
+                affected_levels.items[edit.level] = true;
+                affected_level_count += 1;
+            }
+        }
         // Whole-level dirty requests mark a level fully changed (every chunk remasked + patched).
         // Used when a change cannot be localized to cells — e.g. a destroyed/toggled static
         // obstacle whose nav cell is no longer resolvable from the entity.
@@ -624,7 +642,25 @@ pub const NavGraph = struct {
         if (affected_level_count == 0) return stats;
         // Purely diagnostic, O(edits) via the dirty-chunk stamp; only pay for it when perf
         // logging consumes it.
-        if (runtime_perf_log.enabled) stats.dirty_chunks = self.countDirtyChunks(world, edits);
+        if (runtime_perf_log.enabled) stats.dirty_chunks = self.countDirtyChunks(world, edits, cell_edits);
+
+        // Re-derive the static-body coverage cache from the CURRENT live static-body set before
+        // any chunk remask reads it (staticBodyCoversNavCell's fast path is a cache read, so a
+        // stale cache would otherwise still report a destroyed/moved body's old cells blocked).
+        // A whole-level-dirty request rebuilds via markStaticBodies (O(bodies), one rasterize per
+        // body's own footprint) rather than refreshStaticCoverageSpan over the whole grid, which
+        // would scan every live body per cell (O(cells x bodies)); an entity rect still uses the
+        // cell-scoped refresh since its span is small by construction.
+        for (full_level_ids) |full_level| {
+            if (@as(usize, full_level) >= self.levels.items.len) continue;
+            const level_grid = &self.levels.items[full_level];
+            if (level_grid.cellCount() == 0) continue;
+            try level_grid.markStaticBodies(self.allocator, data);
+        }
+        for (cell_edits) |edit| {
+            if (@as(usize, edit.level) >= self.levels.items.len) continue;
+            self.levels.items[edit.level].refreshStaticCoverageSpan(data, edit.span);
+        }
 
         // Re-derive the blocked mask + chunk-local components of every chunk an edit touched
         // (or every chunk on a whole-level-dirty level), reading the world over the WHOLE chunk
@@ -636,7 +672,7 @@ pub const NavGraph = struct {
         if (full_relabel) {
             for (self.levels.items, 0..) |_, level_index| {
                 if (!affected_levels.items[level_index]) continue;
-                self.remaskChangedChunks(@intCast(level_index), data, world, edits, levelIsFull(full_level_ids, level_index), remask_threads);
+                self.remaskChangedChunks(@intCast(level_index), data, world, edits, cell_edits, levelIsFull(full_level_ids, level_index), remask_threads);
             }
             for (self.levels.items) |*level_grid| level_grid.buildComponents();
             try self.buildAbstractGraphs(world);
@@ -650,8 +686,8 @@ pub const NavGraph = struct {
                 // Changed chunks: remask from world + re-flood components (deduped). Neighbor
                 // chunks added by buildDirtySet are NOT remasked/re-flooded — their mask is
                 // untouched — only their abstract layer is patched below.
-                self.remaskChangedChunks(level, data, world, edits, full_level, remask_threads);
-                self.buildDirtySet(level, world, edits, full_level);
+                self.remaskChangedChunks(level, data, world, edits, cell_edits, full_level, remask_threads);
+                self.buildDirtySet(level, world, edits, cell_edits, full_level);
                 stats.chunks_patched += self.dirty_set.items.len;
                 if (try self.patchDirtyChunks(level, world, patch_threads)) overflow = true;
             }
@@ -690,7 +726,7 @@ pub const NavGraph = struct {
     // the pre-sized scratch slots; otherwise serial (slot 0). Returns true if any chunk overflowed
     // its edge window. parallelForWithOptions is a barrier, so self.dirty_set stays stable across
     // the batch and the next level's buildDirtySet runs only after it completes.
-    fn patchDirtyChunks(self: *NavGraph, level: u16, world: ?*const WorldSystem, patch_threads: ?NavStageThreads) !bool {
+    fn patchDirtyChunks(self: *NavGraph, level: u16, world: *const WorldSystem, patch_threads: ?NavStageThreads) !bool {
         const chunks = self.dirty_set.items;
         if (patch_threads) |threads| {
             const participants = threads.thread_system.participantSlotCount();
@@ -723,7 +759,7 @@ pub const NavGraph = struct {
     // dirty cell falls in, plus each of those chunks' orthogonal (border-sharing) internal
     // neighbors. Diagonal neighbors are excluded — they share only a corner, never a border
     // line, so no transition edge crosses them. Deduped via an epoch-stamped marker.
-    pub fn buildDirtySet(self: *NavGraph, level: u16, world: ?*const WorldSystem, edits: []const NavCellEdit, full_level: bool) void {
+    fn buildDirtySet(self: *NavGraph, level: u16, world: *const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan, full_level: bool) void {
         self.dirty_set.clearRetainingCapacity();
         _ = self.bumpDirtyEpoch();
         if (full_level) {
@@ -734,31 +770,41 @@ pub const NavGraph = struct {
             while (chunk < total) : (chunk += 1) self.addDirtyChunk(chunk);
             return;
         }
-        const world_system = world orelse return;
-        const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
         const cx_count = self.chunksX();
         const cy_count = self.chunksY();
+        const level_grid = &self.levels.items[level];
         for (edits) |edit| {
             if (edit.level != level) continue;
-            const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
-            var cy = span.min_y / ct;
-            const cy1 = span.max_y / ct;
-            while (cy <= cy1) : (cy += 1) {
-                var cx = span.min_x / ct;
-                const cx1 = span.max_x / ct;
-                while (cx <= cx1) : (cx += 1) {
-                    self.addDirtyChunk(@intCast(cy * cx_count + cx));
-                    if (cx > 0) self.addDirtyChunk(@intCast(cy * cx_count + cx - 1));
-                    if (cx + 1 < cx_count) self.addDirtyChunk(@intCast(cy * cx_count + cx + 1));
-                    if (cy > 0) self.addDirtyChunk(@intCast((cy - 1) * cx_count + cx));
-                    if (cy + 1 < cy_count) self.addDirtyChunk(@intCast((cy + 1) * cx_count + cx));
-                }
+            const span = level_grid.navSpanForTile(world, edit) orelse continue;
+            self.addDirtySpanNeighbors(span, ct, cx_count, cy_count);
+        }
+        for (cell_edits) |edit| {
+            if (edit.level != level) continue;
+            self.addDirtySpanNeighbors(edit.span, ct, cx_count, cy_count);
+        }
+    }
+
+    // Marks every chunk a nav-cell span touches plus each touched chunk's orthogonal
+    // (border-sharing) internal neighbors dirty. Shared by buildDirtySet's tile-edit and
+    // entity-driven cell-edit passes so both add neighbors identically.
+    fn addDirtySpanNeighbors(self: *NavGraph, span: types.NavSpan, ct: usize, cx_count: usize, cy_count: usize) void {
+        var cy = span.min_y / ct;
+        const cy1 = span.max_y / ct;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = span.min_x / ct;
+            const cx1 = span.max_x / ct;
+            while (cx <= cx1) : (cx += 1) {
+                self.addDirtyChunk(@intCast(cy * cx_count + cx));
+                if (cx > 0) self.addDirtyChunk(@intCast(cy * cx_count + cx - 1));
+                if (cx + 1 < cx_count) self.addDirtyChunk(@intCast(cy * cx_count + cx + 1));
+                if (cy > 0) self.addDirtyChunk(@intCast((cy - 1) * cx_count + cx));
+                if (cy + 1 < cy_count) self.addDirtyChunk(@intCast((cy + 1) * cx_count + cx));
             }
         }
     }
 
-    pub fn addDirtyChunk(self: *NavGraph, chunk: u32) void {
+    fn addDirtyChunk(self: *NavGraph, chunk: u32) void {
         if (self.dirty_stamp.items[chunk] == self.dirty_epoch) return;
         self.dirty_stamp.items[chunk] = self.dirty_epoch;
         self.dirty_set.appendAssumeCapacity(chunk);
@@ -784,26 +830,37 @@ pub const NavGraph = struct {
     // simultaneous diggers), so the quadratic form must not run. Dedup is by chunk id; a
     // cross-level same-chunk-id collision under-counts by one, immaterial for a diagnostic.
     // Bumps the dirty epoch, which downstream stages re-bump.
-    pub fn countDirtyChunks(self: *NavGraph, world: ?*const WorldSystem, edits: []const NavCellEdit) usize {
-        const world_system = world orelse return 0;
+    fn countDirtyChunks(self: *NavGraph, world: *const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan) usize {
         const epoch = self.bumpDirtyEpoch();
         const ct: usize = self.chunk_tiles;
         const cx_count = self.chunksX();
         var count: usize = 0;
         for (edits) |edit| {
             const level_grid = self.grid(edit.level) orelse continue;
-            const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
-            var cy = span.min_y / ct;
-            const cy1 = span.max_y / ct;
-            while (cy <= cy1) : (cy += 1) {
-                var cx = span.min_x / ct;
-                const cx1 = span.max_x / ct;
-                while (cx <= cx1) : (cx += 1) {
-                    const chunk: u32 = @intCast(cy * cx_count + cx);
-                    if (self.dirty_stamp.items[chunk] == epoch) continue;
-                    self.dirty_stamp.items[chunk] = epoch;
-                    count += 1;
-                }
+            const span = level_grid.navSpanForTile(world, edit) orelse continue;
+            count += self.countChangedSpanChunks(span, ct, cx_count, epoch);
+        }
+        for (cell_edits) |edit| {
+            if (@as(usize, edit.level) >= self.levels.items.len) continue;
+            count += self.countChangedSpanChunks(edit.span, ct, cx_count, epoch);
+        }
+        return count;
+    }
+
+    // Counts distinct not-yet-stamped chunks a span touches, stamping them along the way.
+    // Shared helper for countDirtyChunks' tile-edit and entity-driven cell-edit passes.
+    fn countChangedSpanChunks(self: *NavGraph, span: types.NavSpan, ct: usize, cx_count: usize, epoch: u32) usize {
+        var count: usize = 0;
+        var cy = span.min_y / ct;
+        const cy1 = span.max_y / ct;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = span.min_x / ct;
+            const cx1 = span.max_x / ct;
+            while (cx <= cx1) : (cx += 1) {
+                const chunk: u32 = @intCast(cy * cx_count + cx);
+                if (self.dirty_stamp.items[chunk] == epoch) continue;
+                self.dirty_stamp.items[chunk] = epoch;
+                count += 1;
             }
         }
         return count;
@@ -816,8 +873,8 @@ pub const NavGraph = struct {
     // footprint's chunk set, not the level cell count. Reads the world whole-chunk so cells the
     // producer coalesced or dropped are still correct. The epoch bump is independent of
     // buildDirtySet's (called next per level), so the two never alias a stamp.
-    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: ?*const WorldSystem, edits: []const NavCellEdit, full_level: bool, remask_threads: ?NavStageThreads) void {
-        const world_system = world orelse return;
+    fn remaskChangedChunks(self: *NavGraph, level: u16, data: *const DataSystem, world: *const WorldSystem, edits: []const NavCellEdit, cell_edits: []const types.ChangedSpan, full_level: bool, remask_threads: ?NavStageThreads) void {
+        const world_system = world;
         const level_grid = &self.levels.items[level];
         const ct: usize = self.chunk_tiles;
         const cx_count = level_grid.chunksX();
@@ -832,20 +889,15 @@ pub const NavGraph = struct {
                 self.dirty_stamp.items[chunk] = epoch;
                 self.changed_chunks.appendAssumeCapacity(chunk);
             }
-        } else for (edits) |edit| {
-            if (edit.level != level) continue;
-            const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
-            var cy = span.min_y / ct;
-            const cy1 = span.max_y / ct;
-            while (cy <= cy1) : (cy += 1) {
-                var cx = span.min_x / ct;
-                const cx1 = span.max_x / ct;
-                while (cx <= cx1) : (cx += 1) {
-                    const chunk: u32 = @intCast(cy * cx_count + cx);
-                    if (self.dirty_stamp.items[chunk] == epoch) continue;
-                    self.dirty_stamp.items[chunk] = epoch;
-                    self.changed_chunks.appendAssumeCapacity(chunk);
-                }
+        } else {
+            for (edits) |edit| {
+                if (edit.level != level) continue;
+                const span = level_grid.navSpanForTile(world_system, edit) orelse continue;
+                self.addChangedSpanChunks(span, ct, cx_count, epoch);
+            }
+            for (cell_edits) |edit| {
+                if (edit.level != level) continue;
+                self.addChangedSpanChunks(edit.span, ct, cx_count, epoch);
             }
         }
 
@@ -880,6 +932,25 @@ pub const NavGraph = struct {
         applyBlockedDelta(level_grid, delta);
     }
 
+    // Marks every chunk a nav-cell span touches as changed (deduped via the epoch stamp),
+    // WITHOUT border neighbors — remaskChangedChunks only re-derives the exact touched chunks
+    // (neighbor chunks are patched, not remasked, by buildDirtySet/patchDirtyChunks). Shared by
+    // the tile-edit and entity-driven cell-edit passes so both add chunks identically.
+    fn addChangedSpanChunks(self: *NavGraph, span: types.NavSpan, ct: usize, cx_count: usize, epoch: u32) void {
+        var cy = span.min_y / ct;
+        const cy1 = span.max_y / ct;
+        while (cy <= cy1) : (cy += 1) {
+            var cx = span.min_x / ct;
+            const cx1 = span.max_x / ct;
+            while (cx <= cx1) : (cx += 1) {
+                const chunk: u32 = @intCast(cy * cx_count + cx);
+                if (self.dirty_stamp.items[chunk] == epoch) continue;
+                self.dirty_stamp.items[chunk] = epoch;
+                self.changed_chunks.appendAssumeCapacity(chunk);
+            }
+        }
+    }
+
     // Applies a signed blocked-cell delta to a level grid's count after a (possibly threaded)
     // remask. The net count is always non-negative (a remask cannot unblock more than is blocked).
     fn applyBlockedDelta(level_grid: *NavGrid, delta: isize) void {
@@ -892,7 +963,7 @@ pub const NavGraph = struct {
     }
 
     // Nav cell index of the nav cell containing a world tile's origin corner.
-    pub fn navCellIndexForTile(self: *const NavGraph, world: *const WorldSystem, edit: NavCellEdit) ?usize {
+    fn navCellIndexForTile(self: *const NavGraph, world: *const WorldSystem, edit: NavCellEdit) ?usize {
         const level_grid = self.grid(edit.level) orelse return null;
         const rect = world.cellRect(edit.x, edit.y) orelse return null;
         const cell = level_grid.worldToCellClamped(.{ .x = rect.x, .y = rect.y });
@@ -901,32 +972,32 @@ pub const NavGraph = struct {
 
     // Chunk-tiling geometry for this graph; the shared source agreeing with every level's
     // NavGrid so the chunk_id<->cell mapping and label encode/decode cannot drift apart.
-    pub fn chunkGeometry(self: *const NavGraph) types.ChunkGeometry {
+    fn chunkGeometry(self: *const NavGraph) types.ChunkGeometry {
         return .{ .width = self.width, .height = self.height, .chunk_tiles = self.chunk_tiles };
     }
 
-    pub fn chunksX(self: *const NavGraph) usize {
+    fn chunksX(self: *const NavGraph) usize {
         return self.chunkGeometry().chunksX();
     }
 
-    pub fn chunksY(self: *const NavGraph) usize {
+    fn chunksY(self: *const NavGraph) usize {
         return self.chunkGeometry().chunksY();
     }
 
-    pub fn chunkOf(self: *const NavGraph, cell_index: usize) u32 {
+    fn chunkOf(self: *const NavGraph, cell_index: usize) u32 {
         return self.chunkGeometry().chunkOf(cell_index);
     }
 
-    pub fn chunkCount(self: *const NavGraph) usize {
+    fn chunkCount(self: *const NavGraph) usize {
         return self.chunksX() * self.chunksY();
     }
 
     // Chunk-local coordinate of a cell within its owning chunk.
-    pub fn localOfCell(self: *const NavGraph, cell_index: usize) struct { x: usize, y: usize } {
+    fn localOfCell(self: *const NavGraph, cell_index: usize) struct { x: usize, y: usize } {
         return .{ .x = (cell_index % self.width) % self.chunk_tiles, .y = (cell_index / self.width) % self.chunk_tiles };
     }
 
-    pub fn isPerimeterCell(self: *const NavGraph, cell_index: usize) bool {
+    fn isPerimeterCell(self: *const NavGraph, cell_index: usize) bool {
         const ct: usize = self.chunk_tiles;
         const lc = self.localOfCell(cell_index);
         return lc.x == 0 or lc.x == ct - 1 or lc.y == 0 or lc.y == ct - 1;
@@ -935,7 +1006,7 @@ pub const NavGraph = struct {
     // Fixed bijection from a chunk's perimeter cells to [0, 4*ct): a canonical slot per
     // perimeter cell (corners resolved to a single edge), so a border cell's node id is a
     // pure function of its position and never moves for the life of the graph.
-    pub fn perimeterSlot(self: *const NavGraph, cell_index: usize) u32 {
+    fn perimeterSlot(self: *const NavGraph, cell_index: usize) u32 {
         const ct: usize = self.chunk_tiles;
         const lc = self.localOfCell(cell_index);
         const slot: usize = if (lc.y == 0)
@@ -951,7 +1022,7 @@ pub const NavGraph = struct {
 
     // Geometric node slot for a portal cell: chunk slot base plus its fixed perimeter slot,
     // or (for a non-perimeter interior link endpoint) base + 4*ct + its stable tail index.
-    pub fn slotForCell(self: *const NavGraph, cell_index: usize) u32 {
+    fn slotForCell(self: *const NavGraph, cell_index: usize) u32 {
         const chunk = self.chunkOf(cell_index);
         const base = self.chunk_portal_base.items[chunk];
         if (self.isPerimeterCell(cell_index)) return base + self.perimeterSlot(cell_index);
@@ -960,7 +1031,7 @@ pub const NavGraph = struct {
     }
 
     // Tail index of an interior link-endpoint cell within its chunk's link-cell run.
-    pub fn linkTailIndex(self: *const NavGraph, chunk: u32, cell_index: usize) u32 {
+    fn linkTailIndex(self: *const NavGraph, chunk: u32, cell_index: usize) u32 {
         const lo = self.chunk_link_base.items[chunk];
         const len = self.chunk_link_count.items[chunk];
         const run = self.chunk_link_cells.items[lo .. lo + len];
@@ -975,7 +1046,7 @@ pub const NavGraph = struct {
     // Computes the chunk-stable slot geometry (portal caps/base/total_slots and the per-chunk
     // interior link-endpoint runs) from the current dimensions and the world's link set. Pure
     // geometry, independent of obstacles, so it is invariant across digs.
-    pub fn computePortalGeometry(self: *NavGraph, world: ?*const WorldSystem) !void {
+    fn computePortalGeometry(self: *NavGraph, world: ?*const WorldSystem) !void {
         const cell_count = self.cellCount();
         std.debug.assert(cell_count < no_cell);
         const chunk_count = self.chunkCount();
@@ -1033,7 +1104,7 @@ pub const NavGraph = struct {
         }
     }
 
-    pub fn recordLinkEndpoint(self: *NavGraph, x: u16, y: u16) !void {
+    fn recordLinkEndpoint(self: *NavGraph, x: u16, y: u16) !void {
         const cell = self.levels.items[0].indexForCell(.{ .x = x, .y = y }) orelse return;
         if (self.isPerimeterCell(cell)) return; // perimeter endpoints reuse their perimeter slot
         const chunk = self.chunkOf(cell);
@@ -1047,7 +1118,7 @@ pub const NavGraph = struct {
 
     // Reorders chunk_link_cells into per-chunk contiguous sorted runs and fills the per-chunk
     // base offsets, so linkTailIndex can binary-search a chunk's run.
-    pub fn groupLinkCellRuns(self: *NavGraph, chunk_count: usize) !void {
+    fn groupLinkCellRuns(self: *NavGraph, chunk_count: usize) !void {
         var running: u32 = 0;
         for (0..chunk_count) |c| {
             self.chunk_link_base.items[c] = running;
@@ -1078,7 +1149,7 @@ pub const NavGraph = struct {
     // Full per-level build into the geometric slot space: tombstone every slot, rebuild each
     // chunk's portals/order/labels, and accumulate the level's edges into edge_scratch (left
     // for placeLevelEdges after the shared edge caps are measured).
-    pub fn buildLevelInit(self: *NavGraph, level: u16, world: ?*const WorldSystem, scratch_slot: usize) !void {
+    fn buildLevelInit(self: *NavGraph, level: u16, world: ?*const WorldSystem) !void {
         const lg = &self.level_graphs.items[level];
         @memset(lg.cell_to_portal.items, no_cell);
         @memset(lg.portals.items, .{ .level = level, .cell_index = no_cell, .chunk = 0 });
@@ -1086,10 +1157,9 @@ pub const NavGraph = struct {
         @memset(lg.chunk_order_len.items, 0);
         @memset(lg.chunk_label_len.items, 0);
         lg.edge_scratch.clearRetainingCapacity();
-        // scratch_slot reserves room for a future threaded caller to give each
-        // worker its own patch-scratch slot; the only caller today is serial and
-        // always passes 0.
-        const scratch = &self.patch_scratch.items[scratch_slot % self.patch_scratch.items.len];
+        // The init build is serial (never threaded), so slot 0 is always the right — and
+        // only — patch scratch to use here.
+        const scratch = &self.patch_scratch.items[0];
         const chunk_count = self.chunkCount();
         var chunk: u32 = 0;
         while (chunk < chunk_count) : (chunk += 1) {
@@ -1109,7 +1179,7 @@ pub const NavGraph = struct {
     // and a liveness toggle forces no per-level graph rebuild. Also rebuilds link_edge_refs,
     // the sorted (level, cell) index that lets abstractCorridor find incident links in
     // O(log(link_count)) rather than scanning the full link_edges slice per portal expansion.
-    pub fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
+    fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
         self.link_edges.clearRetainingCapacity();
         self.link_edge_refs.clearRetainingCapacity();
         const world_system = world orelse return;
@@ -1154,7 +1224,7 @@ pub const NavGraph = struct {
     // Returns a persistent u32 scratch slice of `len`, growing the backing buffer only
     // when a build needs more than any prior build. The three abstract-graph build
     // helpers use this sequentially (never overlapping), so one buffer serves all.
-    pub fn buildScratch(self: *NavGraph, len: usize) ![]u32 {
+    fn buildScratch(self: *NavGraph, len: usize) ![]u32 {
         try setLen(&self.build_u32_scratch, self.allocator, len);
         return self.build_u32_scratch.items;
     }
@@ -1162,7 +1232,7 @@ pub const NavGraph = struct {
     // Per-chunk label stride matching NavGrid's chunk-local label encoding (one shared
     // definition in ChunkGeometry), so a chunk id can be recovered from one of its encoded
     // labels by integer division.
-    pub fn labelStride(self: *const NavGraph) u64 {
+    fn labelStride(self: *const NavGraph) u64 {
         return self.chunkGeometry().labelStride();
     }
 
@@ -1192,11 +1262,11 @@ pub const NavGraph = struct {
     // intra-chunk edges, its ordering/label sub-index, and compacts its edges into its fixed
     // window. Touches no other chunk's slots, so the dirty-bounded incremental update never
     // renumbers or rebuilds an unaffected chunk. Returns true on an edge-window overflow.
-    pub fn patchChunk(self: *NavGraph, level: u16, world: ?*const WorldSystem, chunk: u32, scratch: *ChunkPatchScratch) !bool {
+    fn patchChunk(self: *NavGraph, level: u16, world: *const WorldSystem, chunk: u32, scratch: *ChunkPatchScratch) !bool {
         self.clearChunkSlots(level, chunk);
         scratch.edges.clearRetainingCapacity();
         try self.discoverChunkPortals(level, chunk, scratch);
-        if (world) |world_system| self.addChunkLinkPortals(level, chunk, world_system);
+        self.addChunkLinkPortals(level, chunk, world);
         try self.connectChunkIntraEdges(level, chunk, scratch);
         self.orderChunkPortals(level, chunk);
         return try self.compactChunkEdges(level, chunk, scratch);
@@ -1204,7 +1274,7 @@ pub const NavGraph = struct {
 
     // Tombstones a chunk's whole slot window and clears the cell_to_portal entries of the
     // cells it owned, so a patch starts from a clean chunk independent of its prior content.
-    pub fn clearChunkSlots(self: *NavGraph, level: u16, chunk: u32) void {
+    fn clearChunkSlots(self: *NavGraph, level: u16, chunk: u32) void {
         const lg = &self.level_graphs.items[level];
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
@@ -1222,40 +1292,102 @@ pub const NavGraph = struct {
     }
 
     // Inclusive cell bounds of one chunk, clamped to the grid.
-    pub fn chunkBounds(self: *const NavGraph, chunk: u32) types.ChunkGeometry.Bounds {
+    fn chunkBounds(self: *const NavGraph, chunk: u32) types.ChunkGeometry.Bounds {
         return self.chunkGeometry().chunkBounds(chunk);
     }
 
-    // Scans one chunk's up-to-four INTERNAL borders, adding each open border cell on the
-    // chunk side as a portal and emitting the directed transition edge into its open
-    // neighbor. The reverse edge lives in the neighbor chunk's window and is emitted when
-    // that chunk is patched (both source and neighbor are always in the dirty set), so each
-    // shared transition edge is emitted exactly once.
-    pub fn discoverChunkPortals(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
+    // Scans one chunk's up-to-four INTERNAL borders, materializing one portal PER MAXIMAL
+    // CONTIGUOUS OPEN RUN along each border (not one per open cell) — an open cell pair
+    // that borders a blocked cell on the far side, or the chunk edge, closes a run. Two
+    // cardinally-adjacent open cells are always the same chunk-local component by
+    // construction of the flood, so a run is always one connected region: collapsing it to
+    // one representative loses no reachability. This matters because unconsolidated
+    // per-cell portals scale with BORDER LENGTH regardless of terrain — an open,
+    // obstacle-free area is the WORST case (a wall only removes boundary cells from portal
+    // candidacy), making the abstract chunk-portal search (solve.zig's abstractCorridor)
+    // needlessly dense exactly where it should be cheapest. The reverse edge lives in the
+    // neighbor chunk's window and is emitted when that chunk is patched (both source and
+    // neighbor are always in the dirty set), so each shared transition edge is emitted
+    // exactly once. Run selection must be a PURE FUNCTION of this border's blocked[]
+    // pattern: both chunks sharing a border independently scan the identical physical
+    // open/blocked pattern, so a deterministic rule (the run's midpoint) lands on the same
+    // cell-pair from both sides without cross-chunk coordination — required for the
+    // incremental-patch-matches-full-rebuild invariant this module is tested against.
+    fn discoverChunkPortals(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
         const lg = &self.level_graphs.items[level];
         const blocked = self.levels.items[level].blocked.items;
         const w = self.width;
         const b = self.chunkBounds(chunk);
         if (b.x0 > 0) {
-            var y = b.y0;
-            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x0, y * w + b.x0 - 1, chunk, scratch);
+            try self.discoverBorderRuns(lg, level, blocked, b.y0, b.y1, b.y0 * w + b.x0, w, -1, chunk, scratch);
         }
         if (b.x1 < w) {
-            var y = b.y0;
-            while (y < b.y1) : (y += 1) try self.tryBorderPair(lg, level, blocked, y * w + b.x1 - 1, y * w + b.x1, chunk, scratch);
+            try self.discoverBorderRuns(lg, level, blocked, b.y0, b.y1, b.y0 * w + b.x1 - 1, w, 1, chunk, scratch);
         }
         if (b.y0 > 0) {
-            var x = b.x0;
-            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, b.y0 * w + x, (b.y0 - 1) * w + x, chunk, scratch);
+            try self.discoverBorderRuns(lg, level, blocked, b.x0, b.x1, b.y0 * w + b.x0, 1, -@as(isize, @intCast(w)), chunk, scratch);
         }
         if (b.y1 < self.height) {
-            var x = b.x0;
-            while (x < b.x1) : (x += 1) try self.tryBorderPair(lg, level, blocked, (b.y1 - 1) * w + x, b.y1 * w + x, chunk, scratch);
+            try self.discoverBorderRuns(lg, level, blocked, b.x0, b.x1, (b.y1 - 1) * w + b.x0, 1, @as(isize, @intCast(w)), chunk, scratch);
         }
     }
 
-    pub fn tryBorderPair(self: *NavGraph, lg: *NavLevelGraph, level: u16, blocked: []const bool, c_cell: usize, n_cell: usize, chunk: u32, scratch: *ChunkPatchScratch) !void {
-        if (blocked[c_cell] or blocked[n_cell]) return;
+    // Scans loop indices [lo, hi) along one border line. `c_base`/`c_step` give this
+    // chunk's border cell at a given index (c_cell = c_base + (index - lo) * c_step);
+    // `n_offset` is the fixed signed offset from a c_cell to its neighbor-chunk mirror
+    // (-1/+1 for a vertical border scanned by row, -w/+w for a horizontal border scanned
+    // by column). Both cells open extends the current run; a block (or reaching `hi`)
+    // closes it and materializes exactly one portal pair at the run's midpoint.
+    fn discoverBorderRuns(
+        self: *NavGraph,
+        lg: *NavLevelGraph,
+        level: u16,
+        blocked: []const bool,
+        lo: usize,
+        hi: usize,
+        c_base: usize,
+        c_step: usize,
+        n_offset: isize,
+        chunk: u32,
+        scratch: *ChunkPatchScratch,
+    ) !void {
+        var run_start: ?usize = null;
+        var i: usize = lo;
+        while (i < hi) : (i += 1) {
+            const c_cell = c_base + (i - lo) * c_step;
+            const n_cell: usize = @intCast(@as(isize, @intCast(c_cell)) + n_offset);
+            if (!blocked[c_cell] and !blocked[n_cell]) {
+                if (run_start == null) run_start = i;
+            } else if (run_start) |start| {
+                try self.emitBorderRunPortal(lg, level, c_base, c_step, n_offset, lo, start, i, chunk, scratch);
+                run_start = null;
+            }
+        }
+        if (run_start) |start| {
+            try self.emitBorderRunPortal(lg, level, c_base, c_step, n_offset, lo, start, hi, chunk, scratch);
+        }
+    }
+
+    // Materializes the single portal pair representing an open run [run_start, run_end),
+    // at its midpoint (floor-biased toward the start on an even-length run) — deterministic
+    // given only the run's own bounds, so both chunks sharing this border compute the same
+    // representative independently.
+    fn emitBorderRunPortal(
+        self: *NavGraph,
+        lg: *NavLevelGraph,
+        level: u16,
+        c_base: usize,
+        c_step: usize,
+        n_offset: isize,
+        lo: usize,
+        run_start: usize,
+        run_end: usize,
+        chunk: u32,
+        scratch: *ChunkPatchScratch,
+    ) !void {
+        const mid = run_start + (run_end - run_start) / 2;
+        const c_cell = c_base + (mid - lo) * c_step;
+        const n_cell: usize = @intCast(@as(isize, @intCast(c_cell)) + n_offset);
         self.addPortalCell(lg, level, c_cell, chunk);
         try scratch.edges.append(self.allocator, .{
             .from = self.slotForCell(c_cell),
@@ -1265,7 +1397,7 @@ pub const NavGraph = struct {
 
     // Marks a cell live at its geometric slot. Idempotent: a corner cell touched by two of
     // its chunk's borders keeps a single node.
-    pub fn addPortalCell(self: *NavGraph, lg: *NavLevelGraph, level: u16, cell_index: usize, chunk: u32) void {
+    fn addPortalCell(self: *NavGraph, lg: *NavLevelGraph, level: u16, cell_index: usize, chunk: u32) void {
         if (lg.cell_to_portal.items[cell_index] != no_cell) return;
         const slot = self.slotForCell(cell_index);
         lg.portals.items[slot] = .{ .level = level, .cell_index = @intCast(cell_index), .chunk = chunk };
@@ -1275,7 +1407,7 @@ pub const NavGraph = struct {
     // Adds this chunk's open link-endpoint cells (on this level) as portals so the intra-chunk
     // pass can connect them to their chunk-local-component peers. Liveness of the cross-level
     // link itself is decided later in rebuildLinkEdges; membership depends only on this level.
-    pub fn addChunkLinkPortals(self: *NavGraph, level: u16, chunk: u32, world: *const WorldSystem) void {
+    fn addChunkLinkPortals(self: *NavGraph, level: u16, chunk: u32, world: *const WorldSystem) void {
         const lg = &self.level_graphs.items[level];
         const level_grid = &self.levels.items[level];
         for (world.levelLinks()) |link| {
@@ -1284,7 +1416,7 @@ pub const NavGraph = struct {
         }
     }
 
-    pub fn tryLinkPortal(self: *NavGraph, lg: *NavLevelGraph, level_grid: *const NavGrid, x: u16, y: u16, chunk: u32) void {
+    fn tryLinkPortal(self: *NavGraph, lg: *NavLevelGraph, level_grid: *const NavGrid, x: u16, y: u16, chunk: u32) void {
         const cell = level_grid.indexForCell(.{ .x = x, .y = y }) orelse return;
         if (self.chunkOf(cell) != chunk or level_grid.blocked.items[cell]) return;
         // The per-chunk interior link-endpoint runs (and thus the interior slot space) are built
@@ -1311,7 +1443,7 @@ pub const NavGraph = struct {
 
     // Connects this chunk's live same-chunk-component portals pairwise with octile cost. Both
     // endpoints share the chunk so both directions land in this chunk's edge window.
-    pub fn connectChunkIntraEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
+    fn connectChunkIntraEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !void {
         const lg = &self.level_graphs.items[level];
         const components = self.levels.items[level].components.items;
         const pbase = self.chunk_portal_base.items[chunk];
@@ -1336,7 +1468,7 @@ pub const NavGraph = struct {
     // Writes this chunk's live slots into its portal_order window sorted by (chunk-local
     // label, cell) and builds the chunk's compact label sub-index. Labels of one chunk are
     // disjoint from every other chunk's, so no cross-chunk ordering is needed.
-    pub fn orderChunkPortals(self: *NavGraph, level: u16, chunk: u32) void {
+    fn orderChunkPortals(self: *NavGraph, level: u16, chunk: u32) void {
         const lg = &self.level_graphs.items[level];
         const components = self.levels.items[level].components.items;
         const pbase = self.chunk_portal_base.items[chunk];
@@ -1368,7 +1500,7 @@ pub const NavGraph = struct {
     // Drains this chunk's edge_scratch into its fixed edge window, grouped by source slot,
     // setting portal_edge_start/portal_edge_count per slot. Returns true (without writing past
     // the window) when the chunk's edges exceed its cap, so the caller can fall back.
-    pub fn compactChunkEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !bool {
+    fn compactChunkEdges(self: *NavGraph, level: u16, chunk: u32, scratch: *ChunkPatchScratch) !bool {
         const lg = &self.level_graphs.items[level];
         const pbase = self.chunk_portal_base.items[chunk];
         const pcap = self.chunk_portal_cap.items[chunk];
@@ -1383,7 +1515,18 @@ pub const NavGraph = struct {
             lg.portal_edge_start.items[slot] = running;
             running += lg.portal_edge_count.items[slot];
         }
-        if (running - ebase > ecap) return true;
+        if (running - ebase > ecap) {
+            // The counts above claim adjacency that was never written into portal_edges (this
+            // chunk's window still holds whatever the last successful build/patch left there).
+            // The caller always follows an overflow with a full buildAbstractGraphs rebuild, but
+            // that rebuild can itself fail (OOM) before reaching this chunk, and a failed `try`
+            // leaves the graph object exactly as it stands right now. Re-zero the counts so a
+            // reader in that window sees empty (not dangling/stale) adjacency for this chunk
+            // instead of a CSR range whose content was never refreshed for the new topology.
+            var zero_slot = pbase;
+            while (zero_slot < pbase + pcap) : (zero_slot += 1) lg.portal_edge_count.items[zero_slot] = 0;
+            return true;
+        }
         // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start. Uses
         // this worker's own cursor buffer so parallel chunk patches never share writable state.
         try setLen(&scratch.cursor, self.allocator, pcap);
@@ -1401,7 +1544,7 @@ pub const NavGraph = struct {
     // Drains a fully-built level's edge_scratch (all chunks) into the edge arena, grouped by
     // source slot within each chunk's window. Used only by the full build, where caps were
     // measured to fit, so it cannot overflow.
-    pub fn placeLevelEdges(self: *NavGraph, level: u16) !void {
+    fn placeLevelEdges(self: *NavGraph, level: u16) !void {
         const lg = &self.level_graphs.items[level];
         try setLen(&lg.portal_edges, self.allocator, self.total_edge_slots);
         @memset(lg.portal_edge_count.items, 0);
@@ -1430,7 +1573,7 @@ pub const NavGraph = struct {
     // Sizes the per-chunk edge windows from the measured per-chunk MAX init edge count across
     // levels, times the slack multiplier, with a floor. Shared geometry, so the cap of a chunk
     // covers every level's count for that chunk.
-    pub fn computeEdgeCaps(self: *NavGraph) !void {
+    fn computeEdgeCaps(self: *NavGraph) !void {
         const chunk_count = self.chunkCount();
         try setLen(&self.chunk_edge_cap, self.allocator, chunk_count);
         try setLen(&self.chunk_edge_base, self.allocator, chunk_count);
@@ -1454,7 +1597,7 @@ pub const NavGraph = struct {
 
     // Local portal node index for a cell on `level`, or null when the cell is not a
     // portal. Indexes that level's own cell_to_portal directly.
-    pub fn portalIndex(self: *const NavGraph, level: u16, cell_index: u32) ?u32 {
+    fn portalIndex(self: *const NavGraph, level: u16, cell_index: u32) ?u32 {
         const lg = self.levelGraph(level) orelse return null;
         if (cell_index >= lg.cell_to_portal.items.len) return null;
         const value = lg.cell_to_portal.items[cell_index];
@@ -1475,11 +1618,11 @@ pub const NavGraph = struct {
 // Orders a level's portal node indices by chunk-local component label (then cell index
 // for a deterministic build) so each label's portals form a contiguous sub-run that
 // abstract seeding can scan in isolation.
-pub const PortalComponentSort = struct {
+const PortalComponentSort = struct {
     portals: []const PortalNode,
     components: []const u32,
 
-    pub fn lessThan(self: PortalComponentSort, lhs: u32, rhs: u32) bool {
+    fn lessThan(self: PortalComponentSort, lhs: u32, rhs: u32) bool {
         const a_cell = self.portals[lhs].cell_index;
         const b_cell = self.portals[rhs].cell_index;
         const a_comp = self.components[a_cell];
@@ -1494,8 +1637,12 @@ pub const PortalComponentSort = struct {
 // ----------------------------------------------------------------------------
 
 const PathfindingSystem = @import("system.zig").PathfindingSystem;
+const EntityId = @import("../../data_system.zig").EntityId;
+const SimulationFrame = @import("../../simulation.zig").SimulationFrame;
 const test_support = @import("test_support.zig");
 const abstractCapacity = test_support.abstractCapacity;
+const baselineCapacity = test_support.baselineCapacity;
+const addNavBody = test_support.addNavBody;
 const loadTestWorldMeta = test_support.loadTestWorldMeta;
 const requireTestTile = test_support.requireTestTile;
 
@@ -1604,6 +1751,40 @@ fn expectGraphsEquivalent(a: *const NavGraph, b: *const NavGraph) !void {
     for (a_edges.items, b_edges.items) |ea, eb| {
         try t.expectEqual(ea, eb);
     }
+}
+
+test "regression: destroying a static body and remasking leaves its cell correctly open (coverage-cache staleness)" {
+    // NavGrid.markStaticBodies rasterizes a per-cell static-body coverage cache
+    // (static_blocked) only when the WHOLE graph rebuilds. Before the fix, neither the
+    // whole-level-dirty path nor the incremental patch ever refreshed that cache, so
+    // staticBodyCoversNavCell's O(1) fast path kept reporting a destroyed/moved body's old
+    // cells as covered forever after the first rebuild. This spawns a static body, destroys
+    // it, and remasks via the whole-level-dirty path (markNavLevelDirty), asserting the
+    // vacated cell is correctly open — this would fail (stay blocked) without the
+    // refreshStaticCoverageSpan calls in NavGraph.applyNavUpdates.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+
+    const entity = try addNavBody(&data, .{ .x = 100, .y = 100 }, .{ .x = 16, .y = 16 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+
+    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 100, .y = 100 });
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+
+    _ = data.destroyEntity(entity);
+    try system.markNavLevelDirty(0);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+
+    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
 }
 
 test "incremental nav update remask matches the composed world mask across levels" {
@@ -1815,10 +1996,17 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     const grass = try requireTestTile(&meta, "grass");
     const tree = try requireTestTile(&meta, "tree_0");
 
-    // 12x12 open world, 4-tile chunks. The vertical border at x=4 puts cell (3,5) in
-    // chunk (0,1) and its open neighbor (4,5) in chunk (1,1); both are border portals.
+    // 12x12 world, 4-tile chunks. The vertical border at x=4 spans y=4..7 for chunk row 1;
+    // (3,4)/(3,6)/(3,7) start blocked so (3,5)|(4,5) is the border's ONLY open cell pair —
+    // an isolated 1-cell run, so it is unambiguously the run's own representative portal
+    // under discoverChunkPortals' run consolidation (see that function's doc comment),
+    // rather than depending on which cell a multi-cell run's midpoint happens to land on.
     var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 384, 384);
     defer world.deinit();
+    const isolation_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
+    for ([_]u16{ 4, 6, 7 }) |wy| {
+        _ = try world.setDenseTile(isolation_layer, 3, wy, tree);
+    }
 
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
@@ -1835,8 +2023,7 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     // Block (3,5) on the chunk (0,1) side: the (3,5)|(4,5) portal pair disappears, so
     // the NEIGHBOR chunk (1,1)'s portal at (4,5) flips off even though only chunk (0,1)
     // is relabeled.
-    const obstacle_layer = try world.addDenseLayer(0, 0, .obstacle, grass);
-    const changed = (try world.setDenseTile(obstacle_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
+    const changed = (try world.setDenseTile(isolation_layer, 3, 5, tree)) orelse return error.TestExpectedEqual;
     _ = try system.applyNavUpdates(&data, &world, &.{.{ .level = changed.level, .x = changed.x, .y = changed.y }});
 
     try std.testing.expect(system.graph.portalIndex(0, @intCast(near)) == null);
@@ -1849,6 +2036,40 @@ test "incremental nav update on a chunk border flips a neighbor chunk's portal" 
     try rebuilt.reserve(abstractCapacity());
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+// Regression guard for discoverChunkPortals' run consolidation: an open chunk border must
+// yield ONE portal per contiguous open run, not one per open cell — an obstacle-free area
+// is the WORST case for portal density under the old per-cell scheme (a wall only ever
+// removes boundary cells from candidacy), which made the abstract chunk-portal search
+// needlessly expensive exactly where it should be cheapest (see discoverChunkPortals'
+// doc comment). A fully-interior chunk with all four borders open has at most one live
+// portal per side (4), never one per open boundary cell (up to chunk_tiles per side).
+test "a fully-open interior chunk yields at most one portal per border side, not one per open cell" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // 12x12 open world, 4-tile chunks: a 3x3 chunk grid whose CENTER chunk (1,1) is the
+    // only one with all four sides internal (bordering another chunk on every side).
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGrid(&data, 384, 384, 32);
+
+    const chunk_tiles = system.capacity.nav_chunk_tiles;
+    const chunks_per_side = 3;
+    const center_chunk: u32 = 1 * chunks_per_side + 1;
+    const pbase = system.graph.chunk_portal_base.items[center_chunk];
+    const pcap = system.graph.chunk_portal_cap.items[center_chunk];
+    var live_count: usize = 0;
+    for (system.graph.level_graphs.items[0].portals.items[pbase .. pbase + pcap]) |portal| {
+        if (portal.cell_index != no_cell) live_count += 1;
+    }
+    // One border-consolidated portal per side (4), well under one per open boundary cell
+    // per side on all four sides (up to chunk_tiles * 4) that the pre-consolidation scheme
+    // would have produced for a fully-open chunk.
+    try std.testing.expect(live_count <= 4);
+    try std.testing.expect(live_count < @as(usize, chunk_tiles) * 4);
 }
 
 test "incremental nav update opening a ramp endpoint adds a live LevelLink edge" {
@@ -2132,6 +2353,15 @@ test "incremental dig overflowing a chunk edge window falls back to a full rebui
             try edits.append(std.testing.allocator, .{ .level = opened.level, .x = opened.x, .y = opened.y });
         }
     }
+    // Border-run consolidation (nav_graph.zig's discoverChunkPortals) means a solidly-open
+    // chunk now yields only a handful of portals (one per contiguous open run per border
+    // side), not one per open cell, so opening this whole world no longer produces enough
+    // edges on its own to exceed chunk_edge_floor. Force the overflow directly instead —
+    // the same technique "compactChunkEdges zeroes the chunk's edge counts on overflow..."
+    // already uses below — so this test exercises the actual overflow->fallback->rebuild
+    // response through the real applyNavUpdates entry point, independent of how many edges
+    // a given portal scheme happens to produce for this geometry.
+    for (system.graph.chunk_edge_cap.items) |*cap| cap.* = 0;
     const stats = try system.applyNavUpdates(&data, &world, edits.items);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expectEqual(@as(usize, 1), stats.edge_cap_fallback);
@@ -2142,6 +2372,45 @@ test "incremental dig overflowing a chunk edge window falls back to a full rebui
     try rebuilt.reserve(abstractCapacity());
     try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, 384, 384, 32, null);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "compactChunkEdges zeroes the chunk's edge counts on overflow instead of leaving them dangling" {
+    // Isolates compactChunkEdges from the caller's always-follows-with-a-full-rebuild
+    // convention: an overflow must leave the chunk's OWN CSR self-consistent (empty
+    // adjacency) even if nothing else runs afterward (e.g. the fallback rebuild OOMs).
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+
+    const chunk: u32 = 0;
+    const pbase = system.graph.chunk_portal_base.items[chunk];
+    const pcap = system.graph.chunk_portal_cap.items[chunk];
+    // Sanity: the init build gave this chunk real edges to lose on a forced overflow.
+    var had_edges = false;
+    for (system.graph.level_graphs.items[0].portal_edge_count.items[pbase .. pbase + pcap]) |count| {
+        if (count != 0) had_edges = true;
+    }
+    try std.testing.expect(had_edges);
+
+    // Force overflow: shrink this chunk's edge window below any possible edge count.
+    system.graph.chunk_edge_cap.items[chunk] = 0;
+    const overflowed = try system.graph.patchChunk(0, &world, chunk, &system.graph.patch_scratch.items[0]);
+    try std.testing.expect(overflowed);
+
+    // The chunk's counts must be zero (empty adjacency), not stale/dangling into whatever
+    // patchChunk's clearChunkSlots + re-discovery left in portal_edges for this window.
+    for (system.graph.level_graphs.items[0].portal_edge_count.items[pbase .. pbase + pcap]) |count| {
+        try std.testing.expectEqual(@as(u32, 0), count);
+    }
 }
 
 test "incremental single-chunk dig patches a constant chunk set independent of world size" {
@@ -2333,4 +2602,340 @@ test "incremental nav update threaded chunk patch matches a serial full rebuild"
     try std.testing.expectEqualSlices(PortalNode, full.portals.items, inc.portals.items);
     try std.testing.expectEqualSlices(u32, full.cell_to_portal.items, inc.cell_to_portal.items);
     try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "entity obstacle create/destroy patches a constant chunk set independent of world size and matches a full rebuild" {
+    // Mirrors "incremental single-chunk dig patches a constant chunk set independent of world
+    // size" but for an entity-driven obstacle rect resolved through markNavObstacleRectDirty
+    // instead of a tile edit, proving the same chunk-bounded localization for entities.
+    const extents = [_]f32{ 512, 1024 };
+    var patched: [extents.len]usize = undefined;
+    for (extents, 0..) |extent, i| {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var meta = try loadTestWorldMeta(std.testing.allocator);
+        defer meta.deinit();
+
+        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        defer world.deinit();
+
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(abstractCapacity());
+        try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+        // Cell (5,5) sits in chunk (1,1) (4-tile chunks): interior for both worlds.
+        const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+        const rect = data.staticObstacleWorldRect(entity).?;
+        try system.markNavObstacleRectDirty(0, rect);
+        const create_stats = try system.applyBufferedNavUpdates(&data, &world, null);
+        patched[i] = create_stats.chunks_patched;
+
+        var rebuilt_created = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt_created.deinit();
+        try rebuilt_created.reserve(abstractCapacity());
+        try rebuilt_created.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+        try expectGraphsEquivalent(&system.graph, &rebuilt_created.graph);
+
+        _ = data.destroyEntity(entity);
+        try system.markNavObstacleRectDirty(0, rect);
+        _ = try system.applyBufferedNavUpdates(&data, &world, null);
+
+        var rebuilt_destroyed = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt_destroyed.deinit();
+        try rebuilt_destroyed.reserve(abstractCapacity());
+        try rebuilt_destroyed.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+        try expectGraphsEquivalent(&system.graph, &rebuilt_destroyed.graph);
+    }
+    try std.testing.expectEqual(@as(usize, 5), patched[0]);
+    try std.testing.expectEqual(patched[0], patched[1]);
+}
+
+test "entity obstacle move marks both old and new spans dirty at a distance-independent patch cost" {
+    // Moves a static obstacle corner-to-corner in one batch (two markNavObstacleRectDirty
+    // calls: old rect then new rect — never a bounding box spanning both). A corner chunk
+    // has exactly two orthogonal neighbors (self + 2), so each span patches 3 chunks; the two
+    // spans never share a chunk once the grid is at least 3 chunks wide, so the total (6) is
+    // identical regardless of how far apart the corners are in world units.
+    const extents = [_]f32{ 512, 1024 };
+    var patched: [extents.len]usize = undefined;
+    for (extents, 0..) |extent, i| {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var meta = try loadTestWorldMeta(std.testing.allocator);
+        defer meta.deinit();
+
+        var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+        defer world.deinit();
+
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(abstractCapacity());
+
+        const entity = try addNavBody(&data, .{ .x = 8, .y = 8 }, .{ .x = 8, .y = 8 }, true);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+        const old_rect = data.staticObstacleWorldRect(entity).?;
+        const old_cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 8, .y = 8 });
+        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(old_cell));
+
+        const cells_side: u16 = @intFromFloat(extent / 32.0);
+        const far_coord: f32 = @as(f32, @floatFromInt(cells_side - 1)) * 32.0 + 8.0;
+        const body = data.movementBodyPtr(entity).?;
+        body.position_x.* = far_coord;
+        body.position_y.* = far_coord;
+        body.previous_x.* = far_coord;
+        body.previous_y.* = far_coord;
+        const new_rect = data.staticObstacleWorldRect(entity).?;
+        const new_cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = far_coord, .y = far_coord });
+
+        try system.markNavObstacleRectDirty(0, old_rect);
+        try system.markNavObstacleRectDirty(0, new_rect);
+        const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+        patched[i] = stats.chunks_patched;
+
+        try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(old_cell));
+        try std.testing.expect(system.graph.grid(0).?.isBlockedCell(new_cell));
+
+        var rebuilt = PathfindingSystem.init(std.testing.allocator);
+        defer rebuilt.deinit();
+        try rebuilt.reserve(abstractCapacity());
+        try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+        try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+    }
+    try std.testing.expectEqual(@as(usize, 6), patched[0]);
+    try std.testing.expectEqual(patched[0], patched[1]);
+}
+
+test "overlapping static bodies: destroying one leaves the shared cell blocked by the survivor" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+
+    // Two static bodies fully overlapping the same cell.
+    const a = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+    const b = try addNavBody(&data, .{ .x = 162, .y = 162 }, .{ .x = 8, .y = 8 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+
+    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
+    try std.testing.expectEqual(cell, system.graph.grid(0).?.worldToCellClamped(.{ .x = 162, .y = 162 }));
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+
+    // Destroy body `a`; `b` still covers the shared cell, so it must stay blocked (proving
+    // refreshStaticCoverageSpan re-derives from the CURRENT live body set, not a blind toggle).
+    const rect_a = data.staticObstacleWorldRect(a).?;
+    _ = data.destroyEntity(a);
+    try system.markNavObstacleRectDirty(0, rect_a);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+
+    // Destroying the survivor `b` too finally opens the cell.
+    const rect_b = data.staticObstacleWorldRect(b).?;
+    _ = data.destroyEntity(b);
+    try system.markNavObstacleRectDirty(0, rect_b);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
+}
+
+test "static-to-dynamic-to-static toggle blocks and unblocks in place without moving" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 512, 512);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+
+    const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+    const cell = system.graph.grid(0).?.worldToCellClamped(.{ .x = 160, .y = 160 });
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+
+    // Toggle static -> dynamic in place: old rect == new rect; only the "old" side fires
+    // (the entity is no longer a static obstacle, so there is no new-side rect to block).
+    const rect = data.staticObstacleWorldRect(entity).?;
+    try data.setCollisionResponse(entity, .{ .mobility = .dynamic });
+    try system.markNavObstacleRectDirty(0, rect);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expect(!system.graph.grid(0).?.isBlockedCell(cell));
+
+    // Toggle back dynamic -> static in place: only the "new" side fires.
+    try data.setCollisionResponse(entity, .{ .mobility = .static });
+    const new_rect = data.staticObstacleWorldRect(entity).?;
+    try std.testing.expectEqual(rect, new_rect);
+    try system.markNavObstacleRectDirty(0, new_rect);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expect(system.graph.grid(0).?.isBlockedCell(cell));
+}
+
+test "incremental nav update threaded chunk patch matches a serial full rebuild with an entity-obstacle cell edit" {
+    // Extends the threaded tile-edit parity test with a cell_edits-sourced entry (an
+    // entity-driven obstacle destroy) folded into the SAME threaded batch, proving the
+    // cell_edits path through NavGraph.applyNavUpdates/buildDirtySet/remaskChangedChunks
+    // matches a serial full rebuild exactly like the tile-edit path already does.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+
+    // A static body present at build time, destroyed as part of the same threaded batch below.
+    const entity = try addNavBody(&data, .{ .x = 224, .y = 224 }, .{ .x = 8, .y = 8 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+    const cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+    };
+    for (cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    const rect = data.staticObstacleWorldRect(entity).?;
+    _ = data.destroyEntity(entity);
+    try system.markNavObstacleRectDirty(0, rect);
+    _ = try system.applyBufferedNavUpdates(&data, &world, &threads);
+
+    var rebuilt = PathfindingSystem.init(std.testing.allocator);
+    defer rebuilt.deinit();
+    try rebuilt.reserve(cap);
+    try rebuilt.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+    try expectGraphsEquivalent(&system.graph, &rebuilt.graph);
+}
+
+test "entity-obstacle rect nav update is allocation-free at steady state" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+    // Warmup: one entity-obstacle create+destroy churn through the real
+    // markNavObstacleRectDirty + applyBufferedNavUpdates path, so every buffer it touches
+    // (nav_dirty_cell_spans, dirty_set/dirty_stamp, patch/remask scratch) reaches steady-state
+    // capacity before the failing-allocator proof below.
+    {
+        const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+        const rect = data.staticObstacleWorldRect(entity).?;
+        try system.markNavObstacleRectDirty(0, rect);
+        _ = try system.applyBufferedNavUpdates(&data, &world, null);
+        _ = data.destroyEntity(entity);
+        try system.markNavObstacleRectDirty(0, rect);
+        _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    }
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    const entity = try addNavBody(&data, .{ .x = 320, .y = 320 }, .{ .x = 8, .y = 8 }, true);
+    const rect = data.staticObstacleWorldRect(entity).?;
+    try system.markNavObstacleRectDirty(0, rect);
+    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
+// Commits a single set_movement_body structural command through `frame` (real
+// structural-commit -> event pipeline, mirroring how the game state drives it) and
+// applies it, so the produced component_changed event carries real
+// old/new_obstacle_world_rect fields resolved from DataSystem, not a hand-built event.
+fn commitMovedStaticObstacle(frame: *SimulationFrame, data: *DataSystem, entity: EntityId, position: math.Vec2) !void {
+    frame.beginStep();
+    try frame.structural_commands.prepareRangeCounts(1);
+    frame.structural_commands.addCount(0, 1);
+    try frame.structural_commands.prefix();
+    var writer = frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .set_movement_body = .{
+        .entity = entity,
+        .body = .{ .position = position, .previous_position = position },
+    } });
+    writer.finish();
+    frame.structural_commands.finishWrite();
+    _ = try frame.applyStructuralCommands(data);
+}
+
+test "reactToPostCommitNavEvents appends both old and new obstacle spans for one moved static obstacle, allocation-free at steady state (FailingAllocator)" {
+    // The steady-state test above only ever exercises ONE markNavObstacleRectDirty append
+    // per applyBufferedNavUpdates call (a create, then a destroy), called directly rather
+    // than through reactToPostCommitNavEvents. reactToPostCommitNavEvents's component_changed
+    // handling appends up to TWO spans per event -- old_obstacle_world_rect and
+    // new_obstacle_world_rect -- whenever a moving entity stays a static nav obstacle across
+    // the change, so this drives that real 2-appends-in-one-batch case through the actual
+    // structural-commit -> event -> react pipeline.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+
+    const entity = try addNavBody(&data, .{ .x = 160, .y = 160 }, .{ .x = 8, .y = 8 }, true);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    // Warmup: move the obstacle once through the real pipeline (2 appends in one batch)
+    // so nav_dirty_cell_spans reaches its real steady-state high-water mark, along with
+    // every other buffer reactToPostCommitNavEvents touches, before the failing-allocator
+    // proof below.
+    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 224, .y = 224 });
+    const warmup_stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), warmup_stats.incremental_rebuilds);
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    // Move it again: a second single-batch, 2-append occurrence must not allocate.
+    try commitMovedStaticObstacle(&frame, &data, entity, .{ .x = 64, .y = 64 });
+    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    system.graph.allocator = original;
+    system.allocator = original;
 }

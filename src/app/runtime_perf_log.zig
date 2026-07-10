@@ -5,6 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const logging = @import("../core/logging.zig");
+const sdl = @import("../platform/sdl.zig").c;
 const BatchStats = @import("thread_system.zig").BatchStats;
 const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
@@ -51,6 +52,12 @@ pub const Metric = enum {
     ai_navigation_intents,
     ai_separation_candidate_checks,
     ai_separation_neighbor_samples,
+    perception_observers,
+    perception_sensed,
+    perception_los_checks,
+    perception_los_blocked,
+    perception_nearest_threat_found,
+    perception_candidate_checks,
     steering_navigation_intents,
     steering_selected_intents,
     steering_movement_intents,
@@ -78,11 +85,15 @@ pub const Metric = enum {
     path_cache_hits,
     path_cache_evictions,
     path_budget_exhausted,
+    path_escalated_solves,
+    path_escalated_deferred,
     path_goal_projected,
     path_group_fields_built,
     path_group_field_reuses,
     path_group_field_rebuild_throttled,
     path_group_field_samples,
+    path_max_stitch_segments,
+    path_max_distinct_group_keys,
     nav_dirty_chunks,
     nav_incremental_rebuilds,
     nav_full_relabel,
@@ -125,6 +136,9 @@ pub const Metric = enum {
     simulation_events_world_tile_changed,
     simulation_events_world_obstacle_changed,
     simulation_events_nav_region_invalidated,
+    simulation_events_entity_perceived,
+    simulation_events_entity_lost,
+    simulation_events_affect_threshold_crossed,
     simulation_events_structural_commit_stage,
     simulation_events_domain_reaction_stage,
 };
@@ -142,6 +156,9 @@ pub const Timing = enum {
     // serial/dispatch overhead that the batch counters never see. The
     // gameplay_* timers cover state-owned glue outside the pipeline.
     pipeline_spatial_index,
+    pipeline_perception,
+    pipeline_ai_memory,
+    pipeline_ai_affect,
     pipeline_ai,
     pipeline_steering,
     pipeline_pathfinding,
@@ -173,6 +190,7 @@ pub const Timing = enum {
 
 pub const BatchStage = enum {
     spatial_index_build,
+    perception,
     ai_separation,
     ai_intent,
     steering,
@@ -209,6 +227,14 @@ pub const Context = if (enabled) struct {
         if (self.logger) |logger| logger.recordMetric(metric, value);
     }
 
+    // High-water-mark variant: keeps the max value recorded within the interval
+    // instead of summing every call, for metrics that are already a per-step peak
+    // (e.g. max_stitch_segments_observed) where summing across steps would conflate
+    // magnitude with frequency.
+    pub fn recordMetricMax(self: Context, metric: Metric, value: u64) void {
+        if (self.logger) |logger| logger.recordMetricMax(metric, value);
+    }
+
     pub fn recordTiming(self: Context, timing: Timing, duration_ns: u64) void {
         if (self.logger) |logger| logger.recordTiming(timing, duration_ns);
     }
@@ -222,6 +248,7 @@ pub const Context = if (enabled) struct {
     }
 
     pub fn recordMetric(_: Context, _: Metric, _: u64) void {}
+    pub fn recordMetricMax(_: Context, _: Metric, _: u64) void {}
     pub fn recordTiming(_: Context, _: Timing, _: u64) void {}
     pub fn recordBatch(_: Context, _: BatchStage, _: BatchStats) void {}
 };
@@ -233,12 +260,47 @@ comptime {
     }
 }
 
+// Comptime-gated wall-clock timer for one fixed-step stage/phase. Zero-field,
+// zero-cost no-op when perf logging is disabled; otherwise samples the SDL
+// monotonic clock. `stop` is the direct-to-context convenience for a stage bound
+// to one Timing id; `lap` returns the raw duration for a caller that folds it into
+// its own stats struct first (e.g. PathfindingStats' per-phase ns fields) before it
+// reaches the perf log.
+pub const StageTimer = if (enabled) struct {
+    start_ns: u64,
+
+    pub fn start() StageTimer {
+        return .{ .start_ns = sdl.SDL_GetTicksNS() };
+    }
+
+    pub const begin = start;
+
+    pub fn lap(self: *const StageTimer) u64 {
+        const now = sdl.SDL_GetTicksNS();
+        return if (now > self.start_ns) now - self.start_ns else 0;
+    }
+
+    pub fn stop(self: StageTimer, perf: Context, timing: Timing) void {
+        perf.recordTiming(timing, self.lap());
+    }
+} else struct {
+    pub fn start() StageTimer {
+        return .{};
+    }
+    pub const begin = start;
+    pub fn lap(_: *const StageTimer) u64 {
+        return 0;
+    }
+    pub fn stop(_: StageTimer, _: Context, _: Timing) void {}
+};
+
 const DisabledRuntimePerfLog = struct {
     pub fn init(_: u64) DisabledRuntimePerfLog {
         return .{};
     }
 
     pub fn recordMetric(_: *DisabledRuntimePerfLog, _: Metric, _: u64) void {}
+    pub fn recordMetricMax(_: *DisabledRuntimePerfLog, _: Metric, _: u64) void {}
     pub fn recordTiming(_: *DisabledRuntimePerfLog, _: Timing, _: u64) void {}
     pub fn recordBatch(_: *DisabledRuntimePerfLog, _: BatchStage, _: BatchStats) void {}
     pub fn recordFrame(_: *DisabledRuntimePerfLog, _: u64, _: FrameSample) void {}
@@ -257,6 +319,11 @@ const EnabledRuntimePerfLog = struct {
 
     pub fn recordMetric(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
         self.metrics[@intFromEnum(metric_id)] += value;
+    }
+
+    pub fn recordMetricMax(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
+        const slot = &self.metrics[@intFromEnum(metric_id)];
+        slot.* = @max(slot.*, value);
     }
 
     pub fn recordTiming(self: *EnabledRuntimePerfLog, timing_id: Timing, duration_ns: u64) void {
@@ -369,6 +436,9 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         const pipeline_spatial_index_timing = self.timingValue(.pipeline_spatial_index);
+        const pipeline_perception_timing = self.timingValue(.pipeline_perception);
+        const pipeline_ai_memory_timing = self.timingValue(.pipeline_ai_memory);
+        const pipeline_ai_affect_timing = self.timingValue(.pipeline_ai_affect);
         const pipeline_ai_timing = self.timingValue(.pipeline_ai);
         const pipeline_steering_timing = self.timingValue(.pipeline_steering);
         const pipeline_pathfinding_timing = self.timingValue(.pipeline_pathfinding);
@@ -378,11 +448,17 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
         log.debug(
-            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(pipeline_spatial_index_timing.averageNs()),
                 millis(pipeline_spatial_index_timing.max_ns),
+                millis(pipeline_perception_timing.averageNs()),
+                millis(pipeline_perception_timing.max_ns),
+                millis(pipeline_ai_memory_timing.averageNs()),
+                millis(pipeline_ai_memory_timing.max_ns),
+                millis(pipeline_ai_affect_timing.averageNs()),
+                millis(pipeline_ai_affect_timing.max_ns),
                 millis(pipeline_ai_timing.averageNs()),
                 millis(pipeline_ai_timing.max_ns),
                 millis(pipeline_steering_timing.averageNs()),
@@ -427,7 +503,7 @@ const EnabledRuntimePerfLog = struct {
         const pathfinding_solve_timing = self.timingValue(.pathfinding_solve);
         const pathfinding_publish_timing = self.timingValue(.pathfinding_publish);
         log.debug(
-            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3}",
+            "perf {d:.1}s pathfinding accept_avg_ms={d:.3} accept_max_ms={d:.3} group_avg_ms={d:.3} group_max_ms={d:.3} solve_avg_ms={d:.3} solve_max_ms={d:.3} publish_avg_ms={d:.3} publish_max_ms={d:.3} max_stitch_segments={} group_built={} group_reuses={} group_throttled={} group_samples={} max_distinct_group_keys={}",
             .{
                 elapsed_s,
                 millis(pathfinding_accept_timing.averageNs()),
@@ -438,6 +514,12 @@ const EnabledRuntimePerfLog = struct {
                 millis(pathfinding_solve_timing.max_ns),
                 millis(pathfinding_publish_timing.averageNs()),
                 millis(pathfinding_publish_timing.max_ns),
+                self.metricValue(.path_max_stitch_segments),
+                self.metricValue(.path_group_fields_built),
+                self.metricValue(.path_group_field_reuses),
+                self.metricValue(.path_group_field_rebuild_throttled),
+                self.metricValue(.path_group_field_samples),
+                self.metricValue(.path_max_distinct_group_keys),
             },
         );
         log.debug(
@@ -507,7 +589,20 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} structural_stage={} domain_stage={}",
+            "perf {d:.1}s perception observers={} observers_avg={d:.1} sensed={} los_checks={} los_blocked={} nearest_found={} candidate_checks={}",
+            .{
+                elapsed_s,
+                self.metricValue(.perception_observers),
+                averagePer(self.metricValue(.perception_observers), update_count),
+                self.metricValue(.perception_sensed),
+                self.metricValue(.perception_los_checks),
+                self.metricValue(.perception_los_blocked),
+                self.metricValue(.perception_nearest_threat_found),
+                self.metricValue(.perception_candidate_checks),
+            },
+        );
+        log.debug(
+            "perf {d:.1}s events total={} dropped={} created={} destroyed={} component_changed={} world_tile_changed={} world_obstacle_changed={} nav_invalidated={} entity_perceived={} entity_lost={} affect_crossed={} structural_stage={} domain_stage={}",
             .{
                 elapsed_s,
                 self.metricValue(.simulation_events_total),
@@ -518,12 +613,15 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.simulation_events_world_tile_changed),
                 self.metricValue(.simulation_events_world_obstacle_changed),
                 self.metricValue(.simulation_events_nav_region_invalidated),
+                self.metricValue(.simulation_events_entity_perceived),
+                self.metricValue(.simulation_events_entity_lost),
+                self.metricValue(.simulation_events_affect_threshold_crossed),
                 self.metricValue(.simulation_events_structural_commit_stage),
                 self.metricValue(.simulation_events_domain_reaction_stage),
             },
         );
         log.debug(
-            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
+            "perf {d:.1}s path accepted={} duplicate={} pending={} solved={} fallback={} available={} unavailable={} dropped={} deferred={} fallback_deferred={} cache_hits={} evictions={} budget_exhausted={} escalated={} escalated_deferred={} goal_projected={} group_built={} group_reuses={} group_throttled={} group_samples={}",
             .{
                 elapsed_s,
                 self.metricValue(.path_accepted_requests),
@@ -539,6 +637,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_cache_hits),
                 self.metricValue(.path_cache_evictions),
                 self.metricValue(.path_budget_exhausted),
+                self.metricValue(.path_escalated_solves),
+                self.metricValue(.path_escalated_deferred),
                 self.metricValue(.path_goal_projected),
                 self.metricValue(.path_group_fields_built),
                 self.metricValue(.path_group_field_reuses),
@@ -586,7 +686,7 @@ const EnabledRuntimePerfLog = struct {
             const batch_stats = self.batchValue(stage);
             if (batch_stats.calls != 0) {
                 log.debug(
-                    "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} worker_util_avg={d:.1}%",
+                    "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} wait_on_max_ms={d:.3} worker_util_avg={d:.1}%",
                     .{
                         elapsed_s,
                         field.name,
@@ -599,6 +699,7 @@ const EnabledRuntimePerfLog = struct {
                         millis(batch_stats.averageNs()),
                         millis(batch_stats.max_duration_ns),
                         millis(batch_stats.averageWaitNs()),
+                        millis(batch_stats.wait_ns_on_max_duration),
                         batch_stats.averageWorkerUtilization() * 100.0,
                     },
                 );
@@ -645,6 +746,13 @@ const BatchAggregate = struct {
     total_duration_ns: u64 = 0,
     max_duration_ns: u64 = 0,
     total_wait_ns: u64 = 0,
+    // Main-thread wait time on the single call whose *duration* was the
+    // worst seen (not an independent max across all calls) -- lets a caller
+    // tell apart "one worker got an unlucky range while siblings idled"
+    // (wait_ns_on_max_duration close to max_duration_ns) from "every worker
+    // was equally busy that step, just on a globally harder population"
+    // (wait_ns_on_max_duration small relative to max_duration_ns).
+    wait_ns_on_max_duration: u64 = 0,
     total_worker_utilization: f64 = 0,
     max_active_worker_threads: usize = 0,
 
@@ -658,7 +766,10 @@ const BatchAggregate = struct {
             self.threaded_calls += 1;
         }
         self.total_duration_ns += stats.batch_duration_ns;
-        self.max_duration_ns = @max(self.max_duration_ns, stats.batch_duration_ns);
+        if (stats.batch_duration_ns >= self.max_duration_ns) {
+            self.max_duration_ns = stats.batch_duration_ns;
+            self.wait_ns_on_max_duration = stats.main_thread_wait_ns;
+        }
         self.total_wait_ns += stats.main_thread_wait_ns;
         self.total_worker_utilization += stats.worker_utilization;
         self.max_active_worker_threads = @max(self.max_active_worker_threads, stats.active_worker_threads);

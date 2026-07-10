@@ -74,14 +74,38 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
    not string paths, live renderer/SDL/audio handles, or prepared draw records. Convert
    stable IDs to renderer texture IDs at the render-prep boundary, not in `DataSystem`.
    Keep asset paths relative and traversal-safe.
-10. Log only through `src/core/logging.zig` scoped loggers, never raw `std.log`/`std.debug.print`;
+10. Every `reserve`/`ensureTotalCapacity` + `assumeCapacity`/`addOneAssumeCapacity` pairing
+    ships a same-change `std.testing.FailingAllocator` proof test that the warmed path
+    allocates zero times — a comment or "allocation-free" claim is not proof (ReleaseFast
+    strips the assert backing `assumeCapacity`). For threaded writes, reserve on the main
+    thread before dispatch, sized from dispatch's own value, and assert each worker's
+    `worker_id`/`range.index` against the buffer length captured at dispatch.
+11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
+    never derived from world/map size, cell count, portal count, or other "current scale." A
+    chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
+    algorithm change, never a bigger number sized to one map.
+12. Log only through `src/core/logging.zig` scoped loggers, never raw `std.log`/`std.debug.print`;
     `warn` for recovered degradation, `err` for real failures; pure helpers/validation stay
-    log-free. Hot/frame-adjacent paths carry no logging in release — any per-frame/update/draw/
-    entity instrumentation must be comptime-gated out to a zero-sized no-op (`runtime_perf_log.zig`
-    pattern), not runtime-skipped. See `docs/coding-standards.md` Logging.
-11. Add behavior-focused Zig tests when logic can be tested without opening a window.
+    log-free. Hot/frame-adjacent paths carry no logging in release — comptime-gate any such
+    instrumentation to a zero-sized no-op (`runtime_perf_log.zig` pattern), never runtime-skip it.
+13. Add behavior-focused Zig tests when logic can be tested without opening a window.
 
 ## ECS / Hot-Path Rules
+
+Default persistent/gather-buffer storage to `std.MultiArrayList` (row struct, `rows: std.MultiArrayList(Row)`)
+per `docs/coding-standards.md` Dense SoA storage. Hot-path rules are mandatory: call
+`rows.slice()` once per stage/function and reuse the column slices — never call
+`rows.items(.field)` inside a loop (rebuilds pointers per call; measured large Debug/Release
+regressions). Hot per-row gather loops use the `addOneAssumeCapacity` + `set()` append helper
+(`appendMalRow` pattern), not `rows.appendAssumeCapacity(row)` per row.
+
+Adding or reordering a `SimulationPipeline` stage requires, in the same change: the
+`PipelineResource` tag(s) it reads/writes in `simulation_pipeline.zig`'s `stageContract()`,
+its `StageId` slotted into `stage_order` at the position its real dependencies require, and
+the real call in `update()` at that position. `zig build check` comptime-fails a stage that
+reads a resource no earlier stage writes. Ordering dependencies with no shared tracked
+resource need a targeted causal-effect test instead (construct a scenario where the wrong
+order produces an observably different result).
 
 `DataSystem` is the persistent gameplay-data owner and ECS foundation (entity IDs, masks,
 dense typed SoA stores). Do not make app/render/SDL/GPU/input-frame/thread/event services
@@ -100,22 +124,19 @@ item-count floors. Do not turn the main thread into a dumping ground for scalabl
 payloads, or service shortcuts to production contracts. Tests use private helpers, local
 fixtures, mocks, or real payloads.
 
-**All vector and named-math operations go through `core`.** Use `src/core/simd.zig` (vector
-types and ops) and `src/core/math.zig` (reusable scalar/vector math) for every vector operation
-and every named math operation, so the math is tested once and SIMD use stays consistent. This
-is unconditional — a processor being domain-specific is not a reason to hand-roll: do not declare
-raw `@Vector` in a system, and do not hand-roll a named primitive inline (gather/scatter,
-reciprocal/inverse sqrt, length/normalize, trig, interpolation, clamp/saturating conversions, and
-the like). If a needed primitive is missing, add it to `core` with scalar-vs-SIMD parity tests
-and consume it; keep scalar and SIMD forms of the same operation paired so layouts agree. A
-one-system composite kernel (e.g. contact resolution) may stay in its system, but assemble it
-from `core` primitives, not raw intrinsics; if a kernel is reused across systems, promote it to
-`core`. Plain operator arithmetic (`+ - * /`, including on `simd` vector types) is fine inline —
-the rule is about raw `@Vector` and named primitives, not basic arithmetic. Vectorize dense
-uniform branch-light float loops over aligned SoA columns (with a scalar tail) through these
-helpers, judged at target battle scale per `docs/coding-standards.md`; for gather-bound or
-per-element-branchy loops use gather-into-packed-SoA-scratch then masked vector math; leave only
-irreducible loops (e.g. frontier traversal, swap-remove) scalar with a stated reason.
+**All vector/named-math ops go through `core`** (`src/core/simd.zig` vector types/ops,
+`src/core/math.zig` reusable scalar/vector math) — unconditional, regardless of how
+domain-specific a processor is. Never declare raw `@Vector` in a system or hand-roll a named
+primitive inline (gather/scatter, reciprocal/inverse sqrt, length/normalize, trig,
+interpolation, clamp/saturating conversions). Missing primitive → add it to `core` with
+scalar-vs-SIMD parity tests and consume it; keep scalar/SIMD forms paired so layouts agree. A
+one-system composite kernel (e.g. contact resolution) may stay in its system but is assembled
+from `core` primitives, not raw intrinsics; promote a kernel reused across systems. Plain
+operator arithmetic (`+ - * /`, incl. on `simd` types) is fine inline. Vectorize dense uniform
+branch-light float loops over aligned SoA columns (scalar tail) through these helpers, judged
+at target battle scale; gather-bound/branchy loops use gather-into-packed-scratch then masked
+vector math; leave only irreducible loops (frontier traversal, swap-remove) scalar with a
+stated reason.
 
 ## Slices & Scaffolding
 

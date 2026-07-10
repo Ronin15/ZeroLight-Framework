@@ -10,11 +10,11 @@
 const std = @import("std");
 const math = @import("../core/math.zig");
 const runtime_perf_log = @import("../app/runtime_perf_log.zig");
-const c = @import("../platform/sdl.zig").c;
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const ThreadSystem = @import("../app/thread_system.zig").ThreadSystem;
 const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
+const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
@@ -25,6 +25,11 @@ const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
 const AiStats = @import("systems/ai.zig").AiStats;
 const AiSystem = @import("systems/ai.zig").AiSystem;
+const default_goal_requantization_hysteresis_distance = @import("systems/ai.zig").default_goal_requantization_hysteresis_distance;
+const AiMemoryStats = @import("systems/ai_memory.zig").AiMemoryStats;
+const AiMemorySystem = @import("systems/ai_memory.zig").AiMemorySystem;
+const AffectStats = @import("systems/affect.zig").AffectStats;
+const AffectSystem = @import("systems/affect.zig").AffectSystem;
 const CollisionStats = @import("systems/collision.zig").CollisionStats;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
 const CollisionResponseStats = @import("systems/collision_response.zig").CollisionResponseStats;
@@ -35,6 +40,9 @@ const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapaci
 const PathfindingStats = @import("systems/pathfinding.zig").PathfindingStats;
 const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
+const PerceptionStats = @import("systems/perception.zig").PerceptionStats;
+const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
+const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -45,8 +53,133 @@ const cognition_halo_chunks = @import("simulation_scope.zig").cognition_halo_chu
 const SimulationScopeSystem = @import("systems/simulation_scope.zig").SimulationScopeSystem;
 const SpatialIndexStats = @import("systems/spatial_index.zig").SpatialIndexStats;
 const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSystem;
+const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+
+/// Coarse per-step data resources stages read/write, for the stage-ordering
+/// contract below. Some tags bundle several SoA columns owned by one system
+/// (e.g. `movement_positions` covers the movement body's position/velocity
+/// columns together) rather than tracking every field individually.
+const PipelineResource = enum {
+    world_tiles,
+    events,
+    ai_scope_indices,
+    spatial_index,
+    navigation_intents,
+    movement_intents,
+    path_requests,
+    movement_positions,
+    movement_scope_indices,
+    collision_scope_indices,
+    contacts,
+    collision_triggers,
+    world_level,
+    structural_commands,
+    perception_sensed,
+    ai_memory,
+    affect_drives,
+};
+
+const ResourceSet = std.EnumSet(PipelineResource);
+
+fn resources(comptime items: []const PipelineResource) ResourceSet {
+    return ResourceSet.initMany(items);
+}
+
+const StageId = enum {
+    dig_world_edit,
+    scope_advance_and_ai_gather,
+    spatial_index_build,
+    perception_update,
+    ai_memory_update,
+    affect_update,
+    ai_decide,
+    steering_update,
+    pathfinding_update,
+    apply_ai_movement_intents,
+    movement_scope_gather,
+    movement_integrate,
+    bounds_and_tile_gate,
+    collision_scope_gather,
+    collision_detect,
+    collision_respond,
+    plane_traversal,
+    tier_policy,
+};
+
+const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
+
+/// Declares each stage's resource reads/writes against `stage_order` below.
+/// Checked at comptime: a stage cannot read a resource no earlier stage in
+/// `stage_order` writes.
+fn stageContract(stage: StageId) StageContract {
+    return switch (stage) {
+        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
+        .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_scope_indices}) },
+        .spatial_index_build => .{ .reads = resources(&.{.ai_scope_indices}), .writes = resources(&.{.spatial_index}) },
+        // Queries the spatial index for hostile candidates and writes sensed state; also
+        // emits acquisition/loss transition events (Slice 29).
+        .perception_update => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index }), .writes = resources(&.{ .perception_sensed, .events }) },
+        // Refreshes from this step's perception transition events (Slice 30); does not
+        // read perception_sensed's raw columns directly.
+        .ai_memory_update => .{ .reads = resources(&.{ .ai_scope_indices, .events }), .writes = resources(&.{.ai_memory}) },
+        // Appraises this step's just-written perception + memory columns into drives
+        // (Slice 31); arbitration (Slice 32), wired into ai_decide below, is the
+        // first affect_drives reader.
+        .affect_update => .{ .reads = resources(&.{ .ai_scope_indices, .perception_sensed, .ai_memory }), .writes = resources(&.{ .affect_drives, .events }) },
+        .ai_decide => .{ .reads = resources(&.{ .ai_scope_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }), .writes = resources(&.{.navigation_intents}) },
+        .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
+        .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
+        .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
+        .movement_scope_gather => .{ .reads = .empty, .writes = resources(&.{.movement_scope_indices}) },
+        .movement_integrate => .{ .reads = resources(&.{ .movement_positions, .movement_scope_indices }), .writes = resources(&.{.movement_positions}) },
+        .bounds_and_tile_gate => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.movement_positions}) },
+        .collision_scope_gather => .{ .reads = .empty, .writes = resources(&.{.collision_scope_indices}) },
+        .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
+        .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
+        .plane_traversal => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{ .world_tiles, .world_level, .events }) },
+        .tier_policy => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.structural_commands}) },
+    };
+}
+
+/// The pipeline's concrete fixed-step stage order. Reads-before-writes ordering
+/// is enforced at comptime below; ordering it cannot see (e.g. two stages that
+/// share no `PipelineResource`) is proven by causal-effect tests further down
+/// in this file, the same technique the other stage-order tests use.
+const stage_order = [_]StageId{
+    .dig_world_edit,
+    .scope_advance_and_ai_gather,
+    .spatial_index_build,
+    .perception_update,
+    .ai_memory_update,
+    .affect_update,
+    .ai_decide,
+    .steering_update,
+    .pathfinding_update,
+    .apply_ai_movement_intents,
+    .movement_scope_gather,
+    .movement_integrate,
+    .bounds_and_tile_gate,
+    .collision_scope_gather,
+    .collision_detect,
+    .collision_respond,
+    .plane_traversal,
+    .tier_policy,
+};
+
+comptime {
+    var produced: ResourceSet = .empty;
+    for (stage_order) |stage| {
+        const contract = stageContract(stage);
+        const unmet = contract.reads.differenceWith(produced);
+        if (unmet.count() != 0) {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' reads a resource no earlier stage writes — fix stage_order or stageContract()");
+        }
+        produced.setUnion(contract.writes);
+    }
+}
 
 /// Construction policy for the state-owned simulation pipeline.
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
@@ -63,6 +196,17 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
+    /// This state's reserved share of `frame.events`'s `capacity_limit` (see
+    /// `SimulationFrame.reserveStreams`), passed through as
+    /// `PerceptionConfig.max_events_per_step`. Sized by the caller against its
+    /// own event-capacity budget, same as `contact_capacity`/
+    /// `static_obstacle_capacity`; defaults to 0.
+    perception_max_events_per_step: usize = 0,
+    /// This state's reserved share of `frame.events`'s `capacity_limit`,
+    /// passed through as `AffectConfig.max_events_per_step`. Sized by the
+    /// caller against its own event-capacity budget, same as
+    /// `perception_max_events_per_step`; defaults to 0.
+    affect_max_events_per_step: usize = 0,
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -89,6 +233,9 @@ pub const SimulationPipelineUpdateContext = struct {
 pub const SimulationPipelineStats = struct {
     scope: SimulationScope = .{},
     spatial_index: SpatialIndexStats = .{},
+    perception: PerceptionStats = .{},
+    ai_memory: AiMemoryStats = .{},
+    affect: AffectStats = .{},
     ai: AiStats = .{},
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
@@ -99,6 +246,7 @@ pub const SimulationPipelineStats = struct {
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
         const spatial_index_stats = self.spatial_index;
+        const perception_stats = self.perception;
         const ai_stats = self.ai;
         const steering_stats = self.steering;
         const pathfinding_stats = self.pathfinding;
@@ -120,6 +268,14 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.scope_chunk_filtered_entities, metric(scope_stats.chunk_filtered_entities));
 
         perf.recordBatch(.spatial_index_build, spatial_index_stats.batch);
+
+        perf.recordMetric(.perception_observers, metric(perception_stats.observer_count));
+        perf.recordMetric(.perception_sensed, metric(perception_stats.sensed_count));
+        perf.recordMetric(.perception_los_checks, metric(perception_stats.los_checks));
+        perf.recordMetric(.perception_los_blocked, metric(perception_stats.los_blocked));
+        perf.recordMetric(.perception_nearest_threat_found, metric(perception_stats.nearest_threat_found_count));
+        perf.recordMetric(.perception_candidate_checks, metric(perception_stats.candidate_checks));
+        perf.recordBatch(.perception, perception_stats.batch);
 
         perf.recordMetric(.ai_entities, metric(ai_stats.entity_count));
         perf.recordMetric(.ai_intents, metric(ai_stats.intent_count));
@@ -158,11 +314,14 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.path_cache_hits, metric(pathfinding_stats.cache_hits));
         perf.recordMetric(.path_cache_evictions, metric(pathfinding_stats.cache_evictions));
         perf.recordMetric(.path_budget_exhausted, metric(pathfinding_stats.budget_exhausted));
+        perf.recordMetric(.path_escalated_solves, metric(pathfinding_stats.escalated_solves));
+        perf.recordMetric(.path_escalated_deferred, metric(pathfinding_stats.escalated_deferred));
         perf.recordMetric(.path_goal_projected, metric(pathfinding_stats.goal_projected));
         perf.recordMetric(.path_group_fields_built, metric(pathfinding_stats.group_fields_built));
         perf.recordMetric(.path_group_field_reuses, metric(pathfinding_stats.group_field_reuses));
         perf.recordMetric(.path_group_field_rebuild_throttled, metric(pathfinding_stats.group_field_rebuild_throttled));
         perf.recordMetric(.path_group_field_samples, metric(pathfinding_stats.group_field_samples));
+        perf.recordMetricMax(.path_max_stitch_segments, metric(pathfinding_stats.max_stitch_segments_observed));
         perf.recordBatch(.path_fallback, pathfinding_stats.fallback_batch);
         perf.recordTiming(.pathfinding_accept, pathfinding_stats.accept_ns);
         perf.recordTiming(.pathfinding_group_service, pathfinding_stats.group_service_ns);
@@ -207,9 +366,29 @@ pub const SimulationPipeline = struct {
     /// cognition-scoped population the scope system selects for AI. AI
     /// separation queries it read-only; future perception stages reuse it too.
     spatial_index: SpatialIndexSystem,
+    /// AI perception substrate (Slice 29): queries the shared spatial index for
+    /// hostile candidates within vision/FOV/line-of-sight and writes sensed
+    /// state to `PerceptionStore` for the cognition-scoped `AiPerception` subset.
+    perception: PerceptionSystem,
+    /// AI short-term memory: decays staleness/familiarity/ring contacts for the
+    /// cognition-scoped `AiPerception` + `AiMemory` subset and refreshes from
+    /// this step's perception acquisition events, feeding `AiSystem`'s
+    /// memory-aware cold-pursue retarget.
+    ai_memory: AiMemorySystem,
+    /// Emotion-drive appraisal (fear/curiosity/aggression/fatigue): appraises
+    /// this step's just-refreshed `AiPerception`/`AiMemory` state (both
+    /// optional per row) plus each agent's own `AiAgent.active_behavior` into
+    /// the cognition-scoped `AiAffect` subset. `AiConfig.affect_slice` threads
+    /// the resulting drives into arbitration (Slice 32) one stage later; this
+    /// stage only appraises and decays them.
+    affect: AffectSystem,
     dig: DigController,
     audio_controller: AudioController,
     nav_cell_size: f32,
+    /// See `SimulationPipelineConfig.perception_max_events_per_step`.
+    perception_max_events_per_step: usize,
+    /// See `SimulationPipelineConfig.affect_max_events_per_step`.
+    affect_max_events_per_step: usize,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -239,7 +418,30 @@ pub const SimulationPipeline = struct {
         try scope.reserve(config.movement_body_capacity);
         var spatial_index = SpatialIndexSystem.init(allocator);
         errdefer spatial_index.deinit();
-        try spatial_index.reserve(config.movement_body_capacity);
+        const spatial_geometry: SpatialIndexDenseWindowGeometry = if (config.navigation_world) |world|
+            .{ .chunk_size_tiles = world.chunk_size_tiles, .tile_size = world.tile_size }
+        else
+            .{};
+        try spatial_index.reserve(config.movement_body_capacity, spatial_geometry);
+        // No reserve method: PerceptionSystem lazily ensureTotalCapacity's its
+        // gather buffers on first use, same as AiSystem.
+        var perception = PerceptionSystem.init(allocator);
+        errdefer perception.deinit();
+        // Pays every level's first-ever `level_blocked` cache build once here,
+        // alongside pathfinding's own static grid build above, instead of
+        // scattered across whichever live steps first put an observer on each
+        // level (see `PerceptionSystem.prebuildLevelCaches`'s doc comment).
+        if (config.navigation_world) |world| {
+            try perception.prebuildLevelCaches(world);
+        }
+        // No reserve method: AiMemorySystem lazily ensureTotalCapacity's its
+        // gather buffer on first use, same as PerceptionSystem/AiSystem.
+        var ai_memory = AiMemorySystem.init(allocator);
+        errdefer ai_memory.deinit();
+        // No reserve method: AffectSystem lazily ensureTotalCapacity's its
+        // gather buffer on first use, same as AiMemorySystem/PerceptionSystem.
+        var affect = AffectSystem.init(allocator);
+        errdefer affect.deinit();
 
         return .{
             .movement = MovementSystem.init(),
@@ -250,15 +452,23 @@ pub const SimulationPipeline = struct {
             .pathfinding = pathfinding,
             .scope = scope,
             .spatial_index = spatial_index,
+            .perception = perception,
+            .ai_memory = ai_memory,
+            .affect = affect,
             .dig = DigController.init(config.dig),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
+            .perception_max_events_per_step = config.perception_max_events_per_step,
+            .affect_max_events_per_step = config.affect_max_events_per_step,
         };
     }
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.affect.deinit();
+        self.ai_memory.deinit();
+        self.perception.deinit();
         self.spatial_index.deinit();
         self.scope.deinit();
         self.pathfinding.deinit();
@@ -339,6 +549,20 @@ pub const SimulationPipeline = struct {
         return self.pathfinding.reactToPostCommitNavEvents(frame, data, world, thread_system);
     }
 
+    /// Orchestrates the post-commit perception-cache reaction by delegating to
+    /// the cache-owning `PerceptionSystem`, which records localized dirty
+    /// rects for its LOS-blocked bitmap cache from the same committed events
+    /// `reactToPostCommitNavEvents` reacts to — a fully independent side
+    /// effect on disjoint state, so call order between the two does not
+    /// matter.
+    pub fn reactToPostCommitPerceptionEvents(
+        self: *SimulationPipeline,
+        frame: *SimulationFrame,
+        world: *const WorldSystem,
+    ) !void {
+        return self.perception.reactToPostCommitPerceptionEvents(frame, world);
+    }
+
     /// Whether any pending structural command may invalidate navigation once
     /// applied. Delegates to `PathfindingSystem`; used for the pre-commit event
     /// capacity preflight.
@@ -358,9 +582,10 @@ pub const SimulationPipeline = struct {
         self.audio_controller.queueAmbient(audio, input, data, player);
     }
 
-    /// Queues collision SFX for this step's contacts through the owned audio controller.
-    pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, delta_seconds: f32) void {
-        self.audio_controller.queueCollision(audio, frame, data, delta_seconds);
+    /// Queues collision SFX for this step's contacts through the owned audio
+    /// controller. Only contacts involving `player.entity` play a sound.
+    pub fn queueCollisionAudio(self: *SimulationPipeline, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player: Player, delta_seconds: f32) void {
+        self.audio_controller.queueCollision(audio, frame, data, player.entity, delta_seconds);
     }
 
     /// Flags the active jet loop to stop on resume (no command buffer at pause time).
@@ -418,11 +643,60 @@ pub const SimulationPipeline = struct {
         const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_indices });
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
 
+        // Perception substrate (Slice 29): queries the just-built spatial index
+        // for hostile candidates within vision/FOV/line-of-sight, over the same
+        // cognition-scoped `ai_indices` population, writing sensed state to
+        // `PerceptionStore` before AI reads it. The player is folded in as an
+        // extra hostile candidate alongside spatial-index neighbors.
+        const perception_player_candidate: ?PlayerPerceptionCandidate = if (data.movementBodyConst(context.player.entity)) |pbody|
+            .{
+                .entity = context.player.entity,
+                .pos_x = pbody.previous_position.x,
+                .pos_y = pbody.previous_position.y,
+                .faction = data.factionConst(context.player.entity) orelse .neutral,
+                .level = context.player.current_level,
+            }
+        else
+            null;
+
+        var perception_timer = StageTimer.start();
+        const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
+            .scope_dense_indices = ai_indices,
+            .player_candidate = perception_player_candidate,
+            .stimuli = frame.stimuli.mergedItems(),
+            .max_events_per_step = self.perception_max_events_per_step,
+        });
+        perception_timer.stop(context.perf, .pipeline_perception);
+
+        // Decays staleness/familiarity/ring contacts and refreshes from this
+        // step's perception acquisition events, over the same cognition-scoped
+        // `ai_indices` population, before AI reads it for the cold-pursue
+        // retarget below.
+        var ai_memory_timer = StageTimer.start();
+        const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
+            .scope_dense_indices = ai_indices,
+        });
+        ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
+
+        // Appraises this step's just-written perception + memory state into
+        // fear/curiosity/aggression/fatigue, over the same cognition-scoped
+        // `ai_indices` population. Must run after both perception and
+        // ai_memory (it reads their this-step hot columns) and before
+        // arbitration (Slice 32), wired below via `AiConfig.affect_slice`,
+        // reads the resulting drives.
+        var affect_timer = StageTimer.start();
+        const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
+            .scope_dense_indices = ai_indices,
+            .max_events_per_step = self.affect_max_events_per_step,
+        });
+        affect_timer.stop(context.perf, .pipeline_ai_affect);
+
         // The player's plane is deliberately NOT propagated into the AI goal level:
         // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
         // Seeding the player's underground plane here would make them request
         // cross-level paths they cannot walk (start_level is pinned to 0), piling
-        // them at the ramp mouth. They simply seek the (x,y) above the player.
+        // them at the ramp mouth. `player_target` only ever feeds the opt-in
+        // pursue fallback below, never a goal level, so this stays a flat (x,y).
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
             pbody.previous_position
         else
@@ -432,15 +706,41 @@ pub const SimulationPipeline = struct {
         const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
             .intent_seed = 0xfeedf00d,
             .step = self.scope.currentStep(),
-            .seek_target = player_target,
-            // Every demo agent seeks the moving player: the canonical shared goal.
-            // Declaring group mode routes them through one managed flow field
-            // toward the player's nav cell instead of N individual A* solves.
-            .nav_request_kind = .group,
+            // Last-resort fallback (see AiConfig.focus_target's doc comment):
+            // arbitration only reaches for this when a row's own perception/
+            // memory produced no goal and its gain_pursue > 0. Most rows
+            // resolve their goal from their own sensed/remembered/felt state
+            // instead and never touch this pair.
+            .focus_target = player_target,
+            // Ties the pursue fallback's identity to the actual entity
+            // `player_target` represents, so a row falling back to this
+            // signal only ever targets this same entity.
+            .focus_entity = context.player.entity,
+            // Throttles how often the fallback target re-keys as the player
+            // moves continuously, since local separation/steering closes the
+            // small gap between path updates. Without this, the goal re-keys
+            // (and triggers one bounded escalated solve) roughly every nav
+            // cell the player crosses.
+            .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
+            // Ceiling only: arbitration currently resolves every behavior's
+            // goal to `.individual` (each row's goal is agent-specific), so
+            // this has no observable effect today. `.individual` is still the
+            // correct default going forward -- a future group-goal upgrade
+            // (e.g. cohere's shared quantized cell) would otherwise silently
+            // turn back on the moment it lands.
+            .nav_request_kind = .individual,
             .navigation_intents = &frame.navigation_intents,
             // Cognition halo + stagger selection. Steering inherits this scope
             // transitively: it only acts on the navigation intents AI emits here.
             .scope_dense_indices = ai_indices,
+            // Cold-perception agents with fresh memory retarget seek toward
+            // their last-known position instead of losing the goal.
+            .perception_slice = data.aiPerceptionSliceConst(),
+            .memory_slice = data.aiMemorySliceConst(),
+            // Emotion drives (Slice 31/32): arbitration scores each row's
+            // behaviors partly off these, so feelings can change which
+            // behavior wins independent of what's perceived/remembered.
+            .affect_slice = data.aiAffectSliceConst(),
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 
@@ -535,6 +835,9 @@ pub const SimulationPipeline = struct {
         return .{
             .scope = scope,
             .spatial_index = spatial_index_stats,
+            .perception = perception_stats,
+            .ai_memory = ai_memory_stats,
+            .affect = affect_stats,
             .ai = ai_stats,
             .steering = steering_stats,
             .pathfinding = pathfinding_stats,
@@ -569,27 +872,7 @@ pub const SimulationPipeline = struct {
     }
 };
 
-/// Comptime-gated wall-clock timer for one pipeline stage. When perf logging
-/// is disabled it is a zero-field, zero-cost no-op; when enabled it samples the
-/// SDL nanosecond clock and forwards the duration to the bound perf context.
-const StageTimer = if (runtime_perf_log.enabled) struct {
-    start_ns: u64,
-
-    fn start() StageTimer {
-        return .{ .start_ns = c.SDL_GetTicksNS() };
-    }
-
-    fn stop(self: StageTimer, perf: runtime_perf_log.Context, timing: runtime_perf_log.Timing) void {
-        const end_ns = c.SDL_GetTicksNS();
-        perf.recordTiming(timing, if (end_ns > self.start_ns) end_ns - self.start_ns else 0);
-    }
-} else struct {
-    fn start() StageTimer {
-        return .{};
-    }
-
-    fn stop(_: StageTimer, _: runtime_perf_log.Context, _: runtime_perf_log.Timing) void {}
-};
+const StageTimer = runtime_perf_log.StageTimer;
 
 fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
     for (frame.intents.mergedItems()) |item| {
@@ -719,6 +1002,11 @@ fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: 
     }
 }
 
+test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
+    const contract = stageContract(.ai_decide);
+    try std.testing.expect(contract.reads.contains(.affect_drives));
+}
+
 test "pipeline updates full active player-only state through serial path" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -774,6 +1062,98 @@ test "pipeline updates full active player-only state through serial path" {
     try std.testing.expectEqual(@as(usize, 0), frame.contacts.mergedItems().len);
 }
 
+test "pipeline commits the dig stage's world edit before plane traversal reads it in the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // `dig_world_edit` and `plane_traversal` share no `PipelineResource` (dig
+    // authors the tile change directly on the borrowed `WorldSystem`, not a
+    // frame-tracked resource), so the comptime reads-before-writes check above
+    // cannot see this dependency. This test proves the real call-site order
+    // still runs dig before plane traversal, the same causal-effect technique
+    // the ai_memory/affect ordering tests below use.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    // Player stands at cell (5,3) facing right, so this step's dig punches a
+    // hole at (6,3) -- the same cell an NPC crosses into this step.
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    try std.testing.expect(!world.denseFloorIsEmpty(0, 6, 3));
+
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(npc, 0);
+    try data.setSimulationTier(npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    frame.dig_intent = .hole;
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // The NPC crossed from (5,3) into the just-dug hole cell (6,3) and fell to
+    // level 1 within this same step. That is only reachable if dig_world_edit's
+    // tile change committed to `WorldSystem` before plane_traversal read that
+    // cell's floor state this step -- a misordering would leave the tile solid
+    // until next step and the NPC would not fall yet.
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+    const floor1 = world.denseFloorLayerForLevel(1).?;
+    try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+}
+
 test "pipeline resamples AI wander direction across fixed steps" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -782,7 +1162,7 @@ test "pipeline resamples AI wander direction across fixed steps" {
     var player = try Player.spawn(&data);
     const wanderer = try data.createEntity();
     try data.setMovementBody(wanderer, .{ .position = .{ .x = 10, .y = 10 }, .previous_position = .{ .x = 10, .y = 10 }, .velocity = .{}, .speed = 20 });
-    try data.setAiAgent(wanderer, .{ .behavior = .wander, .wander_amplitude = 30, .seek_weight = 0 });
+    try data.setAiAgent(wanderer, .{ .active_behavior = .wander, .wander_amplitude = 30, .gain_pursue = 0 });
 
     var world = WorldSystem{
         .allocator = std.testing.allocator,
@@ -869,6 +1249,338 @@ test "pipeline syncs movement previous positions" {
     const synced = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(synced.position.x, synced.previous_position.x);
     try std.testing.expectEqual(synced.position.y, synced.previous_position.y);
+}
+
+test "pipeline runs ai_memory after perception and before ai, feeding memory into AI's cold-pursue retarget" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data); // Spawns at (400, 225).
+
+    const agent = try data.createEntity();
+    // Far outside the default AiPerception vision_range (192) from the
+    // player, so the real PerceptionSystem pass this step reports the target
+    // not visible regardless of hostility.
+    try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
+    try data.setAiPerception(agent, .{});
+    // Memory of the player -- the same entity the pipeline's focus_entity
+    // resolves to below -- so arbitration's memory/focus identity match lets the
+    // retarget through and this still proves the ai_memory-before-ai order.
+    try data.setAiMemory(agent, .{
+        .last_known_target = player.entity,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Both stages ran over the same scoped agent this step (observable stage
+    // order: ai_memory processes after perception and before ai reads it).
+    try std.testing.expectEqual(@as(usize, 1), stats.ai_memory.processed_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+
+    // Perception never saw the player (out of vision range) and AiMemory's
+    // fresh last-known position survived AiMemorySystem's decay, so AI's
+    // per-row goal reflects the memory retarget (0, 100) rather than the
+    // player's focus_target fallback (400, 225) — the actual end-to-end proof
+    // that a cold-perception agent retargets via memory through the real pipeline.
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 0), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 100), intents[0].goal.y);
+}
+
+test "pipeline does not retarget a cold agent toward memory of an entity other than the current focus entity" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data); // Spawns at (400, 225); this is the pipeline's focus_entity.
+
+    // A throwaway entity the agent glimpsed earlier, disconnected from the
+    // player. Memory of it must not be trusted as a substitute for the live
+    // player-seek goal, even though it is fresh and valid.
+    const other_target = try data.createEntity();
+    const agent = try data.createEntity();
+    // Far outside the default AiPerception vision_range (192) from the
+    // player, so the real PerceptionSystem pass this step reports the target
+    // not visible regardless of hostility.
+    try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(agent, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
+    try data.setAiPerception(agent, .{});
+    try data.setAiMemory(agent, .{
+        .last_known_target = other_target,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Memory is fresh and valid, but belongs to `other_target`, not the
+    // configured `focus_target` fallback entity -- arbitration's identity
+    // check must reject it, so the goal falls through to the live player
+    // focus_target (400, 225), not snap to (0, 100).
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectEqual(@as(f32, 400), intents[0].goal.x);
+    try std.testing.expectEqual(@as(f32, 225), intents[0].goal.y);
+}
+
+test "pipeline runs affect after perception and ai_memory, before ai" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    // A close hostile puts this step's real PerceptionSystem pass into
+    // target_visible=true with a small nearest_threat_dist, so affect's
+    // fear/aggression must observe *this step's* freshly written perception
+    // state (not a stale previous-step value) to move off baseline.
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiAffect(observer, .{ .decay_rate_fear = 0.5, .decay_rate_aggression = 0.5 });
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
+    // observer as fail-closed (blocked), never reporting a target visible.
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Both perception and affect ran this step over the observer (the only
+    // entity carrying AiAffect); both agents (observer + hostile) reach AI.
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.affect.processed_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.ai.entity_count);
+
+    // Affect observed this step's perception output (hostile visible, close),
+    // proving it ran after perception -- a stale/previous-step read would
+    // have left fear/aggression at their zero default.
+    const affect_after = data.aiAffectConst(observer).?;
+    try std.testing.expect(affect_after.fear > 0);
+    try std.testing.expect(affect_after.aggression > 0);
+}
+
+test "pipeline resolves an aggressive non-player entity's pursue goal to another non-player entity, not the player" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // Push the player well outside every AiPerception's default vision_range
+    // (240) so it never becomes a perceived/fallback candidate this step --
+    // isolating the point of this test: the pursuer's goal comes from its own
+    // perceived hostile, not the pipeline's focus_target fallback.
+    const player_body = data.movementBodyPtr(player.entity).?;
+    player_body.position_x.* = 5000;
+    player_body.position_y.* = 5000;
+    player_body.previous_x.* = 5000;
+    player_body.previous_y.* = 5000;
+
+    const pursuer = try data.createEntity();
+    try data.setMovementBody(pursuer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(pursuer, .{ .active_behavior = .wander, .wander_amplitude = 0, .gain_pursue = 1.0 });
+    try data.setFaction(pursuer, .player);
+    try data.setAiPerception(pursuer, .{});
+
+    // Kept inside the 1x1, 32px-tile world below (see the LOS comment on
+    // `world.addLevel`) so the real LOS raycast doesn't fail closed on an
+    // out-of-bounds endpoint.
+    const target = try data.createEntity();
+    try data.setMovementBody(target, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(target, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(target, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    // A level must exist or PerceptionSystem's LOS-blocked cache treats every
+    // observer as fail-closed (blocked), never reporting a target visible.
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // The pursuer's real perception saw `target` (close, hostile stance) this
+    // step, so arbitration resolves its pursue goal to `target`'s position --
+    // proving the pipeline no longer forces every agent's goal onto the
+    // player, even though the player-broadcast focus_target/focus_entity pair
+    // remains wired as the (unused here) opt-in fallback.
+    const intents = frame.navigation_intents.mergedItems();
+    var found = false;
+    for (intents) |intent| {
+        if (intent.entity.index != pursuer.index or intent.entity.generation != pursuer.generation) continue;
+        found = true;
+        try std.testing.expectEqual(@as(f32, 10), intent.goal.x);
+        try std.testing.expectEqual(@as(f32, 0), intent.goal.y);
+    }
+    try std.testing.expect(found);
 }
 
 const AssetStore = @import("../assets/assets.zig").AssetStore;
@@ -985,7 +1697,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
-    try data.setAiAgent(dormant_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(dormant_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(dormant_npc, 0);
     // Tier must be set before overwriting position: setSimulationTier snaps
     // previous=position for non-moving tiers, which would erase the crossing
@@ -1009,7 +1721,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
         .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
         .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
     });
-    try data.setAiAgent(active_npc, .{ .behavior = .wander, .seek_weight = 0 });
+    try data.setAiAgent(active_npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
     try data.setWorldLevel(active_npc, 0);
     try data.setSimulationTier(active_npc, .locomotion);
     {
@@ -1051,4 +1763,174 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(active_npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
     try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+}
+
+test "pipeline runs the perception stage scoped to cognition-tier ai agents without perturbing movement/ai" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    // Cognition-tier observer (default tier): included in `ai_indices`, so it
+    // becomes both an AI gather row and a perception gather row.
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 50, .y = 50 }, .previous_position = .{ .x = 50, .y = 50 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setAiPerception(observer, .{ .vision_range = 100 });
+
+    // Locomotion-tier: `gatherAiAgentIndices` excludes it (tier.allowsCognition()
+    // is false), so it must never enter perception's gather either — proves
+    // perception shares AI's exact scoped population rather than its own.
+    const out_of_scope = try data.createEntity();
+    try data.setMovementBody(out_of_scope, .{ .position = .{ .x = 60, .y = 60 }, .previous_position = .{ .x = 60, .y = 60 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(out_of_scope, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setAiPerception(out_of_scope, .{ .vision_range = 100 });
+    try data.setSimulationTier(out_of_scope, .locomotion);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 4, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // Scoping: perception's gather ran only over the cognition-tier ai agent,
+    // matching AI's own scoped population (both read the same `ai_indices`)
+    // even though two entities in `DataSystem` carry `AiPerception`.
+    try std.testing.expectEqual(@as(usize, 1), stats.ai.entity_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.observer_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.candidate_population_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.perceived_events);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.lost_events);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+
+    // No hostile candidate in range (default/neutral factions never read as
+    // hostile toward each other or the player): the in-scope observer's sensed
+    // state stays cold.
+    const observer_perception = data.aiPerceptionConst(observer).?;
+    try std.testing.expect(!observer_perception.target_visible);
+    try std.testing.expectEqual(EntityId.invalid, observer_perception.nearest_threat);
+
+    // Regression safety: inserting the perception stage between spatial_index
+    // and AI does not perturb the existing movement stage's output — every
+    // non-dormant body (player + both NPCs) still integrates.
+    try std.testing.expectEqual(@as(usize, 3), stats.movement.body_count);
+}
+
+test "pipeline perception events truncate instead of throwing when the shared event capacity is tight" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    // Two observer/hostile pairs. Each observer is closer to its own hostile
+    // than to the other pair's, so nearest-threat selection locks each onto
+    // its own target; both newly perceive their hostile this step, so
+    // perception emits two events.
+    const observer_a = try data.createEntity();
+    try data.setMovementBody(observer_a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
+    try data.setAiAgent(observer_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(observer_a, .player);
+    try data.setAiPerception(observer_a, .{});
+    const hostile_a = try data.createEntity();
+    try data.setMovementBody(hostile_a, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile_a, .hostile);
+
+    const observer_b = try data.createEntity();
+    try data.setMovementBody(observer_b, .{ .position = .{ .x = 100, .y = 0 }, .previous_position = .{ .x = 100, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
+    try data.setAiAgent(observer_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(observer_b, .player);
+    try data.setAiPerception(observer_b, .{});
+    const hostile_b = try data.createEntity();
+    try data.setMovementBody(hostile_b, .{ .position = .{ .x = 110, .y = 0 }, .previous_position = .{ .x = 110, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile_b, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 8,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    // Real per-step event budget of 1 — tighter than the two events this
+    // step's perceptions produce.
+    try frame.reserveStreams(4, 1, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+        .perception_max_events_per_step = 1,
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.perceived_events + stats.perception.lost_events);
+    try std.testing.expectEqual(@as(usize, 1), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
 }

@@ -5,13 +5,15 @@
 //! Foundation types, sentinels, capacity/config/stats records, and pure helpers
 //! shared across the pathfinding package: packed-ref helpers, the goal-keyed query
 //! key, the octile cost helpers, the binary-heap primitives, and the small array
-//! resize utilities. Leaf module — depends only on core/app primitives.
+//! resize utilities. Leaf module within the pathfinding package (no other package
+//! module imports it back) — depends on core/app primitives plus a few lightweight
+//! game-module TYPE imports (EntityId, PathAgentClass, PathRequestKind) that
+//! PendingRequest/PathQueryKey reference, never on game module behavior.
 
 const std = @import("std");
 const math = @import("../../../core/math.zig");
 const simd = @import("../../../core/simd.zig");
 const runtime_perf_log = @import("../../../app/runtime_perf_log.zig");
-const sdl = @import("../../../platform/sdl.zig").c;
 const BatchStats = @import("../../../app/thread_system.zig").BatchStats;
 const AdaptiveWorkTuner = @import("../../../app/thread_system.zig").AdaptiveWorkTuner;
 const EntityId = @import("../../data_system.zig").EntityId;
@@ -45,8 +47,45 @@ pub const open_heap_headroom_factor: usize = 4;
 pub const default_max_stored_path_cells: usize = 512;
 // Demand-driven managed shared-goal flow fields.
 pub const default_max_group_fields: usize = 4;
-pub const default_group_field_rebuild_min_steps: u32 = 30;
+// Must stay below however long a build takes to reach `.ready` at
+// default_group_field_build_budget, or a completed build is always ready for an
+// already-superseded goal and never gets sampled with the CURRENT key — see
+// pathfinding-group-field-detour-moving's samples_total>0 regression guard, which
+// validates this exact pairing. This is an internal relationship between two
+// pathfinding-owned constants, not a caller/world-scale judgment call (unlike
+// min_group_field_agents), so it stays a fixed default here rather than something
+// every caller must independently re-derive and keep in sync by hand.
+pub const default_group_field_rebuild_min_steps: u32 = 8;
+// PER-STEP cap: the actual lever that bounds a single frame's worst-case group-field
+// cost (unlike group_field_max_cells, which only bounds how many steps a build can take
+// in total — a single expand() call can still spend this many cells' worth of work in
+// one step regardless of the total cap). NOT free to lower in isolation: a shared field
+// must finish flooding a full-size world well within one rekey cadence or it can never
+// catch a moving goal (the field completes, but always for an already-superseded goal
+// cell, so it never matches the CURRENT request key and is never sampled — see
+// pathfinding-group-field-detour-moving's samples_total>0 regression guard, calibrated
+// to a 120px/s pursuit goal on a 256x256/32px grid needing ~8 steps to fully flood at
+// this budget against a 16-step rekey cadence). Real per-frame cost is bounded instead
+// by min_group_field_agents gating the feature to battle-scale crowds (see
+// game_demo_state.proceduralPathfindingCapacity) and group_field_max_cells preventing a
+// pathological total build size, not by starving the per-step relax rate itself.
 pub const default_group_field_build_budget: usize = 8192;
+// Fixed cap on total distinct cells one flow-field build may cover, independent of world
+// size — without this, a build floods the WHOLE reachable component from the goal (the
+// entire grid in open terrain), so cost scales with world size, violating this module's
+// "per-query work is a fixed constant" rule (see max_abstract_nodes' doc comment for the
+// same principle applied to abstract search). Deliberately generous (well above any
+// current world's cell count, e.g. the 256x256/32px demo world's 65536 cells) rather than
+// tight against the per-step budget: a build's REQUIRED coverage is set by the distance
+// from the goal to the farthest sharer, not by this constant, and a cap too close to a
+// real world's cell count silently truncates the field before it ever reaches agents on
+// the far side of a detour (starving them into permanent individual-solve fallback,
+// exactly the failure pathfinding-group-field-detour-moving's samples_total>0 regression
+// guard exists to catch). This bounds a FUTURE much larger world's worst case while
+// staying a no-op ceiling for any world built today; group_field_build_budget (the
+// PER-STEP cap) is the lever that actually bounds per-frame cost, since a single step can
+// still process up to that many cells regardless of this total.
+pub const default_group_field_max_cells: usize = 131072;
 // Group-field threshold: a flow-field build is O(cells), so the shared field earns
 // its build only at grid-scale crowds, not a population fraction. Threshold =
 // clamp(cellCount / cells_per_group_agent, floor, budget); auto-scales with world
@@ -107,23 +146,61 @@ pub const inter_level_penalty: u32 = cardinal_cost * 4;
 // Bounded node budget for the abstract A* over portal/link nodes. The abstract
 // graph is small (portals scale with chunk borders, not cells), so this caps the
 // per-query abstract work; refinement of each segment uses the local budget.
+// This is the TIER-0 (first, cheap attempt) default — see PendingRequest.tier.
+// A FIXED constant, deliberately never derived from world/graph size: per-query
+// work must stay bounded independent of world size (see the existing
+// "regardless of world size" test on the abstract solve, and the constant-set
+// invariant nav_graph.zig's incremental-dig tests pin), so a request that does
+// not fit is a bounded, honest "try the bigger fixed tier-1 budget next", never
+// a bigger number picked because THIS map happened to need it.
 pub const default_max_abstract_nodes: usize = 4096;
 // Cap on the stored stitched-path cells per cached cross-chunk/cross-level result.
 // An abstract corridor is refined into a single grid-adjacent (level,cell) path by
 // stitching local A* segments; this bounds that path. A stitched path that exceeds
 // the cap spills to a later frame (budget_exhausted) and is retried from the agent's
-// advanced position, so the cap is never a silent truncation.
+// advanced position, so the cap is never a silent truncation. Tier-0 default; see
+// default_max_abstract_nodes's doc comment for why this stays fixed.
 pub const default_max_stitched_path_cells: usize = 512;
+// Tier-0 (first-attempt) abstract-search attempt caps, independently settable from
+// max_abstract_nodes/max_stitched_path_cells (the tier-1 ceiling below) so a
+// caller/test can force a deterministic tier-0 saturation without disturbing tier 1.
+// Default equals the historical fixed defaults, so the common case's solve cost is
+// unchanged by the tier split.
+pub const default_tier0_abstract_node_attempt_cap: usize = default_max_abstract_nodes;
+pub const default_tier0_stitched_attempt_cap: usize = default_max_stitched_path_cells;
+// Tier-1 (second, escalated attempt) caps: FIXED constants, a flat multiple of the
+// tier-0 defaults, exactly like every other budget in this module — NOT derived from
+// or scaled to the built graph's portal count, level size, or any other measured
+// world state (a prior version of this fix did that and was rejected: worlds vary in
+// size, so a budget must stay bounded independent of it, matching this file's other
+// "independent of total cell count" / "independent of world size" invariants). A
+// request that still exhausts the tier-1 budget is genuinely hard for THIS fixed
+// budget, not "this particular map is big" — see PendingRequest.tier and
+// compactPendingAfterSolve's budget_exhausted handling, which drops such a request to
+// `.missing` (retryable later, NOT a false negative) rather than growing the budget.
+pub const default_tier1_abstract_node_cap: usize = default_max_abstract_nodes * 4;
+pub const default_tier1_stitched_cell_cap: usize = default_max_stitched_path_cells * 4;
+// FIXED cap on the number of per-segment local A* runs one stitchCorridor call may
+// attempt (solve.zig). max_abstract_nodes only loosely bounds this (a corridor can be
+// at most that many portals long), which is far too loose to bound real per-frame
+// cost: each non-link segment can independently spend up to max_explored_nodes doing
+// its own local search, so total stitch work is corridor_length * max_explored_nodes,
+// NOT the additive "abstract budget plus local budget" a corridor walk might suggest.
+// Without this, a long, portal-dense corridor (more likely after digging carves an
+// irregular tunnel network with many small chunks/portals) multiplies that per-segment
+// cost by however many portals the corridor happens to cross — scaling with graph
+// structure, exactly what this module's budgets must never do. A stitch that exceeds
+// this is budget_exhausted (retried next frame), matching every other spill path here.
+// Sized generously above the "lake detour: reported-bug scale" test's corridor (a
+// 256x256/16-tile-chunk full-height-and-back detour around a single-gap wall, the
+// worst legitimate corridor this suite exercises), not tuned tight to it — tight
+// against one scenario risks silently starving a different, longer legitimate
+// corridor exactly like an undersized group_field_max_cells starved far-side group
+// members (see that constant's doc comment for the same failure shape).
+pub const default_max_stitch_segments: usize = 512;
 // Steps after which a cached result is re-solved when next requested, so an agent
 // picks up world changes that did not directly cross its path. 0 disables. ~5s at 60Hz.
 pub const default_cache_ttl_steps: u32 = 300;
-// Queue-fairness thresholds for a pending entry that keeps budget-spilling. After this
-// many consecutive budget-exhausted retries it is rotated to the BACK of pending so
-// late-queued work behind a chronic spiller still reaches the solver.
-pub const budget_exhausted_rotate_after: u32 = 4;
-// After this many it is demoted to a hard negative (negative-cached) so a request that
-// never fits the per-solve budget stops consuming a solve slot every frame.
-pub const budget_exhausted_drop_after: u32 = 32;
 
 pub const no_parent: usize = std.math.maxInt(usize);
 pub const no_cell: u32 = std.math.maxInt(u32);
@@ -147,11 +224,20 @@ comptime {
 
 // Packs a per-level abstract node identity. local is a node index within the level's
 // own NavLevelGraph.portals run, so packing keeps cross-level search keys distinct
-// without a global node numbering. Sentinel contract: refLevel/refLocal must only decode
-// a real packed ref — decoding no_ref/no_parent (maxInt) would panic the refLevel @intCast,
-// and packRef(0xFFFF, 0xFFFFFFFF) aliases no_ref exactly. Callers guard the sentinel first.
+// without a global node numbering. A packed ref's top 16 bits are always 0 (level is a
+// u16), so no real packed ref can ever equal no_ref/no_parent (maxInt, all 64 bits set) —
+// packRef never aliases the sentinel. Sentinel contract is one-directional instead:
+// refLevel/refLocal must only decode a real packed ref, never no_ref/no_parent directly,
+// since `no_ref >> 32` would panic refLevel's @intCast to u16 (0xFFFFFFFF does not fit).
+// Callers guard the sentinel first.
 pub fn packRef(level: u16, local: u32) usize {
     return (@as(usize, level) << 32) | local;
+}
+
+comptime {
+    if (packRef(std.math.maxInt(u16), std.math.maxInt(u32)) == no_ref) {
+        @compileError("packRef must never alias the no_ref sentinel");
+    }
 }
 
 pub fn refLevel(ref: usize) u16 {
@@ -322,22 +408,47 @@ pub const PathQueryKey = struct {
 };
 
 pub const PathfindingCapacity = struct {
+    // NOTE: this type doubles as both the caller-supplied base config (passed to
+    // reserve()/applyDerivedCapacity) AND the internal derived-capacity storage
+    // (self.capacity). The five fields below are the DERIVED side only: deriveCapacity
+    // unconditionally recomputes and overwrites them from agent_count/max_agent_budget
+    // every time capacity is applied, so a value set here on a caller-constructed
+    // PathfindingCapacity has NO effect — it is silently discarded before first use.
+    // Configure population/throughput scaling via max_agent_budget instead; these fields
+    // exist on this type only because deriveCapacity's output is stored back into it.
     max_frame_requests: usize = default_max_frame_requests,
     max_pending_requests: usize = default_max_pending_requests,
     max_cached_results: usize = default_max_cached_results,
-    // Threaded participant slots (workers + 1). Set from the configured thread system
-    // by the pipeline; each gets an O(cells) A* scratch slot sized during the build.
-    worker_participant_count: usize = default_worker_participant_count,
     max_solved_requests_per_step: usize = default_max_solved_requests_per_step,
     max_fallback_requests_per_step: usize = default_max_fallback_requests_per_step,
+    // Threaded participant slots (workers + 1). Set from the configured thread system
+    // by the pipeline; each gets an O(cells) A* scratch slot sized during the build.
+    // NOT recomputed by deriveCapacity — a genuine caller-supplied value.
+    worker_participant_count: usize = default_worker_participant_count,
     // Budget-bounded A* sizing.
     max_explored_nodes: usize = default_max_explored_nodes,
     max_stored_path_cells: usize = default_max_stored_path_cells,
-    // Abstract chunk-portal tier sizing. nav_chunk_tiles sets the abstract chunk
-    // side length; max_abstract_nodes bounds abstract A* work.
+    // Abstract chunk-portal tier sizing. nav_chunk_tiles sets the abstract chunk side
+    // length. max_abstract_nodes/max_stitched_path_cells bound the ESCALATED (tier-1)
+    // abstract A*/stitched-corridor work — FIXED constants (default_tier1_*), never
+    // derived from or scaled to world/graph size (see those constants' doc comments).
     nav_chunk_tiles: u16 = default_nav_chunk_tiles,
-    max_abstract_nodes: usize = default_max_abstract_nodes,
-    max_stitched_path_cells: usize = default_max_stitched_path_cells,
+    max_abstract_nodes: usize = default_tier1_abstract_node_cap,
+    max_stitched_path_cells: usize = default_tier1_stitched_cell_cap,
+    // Tier-0 (first-attempt) abstract-search caps: independent of max_abstract_nodes/
+    // max_stitched_path_cells above, so a caller/test can force a deterministic tier-0
+    // saturation without disturbing the tier-1 ceiling.
+    tier0_abstract_node_cap: usize = default_tier0_abstract_node_attempt_cap,
+    tier0_stitched_cell_cap: usize = default_tier0_stitched_attempt_cap,
+    // Caps per-segment local A* attempts within one stitchCorridor call, independent of
+    // corridor/portal count. See default_max_stitch_segments' doc comment.
+    max_stitch_segments: usize = default_max_stitch_segments,
+    // Per-step cap on ESCALATED (tier-1) solve attempts admitted into the fallback
+    // batch. Tier-1 attempts are the expensive ones (the derived, larger ceiling), so
+    // bounding how many run in one step bounds worst-case per-step solver cost even
+    // when several agents are simultaneously stuck. Tier-0 attempts are unaffected and
+    // keep filling remaining slots up to max_fallback_requests_per_step as before.
+    max_escalated_solves_per_step: usize = 1,
     // Incremental nav update: when an `applyNavUpdates` batch touches more than this
     // many levels, it relabels every level (a loud, counted fallback) rather than
     // only the affected ones.
@@ -348,8 +459,10 @@ pub const PathfindingCapacity = struct {
     max_group_fields: usize = default_max_group_fields,
     group_field_rebuild_min_steps: u32 = default_group_field_rebuild_min_steps,
     group_field_build_budget: usize = default_group_field_build_budget,
+    group_field_max_cells: usize = default_group_field_max_cells,
     // Pins the group-field threshold when non-zero; 0 derives it from grid size (see
-    // groupFieldThreshold). Non-zero is for tests exercising field mechanics.
+    // groupFieldThreshold). Production pins this too: a derived threshold scales with
+    // grid size and goes dead when the map is large relative to the mover count.
     min_group_field_agents: usize = default_min_group_field_agents,
     // Elastic capacity ceiling (the only fixed capacity number). Live capacity
     // tracks the agent count up to this, then requests follow dropped_requests.
@@ -357,6 +470,31 @@ pub const PathfindingCapacity = struct {
     // Steps the agent count must stay below half capacity before pools shrink.
     capacity_shrink_window: u32 = default_capacity_shrink_window,
 };
+
+// Derives the per-step/memory caps from an agent count, clamped to [floor,
+// max_agent_budget ceiling]. Population scales the QUEUE and CACHE (frame/pending
+// requests, 4n cached results) so every agent can be queued and every path
+// cached. Per-frame A* SOLVE work does NOT scale with population: the solve and
+// fallback budgets are pinned to a fixed amortization ceiling (clamped down to
+// the population so a tiny crowd caps low), so frame time stays bounded as the
+// army grows. Algorithm/memory sizing (scratch, path strides, chunk size, group
+// field count) is left untouched. Lives here (not system.zig) because the nav
+// memory gate must derive the same ELASTIC CEILING caps the elastic resize can
+// later grow to — one derivation, no drift.
+pub fn deriveCapacity(base: PathfindingCapacity, agent_count: usize) PathfindingCapacity {
+    var cap = base;
+    const clamped = std.math.clamp(agent_count, min_capacity_floor, @max(min_capacity_floor, base.max_agent_budget));
+    cap.max_frame_requests = clamped;
+    cap.max_pending_requests = clamped;
+    cap.max_cached_results = clamped *| cached_results_per_agent;
+    // Per-frame solve/fallback amortization ceiling, clamped down to the population
+    // (fallback <= solves). Independent of crowd size so a diverse-goal burst spreads
+    // across frames; the adaptive tuner threads the work under it.
+    const solve_ceiling = @min(default_max_solves_per_frame, clamped);
+    cap.max_solved_requests_per_step = solve_ceiling;
+    cap.max_fallback_requests_per_step = solve_ceiling;
+    return cap;
+}
 
 pub const PathfindingConfig = struct {
     items_per_range: ?usize = null,
@@ -367,26 +505,9 @@ pub const PathfindingConfig = struct {
     max_fallback_requests_per_step: ?usize = null,
 };
 
-// Comptime-gated monotonic phase timer for the fixed-step pathfinding update.
-// Zero-cost no-op when perf logging is disabled; uses the SDL monotonic clock
-// (gated, perf-only) like the other fixed-step stage timers.
-pub const PhaseTimer = if (runtime_perf_log.enabled) struct {
-    start_ns: u64,
-    pub fn begin() PhaseTimer {
-        return .{ .start_ns = sdl.SDL_GetTicksNS() };
-    }
-    pub fn lap(self: *PhaseTimer) u64 {
-        const now = sdl.SDL_GetTicksNS();
-        return if (now > self.start_ns) now - self.start_ns else 0;
-    }
-} else struct {
-    pub fn begin() PhaseTimer {
-        return .{};
-    }
-    pub fn lap(_: *PhaseTimer) u64 {
-        return 0;
-    }
-};
+// The fixed-step pathfinding update's phase timer: the one shared StageTimer
+// (see runtime_perf_log.zig), used here via its `begin`/`lap` interface.
+pub const PhaseTimer = runtime_perf_log.StageTimer;
 
 pub const PathfindingStats = struct {
     accepted_requests: usize = 0,
@@ -403,6 +524,18 @@ pub const PathfindingStats = struct {
     cache_evictions: usize = 0,
     // Solver and flow-field counters.
     budget_exhausted: usize = 0,
+    // Tier-1 (escalated) solve attempts admitted into this step's fallback batch, and
+    // tier-1-ready requests that were NOT admitted because max_escalated_solves_per_step
+    // was already reached this step (they simply wait for a later step).
+    escalated_solves: usize = 0,
+    escalated_deferred: usize = 0,
+    // A tier-1 attempt that still exhausted its (fixed) budget: dropped from pending
+    // WITHOUT negative-caching, so the next query falls through to `.missing` (retryable
+    // later) rather than a false definitive `.unavailable`. See compactPendingAfterSolve.
+    escalated_dropped: usize = 0,
+    // Start-side solve failures dropped without negative-caching (see
+    // PathSolveResult.start_invalid).
+    start_invalid_dropped: usize = 0,
     goal_projected: usize = 0,
     group_fields_built: usize = 0,
     group_field_reuses: usize = 0,
@@ -411,6 +544,16 @@ pub const PathfindingStats = struct {
     // Abstract-tier and cross-level routing counters.
     abstract_solves: usize = 0,
     cross_level_solves: usize = 0,
+    // Diagnostic only: the most per-segment local A* searches any single stitchCorridor
+    // call needed this step, aggregated across workers in finishUpdate (see
+    // SearchScratch.max_stitch_segments_used). Lets a live perf capture distinguish "the
+    // fixed max_stitch_segments cap is what's bounding solve cost" (this stays pinned at
+    // or near the cap every spike) from "some other cost dominates" (this stays low).
+    max_stitch_segments_observed: usize = 0,
+    // Diagnostic only: distinct group keys tallied this step, after decay/compaction —
+    // see beginSolve's doc comment for why this distinguishes the two group-cost failure
+    // shapes a live perf capture can't otherwise tell apart.
+    distinct_group_keys: usize = 0,
     fallback_batch: BatchStats = .{},
     // Per-phase update timings (ns); zero when perf logging is disabled. Recorded
     // as pathfinding_* sub-stage timers that break down pipeline_pathfinding.
@@ -451,10 +594,16 @@ pub const PendingRequest = struct {
     // `no_parent` means projection found no open cell near the goal: a
     // definitive unavailable.
     goal_index: usize,
-    // Consecutive frames this entry has budget-spilled. Drives queue-fairness aging in
-    // compactPendingAfterSolve (rotate-to-back, then demote) so a chronic spiller never
-    // starves the tail. Reset implicitly: a solved entry leaves pending entirely.
-    retries: u32 = 0,
+    // Two-tier retry ladder: 0 is the first (cheap, fixed-budget) attempt; a
+    // budget_exhausted at tier 0 promotes to tier 1 (a larger but still FIXED
+    // abstract-node/stitched-cell ceiling — never derived from world/graph size) and
+    // rotates to the back of pending once. A budget_exhausted AT tier 1 drops the
+    // request WITHOUT negative-caching (not a definitive negative, just "doesn't fit
+    // either fixed budget") — worst case exactly two solve attempts per request, never
+    // the old unbounded retry storm, and never a false `.unavailable` for a goal that
+    // may genuinely be reachable. Reset implicitly: a solved or dropped entry leaves
+    // pending entirely.
+    tier: u8 = 0,
 };
 
 // One cell of a stitched obstacle-aware corridor path, tagged with its level. The
@@ -517,6 +666,12 @@ pub const PathSolveResult = union(enum) {
     deferred: PathQueryKey,
     // Budget spill: request stays pending; counted as budget-exhausted.
     budget_exhausted: PathQueryKey,
+    // Start-side failure (blocked/off-grid representative start, unseedable start
+    // component): a property of the representative agent, not of the goal. Dropped
+    // from pending WITHOUT negative-caching — the goal-keyed `unavailable` set is
+    // shared by every agent, so caching this would poison the goal for all of them.
+    // The next status query falls through to `.missing` (retryable).
+    start_invalid: PathQueryKey,
 };
 
 pub const OpenNode = struct {
@@ -658,19 +813,24 @@ pub fn keysEqual(a: PathQueryKey, b: PathQueryKey) bool {
         a.goal.y == b.goal.y;
 }
 
+// FNV-1a 64-bit offset basis and prime, shared by both hash functions below so the
+// constants are defined once rather than duplicated per function.
+const fnv_offset_basis: u64 = 14695981039346656037;
+const fnv_prime: u64 = 1099511628211;
+
 pub fn hashPathKey(key: PathQueryKey) usize {
-    var h: u64 = 14695981039346656037;
+    var h: u64 = fnv_offset_basis;
     inline for (.{ key.nav_version, @intFromEnum(key.agent_class), @as(u32, key.goal_level), @as(u32, @bitCast(key.goal.x)), @as(u32, @bitCast(key.goal.y)) }) |part| {
         h ^= @as(u64, part);
-        h *%= 1099511628211;
+        h *%= fnv_prime;
     }
     return @intCast(h);
 }
 
 pub fn hashUsize(value: usize) usize {
-    var h: u64 = 14695981039346656037;
+    var h: u64 = fnv_offset_basis;
     h ^= @as(u64, @intCast(value));
-    h *%= 1099511628211;
+    h *%= fnv_prime;
     return @intCast(h);
 }
 
@@ -690,11 +850,23 @@ pub fn setLen(list: anytype, allocator: std.mem.Allocator, len: usize) !void {
     list.items.len = len;
 }
 
+// Whether a list should shrink-and-free before regrowing to `target_capacity`, given its
+// current physical `current_capacity`. Hysteresis (only below HALF, not merely below) so
+// the allocator's own size-class rounding slack — ensureTotalCapacity commonly hands back
+// more than requested — does not perpetually free-then-reallocate the same padded
+// capacity on every repeated reserve() call at an unchanged logical target. A genuine
+// large downsize still frees memory; only the "target == last target, but < the padded
+// physical capacity" false positive is absorbed. Shared by every reserve()-style
+// function in this package so the fix lives in one place.
+pub fn shouldShrinkCapacity(current_capacity: usize, target_capacity: usize) bool {
+    return target_capacity *| 2 < current_capacity;
+}
+
 // Grows (amortized) or shrinks-and-frees a per-step scratch list's backing capacity
 // to `capacity`, leaving it empty. Used for lists the update repopulates each step,
 // so no contents need to survive the resize. Shrinking frees memory back.
 pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize) !void {
-    if (capacity < list.capacity) {
+    if (shouldShrinkCapacity(list.capacity, capacity)) {
         list.clearRetainingCapacity();
         list.shrinkAndFree(allocator, 0);
     }
@@ -705,8 +877,103 @@ pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std
 // Like resizeArrayList but for a pool sized to exactly `capacity` and memset to a
 // fill value (the disjoint worker path/stitched stripes). Shrinking frees memory.
 pub fn resizeFilledArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize, fill: T) !void {
-    if (capacity < list.capacity) list.shrinkAndFree(allocator, 0);
+    if (shouldShrinkCapacity(list.capacity, capacity)) list.shrinkAndFree(allocator, 0);
     try list.ensureTotalCapacity(allocator, capacity);
     list.items.len = capacity;
     @memset(list.items, fill);
+}
+
+// ----------------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------------
+
+test "octileCells and octileXY saturate identically instead of one silently wrapping" {
+    // Both share octileCost's u64 core and the same maxInt(u32) saturation clamp, so a
+    // pathological delta produces the same capped result from either entry point rather
+    // than one wrapping to a small value.
+    const width: usize = 4;
+    const far_a: u32 = 0; // (0, 0)
+    const far_b: u32 = 3 + 3 * width; // (3, 3) on a 4-wide grid: a small, exact delta.
+    try std.testing.expectEqual(@as(u32, 3 * diagonal_cost), octileCells(width, far_a, far_b));
+    try std.testing.expectEqual(@as(u32, 3 * diagonal_cost), octileXY(0, 0, 3, 3));
+
+    // A delta far beyond any real grid saturates to maxInt(u32) rather than wrapping.
+    const huge: i32 = std.math.maxInt(i32);
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), octileXY(0, 0, huge, huge));
+}
+
+test "downsamplePathInto preserves start/goal and handles degenerate dst lengths" {
+    // src fits: exact copy, no downsampling.
+    var exact: [4]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), downsamplePathInto(exact[0..3], &.{ 10, 11, 12 }));
+    try std.testing.expectEqualSlices(u32, &.{ 10, 11, 12 }, exact[0..3]);
+
+    // dst.len == 0: guarded before the (dst.len - 1) divisor; returns 0 without touching dst.
+    var zero_dst: [0]u32 = .{};
+    try std.testing.expectEqual(@as(usize, 0), downsamplePathInto(&zero_dst, &.{ 1, 2, 3 }));
+
+    // dst.len == 1: keeps only the start cell (never the goal), per the single-cell-budget
+    // guard, and does not evaluate the (dst.len - 1) divisor.
+    var one_dst: [1]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), downsamplePathInto(&one_dst, &.{ 7, 8, 9 }));
+    try std.testing.expectEqual(@as(u32, 7), one_dst[0]);
+
+    // src longer than dst: downsampled but start and goal are always preserved exactly.
+    var short_dst: [3]u32 = undefined;
+    const long_src = [_]u32{ 20, 21, 22, 23, 24, 25, 26 };
+    try std.testing.expectEqual(@as(usize, 3), downsamplePathInto(&short_dst, &long_src));
+    try std.testing.expectEqual(@as(u32, 20), short_dst[0]);
+    try std.testing.expectEqual(@as(u32, 26), short_dst[2]);
+}
+
+test "tileIndexClamped handles degenerate count, negative, and non-finite input" {
+    // Zero-sized grid: no valid index; also guards clamp(., 0, -1) below.
+    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(100, 32, 0));
+    // Non-positive value (including a would-be-negative tile) clamps to 0.
+    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(-5, 32, 10));
+    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(0, 32, 10));
+    // NaN fails every comparison, including `> 0`, so it also clamps to 0 rather than
+    // reaching the illegal-behavior floorToI32(NaN) path.
+    try std.testing.expectEqual(@as(u16, 0), tileIndexClamped(std.math.nan(f32), 32, 10));
+    // In-range value maps to its tile; a value past the last tile clamps to count-1.
+    try std.testing.expectEqual(@as(u16, 3), tileIndexClamped(100, 32, 10));
+    try std.testing.expectEqual(@as(u16, 9), tileIndexClamped(1_000_000, 32, 10));
+}
+
+test "lessNode ties break deterministically on f, then h, then index" {
+    // Equal f: lower h wins (closer to the goal by the heuristic).
+    try std.testing.expect(lessNode(.{ .index = 5, .f = 10, .h = 2 }, .{ .index = 5, .f = 10, .h = 3 }));
+    // Equal f and h: lower index wins, so heap order never depends on insertion order.
+    try std.testing.expect(lessNode(.{ .index = 1, .f = 10, .h = 2 }, .{ .index = 2, .f = 10, .h = 2 }));
+    try std.testing.expect(!lessNode(.{ .index = 2, .f = 10, .h = 2 }, .{ .index = 1, .f = 10, .h = 2 }));
+    // Lower f always wins regardless of h/index.
+    try std.testing.expect(lessNode(.{ .index = 9, .f = 5, .h = 100 }, .{ .index = 0, .f = 6, .h = 0 }));
+}
+
+test "resize helpers shrink-and-free below capacity and grow-reuse at or above it" {
+    var list: std.ArrayList(u32) = .empty;
+    defer list.deinit(std.testing.allocator);
+
+    try resizeArrayList(u32, &list, std.testing.allocator, 8);
+    const grown_capacity = list.capacity;
+    try std.testing.expect(grown_capacity >= 8);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+
+    // At/above the current capacity: no shrink-and-free, capacity is reused or grown.
+    try resizeArrayList(u32, &list, std.testing.allocator, 8);
+    try std.testing.expectEqual(grown_capacity, list.capacity);
+
+    // Below the current capacity: shrinks-and-frees rather than just leaving the extra
+    // capacity allocated, so an elastic down-resize actually releases memory.
+    try resizeArrayList(u32, &list, std.testing.allocator, 2);
+    try std.testing.expect(list.capacity < grown_capacity);
+    try std.testing.expect(list.capacity >= 2);
+    try std.testing.expectEqual(@as(usize, 0), list.items.len);
+
+    // resizeFilledArrayList additionally sets items.len to capacity and fills it.
+    var filled: std.ArrayList(u8) = .empty;
+    defer filled.deinit(std.testing.allocator);
+    try resizeFilledArrayList(u8, &filled, std.testing.allocator, 4, 0xAB);
+    try std.testing.expectEqual(@as(usize, 4), filled.items.len);
+    for (filled.items) |byte| try std.testing.expectEqual(@as(u8, 0xAB), byte);
 }
