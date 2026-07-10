@@ -1259,7 +1259,7 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     var player = try Player.spawn(&data); // Spawns at (400, 225).
 
     const agent = try data.createEntity();
-    // Far outside the default AiPerception vision_range (240) from the
+    // Far outside the default AiPerception vision_range (192) from the
     // player, so the real PerceptionSystem pass this step reports the target
     // not visible regardless of hostility.
     try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
@@ -1345,7 +1345,7 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     // player-seek goal, even though it is fresh and valid.
     const other_target = try data.createEntity();
     const agent = try data.createEntity();
-    // Far outside the default AiPerception vision_range (240) from the
+    // Far outside the default AiPerception vision_range (192) from the
     // player, so the real PerceptionSystem pass this step reports the target
     // not visible regardless of hostility.
     try data.setMovementBody(agent, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });

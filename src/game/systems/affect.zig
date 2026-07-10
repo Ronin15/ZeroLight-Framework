@@ -11,10 +11,11 @@
 //! on a rising or falling edge. A true Schmitt trigger (each drive's bit in
 //! `AiAffect.above_threshold_mask`, persisted across steps) gates the edges,
 //! so a value hovering at threshold cannot refire the same edge twice. Runs
-//! after perception and ai_memory (both must have written
-//! this step's state first) and before AI reads it — a future arbitration
-//! slice is expected to switch behavior on the resulting drives; this system
-//! only appraises and decays them.
+//! after perception and ai_memory (both must have written this step's state
+//! first) and before AI reads it — arbitration (`arbitration.zig`, Slice 32)
+//! reads the resulting drives one stage later via `AiConfig.affect_slice`;
+//! this system only appraises and decays them, it never switches behavior
+//! itself.
 //!
 //! Gather mirrors ai_memory.zig/perception.zig's population-domain shape:
 //! walk scope_dense_indices (or every ai_agents row), keeping rows that carry
@@ -51,8 +52,10 @@
 //!
 //! Deliberately deferred: fear and aggression share the same visible-hostile
 //! signal but use independent gain constants and are never cross-coupled;
-//! there is no cross-drive modulation of any kind; AiConfig does not yet read
-//! any affect drive. All of that is future arbitration-slice territory.
+//! there is no cross-drive modulation of any kind within this system --
+//! arbitration.zig is the sole consumer that weighs drives against each
+//! other (and against behaviors), and it does so downstream, over this
+//! system's already-independent output.
 
 const std = @import("std");
 const math = @import("../../core/math.zig");
@@ -135,7 +138,7 @@ const AffectGatherRow = struct {
     vision_range: f32,
     heard_stimulus_f: f32,
     familiarity: f32,
-    behavior_pursue_f: f32,
+    behavior_exertion_f: f32,
 };
 
 fn appendAffectGatherRow(
@@ -290,7 +293,7 @@ pub const AffectSystem = struct {
             .vision_range = rows.items(.vision_range),
             .heard_stimulus_f = rows.items(.heard_stimulus_f),
             .familiarity = rows.items(.familiarity),
-            .behavior_pursue_f = rows.items(.behavior_pursue_f),
+            .behavior_exertion_f = rows.items(.behavior_exertion_f),
             .affect_slice = data.aiAffectSlice(),
             .event_ranges = self.event_ranges.items[0..range_count],
         };
@@ -347,7 +350,7 @@ pub const AffectSystem = struct {
                 .vision_range = vision_range,
                 .heard_stimulus_f = heard_stimulus_f,
                 .familiarity = familiarity,
-                .behavior_pursue_f = if (ai_agents.behaviors[i] == .pursue) 1 else 0,
+                .behavior_exertion_f = if (ai_agents.behaviors[i] == .pursue or ai_agents.behaviors[i] == .flee) 1 else 0,
             });
         }
     }
@@ -427,7 +430,7 @@ const AffectJobContext = struct {
     vision_range: []const f32,
     heard_stimulus_f: []const f32,
     familiarity: []const f32,
-    behavior_pursue_f: []const f32,
+    behavior_exertion_f: []const f32,
     affect_slice: AiAffectSlice,
     event_ranges: []AffectEventRangeSlot,
 };
@@ -658,7 +661,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
     const entities = job.entities;
-    const behavior_pursue_f = job.behavior_pursue_f;
+    const behavior_exertion_f = job.behavior_exertion_f;
     const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
@@ -674,12 +677,14 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const prev = simd.gatherFloat4(s.fatigue, lanes);
 
         // Fatigue's own input is this row's AiAgent.active_behavior, not
-        // perception/memory: pursuing (active pursuit) raises it; wandering
-        // adds no delta, so the outer decay-toward-baseline alone pulls it
-        // back down.
-        const pursue_f = simd.loadFloat4(behavior_pursue_f[k..]);
-        const pursue_mask = simd.greaterThanFloat4(pursue_f, half);
-        const delta = simd.selectFloat4(pursue_mask, gain, zero);
+        // perception/memory: pursuing or fleeing (both exertive locomotion,
+        // matching arbitration.zig's drive_behavior_weight fatigue row, which
+        // discourages both equally) raises it; wandering/investigating/
+        // cohering add no delta, so the outer decay-toward-baseline alone
+        // pulls it back down.
+        const exertion_f = simd.loadFloat4(behavior_exertion_f[k..]);
+        const exertion_mask = simd.greaterThanFloat4(exertion_f, half);
+        const delta = simd.selectFloat4(exertion_mask, gain, zero);
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
@@ -689,7 +694,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     while (k < range.end) : (k += 1) {
         const index = indices[k];
         const prev = s.fatigue[index];
-        const delta: f32 = if (behavior_pursue_f[k] > 0.5) gain_fatigue else 0;
+        const delta: f32 = if (behavior_exertion_f[k] > 0.5) gain_fatigue else 0;
         const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
         s.fatigue[index] = final;
         if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
@@ -923,6 +928,23 @@ test "fatigue rises under seek and decays under wander across steps" {
     data.aiAgentSlice().active_behavior[agent_index] = .wander;
     for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
     try testing.expect(data.aiAffectConst(entity).?.fatigue < seeking_fatigue);
+}
+
+test "fatigue rises under flee just like pursue, matching arbitration's exertion model for both" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    const fleer = try addAgentWithAffect(&data, .{ .active_behavior = .flee }, .{ .decay_rate_fatigue = 0.2 });
+    const wanderer = try addAgentWithAffect(&data, .{ .active_behavior = .wander }, .{ .decay_rate_fatigue = 0.2 });
+
+    var sys = AffectSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    for (0..10) |_| _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try testing.expect(data.aiAffectConst(fleer).?.fatigue > 0);
+    try testing.expect(data.aiAffectConst(fleer).?.fatigue > data.aiAffectConst(wanderer).?.fatigue);
 }
 
 test "threshold crossing emits exactly one rising then one falling event, with no chatter at the threshold" {

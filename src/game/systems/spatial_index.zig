@@ -635,11 +635,17 @@ pub const SpatialIndexSystem = struct {
     /// belt-and-suspenders pattern the other processors use).
     ///
     /// The bounding box fitting inside `dense_lookup`'s reserved capacity is a
-    /// program invariant, not a runtime-handled case — `reserve`'s sizing
-    /// keeps this comfortably true for every world/camera configuration
-    /// reachable in this codebase today (see `max_dense_window_side_cells`'s
-    /// doc comment for the caveat on that assumption). If it is ever violated
-    /// this asserts rather than silently degrading.
+    /// program invariant that `reserve`'s sizing keeps comfortably true for
+    /// every world/camera configuration reachable in this codebase today (see
+    /// `max_dense_window_side_cells`'s doc comment for the caveat on that
+    /// assumption). It is not enforced with `std.debug.assert`, since this
+    /// project ships ReleaseFast (which strips asserts) — an assert-only guard
+    /// would let a violation silently corrupt `dense_lookup.starts`/`ends` in
+    /// the shipped build. Instead the write loop below unconditionally clamps
+    /// the window and skips any cell that falls outside it in every build
+    /// mode: a violation just can't be found via the dense lookup for that
+    /// step (a correctness gap, not memory corruption or a crash) —
+    /// `entries`/`ranges` themselves are unaffected.
     fn buildEntriesAndRanges(self: *SpatialIndexSystem) !void {
         self.dense_lookup.clearTouched();
         const n = self.rows.len;
@@ -665,11 +671,10 @@ pub const SpatialIndexSystem = struct {
         }
         const min_y = self.entries.items[0].cell.y;
         const max_y = self.entries.items[self.entries.items.len - 1].cell.y;
-        const width: u32 = @intCast(max_x - min_x + 1);
-        const height: u32 = @intCast(max_y - min_y + 1);
-
-        std.debug.assert(width <= self.dense_lookup.capacity_cells_x);
-        std.debug.assert(height <= self.dense_lookup.capacity_cells_y);
+        const width_unclamped: u32 = @intCast(max_x - min_x + 1);
+        const height_unclamped: u32 = @intCast(max_y - min_y + 1);
+        const width = @min(width_unclamped, self.dense_lookup.capacity_cells_x);
+        const height = @min(height_unclamped, self.dense_lookup.capacity_cells_y);
 
         self.dense_lookup.origin = .{ .x = min_x, .y = min_y };
         self.dense_lookup.width = width;
@@ -695,6 +700,10 @@ pub const SpatialIndexSystem = struct {
             std.debug.assert(range.start <= std.math.maxInt(u32) and range.end <= std.math.maxInt(u32));
             const rel_x: u32 = @intCast(cell.x - min_x);
             const rel_y: u32 = @intCast(cell.y - min_y);
+            // Skip cells the clamp above pushed outside the reserved window
+            // rather than index past `starts`/`ends` — see this function's
+            // doc comment on why a clamp+skip backs the debug assert.
+            if (rel_x >= width or rel_y >= height) continue;
             const idx = @as(usize, rel_y) * width + rel_x;
             self.dense_lookup.starts.items[idx] = @intCast(range.start);
             self.dense_lookup.ends.items[idx] = @intCast(range.end);
@@ -1442,4 +1451,49 @@ test "reserve clamps the dense window to the hard ceiling for a pathological wor
     try sys.reserve(4, .{ .cell_size = 1.0, .chunk_size_tiles = 60000, .tile_size = 500.0 });
     try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_x);
     try testing.expectEqual(max_dense_window_side_cells, sys.dense_lookup.capacity_cells_y);
+}
+
+test "buildEntriesAndRanges clamps the dense window and skips out-of-window cells instead of writing past reserved capacity" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+
+    const near = try data.createEntity();
+    try data.setMovementBody(near, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(near, .{ .active_behavior = .wander });
+
+    // Cell (1250, 1250) at cell_size 32 -- far outside the deliberately tiny
+    // 4x4 window reserved below, forcing the bounding box to exceed reserved
+    // capacity the way a real violation of the dense-window sizing assumption
+    // would.
+    const far = try data.createEntity();
+    try data.setMovementBody(far, .{ .position = .{ .x = 40000.0, .y = 40000.0 }, .previous_position = .{ .x = 40000.0, .y = 40000.0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(far, .{ .active_behavior = .wander });
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    // Bypass reserve()'s own sizing (which would comfortably cover this case)
+    // to directly force the undersized-window path this test targets.
+    try sys.dense_lookup.reserve(testing.allocator, 4, 4, 2);
+    sys.cell_size = 32.0;
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    const stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
+    try testing.expectEqual(@as(usize, 2), stats.entity_count);
+
+    // Window is clamped to the reserved 4x4 capacity, not the true ~1251-cell span.
+    try testing.expectEqual(@as(u32, 4), sys.dense_lookup.width);
+    try testing.expectEqual(@as(u32, 4), sys.dense_lookup.height);
+
+    // ranges/entries still hold both cells for parity consumers...
+    try testing.expectEqual(@as(usize, 2), sys.ranges.items.len);
+    try testing.expectEqual(@as(usize, 2), sys.entries.items.len);
+
+    // ...but the dense lookup only finds the in-window cell (0,0): the
+    // out-of-window cell was skipped on write rather than indexed past
+    // starts/ends, so this must not panic/corrupt even under bounds checking.
+    const view = sys.view();
+    var visitor = RecordingVisitor{};
+    _ = view.queryNeighbors(0, 0, null, 1, .{ .radius = 10.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
+    try testing.expectEqual(@as(usize, 1), visitor.count);
 }
