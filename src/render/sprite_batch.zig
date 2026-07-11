@@ -328,8 +328,11 @@ pub const SpriteBatch = struct {
         try self.draw_groups.ensureTotalCapacity(self.allocator, self.commands.items.len);
     }
 
-    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver) void {
-        _ = self.build(texture_resolver, null, .{ .adaptive = false }) catch unreachable;
+    pub fn buildSerial(self: *SpriteBatch, texture_resolver: TextureResolver) !void {
+        // `build` allocates via `ensureFrameStorage`; surface OutOfMemory/Overflow to the
+        // caller rather than folding a recoverable failure into ReleaseFast UB. Callers that
+        // have already reserved capacity should call `buildAssumeCapacity` directly.
+        _ = try self.build(texture_resolver, null, .{ .adaptive = false });
     }
 
     pub fn build(
@@ -755,7 +758,7 @@ test "batch builder skips invalid stale and destroyed texture ids" {
         .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 6), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
@@ -790,7 +793,7 @@ test "batch builder groups by texture and coordinate presentation" {
         .coordinate_space = .drawable,
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 18), batch.positions.items.len);
     try std.testing.expectEqual(@as(usize, 3), batch.draw_groups.items.len);
@@ -829,7 +832,7 @@ test "world vertices ignore camera now that the transform is baked on the GPU" {
         .coordinate_space = .logical,
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     // All spaces emit world/identity-space geometry; the camera is applied by
     // the renderer's vertex uniform, never on the CPU.
@@ -870,7 +873,7 @@ test "batch builder preserves ordered submission stream" {
         .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(f32, 10), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[6][0]);
@@ -943,7 +946,7 @@ test "batch builder splits a same-texture run on render order change" {
         .order = RenderOrder.world(1),
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
     try std.testing.expectEqual(@as(i32, -2), batch.draw_groups.items[0].order.depth);
@@ -979,7 +982,7 @@ test "world and logical vertices stay independent of drawable presentation" {
         .coordinate_space = .drawable,
     });
 
-    batch.buildSerial(table.resolver());
+    try batch.buildSerial(table.resolver());
 
     try std.testing.expectEqual(@as(f32, 20), batch.positions.items[0][0]);
     try std.testing.expectEqual(@as(f32, 30), batch.positions.items[0][1]);
@@ -1082,7 +1085,7 @@ test "parallel sprite prep matches serial vertices and draw groups" {
     try addParallelParityCommands(&serial);
     try addParallelParityCommands(&threaded);
 
-    serial.buildSerial(table.resolver());
+    try serial.buildSerial(table.resolver());
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{
         .max_worker_threads = 2,

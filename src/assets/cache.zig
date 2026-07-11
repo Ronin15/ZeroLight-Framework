@@ -35,8 +35,8 @@ pub const AssetCache = struct {
     lease_slots: std.ArrayList(LeaseSlot) = .empty,
     first_free_lease_slot: ?u32 = null,
 
-    pub fn init(allocator: std.mem.Allocator, assetStore: assets.AssetStore) AssetCache {
-        return initWithBackend(allocator, assetStore, rendererBackend());
+    pub fn init(allocator: std.mem.Allocator, asset_store: assets.AssetStore) AssetCache {
+        return initWithBackend(allocator, asset_store, rendererBackend());
     }
 
     pub fn deinit(self: *AssetCache, renderer: *Renderer) void {
@@ -51,10 +51,10 @@ pub const AssetCache = struct {
         self.releaseTextureWithContext(@ptrCast(renderer), lease);
     }
 
-    fn initWithBackend(allocator: std.mem.Allocator, assetStore: assets.AssetStore, backend: TextureBackend) AssetCache {
+    fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextureBackend) AssetCache {
         return .{
             .allocator = allocator,
-            .assets = assetStore,
+            .assets = asset_store,
             .backend = backend,
             .owner_id = nextCacheOwnerId(),
         };
@@ -502,8 +502,8 @@ fn testCache(allocator: std.mem.Allocator) AssetCache {
 pub const testing = if (builtin.is_test) struct {
     pub const Backend = FakeBackend;
 
-    pub fn initCache(allocator: std.mem.Allocator, assetStore: assets.AssetStore) AssetCache {
-        return AssetCache.initWithBackend(allocator, assetStore, Backend.backend());
+    pub fn initCache(allocator: std.mem.Allocator, asset_store: assets.AssetStore) AssetCache {
+        return AssetCache.initWithBackend(allocator, asset_store, Backend.backend());
     }
 
     pub fn deinitCache(cache: *AssetCache, fake: *Backend) void {

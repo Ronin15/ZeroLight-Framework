@@ -190,8 +190,8 @@ pub const TextService = struct {
     default_font: FontId = FontId.invalid,
     ttf_initialized: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, assetStore: assets.AssetStore) !TextService {
-        var service = initWithBackend(allocator, assetStore, rendererBackend());
+    pub fn init(allocator: std.mem.Allocator, asset_store: assets.AssetStore) !TextService {
+        var service = initWithBackend(allocator, asset_store, rendererBackend());
         errdefer service.deinitAfterFailedInit();
 
         if (!c.TTF_Init()) {
@@ -260,10 +260,10 @@ pub const TextService = struct {
         return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
-    fn initWithBackend(allocator: std.mem.Allocator, assetStore: assets.AssetStore, backend: TextBackend) TextService {
+    fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextBackend) TextService {
         return .{
             .allocator = allocator,
-            .assets = assetStore,
+            .assets = asset_store,
             .backend = backend,
         };
     }

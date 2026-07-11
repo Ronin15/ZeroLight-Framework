@@ -223,10 +223,10 @@ pub const AudioService = struct {
     // otherwise be silently swallowed; this surfaces it once per recurring error.
     last_warned_control_error: ?anyerror = null,
 
-    pub fn init(allocator: std.mem.Allocator, assetStore: assets.AssetStore, config: AudioConfig) !AudioService {
+    pub fn init(allocator: std.mem.Allocator, asset_store: assets.AssetStore, config: AudioConfig) !AudioService {
         var service = AudioService{
             .allocator = allocator,
-            .assets = assetStore,
+            .assets = asset_store,
             .config = config,
             .enabled = config.enabled,
             .backend = disabledBackend(),
@@ -262,14 +262,14 @@ pub const AudioService = struct {
 
     pub fn initWithBackend(
         allocator: std.mem.Allocator,
-        assetStore: assets.AssetStore,
+        asset_store: assets.AssetStore,
         config: AudioConfig,
         backend: Backend,
         backend_context: *anyopaque,
     ) !AudioService {
         var service = AudioService{
             .allocator = allocator,
-            .assets = assetStore,
+            .assets = asset_store,
             .config = config,
             .enabled = config.enabled,
             .backend = backend,
@@ -1120,8 +1120,8 @@ test "audio command buffer enforces per-step command cap" {
 }
 
 test "disabled audio backend context is stable after service move" {
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.init(std.testing.allocator, assetStore, .{ .enabled = false });
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.init(std.testing.allocator, asset_store, .{ .enabled = false });
     const context_address = @intFromPtr(service.backend_context);
     try std.testing.expectEqual(@intFromPtr(disabledBackendContext()), context_address);
     try std.testing.expect(context_address != @intFromPtr(&service));
@@ -1143,11 +1143,11 @@ test "audio service init cleans up music track when first sfx track creation fai
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
     fake.fail_create_after = 1;
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
 
     try std.testing.expectError(
         error.AudioBackendFailure,
-        AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 2 }, FakeBackendContext.backend(), @ptrCast(&fake)),
+        AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 2 }, FakeBackendContext.backend(), @ptrCast(&fake)),
     );
 
     try std.testing.expectEqual(@as(u32, 1), fake.create_track_calls);
@@ -1159,11 +1159,11 @@ test "audio service init cleans up partially created sfx tracks" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
     fake.fail_create_after = 3;
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
 
     try std.testing.expectError(
         error.AudioBackendFailure,
-        AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 4 }, FakeBackendContext.backend(), @ptrCast(&fake)),
+        AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 4 }, FakeBackendContext.backend(), @ptrCast(&fake)),
     );
 
     try std.testing.expectEqual(@as(u32, 3), fake.create_track_calls);
@@ -1175,8 +1175,8 @@ test "audio service preloads ids and memoizes failed paths" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
     try fake.failPath("audio/sfx/missing.wav");
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 2 }, FakeBackendContext.backend(), @ptrCast(&fake));
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 2 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
     try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     try std.testing.expect(!try service.preloadAudio(.player_jet_sfx, "audio/sfx/missing.wav", .sfx, true));
@@ -1199,8 +1199,8 @@ test "audio service preloads ids and memoizes failed paths" {
 test "audio service plays music idempotently and ducks on pause" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{
         .max_sfx_tracks = 1,
         .music_gain = 0.5,
         .paused_music_gain = 0.25,
@@ -1234,8 +1234,8 @@ test "audio service plays music idempotently and ducks on pause" {
 test "audio service applies spatial position relative to listener" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{
         .max_sfx_tracks = 1,
         .spatial_units_per_meter = 100,
     }, FakeBackendContext.backend(), @ptrCast(&fake));
@@ -1256,8 +1256,8 @@ test "audio service applies spatial position relative to listener" {
 test "audio service applies per-sfx frequency ratio" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
     try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
@@ -1273,8 +1273,8 @@ test "audio service applies per-sfx frequency ratio" {
 test "audio service starts updates and stops keyed looping sfx" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 1, .sfx_gain = 1.0 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
     try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
     var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
@@ -1315,8 +1315,8 @@ test "audio service starts updates and stops keyed looping sfx" {
 test "audio service clears backend position when stopping looping sfx" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1, .spatial_units_per_meter = 100 }, FakeBackendContext.backend(), @ptrCast(&fake));
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 1, .spatial_units_per_meter = 100 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
     try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
     try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));
@@ -1343,8 +1343,8 @@ test "audio service clears backend position when stopping looping sfx" {
 test "audio service does not steal active loop track for one shot sfx" {
     var fake = FakeBackendContext.init(std.testing.allocator);
     defer fake.deinit();
-    const assetStore = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
-    var service = try AudioService.initWithBackend(std.testing.allocator, assetStore, .{ .max_sfx_tracks = 1 }, FakeBackendContext.backend(), @ptrCast(&fake));
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{ .max_sfx_tracks = 1 }, FakeBackendContext.backend(), @ptrCast(&fake));
     defer service.deinit();
     try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
     try std.testing.expect(try service.preloadAudio(.collision_sfx, "audio/sfx/hit.wav", .sfx, true));

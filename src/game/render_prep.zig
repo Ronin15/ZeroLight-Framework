@@ -331,7 +331,7 @@ pub fn dynamicRecordCapacity(scene: GameplayScene) usize {
 
 /// Peak gameplay sprite commands for the demo state. Stacked UI headroom covers
 /// pause/menu rects submitted after gameplay enqueue; `Engine` adds
-/// `Renderer.kOverlayCommandHeadroom` for the debug overlay afterward.
+/// `Renderer.k_overlay_command_headroom` for the debug overlay afterward.
 pub fn spriteCommandCapacity(scene: GameplayScene) usize {
     const visual_count = scene.data.primitiveVisualSliceConst().entities.len;
     const player_marker_count: usize = 1;
@@ -339,7 +339,7 @@ pub fn spriteCommandCapacity(scene: GameplayScene) usize {
         visual_count +
         player_marker_count +
         scene.particles.activeCount() +
-        Renderer.kStackedStateUiHeadroom;
+        Renderer.k_stacked_state_ui_headroom;
 }
 
 pub fn ensureScenePrepCapacity(prep: *DynamicScenePrep, scene: GameplayScene) !void {
@@ -963,7 +963,7 @@ test "sprite command capacity sums sparse reserve visuals player and ui headroom
     const player_entity = try EntityId.init(0, 1);
 
     try std.testing.expectEqual(
-        @as(usize, 3) + 1 + 1 + 1 + Renderer.kStackedStateUiHeadroom,
+        @as(usize, 3) + 1 + 1 + 1 + Renderer.k_stacked_state_ui_headroom,
         spriteCommandCapacity(.{
             .data = &data,
             .world = &world,
@@ -1099,7 +1099,7 @@ test "collect dynamic records after structural growth stays within reserve and a
     );
     try std.testing.expectEqual(
         world.reserveRenderRecords() + data.primitiveVisualSliceConst().entities.len + 1 +
-            particles.activeCount() + Renderer.kStackedStateUiHeadroom,
+            particles.activeCount() + Renderer.k_stacked_state_ui_headroom,
         spriteCommandCapacity(scene),
     );
 

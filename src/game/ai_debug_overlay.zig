@@ -9,7 +9,7 @@
 //! RNG, or intent streams — the overlay's presence is invisible to the sim.
 //!
 //! Fixed budgets (never scaled to world/agent/cell count): at most
-//! `kMaxAnnotatedAgents` agents are annotated (overflow past the cap is simply
+//! `k_max_annotated_agents` agents are annotated (overflow past the cap is simply
 //! not drawn), and every vision ring uses `ring_segments` segments. The gather
 //! is a pure function of `*const DataSystem` + camera rect into a caller-owned
 //! fixed buffer, so it is unit-testable headlessly and allocation-free.
@@ -42,7 +42,7 @@ const sprite_batch = @import("../render/sprite_batch.zig");
 /// Maximum agents annotated in a single frame. A fixed constant, deliberately
 /// independent of agent/world/cell count: overflow past the cap is not drawn,
 /// so overlay cost stays bounded regardless of how many agents exist.
-pub const kMaxAnnotatedAgents: usize = 16;
+pub const k_max_annotated_agents: usize = 16;
 
 /// Segments approximating each vision ring arc. Fixed regardless of world size.
 const ring_segments: usize = 24;
@@ -117,7 +117,7 @@ pub fn coneSpokeAngles(facing: Vec2, fov_half_angle: f32) [2]f32 {
     return .{ facing_angle - fov_half_angle, facing_angle + fov_half_angle };
 }
 
-/// Selects up to `out.len` (`kMaxAnnotatedAgents`) cognition-tier agents inside
+/// Selects up to `out.len` (`k_max_annotated_agents`) cognition-tier agents inside
 /// `camera_rect`, first-N in stable AI-agent store order, and fills `out` with
 /// their viz data. Returns the count written. Reads only `*const DataSystem`
 /// const views: it cannot perturb sim state, RNG, or intents. Allocation-free —
@@ -206,7 +206,7 @@ pub const AiDebugOverlay = struct {
     /// Callers reserve this once up front so the first F2 toggle draws
     /// allocation-free.
     pub fn commandCapacity() usize {
-        return kMaxAnnotatedAgents * per_agent_commands + hud_commands;
+        return k_max_annotated_agents * per_agent_commands + hud_commands;
     }
 
     /// Prepared labels are `TextService`-owned cache handles freed when the
@@ -227,7 +227,7 @@ pub const AiDebugOverlay = struct {
     ) !void {
         try self.ensureLabels(text_service, renderer);
 
-        var scratch: [kMaxAnnotatedAgents]AgentAnnotation = undefined;
+        var scratch: [k_max_annotated_agents]AgentAnnotation = undefined;
         const n = gatherAnnotations(data, camera_rect, &scratch);
         for (scratch[0..n]) |ann| {
             try drawAgent(renderer, ann, self.behavior_labels);
@@ -476,7 +476,7 @@ test "tallyBehaviorsByCognition counts the whole cognition set independent of ca
     try testing.expectEqual(@as(usize, 0), counts[@intFromEnum(AiBehavior.cohere)]);
 }
 
-test "gatherAnnotations caps at kMaxAnnotatedAgents regardless of agent count or camera size" {
+test "gatherAnnotations caps at k_max_annotated_agents regardless of agent count or camera size" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
 
@@ -486,13 +486,13 @@ test "gatherAnnotations caps at kMaxAnnotatedAgents regardless of agent count or
         _ = try addCognitionAgent(&data, @floatFromInt(10 * i), @floatFromInt(10 * i));
     }
 
-    var out: [kMaxAnnotatedAgents]AgentAnnotation = undefined;
-    try testing.expectEqual(kMaxAnnotatedAgents, gatherAnnotations(&data, camera, &out));
+    var out: [k_max_annotated_agents]AgentAnnotation = undefined;
+    try testing.expectEqual(k_max_annotated_agents, gatherAnnotations(&data, camera, &out));
 
     // A far larger camera rect (same agents) yields the identical cap: the bound
     // is a fixed constant, independent of world/camera size.
     const bigger = Rect{ .x = -10000, .y = -10000, .w = 100000, .h = 100000 };
-    try testing.expectEqual(kMaxAnnotatedAgents, gatherAnnotations(&data, bigger, &out));
+    try testing.expectEqual(k_max_annotated_agents, gatherAnnotations(&data, bigger, &out));
 }
 
 test "gatherAnnotations excludes agents outside the camera rect and non-cognition tiers" {
@@ -506,7 +506,7 @@ test "gatherAnnotations excludes agents outside the camera rect and non-cognitio
     try data.setSimulationTier(demoted, .locomotion);
     _ = inside;
 
-    var out: [kMaxAnnotatedAgents]AgentAnnotation = undefined;
+    var out: [k_max_annotated_agents]AgentAnnotation = undefined;
     const count = gatherAnnotations(&data, camera, &out);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(f32, 50), out[0].position.x);
@@ -528,7 +528,7 @@ test "gatherAnnotations populates sub-component viz and skips missing components
     // A bare agent (no perception/affect/memory) must still annotate.
     _ = try addCognitionAgent(&data, 300, 300);
 
-    var out: [kMaxAnnotatedAgents]AgentAnnotation = undefined;
+    var out: [k_max_annotated_agents]AgentAnnotation = undefined;
     const count = gatherAnnotations(&data, camera, &out);
     try testing.expectEqual(@as(usize, 2), count);
 
@@ -562,7 +562,7 @@ test "gatherAnnotations does not perturb AI state (read-only const-view proof)" 
     }
 
     const before = aiStateHash(&data);
-    var out: [kMaxAnnotatedAgents]AgentAnnotation = undefined;
+    var out: [k_max_annotated_agents]AgentAnnotation = undefined;
     _ = gatherAnnotations(&data, camera, &out);
     try testing.expectEqual(before, aiStateHash(&data));
 }
@@ -585,7 +585,7 @@ test "behavior label cache covers every AiBehavior tag" {
 }
 
 test "command capacity is a fixed bound from the fixed budgets" {
-    try testing.expectEqual(kMaxAnnotatedAgents * per_agent_commands + hud_commands, AiDebugOverlay.commandCapacity());
+    try testing.expectEqual(k_max_annotated_agents * per_agent_commands + hud_commands, AiDebugOverlay.commandCapacity());
 }
 
 test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocator proof)" {
@@ -594,14 +594,14 @@ test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocato
     defer data.deinit();
     const camera = Rect{ .x = 0, .y = 0, .w = 100000, .h = 100000 };
 
-    // Worst case: kMaxAnnotatedAgents fully-equipped cognition agents inside the
+    // Worst case: k_max_annotated_agents fully-equipped cognition agents inside the
     // rect, each carrying perception (2 spokes + ring), affect (drive bars), and
     // a fully-populated memory ring (max markers).
     var full_ring = data_system.AiMemory{};
     for (0..ai_memory_ring_capacity) |slot| {
         full_ring.ring[slot] = .{ .entity = try EntityId.init(1, 1), .x = 1, .y = 1, .age = 1 };
     }
-    for (0..kMaxAnnotatedAgents) |i| {
+    for (0..k_max_annotated_agents) |i| {
         const entity = try addCognitionAgent(&data, @floatFromInt(10 * i), 10);
         try data.setAiPerception(entity, .{ .vision_range = 120, .fov_half_angle_radians = 0.5 });
         try data.setAiAffect(entity, .{ .fear = 0.5, .curiosity = 0.5, .aggression = 0.5, .fatigue = 0.5 });

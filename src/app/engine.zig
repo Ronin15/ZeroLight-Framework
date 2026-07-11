@@ -359,7 +359,7 @@ pub const Engine = struct {
                 // Gameplay states reserve stacked UI headroom; this grows for the
                 // debug overlay after all stacked states finish enqueue.
                 try self.renderer.reserveSpriteCommands(
-                    self.renderer.spriteCommandCount() + Renderer.kOverlayCommandHeadroom,
+                    self.renderer.spriteCommandCount() + Renderer.k_overlay_command_headroom,
                 );
                 const perf_overlay_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
                 try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
