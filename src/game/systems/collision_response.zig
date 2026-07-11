@@ -274,7 +274,7 @@ pub const CollisionResponseSystem = struct {
 };
 
 fn movementIndexForIntent(data: *const DataSystem, movement: MovementBodySlice, entity: EntityId, cached_index: usize) ?usize {
-    if (cached_index < movement.entities.len and entityIdsEqual(movement.entities[cached_index], entity)) {
+    if (cached_index < movement.entities.len and movement.entities[cached_index].eql(entity)) {
         return cached_index;
     }
     return data.movementBodyDenseIndex(entity);
@@ -282,10 +282,6 @@ fn movementIndexForIntent(data: *const DataSystem, movement: MovementBodySlice, 
 
 fn shouldApplyNormalVelocityResponse(velocity: f32, normal: f32) bool {
     return normal != 0 and velocity * normal < 0;
-}
-
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
 }
 
 fn addEntity(
@@ -453,10 +449,10 @@ test "trigger response emits event without physical correction" {
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 1), stats.trigger_count);
     try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
-    try std.testing.expect(entityIdsEqual(trigger, frame.events.mergedItems()[0].payload.entity_created));
+    try std.testing.expect(trigger.eql(frame.events.mergedItems()[0].payload.entity_created));
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
-    try std.testing.expect(entityIdsEqual(trigger, frame.collision_triggers.mergedItems()[0].a));
-    try std.testing.expect(entityIdsEqual(dynamic, frame.collision_triggers.mergedItems()[0].b));
+    try std.testing.expect(trigger.eql(frame.collision_triggers.mergedItems()[0].a));
+    try std.testing.expect(dynamic.eql(frame.collision_triggers.mergedItems()[0].b));
     try std.testing.expectEqual(@as(f32, 14), data.movementBodyConst(dynamic).?.position.x);
 }
 

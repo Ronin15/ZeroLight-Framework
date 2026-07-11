@@ -165,11 +165,7 @@ pub const AudioController = struct {
 
 /// Whether `entity` is either side of `contact`.
 fn involvesEntity(contact: CollisionContact, entity: EntityId) bool {
-    return entitiesEqual(contact.a, entity) or entitiesEqual(contact.b, entity);
-}
-
-fn entitiesEqual(a: EntityId, b: EntityId) bool {
-    return a.index == b.index and a.generation == b.generation;
+    return contact.a.eql(entity) or contact.b.eql(entity);
 }
 
 fn contactAudioPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {

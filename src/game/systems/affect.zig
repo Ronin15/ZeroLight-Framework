@@ -446,6 +446,7 @@ fn affectRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 /// correctness (the drives are independent), only for event-append order
 /// within the range's scratch buffer.
 fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
+    std.debug.assert(range.index < job.event_ranges.len);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.entities.len);
     processFearColumn(job, range);

@@ -76,7 +76,7 @@ pub const FontDesc = struct {
 
     pub fn validate(self: FontDesc) !void {
         try assets.validateRelativePath(self.asset_path);
-        if (self.point_size <= 0 or self.point_size != self.point_size) return error.InvalidFontSize;
+        if (self.point_size <= 0 or std.math.isNan(self.point_size)) return error.InvalidFontSize;
     }
 };
 
@@ -295,8 +295,30 @@ pub const TextService = struct {
     }
 
     fn deinitAfterFailedInit(self: *TextService) void {
-        const no_backend_context: *anyopaque = @ptrFromInt(1);
-        self.deinitWithContext(no_backend_context);
+        // The init path never creates a cache entry (entries are created only in
+        // prepareTextWithContext), so failed-init teardown is font-only and needs
+        // no backend context. Assert that invariant rather than routing a fake
+        // context through the entry-destroying deinitWithContext.
+        std.debug.assert(self.entries.items.len == 0);
+        self.entries.deinit(self.allocator);
+        self.entries = .empty;
+        self.first_free_entry_slot = null;
+
+        for (self.fonts.items) |slot| {
+            if (!slot.alive) continue;
+            self.backend.close_font(slot.font.?);
+            self.allocator.free(slot.desc.?.asset_path);
+        }
+        self.fonts.deinit(self.allocator);
+        self.fonts = .empty;
+        self.first_free_font_slot = null;
+
+        self.default_font = FontId.invalid;
+
+        if (self.ttf_initialized) {
+            c.TTF_Quit();
+            self.ttf_initialized = false;
+        }
     }
 
     fn prepareTextWithContext(
@@ -636,7 +658,7 @@ fn validateColor(color: config.Color) !void {
 }
 
 fn validateColorComponent(value: f32) !void {
-    if (value != value or value < 0 or value > 1) return error.InvalidTextColor;
+    if (std.math.isNan(value) or value < 0 or value > 1) return error.InvalidTextColor;
 }
 
 fn colorByte(value: f32) u8 {

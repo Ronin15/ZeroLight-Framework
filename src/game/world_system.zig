@@ -651,13 +651,34 @@ pub const WorldSystem = struct {
     }
 
     pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
+        // The count has no depth-ordering constraint (unlike submitVisibleSparseRange),
+        // so walk only the chunks inside the cached visible window via the per-chunk
+        // sparse index instead of scanning the whole sparse set every visibility
+        // update. The result is identical: every sparse tile in a visible chunk that
+        // also passes the finer per-tile bounds test is counted exactly once.
+        const region = self.visibleChunkRegion() orelse return 0;
         const bounds = self.visibleTileBounds();
-        var visible_sparse_tiles: usize = 0;
-        const sparse_chunks = self.sparse_tiles.items(.chunk_index);
+        const chunks_x = self.chunksX();
+        const chunks_y = self.chunksY();
+        const min_cx: u16 = @intCast(@max(0, region.min.x));
+        const min_cy: u16 = @intCast(@max(0, region.min.y));
+        const max_cx_exclusive: u16 = @intCast(@min(@as(i32, chunks_x), region.max_exclusive.x));
+        const max_cy_exclusive: u16 = @intCast(@min(@as(i32, chunks_y), region.max_exclusive.y));
         const sparse_cells = self.sparse_tiles.items(.cell_index);
-        for (sparse_chunks, sparse_cells) |chunk_index, cell| {
-            if (self.isSparseChunkVisible(chunk_index) and self.cellInVisibleBounds(cell, bounds)) {
-                visible_sparse_tiles += 1;
+        var visible_sparse_tiles: usize = 0;
+        var level: u16 = 0;
+        while (level < self.level_base_z.items.len) : (level += 1) {
+            var cy = min_cy;
+            while (cy < max_cy_exclusive) : (cy += 1) {
+                var cx = min_cx;
+                while (cx < max_cx_exclusive) : (cx += 1) {
+                    const local_chunk_index = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
+                    for (self.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
+                        if (self.cellInVisibleBounds(sparse_cells[sparse_index], bounds)) {
+                            visible_sparse_tiles += 1;
+                        }
+                    }
+                }
             }
         }
         return visible_sparse_tiles;
@@ -2023,6 +2044,14 @@ pub const WorldSystem = struct {
 fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const build: *ProceduralBuildContext = @ptrCast(@alignCast(context));
     const chunks_x = ceilDiv(build.width, build.chunk_size_tiles);
+    const chunks_y = ceilDiv(build.height, build.chunk_size_tiles);
+    // Threaded worldgen write-range hardening (mirrors movement/collision/perception
+    // workers): the dispatched range indexes chunks, and this worker writes each
+    // chunk's cells at `y * width + x` (y < height, x < width), so its maximum write
+    // index is bounded by `width * height`, which must fit the shared tile buffer.
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= @as(usize, chunks_x) * @as(usize, chunks_y));
+    std.debug.assert(@as(usize, build.width) * @as(usize, build.height) <= build.tiles.len);
     for (range.start..range.end) |chunk_index| {
         const chunk_x: u16 = @intCast(chunk_index % chunks_x);
         const chunk_y: u16 = @intCast(chunk_index / chunks_x);

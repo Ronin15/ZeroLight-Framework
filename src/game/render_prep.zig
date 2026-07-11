@@ -423,7 +423,7 @@ pub fn collectDynamicRecords(
         if (!entityVisibleForRenderCollect(movement_index, scope, visible_chunks)) continue;
         if (!movement.has_primitive_visual[movement_index]) continue;
 
-        const collect_indices = scene.data.renderCollectIndicesForMovement(movement_index) orelse continue;
+        const collect_indices = scene.data.renderCollectIndicesForMovement(movement, movement_index, visuals.entities.len) orelse continue;
         const visual_index = collect_indices.visual_index;
 
         const render_x = math.lerp(

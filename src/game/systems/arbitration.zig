@@ -142,10 +142,6 @@ fn memoryFresh(signals: Signals) bool {
     return signals.memory_last_known_target.isValid() and signals.memory_staleness < signals.memory_max_staleness;
 }
 
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
-}
-
 /// Fresh memory is only a valid pursue/flee substitute for the *same*
 /// opt-in `focus_target` entity when one is configured — memory of some
 /// other entity this agent glimpsed earlier (e.g. a different hostile) is
@@ -156,7 +152,7 @@ fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
 /// still act on where it last saw it).
 fn memoryMatchesFocus(signals: Signals) bool {
     const wanted = signals.focus_target orelse return true;
-    return entityIdsEqual(signals.memory_last_known_target, wanted);
+    return signals.memory_last_known_target.eql(wanted);
 }
 
 fn hasFreshRingContact(signals: Signals) bool {

@@ -71,7 +71,11 @@ established use is generational-handle constructors bounded by capacity
 whose failure case cannot occur within the reserved index/generation range. Hold
 `unreachable` to the same "provable, not merely expected" bar as `assumeCapacity`;
 if a failure is recoverable or attacker/data-influenced, return an error or
-assert instead.
+assert instead. The same strip makes narrowing casts unsafe: widen signed
+coordinate/cell spans to `i64`/`usize` before subtracting and `@intCast`-ing to
+an unsigned width/capacity, clamp while wide, then narrow — a saturated
+float→`i32` conversion makes `@intCast(max - min + 1)` overflow/out-of-range UB,
+not a panic.
 
 This is enforced by `zig build idiom-lint` (part of `zig build verify`): a
 `catch unreachable` / `orelse unreachable` outside a `test` block is rejected
@@ -97,10 +101,15 @@ comment:
    selection/profile value the dispatch itself uses, so buffer size and
    worker/range count cannot drift apart across a future edit.
 
-New threaded hot-path code should add a `std.debug.assert` at the top of the
-worker job comparing its `worker_id`/`range.index` against the buffer length
-captured at dispatch time, so a future refactor that breaks this ordering
-fails loudly in Debug/ReleaseSafe instead of silently in ReleaseFast.
+New threaded hot-path code should open each worker job with a `std.debug.assert`
+covering **both** its write range against the buffer length and `range.index`
+against the dispatched range count, captured at dispatch time — a stage cloned
+from a sibling routinely keeps one and drops the other, and the missing guard is
+a silent OOB write in ReleaseFast rather than a Debug/ReleaseSafe panic. The
+`FailingAllocator` proof above must likewise exercise the real multi-worker
+`ThreadSystem`, not only the serial/inline branch: an undersized reserve on the
+threaded path fails as a concurrent shared-allocator call (a data race), not a
+clean single-threaded OOM.
 
 Allocators are owned explicitly: every allocating struct takes an
 `std.mem.Allocator` at `init` and stores it as a field, set immediately —

@@ -48,7 +48,17 @@ construction (sanctioned case: capacity-bounded generational-handle constructors
 `catch`/`orelse unreachable` outside a `test` block must be on a sanctioned handle constructor
 or carry `// lint:allow catch-unreachable: <reason>`; flag an annotation used to silence a
 genuinely recoverable failure (it should propagate the error instead — see
-`SpriteBatch.buildSerial`). `zig build idiom-lint` (part of `verify`) enforces this.
+`SpriteBatch.buildSerial`). `zig build idiom-lint` (part of `verify`) enforces this. Also flag: a
+signed span narrowed to unsigned without widening first (`@intCast(max - min + 1)` after a saturated
+float→`i32` is overflow UB — widen to `i64`, clamp wide, then narrow); a `FailingAllocator` proof
+covering only the serial/inline branch of a path that also runs threaded (prove the real multi-worker
+`ThreadSystem` — an undersized threaded reserve is a data race, not a clean OOM); a worker job missing
+the entry `std.debug.assert` on BOTH write range vs buffer length and `range.index` vs dispatched range
+count; an append into a pool tracking a fixed-capacity dedup/probe table gated on the `ArrayList`'s
+physical `.capacity` instead of the shared logical cap (they desync as `ensureTotalCapacity` rounds up);
+a `.?` on an optional field kept non-null only by cross-thread ordering (invisible to `idiom-lint`); and
+a reserve/overflow contract whose assert and overflow check bound different quantities (pre-rounding
+request vs rounded `.capacity`) — both must bound the same value.
 
 **Idiomatic naming & stdlib currency** — enforced by `zig build idiom-lint` (`tools/lint_idioms.py`),
 but still flag in review: camelCased locals/fields (Zig: snake_case variables/fields, camelCase
@@ -69,7 +79,10 @@ not a bigger number sized to one map.
 **`std.MultiArrayList` hot paths** — flag `rows.items(.field)` called inside a loop instead of
 caching `rows.slice()` once per stage/function (rebuilds slice pointers per call; measured
 large Debug/Release regressions). Flag `rows.appendAssumeCapacity(row)` per row in a hot
-gather loop instead of the `addOneAssumeCapacity` + `set()` pattern.
+gather loop instead of the `addOneAssumeCapacity` + `set()` pattern. Flag a per-row
+render/collect helper that calls `.slice()`/`.sliceConst()` internally per row instead of taking
+already-built const column slices from its caller — the rebuild hides behind the `pub` boundary
+(invisible to `idiom-lint`) and is dead work in ReleaseFast when it only feeds a stripped bounds assert.
 
 **Pipeline stage-ordering contract** — a new or reordered `SimulationPipeline` stage must add
 its `PipelineResource` read/write tag(s) to `stageContract()`, its `StageId` in `stage_order`
@@ -110,7 +123,10 @@ persistent entity/component facts or replace hot SoA processors. Typed events ar
 signals — flag global pub/sub buses, string-topic dispatchers, callback chains, recursive
 immediate redispatch, pointer/handle/allocator/service payloads, events used as persistent
 state, and generic streams collapsed from what should stay specialized (contacts, movement
-intents, nav intents, path requests, render prep, structural commands).
+intents, nav intents, path requests, render prep, structural commands). Flag a batched
+`RangeOutputStream`/`SimulationEvents` producer driven one record-per-item in a publish loop —
+`SimulationEvents.finishWrite` rebuilds stats over all ranges and survives ReleaseFast, so
+per-record `finishWrite` is O(N²); the whole change set should be written, then finished once.
 
 **SIMD / threaded processors** — hot ECS data stays in direct SoA column iteration; masks are
 membership/query, not dynamic joins in hot loops; structural changes, state transitions,

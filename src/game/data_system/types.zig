@@ -52,6 +52,10 @@ pub const EntityId = struct {
     pub fn matches(self: EntityId, index: u32, generation: u32) bool {
         return self.isValid() and self.index == index and self.generation == generation;
     }
+
+    pub fn eql(self: EntityId, other: EntityId) bool {
+        return self.index == other.index and self.generation == other.generation;
+    }
 };
 
 pub const Component = enum(u5) {

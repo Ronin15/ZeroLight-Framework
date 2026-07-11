@@ -963,6 +963,8 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     // Jobs never append outside their assigned output range, which keeps the
     // transient intent stream deterministic across serial and threaded runs.
     const job: *SteeringJobContext = @ptrCast(@alignCast(context));
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.selected.len);
     var writer = job.intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |index| {
         const result = computeAvoidance(job, index);
@@ -1093,7 +1095,7 @@ fn accumulateAgentAvoidanceBounded(
                 if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
                 candidate_count.* += 1;
                 const other_index = entry.index;
-                if (entityIdsEqual(job.agents.entity[other_index], self_entity)) continue;
+                if (job.agents.entity[other_index].eql(self_entity)) continue;
                 const dx = start_x - job.agents.x[other_index];
                 const dy = start_y - job.agents.y[other_index];
                 const combined_radius = avoidance_radius + job.agents.radius[other_index];
@@ -1289,10 +1291,6 @@ fn foldSignature(hash: u64, value: u32) u64 {
 
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
     return math.length(.{ .x = a.x - b.x, .y = a.y - b.y });
-}
-
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
 }
 
 fn serialBatch(count: usize) BatchStats {

@@ -594,8 +594,21 @@ pub const SimulationFrame = struct {
     }
 
     fn publishStructuralChanges(self: *SimulationFrame, changes: []const StructuralChange) !void {
+        if (changes.len == 0) return;
+        // Publish every change in a single appended event range with one
+        // finishWrite. finishWrite rebuilds event stats over all ranges
+        // (O(ranges)) and survives ReleaseFast, so one appendRequired per change
+        // would be O(N^2). This is the batched form of appendRequired: reserve,
+        // append one range counted for the whole slice, prefix it, write every
+        // event, then finish the write exactly once.
+        try self.events.ensureCanAppend(changes.len);
+        try self.events.reserveAppendCapacity(1, changes.len);
+        const first_range = try self.events.appendRangeCounts(1);
+        self.events.addCount(first_range, changes.len);
+        try self.events.prefixAppendedRanges(first_range);
+        var writer = self.events.rangeWriter(first_range);
         for (changes) |change| {
-            try self.events.appendRequired(switch (change) {
+            writer.write(switch (change) {
                 .entity_created => |entity| .{
                     .stage = .structural_commit,
                     .payload = .{ .entity_created = entity },
@@ -622,6 +635,8 @@ pub const SimulationFrame = struct {
                 },
             });
         }
+        writer.finish();
+        self.events.finishWrite();
     }
 };
 

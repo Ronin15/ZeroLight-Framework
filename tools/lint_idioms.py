@@ -12,6 +12,9 @@ reviewer diligence:
    recoverable failure into ReleaseFast UB: on a sanctioned generational-handle
    constructor, inside a `test` block (not shipped), or with an explicit
    `// lint:allow catch-unreachable: <reason>` justification at the site.
+4. No scalar NaN self-compare (`x != x` / `x == x`); use std.math.isNan
+   (src/core/simd.zig exempt — element-wise vector NaN masks are legitimate).
+5. No free-function EntityId equality helper; EntityId.eql owns the primitive.
 
 Run via `zig build idiom-lint` (also part of `zig build verify`).
 """
@@ -34,6 +37,24 @@ HANDLE_CTOR = re.compile(
 )
 CATCH_UNREACHABLE = re.compile(r"\b(?:catch|orelse)\s+unreachable\b")
 ALLOW_ANNOTATION = "lint:allow catch-unreachable"
+
+# Scalar NaN self-comparison (`x != x` / `x == x`). std.math.isNan is the
+# canonical spelling (see src/core/math.zig); a hand-rolled self-compare is idiom
+# drift. Operands are boundary-anchored to a single maximal token so member/index
+# accesses and `x == x - 1` style expressions (different real operands) do not
+# match. src/core/simd.zig is exempt: element-wise `@Vector != @Vector` NaN masks
+# are legitimate there and std.math.isNan (scalar-only) does not apply.
+NAN_SELF_COMPARE = re.compile(
+    r"(?<![\w.\]\)])([A-Za-z_][\w.]*)\s*(?:==|!=)\s*([A-Za-z_][\w.]*)(?![\w.\[(]|\s*[-+*/%<>])"
+)
+NAN_SELF_COMPARE_EXEMPT = {"src/core/simd.zig"}
+
+# A free function performing EntityId equality (`fn *Equal(... : EntityId ...)`).
+# EntityId owns `eql` (src/game/data_system/types.zig); a standalone helper is a
+# divergent re-implementation of a primitive that belongs on its type. Keyed on
+# the EntityId parameter type so both `entityIdsEqual` and `entitiesEqual` spellings
+# are caught; the promoted method is named `eql`, so it never self-triggers.
+ENTITY_EQL_FN = re.compile(r"\bfn\s+\w*[Ee]qual\s*\([^)]*:\s*EntityId\b")
 
 # (pattern, message). Matched against comment-stripped code only.
 FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -79,6 +100,7 @@ def strip_line_comment(line: str) -> str:
 def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
     issues: list[tuple[str, int, str, str]] = []
     rel = str(path.relative_to(REPO_ROOT))
+    nan_exempt = rel in NAN_SELF_COMPARE_EXEMPT
     in_test = False
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
         code = strip_line_comment(raw)
@@ -101,6 +123,31 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                 issues.append(
                     (rel, lineno, f"camelCase field/parameter `{camel.group(1)}`; Zig fields/params use snake_case", raw.strip())
                 )
+
+        if not nan_exempt:
+            for m in NAN_SELF_COMPARE.finditer(code):
+                if m.group(1) == m.group(2):
+                    issues.append(
+                        (
+                            rel,
+                            lineno,
+                            f"NaN self-compare `{m.group(1)} != {m.group(1)}`; use std.math.isNan(x) "
+                            "(see src/core/math.zig) — scalar NaN checks go through the stdlib helper",
+                            raw.strip(),
+                        )
+                    )
+                    break
+
+        if ENTITY_EQL_FN.search(code):
+            issues.append(
+                (
+                    rel,
+                    lineno,
+                    "free-function EntityId equality helper; use the EntityId.eql method "
+                    "(src/game/data_system/types.zig) instead of a divergent copy",
+                    raw.strip(),
+                )
+            )
 
         if CATCH_UNREACHABLE.search(code):
             allowed = in_test or HANDLE_CTOR.search(code) or ALLOW_ANNOTATION in raw

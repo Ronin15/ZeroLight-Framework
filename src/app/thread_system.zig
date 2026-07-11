@@ -871,13 +871,18 @@ const Shared = struct {
     // Atomic fetch-add is the only synchronization inside the hot work loop.
     // Job functions must provide their own range-local write discipline.
     fn runBatchRanges(self: *Shared, id: WorkerId) void {
+        // job_fn/context are populated at dispatch before any worker (or the
+        // main thread) enters this helper and stay valid until pending_workers
+        // drains. Assert once so an ordering regression trips loudly in
+        // Debug/ReleaseSafe instead of shipping as ReleaseFast UB via `.?`.
+        std.debug.assert(self.batch.job_fn != null and self.batch.context != null);
+        const job_fn = self.batch.job_fn.?;
+        const context = self.batch.context.?;
         while (true) {
             const range_index = self.batch.next_range.fetchAdd(1, .monotonic);
             if (range_index >= self.batch.range_count) return;
 
             const range = rangeForIndex(self.batch.item_count, self.batch.items_per_range, range_index);
-            const job_fn = self.batch.job_fn.?;
-            const context = self.batch.context.?;
             if (id.index == 0) {
                 _ = self.batch.main_thread_ranges.fetchAdd(1, .monotonic);
             } else {
@@ -889,6 +894,9 @@ const Shared = struct {
     }
 
     fn runBatchRangeIndex(self: *Shared, id: WorkerId, range_index: usize) void {
+        // See runBatchRanges: assert non-null so a dispatch/reset ordering
+        // regression trips loudly rather than becoming ReleaseFast UB.
+        std.debug.assert(self.batch.job_fn != null and self.batch.context != null);
         const range = rangeForIndex(self.batch.item_count, self.batch.items_per_range, range_index);
         const job_fn = self.batch.job_fn.?;
         const context = self.batch.context.?;
@@ -1131,7 +1139,9 @@ fn recordRangeIndex(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 }
 
 test "batch stats stay lean scalar telemetry" {
-    try std.testing.expectEqual(@as(usize, 88), @sizeOf(BatchStats));
+    // Upper bound, not an exact contract: guards against telemetry growth while
+    // tolerating target-specific layout/padding differences.
+    try std.testing.expect(@sizeOf(BatchStats) <= 88);
     try std.testing.expect(@alignOf(BatchStats) <= @alignOf(usize));
 }
 
@@ -1903,6 +1913,37 @@ test "batch submission does not allocate after init" {
     const stats = threads.parallelFor(hits.len, &context, markCoverage);
 
     try std.testing.expect(stats.ran_inline);
+    for (&hits) |*hit| {
+        try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
+    }
+}
+
+test "threaded batch submission does not allocate after init" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = 16,
+    });
+    defer threads.deinit();
+
+    const original_allocator = threads.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    threads.allocator = failing_allocator.allocator();
+    defer threads.allocator = original_allocator;
+
+    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var context = CoverageContext{ .hits = hits[0..] };
+    const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{
+        .adaptive = false,
+        .selected_profile = .{
+            .worker_threads = 1,
+            .items_per_range = 16,
+        },
+    });
+
+    try std.testing.expect(!stats.ran_inline);
+    try std.testing.expectEqual(@as(usize, 1), stats.active_worker_threads);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
     }

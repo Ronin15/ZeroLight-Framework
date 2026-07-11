@@ -582,53 +582,81 @@ pub const CollisionSystem = struct {
         }
     }
 
+    /// Serial-broadphase mirror of `BroadphaseRangeBuffer.appendCandidateAssumeCapacity`:
+    /// always counts the pair into `required_capacity`, but only writes it while the
+    /// reserved buffer still has spare capacity. That lets the scan detect (and the
+    /// caller regrow) an under-estimate after the pass instead of hidden-allocating in
+    /// the hot inline loop, which is what a plain fallible `append` would do once a
+    /// dense/clustered scene needs more pairs than `estimateBroadphasePairCapacity`
+    /// reserved (that estimate is capped at body count, but pair count can exceed it).
+    fn appendCandidatePairChecked(self: *CollisionSystem, required_capacity: *usize, pair: CandidatePair) void {
+        required_capacity.* += 1;
+        if (self.candidate_pairs.items.len < self.candidate_pairs.capacity) {
+            self.candidate_pairs.appendAssumeCapacity(pair);
+        }
+    }
+
     fn buildBroadphaseCandidatesSimd(self: *CollisionSystem) !BroadphaseStats {
-        self.candidate_pairs.clearRetainingCapacity();
-        var stats = BroadphaseStats{};
         const proxies = self.sliceConst();
         const sorted_count = self.order.items.len;
         try self.candidate_pairs.ensureTotalCapacity(
             self.allocator,
             estimateBroadphasePairCapacity(sorted_count, sorted_count),
         );
-        for (0..sorted_count) |sorted_index| {
-            const proxy_index = self.order.items[sorted_index];
-            const proxy_max_x = proxies.max_x[proxy_index];
-            const proxy_min_y = proxies.min_y[proxy_index];
-            const proxy_max_y = proxies.max_y[proxy_index];
-            var candidate_sorted_index = sorted_index + 1;
 
-            while (candidate_sorted_index + simd.lane_count <= sorted_count) {
-                var candidate_indices: [simd.lane_count]usize = undefined;
-                inline for (0..simd.lane_count) |lane| {
-                    candidate_indices[lane] = self.order.items[candidate_sorted_index + lane];
+        // Same overflow-regrow discipline the threaded path uses: append while the
+        // reserved buffer has room and count what a clustered scene really needs,
+        // then grow once to the exact count and replay the deterministic scan (it
+        // reads only const proxy/order columns). Keeps the serial broadphase
+        // allocation-free after warmup even when pair count exceeds body count.
+        while (true) {
+            self.candidate_pairs.clearRetainingCapacity();
+            var stats = BroadphaseStats{};
+            var required_capacity: usize = 0;
+            for (0..sorted_count) |sorted_index| {
+                const proxy_index = self.order.items[sorted_index];
+                const proxy_max_x = proxies.max_x[proxy_index];
+                const proxy_min_y = proxies.min_y[proxy_index];
+                const proxy_max_y = proxies.max_y[proxy_index];
+                var candidate_sorted_index = sorted_index + 1;
+
+                while (candidate_sorted_index + simd.lane_count <= sorted_count) {
+                    var candidate_indices: [simd.lane_count]usize = undefined;
+                    inline for (0..simd.lane_count) |lane| {
+                        candidate_indices[lane] = self.order.items[candidate_sorted_index + lane];
+                    }
+                    const candidate_min_x = simd.gatherFloat4(proxies.min_x, candidate_indices);
+                    const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
+                    if (!x_active[0]) break;
+
+                    const candidate_min_y = simd.gatherFloat4(proxies.min_y, candidate_indices);
+                    const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
+                    const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
+                    inline for (0..simd.lane_count) |lane| {
+                        if (overlaps[lane]) {
+                            self.appendCandidatePairChecked(&required_capacity, .{ .a = proxy_index, .b = candidate_indices[lane] });
+                        }
+                    }
+                    stats.simd_groups += 1;
+                    candidate_sorted_index += simd.lane_count;
+                    if (!x_active[simd.lane_count - 1]) break;
                 }
-                const candidate_min_x = simd.gatherFloat4(proxies.min_x, candidate_indices);
-                const x_active = candidate_min_x < simd.splatFloat4(proxy_max_x);
-                if (!x_active[0]) break;
 
-                const candidate_min_y = simd.gatherFloat4(proxies.min_y, candidate_indices);
-                const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
-                const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
-                inline for (0..simd.lane_count) |lane| {
-                    if (overlaps[lane]) {
-                        try self.candidate_pairs.append(self.allocator, .{ .a = proxy_index, .b = candidate_indices[lane] });
+                while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
+                    const candidate_index = self.order.items[candidate_sorted_index];
+                    if (proxies.min_x[candidate_index] >= proxy_max_x) break;
+                    if (overlapsY(proxies, proxy_index, candidate_index)) {
+                        self.appendCandidatePairChecked(&required_capacity, .{ .a = proxy_index, .b = candidate_index });
                     }
                 }
-                stats.simd_groups += 1;
-                candidate_sorted_index += simd.lane_count;
-                if (!x_active[simd.lane_count - 1]) break;
             }
 
-            while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
-                const candidate_index = self.order.items[candidate_sorted_index];
-                if (proxies.min_x[candidate_index] >= proxy_max_x) break;
-                if (overlapsY(proxies, proxy_index, candidate_index)) {
-                    try self.candidate_pairs.append(self.allocator, .{ .a = proxy_index, .b = candidate_index });
-                }
+            if (required_capacity > self.candidate_pairs.capacity) {
+                try self.candidate_pairs.ensureTotalCapacity(self.allocator, required_capacity);
+                continue;
             }
+            return stats;
         }
-        return stats;
     }
 
     fn buildBroadphaseCandidatesThreaded(
@@ -1243,6 +1271,44 @@ test "collision update reuses warmed scratch without steady state allocation" {
 
     const stats = try system.updateSerial(&data, &contacts);
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
+    try std.testing.expect(contacts.mergedItems().len > 0);
+}
+
+test "serial collision broadphase warms clustered overflow without steady state allocation" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Tightly clustered bodies all mutually overlap, so the candidate pair count
+    // (~N*(N-1)/2) far exceeds the body-count-capped broadphase estimate. The warmup
+    // update must overflow the reserved candidate buffer and regrow it once; the
+    // failing-allocator update then reuses that warmed capacity with zero allocation.
+    for (0..24) |index| {
+        const jitter: f32 = @floatFromInt(index % 3);
+        _ = try addBody(&data, jitter * 0.25, 0, 8);
+    }
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const warm_stats = try system.updateSerial(&data, &contacts);
+    // Confirm the fixture actually exercises the overflow-regrow path.
+    try std.testing.expect(warm_stats.candidate_pair_count > warm_stats.body_count);
+
+    const original_system_allocator = system.allocator;
+    const original_contacts_allocator = contacts.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const fail = failing_allocator.allocator();
+    system.allocator = fail;
+    contacts.allocator = fail;
+    defer {
+        system.allocator = original_system_allocator;
+        contacts.allocator = original_contacts_allocator;
+    }
+
+    const stats = try system.updateSerial(&data, &contacts);
+    try std.testing.expectEqual(@as(usize, 24), stats.body_count);
+    try std.testing.expect(stats.candidate_pair_count > stats.body_count);
     try std.testing.expect(contacts.mergedItems().len > 0);
 }
 

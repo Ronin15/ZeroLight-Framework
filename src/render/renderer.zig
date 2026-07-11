@@ -633,8 +633,9 @@ pub const Renderer = struct {
                 .dynamic = upload_dynamic,
                 .static_vertices = upload_static,
                 .tile_edits = upload_tile_edits,
-            }) catch {
-                return finishAcquiredCommandBufferAfterError(command_buffer, "SDL_BeginGPUCopyPass");
+            }) catch |err| {
+                log.err("recording frame copy pass failed: {s}", .{@errorName(err)});
+                return finishAcquiredCommandBufferAfterError(command_buffer, "copy pass");
             };
         }
         // The static buffer now holds current data on the GPU; reuse it until the
@@ -1122,9 +1123,12 @@ pub const Renderer = struct {
     fn ensureFrameBatchCapacity(self: *Renderer) !void {
         const command_count = self.batch.commands.items.len;
         if (command_count == 0) return;
-        if (comptime @import("builtin").mode == .Debug) {
-            std.debug.assert(command_count <= self.command_high_water);
-        }
+        // Over-submission beyond the reserved `command_high_water` is owned by the
+        // grow fallback below, identically in Debug and ReleaseFast. `drawSprite`'s
+        // `SpriteCommandOverflow` guard (against the ArrayList's physical capacity)
+        // is the only hard bound; a Debug-only assert against `command_high_water`
+        // would panic on over-reservations that the frame path otherwise regrows,
+        // making the two modes disagree and leaving this fallback dead in Debug.
         if (command_count <= self.command_high_water) return;
 
         const needed_vertices = try std.math.mul(usize, command_count, 6);

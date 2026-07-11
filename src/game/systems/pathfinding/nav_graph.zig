@@ -2874,6 +2874,90 @@ test "entity-obstacle rect nav update is allocation-free at steady state" {
     system.allocator = original;
 }
 
+test "threaded multi-worker chunk patch/remask is allocation-free at steady state (FailingAllocator)" {
+    // The serial slot-0 proof above swaps in a failing allocator with thread_system=null,
+    // so the worker append (scratch.edges.append / setLen on worker threads at
+    // remaskChangedChunks/patchChunkJob) is only ever proven allocation-free on the inline
+    // slot-0 path. This drives the SAME failing-allocator proof through a REAL multi-worker
+    // ThreadSystem so the reserve-before-dispatch invariant (patch/remask scratch sized to
+    // the participant count) is proven on the path that actually fans out to worker threads.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+    // Force the parallel schedule rather than letting the tuner keep the small batch inline,
+    // so the proof exercises the worker-thread append, not the serial slot-0 fallback.
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
+    // set and the patch dirty set exceed one chunk and actually fan out to workers.
+    const warm_cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    // A distinct cell in each of the SAME five chunks, dug during the failing-allocator proof
+    // below. Same per-chunk/per-worker footprint as the warmup, so no buffer grows.
+    const proof_cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 2, .y = 2 },  .{ .x = 14, .y = 1 },
+        .{ .x = 2, .y = 14 }, .{ .x = 14, .y = 14 },
+        .{ .x = 6, .y = 6 },
+    };
+
+    // Warmup: toggle the warm cells on then off through the THREADED path, so every buffer the
+    // threaded remask/patch touches (dirty_set/dirty_stamp, changed spans, per-participant patch
+    // and remask scratch) reaches steady-state capacity before the failing-allocator proof.
+    for ([_]@TypeOf(tree){ tree, grass }) |tile| {
+        for (warm_cells) |cell| {
+            _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tile)) orelse return error.TestExpectedEqual;
+            try system.markNavDirty(0, cell.x, cell.y);
+        }
+        const warm_stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+        try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
+        // The warmup itself must have threaded (not fallen back inline), or it would not have
+        // grown the per-participant worker scratch the proof relies on.
+        try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+        try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+    }
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    for (proof_cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    // Both stages threaded under the failing allocator: the worker append allocated zero times.
+    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
 // Commits a single set_movement_body structural command through `frame` (real
 // structural-commit -> event pipeline, mirroring how the game state drives it) and
 // applies it, so the produced component_changed event carries real

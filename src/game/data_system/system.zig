@@ -443,14 +443,22 @@ pub const DataSystem = struct {
 
     /// Drawable indices for a movement-body dense row. The movement index is the
     /// loop anchor for render collect and matches scope columns (`tier`, `chunk_*`).
-    pub fn renderCollectIndicesForMovement(self: *const DataSystem, movement_index: usize) ?RenderCollectIndices {
-        const movement = self.movement_bodies.sliceConst();
+    /// The caller passes the movement column slice it is already iterating and the
+    /// primitive-visual row count (for the debug bounds assert) so this stays a pure
+    /// slot resolve with no per-row MultiArrayList slice rebuild — the 11-column and
+    /// 15-column rebuilds this used to do are dead work in the hot render-collect
+    /// loop (and the 15-column rebuild only fed a bounds assert ReleaseFast strips).
+    /// The caller has already confirmed `movement.has_primitive_visual[movement_index]`.
+    pub fn renderCollectIndicesForMovement(
+        self: *const DataSystem,
+        movement: ConstMovementBodySlice,
+        movement_index: usize,
+        primitive_visual_count: usize,
+    ) ?RenderCollectIndices {
         if (movement_index >= movement.entities.len) return null;
-        if (!movement.has_primitive_visual[movement_index]) return null;
         const slot = self.resolveSlotConst(movement.entities[movement_index]) orelse return null;
         const visual_index = slot.primitive_visual_index orelse return null;
-        const visuals = self.primitive_visuals.sliceConst();
-        std.debug.assert(visual_index < visuals.entities.len);
+        std.debug.assert(visual_index < primitive_visual_count);
         return .{
             .visual_index = @intCast(visual_index),
             .asset_ref_index = if (slot.asset_ref_index) |index| @intCast(index) else null,
@@ -1461,7 +1469,11 @@ test "render collect indices resolve drawable rows from movement dense index" {
     });
     try data.setAssetReference(entity, .{ .sprite = .demo_tile });
 
-    const indices = data.renderCollectIndicesForMovement(0).?;
+    const indices = data.renderCollectIndicesForMovement(
+        data.movementBodySliceConst(),
+        0,
+        data.primitiveVisualSliceConst().entities.len,
+    ).?;
     try std.testing.expectEqual(@as(usize, 0), indices.visual_index);
     try std.testing.expect(indices.asset_ref_index != null);
     try std.testing.expect(indices.facing_index != null);
@@ -1469,11 +1481,23 @@ test "render collect indices resolve drawable rows from movement dense index" {
     const movement_only = try data.createEntity();
     try data.setMovementBody(movement_only, testBody(2));
     try std.testing.expect(!data.movementBodySliceConst().has_primitive_visual[1]);
-    try std.testing.expect(data.renderCollectIndicesForMovement(1) == null);
-    try std.testing.expect(data.renderCollectIndicesForMovement(99) == null);
+    try std.testing.expect(data.renderCollectIndicesForMovement(
+        data.movementBodySliceConst(),
+        1,
+        data.primitiveVisualSliceConst().entities.len,
+    ) == null);
+    try std.testing.expect(data.renderCollectIndicesForMovement(
+        data.movementBodySliceConst(),
+        99,
+        data.primitiveVisualSliceConst().entities.len,
+    ) == null);
 
     _ = data.destroyEntity(entity);
-    try std.testing.expect(data.renderCollectIndicesForMovement(0) == null);
+    try std.testing.expect(data.renderCollectIndicesForMovement(
+        data.movementBodySliceConst(),
+        0,
+        data.primitiveVisualSliceConst().entities.len,
+    ) == null);
     try std.testing.expect(data.movementBodySliceConst().entities.len == 1);
 }
 
@@ -1493,7 +1517,11 @@ test "setMovementBody syncs has_primitive_visual when the visual row already exi
     try data.setMovementBody(entity, testBody(1));
 
     try std.testing.expect(data.movementBodySliceConst().has_primitive_visual[0]);
-    try std.testing.expect(data.renderCollectIndicesForMovement(0) != null);
+    try std.testing.expect(data.renderCollectIndicesForMovement(
+        data.movementBodySliceConst(),
+        0,
+        data.primitiveVisualSliceConst().entities.len,
+    ) != null);
 }
 
 test "movement body columns can be loaded directly through simd helpers" {

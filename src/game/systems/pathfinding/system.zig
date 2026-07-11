@@ -1052,10 +1052,21 @@ pub const PathfindingSystem = struct {
             self.group_requests.items[group_index].count += 1;
             return;
         }
-        if (self.group_requests.items.len < self.group_requests.capacity) {
+        // Gate on the LOGICAL cap, not group_requests' physical .capacity:
+        // ensureTotalCapacity rounds up, so the ArrayList's physical capacity can
+        // exceed max_solved_requests_per_step while group_key_map is reserved to
+        // exactly that logical cap and refuses inserts beyond it. Appending into the
+        // physical slack would then silently drop the map registration and desync the
+        // two, splitting one goal's tally across duplicate slots.
+        if (self.group_requests.items.len < self.capacity.max_solved_requests_per_step) {
             const new_index = self.group_requests.items.len;
             self.group_requests.appendAssumeCapacity(.{ .key = key, .count = 1 });
-            _ = self.group_key_map.insert(key, new_index);
+            if (!self.group_key_map.insert(key, new_index)) {
+                // Registration refused (map full): roll back the tally append so
+                // group_requests and group_key_map stay in lockstep and can never
+                // diverge into duplicate, count-splitting slots.
+                self.group_requests.items.len -= 1;
+            }
         }
     }
 
@@ -1987,6 +1998,54 @@ test "pathfinding sub-threshold transient crowd decays back to no group field" {
     for (system.group_fields.items) |field| {
         try std.testing.expectEqual(GroupFieldState.empty, field.state);
     }
+}
+
+test "pathfinding group tally refuses over-cap distinct keys without desyncing the map" {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+
+    // The logical per-step cap governs how many distinct group tallies may register:
+    // group_requests is reserved to it, but group_key_map refuses inserts past exactly
+    // this cap. recordGroupRequest must gate the new-group append on the LOGICAL cap, not
+    // the ArrayList's physical .capacity — otherwise appends into physical slack outrun the
+    // dropped map registrations and split one goal's count across duplicate slots.
+    const logical_cap = system.capacity.max_solved_requests_per_step;
+    try std.testing.expect(logical_cap >= 2);
+
+    // Force physical slack above the logical cap so the logical/physical divergence is
+    // exercised deterministically regardless of the allocator's size-class rounding.
+    try system.group_requests.ensureTotalCapacity(system.allocator, logical_cap * 4);
+    try std.testing.expect(system.group_requests.capacity > logical_cap);
+
+    // A repeated key must accumulate in ONE slot, never spawn duplicates.
+    const repeated = PathQueryKey{ .nav_version = 1, .agent_class = .default, .goal = .{ .x = 0, .y = 0 } };
+    system.recordGroupRequest(repeated);
+    system.recordGroupRequest(repeated);
+    system.recordGroupRequest(repeated);
+
+    // Drive more distinct goals than the logical cap in a single step.
+    var made: usize = 0;
+    while (made < logical_cap + 5) : (made += 1) {
+        system.recordGroupRequest(.{ .nav_version = 1, .agent_class = .default, .goal = .{ .x = @intCast(made + 1), .y = 0 } });
+    }
+
+    // The tally never overflows the logical cap into the ArrayList's physical slack.
+    try std.testing.expectEqual(logical_cap, system.group_requests.items.len);
+
+    // Every registered tally is keyed to exactly one slot: no two entries share a key, and
+    // group_key_map round-trips each key back to its own slot index.
+    var seen = std.AutoHashMap(PathQueryKey, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (system.group_requests.items, 0..) |tally, idx| {
+        const gop = try seen.getOrPut(tally.key);
+        try std.testing.expect(!gop.found_existing);
+        try std.testing.expectEqual(@as(?usize, idx), system.group_key_map.find(tally.key));
+    }
+
+    // The repeated key accumulated all three requests in its single slot.
+    const repeated_index = system.group_key_map.find(repeated) orelse return error.RepeatedKeyMissing;
+    try std.testing.expectEqual(@as(usize, 3), system.group_requests.items[repeated_index].count);
 }
 
 test "pathfinding group field within the same nav cell reuses without rebuilding" {

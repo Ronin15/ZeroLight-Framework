@@ -1107,11 +1107,6 @@ fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize) RowCohe
 /// Per-row job context for `writeAiIntentsJob`: every input column
 /// `resolveRowArbitration` needs to build a transient `arbitration.Signals`
 /// and call `scoreBehaviors`/`selectSticky`/`resolveGoal`, plus the resolved
-/// output columns and `ai_agent_hot` (arbitration's mutable hot-column
-/// write-back target). See `buildAiJobContext`.
-/// Per-row job context for `writeAiIntentsJob`: every input column
-/// `resolveRowArbitration` needs to build a transient `arbitration.Signals`
-/// and call `scoreBehaviors`/`selectSticky`/`resolveGoal`, plus the resolved
 /// output column and `ai_agent_hot` (arbitration's mutable hot-column
 /// write-back target). See `buildAiJobContext`.
 const AiJobContext = struct {
@@ -1278,9 +1273,9 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.entities[i].index,
             job.wander_step,
         );
-        const sep_x = if (i < job.sep_x.len) job.sep_x[i] else 0;
-        const sep_y = if (i < job.sep_y.len) job.sep_y[i] else 0;
-        const dir = applySeparationAndNormalize(base_dir, sep_x, sep_y);
+        std.debug.assert(i < job.sep_x.len);
+        std.debug.assert(i < job.sep_y.len);
+        const dir = applySeparationAndNormalize(base_dir, job.sep_x[i], job.sep_y[i]);
 
         writer.write(.{
             .entity = job.entities[i],

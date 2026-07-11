@@ -78,18 +78,27 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
    stable IDs to renderer texture IDs at the render-prep boundary, not in `DataSystem`.
    Keep asset paths relative and traversal-safe.
 10. Every `reserve`/`ensureTotalCapacity` + `assumeCapacity`/`addOneAssumeCapacity` pairing
-    ships a same-change `std.testing.FailingAllocator` proof test that the warmed path
-    allocates zero times — a comment or "allocation-free" claim is not proof (ReleaseFast
-    strips the assert backing `assumeCapacity`). For threaded writes, reserve on the main
-    thread before dispatch, sized from dispatch's own value, and assert each worker's
-    `worker_id`/`range.index` against the buffer length captured at dispatch. ReleaseFast also
-    makes a reached `unreachable`/`catch unreachable`/`orelse unreachable` (incl. `.?`) undefined
-    behavior, not a panic — use only where impossibility is provable by construction (e.g.
-    capacity-bounded generational-handle constructors); otherwise return an error. `zig build
-    idiom-lint` (part of `verify`) rejects a `catch`/`orelse unreachable` outside a `test` block
-    unless it is on a sanctioned handle constructor or carries `// lint:allow catch-unreachable:
-    <reason>`. Never add that annotation to silence the lint on a recoverable failure — propagate
-    the error (`SpriteBatch.buildSerial` returns `!void` for exactly this reason).
+    ships a same-change `std.testing.FailingAllocator` proof that the warmed path allocates zero
+    times — a comment or "allocation-free" claim is not proof (ReleaseFast strips the assert
+    backing `assumeCapacity`). Prove the path that runs: exercise the real multi-worker
+    `ThreadSystem`, not only the serial slot-0 / inline branch (an undersized threaded reserve
+    fails as a shared-allocator data race, not a clean OOM). For threaded writes, reserve on the
+    main thread before dispatch, sized from dispatch's own value, and open each worker with
+    `std.debug.assert` bounding its write range against the buffer length AND `range.index`
+    against the dispatched range count. When an appendable pool must track a separately reserved
+    fixed-capacity dedup/probe table, gate the append on the shared logical cap, never an
+    `ArrayList`'s physical `.capacity` (`ensureTotalCapacity` rounds up, so the two desync), and
+    honor the probe's insert-bool. Widen signed coordinate/cell spans to `i64`/`usize` before
+    subtracting and `@intCast`-ing to unsigned, clamp while wide, then narrow — saturated
+    float→`i32` makes `@intCast(max - min + 1)` overflow UB. ReleaseFast makes a reached
+    `unreachable`/`catch unreachable`/`orelse unreachable` (incl. `.?`) undefined behavior, not a
+    panic — use only where impossibility is provable by construction (capacity-bounded
+    generational-handle constructors); otherwise return an error. A `.?` on an optional field in a
+    hot/worker loop is invisible to `idiom-lint` — capture it as a non-optional local at dispatch
+    or `assert(field != null)` at entry. `zig build idiom-lint` (part of `verify`) rejects a
+    `catch`/`orelse unreachable` outside a `test` block unless on a sanctioned handle constructor
+    or carrying `// lint:allow catch-unreachable: <reason>`; never annotate to silence a recoverable
+    failure — propagate it (`SpriteBatch.buildSerial` returns `!void` for this reason).
 11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
     never derived from world/map size, cell count, portal count, or other "current scale." A
     chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
@@ -107,7 +116,11 @@ per `docs/coding-standards.md` Dense SoA storage. Hot-path rules are mandatory: 
 `rows.slice()` once per stage/function and reuse the column slices — never call
 `rows.items(.field)` inside a loop (rebuilds pointers per call; measured large Debug/Release
 regressions). Hot per-row gather loops use the `addOneAssumeCapacity` + `set()` append helper
-(`appendMalRow` pattern), not `rows.appendAssumeCapacity(row)` per row.
+(`appendMalRow` pattern), not `rows.appendAssumeCapacity(row)` per row. A per-row render/collect
+helper takes already-built const column slices from its caller — never call
+`.slice()`/`.sliceConst()` inside the per-row helper: the rebuild hides behind the `pub`
+boundary (invisible to `idiom-lint`) and is dead work in ReleaseFast when it only feeds a
+bounds assert the release build strips.
 
 Adding or reordering a `SimulationPipeline` stage requires, in the same change: the
 `PipelineResource` tag(s) it reads/writes in `simulation_pipeline.zig`'s `stageContract()`,
@@ -128,7 +141,11 @@ transitions, SDL/GPU calls, asset loading, save/load, and renderer resource owne
 an explicit deferred/main-thread boundary, and use typed range-owned output buffers
 (count/prefix/contiguous-write/range-index merge/batch commit) over global per-command
 atomics or event buses. Keep a serial fallback; do not gate worker participation with static
-item-count floors. Do not turn the main thread into a dumping ground for scalable work.
+item-count floors. Do not turn the main thread into a dumping ground for scalable work. Drive a
+batched `RangeOutputStream`/`SimulationEvents` producer once per commit — reserve and write every
+range, then call `finishWrite` a single time; a record-per-item publish loop is O(N²) because
+`SimulationEvents.finishWrite` rebuilds stats over all ranges (and, unlike
+`RangeOutputStream.finishWrite`, survives ReleaseFast).
 
 **Never** add test-only enum tags, union variants, marker fields, fake stages, fixture
 payloads, or service shortcuts to production contracts. Tests use private helpers, local

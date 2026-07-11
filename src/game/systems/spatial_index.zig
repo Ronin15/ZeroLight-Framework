@@ -297,20 +297,39 @@ pub const SpatialIndexView = struct {
         // Row-independent x clip: the scanned x-span never depends on cell_y,
         // so it is computed once against the dense window's bounds rather than
         // once per row.
-        const window_min_x = self.dense_lookup.origin.x;
-        const window_max_x = window_min_x + @as(i32, @intCast(self.dense_lookup.width)) - 1;
-        const clipped_min_x = @max(own_cell.x - cell_scan_radius, window_min_x);
-        const clipped_max_x = @min(own_cell.x + cell_scan_radius, window_max_x);
+        // Widen before narrowing: `own_cell.x +/- cell_scan_radius` on i32 cell
+        // coordinates (from saturating `floorToI32`, so possibly `minInt`/
+        // `maxInt`) can overflow i32, which is UB in ReleaseFast. Compute the
+        // clip in i64; the offsets that feed `@intCast` are provably in range
+        // (`clipped_min_x >= window_min_x`, and the span is `>= 1` past the
+        // early return), so the result is identical for well-formed inputs.
+        const window_min_x: i64 = self.dense_lookup.origin.x;
+        const window_max_x: i64 = window_min_x + @as(i64, self.dense_lookup.width) - 1;
+        const clipped_min_x = @max(@as(i64, own_cell.x) - cell_scan_radius, window_min_x);
+        const clipped_max_x = @min(@as(i64, own_cell.x) + cell_scan_radius, window_max_x);
         if (clipped_min_x > clipped_max_x) return stats;
         const row_x_offset: usize = @intCast(clipped_min_x - window_min_x);
         const n_cells: usize = @intCast(clipped_max_x - clipped_min_x + 1);
         const vectorized_len = simd.vectorizedEnd(n_cells);
 
-        var cell_y = own_cell.y - cell_scan_radius;
-        while (cell_y <= own_cell.y + cell_scan_radius) : (cell_y += 1) {
-            const rel_y = cell_y - self.dense_lookup.origin.y;
-            if (rel_y < 0 or rel_y >= @as(i32, @intCast(self.dense_lookup.height))) continue;
-            const row_base = @as(usize, @intCast(rel_y)) * self.dense_lookup.width + row_x_offset;
+        // Same widen-before-narrow clip for the y-scan bounds: `own_cell.y +/-
+        // cell_scan_radius` on i32 cell coordinates (saturating `floorToI32`, so
+        // possibly `minInt`/`maxInt`) can overflow i32, UB in ReleaseFast.
+        // Clamping the range to the window's y-span while wide makes each row's
+        // `rel_y` in-bounds by construction — it drops the old `rel_y < 0 or
+        // rel_y >= height` `continue` skip while visiting exactly the same rows
+        // in the same order for well-formed inputs, and bounds the loop to the
+        // reserved window instead of the raw (possibly saturated) scan span.
+        const window_min_y: i64 = self.dense_lookup.origin.y;
+        const window_max_y: i64 = window_min_y + @as(i64, self.dense_lookup.height) - 1;
+        const clipped_min_y = @max(@as(i64, own_cell.y) - cell_scan_radius, window_min_y);
+        const clipped_max_y = @min(@as(i64, own_cell.y) + cell_scan_radius, window_max_y);
+        if (clipped_min_y > clipped_max_y) return stats;
+
+        var cell_y: i64 = clipped_min_y;
+        while (cell_y <= clipped_max_y) : (cell_y += 1) {
+            const rel_y: usize = @intCast(cell_y - window_min_y);
+            const row_base = rel_y * self.dense_lookup.width + row_x_offset;
 
             var j: usize = 0;
             while (j < vectorized_len) : (j += simd.lane_count) {
@@ -671,10 +690,17 @@ pub const SpatialIndexSystem = struct {
         }
         const min_y = self.entries.items[0].cell.y;
         const max_y = self.entries.items[self.entries.items.len - 1].cell.y;
-        const width_unclamped: u32 = @intCast(max_x - min_x + 1);
-        const height_unclamped: u32 = @intCast(max_y - min_y + 1);
-        const width = @min(width_unclamped, self.dense_lookup.capacity_cells_x);
-        const height = @min(height_unclamped, self.dense_lookup.capacity_cells_y);
+        // Widen before narrowing: `max - min` on i32 cell coordinates (produced
+        // from possibly-inf/huge positions via saturating `floorToI32`) can
+        // overflow i32, and an out-of-range `@intCast` to u32 is UB in
+        // ReleaseFast (safety checks stripped) — and it would run *before* the
+        // capacity clamp meant to contain an oversized window. Compute the span
+        // in i64, clamp against the reserved capacity while still wide, then
+        // narrow the already-bounded value to u32.
+        const width_span = @as(i64, max_x) - @as(i64, min_x) + 1;
+        const height_span = @as(i64, max_y) - @as(i64, min_y) + 1;
+        const width: u32 = @intCast(@min(width_span, @as(i64, self.dense_lookup.capacity_cells_x)));
+        const height: u32 = @intCast(@min(height_span, @as(i64, self.dense_lookup.capacity_cells_y)));
 
         self.dense_lookup.origin = .{ .x = min_x, .y = min_y };
         self.dense_lookup.width = width;
