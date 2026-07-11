@@ -9,17 +9,25 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
 zig build bench     # run CPU gameplay and render-prep benchmarks
-zig build verify    # run check, test, shader compilation, and atlas lint
+zig build verify    # run check, test, shader compilation, atlas + idiom lint
 zig build package   # install selected-mode binaries and runtime assets
 ```
 
 Useful supporting commands:
 
 ```sh
-zig build fmt       # format build.zig, build.zig.zon, and src/
-zig build shaders   # compile GLSL shader sources to platform GPU shaders
-zig build gpu-smoke # run a display-gated renderer pipeline smoke
+zig build fmt        # format build.zig, build.zig.zon, and src/
+zig build shaders    # compile GLSL shader sources to platform GPU shaders
+zig build gpu-smoke  # run a display-gated renderer pipeline smoke
+zig build assets-lint # lint runtime atlases and source sprite consistency
+zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreachable
 ```
+
+`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) enforces
+the naming/currency/`catch unreachable` rules from `docs/coding-standards.md`:
+snake_case fields/params, `k_snake_case` constants, current stdlib spellings, and
+`catch`/`orelse unreachable` only on a sanctioned handle constructor, inside a
+`test` block, or with a `// lint:allow catch-unreachable: <reason>` annotation.
 
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.

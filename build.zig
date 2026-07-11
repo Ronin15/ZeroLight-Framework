@@ -220,11 +220,16 @@ pub fn build(b: *std.Build) void {
     const assets_lint_step = b.step("assets-lint", "Lint registered runtime atlases and source sprite consistency");
     assets_lint_step.dependOn(&assets_lint_cmd.step);
 
+    const idiom_lint_cmd = b.addSystemCommand(&.{ "python3", "tools/lint_idioms.py" });
+    const idiom_lint_step = b.step("idiom-lint", "Lint Zig sources for idiom/currency regressions (naming, deprecated stdlib, unsafe catch unreachable)");
+    idiom_lint_step.dependOn(&idiom_lint_cmd.step);
+
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);
     verify_step.dependOn(test_step);
     verify_step.dependOn(shaders_step);
     verify_step.dependOn(&assets_lint_cmd.step);
+    verify_step.dependOn(&idiom_lint_cmd.step);
 
     const gpu_smoke_run = b.addRunArtifact(gpu_smoke_exe);
     addWindowsSdlRunRuntime(gpu_smoke_run, windows_sdl_runtime);

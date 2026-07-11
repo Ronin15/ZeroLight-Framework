@@ -83,9 +83,13 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
     strips the assert backing `assumeCapacity`). For threaded writes, reserve on the main
     thread before dispatch, sized from dispatch's own value, and assert each worker's
     `worker_id`/`range.index` against the buffer length captured at dispatch. ReleaseFast also
-    makes a reached `unreachable`/`catch unreachable` undefined behavior, not a panic — use only
-    where impossibility is provable by construction (e.g. capacity-bounded generational-handle
-    constructors); otherwise return an error.
+    makes a reached `unreachable`/`catch unreachable`/`orelse unreachable` (incl. `.?`) undefined
+    behavior, not a panic — use only where impossibility is provable by construction (e.g.
+    capacity-bounded generational-handle constructors); otherwise return an error. `zig build
+    idiom-lint` (part of `verify`) rejects a `catch`/`orelse unreachable` outside a `test` block
+    unless it is on a sanctioned handle constructor or carries `// lint:allow catch-unreachable:
+    <reason>`. Never add that annotation to silence the lint on a recoverable failure — propagate
+    the error (`SpriteBatch.buildSerial` returns `!void` for exactly this reason).
 11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
     never derived from world/map size, cell count, portal count, or other "current scale." A
     chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
@@ -157,7 +161,8 @@ preserve current behavior; never document deferred runtime behavior as complete.
 - `zig build check` — compile coverage of game, bench, and GPU-smoke executables (no install).
 - `zig build test` — unit behavior and reusable module coverage.
 - `zig build shaders` — after shader source or shader build-wiring changes.
-- `zig build verify` — before considering a larger slice complete (check + test + shaders + atlas lint).
+- `zig build verify` — before considering a larger slice complete (check + test + shaders + atlas + idiom lint).
+- `zig build idiom-lint` — after edits touching naming, stdlib containers, or `catch`/`orelse unreachable`; catches naming/currency drift and unsafe error-swallowing before `verify` does.
 - `zig build gpu-smoke` — only when display/GPU validation is relevant and a display exists.
 - `zig build fmt` — after editing Zig/build files.
 

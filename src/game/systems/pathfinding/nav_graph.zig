@@ -1037,9 +1037,10 @@ pub const NavGraph = struct {
         const run = self.chunk_link_cells.items[lo .. lo + len];
         // slotForCell only reaches here for a non-perimeter portal cell that was already
         // admitted as a portal. Border cells (tryBorderPair) are perimeter; link endpoints are
-        // gated by tryLinkPortal, which skips any interior cell absent from this run. So a miss
-        // is an invariant violation; surface it loudly instead of aliasing onto slot 0.
-        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable;
+        // gated by tryLinkPortal, which skips any interior cell absent from this run, so a miss
+        // is an invariant violation (a Debug/ReleaseSafe panic; the invariant is covered by the
+        // "runtime interior link endpoint is deferred" regression test) rather than a real path.
+        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable; // lint:allow catch-unreachable: interior portal cell provably present in run (see above)
         return @intCast(rel);
     }
 

@@ -129,12 +129,13 @@ zig build dev        # shaders + assets + run (edit/run loop)
 zig build check      # compile coverage (game, gpu-smoke, bench) — no install
 zig build test       # run Zig unit tests
 zig build bench      # CPU gameplay and render-prep benchmarks
-zig build verify     # full gate: check + test + shader compile + atlas lint
+zig build verify     # full gate: check + test + shaders + atlas + idiom lint
 zig build fmt        # format build.zig, build.zig.zon, and src/
 zig build shaders    # compile GLSL sources to platform GPU shaders
 zig build gpu-smoke  # display-gated renderer pipeline smoke (needs a display)
 zig build package    # install selected-mode binaries and runtime assets
 zig build assets-lint # lint runtime atlases and source sprite consistency
+zig build idiom-lint # lint Zig naming, stdlib currency, unsafe catch unreachable
 zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cache
 ```
 

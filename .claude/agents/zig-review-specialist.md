@@ -42,14 +42,21 @@ sits close to the creation site. Flag any new `reserve`/`ensureTotalCapacity` +
 proof, and ReleaseFast strips the assert backing `assumeCapacity`. For threaded writes,
 confirm the reserve happens on the main thread strictly before dispatch, sized from the value
 dispatch uses, and that the worker asserts its range against the buffer length. ReleaseFast
-also makes a reached `unreachable`/`catch unreachable` undefined behavior, not a panic — flag
-either where impossibility is not provable by construction (sanctioned case: capacity-bounded
-generational-handle constructors).
+also makes a reached `unreachable`/`catch unreachable`/`orelse unreachable` (incl. `.?`)
+undefined behavior, not a panic — flag either where impossibility is not provable by
+construction (sanctioned case: capacity-bounded generational-handle constructors). A new
+`catch`/`orelse unreachable` outside a `test` block must be on a sanctioned handle constructor
+or carry `// lint:allow catch-unreachable: <reason>`; flag an annotation used to silence a
+genuinely recoverable failure (it should propagate the error instead — see
+`SpriteBatch.buildSerial`). `zig build idiom-lint` (part of `verify`) enforces this.
 
-**Idiomatic naming & stdlib currency** — flag camelCased locals/fields (Zig: snake_case
-variables/fields, camelCase callables, PascalCase types) and the deprecated
+**Idiomatic naming & stdlib currency** — enforced by `zig build idiom-lint` (`tools/lint_idioms.py`),
+but still flag in review: camelCased locals/fields (Zig: snake_case variables/fields, camelCase
+callables, PascalCase types), C++-style `kFoo` constants (use `k_snake_case`), and the deprecated
 `std.ArrayListUnmanaged` alias (use `std.ArrayList`, init `= .empty`) or other removed/renamed
-stdlib spellings.
+stdlib spellings. The lint intentionally exempts function-pointer-typed fields from the camelCase
+check, so a camelCase fn-pointer field that should match the snake_case production vtables
+(`state.zig`, `audio.zig`, `cache.zig`) is a review-only catch.
 
 **Fixed work budgets** — any per-query/per-frame budget (search node caps, solve ceilings,
 and similar) must be a fixed constant. Flag a budget/capacity constant derived from or scaled

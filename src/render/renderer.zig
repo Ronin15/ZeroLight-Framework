@@ -819,7 +819,7 @@ pub const Renderer = struct {
             self.resolution_policy,
             window_size,
             drawable_size,
-        ) catch unreachable;
+        ) catch unreachable; // lint:allow catch-unreachable: all inputs proven non-zero (see comment above)
         self.current_presentation = presentation;
         self.logPresentationChange(presentation);
         return presentation;

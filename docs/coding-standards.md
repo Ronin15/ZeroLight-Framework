@@ -62,15 +62,28 @@ memory-corruption risk in the shipped binary, not a missed optimization. Add
 the proof test in the same change that adds the `assumeCapacity` call — do not
 defer it.
 
-The same ReleaseFast safety-strip applies to `unreachable` and `catch
-unreachable`: in the shipped binary a reached `unreachable` is undefined
-behavior, not a panic. Both are permitted only where the state is provably
-impossible by construction — the established use is generational-handle
-constructors bounded by capacity (`TextureId.init(...) catch unreachable`,
-`EntityId.init(...) catch unreachable`), whose failure case cannot occur within
-the reserved index/generation range. Hold `unreachable` to the same
-"provable, not merely expected" bar as `assumeCapacity`; if a failure is
-recoverable or attacker/data-influenced, return an error or assert instead.
+The same ReleaseFast safety-strip applies to `unreachable`, `catch unreachable`,
+and `orelse unreachable` (including `.?`, which is `orelse unreachable`): in the
+shipped binary a reached `unreachable` is undefined behavior, not a panic. All
+are permitted only where the state is provably impossible by construction — the
+established use is generational-handle constructors bounded by capacity
+(`TextureId.init(...) catch unreachable`, `EntityId.init(...) catch unreachable`),
+whose failure case cannot occur within the reserved index/generation range. Hold
+`unreachable` to the same "provable, not merely expected" bar as `assumeCapacity`;
+if a failure is recoverable or attacker/data-influenced, return an error or
+assert instead.
+
+This is enforced by `zig build idiom-lint` (part of `zig build verify`): a
+`catch unreachable` / `orelse unreachable` outside a `test` block is rejected
+unless it is on a sanctioned handle constructor or carries an explicit
+`// lint:allow catch-unreachable: <reason>` justification at the site. Do not add
+the annotation to silence the lint on a genuinely recoverable failure — propagate
+the error instead (the reference case is `SpriteBatch.buildSerial`, which returns
+`!void` rather than folding `ensureFrameStorage`'s allocation error into UB). The
+same lint gate enforces snake_case struct fields/parameters, `k_snake_case`
+constants, and current stdlib spellings (no `std.ArrayListUnmanaged`,
+`usingnamespace`, `std.mem.copy`/`set`, `std.BoundedArray`); its rules live in
+`tools/lint_idioms.py`.
 
 When a collection is written from more than one thread, both of these must
 hold and be verifiable by reading the call site, not just asserted in a
