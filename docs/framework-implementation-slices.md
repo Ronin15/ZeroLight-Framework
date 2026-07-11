@@ -81,17 +81,21 @@ Use this index to choose the next slice; **implement from that slice's section**
 | --- | --- | --- |
 | **33** | **Next** | Data-driven AI archetypes + debug introspection — depends on Slice 32 (landed) |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — after 32 reshapes AI loops |
-| **37** | Not started | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening |
+| **37** | Partial | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening — stale-doc checklist item landed; rest open |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
 | **39** | Not started | Sensory stimulus ecosystem — more `WorldStimulus` producers/kinds |
 | **40** | Not started | Action/interaction intent substrate |
 | **41** | Not started | World interest / affordance markers |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood |
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer, independent of AI slices 33/35/37-42) |
+| **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 (app/input layer) |
+| **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on Slice 40 |
+| **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
 
 **Recently settled (archive only):** 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
-**Residual non-slice backlog:** 23A `expand2`→`world` merge and optional render
-micro-opts — see **Scaling Gaps** / Next Priority Tracks, not a live slice body.
+**Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
+`mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
+`expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
 
 **Bench policy:** 50k bench scales are throughput ceilings, not per-frame targets.
 
@@ -134,8 +138,7 @@ follow **Suggested Order** and the open items in the target slice section.
   widening slice only when a new tag would exceed 32 (see Scaling Gaps).
 - Guard CPU paths with existing benches; keep SDL_GPU submit on the render thread.
 - Hardening without a slice number: collision-response merge, `SpriteBatch`
-  capacity, text-cache lifetime, 23A `expand2`→`world` merge (track when
-  scheduled as slices).
+  capacity, text-cache lifetime (track when scheduled as slices).
 - Reuse state-owned `SimulationPipeline`; persistent data in `DataSystem`;
   structural changes through `SimulationFrame`.
 
@@ -180,10 +183,10 @@ world depth, or cognition-track scope.
 
 **Branch / packaging residuals**
 
-- [ ] **Slice 23A merge residual.** GPU tilemap hardening is landed on
-      `expand2` (archive Slice 23A). Remaining: land as a coherent commit stack
-      and merge to `world`; optional O(n) linear `mergeDrawList` micro-opt only
-      after measuring.
+- [x] **Slice 23A merge — settled.** GPU tilemap hardening (archive Slice 23A)
+      is merged into `main` (`expand2`/`world` are ancestors of HEAD). The only
+      remaining item is the optional O(n) linear `mergeDrawList` micro-opt below,
+      to do after measuring — not a merge task.
 
 **Render scale**
 
@@ -1189,6 +1192,190 @@ keyboard — no rebind UI (defaults only, a later slice).
       input, (e) plugging in a second controller while one is active does not
       steal input from the first.
 
+## Slice 44: Input Rebinding And Extended Gamepad Controls
+
+**Status: not started.** App/input-layer work, depends on Slice 43 (landed);
+independent of the AI-track slices — no ordering dependency either way.
+
+Goal: fill the controls Slice 43 deliberately deferred — a rebind capture UI
+(defaults are no longer the only option) and the right-stick / trigger axes it
+left as no-ops — without recompiling to change a binding and without breaking
+the device-agnostic `Action` contract keyboard and gamepad already share.
+
+### Current foundation (do not rebuild)
+
+- `src/app/input.zig`'s `default_key_bindings` / `default_gamepad_bindings` are
+  compile-time `pub const` tables; `actionForKey` / `actionForGamepadButton` /
+  `actionForPressEvent` iterate them. A rebind UI needs a **runtime-mutable**
+  table these resolvers read instead of the const arrays directly.
+- `src/app/input_router.zig`'s `routeAction` + `SDL_EVENT_GAMEPAD_AXIS_MOTION`
+  case forward only `SDL_GAMEPAD_AXIS_LEFTX`/`_LEFTY`; right stick and triggers
+  arrive but are dropped.
+- `src/game/settings_menu_state.zig` already owns a runtime settings struct
+  (`RuntimeAudioSettings`) and menu-driven adjustment flow — the pattern a
+  `RuntimeInputBindings` and its capture UI mirror.
+
+### Architecture notes
+
+- Introduce a runtime binding table (`RuntimeInputBindings`, initialized by
+  copying the `default_*` consts) owned where the menu can mutate it; rewrite
+  `actionForKey`/`actionForGamepadButton` to resolve against it. Keep the const
+  tables as the reset-to-defaults source.
+- Rebind capture (press-a-key-to-bind) lives in `settings_menu_state.zig`; reject
+  conflicting/duplicate bindings loudly rather than silently shadowing an action.
+- Add right-stick and trigger `Action` bindings with new axis cases in
+  `input_router.zig`, gated by the same `InputRoutingPolicy` as the left stick.
+  Right-stick semantics (e.g. camera/aim) stay a thin mapping — no new gameplay
+  contract.
+- **Persistence of custom bindings is deferred to Slice 46** (save/load). Until
+  then bindings reset to defaults each launch — document this explicitly, do not
+  leave it an implicit surprise.
+
+### Checklist
+
+- [ ] `RuntimeInputBindings` runtime table + reset-to-defaults; `actionFor*`
+      resolve against it; tests that a rebound action resolves to the new
+      key/button and that reset restores defaults.
+- [ ] Settings-menu rebind capture flow with conflict/duplicate rejection; tests
+      for the rejection path.
+- [ ] Right-stick / trigger `Action` bindings + `input_router.zig` axis cases,
+      policy-gated; tests mirroring the left-stick gating/no-op tests.
+- [ ] Docs: update `docs/state-stack-and-input.md` `## Gamepad` / rebinding
+      contract; note the reset-each-launch behavior pending Slice 46.
+
+### Acceptance checks
+
+- [ ] A rebound action resolves at runtime with no recompile; right stick /
+      triggers drive their bound actions.
+- [ ] Keyboard-only and default-binding paths are byte-for-byte unchanged.
+- [ ] `zig build verify` passes.
+
+## Slice 45: First Action-Intent Consumer Domain Controller (Destructibles)
+
+**Status: not started.** Depends on Slice 40 (action-intent substrate). Do not
+start before 40's `action_intents` stream exists.
+
+Goal: land the **first pipeline-owned domain controller** that consumes Slice
+40's action intents into an actual gameplay domain, proving the substrate end to
+end. Destructibles / explosions are the exemplar (a confirmed future direction),
+but the slice's real contract is the controller pattern, not the specific
+content.
+
+### Current foundation (do not rebuild)
+
+- Slice 40 grows `SimulationIntent` (`simulation.zig`, today
+  `union(enum){ movement }`) with an action variant and an `action_intents`
+  `RangeOutputStream` on `SimulationFrame`.
+- `src/game/dig_controller.zig` is the template for a pipeline-owned controller
+  that reacts at a fixed stage, emits `world_tile_changed`, and routes structural
+  edits through deferred `StructuralCommand`s + world edits — never mutating
+  `DataSystem` inside worker ranges.
+- `docs/architecture.md` already describes "light domain controllers" for
+  combat / spawning / rules / encounters as the intended slot for exactly this.
+
+### Architecture notes
+
+- New controller owned by `SimulationPipeline`, consuming **merged**
+  `ActionIntent`s at a reaction phase after intent merge — not inside worker
+  ranges, not before the merge barrier.
+- Destruction results (tile removal, entity despawn, debris/particle spawn) go
+  through deferred `StructuralCommand`s and world edits; the controller requests
+  consideration, it does not directly mutate stores on the hot path.
+- Emit a typed `SimulationEvent` for the destruction moment (scalar payload only,
+  per the Slice 21 event contract). Reuse the existing `world_tile_changed`
+  reaction so pathfinding nav-invalidation and perception caches update locally,
+  not via a whole-level rebuild.
+- No renderer / audio / SDL handles in the controller; audio & particles are
+  driven through the existing `AudioController` / particle system.
+- Keep locomotion (`NavigationIntent`) and this action-consumer stream separate —
+  this slice must not overload navigation fields.
+
+### Checklist
+
+- [ ] Define a compact destructible fact (a `DataSystem` column or world marker)
+      — may be the first `Component` tag past 13/32; coordinate with the widening
+      note in Scaling Gaps if so.
+- [ ] Controller consumes action intents → deferred destruction commands; local
+      nav re-mask + destruction `SimulationEvent`; particle/audio via existing
+      controllers.
+- [ ] Capacity / determinism / serial==threaded parity tests; payload-purity
+      test (no pointers/handles in the event).
+- [ ] Docs: `docs/simulation-tiers-and-pipeline.md` records the controller's
+      stage placement and the action-intent → deferred-command contract.
+
+### Acceptance checks
+
+- [ ] An action intent targeting a destructible destroys it deterministically
+      through deferred commands; nav updates locally.
+- [ ] No action producers running → world unchanged (movement-only demos
+      unaffected).
+- [ ] `NavigationIntent` contract untouched; `zig build verify` passes.
+
+## Slice 46: Save/Load Persistence
+
+**Status: not started.** Completes the design intent from archive **Slice 10**,
+which introduced `DataSystem` as "the state-owned persistent gameplay data
+container **and save/load streaming boundary**" — the boundary exists, the
+serialization was never implemented. Largely independent; benefits from Slice 44
+(to persist custom bindings) but does not require it.
+
+Goal: serialize and restore a running simulation to/from disk so gameplay state
+survives a restart, reconstructing a **byte-identical** simulation — persisting
+only stable IDs and enum/scalar columns, never paths or live handles.
+
+### Current foundation (do not rebuild)
+
+- `DataSystem` holds ~15 default-initialized SoA stores (`movement_bodies`,
+  `facings`, `asset_refs`, `collision_*`, `ai_agents`, `steering_agents`,
+  `world_levels`, `factions`, `ai_perceptions`, `ai_memories`, `ai_affects`, …)
+  plus entity slots + generations.
+- `WorldSystem` owns tile / level storage; `player.zig` owns player state;
+  `core/rng.zig` owns deterministic per-entity RNG; `RuntimeAssets` /
+  `manifest.zig` own stable `SpriteAssetId` / `AudioAssetId`.
+- The atlas / tileset metadata loaders (`world_tileset_meta.zig`,
+  `sprite_atlas_meta.zig`) are the pattern for strict, versioned, load-time
+  validation.
+
+### Architecture notes
+
+- Serialize by **stable asset IDs, entity slot + generation, and enum/scalar
+  columns** — never file paths, live SDL/GPU/mixer handles, or prepared draw
+  records (CLAUDE.md hard rule). This is what makes `DataSystem` the correct
+  boundary rather than the renderer or asset layer.
+- Versioned container: header (magic + format version) and per-store
+  length-prefixed sections; strict validation on load (reject unknown version,
+  out-of-range IDs, length mismatch) with **no partial apply** on failure —
+  mirror the atlas-metadata loader discipline.
+- Round-trip must reproduce an identical simulation checksum: persist enough sim
+  state (step counter, RNG state, deferred-command-free quiescent snapshot point)
+  that `save → load` yields byte-for-byte parity.
+- Serialization is a **cold-path** operation (explicit save/load, not per-frame),
+  so normal allocator use is fine — this is not a hot-path allocation-free
+  constraint — but it must round-trip every persistent store and the world tile
+  grid, not a subset.
+
+### Checklist
+
+- [ ] Versioned save writer over `DataSystem` stores + `WorldSystem` tiles/levels
+      + player + sim step / RNG state; stable-ID mapping (no paths/handles).
+- [ ] Strict-validation reader; corrupt / unknown-version / out-of-range
+      rejection tests with no partial apply.
+- [ ] Round-trip determinism test: `save → load → checksum-equal` against a
+      hand-built fixture world.
+- [ ] Optional: persist Slice 44 custom input bindings if that slice has landed.
+- [ ] Docs: `docs/architecture.md` records the save/load boundary contract
+      (what is persisted, by which stable identifiers, and what is deliberately
+      excluded).
+
+### Acceptance checks
+
+- [ ] Save then load reproduces an identical simulation checksum on a fixture
+      world.
+- [ ] Malformed / version-mismatched saves reject loudly without partially
+      mutating live state.
+- [ ] Serialized form contains no handles or filesystem paths (payload-purity
+      inspection/test); `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1215,7 +1402,7 @@ keyboard — no rebind UI (defaults only, a later slice).
 21. Typed simulation event system and domain signals.
 22. Simulation pipeline and tier/scope scaffolding.
 23. Atlas-backed world rendering addition.
-23A. GPU tilemap render hardening (`expand2`; merge before depth expansion).
+23A. GPU tilemap render hardening (landed; merged to `main`).
 23B. Multi-depth dense-layer render scaling (~120 levels).
 24. Scoped simulation tiers and chunk policy.
 24B. Render collect hardening (movement dense-index collect + camera-only gates).
@@ -1228,16 +1415,20 @@ keyboard — no rebind UI (defaults only, a later slice).
 29. AI perception substrate.
 30. AI memory and scope-aware AI state policy.
 31. AI affect and emotion drives.
-32. AI behavior arbitration (**consume emotion drives**). **← next**
-33. Data-driven AI archetypes and debug introspection (incl. affect blocks).
+32. AI behavior arbitration (**consume emotion drives**) — landed.
+33. Data-driven AI archetypes and debug introspection (incl. affect blocks). **← next**
 39. Sensory stimulus ecosystem (richer hearing/investigate inputs).
 41. World interest / affordance markers (multi-source goals).
 40. Action and interaction intent substrate (non-locomotion emergence).
+45. First action-intent consumer domain controller / destructibles (after 40).
 42. Affect expansion (more feelings, coupling, appraisal gains, optional mood).
 35. AI and steering hot-loop SIMD restructure (after 32 reshapes AI loops).
 36. Single-pass dense-layer depth compositing.
 37. Dense render-window ceiling raise + shader/host sync hardening.
 38. Elevation above the surface.
+43. SDL3 gamepad/controller support (landed; independent input track).
+44. Input rebinding UI + extended gamepad controls (after 43).
+46. Save/load persistence (independent; benefits from 44 for binding persistence).
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents
