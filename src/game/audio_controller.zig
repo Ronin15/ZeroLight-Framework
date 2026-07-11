@@ -12,6 +12,7 @@
 const std = @import("std");
 const math = @import("../core/math.zig");
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
+const AudioCommand = @import("../app/audio.zig").AudioCommand;
 const LoopingSfxId = @import("../app/audio.zig").LoopingSfxId;
 const InputState = @import("../app/input.zig").InputState;
 const AudioAssetId = @import("../assets/manifest.zig").AudioAssetId;
@@ -64,16 +65,19 @@ pub const AudioController = struct {
             audio.setListener(.{ .x = body.position.x + 16, .y = body.position.y + 16 }) catch {};
             const player_moving = input.movementVector().x != 0 or input.movementVector().y != 0;
             if (player_moving and !self.jet_loop_active) {
+                // Gate the latch on enqueue success (mirrors the `music_started`
+                // latch above): if the command is dropped, the latch must not
+                // advance or the start edge would never re-trigger.
                 audio.startLoopingSfx(player_jet_loop_id, .{
                     .asset = jet_sfx,
                     .gain = 0.34,
                     .priority = 220,
                     .frequency_ratio = 1.0,
                     .position = .{ .x = body.position.x + 16, .y = body.position.y + 16 },
-                }) catch {};
+                }) catch return;
                 self.jet_loop_active = true;
             } else if (!player_moving and self.jet_loop_active) {
-                audio.stopLoopingSfx(player_jet_loop_id) catch {};
+                audio.stopLoopingSfx(player_jet_loop_id) catch return;
                 self.jet_loop_active = false;
             }
         }
@@ -288,6 +292,104 @@ fn contactFixture(a: EntityId, b: EntityId, penetration: f32) CollisionContact {
         .normal_y = 0,
         .penetration = penetration,
     };
+}
+
+fn countKind(commands: *const AudioCommandBuffer, comptime tag: std.meta.Tag(AudioCommand)) usize {
+    var n: usize = 0;
+    for (commands.items()) |command| {
+        if (std.meta.activeTag(command) == tag) n += 1;
+    }
+    return n;
+}
+
+test "queueAmbient edge-latches the jet loop across movement and pause/resume" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    const player = Player{ .entity = player_entity };
+
+    var moving = InputState{};
+    moving.setHeld(.move_right, true);
+    const idle = InputState{};
+
+    var commands = AudioCommandBuffer.init(allocator, 8);
+    defer commands.deinit();
+    var controller = AudioController.init();
+
+    // First moving step: music starts once, listener updates, jet loop starts and latches.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &moving, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .play_music));
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .set_listener));
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .start_looping_sfx));
+    try std.testing.expectEqual(@as(usize, 0), countKind(&commands, .stop_looping_sfx));
+    try std.testing.expect(controller.music_started);
+    try std.testing.expect(controller.jet_loop_active);
+
+    // Idle step: no new music, jet loop stops on the falling edge and clears the latch.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &idle, &data, player);
+    try std.testing.expectEqual(@as(usize, 0), countKind(&commands, .play_music));
+    try std.testing.expectEqual(@as(usize, 0), countKind(&commands, .start_looping_sfx));
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .stop_looping_sfx));
+    try std.testing.expect(!controller.jet_loop_active);
+
+    // Still idle: loop already inactive, so no redundant stop is emitted.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &idle, &data, player);
+    try std.testing.expectEqual(@as(usize, 0), countKind(&commands, .stop_looping_sfx));
+    try std.testing.expect(!controller.jet_loop_active);
+
+    // Moving again re-triggers the rising edge.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &moving, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .start_looping_sfx));
+    try std.testing.expect(controller.jet_loop_active);
+
+    // Pause with an active loop defers a stop: onPause has no command buffer.
+    controller.onPause();
+    try std.testing.expect(!controller.jet_loop_active);
+    try std.testing.expect(controller.jet_loop_stop_pending);
+
+    // First step after resume flushes the deferred stop before the movement edge runs.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &idle, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .stop_looping_sfx));
+    try std.testing.expect(!controller.jet_loop_stop_pending);
+    try std.testing.expect(!controller.jet_loop_active);
+}
+
+test "queueAmbient does not latch the jet loop when the start command is dropped" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    const player = Player{ .entity = player_entity };
+
+    var moving = InputState{};
+    moving.setHeld(.move_right, true);
+
+    // Cap the buffer so music + listener fill it and the jet-loop start is dropped.
+    var commands = AudioCommandBuffer.init(allocator, 2);
+    defer commands.deinit();
+    var controller = AudioController.init();
+
+    controller.queueAmbient(&commands, &moving, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .play_music));
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .set_listener));
+    try std.testing.expectEqual(@as(usize, 0), countKind(&commands, .start_looping_sfx));
+    // Fix A: the latch must not advance when the enqueue fails, or the start edge
+    // would never re-trigger once the buffer has room again.
+    try std.testing.expect(!controller.jet_loop_active);
+
+    // A later step with room re-attempts the start, proving the edge survived the drop.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &moving, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .start_looping_sfx));
+    try std.testing.expect(controller.jet_loop_active);
 }
 
 test "queueCollision plays a sound for a contact involving the player" {

@@ -148,13 +148,15 @@ pub const AssetCache = struct {
             if (self.entries.contains(insert.relative_path)) return error.DuplicateStartupTexture;
 
             const owned_path = try self.allocator.dupe(u8, insert.relative_path);
-            errdefer self.allocator.free(owned_path);
+            var put_done = false;
+            errdefer if (!put_done) self.allocator.free(owned_path);
 
             try self.entries.put(self.allocator, owned_path, .{
                 .path = owned_path,
                 .texture = texture,
                 .retain_count = 1,
             });
+            put_done = true;
             errdefer {
                 const removed = self.entries.fetchRemove(owned_path);
                 std.debug.assert(removed != null);

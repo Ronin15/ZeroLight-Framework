@@ -90,23 +90,23 @@ pub const SettingsMenuState = struct {
     pub fn handleEvent(self: *SettingsMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
         const action = inputFile.actionForPressEvent(event) orelse return false;
         switch (action) {
-            .menuUp => {
+            .menu_up => {
                 self.changeSelection(-1);
                 return true;
             },
-            .menuDown => {
+            .menu_down => {
                 self.changeSelection(1);
                 return true;
             },
-            .menuLeft => {
+            .menu_left => {
                 self.pending_adjust = -1;
                 return true;
             },
-            .menuRight => {
+            .menu_right => {
                 self.pending_adjust = 1;
                 return true;
             },
-            .resumeGame => {
+            .resume_game => {
                 try self.activate(transitions);
                 return true;
             },
@@ -302,20 +302,20 @@ test "settings handleEvent uses named input actions" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    var up = keyEventForAction(.menuUp);
+    var up = keyEventForAction(.menu_up);
     try std.testing.expect(try settings.handleEvent(&up, &transitions));
     try std.testing.expectEqual(@as(usize, 3), settings.selected);
 
-    var down = keyEventForAction(.menuDown);
+    var down = keyEventForAction(.menu_down);
     try std.testing.expect(try settings.handleEvent(&down, &transitions));
     try std.testing.expectEqual(@as(usize, 0), settings.selected);
 
-    var right = keyEventForAction(.menuRight);
+    var right = keyEventForAction(.menu_right);
     try std.testing.expect(try settings.handleEvent(&right, &transitions));
     try std.testing.expectEqual(@as(i32, 1), settings.pending_adjust);
 
     settings.selected = 3;
-    var confirm = keyEventForAction(.resumeGame);
+    var confirm = keyEventForAction(.resume_game);
     try std.testing.expect(try settings.handleEvent(&confirm, &transitions));
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }
@@ -328,20 +328,20 @@ test "settings handleEvent uses named gamepad input actions identically to keybo
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    var up = gamepadButtonEventForAction(.menuUp);
+    var up = gamepadButtonEventForAction(.menu_up);
     try std.testing.expect(try settings.handleEvent(&up, &transitions));
     try std.testing.expectEqual(@as(usize, 3), settings.selected);
 
-    var down = gamepadButtonEventForAction(.menuDown);
+    var down = gamepadButtonEventForAction(.menu_down);
     try std.testing.expect(try settings.handleEvent(&down, &transitions));
     try std.testing.expectEqual(@as(usize, 0), settings.selected);
 
-    var right = gamepadButtonEventForAction(.menuRight);
+    var right = gamepadButtonEventForAction(.menu_right);
     try std.testing.expect(try settings.handleEvent(&right, &transitions));
     try std.testing.expectEqual(@as(i32, 1), settings.pending_adjust);
 
     settings.selected = 3;
-    var confirm = gamepadButtonEventForAction(.resumeGame);
+    var confirm = gamepadButtonEventForAction(.resume_game);
     try std.testing.expect(try settings.handleEvent(&confirm, &transitions));
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }

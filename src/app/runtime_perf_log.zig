@@ -12,12 +12,6 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 const log = logging.perf;
 
 pub const enabled = builtin.mode == .Debug and logging.enabled(.debug);
-// Comptime gate for hot/frame-adjacent diagnostic logging (e.g. a recovered-degradation
-// warn on an event-driven simulation reaction). Compiled out in release (no hot-path
-// logging) and in test builds, where stderr output during a `--listen` test would corrupt
-// the test-runner protocol. A gated warn is therefore a zero-sized no-op there while
-// staying live in a Debug dev run.
-pub const hot_log_enabled = builtin.mode == .Debug and !builtin.is_test and logging.enabled(.warn);
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FrameResult = enum {

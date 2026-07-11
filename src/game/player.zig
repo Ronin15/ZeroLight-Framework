@@ -125,8 +125,8 @@ test "player movement clamps to state bounds" {
         .speed = Player.speed,
     });
     var input = InputState{};
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
     var movement_slice = data.movementBodySlice();
@@ -144,7 +144,7 @@ test "player facing updates from movement and remains while idle" {
     const player = try Player.spawn(&data);
 
     var input = InputState{};
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
     try std.testing.expectEqual(Facing.up, data.facingConst(player.entity).?.direction);
@@ -169,8 +169,8 @@ test "player horizontal facing wins for diagonal movement" {
     const player = try Player.spawn(&data);
 
     var input = InputState{};
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
 

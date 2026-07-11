@@ -24,6 +24,7 @@ const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
 const WorldSystem = @import("world_system.zig").WorldSystem;
 const TileId = @import("world_system.zig").TileId;
+const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
 const CellCoord = @import("world_system.zig").CellCoord;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
@@ -37,8 +38,13 @@ const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 /// loading. `ramp_tile` climbs between planes; `tunnel_tile` is the walkable floor
 /// left when mining forward through solid underground dirt.
 pub const DigConfig = struct {
-    ramp_tile: TileId = 0,
-    tunnel_tile: TileId = 0,
+    // Default to the invalid sentinel, not tile 0: TileId 0 is a real,
+    // movement-blocking tile, so a 0 default would silently carve it. Leaving
+    // these unresolved trips the carve-path guard in `DigController.process`
+    // rather than digging a wrong tile. `fromMeta`/`fromRuntimeAssets` resolve
+    // them to valid ids.
+    ramp_tile: TileId = invalid_tile_id,
+    tunnel_tile: TileId = invalid_tile_id,
 
     /// Resolves the dig tiles by name from the world tileset metadata. `ramp_tile`
     /// climbs between planes; `tunnel_tile` is the walkable floor mined through
@@ -75,9 +81,9 @@ pub const DigController = struct {
     /// edge so one press digs one cell. When several fire the same frame, hole
     /// (forward) wins, then down, then ramp. `process` consumes the intent.
     pub fn captureIntent(self: *DigController, input: *const InputState, frame: *SimulationFrame) void {
-        const hole_held = input.isHeld(.digHole);
-        const down_held = input.isHeld(.digDown);
-        const ramp_held = input.isHeld(.digRamp);
+        const hole_held = input.isHeld(.dig_hole);
+        const down_held = input.isHeld(.dig_down);
+        const ramp_held = input.isHeld(.dig_ramp);
         if (hole_held and !self.hole_held_last) {
             frame.dig_intent = .hole;
         } else if (down_held and !self.down_held_last) {
@@ -103,6 +109,14 @@ pub const DigController = struct {
     ) !void {
         const intent = frame.dig_intent;
         if (intent == .none) return;
+
+        // Fail loudly on an unresolved config rather than silently carving the
+        // invalid sentinel into the world: reaching the carve path means the
+        // controller's dig tiles must have been resolved to valid ids (via
+        // `DigConfig.fromMeta`/`fromRuntimeAssets`). The sentinel defaults exist so
+        // a controller that is never asked to dig need not resolve them.
+        std.debug.assert(self.ramp_tile != invalid_tile_id);
+        std.debug.assert(self.tunnel_tile != invalid_tile_id);
 
         const body = data.movementBodyConst(player.entity) orelse return;
         const facing = data.facingConst(player.entity) orelse return;
@@ -276,7 +290,6 @@ fn facingOffset(direction: Facing) math.Vec2 {
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
-const invalid_tile_id = @import("world_system.zig").invalid_tile_id;
 
 fn testDigController(meta: anytype) !DigController {
     return DigController.init(.{
@@ -545,7 +558,7 @@ test "dig controller captures intent once on the rising edge of a held key" {
     defer frame.deinit();
 
     var input = InputState{};
-    input.setHeld(.digHole, true);
+    input.setHeld(.dig_hole, true);
 
     frame.beginStep();
     dig.captureIntent(&input, &frame);
@@ -557,12 +570,12 @@ test "dig controller captures intent once on the rising edge of a held key" {
     try std.testing.expectEqual(DigIntent.none, frame.dig_intent);
 
     // Release, then press again: the rising edge fires once more.
-    input.setHeld(.digHole, false);
+    input.setHeld(.dig_hole, false);
     frame.beginStep();
     dig.captureIntent(&input, &frame);
     try std.testing.expectEqual(DigIntent.none, frame.dig_intent);
 
-    input.setHeld(.digHole, true);
+    input.setHeld(.dig_hole, true);
     frame.beginStep();
     dig.captureIntent(&input, &frame);
     try std.testing.expectEqual(DigIntent.hole, frame.dig_intent);

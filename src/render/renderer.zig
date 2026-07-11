@@ -275,9 +275,7 @@ pub const Renderer = struct {
 
         try gpu_device.configureSwapchain(device, window, app_config);
 
-        const sampler = gpu_device.createSampler(device) catch |err| {
-            return err;
-        };
+        const sampler = try gpu_device.createSampler(device);
         errdefer c.SDL_ReleaseGPUSampler(device, sampler);
 
         const vertex_streams = try createVertexStreams(device, initial_batch_vertices);

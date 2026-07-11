@@ -175,7 +175,7 @@ test "pause controller enter and exit are idempotent" {
     var pause_count: u32 = 0;
     var resume_count: u32 = 0;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
     var time_loop = TimeLoop.init(0);
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns * 2;
     var states = StateStack.init(std.testing.allocator);
@@ -190,7 +190,7 @@ test "pause controller enter and exit are idempotent" {
     try std.testing.expect(!pause.isPolicyPaused());
     try std.testing.expectEqual(@as(usize, 2), states.len());
     try std.testing.expectEqual(@as(u32, 1), pause_count);
-    try std.testing.expect(!input.isHeld(.moveRight));
+    try std.testing.expect(!input.isHeld(.move_right));
     try std.testing.expectEqual(@as(u64, 10), time_loop.last_time_ns);
     try std.testing.expectEqual(@as(u64, 0), time_loop.accumulator_ns);
 
@@ -526,7 +526,7 @@ test "pause enter does not mutate gameplay when modal allocation fails" {
 
     var pause_count: u32 = 0;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
     var time_loop = TimeLoop.init(42);
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns;
     var states = StateStack.init(std.testing.allocator);
@@ -543,7 +543,7 @@ test "pause enter does not mutate gameplay when modal allocation fails" {
     try std.testing.expect(!pause.isPaused());
     try std.testing.expectEqual(@as(usize, 1), states.len());
     try std.testing.expectEqual(@as(u32, 0), pause_count);
-    try std.testing.expect(input.isHeld(.moveRight));
+    try std.testing.expect(input.isHeld(.move_right));
     try std.testing.expectEqual(@as(u64, 42), time_loop.last_time_ns);
     try std.testing.expectEqual(TimeLoop.fixed_delta_ns, time_loop.accumulator_ns);
 }

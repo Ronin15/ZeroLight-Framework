@@ -64,6 +64,11 @@ pub const GamepadManager = struct {
     }
 
     fn openDevice(self: *GamepadManager, id: c.SDL_JoystickID) bool {
+        // Handle-owning setter: a prior open handle must have been closed first,
+        // or assigning `self.active` here would silently leak it. All callers
+        // adopt only when nothing is active (first-connected-wins) or after
+        // `closeActive`/`deinit` cleared it.
+        std.debug.assert(self.active == null);
         const handle = c.SDL_OpenGamepad(id) orelse return false;
         self.active = .{ .id = id, .handle = handle };
         if (logging.enabled(.debug)) {

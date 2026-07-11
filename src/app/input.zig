@@ -7,21 +7,21 @@ const math = @import("../core/math.zig");
 const c = @import("../platform/sdl.zig").c;
 
 pub const Action = enum(usize) {
-    moveLeft,
-    moveRight,
-    moveUp,
-    moveDown,
+    move_left,
+    move_right,
+    move_up,
+    move_down,
     pause,
-    resumeGame,
+    resume_game,
     quit,
-    toggleDebugOverlay,
-    menuUp,
-    menuDown,
-    menuLeft,
-    menuRight,
-    digHole,
-    digRamp,
-    digDown,
+    toggle_debug_overlay,
+    menu_up,
+    menu_down,
+    menu_left,
+    menu_right,
+    dig_hole,
+    dig_ramp,
+    dig_down,
 };
 
 const action_count = @typeInfo(Action).@"enum".fields.len;
@@ -32,22 +32,22 @@ pub const KeyBinding = struct {
 };
 
 pub const default_key_bindings = [_]KeyBinding{
-    .{ .key = c.SDLK_A, .action = .moveLeft },
-    .{ .key = c.SDLK_D, .action = .moveRight },
-    .{ .key = c.SDLK_W, .action = .moveUp },
-    .{ .key = c.SDLK_S, .action = .moveDown },
+    .{ .key = c.SDLK_A, .action = .move_left },
+    .{ .key = c.SDLK_D, .action = .move_right },
+    .{ .key = c.SDLK_W, .action = .move_up },
+    .{ .key = c.SDLK_S, .action = .move_down },
     .{ .key = c.SDLK_P, .action = .pause },
-    .{ .key = c.SDLK_RETURN, .action = .resumeGame },
-    .{ .key = c.SDLK_SPACE, .action = .resumeGame },
+    .{ .key = c.SDLK_RETURN, .action = .resume_game },
+    .{ .key = c.SDLK_SPACE, .action = .resume_game },
     .{ .key = c.SDLK_ESCAPE, .action = .quit },
-    .{ .key = c.SDLK_F2, .action = .toggleDebugOverlay },
-    .{ .key = c.SDLK_UP, .action = .menuUp },
-    .{ .key = c.SDLK_DOWN, .action = .menuDown },
-    .{ .key = c.SDLK_LEFT, .action = .menuLeft },
-    .{ .key = c.SDLK_RIGHT, .action = .menuRight },
-    .{ .key = c.SDLK_E, .action = .digHole },
-    .{ .key = c.SDLK_Q, .action = .digRamp },
-    .{ .key = c.SDLK_F, .action = .digDown },
+    .{ .key = c.SDLK_F2, .action = .toggle_debug_overlay },
+    .{ .key = c.SDLK_UP, .action = .menu_up },
+    .{ .key = c.SDLK_DOWN, .action = .menu_down },
+    .{ .key = c.SDLK_LEFT, .action = .menu_left },
+    .{ .key = c.SDLK_RIGHT, .action = .menu_right },
+    .{ .key = c.SDLK_E, .action = .dig_hole },
+    .{ .key = c.SDLK_Q, .action = .dig_ramp },
+    .{ .key = c.SDLK_F, .action = .dig_down },
 };
 
 pub const GamepadButtonBinding = struct {
@@ -56,17 +56,17 @@ pub const GamepadButtonBinding = struct {
 };
 
 pub const default_gamepad_bindings = [_]GamepadButtonBinding{
-    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_UP, .action = .menuUp },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_DOWN, .action = .menuDown },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_LEFT, .action = .menuLeft },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT, .action = .menuRight },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_SOUTH, .action = .resumeGame },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_UP, .action = .menu_up },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_DOWN, .action = .menu_down },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_LEFT, .action = .menu_left },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT, .action = .menu_right },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_SOUTH, .action = .resume_game },
     .{ .button = c.SDL_GAMEPAD_BUTTON_EAST, .action = .quit },
     .{ .button = c.SDL_GAMEPAD_BUTTON_START, .action = .pause },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_WEST, .action = .digHole },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_NORTH, .action = .digRamp },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, .action = .digDown },
-    .{ .button = c.SDL_GAMEPAD_BUTTON_BACK, .action = .toggleDebugOverlay },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_WEST, .action = .dig_hole },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_NORTH, .action = .dig_ramp },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, .action = .dig_down },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_BACK, .action = .toggle_debug_overlay },
 };
 
 /// Radial deadzone applied to the raw left-stick axes before they contribute
@@ -92,9 +92,9 @@ pub const InputState = struct {
     /// of unplug (it would otherwise never see a button-up event).
     pub fn releaseGamepadInput(self: *InputState) void {
         self.releaseMovement();
-        self.held_actions.set(.digHole, false);
-        self.held_actions.set(.digRamp, false);
-        self.held_actions.set(.digDown, false);
+        self.held_actions.set(.dig_hole, false);
+        self.held_actions.set(.dig_ramp, false);
+        self.held_actions.set(.dig_down, false);
     }
 
     pub fn handleEvent(self: *InputState, event: *const c.SDL_Event) void {
@@ -126,10 +126,10 @@ pub const InputState = struct {
 
     pub fn movementVector(self: *const InputState) math.Vec2 {
         var direction = math.Vec2{};
-        if (self.isHeld(.moveLeft)) direction.x -= 1;
-        if (self.isHeld(.moveRight)) direction.x += 1;
-        if (self.isHeld(.moveUp)) direction.y -= 1;
-        if (self.isHeld(.moveDown)) direction.y += 1;
+        if (self.isHeld(.move_left)) direction.x -= 1;
+        if (self.isHeld(.move_right)) direction.x += 1;
+        if (self.isHeld(.move_up)) direction.y -= 1;
+        if (self.isHeld(.move_down)) direction.y += 1;
         const stick = deadzonedStick(self.gamepad_stick_x_raw, self.gamepad_stick_y_raw);
         return .{
             .x = math.clamp(direction.x + stick.x, -1, 1),
@@ -169,22 +169,22 @@ pub const FrameCommands = struct {
 };
 
 const movement_actions = [_]Action{
-    .moveLeft,
-    .moveRight,
-    .moveUp,
-    .moveDown,
+    .move_left,
+    .move_right,
+    .move_up,
+    .move_down,
 };
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp, .digDown => true,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => true,
         else => false,
     };
 }
 
 fn isCommandAction(action: Action) bool {
     return switch (action) {
-        .pause, .resumeGame, .quit, .toggleDebugOverlay, .menuUp, .menuDown, .menuLeft, .menuRight => true,
+        .pause, .resume_game, .quit, .toggle_debug_overlay, .menu_up, .menu_down, .menu_left, .menu_right => true,
         else => false,
     };
 }
@@ -248,34 +248,34 @@ const ActionFlags = struct {
 };
 
 test "default key bindings map keyboard keys to actions" {
-    try std.testing.expectEqual(Action.moveLeft, actionForKey(c.SDLK_A).?);
-    try std.testing.expectEqual(Action.moveRight, actionForKey(c.SDLK_D).?);
-    try std.testing.expectEqual(Action.moveUp, actionForKey(c.SDLK_W).?);
-    try std.testing.expectEqual(Action.moveDown, actionForKey(c.SDLK_S).?);
+    try std.testing.expectEqual(Action.move_left, actionForKey(c.SDLK_A).?);
+    try std.testing.expectEqual(Action.move_right, actionForKey(c.SDLK_D).?);
+    try std.testing.expectEqual(Action.move_up, actionForKey(c.SDLK_W).?);
+    try std.testing.expectEqual(Action.move_down, actionForKey(c.SDLK_S).?);
     try std.testing.expectEqual(Action.pause, actionForKey(c.SDLK_P).?);
-    try std.testing.expectEqual(Action.resumeGame, actionForKey(c.SDLK_RETURN).?);
-    try std.testing.expectEqual(Action.resumeGame, actionForKey(c.SDLK_SPACE).?);
+    try std.testing.expectEqual(Action.resume_game, actionForKey(c.SDLK_RETURN).?);
+    try std.testing.expectEqual(Action.resume_game, actionForKey(c.SDLK_SPACE).?);
     try std.testing.expectEqual(Action.quit, actionForKey(c.SDLK_ESCAPE).?);
-    try std.testing.expectEqual(Action.toggleDebugOverlay, actionForKey(c.SDLK_F2).?);
-    try std.testing.expectEqual(Action.menuUp, actionForKey(c.SDLK_UP).?);
-    try std.testing.expectEqual(Action.menuDown, actionForKey(c.SDLK_DOWN).?);
-    try std.testing.expectEqual(Action.menuLeft, actionForKey(c.SDLK_LEFT).?);
-    try std.testing.expectEqual(Action.menuRight, actionForKey(c.SDLK_RIGHT).?);
+    try std.testing.expectEqual(Action.toggle_debug_overlay, actionForKey(c.SDLK_F2).?);
+    try std.testing.expectEqual(Action.menu_up, actionForKey(c.SDLK_UP).?);
+    try std.testing.expectEqual(Action.menu_down, actionForKey(c.SDLK_DOWN).?);
+    try std.testing.expectEqual(Action.menu_left, actionForKey(c.SDLK_LEFT).?);
+    try std.testing.expectEqual(Action.menu_right, actionForKey(c.SDLK_RIGHT).?);
 }
 
 test "input key mapping tracks held gameplay actions" {
     var input = InputState{};
 
-    input.setHeld(.moveLeft, true);
-    input.setHeld(.moveUp, true);
-    try std.testing.expect(input.isHeld(.moveLeft));
-    try std.testing.expect(input.isHeld(.moveUp));
-    try std.testing.expect(!input.isHeld(.moveRight));
-    try std.testing.expect(!input.isHeld(.moveDown));
+    input.setHeld(.move_left, true);
+    input.setHeld(.move_up, true);
+    try std.testing.expect(input.isHeld(.move_left));
+    try std.testing.expect(input.isHeld(.move_up));
+    try std.testing.expect(!input.isHeld(.move_right));
+    try std.testing.expect(!input.isHeld(.move_down));
 
-    input.setHeld(.moveLeft, false);
-    try std.testing.expect(!input.isHeld(.moveLeft));
-    try std.testing.expect(input.isHeld(.moveUp));
+    input.setHeld(.move_left, false);
+    try std.testing.expect(!input.isHeld(.move_left));
+    try std.testing.expect(input.isHeld(.move_up));
 }
 
 test "input ignores command actions for held gameplay state" {
@@ -290,8 +290,8 @@ test "input ignores command actions for held gameplay state" {
 test "movement vector resolves held movement actions" {
     var input = InputState{};
 
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
     const movement = input.movementVector();
 
     try std.testing.expectEqual(@as(f32, 1), movement.x);
@@ -301,20 +301,20 @@ test "movement vector resolves held movement actions" {
 test "frame commands latch non-repeated key down events" {
     var commands = FrameCommands{};
 
-    commands.pressed_actions.set(.toggleDebugOverlay, true);
+    commands.pressed_actions.set(.toggle_debug_overlay, true);
     commands.pressed_actions.set(.pause, true);
     commands.pressed_actions.set(.quit, true);
-    commands.pressed_actions.set(.resumeGame, true);
-    try std.testing.expect(commands.wasPressed(.toggleDebugOverlay));
+    commands.pressed_actions.set(.resume_game, true);
+    try std.testing.expect(commands.wasPressed(.toggle_debug_overlay));
     try std.testing.expect(commands.wasPressed(.pause));
     try std.testing.expect(commands.wasPressed(.quit));
-    try std.testing.expect(commands.wasPressed(.resumeGame));
+    try std.testing.expect(commands.wasPressed(.resume_game));
 
     commands.beginFrame();
-    try std.testing.expect(!commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(!commands.wasPressed(.toggle_debug_overlay));
     try std.testing.expect(!commands.wasPressed(.pause));
     try std.testing.expect(!commands.wasPressed(.quit));
-    try std.testing.expect(!commands.wasPressed(.resumeGame));
+    try std.testing.expect(!commands.wasPressed(.resume_game));
 }
 
 test "frame commands survive key up in the same frame" {
@@ -352,7 +352,7 @@ test "frame commands survive key up in the same frame" {
     commands.handleEvent(&up_event);
     input.handleEvent(&up_event);
 
-    try std.testing.expect(commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(commands.wasPressed(.toggle_debug_overlay));
 }
 
 test "frame commands ignore repeated command keys" {
@@ -373,57 +373,57 @@ test "frame commands ignore repeated command keys" {
 
     commands.handleEvent(&event);
 
-    try std.testing.expect(!commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(!commands.wasPressed(.toggle_debug_overlay));
 }
 
 test "input can release held movement when gameplay is paused" {
     var input = InputState{};
-    input.setHeld(.moveLeft, true);
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
-    input.setHeld(.moveDown, true);
+    input.setHeld(.move_left, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
+    input.setHeld(.move_down, true);
     input.handleGamepadAxis(12000, -8000);
 
     input.releaseMovement();
 
-    try std.testing.expect(!input.isHeld(.moveLeft));
-    try std.testing.expect(!input.isHeld(.moveRight));
-    try std.testing.expect(!input.isHeld(.moveUp));
-    try std.testing.expect(!input.isHeld(.moveDown));
+    try std.testing.expect(!input.isHeld(.move_left));
+    try std.testing.expect(!input.isHeld(.move_right));
+    try std.testing.expect(!input.isHeld(.move_up));
+    try std.testing.expect(!input.isHeld(.move_down));
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
 }
 
 test "releaseGamepadInput clears movement, dig, and stick state together" {
     var input = InputState{};
-    input.setHeld(.moveRight, true);
-    input.setHeld(.digHole, true);
-    input.setHeld(.digRamp, true);
-    input.setHeld(.digDown, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.dig_hole, true);
+    input.setHeld(.dig_ramp, true);
+    input.setHeld(.dig_down, true);
     input.handleGamepadAxis(20000, 20000);
 
     input.releaseGamepadInput();
 
-    try std.testing.expect(!input.isHeld(.moveRight));
-    try std.testing.expect(!input.isHeld(.digHole));
-    try std.testing.expect(!input.isHeld(.digRamp));
-    try std.testing.expect(!input.isHeld(.digDown));
+    try std.testing.expect(!input.isHeld(.move_right));
+    try std.testing.expect(!input.isHeld(.dig_hole));
+    try std.testing.expect(!input.isHeld(.dig_ramp));
+    try std.testing.expect(!input.isHeld(.dig_down));
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
 }
 
 test "actionForGamepadButton resolves every default binding and rejects unmapped buttons" {
-    try std.testing.expectEqual(Action.menuUp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_UP).?);
-    try std.testing.expectEqual(Action.menuDown, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_DOWN).?);
-    try std.testing.expectEqual(Action.menuLeft, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_LEFT).?);
-    try std.testing.expectEqual(Action.menuRight, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT).?);
-    try std.testing.expectEqual(Action.resumeGame, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_SOUTH).?);
+    try std.testing.expectEqual(Action.menu_up, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_UP).?);
+    try std.testing.expectEqual(Action.menu_down, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_DOWN).?);
+    try std.testing.expectEqual(Action.menu_left, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_LEFT).?);
+    try std.testing.expectEqual(Action.menu_right, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_DPAD_RIGHT).?);
+    try std.testing.expectEqual(Action.resume_game, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_SOUTH).?);
     try std.testing.expectEqual(Action.quit, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_EAST).?);
     try std.testing.expectEqual(Action.pause, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_START).?);
-    try std.testing.expectEqual(Action.digHole, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_WEST).?);
-    try std.testing.expectEqual(Action.digRamp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_NORTH).?);
-    try std.testing.expectEqual(Action.digDown, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER).?);
-    try std.testing.expectEqual(Action.toggleDebugOverlay, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_BACK).?);
+    try std.testing.expectEqual(Action.dig_hole, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_WEST).?);
+    try std.testing.expectEqual(Action.dig_ramp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_NORTH).?);
+    try std.testing.expectEqual(Action.dig_down, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER).?);
+    try std.testing.expectEqual(Action.toggle_debug_overlay, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_BACK).?);
     try std.testing.expectEqual(@as(?Action, null), actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_GUIDE));
 }
 
@@ -454,7 +454,7 @@ test "actionForPressEvent resolves keyboard and gamepad press shapes" {
         .down = true,
         .repeat = false,
     } };
-    try std.testing.expectEqual(Action.moveLeft, actionForPressEvent(&key_down).?);
+    try std.testing.expectEqual(Action.move_left, actionForPressEvent(&key_down).?);
 
     var key_repeat = key_down;
     key_repeat.key.repeat = true;
@@ -465,7 +465,7 @@ test "actionForPressEvent resolves keyboard and gamepad press shapes" {
     try std.testing.expectEqual(@as(?Action, null), actionForPressEvent(&key_up));
 
     var gamepad_down = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_GAMEPAD_BUTTON_SOUTH, true);
-    try std.testing.expectEqual(Action.resumeGame, actionForPressEvent(&gamepad_down).?);
+    try std.testing.expectEqual(Action.resume_game, actionForPressEvent(&gamepad_down).?);
 
     var gamepad_unmapped = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_GAMEPAD_BUTTON_GUIDE, true);
     try std.testing.expectEqual(@as(?Action, null), actionForPressEvent(&gamepad_unmapped));
@@ -490,20 +490,20 @@ test "deadzonedStick zeroes small deflection and normalizes full deflection" {
 
 test "movementVector combines keyboard and gamepad stick input" {
     var keyboard_only = InputState{};
-    keyboard_only.setHeld(.moveRight, true);
-    keyboard_only.setHeld(.moveUp, true);
+    keyboard_only.setHeld(.move_right, true);
+    keyboard_only.setHeld(.move_up, true);
     const keyboard_movement = keyboard_only.movementVector();
     try std.testing.expectEqual(@as(f32, 1), keyboard_movement.x);
     try std.testing.expectEqual(@as(f32, -1), keyboard_movement.y);
 
     var same_axis = InputState{};
-    same_axis.setHeld(.moveRight, true);
+    same_axis.setHeld(.move_right, true);
     same_axis.handleGamepadAxis(32767, null);
     const same_axis_movement = same_axis.movementVector();
     try std.testing.expectEqual(@as(f32, 1), same_axis_movement.x);
 
     var independent_axes = InputState{};
-    independent_axes.setHeld(.moveRight, true);
+    independent_axes.setHeld(.move_right, true);
     independent_axes.handleGamepadAxis(null, 32767);
     const independent_movement = independent_axes.movementVector();
     try std.testing.expectEqual(@as(f32, 1), independent_movement.x);

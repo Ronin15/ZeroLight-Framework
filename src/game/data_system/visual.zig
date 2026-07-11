@@ -272,9 +272,9 @@ pub const AssetReferenceStore = struct {
 
     pub fn append(self: *AssetReferenceStore, allocator: std.mem.Allocator, entity: EntityId, asset_ref: AssetReference) !u32 {
         if (self.rows.len >= std.math.maxInt(u32)) return error.TooManyAssetReferenceRows;
-        try self.ensureCapacity(allocator, self.rows.len + 1);
+        try self.ensureCapacityForOne(allocator);
         const index: u32 = @intCast(self.rows.len);
-        try self.rows.append(allocator, .{
+        self.rows.appendAssumeCapacity(.{
             .entity = entity,
             .sprite = asset_ref.sprite,
             .atlas_entry_id = asset_ref.atlas_entry_id,
@@ -322,7 +322,32 @@ pub const AssetReferenceStore = struct {
         self.* = .{};
     }
 
+    fn ensureCapacityForOne(self: *AssetReferenceStore, allocator: std.mem.Allocator) !void {
+        try self.ensureCapacity(allocator, self.rows.len + 1);
+    }
+
     pub fn ensureCapacity(self: *AssetReferenceStore, allocator: std.mem.Allocator, capacity: usize) !void {
         try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
+
+test "AssetReferenceStore append is allocation-free after ensureCapacity reserves" {
+    var store: AssetReferenceStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    // fail_index 0 turns any allocation attempt into an immediate error, so a
+    // succeeding append proves the warmed reserve+appendAssumeCapacity path
+    // allocates zero times (ReleaseFast strips the assumeCapacity assert).
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u16 = 0;
+    while (i < reserved) : (i += 1) {
+        _ = try store.append(failing_alloc, .invalid, .{ .sprite = .demo_tile, .atlas_entry_id = i });
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}

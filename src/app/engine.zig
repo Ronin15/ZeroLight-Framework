@@ -271,7 +271,7 @@ pub const Engine = struct {
         }
         try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.nowNs());
         if (!frame_policy.should_pause_gameplay and self.pause.isPaused() and
-            (self.commands.wasPressed(Action.resumeGame) or self.commands.wasPressed(Action.pause)))
+            (self.commands.wasPressed(Action.resume_game) or self.commands.wasPressed(Action.pause)))
         {
             log.debug("resuming gameplay by input command", .{});
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());

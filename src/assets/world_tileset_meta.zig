@@ -200,17 +200,6 @@ fn jsonTileToEntry(tile: JsonTileEntry) TileEntry {
     };
 }
 
-pub fn sourceRectForIndex(index: u16, columns: u32, tile_size: f32) manifest.SourceRect {
-    const col = @as(f32, @floatFromInt(index % columns));
-    const row = @as(f32, @floatFromInt(index / columns));
-    return .{
-        .x = col * tile_size,
-        .y = row * tile_size,
-        .w = tile_size,
-        .h = tile_size,
-    };
-}
-
 pub fn load(
     allocator: std.mem.Allocator,
     asset_store: @import("assets.zig").AssetStore,

@@ -60,7 +60,12 @@ strips the debug assert backing `assumeCapacity`'s capacity check and disables
 bounds/overflow safety checks; an unproven reserve is a silent
 memory-corruption risk in the shipped binary, not a missed optimization. Add
 the proof test in the same change that adds the `assumeCapacity` call — do not
-defer it.
+defer it. When the reserve and its `assumeCapacity` commit live in separate
+functions or public entry points (not one guarded helper), the proof must
+exercise the reserved-then-push **success** branch — reserve, then arm the
+allocator to fail on the next allocation, and assert the push completes — not
+just the reserve-fails cleanup branch, since split sizing can silently desync
+from the push count across a future edit.
 
 The same ReleaseFast safety-strip applies to `unreachable`, `catch unreachable`,
 and `orelse unreachable` (including `.?`, which is `orelse unreachable`): in the
@@ -128,7 +133,15 @@ if an earlier step fails, and double-frees a field whose own narrow
 `defer`s cleanup after allocating a container (e.g. `allocator.create(T)`)
 must register that full cleanup `defer` only after the fallible `init` call
 succeeds, with a narrower `errdefer` covering just the failure window before
-that.
+that. A function that takes ownership of an already-constructed by-value
+resource registers its `errdefer <res>.deinit()` as the **first** statement,
+before any other fallible step — the caller built it inline and holds no cleanup
+handle, so an earlier failure leaks it. Once a step transfers ownership of an
+allocation onward (a map `put`, list `append`, or lease-slot commit), disarm the
+earlier free-`errdefer` with a per-iteration bool set right after the transfer,
+so exactly one path frees it. A handle-owning setter that overwrites an owned
+slot asserts the slot empty (or closes the prior handle first) rather than
+relying on call-site ordering to avoid a leak.
 
 Avoid per-frame, per-event, per-draw, or per-processor-loop string lookup,
 hash-map dispatch, broad dynamic dispatch, callback chains, repeated descriptor

@@ -15,6 +15,8 @@ reviewer diligence:
 4. No scalar NaN self-compare (`x != x` / `x == x`); use std.math.isNan
    (src/core/simd.zig exempt — element-wise vector NaN masks are legitimate).
 5. No free-function EntityId equality helper; EntityId.eql owns the primitive.
+6. No no-op `catch |e| return e` (or `{ return e; }`); it is just `try`.
+7. No camelCase enum tags (Zig enum members are snake_case).
 
 Run via `zig build idiom-lint` (also part of `zig build verify`).
 """
@@ -48,6 +50,42 @@ NAN_SELF_COMPARE = re.compile(
     r"(?<![\w.\]\)])([A-Za-z_][\w.]*)\s*(?:==|!=)\s*([A-Za-z_][\w.]*)(?![\w.\[(]|\s*[-+*/%<>])"
 )
 NAN_SELF_COMPARE_EXEMPT = {"src/core/simd.zig"}
+
+# A `catch` whose whole body just re-returns the same error binding — `... catch
+# |e| return e;` or `... catch |e| { return e; }`. That is exactly `try` with no
+# cleanup, logging, or translation, and it reads as if it intends handling it does
+# not perform. The open-brace form's `return e;` on the next line is matched by a
+# tiny two-line lookahead in lint_file. Any other statement in the block (a log
+# call, a defer, a translated/other return) means it is doing real work — not a
+# match.
+NOOP_CATCH_SAMELINE = re.compile(r"catch\s*\|\s*(\w+)\s*\|\s*\{?\s*return\s+(\w+)\s*;")
+NOOP_CATCH_OPEN = re.compile(r"catch\s*\|\s*(\w+)\s*\|\s*\{\s*$")
+RETURN_ONLY = re.compile(r"^\s*return\s+(\w+)\s*;\s*$")
+
+# camelCase enum tags. Zig names enum members snake_case (sibling enums do), but
+# CAMEL_FIELD_OR_PARAM can't see a bare tag (no `:` type annotation). We track
+# `enum {` / `enum(T) {` bodies by brace depth and flag a camelCase bare tag at
+# the body's own depth. Deliberately NOT tracked: `union(enum)` bodies (their
+# `enum` sits inside `(...)`, and members carry payload types) and `error {}`
+# sets (no `enum` keyword) — both avoid false positives. A method nested in an
+# enum is skipped (its body sits below the tag depth). Single-line enum bodies
+# are a tolerated false-negative. Braces inside string/char literals are stripped
+# before counting so format strings like "{s}" cannot skew the depth.
+ENUM_BODY_OPEN = re.compile(r"\benum\b\s*(?:\([^)]*\))?\s*\{")
+ENUM_TAG_CAMEL = re.compile(r"^\s*([a-z][a-z0-9]*[A-Z][A-Za-z0-9]*)\s*(?:,|=[^=]|$)")
+_STR_LIT = re.compile(r'"(?:\\.|[^"\\])*"')
+_CHR_LIT = re.compile(r"'(?:\\.|[^'\\])*'")
+
+
+def strip_literals_for_braces(code: str) -> str:
+    """Blank string/char-literal (and Zig multiline-string) contents so braces
+    inside them do not skew brace-depth tracking."""
+    code = _STR_LIT.sub('""', code)
+    code = _CHR_LIT.sub("''", code)
+    stripped = code.lstrip()
+    if stripped.startswith("\\\\"):  # Zig multiline-string line: remainder is text
+        return code[: len(code) - len(stripped)]
+    return code
 
 # A free function performing EntityId equality (`fn *Equal(... : EntityId ...)`).
 # EntityId owns `eql` (src/game/data_system/types.zig); a standalone helper is a
@@ -102,7 +140,10 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
     rel = str(path.relative_to(REPO_ROOT))
     nan_exempt = rel in NAN_SELF_COMPARE_EXEMPT
     in_test = False
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    brace_depth = 0
+    enum_body_depths: list[int] = []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for lineno, raw in enumerate(lines, start=1):
         code = strip_line_comment(raw)
 
         # Track top-level `test` blocks. `zig fmt` closes top-level decls with a
@@ -148,6 +189,42 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                     raw.strip(),
                 )
             )
+
+        noop = NOOP_CATCH_SAMELINE.search(code)
+        noop_hit = bool(noop) and noop.group(1) == noop.group(2)
+        if not noop_hit:
+            open_catch = NOOP_CATCH_OPEN.search(code)
+            if open_catch and lineno < len(lines):
+                nxt = RETURN_ONLY.match(strip_line_comment(lines[lineno]))
+                noop_hit = bool(nxt) and nxt.group(1) == open_catch.group(1)
+        if noop_hit:
+            issues.append(
+                (
+                    rel,
+                    lineno,
+                    "no-op `catch |e| return e` just re-returns the error; use `try` "
+                    "(a catch that only rethrows performs no cleanup/logging/translation)",
+                    raw.strip(),
+                )
+            )
+
+        # camelCase enum-tag check + brace-depth tracking (must run every line so
+        # the depth stays correct even for lines with no other finding).
+        if ENUM_BODY_OPEN.search(code):
+            enum_body_depths.append(brace_depth)
+        if enum_body_depths and brace_depth == enum_body_depths[-1] + 1:
+            tag = ENUM_TAG_CAMEL.match(code)
+            if tag:
+                issues.append(
+                    (rel, lineno, f"camelCase enum tag `{tag.group(1)}`; Zig enum members use snake_case", raw.strip())
+                )
+        for ch in strip_literals_for_braces(code):
+            if ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+                if enum_body_depths and brace_depth == enum_body_depths[-1]:
+                    enum_body_depths.pop()
 
         if CATCH_UNREACHABLE.search(code):
             allowed = in_test or HANDLE_CTOR.search(code) or ALLOW_ANNOTATION in raw

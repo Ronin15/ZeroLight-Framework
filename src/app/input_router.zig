@@ -100,10 +100,10 @@ fn routeAction(policy: InputRoutingPolicy, action: Action, is_down: bool, is_rep
 
 pub fn contextForAction(action: Action) InputContext {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp, .digDown => .gameplay,
-        .pause, .resumeGame, .quit => .app,
-        .toggleDebugOverlay => .debug,
-        .menuUp, .menuDown, .menuLeft, .menuRight => .ui,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => .gameplay,
+        .pause, .resume_game, .quit => .app,
+        .toggle_debug_overlay => .debug,
+        .menu_up, .menu_down, .menu_left, .menu_right => .ui,
     };
 }
 
@@ -129,7 +129,7 @@ pub const ContextFlags = struct {
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .moveLeft, .moveRight, .moveUp, .moveDown, .digHole, .digRamp, .digDown => true,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => true,
         else => false,
     };
 }
@@ -181,28 +181,28 @@ fn gamepadAxisEvent(axis: c.SDL_GamepadAxis, value: i16) c.SDL_Event {
 test "gameplay routing allows gameplay app and debug actions" {
     const policy = InputRoutingPolicy.gameplay();
 
-    try std.testing.expect(policy.allowsAction(.moveLeft));
+    try std.testing.expect(policy.allowsAction(.move_left));
     try std.testing.expect(policy.allowsAction(.pause));
     try std.testing.expect(policy.allowsAction(.quit));
-    try std.testing.expect(policy.allowsAction(.resumeGame));
-    try std.testing.expect(policy.allowsAction(.toggleDebugOverlay));
-    try std.testing.expect(!policy.allowsAction(.menuUp));
-    try std.testing.expect(!policy.allowsAction(.menuDown));
+    try std.testing.expect(policy.allowsAction(.resume_game));
+    try std.testing.expect(policy.allowsAction(.toggle_debug_overlay));
+    try std.testing.expect(!policy.allowsAction(.menu_up));
+    try std.testing.expect(!policy.allowsAction(.menu_down));
     try std.testing.expect(!policy.allowsContext(.ui));
 }
 
 test "ui modal routing blocks gameplay while keeping UI and debug commands" {
     const policy = InputRoutingPolicy.modalUi();
 
-    try std.testing.expect(!policy.allowsAction(.moveRight));
+    try std.testing.expect(!policy.allowsAction(.move_right));
     try std.testing.expect(policy.allowsContext(.ui));
     try std.testing.expect(policy.allowsAction(.pause));
     try std.testing.expect(policy.allowsAction(.quit));
-    try std.testing.expect(policy.allowsAction(.toggleDebugOverlay));
-    try std.testing.expect(policy.allowsAction(.menuUp));
-    try std.testing.expect(policy.allowsAction(.menuDown));
-    try std.testing.expect(policy.allowsAction(.menuLeft));
-    try std.testing.expect(policy.allowsAction(.menuRight));
+    try std.testing.expect(policy.allowsAction(.toggle_debug_overlay));
+    try std.testing.expect(policy.allowsAction(.menu_up));
+    try std.testing.expect(policy.allowsAction(.menu_down));
+    try std.testing.expect(policy.allowsAction(.menu_left));
+    try std.testing.expect(policy.allowsAction(.menu_right));
 }
 
 test "pass through overlay routing allows gameplay ui app and debug contexts" {
@@ -231,16 +231,16 @@ test "routed gameplay events mutate held input only when gameplay is allowed" {
     var up_event = keyEvent(c.SDL_EVENT_KEY_UP, c.SDLK_A, false);
 
     routeEvent(InputRoutingPolicy.modalUi(), &down_event, &input, &commands);
-    try std.testing.expect(!input.isHeld(.moveLeft));
+    try std.testing.expect(!input.isHeld(.move_left));
 
     routeEvent(InputRoutingPolicy.gameplay(), &down_event, &input, &commands);
-    try std.testing.expect(input.isHeld(.moveLeft));
+    try std.testing.expect(input.isHeld(.move_left));
 
     routeEvent(InputRoutingPolicy.modalUi(), &up_event, &input, &commands);
-    try std.testing.expect(input.isHeld(.moveLeft));
+    try std.testing.expect(input.isHeld(.move_left));
 
     routeEvent(InputRoutingPolicy.gameplay(), &up_event, &input, &commands);
-    try std.testing.expect(!input.isHeld(.moveLeft));
+    try std.testing.expect(!input.isHeld(.move_left));
 }
 
 test "routed app and debug commands honor context and key repeat" {
@@ -258,10 +258,10 @@ test "routed app and debug commands honor context and key repeat" {
     try std.testing.expect(!commands.wasPressed(.pause));
 
     routeEvent(InputRoutingPolicy.gameplay().withContext(.debug, false), &debug_event, &input, &commands);
-    try std.testing.expect(!commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(!commands.wasPressed(.toggle_debug_overlay));
 
     routeEvent(InputRoutingPolicy.gameplay(), &debug_event, &input, &commands);
-    try std.testing.expect(commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(commands.wasPressed(.toggle_debug_overlay));
 }
 
 test "routed gamepad button events mutate held input only when gameplay is allowed" {
@@ -271,16 +271,16 @@ test "routed gamepad button events mutate held input only when gameplay is allow
     var up_event = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_UP, c.SDL_GAMEPAD_BUTTON_WEST, false);
 
     routeEvent(InputRoutingPolicy.modalUi(), &down_event, &input, &commands);
-    try std.testing.expect(!input.isHeld(.digHole));
+    try std.testing.expect(!input.isHeld(.dig_hole));
 
     routeEvent(InputRoutingPolicy.gameplay(), &down_event, &input, &commands);
-    try std.testing.expect(input.isHeld(.digHole));
+    try std.testing.expect(input.isHeld(.dig_hole));
 
     routeEvent(InputRoutingPolicy.modalUi(), &up_event, &input, &commands);
-    try std.testing.expect(input.isHeld(.digHole));
+    try std.testing.expect(input.isHeld(.dig_hole));
 
     routeEvent(InputRoutingPolicy.gameplay(), &up_event, &input, &commands);
-    try std.testing.expect(!input.isHeld(.digHole));
+    try std.testing.expect(!input.isHeld(.dig_hole));
 }
 
 test "routed gamepad app and debug button commands honor context, mirroring keyboard" {
@@ -293,10 +293,10 @@ test "routed gamepad app and debug button commands honor context, mirroring keyb
     try std.testing.expect(commands.wasPressed(.pause));
 
     routeEvent(InputRoutingPolicy.gameplay().withContext(.debug, false), &debug_event, &input, &commands);
-    try std.testing.expect(!commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(!commands.wasPressed(.toggle_debug_overlay));
 
     routeEvent(InputRoutingPolicy.gameplay(), &debug_event, &input, &commands);
-    try std.testing.expect(commands.wasPressed(.toggleDebugOverlay));
+    try std.testing.expect(commands.wasPressed(.toggle_debug_overlay));
 }
 
 test "routed gamepad menu navigation matches every InputRoutingPolicy preset like keyboard" {
@@ -305,18 +305,18 @@ test "routed gamepad menu navigation matches every InputRoutingPolicy preset lik
     var menu_event = gamepadButtonEvent(c.SDL_EVENT_GAMEPAD_BUTTON_DOWN, c.SDL_GAMEPAD_BUTTON_DPAD_UP, true);
 
     routeEvent(InputRoutingPolicy.gameplay(), &menu_event, &input, &commands);
-    try std.testing.expect(!commands.wasPressed(.menuUp));
+    try std.testing.expect(!commands.wasPressed(.menu_up));
 
     routeEvent(InputRoutingPolicy.modalUi(), &menu_event, &input, &commands);
-    try std.testing.expect(commands.wasPressed(.menuUp));
+    try std.testing.expect(commands.wasPressed(.menu_up));
 
     commands.beginFrame();
     routeEvent(InputRoutingPolicy.opaqueScreen(), &menu_event, &input, &commands);
-    try std.testing.expect(commands.wasPressed(.menuUp));
+    try std.testing.expect(commands.wasPressed(.menu_up));
 
     commands.beginFrame();
     routeEvent(InputRoutingPolicy.passThroughOverlay(), &menu_event, &input, &commands);
-    try std.testing.expect(commands.wasPressed(.menuUp));
+    try std.testing.expect(commands.wasPressed(.menu_up));
 }
 
 test "gamepad left stick axis motion is gated by gameplay context" {

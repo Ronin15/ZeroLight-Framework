@@ -1111,44 +1111,44 @@ test "state stack input routing follows active state policy" {
     try std.testing.expect(!state_policy.pass_through_overlay.gameplay);
     try std.testing.expect(!state_policy.opaque_screen.gameplay);
 
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
     try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.ui));
 
     _ = try stack.replaceGameplay(TestingState, .{});
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
 
     const modal_handle = try stack.pushModal(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 
     _ = try stack.pushOverlay(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.quit));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 
     var input = InputState{};
     var commands = FrameCommands{};
     var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
     inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
-    try std.testing.expect(!input.isHeld(.moveLeft));
+    try std.testing.expect(!input.isHeld(.move_left));
 
     try std.testing.expect(stack.remove(modal_handle));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
-    try std.testing.expect(input.isHeld(.moveLeft));
+    try std.testing.expect(input.isHeld(.move_left));
 
     _ = try stack.pushOpaque(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 }
 
 test "opaque state render policy hides states below it" {
@@ -1550,6 +1550,59 @@ test "owned gameplay transition destroys state when enqueue fails" {
     const state = try State.create(TestingState, allocator, .{ .deinit_count = &deinit_count });
     try std.testing.expectError(error.OutOfMemory, transitions.replaceOwnedGameplay(state));
     try std.testing.expectEqual(@as(u32, 1), deinit_count);
+}
+
+test "reserved modal push consumes only reserved capacity and allocates zero (FailingAllocator)" {
+    const TestingState = struct {
+        deinit_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    // Arm the allocator so the next allocation after warmup (the reserve plus the
+    // one State box) would be an induced OOM. `pushModalOwnedAfterReserve` must
+    // consume only the reserved slot, touching the allocator zero more times.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const allocator = failing.allocator();
+    var stack = StateStack.init(allocator);
+    defer stack.deinit();
+
+    var deinit_count: u32 = 0;
+    try stack.reserveForAdditionalStates(1);
+    const state = try State.create(TestingState, allocator, .{ .deinit_count = &deinit_count });
+
+    const allocations_after_warmup = failing.allocations;
+    const handle = stack.pushModalOwnedAfterReserve(state);
+
+    // The push allocated nothing (no induced failure, no growth in the count) and
+    // still landed the modal state on the stack.
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(allocations_after_warmup, failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(handle, stack.activeHandle().?);
 }
 
 test "quit transition reports through apply result" {

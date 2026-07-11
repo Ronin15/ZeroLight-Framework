@@ -368,13 +368,19 @@ pub const GameDemoState = struct {
         mover_count: usize,
         asset_store: AssetStore,
     ) !GameDemoState {
+        // Take ownership of the moved-in world before any fallible step. The caller
+        // builds it inline as a call argument, so it has no cleanup handle of its own;
+        // registering this errdefer first means a later failure (capacity derivation,
+        // archetype load, ...) frees it instead of leaking. On the success path
+        // ownership moves into the returned struct's `.world` field and this errdefer
+        // does not fire, so there is no double-deinit.
+        var world = world_value;
+        errdefer world.deinit();
         const pop_cap = deriveDemoPopulationCapacity(mover_count);
         // Cold path: load the data-driven AI archetype catalog once before spawn.
         // A malformed/missing catalog surfaces as an init error rather than a
         // silent fallback to hardcoded personalities.
         const archetype_catalog = try ai_archetypes.load(asset_store, allocator);
-        var world = world_value;
-        errdefer world.deinit();
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
         const player = try Player.spawn(&data);
@@ -1642,7 +1648,7 @@ test "demo owns and completes a simulation frame during update" {
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
     const player_before = demo.data.movementBodyConst(demo.player.entity).?;
     var square_before: [default_demo_mover_count]math.Vec2 = undefined;
     for (demo.test_squares, 0..) |entity, index| {
@@ -1695,7 +1701,7 @@ test "demo queues jet loop audio only on movement edges" {
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
 
     try demo.update(.{
         .input = &input,
@@ -1722,7 +1728,7 @@ test "demo queues jet loop audio only on movement edges" {
     try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
     try std.testing.expectEqual(@as(usize, 1), ambientAudioCommandCount(&audio));
 
-    input.setHeld(.moveRight, false);
+    input.setHeld(.move_right, false);
     audio.beginStep();
     try demo.update(.{
         .input = &input,
@@ -1761,7 +1767,7 @@ test "demo collision response blocks player against obstacles" {
     player_body.previous_x.* = player_body.position_x.*;
     player_body.previous_y.* = player_body.position_y.*;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
 
     try demo.update(.{
         .input = &input,

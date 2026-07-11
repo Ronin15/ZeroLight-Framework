@@ -58,13 +58,26 @@ count; an append into a pool tracking a fixed-capacity dedup/probe table gated o
 physical `.capacity` instead of the shared logical cap (they desync as `ensureTotalCapacity` rounds up);
 a `.?` on an optional field kept non-null only by cross-thread ordering (invisible to `idiom-lint`); and
 a reserve/overflow contract whose assert and overflow check bound different quantities (pre-rounding
-request vs rounded `.capacity`) — both must bound the same value.
+request vs rounded `.capacity`) — both must bound the same value; a split reserve+`assumeCapacity`
+(reserve and commit in separate functions) whose `FailingAllocator` proof covers only the
+reserve-fails branch, not the reserved-then-push success branch. On resource lifetime & contracts,
+flag: a function taking ownership of a by-value resource that registers its `errdefer deinit` after
+a fallible step (leaks on error — register it first); an earlier free-`errdefer` not disarmed by a
+bool after a `put`/`append` transfers ownership (double-free); a handle-owning setter overwriting an
+owned slot without asserting it empty or closing the prior handle (silent leak); an edge/latch
+advanced after a swallowed fallible call rather than on its success path (desyncs from the engine); a
+config field defaulting to an in-domain-valid value (e.g. `TileId` 0) instead of an invalid sentinel
+asserted at the boundary; a boundary validator bounding a scalar on only one end where siblings clamp
+both; a present-but-wrong-typed optional field treated as absent instead of erroring; and a callerless
+`pub` helper — or a `pub` export whose doc asserts a live contract with zero references — as dead API drift.
 
 **Idiomatic naming & stdlib currency** — enforced by `zig build idiom-lint` (`tools/lint_idioms.py`),
-but still flag in review: camelCased locals/fields (Zig: snake_case variables/fields, camelCase
-callables, PascalCase types), C++-style `kFoo` constants (use `k_snake_case`), and the deprecated
-`std.ArrayListUnmanaged` alias (use `std.ArrayList`, init `= .empty`) or other removed/renamed
-stdlib spellings. The lint intentionally exempts function-pointer-typed fields from the camelCase
+but still flag in review: camelCased locals/fields/enum tags (Zig: snake_case variables/fields/enum
+members, camelCase callables, PascalCase types), C++-style `kFoo` constants (use `k_snake_case`), the
+deprecated `std.ArrayListUnmanaged` alias (use `std.ArrayList`, init `= .empty`) or other
+removed/renamed stdlib spellings, scalar NaN self-compare (`x != x` → `std.math.isNan`), a
+free-function `EntityId` equality helper (use `EntityId.eql`), and a no-op `catch |e| return e` (use
+`try`). The lint intentionally exempts function-pointer-typed fields from the camelCase
 check, so a camelCase fn-pointer field that should match the snake_case production vtables
 (`state.zig`, `audio.zig`, `cache.zig`) is a review-only catch.
 

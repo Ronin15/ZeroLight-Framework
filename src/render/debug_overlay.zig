@@ -20,7 +20,7 @@ pub const DebugOverlay = struct {
     }
 
     pub fn applyCommands(self: *DebugOverlay, commands: *const FrameCommands) void {
-        if (commands.wasPressed(.toggleDebugOverlay)) {
+        if (commands.wasPressed(.toggle_debug_overlay)) {
             self.visible = !self.visible;
         }
     }
