@@ -41,7 +41,15 @@ sits close to the creation site. Flag any new `reserve`/`ensureTotalCapacity` +
 `std.testing.FailingAllocator` proof test — a comment or PR claim of "allocation-free" is not
 proof, and ReleaseFast strips the assert backing `assumeCapacity`. For threaded writes,
 confirm the reserve happens on the main thread strictly before dispatch, sized from the value
-dispatch uses, and that the worker asserts its range against the buffer length.
+dispatch uses, and that the worker asserts its range against the buffer length. ReleaseFast
+also makes a reached `unreachable`/`catch unreachable` undefined behavior, not a panic — flag
+either where impossibility is not provable by construction (sanctioned case: capacity-bounded
+generational-handle constructors).
+
+**Idiomatic naming & stdlib currency** — flag camelCased locals/fields (Zig: snake_case
+variables/fields, camelCase callables, PascalCase types) and the deprecated
+`std.ArrayListUnmanaged` alias (use `std.ArrayList`, init `= .empty`) or other removed/renamed
+stdlib spellings.
 
 **Fixed work budgets** — any per-query/per-frame budget (search node caps, solve ceilings,
 and similar) must be a fixed constant. Flag a budget/capacity constant derived from or scaled

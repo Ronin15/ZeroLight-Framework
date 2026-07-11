@@ -192,7 +192,7 @@ fn runCaseWithConfig(
     defer batch.deinit();
     try batch.reserveStorage(command_capacity, vertex_capacity, command_capacity);
 
-    var draw_list: std.ArrayListUnmanaged(sprite_batch.DrawGroup) = .empty;
+    var draw_list: std.ArrayList(sprite_batch.DrawGroup) = .empty;
     defer draw_list.deinit(allocator);
     try draw_list.ensureTotalCapacity(allocator, fixture.static_group_count + command_capacity);
 
@@ -325,7 +325,7 @@ fn runMeasuredOnce(
     io: std.Io,
     fixture: *Fixture,
     batch: *sprite_batch.SpriteBatch,
-    draw_list: *std.ArrayListUnmanaged(sprite_batch.DrawGroup),
+    draw_list: *std.ArrayList(sprite_batch.DrawGroup),
     resolver: sprite_batch.TextureResolver,
     thread_system: ?*ThreadSystem,
     case: suite.BenchmarkCase,

@@ -240,17 +240,17 @@ pub const Renderer = struct {
     // these spans with the dynamic batch by render order.
     static_streams: ?VertexStreams = null,
     static_capacity_vertices: usize = 0,
-    static_positions: std.ArrayListUnmanaged(Position) = .empty,
-    static_uvs: std.ArrayListUnmanaged(Uv) = .empty,
-    static_colors: std.ArrayListUnmanaged(VertexColor) = .empty,
-    static_groups: std.ArrayListUnmanaged(DrawGroup) = .empty,
+    static_positions: std.ArrayList(Position) = .empty,
+    static_uvs: std.ArrayList(Uv) = .empty,
+    static_colors: std.ArrayList(VertexColor) = .empty,
+    static_groups: std.ArrayList(DrawGroup) = .empty,
     static_dirty: bool = false,
     // Per-frame side table for tilemap DrawGroup.window_slot: which composited
     // layer offsets each static tilemap span reads this frame. Reset by
     // beginStaticGeometry; populated by appendStaticTilemapSpan.
     tilemap_window_layers: [k_max_dense_composite_draws]TilemapWindowLayers = undefined,
     tilemap_window_layer_count: usize = 0,
-    draw_list: std.ArrayListUnmanaged(DrawGroup) = .empty,
+    draw_list: std.ArrayList(DrawGroup) = .empty,
     // Reserved upper bounds feeding the merged draw list. `draw_list` is sized to
     // their sum so the per-frame merge stays allocation-free.
     reserved_dynamic_groups: usize = 0,
@@ -1346,7 +1346,7 @@ fn coalesceDrawList(items: []DrawGroup) usize {
 // Builds the per-frame unified draw list from retained static spans and dynamic
 // groups: append (static first), stable-sort by order, then coalesce.
 pub fn mergeDrawList(
-    out: *std.ArrayListUnmanaged(DrawGroup),
+    out: *std.ArrayList(DrawGroup),
     allocator: std.mem.Allocator,
     static_groups: []const DrawGroup,
     dynamic_groups: []const DrawGroup,
@@ -1723,7 +1723,7 @@ fn testDrawGroup(
 
 test "draw list interleaves static and dynamic by render order across z" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     // Static floor (-2) and effect (+1) tiles; a dynamic actor (0) between them.
@@ -1782,7 +1782,7 @@ test "same-texture dynamic run straddling a static span interleaves by order" {
     batch.buildSerial(resolver);
     try std.testing.expectEqual(@as(usize, 2), batch.draw_groups.items.len);
 
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
     const static_groups = [_]DrawGroup{
         testDrawGroup(.static, 2, .world, RenderOrder.world(0), 0, 6),
@@ -1801,7 +1801,7 @@ test "same-texture dynamic run straddling a static span interleaves by order" {
 
 test "draw list coalesces contiguous same-source same-texture spans" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     const static_groups = [_]DrawGroup{
@@ -1818,7 +1818,7 @@ test "draw list coalesces contiguous same-source same-texture spans" {
 
 test "draw list keeps non-contiguous spans separate" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     const static_groups = [_]DrawGroup{
@@ -1833,7 +1833,7 @@ test "draw list keeps non-contiguous spans separate" {
 
 test "mergeDrawList sorts unsorted underground dense layers back to front" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     // `submitStaticDenseGeometry` appends in dense-layer index order (surface
@@ -1861,7 +1861,7 @@ test "mergeDrawList sorts unsorted underground dense layers back to front" {
 
 test "tilemap layer quads interleave with dynamic groups by render order" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     // Two dense tilemap layers (floor -2, roof +1) with a dynamic actor (0) between.
@@ -1886,7 +1886,7 @@ test "tilemap layer quads interleave with dynamic groups by render order" {
 
 test "contiguous tilemap groups never coalesce" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     // Same texture/order and contiguous verts — a sprite pair would coalesce, but
@@ -2015,7 +2015,7 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
 
 test "merge draw list stays allocation-free when reserved to combined size" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     // Reserve to dynamic + static budget (2 + 2), as the renderer reservation does.
@@ -2039,7 +2039,7 @@ test "merge draw list stays allocation-free when reserved to combined size" {
 
 test "draw list does not merge across source and keeps static before dynamic at equal order" {
     const allocator = std.testing.allocator;
-    var list: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var list: std.ArrayList(DrawGroup) = .empty;
     defer list.deinit(allocator);
 
     const static_groups = [_]DrawGroup{
@@ -2233,11 +2233,11 @@ test "linear merge matches stable sort for pre-sorted static and dynamic groups"
         testDrawGroup(.dynamic, 1, .logical, RenderOrder.ui(.panel), 6, 6),
     };
 
-    var linear: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var linear: std.ArrayList(DrawGroup) = .empty;
     defer linear.deinit(allocator);
     try mergeDrawList(&linear, allocator, &static_groups, &dynamic_groups);
 
-    var sorted: std.ArrayListUnmanaged(DrawGroup) = .empty;
+    var sorted: std.ArrayList(DrawGroup) = .empty;
     defer sorted.deinit(allocator);
     try sorted.ensureTotalCapacity(allocator, static_groups.len + dynamic_groups.len);
     sorted.appendSliceAssumeCapacity(&static_groups);

@@ -1481,7 +1481,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     // own dynamic draw sits between them in the merged list.
     try std.testing.expect(renderer.static_groups.items[0].order.depth < renderer.static_groups.items[1].order.depth);
 
-    var merged: std.ArrayListUnmanaged(sprite_batch.DrawGroup) = .empty;
+    var merged: std.ArrayList(sprite_batch.DrawGroup) = .empty;
     defer merged.deinit(allocator);
     try mergeDrawList(&merged, allocator, renderer.static_groups.items, &.{});
     try std.testing.expectEqual(@as(usize, 2), merged.items.len);

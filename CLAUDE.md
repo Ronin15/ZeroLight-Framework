@@ -68,8 +68,9 @@ boundaries just to make a local change easier.
 
 - Read the live owning files before editing. Do not rely on stale roadmap memory
   or prior chat summaries for exact implementation details.
-- Follow `docs/coding-standards.md`: `zig fmt`, lowerCamelCase functions/vars,
-  PascalCase types, direct declaration imports, explicit error sets.
+- Follow `docs/coding-standards.md`: `zig fmt`, camelCase functions, snake_case
+  variables/fields, PascalCase types, direct declaration imports, explicit error
+  sets.
 - Treat performance as correctness on hot/frame-adjacent paths. Hot paths must
   be **allocation-free after init/reserve/warmup**, and every such claim needs
   a `std.testing.FailingAllocator` proof test, not just a comment — this

@@ -7,9 +7,16 @@ treat these as repo standards, not optional style notes.
 ## Zig Style
 
 Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the
-formatter will rewrite. Use lowerCamelCase for variables and functions,
-PascalCase for types, and short descriptive names. Keep error sets explicit
-when practical, as in `error{SdlError}`.
+formatter will rewrite. Follow Zig's standard naming: camelCase for functions
+and other callables, snake_case for variables, struct fields, and non-type
+constants, PascalCase for types (and functions that return a type), and short
+descriptive names. Keep error sets explicit when practical, as in
+`error{SdlError}`. The `*anyopaque` + `anyerror!T` function-pointer vtables at
+type-erased service boundaries (state adapters, asset upload, audio/text
+backends) are the accepted "not practical" exception: the concrete error set
+cannot be named across the erased boundary, and these sit on cold
+setup/service paths, not hot per-frame dispatch, so they do not violate the
+"avoid broad dynamic dispatch" performance rule below.
 
 Prefer direct declaration imports for project types and constants when that
 keeps call sites clear, such as `const Engine = @import("app/engine.zig").Engine;`
@@ -21,6 +28,12 @@ function or namespace lookup, such as `inputFile.actionForKey(...)` or
 Avoid `_mod` suffixes, `const Type = file.Type` bridge aliases, and double names
 such as `thread.ThreadSystem`. Do not rewrite SDL/C symbols, generated
 build-option names, or `std.Build` field names.
+
+Use current standard-library spellings. `std.ArrayList` is the unmanaged list in
+Zig 0.16 (it takes an explicit allocator per operation and initializes as
+`.empty`); do not use the deprecated `std.ArrayListUnmanaged` alias for new or
+edited code. Prefer the modern initializer forms (`= .empty`, `.{}`) over
+removed managed-container constructors.
 
 Keep `Renderer` as the render facade for app/game code. Do not import
 `src/render/gpu/*` outside the render/platform boundary.
@@ -48,6 +61,16 @@ bounds/overflow safety checks; an unproven reserve is a silent
 memory-corruption risk in the shipped binary, not a missed optimization. Add
 the proof test in the same change that adds the `assumeCapacity` call — do not
 defer it.
+
+The same ReleaseFast safety-strip applies to `unreachable` and `catch
+unreachable`: in the shipped binary a reached `unreachable` is undefined
+behavior, not a panic. Both are permitted only where the state is provably
+impossible by construction — the established use is generational-handle
+constructors bounded by capacity (`TextureId.init(...) catch unreachable`,
+`EntityId.init(...) catch unreachable`), whose failure case cannot occur within
+the reserved index/generation range. Hold `unreachable` to the same
+"provable, not merely expected" bar as `assumeCapacity`; if a failure is
+recoverable or attacker/data-influenced, return an error or assert instead.
 
 When a collection is written from more than one thread, both of these must
 hold and be verifiable by reading the call site, not just asserted in a

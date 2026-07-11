@@ -386,9 +386,9 @@ test "threaded movement matches serial movement" {
 test "movement explicit items_per_range bypasses tuner" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var gameData = data.DataSystem.init(std.testing.allocator);
-    defer gameData.deinit();
-    try fillMovementData(&gameData, data.movement_range_alignment_items * 8);
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -401,7 +401,7 @@ test "movement explicit items_per_range bypasses tuner" {
         .smallest_range_items = data.movement_range_alignment_items,
         .largest_range_items = data.movement_range_alignment_items * 4,
     });
-    var slice = gameData.movementBodySlice();
+    var slice = game_data.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.5, .{
         .items_per_range = data.movement_range_alignment_items,
         .max_worker_threads = 2,
@@ -416,9 +416,9 @@ test "movement explicit items_per_range bypasses tuner" {
 test "movement system owns adaptive tuner for default update" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var gameData = data.DataSystem.init(std.testing.allocator);
-    defer gameData.deinit();
-    try fillMovementData(&gameData, data.movement_range_alignment_items * 8);
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -429,7 +429,7 @@ test "movement system owns adaptive tuner for default update" {
     var system = MovementSystem.init();
     var stats = MovementStats{};
     for (0..system.adaptive_tuner.report().sample_window) |_| {
-        var slice = gameData.movementBodySlice();
+        var slice = game_data.movementBodySlice();
         stats = system.update(&slice, &threads, 0.5, .{
             .max_worker_threads = 2,
         });
@@ -438,15 +438,15 @@ test "movement system owns adaptive tuner for default update" {
     try std.testing.expect(system.adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
     try std.testing.expect(!system.adaptive_tuner.report().has_threaded_profile);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
-    try std.testing.expectEqual(gameData.movementBodySliceConst().entities.len, stats.body_count);
+    try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
 }
 
 test "movement update uses provided adaptive tuner" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var gameData = data.DataSystem.init(std.testing.allocator);
-    defer gameData.deinit();
-    try fillMovementData(&gameData, data.movement_range_alignment_items * 8);
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -455,24 +455,24 @@ test "movement update uses provided adaptive tuner" {
     defer threads.deinit();
 
     var adaptive_tuner = AdaptiveWorkTuner.init(.{ .sample_window = 1 });
-    var slice = gameData.movementBodySlice();
+    var slice = game_data.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.5, .{
         .max_worker_threads = 2,
         .adaptive_tuner = &adaptive_tuner,
     });
 
-    try std.testing.expectEqual(gameData.movementBodySliceConst().entities.len, stats.body_count);
+    try std.testing.expectEqual(game_data.movementBodySliceConst().entities.len, stats.body_count);
     try std.testing.expect(adaptive_tuner.report().baseline_mean_batch_duration_ns > 0);
     try std.testing.expect(!adaptive_tuner.report().has_threaded_profile);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
 }
 
 test "movement range only writes assigned items" {
-    var gameData = data.DataSystem.init(std.testing.allocator);
-    defer gameData.deinit();
-    try fillMovementData(&gameData, 8);
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, 8);
 
-    var slice = gameData.movementBodySlice();
+    var slice = game_data.movementBodySlice();
     processRange(&slice, .{ .start = 2, .end = 6 }, 1.0, null);
 
     for (0..slice.entities.len) |index| {
@@ -492,9 +492,9 @@ test "movement range only writes assigned items" {
 }
 
 test "warmed movement update does not allocate" {
-    var gameData = data.DataSystem.init(std.testing.allocator);
-    defer gameData.deinit();
-    try fillMovementData(&gameData, 32);
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, 32);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -502,17 +502,17 @@ test "warmed movement update does not allocate" {
     });
     defer threads.deinit();
 
-    const original_data_allocator = gameData.allocator;
+    const original_data_allocator = game_data.allocator;
     const original_thread_allocator = threads.allocator;
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    gameData.allocator = failing_allocator.allocator();
+    game_data.allocator = failing_allocator.allocator();
     threads.allocator = failing_allocator.allocator();
     defer {
-        gameData.allocator = original_data_allocator;
+        game_data.allocator = original_data_allocator;
         threads.allocator = original_thread_allocator;
     }
 
-    var slice = gameData.movementBodySlice();
+    var slice = game_data.movementBodySlice();
     const stats = updateMovementBodies(&slice, &threads, 0.016, .{
         .items_per_range = data.movement_range_alignment_items,
     });

@@ -27,8 +27,11 @@ init/reserve/warmup, and treat performance-sensitive runtime behavior as correct
   unless the user explicitly asks or stdlib/SDL3 genuinely cannot solve the task (PNG
   loading uses core SDL3 — do not add SDL3_image unasked).
 - Follow `docs/coding-standards.md` for Zig style, imports, comments, tests, performance,
-  generated-output rules, and production-contract boundaries. Consult the owning doc when a
-  task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
+  generated-output rules, and production-contract boundaries. Idiomatic Zig naming: camelCase
+  functions/callables, snake_case variables/fields/non-type-constants, PascalCase types — never
+  camelCase a local or field. Current stdlib spellings only: `std.ArrayList` (the 0.16 unmanaged
+  list, init `= .empty`), never the deprecated `std.ArrayListUnmanaged`. Consult the owning doc
+  when a task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
   `docs/simulation-tiers-and-pipeline.md`, `docs/rendering-assets-shaders.md`,
   `docs/atlas-asset-workflow.md`, `docs/development-workflow.md`,
   `docs/framework-implementation-slices.md`.
@@ -79,7 +82,10 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
     allocates zero times — a comment or "allocation-free" claim is not proof (ReleaseFast
     strips the assert backing `assumeCapacity`). For threaded writes, reserve on the main
     thread before dispatch, sized from dispatch's own value, and assert each worker's
-    `worker_id`/`range.index` against the buffer length captured at dispatch.
+    `worker_id`/`range.index` against the buffer length captured at dispatch. ReleaseFast also
+    makes a reached `unreachable`/`catch unreachable` undefined behavior, not a panic — use only
+    where impossibility is provable by construction (e.g. capacity-bounded generational-handle
+    constructors); otherwise return an error.
 11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
     never derived from world/map size, cell count, portal count, or other "current scale." A
     chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
