@@ -29,6 +29,11 @@ const movement_range_alignment_items = @import("data_system.zig").movement_range
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SteeringAgent = @import("data_system.zig").SteeringAgent;
+const ai_archetypes = @import("ai_archetypes.zig");
+const AiArchetypeCatalog = ai_archetypes.AiArchetypeCatalog;
+const AiArchetypeId = ai_archetypes.AiArchetypeId;
+const DemoArchetype = ai_archetypes.DemoArchetype;
+const AiDebugOverlay = @import("ai_debug_overlay.zig").AiDebugOverlay;
 const simulation_scope = @import("simulation_scope.zig");
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
@@ -70,10 +75,10 @@ const demo_test_viewport_height: f32 = 256;
 // the pathfinding group-field threshold live — that made every test in this file spawn
 // 2048 movers too, taking `zig build test` from ~6s to ~43s. Population is now a
 // runtime parameter (see DemoPopulationCapacity/deriveDemoPopulationCapacity) so the
-// battle-scale exercise and fast tests don't have to share one global constant.
+// running demo and fast tests don't have to share one global constant.
 const default_demo_mover_count: usize = 32;
 // Only initProceduralWithRuntimeAssets (the real game, not tests) passes this.
-const battle_scale_demo_mover_count: usize = 2048;
+const procedural_demo_mover_count: usize = 200;
 const obstacle_count = 4;
 
 /// Every mover-count-dependent capacity this demo needs, derived from a single runtime
@@ -253,6 +258,13 @@ pub const GameDemoState = struct {
     // DemoPopulationCapacity), not a comptime constant, so this can't be a fixed array.
     test_squares: []EntityId,
     obstacles: [obstacle_count]EntityId,
+    // Data-driven AI personalities loaded once from assets/ai/archetypes.json;
+    // spawn resolves a slot to a prevalidated bundle by enum index (value types,
+    // no deinit).
+    archetype_catalog: AiArchetypeCatalog,
+    // Render-only AI introspection viz, drawn from `render` when the engine's F2
+    // debug toggle is on (owns its cached label textures; reads sim state only).
+    ai_overlay: AiDebugOverlay = .{},
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
     camera_previous: Camera2D = .{},
@@ -265,15 +277,17 @@ pub const GameDemoState = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         bounds_width: f32,
         bounds_height: f32,
     ) !GameDemoState {
-        return try initWithRuntimeAssets(allocator, runtime_assets, bounds_width, bounds_height);
+        return try initWithRuntimeAssets(allocator, runtime_assets, asset_store, bounds_width, bounds_height);
     }
 
     pub fn initWithRuntimeAssets(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         bounds_width: f32,
         bounds_height: f32,
     ) !GameDemoState {
@@ -295,6 +309,7 @@ pub const GameDemoState = struct {
             null,
             null,
             default_demo_mover_count,
+            asset_store,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -304,6 +319,7 @@ pub const GameDemoState = struct {
     pub fn initProceduralWithRuntimeAssets(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         world_build_config: world_system.WorldBuildConfig,
         thread_system: *ThreadSystem,
         viewport_width: f32,
@@ -328,7 +344,8 @@ pub const GameDemoState = struct {
             thread_system.participantSlotCount(),
             proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
             thread_system,
-            battle_scale_demo_mover_count,
+            procedural_demo_mover_count,
+            asset_store,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -349,8 +366,13 @@ pub const GameDemoState = struct {
         pathfinding_override: ?PathfindingCapacity,
         nav_build_thread_system: ?*ThreadSystem,
         mover_count: usize,
+        asset_store: AssetStore,
     ) !GameDemoState {
         const pop_cap = deriveDemoPopulationCapacity(mover_count);
+        // Cold path: load the data-driven AI archetype catalog once before spawn.
+        // A malformed/missing catalog surfaces as an init error rather than a
+        // silent fallback to hardcoded personalities.
+        const archetype_catalog = try ai_archetypes.load(asset_store, allocator);
         var world = world_value;
         errdefer world.deinit();
         var data = DataSystem.init(allocator);
@@ -371,7 +393,7 @@ pub const GameDemoState = struct {
         }
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
-        const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap);
+        const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap, &archetype_catalog);
         errdefer allocator.free(test_squares);
         const obstacles = try spawnObstacles(&data, &world);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
@@ -441,6 +463,7 @@ pub const GameDemoState = struct {
             .scene_prep = scene_prep,
             .test_squares = test_squares,
             .obstacles = obstacles,
+            .archetype_catalog = archetype_catalog,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .bounds_width = world_width,
@@ -452,6 +475,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
+        self.ai_overlay.deinit();
         self.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
@@ -531,7 +555,11 @@ pub const GameDemoState = struct {
         };
         self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks);
         const scene = self.gameplayScene();
-        try context.renderer.reserveSpriteCommands(render_prep.spriteCommandCapacity(scene));
+        // Always reserve the fixed AI-overlay headroom alongside the gameplay
+        // scene budget (grow-only) so the first F2 toggle draws allocation-free.
+        try context.renderer.reserveSpriteCommands(
+            render_prep.spriteCommandCapacity(scene) + AiDebugOverlay.commandCapacity(),
+        );
         try render_prep.submitGameplayFrame(
             &self.scene_prep,
             scene,
@@ -540,6 +568,9 @@ pub const GameDemoState = struct {
             context.interpolation_alpha,
             camera_rect,
         );
+        if (context.debug_overlay_visible) {
+            try self.ai_overlay.draw(&self.data, camera_rect, context.renderer, context.text_service);
+        }
     }
 
     fn gameplayScene(self: *GameDemoState) render_prep.GameplayScene {
@@ -644,8 +675,8 @@ fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
     return world.width <= 16 and world.height <= 16;
 }
 
-fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, pop_cap: DemoPopulationCapacity) ![]EntityId {
-    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(allocator, data, world, pop_cap);
+fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, pop_cap: DemoPopulationCapacity, catalog: *const AiArchetypeCatalog) ![]EntityId {
+    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(allocator, data, world, pop_cap, catalog);
     const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
     errdefer allocator.free(entities);
     // Wraps naturally (col = index % cols, row = index / cols) rather than requiring an
@@ -658,7 +689,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = 96 + @as(f32, @floatFromInt(col)) * 96,
@@ -685,7 +716,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const underground_index = index - pop_cap.surface_movers;
         const tile = world.tile_size;
         const size: math.Vec2 = .{ .x = 22, .y = 22 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = if (underground_enabled) blk: {
             const level = undergroundSpawnLevelForIndex(world, underground_index, pop_cap.underground_movers);
             const cell = undergroundSpawnCellForIndex(underground_index);
@@ -732,7 +763,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
     return entities;
 }
 
-fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, pop_cap: DemoPopulationCapacity) ![]EntityId {
+fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, pop_cap: DemoPopulationCapacity, catalog: *const AiArchetypeCatalog) ![]EntityId {
     const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
     errdefer allocator.free(entities);
     const cols: usize = 6;
@@ -750,7 +781,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * step_x,
@@ -783,7 +814,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const index = pop_cap.surface_movers + underground_index;
         const col = underground_index % underground_cols;
         const row = underground_index / underground_cols;
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * underground_step_x,
@@ -925,78 +956,40 @@ fn demoColorForIndex(index: usize) config.Color {
     return .{ .r = 0.35 + hue * 0.5, .g = 0.45 + (1 - hue) * 0.4, .b = 0.55 + hue * 0.35, .a = 1.0 };
 }
 
-/// Full component bundle for one demo mover's personality. `behavior == null`
-/// means no `AiAgent` at all (a pure physics/collision body); `perception`/
-/// `memory`/`affect` are independently optional so an entity can carry
-/// `AiAgent` without full cognition (arbitration treats an absent component
-/// as zero signal, per `arbitration.zig`).
-const DemoArchetype = struct {
-    behavior: ?AiAgent,
-    perception: ?AiPerception = null,
-    memory: ?AiMemory = null,
-    affect: ?AiAffect = null,
-    faction: Faction = .hostile,
+/// Length of the demo's fixed personality cycle (one slot per `AiArchetypeId`).
+const demo_archetype_cycle_len: usize = ai_archetypes.archetype_count;
+
+/// The demo's 8-slot spawn cycle in slot order. `AiArchetypeId` tags are already
+/// authored in this order, so slot `i` resolves to bundle `demo_slot_ids[i]`:
+/// 0 wanderer (wander-only, zero pursue gain), 1 pursuer (`focus_target`
+/// fallback), 2 inert (no `AiAgent`), 3 timid (`.ally`, high fear/flee, full
+/// cognition), 4 aggressive (high aggression/pursue, full cognition), 5 curious
+/// (high curiosity/investigate, full cognition), 6 cohesive (cohere from the
+/// shared spatial index, no cognition components), 7 pursuer_strong. Slots 3/4/5
+/// are the `demoCognitionAgentCount` subset that attaches `AiPerception` +
+/// `AiAffect`. Bundles are data-driven from `assets/ai/archetypes.json`.
+const demo_slot_ids: [demo_archetype_cycle_len]AiArchetypeId = .{
+    .wanderer,
+    .pursuer,
+    .inert,
+    .timid,
+    .aggressive,
+    .curious,
+    .cohesive,
+    .pursuer_strong,
 };
 
-/// Length of `demoArchetypeForIndex`'s fixed personality cycle.
-const demo_archetype_cycle_len: usize = 8;
+comptime {
+    std.debug.assert(demo_slot_ids.len == 8);
+}
 /// Count of cycle slots that attach `AiPerception` + `AiAffect` (timid,
-/// aggressive, curious) — kept in sync with the switch below by
-/// `demoCognitionAgentCount`'s doc comment; update both together.
+/// aggressive, curious) — kept in sync with `demo_slot_ids`' cognition subset
+/// by `demoCognitionAgentCount`'s doc comment; update both together.
 const demo_cognition_archetypes_per_cycle: usize = 3;
 
-/// Hardcoded personality archetypes for the demo (full data-driven archetype
-/// JSON is Slice 33). A subset of demo movers gets full cognition
-/// (`AiPerception` + `AiMemory` + `AiAffect`) with a distinct emotion
-/// baseline and gain profile each:
-///
-/// - `timid` (index 3, `.ally` faction): high `baseline_fear` / `gain_flee`.
-///   `.ally` faction makes the `.hostile`-faction majority (including
-///   `aggressive`) a genuine perceived threat, so fear/flee has a real
-///   non-player source, not just the demo `focus_target` fallback.
-/// - `aggressive` (index 4): high `baseline_aggression` / `gain_pursue`.
-///   Perceives `timid`'s `.ally` faction as hostile, so it can chase a
-///   non-player target purely from perception.
-/// - `curious` (index 5): high `baseline_curiosity` / `gain_investigate`,
-///   reacts to heard dig stimuli.
-/// - `cohesive` (index 6): high `gain_cohere` only -- cohere's goal comes
-///   from the shared spatial index (`ai.zig`'s neighbor-mean gather), not
-///   perception/memory/affect, so no cognition components are needed.
-///
-/// The remaining slots keep pre-arbitration-style contrast groups: a
-/// wander-only `AiAgent` with zero pursue gain (index 0), two
-/// `focus_target`-fallback pursuers with no cognition components (indices 1
-/// and 7) that only ever reach the player through arbitration's documented
-/// last-resort fallback, and a pure wanderer with no `AiAgent` at all (index
-/// 2). Indices 0/1 intentionally keep a real `AiAgent` (never `null`): a
-/// handful of tests pin `test_squares[0]`/`[1]`/`[3]` as "the AI squares".
-fn demoArchetypeForIndex(index: usize) DemoArchetype {
-    return switch (index % demo_archetype_cycle_len) {
-        0 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 58, .gain_pursue = 0 } },
-        1 => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 4, .gain_pursue = 1.2 } },
-        2 => .{ .behavior = null },
-        3 => .{
-            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 20, .gain_flee = 2.0, .gain_pursue = 0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_fear = 0.65 },
-            .faction = .ally,
-        },
-        4 => .{
-            .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 6, .gain_pursue = 2.0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_aggression = 0.65 },
-        },
-        5 => .{
-            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 15, .gain_investigate = 2.0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_curiosity = 0.65 },
-        },
-        6 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 10, .gain_cohere = 2.0 } },
-        else => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 7, .gain_pursue = 1.55 } },
-    };
+/// Resolves the data-driven bundle for the demo's cyclic personality slot.
+fn demoArchetypeForIndex(catalog: *const AiArchetypeCatalog, index: usize) DemoArchetype {
+    return catalog.bundleForId(demo_slot_ids[index % demo_archetype_cycle_len]);
 }
 
 fn demoSteeringAgent(size: math.Vec2) SteeringAgent {
@@ -1167,6 +1160,7 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
 }
 
@@ -1304,6 +1298,7 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
     defer demo.deinit();
 
@@ -1371,7 +1366,7 @@ test "demo init validates atlas-backed references at loading boundary" {
     var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
 
-    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height);
+    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), demo_test_viewport_width, demo_test_viewport_height);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
@@ -1401,6 +1396,7 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
     defer demo.deinit();
 
@@ -1430,7 +1426,7 @@ test "demo init rejects missing character atlas metadata" {
 
     try std.testing.expectError(
         error.SpriteAtlasMetadataUnavailable,
-        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height),
+        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), demo_test_viewport_width, demo_test_viewport_height),
     );
 }
 
@@ -1657,6 +1653,7 @@ test "demo owns and completes a simulation frame during update" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1704,6 +1701,7 @@ test "demo queues jet loop audio only on movement edges" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1716,6 +1714,7 @@ test "demo queues jet loop audio only on movement edges" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1729,6 +1728,7 @@ test "demo queues jet loop audio only on movement edges" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1767,6 +1767,7 @@ test "demo collision response blocks player against obstacles" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1813,6 +1814,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
             .input = &InputState{},
             .audio = &audio,
             .runtime_assets = &runtime_assets,
+            .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
             .delta_seconds = 0.016,
             .transitions = &transitions,
             .thread_system = &threads,
@@ -1885,6 +1887,7 @@ test "demo collision response handles player contacts with moving entities" {
         .input = &InputState{},
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1927,6 +1930,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
         .input = &InputState{},
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,

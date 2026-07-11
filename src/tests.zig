@@ -36,6 +36,8 @@ comptime {
     _ = @import("core/logging.zig");
     _ = @import("core/rng.zig");
     _ = @import("core/simd.zig");
+    _ = @import("game/ai_archetypes.zig");
+    _ = @import("game/ai_debug_overlay.zig");
     _ = @import("game/audio_controller.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/dig_controller.zig");

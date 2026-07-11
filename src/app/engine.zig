@@ -294,6 +294,7 @@ pub const Engine = struct {
             .input = &self.input,
             .audio = &self.audio_commands,
             .runtime_assets = &self.runtime_assets,
+            .asset_store = self.assets,
             .delta_seconds = delta_seconds,
             .transitions = &self.transitions,
             .thread_system = &self.thread_system,
@@ -349,6 +350,7 @@ pub const Engine = struct {
                     .text_service = &self.text_service,
                     .interpolation_alpha = interpolation_alpha,
                     .thread_system = &self.thread_system,
+                    .debug_overlay_visible = self.debug_overlay.visible,
                     .perf = perf_context,
                 });
                 if (comptime runtime_perf_log.enabled) {

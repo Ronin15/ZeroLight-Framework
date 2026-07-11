@@ -79,7 +79,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 
 | Slice | Status | Open work (see slice section for full Checklist) |
 | --- | --- | --- |
-| **33** | **Next** | Data-driven AI archetypes + debug introspection — depends on Slice 32 (landed) |
+| **33** | Landed (visual/GPU-smoke verification pending) | Data-driven AI archetypes (JSON→enum bundle table) + debug introspection overlay — implemented and unit-tested; on-screen viz (F2) confirmed only via `gpu-smoke`/manual run |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — after 32 reshapes AI loops |
 | **37** | Partial | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening — stale-doc checklist item landed; rest open |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
@@ -412,8 +412,15 @@ Shared design contracts for the whole track:
     unless a later slice explicitly owns a contract change.
 ## Slice 33: Data-Driven AI Archetypes And Debug Introspection
 
-**Status: not started.** Depends on Slice 32's behavior set, `AiAgent` gains,
-and hot `active_behavior` columns.
+**Status: landed (on-screen visual/`gpu-smoke` verification pending).** Archetype
+catalog (`src/game/ai_archetypes.zig` + `assets/ai/archetypes.json`) loads at
+init through `UpdateContext.asset_store`, spawns replace the deleted
+`demoArchetypeForIndex` literals with byte-identical parity, and the AI
+introspection overlay (`src/game/ai_debug_overlay.zig`) draws under the existing
+F2 / gamepad-BACK toggle. All checklist/acceptance items are integrated and
+unit-tested; only the on-screen appearance (F2 in a live/`gpu-smoke` run) is
+unconfirmed in a headless environment. Kept in the frontier (not archived) until
+that visual pass, mirroring Slice 43.
 
 Goal: make the closed emergent-AI loop **authorable without recompiling** and
 **observable while tuning**, so personalities (timid / curious / aggressive /
@@ -452,7 +459,7 @@ or string behavior names on the hot path.
 
 ### Checklist
 
-- [ ] Define archetype JSON schema (documented in `docs/` or beside the loader):
+- [x] Define archetype JSON schema (documented in `docs/` or beside the loader):
       faction, optional perception/memory/**affect** blocks (per-drive baseline,
       decay_rate, threshold — and, once Slice 42 lands, appraisal gains),
       `AiAgent` behavior gains and wander amplitude, steering defaults,
@@ -463,23 +470,23 @@ or string behavior names on the hot path.
       `vision_range` near 0 and a large `hearing_range`) — mechanically
       already supported since these are cold per-entity fields, not global
       constants; today's demo archetypes (Slice 32) just don't vary them.
-- [ ] Implement loader + strict validation tests (good file, missing field,
+- [x] Implement loader + strict validation tests (good file, missing field,
       out-of-range gain, unknown behavior key, unknown faction, **unknown
       affect drive key**).
-- [ ] Register archetypes in runtime asset / content path used by
+- [x] Register archetypes in runtime asset / content path used by
       `LoadingState` (same install-tree rules as other assets).
-- [ ] Migrate demo spawns to named archetypes (minimum set: `timid`,
+- [x] Migrate demo spawns to named archetypes (minimum set: `timid`,
       `curious`, `aggressive`, `cohesive`, optional `wanderer`) whose
       **emotion baselines** differ enough to show flee / investigate / pursue /
       cohere under the same world.
-- [ ] Extend debug overlay (gated by existing debug flag):
+- [x] Extend debug overlay (gated by existing debug flag):
       - vision cone / range ring from perception cold+facing
       - **emotion drive bars** (fear/curiosity/aggression/fatigue; above-
         threshold highlight)
       - last-known memory marker + ring ticks
       - active behavior label
       - scope/tier counts from existing scope stats (no new sim policy)
-- [ ] Document authoring workflow in `docs/development-workflow.md` or a short
+- [x] Document authoring workflow in `docs/development-workflow.md` or a short
       `docs` note linked from the atlas/AI sections — include "how to tune a
       personality's feelings" via affect blocks.
 - [ ] Optional: promote deferred `memory_expired` event only if debug or a
@@ -487,16 +494,23 @@ or string behavior names on the hot path.
 
 ### Acceptance checks
 
-- [ ] Archetypes load from data with strict validation; spawns apply component
-      bundles identical to hand-built fixtures for the same numbers.
+- [x] Archetypes load from data with strict validation; spawns apply component
+      bundles identical to hand-built fixtures for the same numbers. (Loader
+      parity test asserts each catalog bundle equals the deleted literals
+      field-for-field.)
 - [ ] Demo shows differentiated behavior under the same world stimuli without
       code edits to gains (**timid fear → flee**, **curious → investigate dig
-      noise**, aggressive pursues, cohesive clumps).
-- [ ] Debug overlay visualizes perception / **emotion drives** / memory /
+      noise**, aggressive pursues, cohesive clumps). (Mechanism verified: the
+      `ai` bench shows all five behaviors emerging from the varied archetype
+      baselines; the on-screen scene is the one item pending a live/`gpu-smoke`
+      run.)
+- [x] Debug overlay visualizes perception / **emotion drives** / memory /
       active behavior / scope without changing serial simulation checksums /
-      intent streams.
-- [ ] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
-      passes.
+      intent streams. (Read-only const-slice gather; determinism test proves the
+      AI columns are byte-identical before/after gather.)
+- [x] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
+      passes. (Spawn resolves `@intFromEnum` → prevalidated bundle; strict
+      load-time parse only.)
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 
 Goal: restructure the existing scalar per-agent / per-neighbor loops in AI and
@@ -1416,8 +1430,8 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 30. AI memory and scope-aware AI state policy.
 31. AI affect and emotion drives.
 32. AI behavior arbitration (**consume emotion drives**) — landed.
-33. Data-driven AI archetypes and debug introspection (incl. affect blocks). **← next**
-39. Sensory stimulus ecosystem (richer hearing/investigate inputs).
+33. Data-driven AI archetypes and debug introspection (incl. affect blocks). — landed (visual/GPU-smoke verification pending).
+39. Sensory stimulus ecosystem (richer hearing/investigate inputs). **← next**
 41. World interest / affordance markers (multi-source goals).
 40. Action and interaction intent substrate (non-locomotion emergence).
 45. First action-intent consumer domain controller / destructibles (after 40).

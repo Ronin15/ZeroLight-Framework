@@ -64,6 +64,14 @@ calls it only when `@hasDecl(T, "onResume")`). Only gameplay-owning states
 like `GameDemoState` implement `onResume`; pure UI states typically implement
 `onPause` alone.
 
+`UpdateContext` carries `asset_store` (an `assets.AssetStore` handle) so a state
+can load content catalogs at init from the traversal-safe asset root —
+`GameDemoState` uses it to load the AI archetype catalog
+(`assets/ai/archetypes.json`). `RenderContext` carries `debug_overlay_visible`,
+mirrored from the Engine-owned debug overlay's F2 / gamepad-BACK toggle; a state
+reads it to gate render-only debug draws (e.g. the AI introspection overlay)
+without owning input or a second toggle.
+
 ## Transitions
 
 Use `StateTransitions` from inside a state when a change should happen after the
@@ -92,8 +100,10 @@ when the stack shuts down.
 
 Menu activation should not directly construct gameplay states that require
 runtime catalogs. `MainMenuState` installs an opaque `LoadingState`; that state
-receives `UpdateContext.runtime_assets`, builds the `GameDemoState` world from
-Engine-owned runtime assets, and replaces itself with owned gameplay.
+receives `UpdateContext.runtime_assets` and `UpdateContext.asset_store`, builds
+the `GameDemoState` world from Engine-owned runtime assets (and loads the AI
+archetype catalog through the asset store), and replaces itself with owned
+gameplay.
 
 ## Policies
 

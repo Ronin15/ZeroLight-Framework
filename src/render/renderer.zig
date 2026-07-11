@@ -407,6 +407,13 @@ pub const Renderer = struct {
         });
     }
 
+    /// The 1x1 opaque white texture backing solid tinted quads. Debug viz that
+    /// needs a rotated solid quad (vision cones, ring arcs) builds a `Sprite`
+    /// over this directly, since `submitOrderedRectInSpace` is axis-aligned only.
+    pub fn whiteTexture(self: *const Renderer) TextureId {
+        return self.white_texture;
+    }
+
     pub fn setCamera(self: *Renderer, camera: Camera2D) void {
         self.batch.setCamera(camera);
     }

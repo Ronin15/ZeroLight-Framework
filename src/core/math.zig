@@ -154,6 +154,13 @@ pub fn rotate2D(v: Vec2, angle: SinCos) Vec2 {
     };
 }
 
+/// Angle (radians, `[-pi, pi]`) of the vector `(x, y)` measured from +x. The
+/// single project chokepoint for direction -> angle conversion (e.g. baking a
+/// facing vector into a `Sprite.rotation`), so callers never inline the trig.
+pub fn atan2(y: f32, x: f32) f32 {
+    return std.math.atan2(y, x);
+}
+
 test "aabbFromOffsetSize derives min/max corners from origin, offset, and size" {
     const rect = aabbFromOffsetSize(.{ .x = 10, .y = 20 }, .{ .x = 1, .y = 2 }, .{ .x = 8, .y = 4 });
     try std.testing.expectEqual(@as(f32, 11), rect.min_x);
@@ -296,6 +303,15 @@ test "rotate2D rotates points by a precomputed sin/cos pair" {
         rotate2D(point, angle).y,
         1.0e-6,
     );
+}
+
+test "atan2 recovers the angle sinCos rotated a +x unit vector by" {
+    for ([_]f32{ 0, 0.5, 1.2, -0.8, std.math.pi / 2.0, -std.math.pi / 2.0 }) |angle| {
+        const dir = rotate2D(.{ .x = 1, .y = 0 }, sinCos(angle));
+        try std.testing.expectApproxEqAbs(angle, atan2(dir.y, dir.x), 1.0e-6);
+    }
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, atan2(1, 0), 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), atan2(0, 1), 1.0e-6);
 }
 
 test "clampMinMax matches SIMD clamp and tolerates NaN" {

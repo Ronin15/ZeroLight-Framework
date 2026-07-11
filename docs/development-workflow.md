@@ -182,6 +182,38 @@ registered runtime atlas PNG/JSON sidecars. When `source_assets/` is present,
 lint also compares the source-driven generated manifests against the runtime
 sidecars so additions and art swaps are caught before commit.
 
+## AI Archetypes
+
+Demo AI personalities are data, not code. `assets/ai/archetypes.json` holds one
+self-declaring entry per `AiArchetypeId` (`src/game/ai_archetypes.zig`); the
+loader parses it at load time (strict — an unknown or misspelled key fails the
+load) into a fixed enum → prevalidated component-bundle table, and
+`GameDemoState` spawns from that table. Editing the JSON changes behavior with
+no recompile.
+
+Each entry sets a `faction` and optional `agent` / `perception` / `memory` /
+`affect` blocks. Within a block, only non-default fields need to be written —
+omitted numeric fields fall back to the component's own struct defaults, so an
+entry stays terse. Out-of-range values are rejected at load by the same
+`validateAi*` checks the runtime uses.
+
+To tune a personality's **feelings**, edit its `affect` block: the four drive
+baselines (`baseline_fear` / `baseline_curiosity` / `baseline_aggression` /
+`baseline_fatigue`, each `0..1`) set resting emotion, and optional `decay_rate_*`
+/ `threshold_*` control how fast a drive relaxes and when it crosses into
+above-threshold behavior. Higher `baseline_fear` biases toward flee, higher
+`baseline_curiosity` toward investigate, and so on — arbitration maps drives to
+behavior through the weight table in `src/game/systems/arbitration.zig`. Give an
+archetype a `perception` block with a longer `vision_range` (keen-eyed sentry)
+or a near-zero `vision_range` with a large `hearing_range` (blind tracker) to
+differentiate senses. After editing, run `zig build test` to re-validate the
+catalog.
+
+Press **F2** (or gamepad **BACK**) at runtime to toggle the debug overlay: it
+draws each nearby agent's vision cone, emotion drive bars, memory markers, and
+active behavior label, plus scope/tier counts — read-only, so it never changes
+simulation.
+
 ## Testing
 
 Tests follow Zig conventions: small unit tests live beside the code they cover

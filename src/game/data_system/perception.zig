@@ -27,7 +27,7 @@ pub fn validateAiPerception(perception: AiPerception) !void {
     if (perception.hearing_range > max_ai_perception_hearing_range) return error.InvalidAiPerception;
 }
 
-fn cosHalfFov(fov_half_angle_radians: f32) f32 {
+pub fn cosHalfFov(fov_half_angle_radians: f32) f32 {
     // The f32 nearest pi/2 rounds slightly high, so @cos(pi/2) evaluates to a
     // tiny negative value rather than exactly 0. Clamp so cos_half_fov never
     // goes negative at the validated (0, pi/2] boundary, matching the "FOV

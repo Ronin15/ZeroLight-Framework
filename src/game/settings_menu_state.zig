@@ -7,6 +7,7 @@ const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -255,6 +256,7 @@ test "settings volumes clamp and emit gain commands" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0,
         .transitions = &transitions,
         .thread_system = &threads,

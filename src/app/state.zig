@@ -11,6 +11,7 @@ const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
 const runtime_perf_log = @import("runtime_perf_log.zig");
 const log = @import("../core/logging.zig").app;
 const inputRouter = @import("input_router.zig");
@@ -62,6 +63,9 @@ pub const UpdateContext = struct {
     input: *const InputState,
     audio: *AudioCommandBuffer,
     runtime_assets: *const RuntimeAssets,
+    // Path-safe asset reader threaded through to state init (e.g. loading the AI
+    // archetype catalog); a tiny copyable handle, not per-frame render state.
+    asset_store: AssetStore,
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
@@ -75,6 +79,10 @@ pub const RenderContext = struct {
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
     ui_stack_order: UiStackOrder = .base,
+    // Mirrors the engine-owned F2 / gamepad-BACK debug toggle
+    // (`debug_overlay.visible`); gameplay states use it to gate render-only AI
+    // introspection viz. Off by default so bench and tests never draw it.
+    debug_overlay_visible: bool = false,
     perf: runtime_perf_log.Context = .{},
 };
 
@@ -643,6 +651,7 @@ fn testUpdateContext(
         .input = input,
         .audio = audio,
         .runtime_assets = runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = delta_seconds,
         .transitions = transitions,
         .thread_system = thread_system,

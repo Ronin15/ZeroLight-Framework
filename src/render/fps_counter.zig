@@ -123,7 +123,10 @@ pub const FpsCounter = struct {
     }
 };
 
-fn overlayFontSize(drawable_pixel_scale: f32) f32 {
+/// Drawable-space pixel height of the FPS line at a given pixel scale. Public so
+/// other debug overlays (e.g. the AI scope HUD) can offset below the FPS line
+/// with a gap that tracks it exactly across DPI scales.
+pub fn overlayFontSize(drawable_pixel_scale: f32) f32 {
     return font_size * @max(1.0, drawable_pixel_scale);
 }
 
