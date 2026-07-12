@@ -1,19 +1,62 @@
 # ZeroLight-Framework
 
-Agent instructions for this repository. ZeroLight-Framework is a 2D game
-framework built on **Zig 0.16** and **SDL3 / SDL_GPU**. It runs a thin
-executable timing layer over a fixed-step **60Hz** simulation, a state stack
-with policy-driven input routing, and atlas-backed runtime assets addressed by
-stable IDs. Gameplay is data-oriented: dense **SoA** stores for entities and
-world data (`DataSystem`, `WorldSystem`), with a state-owned
-`SimulationPipeline`, scoped simulation tiers, and multithreaded/SIMD processors
-for movement, AI, steering, collision, pathfinding, and particles.
+Primary project rules for **Grok Build** (also consumed by Cursor/Claude Code
+compat). ZeroLight-Framework is a 2D game framework built on **Zig 0.16** and
+**SDL3 / SDL_GPU**. It runs a thin executable timing layer over a fixed-step
+**60Hz** simulation, a state stack with policy-driven input routing, and
+atlas-backed runtime assets addressed by stable IDs. Gameplay is data-oriented:
+dense **SoA** stores for entities and world data (`DataSystem`, `WorldSystem`),
+with a state-owned `SimulationPipeline`, scoped simulation tiers, and
+multithreaded/SIMD processors for movement, AI, steering, collision,
+pathfinding, and particles.
 
 Shared repo contract (snapshot, docs routing, module ownership, working rules,
 build commands) mirrors `CLAUDE.md`. Keep both in sync when those sections
 change. Do not duplicate full repo documentation here — read the canonical
 `docs/` entries below for details and update them when architecture, workflow,
 or roadmap content changes.
+
+## Grok model routing (plan/review vs code)
+
+Use two models by role. This is **project policy**; Grok does not switch the
+parent session model from markdown alone — pin subagents in
+`~/.grok/config.toml` and use `/model` (or start the session on the right model)
+for the parent.
+
+| Role | Model | Use for |
+|------|--------|---------|
+| **Plan / design / review** | **Grok 4.5** (`grok-4.5`) | Architecture, design docs, multi-agent review, residual-diff review, synthesis, adversarial checking of findings, roadmap/slice planning |
+| **Implement / debug / code** | **Composer 2.5** (`grok-composer-2.5-fast`) | Writing/editing Zig, fixing compile/test failures, mechanical refactors, applying an already-approved plan |
+
+### How agents should behave
+
+- **Parent session on Grok 4.5:** prefer planning, review, and orchestration; when implementation is needed, **delegate coding to** `zig-specialist` / `zig-debug-specialist` (Composer-pinned) rather than bulk-editing the tree yourself unless the change is tiny (1–2 files, no design risk).
+- **Parent session on Composer 2.5:** implement and debug against an agreed plan; for non-trivial design or a full review pass, say so and prefer Grok 4.5 (or spawn `zig-design-specialist` / `zig-review-specialist`).
+- **Never** treat model choice as a reason to skip `docs/` ownership, coding standards, or `zig build verify`.
+
+### Enforce subagent models (user config)
+
+Project `.grok/config.toml` cannot set models (Grok loads model settings only from
+`~/.grok/config.toml`). Recommended pin:
+
+```toml
+# ~/.grok/config.toml
+[subagents.models]
+# Plan / review (Grok 4.5)
+plan = "grok-4.5"
+explore = "grok-4.5"
+zig-design-specialist = "grok-4.5"
+zig-review-specialist = "grok-4.5"
+# Code / debug (Composer 2.5)
+general-purpose = "grok-composer-2.5-fast"
+zig-specialist = "grok-composer-2.5-fast"
+zig-debug-specialist = "grok-composer-2.5-fast"
+```
+
+Parent default is still your choice, e.g. `default = "grok-4.5"` for
+review-heavy sessions or `default = "grok-composer-2.5-fast"` for implement-heavy
+days. Switch anytime with `/model grok-4.5` or `/model grok-composer-2.5-fast`.
+Confirm with `grok models` and `grok inspect`.
 
 ## Source Of Truth (`docs/`)
 
@@ -146,6 +189,49 @@ release candidates. **Packaged builds ship `ReleaseFast`** — see
 `docs/development-workflow.md` for the required pre-release ReleaseSafe
 soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 
+## Grok Build Setup
+
+Grok loads this file as project rules (`AGENTS.md` / `Agents.md`). With Cursor
+compat on (default), it also uses `.cursor/agents/` and
+`.cursor/skills/zig-workflows/`. Claude compat can load `.claude/` mirrors.
+
+| Layer | Path | Role |
+|-------|------|------|
+| Global contract | `AGENTS.md` (this file) | Guardrails, docs routing, model routing, build commands |
+| Shared twin | `CLAUDE.md` | Claude Code contract; keep shared sections in sync |
+| Workflows | `.cursor/skills/zig-workflows/SKILL.md` | When to design / implement / debug / review |
+| Subagents | `.cursor/agents/zig-*.md` | Specialist prompts (mirrored under `.claude/agents/`) |
+| File rules | `.cursor/rules/*.mdc` | Auto-attach context for `src/game/**`, `src/render/**` |
+| Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables |
+| Project Grok cfg | `.grok/config.toml` | MCP / permissions only — **not** model defaults |
+
+### What Grok needs from this file (checklist)
+
+- [x] Project snapshot + Zig 0.16 / SDL3 stack
+- [x] Canonical `docs/` map (do not invent architecture)
+- [x] Module ownership (`src/` boundaries)
+- [x] Working rules (hot path, budgets, allocators, fixtures)
+- [x] Build & verify commands
+- [x] Specialist workflow table + when to delegate
+- [x] Model routing (Grok 4.5 plan/review vs Composer 2.5 code)
+- [x] Bench vs test separation
+- [ ] Hard subagent model pins live in **user** `~/.grok/config.toml` (see above)
+
+Workflows in `zig-workflows` auto-invoke when tasks match. You can also ask
+directly ("use zig-review-specialist", "review my branch", "fix this test
+failure").
+
+| Workflow | Subagent | Preferred model | When |
+|----------|----------|-----------------|------|
+| Design | `zig-design-specialist` | Grok 4.5 | Before non-trivial gameplay/ECS/pipeline work |
+| Implement | `zig-specialist` | Composer 2.5 | Zig implementation in owning modules |
+| Debug | `zig-debug-specialist` | Composer 2.5 | Build/test/shader/SDL/GPU/runtime failures |
+| Review | `zig-review-specialist` | Grok 4.5 | PR/diff / residual-diff review |
+| Architecture assessment | `zig-design-specialist` | Grok 4.5 | Emergent-gameplay readiness report |
+| Module review | `zig-review-specialist` × N | Grok 4.5 | Module-wide pass (pathfinder preset) |
+| Best-practices review | `zig-review-specialist` × N | Grok 4.5 | Hot-subsystem Zig best-practice pass |
+| Deep-correctness review | `zig-review-specialist` × N | Grok 4.5 | Concurrency, algorithms, determinism, test gaps |
+
 ## Claude Code Setup (`.claude/`)
 
 | Layer | Path | Role |
@@ -171,22 +257,9 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 | File rules | `.cursor/rules/*.mdc` | Auto-attach for `src/game/**` and `src/render/**` |
 | Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables |
 
-Claude Code also ships `.claude/workflows/*.js` for orchestrated multi-phase passes; Cursor
-approximates those via Task subagents + presets in `module-presets.md`.
-
-Workflows in `zig-workflows` auto-invoke when tasks match. You can also ask directly
-("use zig-review-specialist", "review my branch", "fix this test failure").
-
-| Workflow | Subagent | When |
-|----------|----------|------|
-| Design | `zig-design-specialist` | Before non-trivial gameplay/ECS/pipeline work |
-| Implement | `zig-specialist` | Zig implementation in owning modules |
-| Debug | `zig-debug-specialist` | Build/test/shader/SDL/GPU/runtime failures |
-| Review | `zig-review-specialist` | PR/diff review |
-| Architecture assessment | `zig-design-specialist` | Emergent-gameplay readiness report |
-| Module review | `zig-review-specialist` × N | Module-wide pass (pathfinder preset) |
-| Best-practices review | `zig-review-specialist` × N | Hot-subsystem Zig best-practice pass |
-| Deep-correctness review | `zig-review-specialist` × N | Concurrency, algorithms, determinism, test gaps |
+Claude Code also ships `.claude/workflows/*.js` for orchestrated multi-phase
+passes; Grok/Cursor approximate those via Task subagents + presets in
+`module-presets.md`.
 
 ## Agent Working Practices
 
