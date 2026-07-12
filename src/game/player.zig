@@ -96,7 +96,6 @@ pub const Player = struct {
         const body = data.movementBodyPtr(self.entity) orelse return;
         body.previous_x.* = body.position_x.*;
         body.previous_y.* = body.position_y.*;
-        body.previous_z.* = body.position_z.*;
     }
 };
 
@@ -186,23 +185,18 @@ test "player pause and resume sync previous position to current data position" {
     body.position_y.* = 24;
     body.previous_x.* = 2;
     body.previous_y.* = 4;
-    body.position_z.* = 12;
-    body.previous_z.* = 2;
 
     player.onPause(&data);
 
     const paused = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(paused.position.x, paused.previous_position.x);
     try std.testing.expectEqual(paused.position.y, paused.previous_position.y);
-    try std.testing.expectEqual(paused.position_z, paused.previous_z);
 
     body.position_x.* = 48;
     body.position_y.* = 96;
-    body.position_z.* = 24;
     player.onResume(&data);
 
     const resumed = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(resumed.position.x, resumed.previous_position.x);
     try std.testing.expectEqual(resumed.position.y, resumed.previous_position.y);
-    try std.testing.expectEqual(resumed.position_z, resumed.previous_z);
 }

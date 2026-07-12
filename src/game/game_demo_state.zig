@@ -937,10 +937,8 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk e;
     };
 
-    const z = world.levelBaseZ(spec.world_level);
     const body = data.movementBodyPtr(entity).?;
-    body.position_z.* = z;
-    body.previous_z.* = z;
+    body.snapZ(world.levelBaseZ(spec.world_level));
     try data.setSimulationMetadata(entity, .{
         .tier = .cognition,
         .chunk = world.chunkCoordForWorldPos(spec.position.x, spec.position.y),

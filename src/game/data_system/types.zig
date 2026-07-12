@@ -108,7 +108,6 @@ pub const MovementBody = struct {
     position: math.Vec2 = .{},
     previous_position: math.Vec2 = .{},
     position_z: i32 = 0,
-    previous_z: i32 = 0,
     velocity: math.Vec2 = .{},
     speed: f32 = 0,
 };
@@ -119,16 +118,15 @@ pub const MovementBodyPtr = struct {
     position_z: *i32,
     previous_x: *f32,
     previous_y: *f32,
-    previous_z: *i32,
     velocity_x: *f32,
     velocity_y: *f32,
     speed: *f32,
 
-    // z is not interpolated: previous_z must always equal position_z when
-    // snapping a body onto a plane (level-change, spawn, fall, ramp).
+    // z is a discrete depth-sort plane index, not integrated or interpolated
+    // (the renderer orders by position_z directly), so snapping onto a plane
+    // only sets position_z. There is no previous-z interpolation baseline.
     pub fn snapZ(self: MovementBodyPtr, z: i32) void {
         self.position_z.* = z;
-        self.previous_z.* = z;
     }
 };
 
@@ -141,7 +139,6 @@ pub const MovementBodySlice = struct {
     position_z: HotI32Slice,
     previous_x: HotF32Slice,
     previous_y: HotF32Slice,
-    previous_z: HotI32Slice,
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
@@ -156,7 +153,6 @@ pub const ConstMovementBodySlice = struct {
     position_z: ConstHotI32Slice,
     previous_x: ConstHotF32Slice,
     previous_y: ConstHotF32Slice,
-    previous_z: ConstHotI32Slice,
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,

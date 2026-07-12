@@ -596,7 +596,6 @@ fn initFixture(
             .position = position,
             .previous_position = position,
             .position_z = @intCast(@as(i32, @intCast(index % 17)) - 8),
-            .previous_z = @intCast(@as(i32, @intCast(index % 17)) - 8),
         });
         syncEntityScopeChunk(&fixture.data, entity, &fixture.world, position);
         try fixture.data.setPrimitiveVisual(entity, .{

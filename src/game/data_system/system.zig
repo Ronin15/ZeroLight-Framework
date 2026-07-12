@@ -1045,7 +1045,6 @@ fn expectMovementBodyColumnsAligned(slice: ConstMovementBodySlice) !void {
     try std.testing.expectEqual(slice.entities.len, slice.position_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.previous_y.len);
-    try std.testing.expectEqual(slice.entities.len, slice.previous_z.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_x.len);
     try std.testing.expectEqual(slice.entities.len, slice.velocity_y.len);
     try std.testing.expectEqual(slice.entities.len, slice.speed.len);
@@ -1362,7 +1361,6 @@ test "movement body store is row aligned and compact after removal" {
         try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 2, slice.position_z[index]);
         try std.testing.expectEqual(expected + 20, slice.previous_x[index]);
         try std.testing.expectEqual(expected + 30, slice.previous_y[index]);
-        try std.testing.expectEqual(@as(i32, @intFromFloat(expected)) - 1, slice.previous_z[index]);
         try std.testing.expectEqual(expected + 40, slice.velocity_x[index]);
         try std.testing.expectEqual(expected + 50, slice.velocity_y[index]);
         try std.testing.expectEqual(expected + 60, slice.speed[index]);
@@ -2703,7 +2701,6 @@ fn testBody(base: f32) MovementBody {
         .position = .{ .x = base, .y = base + 10 },
         .previous_position = .{ .x = base + 20, .y = base + 30 },
         .position_z = @as(i32, @intFromFloat(base)) - 2,
-        .previous_z = @as(i32, @intFromFloat(base)) - 1,
         .velocity = .{ .x = base + 40, .y = base + 50 },
         .speed = base + 60,
     };

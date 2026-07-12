@@ -59,11 +59,9 @@ pub const MovementSystem = struct {
 /// separate pass (SimulationScopeSystem.deriveChunks); movement only integrates
 /// position, so its benchmark exercises exactly this production path.
 ///
-/// Only x/y are snapshotted for render interpolation: z is a discrete plane index,
-/// not integrated here and not interpolated by the renderer, and `previous_z ==
-/// position_z` is held by `snapZ` at every z-change (see data_system/types.zig). So
-/// movement never touches z — copying it here would be dead work that also breaks
-/// the vectorized loop with a scalar per-lane store.
+/// Only x/y are snapshotted for render interpolation: z is a discrete plane index
+/// the renderer orders by directly (never interpolated), so movement never reads or
+/// writes it — there is no previous-z to maintain, keeping the vectorized loop pure.
 fn updateMovementBodies(
     slice: *data.MovementBodySlice,
     thread_system: *ThreadSystem,
@@ -101,7 +99,6 @@ fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
     for (0..slice.entities.len) |index| {
         slice.previous_x[index] = slice.position_x[index];
         slice.previous_y[index] = slice.position_y[index];
-        slice.previous_z[index] = slice.position_z[index];
     }
 }
 
@@ -388,8 +385,8 @@ test "movement range only writes assigned items" {
 }
 
 test "integrate leaves the discrete z plane untouched" {
-    // z is not integrated or interpolated; previous_z == position_z is held by snapZ.
-    // Movement must not write z, so a body already on a plane keeps both z values.
+    // z is a discrete depth-sort plane index, not integrated or interpolated.
+    // Movement must not write z, so a body on a plane keeps its position_z.
     var game_data = data.DataSystem.init(std.testing.allocator);
     defer game_data.deinit();
 
@@ -402,7 +399,6 @@ test "integrate leaves the discrete z plane untouched" {
 
     const body = game_data.movementBodyConst(entity).?;
     try std.testing.expectEqual(@as(i32, 3), body.position_z);
-    try std.testing.expectEqual(@as(i32, 3), body.previous_z);
     // x/y still integrated + snapshotted as before.
     try std.testing.expectEqual(@as(f32, 10), body.previous_position.x);
     try std.testing.expectEqual(@as(f32, 10 + 5 * 0.5), body.position.x);
