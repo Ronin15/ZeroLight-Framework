@@ -70,16 +70,28 @@ fn updateMovementBodies(
 ) MovementStats {
     if (slice.entities.len == 0) return .{};
 
+    // Pre-select so the job context can dual-assert range.index against the
+    // dispatched range count (mirror affect.zig / collision.zig). Mirrors
+    // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
+    const selection = thread_system.selectBatchProfile(config.adaptive_tuner orelse &thread_system.adaptive_tuner, .{
+        .item_count = slice.entities.len,
+        .items_per_range = config.items_per_range,
+        .max_worker_threads = config.max_worker_threads,
+        .range_alignment_items = data.movement_range_alignment_items,
+        .adaptive = config.adaptive,
+    });
     var context = MovementJobContext{
         .slice = slice.*,
         .delta_seconds = delta_seconds,
+        .range_count = selection.range_count,
     };
     const batch = thread_system.parallelForWithOptions(slice.entities.len, &context, movementJob, .{
         .items_per_range = config.items_per_range,
         .max_worker_threads = config.max_worker_threads,
         .range_alignment_items = data.movement_range_alignment_items,
         .adaptive = config.adaptive,
-        .adaptive_tuner = config.adaptive_tuner,
+        .adaptive_tuner = selection.active_tuner,
+        .selected_profile = selection.profile,
     });
     return .{
         .body_count = slice.entities.len,
@@ -104,6 +116,9 @@ fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
 
 fn movementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *MovementJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig). Buffer bounds
+    // also live in processRange (shared with the serial path).
+    std.debug.assert(range.index < job.range_count);
     processRange(&job.slice, range, job.delta_seconds);
 }
 
@@ -153,6 +168,8 @@ fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delt
 
 const MovementJobContext = struct {
     slice: data.MovementBodySlice,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
     delta_seconds: f32,
 };
 
@@ -431,6 +448,50 @@ test "warmed movement update does not allocate" {
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
     try std.testing.expect(stats.batch.ran_inline);
+}
+
+test "threaded multi-worker movement update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+    try fillMovementData(&game_data, data.movement_range_alignment_items * 8);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = data.movement_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var slice = game_data.movementBodySlice();
+    const warmup = updateMovementBodies(&slice, &threads, 0.016, .{
+        .items_per_range = data.movement_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expect(!warmup.batch.ran_inline);
+
+    // Movement writes only into the caller's SoA columns and ThreadSystem
+    // work queues (both reserved at init); swap both to a failing allocator.
+    const original_data_allocator = game_data.allocator;
+    const original_thread_allocator = threads.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    game_data.allocator = failing_allocator.allocator();
+    threads.allocator = failing_allocator.allocator();
+    defer {
+        game_data.allocator = original_data_allocator;
+        threads.allocator = original_thread_allocator;
+    }
+
+    slice = game_data.movementBodySlice();
+    const stats = updateMovementBodies(&slice, &threads, 0.016, .{
+        .items_per_range = data.movement_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(data.movement_range_alignment_items * 8, stats.body_count);
 }
 
 test "dormant rows carry zero velocity and stay frozen across a full-range integrate" {

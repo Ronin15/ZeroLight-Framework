@@ -42,6 +42,9 @@ pub const Player = struct {
         try data.setPrimitiveVisual(entity, playerVisual());
         try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
         try data.setFaction(entity, .player);
+        // Pre-attach surface world_level so the first plane-traversal fall cannot
+        // OOM on component growth after carveLandingCell has already mutated a tile.
+        try data.setWorldLevel(entity, 0);
 
         return .{ .entity = entity };
     }
@@ -110,6 +113,13 @@ fn playerVisual() PrimitiveVisual {
         .marker_depth = Player.marker_depth,
         .marker_margin = Player.marker_margin,
     };
+}
+
+test "player spawn pre-attaches surface world_level" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    try std.testing.expectEqual(@as(?u16, 0), data.worldLevelConst(player.entity));
 }
 
 test "player movement clamps to state bounds" {

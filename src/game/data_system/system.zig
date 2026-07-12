@@ -97,6 +97,7 @@ const AiAffectSlice = types.AiAffectSlice;
 const structural = @import("structural.zig");
 const StructuralPlanScratch = structural.StructuralPlanScratch;
 const NullStructuralChangeSink = structural.NullStructuralChangeSink;
+const NullStructuralCommitPreparer = structural.NullStructuralCommitPreparer;
 const EntitySimulationMetadata = @import("../simulation_scope.zig").EntitySimulationMetadata;
 const SimulationScopeStats = @import("../simulation_scope.zig").SimulationScopeStats;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
@@ -313,9 +314,9 @@ pub const DataSystem = struct {
     }
 
     /// O(rows) scan of the dense scope tier column — the parity baseline for the
-    /// incrementally maintained `tier_counts`. Test/debug only; not on the hot path.
-    /// Counts entities with a movement body (the entities that carry a tier).
-    pub fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
+    /// incrementally maintained `tier_counts`. Same-file test/debug only; not on
+    /// the hot path. Counts entities with a movement body (those that carry a tier).
+    fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
         var counts = [4]usize{ 0, 0, 0, 0 };
         for (self.movement_bodies.scopeSliceConst().tier) |tier| {
             counts[@intFromEnum(tier)] += 1;
@@ -885,16 +886,6 @@ pub const DataSystem = struct {
         change_sink: anytype,
     ) !StructuralCommitStats {
         return structural.applyStructuralCommandsPrepared(self, commands, scratch, preparer, change_sink);
-    }
-
-    // Private, like the original: exercised directly by same-file (test)
-    // callers, not part of the public API surface.
-    fn commitStructuralCommands(
-        self: *DataSystem,
-        commands: []const StructuralCommand,
-        change_sink: anytype,
-    ) !StructuralCommitStats {
-        return structural.commitStructuralCommands(self, commands, change_sink);
     }
 
     fn preflightStructuralCommands(
@@ -2097,7 +2088,8 @@ test "structural command preflight follows destroy then create slot reuse" {
     defer data.allocator = original_allocator;
 
     var sink = NullStructuralChangeSink{};
-    const stats = try data.commitStructuralCommands(&commands, &sink);
+    var preparer = NullStructuralCommitPreparer{};
+    const stats = try data.applyStructuralCommandsPrepared(&commands, &scratch, &preparer, &sink);
     try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 1), data.movementBodySliceConst().entities.len);
@@ -2128,7 +2120,8 @@ test "structural command preflight counts duplicate component sets once" {
     defer data.allocator = original_allocator;
 
     var sink = NullStructuralChangeSink{};
-    const stats = try data.commitStructuralCommands(&commands, &sink);
+    var preparer = NullStructuralCommitPreparer{};
+    const stats = try data.applyStructuralCommandsPrepared(&commands, &scratch, &preparer, &sink);
     try std.testing.expectEqual(@as(usize, 2), stats.components_set);
     try std.testing.expectEqual(@as(usize, 1), data.primitiveVisualSliceConst().entities.len);
     try std.testing.expectEqual(@as(f32, 32), data.primitiveVisualConst(target).?.size.x);
@@ -2513,7 +2506,8 @@ test "structural command commit sets ai_perception without allocating after pref
     defer data.allocator = original_allocator;
 
     var sink = NullStructuralChangeSink{};
-    const stats = try data.commitStructuralCommands(&commands, &sink);
+    var preparer = NullStructuralCommitPreparer{};
+    const stats = try data.applyStructuralCommandsPrepared(&commands, &scratch, &preparer, &sink);
     try std.testing.expectEqual(@as(usize, 1), stats.created);
     try std.testing.expectEqual(@as(usize, 2), stats.components_set);
     const entity = data.movementBodySliceConst().entities[0];

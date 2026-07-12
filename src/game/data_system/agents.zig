@@ -300,6 +300,44 @@ pub const SteeringAgentStore = struct {
     }
 };
 
+test "AiAgentStore append is allocation-free after ensureCapacity reserves" {
+    var store: AiAgentStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "SteeringAgentStore append is allocation-free after ensureCapacity reserves" {
+    var store: SteeringAgentStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
 test "validateAiAgent accepts defaults and the max_ai_gain boundary, rejects each gain individually" {
     try validateAiAgent(.{});
     try validateAiAgent(.{

@@ -54,7 +54,13 @@ pub const FpsCounter = struct {
         }
 
         if (self.texture_dirty or !self.glyphsValid()) {
-            try self.prepareGlyphs(text_service, renderer);
+            // Idle once before glyph retirement so in-flight frames finish sampling
+            // prior textures. Mid-prepare errdefer only releases never-submitted
+            // textures (no idle needed). First prepare has nothing to retire.
+            if (self.glyphsValid()) {
+                renderer.waitForIdle();
+            }
+            try self.prepareGlyphs(text_service, @ptrCast(renderer));
         }
     }
 
@@ -105,12 +111,55 @@ pub const FpsCounter = struct {
         }
     }
 
-    fn prepareGlyphs(self: *FpsCounter, text_service: *TextService, renderer: *Renderer) !void {
-        self.prefix = try text_service.prepareText(renderer, TextRequest.init("FPS ", self.font, yellow));
-        for (&self.digits, 0..) |*digit_text, index| {
-            const digit = [_]u8{@intCast('0' + index)};
-            digit_text.* = try text_service.prepareText(renderer, TextRequest.init(&digit, self.font, yellow));
+    /// Prepares the fixed glyph set through `backend_context` (a `*Renderer` in
+    /// production, or a text `FakeBackend` in unit tests). Caller must have
+    /// already idled the GPU when retiring previously displayed live textures.
+    fn prepareGlyphs(self: *FpsCounter, text_service: *TextService, backend_context: *anyopaque) !void {
+        // Prepare the full new set first so a mid-prepare failure leaves the
+        // previously displayed glyphs intact. On success, retire old entries whose
+        // textures differ (font/DPI change) so the text cache does not grow for
+        // app lifetime. Same-key cache hits share the old texture handle — skip
+        // those so we do not free the just-prepared set.
+        const new_prefix = try text_service.prepareTextWithContext(backend_context, TextRequest.init("FPS ", self.font, yellow));
+        errdefer {
+            // Only retire on failure when this is a newly allocated cache entry,
+            // not a hit that still backs the currently displayed prefix.
+            if (!preparedTextSharesTexture(self.prefix, new_prefix)) {
+                var partial = [_]PreparedText{new_prefix};
+                text_service.destroyPreparedTextsWithContext(backend_context, &partial);
+            }
         }
+
+        var new_digits = [_]PreparedText{PreparedText.invalid} ** 10;
+        var prepared_digits: usize = 0;
+        errdefer {
+            for (new_digits[0..prepared_digits], 0..) |digit_text, index| {
+                if (preparedTextSharesTexture(self.digits[index], digit_text)) {
+                    new_digits[index] = .invalid;
+                }
+            }
+            text_service.destroyPreparedTextsWithContext(backend_context, new_digits[0..prepared_digits]);
+        }
+        for (&new_digits, 0..) |*digit_text, index| {
+            const digit = [_]u8{@intCast('0' + index)};
+            digit_text.* = try text_service.prepareTextWithContext(backend_context, TextRequest.init(&digit, self.font, yellow));
+            prepared_digits += 1;
+        }
+
+        var old_glyphs: [11]PreparedText = undefined;
+        old_glyphs[0] = self.prefix;
+        @memcpy(old_glyphs[1..], self.digits[0..]);
+        for (&old_glyphs, 0..) |*old, index| {
+            if (!old.isValid()) continue;
+            const new_glyph = if (index == 0) new_prefix else new_digits[index - 1];
+            if (preparedTextSharesTexture(old.*, new_glyph)) {
+                old.* = .invalid;
+            }
+        }
+        text_service.destroyPreparedTextsWithContext(backend_context, &old_glyphs);
+
+        self.prefix = new_prefix;
+        self.digits = new_digits;
         self.texture_dirty = false;
     }
 
@@ -134,6 +183,10 @@ fn approxEqAbs(a: f32, b: f32, tolerance: f32) bool {
     return @abs(a - b) <= tolerance;
 }
 
+fn preparedTextSharesTexture(a: PreparedText, b: PreparedText) bool {
+    return a.isValid() and b.isValid() and a.texture.matches(b.texture.index, b.texture.generation);
+}
+
 test "overlay font size follows drawable pixel scale" {
     try std.testing.expectEqual(@as(f32, 18), overlayFontSize(1));
     try std.testing.expectEqual(@as(f32, 36), overlayFontSize(2));
@@ -154,4 +207,124 @@ test "submitted frame sampling updates fps without dirtying cached glyphs" {
 
 test "fps counter uses fixed glyph set" {
     try std.testing.expectEqual(@as(usize, 10), @typeInfo(@TypeOf((FpsCounter{}).digits)).array.len);
+}
+
+test "prepareGlyphs twice with same keys does not destroy shared live textures" {
+    const allocator = std.testing.allocator;
+    var fake = text.FakeBackend{};
+    var service = try text.initFakeTextService(allocator, &fake);
+    defer service.deinitWithContext(&fake);
+
+    var fps = FpsCounter{
+        .font = service.defaultFont(),
+        .texture_dirty = true,
+    };
+
+    try fps.prepareGlyphs(&service, &fake);
+    try std.testing.expect(fps.glyphsValid());
+    try std.testing.expectEqual(@as(u32, 11), fake.render_count); // prefix + 0-9
+    try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
+    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+
+    const first_prefix = fps.prefix;
+    const first_digit0 = fps.digits[0];
+    const destroy_after_first = fake.destroy_count;
+
+    fps.texture_dirty = true;
+    try fps.prepareGlyphs(&service, &fake);
+    try std.testing.expect(fps.glyphsValid());
+    // Cache hits: no new renders, no destroys of shared live textures.
+    try std.testing.expectEqual(@as(u32, 11), fake.render_count);
+    try std.testing.expectEqual(destroy_after_first, fake.destroy_count);
+    try std.testing.expect(preparedTextSharesTexture(first_prefix, fps.prefix));
+    try std.testing.expect(preparedTextSharesTexture(first_digit0, fps.digits[0]));
+    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+}
+
+test "prepareGlyphs with different font retires prior glyphs and keeps cache bounded" {
+    const allocator = std.testing.allocator;
+    var fake = text.FakeBackend{};
+    var service = try text.initFakeTextService(allocator, &fake);
+    defer service.deinitWithContext(&fake);
+
+    var fps = FpsCounter{
+        .font = service.defaultFont(),
+        .texture_dirty = true,
+    };
+
+    try fps.prepareGlyphs(&service, &fake);
+    try std.testing.expectEqual(@as(u32, 11), fake.render_count);
+    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    const old_prefix = fps.prefix;
+    const old_digit0 = fps.digits[0];
+
+    const alt_path = try allocator.dupe(u8, text.default_font_path);
+    var alt_path_owned = true;
+    errdefer if (alt_path_owned) allocator.free(alt_path);
+    const alt_font = try service.registerFont(.{
+        .asset_path = alt_path,
+        .point_size = font_size * 2,
+    }, @ptrFromInt(2));
+    alt_path_owned = false;
+
+    fps.font = alt_font;
+    fps.texture_dirty = true;
+    try fps.prepareGlyphs(&service, &fake);
+
+    try std.testing.expect(fps.glyphsValid());
+    try std.testing.expectEqual(@as(u32, 22), fake.render_count);
+    // Prior 11 glyphs retired; only the new set remains live.
+    try std.testing.expectEqual(@as(u32, 11), fake.destroy_count);
+    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
+    try std.testing.expect(!preparedTextSharesTexture(old_prefix, fps.prefix));
+    try std.testing.expect(!preparedTextSharesTexture(old_digit0, fps.digits[0]));
+    try std.testing.expect(!old_prefix.texture.matches(fps.prefix.texture.index, fps.prefix.texture.generation));
+}
+
+test "prepareGlyphs mid-prepare failure keeps old glyphs and destroys only non-shared new" {
+    const allocator = std.testing.allocator;
+    var fake = text.FakeBackend{};
+    var service = try text.initFakeTextService(allocator, &fake);
+    defer service.deinitWithContext(&fake);
+
+    var fps = FpsCounter{
+        .font = service.defaultFont(),
+        .texture_dirty = true,
+    };
+
+    try fps.prepareGlyphs(&service, &fake);
+    const old_prefix = fps.prefix;
+    const old_digits = fps.digits;
+    try std.testing.expectEqual(@as(u32, 11), fake.render_count);
+    try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
+
+    // Force a different font so every glyph is a cache miss, then fail partway
+    // through the new set.
+    const alt_path = try allocator.dupe(u8, text.default_font_path);
+    var alt_path_owned = true;
+    errdefer if (alt_path_owned) allocator.free(alt_path);
+    const alt_font = try service.registerFont(.{
+        .asset_path = alt_path,
+        .point_size = font_size * 2,
+    }, @ptrFromInt(2));
+    alt_path_owned = false;
+    fps.font = alt_font;
+    fps.texture_dirty = true;
+
+    // After 11 first-prepare renders, allow 6 new successes (prefix + digits
+    // 0-4) then fail on the 7th new attempt (digit 5).
+    fake.fail_at_render_count = 11 + 6;
+    try std.testing.expectError(error.FakeRenderFailed, fps.prepareGlyphs(&service, &fake));
+
+    // Old displayed set is intact.
+    try std.testing.expect(preparedTextSharesTexture(old_prefix, fps.prefix));
+    for (old_digits, fps.digits) |old, current| {
+        try std.testing.expect(preparedTextSharesTexture(old, current));
+    }
+    try std.testing.expect(fps.texture_dirty);
+
+    // Exactly the non-shared partial new set was destroyed: prefix + 5 digits.
+    try std.testing.expectEqual(@as(u32, 6), fake.destroy_count);
+    // Live entries are only the original 11 (partial new ones retired).
+    try std.testing.expectEqual(@as(u32, 11), text.countLiveTextEntries(&service));
 }

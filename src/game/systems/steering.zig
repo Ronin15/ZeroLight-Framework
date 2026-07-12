@@ -495,14 +495,22 @@ pub const SteeringSystem = struct {
         // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
         try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(count));
-        // At most one new runtime row is created per selected intent, so reserve
-        // the worst case once, upfront, instead of growing inside the loop below.
-        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + count);
+        // Map existing runtime rows first, then reserve only for selected intents
+        // that still lack a row. `items.len + count` overshoots a warm population
+        // (requests 2N when N rows already exist) and forces a one-shot realloc
+        // after the first full step — breaking the reserve/warmup contract.
         try resetIndexScratch(&self.runtime_index_by_steering, self.allocator, steering.entities.len);
         for (self.runtime_rows.items, 0..) |row, runtime_index| {
             const steering_index = data.steeringAgentDenseIndex(row.entity) orelse continue;
             self.runtime_index_by_steering.items[steering_index] = runtime_index;
         }
+        var missing_runtime_rows: usize = 0;
+        for (self.selected.items) |selected| {
+            if (self.runtime_index_by_steering.items[selected.steering_index] == invalid_index) {
+                missing_runtime_rows += 1;
+            }
+        }
+        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + missing_runtime_rows);
 
         var request_count: usize = 0;
         var work_row_slice = self.selected_work_rows.slice();
@@ -579,7 +587,7 @@ pub const SteeringSystem = struct {
         }
         try frame.intents.prefixAppendedRanges(range_base);
 
-        var context = self.jobContext(frame, range_base);
+        var context = self.jobContext(frame, range_base, work.range_count);
         const batch = thread_system.parallelForWithOptions(count, &context, writeSteeringMovementJob, .{
             .items_per_range = work.items_per_range,
             .max_worker_threads = work.worker_threads,
@@ -597,7 +605,7 @@ pub const SteeringSystem = struct {
         const range_base = try frame.intents.appendRangeCounts(1);
         frame.intents.addCount(range_base, count);
         try frame.intents.prefixAppendedRanges(range_base);
-        var context = self.jobContext(frame, range_base);
+        var context = self.jobContext(frame, range_base, 1);
         writeSteeringMovementJob(&context, .{ .index = 0, .start = 0, .end = count }, WorkerId.main);
         frame.intents.finishWrite();
         return serialBatch(count);
@@ -745,7 +753,7 @@ pub const SteeringSystem = struct {
         }
     }
 
-    fn jobContext(self: *SteeringSystem, frame: *SimulationFrame, range_base: usize) SteeringJobContext {
+    fn jobContext(self: *SteeringSystem, frame: *SimulationFrame, range_base: usize, range_count: usize) SteeringJobContext {
         return .{
             .selected = self.selected.items,
             .work = self.selectedWorkSlice(),
@@ -763,6 +771,7 @@ pub const SteeringSystem = struct {
             .obstacle_candidate_counts = self.obstacle_candidate_counts.items,
             .intents = &frame.intents,
             .range_base = range_base,
+            .range_count = range_count,
         };
     }
 };
@@ -930,6 +939,8 @@ const SteeringJobContext = struct {
     obstacle_candidate_counts: []u16,
     intents: *RangeOutputStream(SimulationIntent),
     range_base: usize,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 const AvoidanceResult = struct {
@@ -957,6 +968,8 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     // Jobs never append outside their assigned output range, which keeps the
     // transient intent stream deterministic across serial and threaded runs.
     const job: *SteeringJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig).
+    std.debug.assert(range.index < job.range_count);
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= job.selected.len);
     var writer = job.intents.rangeWriter(job.range_base + range.index);
@@ -1864,6 +1877,87 @@ test "steering update is allocation-free after reserves and warmup" {
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+}
+
+test "steering threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var agents: [steering_range_alignment_items * 4]EntityId = undefined;
+    for (&agents, 0..) |*slot, i| {
+        const x: f32 = @floatFromInt(i % 8);
+        const y: f32 = @floatFromInt(i / 8);
+        slot.* = try addSteeredEntity(&data, .{ .x = x * 16.0, .y = y * 16.0 });
+    }
+    _ = try addStaticObstacle(&data, .{ .x = 48, .y = -12 }, .{ .x = 16, .y = 16 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{
+        .max_frame_requests = agents.len,
+        .max_pending_requests = agents.len,
+        .max_cached_results = agents.len * 2,
+        .max_group_fields = 1,
+        .worker_participant_count = 1,
+        .max_solved_requests_per_step = agents.len,
+    });
+    try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(8, 0, agents.len, 0, 0, 0);
+    try frame.reservePathRequests(8, agents.len);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(agents.len);
+
+    const cfg: SteeringConfig = .{
+        .items_per_range = steering_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    };
+
+    // One batched append: each appendNavigationIntent prepareRangeCounts-clears
+    // the stream, so a per-agent loop would leave only the last intent and collapse
+    // the batch to a single-range inline path.
+    var warmup_intents: [agents.len]NavigationIntent = undefined;
+    for (&warmup_intents, agents) |*slot, agent| {
+        slot.* = .{ .entity = agent, .goal = .{ .x = 200, .y = 0 }, .direct_direction_x = 1 };
+    }
+    frame.beginStep();
+    try appendNavigationIntents(&frame, &warmup_intents);
+    const warmup = try steering.update(&data, &frame, &threads, &pathfinding, cfg);
+    try std.testing.expect(!warmup.batch.ran_inline);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_system_allocator = steering.allocator;
+    const original_navigation_allocator = frame.navigation_intents.allocator;
+    const original_intent_allocator = frame.intents.allocator;
+    const original_path_allocator = frame.path_requests.allocator;
+    steering.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    frame.intents.allocator = failing.allocator();
+    frame.path_requests.allocator = failing.allocator();
+    defer {
+        steering.allocator = original_system_allocator;
+        frame.navigation_intents.allocator = original_navigation_allocator;
+        frame.intents.allocator = original_intent_allocator;
+        frame.path_requests.allocator = original_path_allocator;
+    }
+
+    frame.beginStep();
+    try appendNavigationIntents(&frame, &warmup_intents);
+    const stats = try steering.update(&data, &frame, &threads, &pathfinding, cfg);
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(agents.len, stats.movement_intent_count);
 }
 
 test "steering obstacle scratch reserve is independent from agent reserve" {

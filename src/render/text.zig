@@ -3,9 +3,15 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Asset-backed SDL_ttf service for cached UI and debug text.
-//! Text rendering is synchronous on cache misses and cached for app lifetime.
-//! Prepare text only when content/style changes; render stored PreparedText
-//! views with drawPreparedText.
+//! Text rendering is synchronous on cache misses. Cache entries are
+//! reference-counted: each successful `prepareText*` retains the entry, and
+//! `destroyPreparedTexts` releases one retain. GPU textures free only when the
+//! retain count reaches zero, so multi-owner glyph sets (e.g. FPS overlay and
+//! AI debug digits sharing the same cache keys) stay valid when one owner
+//! retires after a font/DPI change. Callers that re-prepare a fixed glyph set
+//! must still destroy their previous PreparedText handles so retains do not
+//! leak. Prepare text only when content/style changes; render stored
+//! PreparedText views with drawPreparedText.
 
 const std = @import("std");
 const assets = @import("../assets/assets.zig");
@@ -260,7 +266,49 @@ pub const TextService = struct {
         return self.prepareText(renderer, TextRequest.init(text, self.defaultFont(), color));
     }
 
-    fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextBackend) TextService {
+    /// Retires the cache entries backing `prepared` texts and invalidates each
+    /// handle in place. Safe no-op for already-invalid entries. Use when a fixed
+    /// glyph set is re-prepared after a font/DPI change so prior textures do not
+    /// accumulate for the app lifetime. One GPU idle covers the whole batch;
+    /// individual releases then use the assume-idle destroy path.
+    pub fn destroyPreparedTexts(self: *TextService, renderer: *Renderer, prepared: []PreparedText) void {
+        var any_valid = false;
+        for (prepared) |entry| {
+            if (entry.isValid()) {
+                any_valid = true;
+                break;
+            }
+        }
+        if (any_valid) renderer.waitForIdle();
+        self.destroyPreparedTextsWithContext(@ptrCast(renderer), prepared);
+    }
+
+    /// Backend-context counterpart to `destroyPreparedTexts`. Does not idle the
+    /// GPU — caller must have synchronized already when releasing live textures
+    /// (the public `destroyPreparedTexts` path does this once for the batch).
+    pub fn destroyPreparedTextsWithContext(self: *TextService, backend_context: *anyopaque, prepared: []PreparedText) void {
+        for (prepared) |*entry| {
+            if (!entry.isValid()) continue;
+            self.destroyEntryByTexture(backend_context, entry.texture);
+            entry.* = .invalid;
+        }
+    }
+
+    fn destroyEntryByTexture(self: *TextService, backend_context: *anyopaque, texture: TextureId) void {
+        for (self.entries.items, 0..) |slot, index| {
+            if (!slot.alive) continue;
+            if (!slot.texture.matches(texture.index, texture.generation)) continue;
+            // One release per PreparedText holder — free only when retain hits 0.
+            self.releaseEntryWithContext(
+                backend_context,
+                TextTextureId.init(@intCast(index), slot.generation) catch unreachable,
+                false,
+            );
+            return;
+        }
+    }
+
+    pub fn initWithBackend(allocator: std.mem.Allocator, asset_store: assets.AssetStore, backend: TextBackend) TextService {
         return .{
             .allocator = allocator,
             .assets = asset_store,
@@ -268,7 +316,7 @@ pub const TextService = struct {
         };
     }
 
-    fn deinitWithContext(self: *TextService, backend_context: *anyopaque) void {
+    pub fn deinitWithContext(self: *TextService, backend_context: *anyopaque) void {
         var entry_index: u32 = 0;
         while (entry_index < self.entries.items.len) : (entry_index += 1) {
             self.destroyEntryWithContext(backend_context, TextTextureId.init(entry_index, self.entries.items[@intCast(entry_index)].generation) catch unreachable);
@@ -321,7 +369,7 @@ pub const TextService = struct {
         }
     }
 
-    fn prepareTextWithContext(
+    pub fn prepareTextWithContext(
         self: *TextService,
         backend_context: *anyopaque,
         request: TextRequest,
@@ -332,6 +380,9 @@ pub const TextService = struct {
 
         if (self.findEntry(key)) |entry_id| {
             const entry = self.resolveEntrySlot(entry_id).?;
+            // Multi-owner retain: a second prepare of the same key (e.g. FPS + AI
+            // debug digits) must keep the entry alive until every holder releases.
+            entry.retain_count += 1;
             return preparedFromEntry(entry);
         }
 
@@ -367,7 +418,7 @@ pub const TextService = struct {
         return null;
     }
 
-    fn registerFont(self: *TextService, desc: FontDesc, font: *c.TTF_Font) !FontId {
+    pub fn registerFont(self: *TextService, desc: FontDesc, font: *c.TTF_Font) !FontId {
         if (self.first_free_font_slot) |index| {
             const slot = &self.fonts.items[@intCast(index)];
             const generation = slot.generation;
@@ -429,6 +480,7 @@ pub const TextService = struct {
                 .width = rendered.width,
                 .height = rendered.height,
                 .generation = generation,
+                .retain_count = 1,
                 .alive = true,
                 .next_free = null,
             };
@@ -443,6 +495,7 @@ pub const TextService = struct {
             .width = rendered.width,
             .height = rendered.height,
             .generation = 1,
+            .retain_count = 1,
             .alive = true,
             .next_free = null,
         });
@@ -461,7 +514,17 @@ pub const TextService = struct {
     }
 
     fn destroyEntryWithContext(self: *TextService, backend_context: *anyopaque, id: TextTextureId) void {
+        // Service teardown / free-list reclaim: force free regardless of retain.
+        self.releaseEntryWithContext(backend_context, id, true);
+    }
+
+    fn releaseEntryWithContext(self: *TextService, backend_context: *anyopaque, id: TextTextureId, force: bool) void {
         const slot = self.resolveEntrySlot(id) orelse return;
+        if (!force) {
+            std.debug.assert(slot.retain_count > 0);
+            slot.retain_count -= 1;
+            if (slot.retain_count > 0) return;
+        }
         self.backend.destroy_texture(backend_context, slot.texture);
         self.allocator.free(slot.key.?.text);
         self.retireEntrySlot(id.index, slot);
@@ -473,6 +536,7 @@ pub const TextService = struct {
         slot.texture = TextureId.invalid;
         slot.width = 0;
         slot.height = 0;
+        slot.retain_count = 0;
         slot.generation = nextGeneration(slot.generation);
         slot.alive = false;
         slot.next_free = self.first_free_entry_slot;
@@ -547,6 +611,9 @@ const TextEntrySlot = struct {
     width: u32 = 0,
     height: u32 = 0,
     generation: u32 = 1,
+    /// Live `PreparedText` holders that prepared this entry (create or cache hit).
+    /// `destroyPreparedTexts` decrements; GPU free only at zero. Teardown forces free.
+    retain_count: u32 = 0,
     alive: bool = false,
     next_free: ?u32 = null,
 };
@@ -571,7 +638,7 @@ const ColorKey = packed struct {
     }
 };
 
-const TextBackend = struct {
+pub const TextBackend = struct {
     render_text: *const fn (*anyopaque, *c.TTF_Font, TextRequest) anyerror!RenderedText,
     destroy_texture: *const fn (*anyopaque, TextureId) void,
     close_font: *const fn (*c.TTF_Font) void,
@@ -639,7 +706,10 @@ fn createTextureFromTextSurface(renderer: *Renderer, surface: *c.SDL_Surface) !T
 
 fn rendererDestroyTexture(context: *anyopaque, texture: TextureId) void {
     const renderer: *Renderer = @ptrCast(@alignCast(context));
-    renderer.destroyTexture(texture);
+    // TextService bulk paths (`deinit`, `destroyPreparedTexts`) idle once before
+    // releasing; mid-prepare errdefer textures were never submitted. Never re-idle
+    // per texture here.
+    renderer.destroyTextureAssumeIdle(texture);
 }
 
 fn sdlAlignment(alignment: TextAlign) c.TTF_HorizontalAlignment {
@@ -685,12 +755,17 @@ fn nextGeneration(generation: u32) u32 {
     return if (next == 0) 1 else next;
 }
 
-const FakeBackend = struct {
+/// In-process text backend for unit tests. Tracks render/destroy counts and can
+/// fail after N successful renders to exercise mid-prepare cleanup.
+pub const FakeBackend = struct {
     next_texture_index: u32 = 0,
     render_count: u32 = 0,
     destroy_count: u32 = 0,
+    /// When set, any render attempted while `render_count >=` this value fails
+    /// with `error.FakeRenderFailed` without advancing the count.
+    fail_at_render_count: ?u32 = null,
 
-    fn backend() TextBackend {
+    pub fn backend() TextBackend {
         return .{
             .render_text = renderText,
             .destroy_texture = destroyTexture,
@@ -701,6 +776,9 @@ const FakeBackend = struct {
     fn renderText(context: *anyopaque, font: *c.TTF_Font, request: TextRequest) !RenderedText {
         _ = font;
         const self: *FakeBackend = @ptrCast(@alignCast(context));
+        if (self.fail_at_render_count) |limit| {
+            if (self.render_count >= limit) return error.FakeRenderFailed;
+        }
         const texture = try TextureId.init(self.next_texture_index, 1);
         self.next_texture_index += 1;
         self.render_count += 1;
@@ -722,7 +800,7 @@ const FakeBackend = struct {
     }
 };
 
-fn initFakeTextService(allocator: std.mem.Allocator, fake: *FakeBackend) !TextService {
+pub fn initFakeTextService(allocator: std.mem.Allocator, fake: *FakeBackend) !TextService {
     var service = TextService.initWithBackend(
         allocator,
         assets.AssetStore.init(allocator, std.testing.io, "assets"),
@@ -736,6 +814,14 @@ fn initFakeTextService(allocator: std.mem.Allocator, fake: *FakeBackend) !TextSe
     }, @ptrFromInt(1));
     fake.* = .{};
     return service;
+}
+
+pub fn countLiveTextEntries(service: *const TextService) u32 {
+    var live: u32 = 0;
+    for (service.entries.items) |slot| {
+        if (slot.alive) live += 1;
+    }
+    return live;
 }
 
 test "font descriptors require asset-backed relative paths and positive size" {
@@ -839,6 +925,65 @@ test "prepared text cache keys include style changes" {
 
     try std.testing.expect(!first.texture.matches(second.texture.index, second.texture.generation));
     try std.testing.expectEqual(@as(u32, 2), fake.render_count);
+}
+
+test "destroyPreparedTexts retires cache entries so re-prepare does not grow unboundedly" {
+    var fake = FakeBackend{};
+    var service = try initFakeTextService(std.testing.allocator, &fake);
+    defer service.deinitWithContext(&fake);
+
+    const request = TextRequest{
+        .text = "FPS ",
+        .style = .{ .font = service.defaultFont() },
+    };
+
+    const first = try service.prepareTextWithContext(&fake, request);
+    try std.testing.expectEqual(@as(u32, 1), fake.render_count);
+    try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
+
+    var retired = [_]PreparedText{first};
+    service.destroyPreparedTextsWithContext(&fake, &retired);
+    try std.testing.expect(!retired[0].isValid());
+    try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
+
+    // Same request after retirement is a fresh cache miss, not a leaked second live entry.
+    const second = try service.prepareTextWithContext(&fake, request);
+    try std.testing.expectEqual(@as(u32, 2), fake.render_count);
+    try std.testing.expect(second.isValid());
+
+    // Only one live entry remains (the re-prepared one); teardown destroys it once.
+    try std.testing.expectEqual(@as(u32, 1), countLiveTextEntries(&service));
+}
+
+test "text cache retains shared entries until every PreparedText holder releases" {
+    // Models FPS + AI debug both preparing the same default-font yellow digits:
+    // one owner retires after a font/DPI change must not free the other's handles.
+    var fake = FakeBackend{};
+    var service = try initFakeTextService(std.testing.allocator, &fake);
+    defer service.deinitWithContext(&fake);
+
+    const request = TextRequest{
+        .text = "0",
+        .style = .{ .font = service.defaultFont(), .color = .{ .r = 1, .g = 0.902, .b = 0.157, .a = 1 } },
+    };
+
+    const fps_holder = try service.prepareTextWithContext(&fake, request);
+    const ai_holder = try service.prepareTextWithContext(&fake, request);
+    try std.testing.expect(fps_holder.texture.matches(ai_holder.texture.index, ai_holder.texture.generation));
+    try std.testing.expectEqual(@as(u32, 1), fake.render_count);
+    try std.testing.expectEqual(@as(u32, 1), countLiveTextEntries(&service));
+
+    var fps_retire = [_]PreparedText{fps_holder};
+    service.destroyPreparedTextsWithContext(&fake, &fps_retire);
+    // Shared entry still live for the AI holder — no GPU free yet.
+    try std.testing.expectEqual(@as(u32, 0), fake.destroy_count);
+    try std.testing.expectEqual(@as(u32, 1), countLiveTextEntries(&service));
+    try std.testing.expect(ai_holder.isValid());
+
+    var ai_retire = [_]PreparedText{ai_holder};
+    service.destroyPreparedTextsWithContext(&fake, &ai_retire);
+    try std.testing.expectEqual(@as(u32, 1), fake.destroy_count);
+    try std.testing.expectEqual(@as(u32, 0), countLiveTextEntries(&service));
 }
 
 test "text placement supports top left and top center anchors" {

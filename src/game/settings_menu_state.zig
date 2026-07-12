@@ -360,7 +360,7 @@ test "settings failed audio command leaves runtime value unchanged" {
     try std.testing.expectEqual(@as(u8, 10), runtime_settings.master);
 }
 
-test "settings back via quit action requests pop" {
+test "settings quit action requests exactly one pop not quit" {
     var runtime_settings = RuntimeAudioSettings.init(.{});
     var settings = SettingsMenuState.init(&runtime_settings, 800, 450);
     defer settings.deinit();
@@ -368,13 +368,16 @@ test "settings back via quit action requests pop" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    // simulate quit (Esc) while on Back or any
-    settings.selected = 3;
-    // We call activate which for Back does pop; or direct
-    try settings.activate(&transitions);
-    // Or via the quit path in real update, here directly test pop request present
-    try transitions.pop();
-    try std.testing.expect(transitions.requests.items.len > 0);
+    const quit_key = keyEventForAction(.quit);
+    try std.testing.expect(try settings.handleEvent(&quit_key, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+    try std.testing.expectEqualStrings("pop", @tagName(transitions.requests.items[0]));
+
+    transitions.clear();
+    const quit_gamepad = gamepadButtonEventForAction(.quit);
+    try std.testing.expect(try settings.handleEvent(&quit_gamepad, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+    try std.testing.expectEqualStrings("pop", @tagName(transitions.requests.items[0]));
 }
 
 fn keyEventForAction(action: inputFile.Action) c.SDL_Event {

@@ -45,6 +45,7 @@ comptime {
     _ = @import("game/loading_state.zig");
     _ = @import("game/main_menu_state.zig");
     _ = @import("game/menu_view.zig");
+    _ = @import("game/pause_state.zig");
     _ = @import("game/settings_menu_state.zig");
     _ = @import("game/player.zig");
     _ = @import("game/render_depth.zig");
@@ -75,6 +76,7 @@ comptime {
     _ = @import("render/gpu/tilemap_pipeline.zig");
     _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
+    _ = @import("render/fps_counter.zig");
     _ = @import("render/renderer.zig");
     _ = @import("render/resources.zig");
     _ = @import("render/sprite_batch.zig");

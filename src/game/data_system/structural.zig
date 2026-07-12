@@ -327,7 +327,10 @@ pub fn applyStructuralCommandsPrepared(
     return try commitStructuralCommands(self, commands, change_sink);
 }
 
-pub fn commitStructuralCommands(
+/// File-private: only `applyStructuralCommandsPrepared` (and its unprepared
+/// wrappers) may commit. Callers must go through preflight/prepared entry points
+/// so capacity is reserved before mutation.
+fn commitStructuralCommands(
     self: *DataSystem,
     commands: []const StructuralCommand,
     change_sink: anytype,

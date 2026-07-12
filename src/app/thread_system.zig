@@ -963,8 +963,12 @@ const Shared = struct {
 
             seen_batch_id = self.batch.id;
             const assigned_range_index = id.index - 1;
+            // Dispatch wakes only workers[0..active] and shapes range_count so
+            // each woken worker has a valid first range. If that invariant
+            // desyncs, still complete the pending_workers count so the main
+            // thread cannot hang waiting on batch_complete forever.
             if (id.index > self.batch.active_worker_thread_count or assigned_range_index >= self.batch.range_count) {
-                self.mutex.unlock(self.io);
+                self.completeWorker();
                 continue;
             }
             self.mutex.unlock(self.io);
@@ -973,13 +977,19 @@ const Shared = struct {
             self.runBatchRanges(id);
 
             self.mutex.lockUncancelable(self.io);
-            std.debug.assert(self.batch.pending_workers > 0);
-            self.batch.pending_workers -= 1;
-            if (self.batch.pending_workers == 0) {
-                self.batch_complete.signal(self.io);
-            }
-            self.mutex.unlock(self.io);
+            self.completeWorker();
         }
+    }
+
+    /// Decrements `pending_workers` and signals the main thread when the batch
+    /// is fully drained. Caller must hold `mutex`. Unlocks before return.
+    fn completeWorker(self: *Shared) void {
+        std.debug.assert(self.batch.pending_workers > 0);
+        self.batch.pending_workers -= 1;
+        if (self.batch.pending_workers == 0) {
+            self.batch_complete.signal(self.io);
+        }
+        self.mutex.unlock(self.io);
     }
 
     // Atomic fetch-add is the only synchronization inside the hot work loop.

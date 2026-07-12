@@ -128,15 +128,22 @@ the pause flow.
 Policies also control named-action routing:
 
 - Gameplay states allow held gameplay input, app commands, and debug commands.
-- Modal overlays block held gameplay input while keeping app and debug commands
-  available.
+- Modal overlays block held gameplay **DOWN** while keeping app and debug
+  commands available. Held gameplay **UP** is still accepted under modal and
+  opaque policies so dig/move cannot trap if the key/button is released while
+  the overlay is up.
 - Pass-through overlays allow gameplay, UI, app, and debug action contexts unless
   a modal or opaque state in the active event path blocks held gameplay input.
-- Opaque screens block gameplay input and keep app and debug commands available.
+- Opaque screens block gameplay **DOWN** and keep app and debug commands
+  available (same UP-clear exception as modal).
 
-The top state controls command availability. Held gameplay input is also gated
-by modal and opaque states in the active event path, so pass-through overlays do
-not tunnel movement through a modal state beneath them.
+The top state controls command availability. Held gameplay **DOWN** is also
+gated by modal and opaque states in the active event path, so pass-through
+overlays do not tunnel movement through a modal state beneath them. When
+gameplay context is lost (pause enter/exit, or a stack transition that drops
+`.gameplay` from the active routing policy), `InputState.releaseHeldGameplay()`
+clears movement, dig hole/ramp/down, and stick deflection together so dig cannot
+stick across the blocked interval.
 
 `.pause` / `.resumeGame` remain routable under modal and opaque policies
 (intentionally, to support P/Enter/Space resume when the pause overlay is the
@@ -196,12 +203,15 @@ them through `input.actionForPressEvent(...)` (resolves either shape to a
 named `Action` in one call), and act on named `Action` values for confirm,
 back, and navigation. Settings-style modal states use
 `context.transitions.pop()`; quit rows use `quit()`. Main menu Start installs
-an opaque owned `LoadingState` with `replaceOwnedState(...)`, and
-`LoadingState` later queues `replaceOwnedGameplay(...)` after constructing
-gameplay from `UpdateContext.runtime_assets`. When a state returns `true` from
-`handleEvent`, `Engine` does not route that same event into global
-`FrameCommands`, so menu Enter/Escape handling does not also resume/pause/quit
-through the app command path.
+an opaque owned `LoadingState` with `replaceOwnedState(...)` (passing a by-value
+snapshot of the menu's `RuntimeAudioSettings`), and `LoadingState` later queues
+`replaceOwnedGameplay(...)` after constructing gameplay from
+`UpdateContext.runtime_assets`. A build failure latches `.failed` without aborting
+the process; Escape/East or confirm then replaces back to `MainMenuState` with
+the preserved audio settings. When a state returns `true` from `handleEvent`,
+`Engine` does not route that same event into global `FrameCommands`, so menu
+Enter/Escape handling does not also resume/pause/quit through the app command
+path.
 
 ## Gamepad
 
@@ -228,12 +238,27 @@ Lifecycle policy:
 - Plugging in a second controller while one is already active does not steal
   input from the first — it is simply ignored until the active device
   disconnects.
+- **Event-path filter (before `handleEvent` and routing)**: `Engine.handleEvents`
+  gates every polled event with `input_router.shouldDeliverEvent(event,
+  gamepad.activeId())` **before** state `handleEvent` and the input router.
+  `SDL_EVENT_GAMEPAD_BUTTON_*` and `SDL_EVENT_GAMEPAD_AXIS_MOTION` pass only
+  when `event.which` matches the open pad; when no pad is open
+  (`activeId() == null`), all pad input is dropped. Non pad-input events
+  (keyboard, quit, `GAMEPAD_ADDED`/`REMOVED`, etc.) always pass. Menus resolve
+  presses via `actionForPressEvent` without a `which` filter, so this early
+  gate is what keeps a second controller from stealing menu control.
+  `routeEventWithGamepad` re-checks the same active-id rule as
+  defense-in-depth. Keyboard events ignore the active-id filter. This matches
+  single-active-gamepad ownership end-to-end (device open + state events +
+  routing), not only at connect time.
 
 The three adoption/fallback decisions
 (`shouldAdopt`/`isActiveDevice`/`pickFallback`) are pure functions unit-tested
-against synthetic `SDL_JoystickID` values; the `SDL_OpenGamepad`/
-`SDL_GetGamepads` glue itself is not unit-testable without real or virtual
-hardware (same posture as the display-gated `gpu-smoke` probe).
+against synthetic `SDL_JoystickID` values; `shouldDeliverEvent` and the
+router's active-id filter are also unit-tested with synthetic `which` values.
+The `SDL_OpenGamepad`/`SDL_GetGamepads` glue itself is not unit-testable
+without real or virtual hardware (same posture as the display-gated
+`gpu-smoke` probe).
 
 ### Default gamepad bindings
 
@@ -243,8 +268,9 @@ machinery as keyboard — there is no separate gamepad routing surface.
 `actionForGamepadButton` and routes it through the same `routeAction` helper
 keyboard events use, so policy gating, held-vs-one-frame classification, and
 repeat handling (gamepad buttons never repeat — SDL does not synthesize repeat
-events for them) all behave identically to keyboard. This slice ships default
-bindings only; there is no rebind UI yet.
+events for them) all behave identically to keyboard. Held gameplay **UP** is
+accepted even when the policy blocks gameplay (same dig-trap fix as keyboard).
+This slice ships default bindings only; there is no rebind UI yet.
 
 `default_gamepad_bindings` in `src/app/input.zig`:
 
@@ -285,6 +311,9 @@ change), and gamepad-only diagonal is already <=1 by construction from the
 deadzone normalization above. The only new edge case — both devices pushing
 the same axis at once — is capped by the per-axis clamp at the same sqrt(2)
 ceiling keyboard-only input already produced, so nothing regresses.
-`InputState.releaseMovement()` (and the pause-controller call sites that
-already invoke it) also zero the raw stick fields, so a paused/blocked
-gameplay context cannot leave stale deflection to snap back in on resume.
+`InputState.releaseHeldGameplay()` (pause enter/exit, gameplay-context-loss
+transitions, and the gamepad-disconnect alias `releaseGamepadInput`) clears
+movement, dig actions, and the raw stick fields together, so a paused/blocked
+gameplay context cannot leave stale dig or stick deflection to snap back in on
+resume. `releaseMovement()` alone clears only movement + stick and is not
+sufficient for dig.

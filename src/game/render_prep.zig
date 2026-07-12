@@ -13,11 +13,12 @@ const ConstPrimitiveVisualSlice = @import("data_system.zig").ConstPrimitiveVisua
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const AssetReference = @import("data_system.zig").AssetReference;
-const Rect = @import("../render/renderer.zig").Rect;
-const RenderOrder = @import("../render/renderer.zig").RenderOrder;
-const Renderer = @import("../render/renderer.zig").Renderer;
-const Sprite = @import("../render/renderer.zig").Sprite;
-const TextureId = @import("../render/resources.zig").TextureId;
+const renderer_mod = @import("../render/renderer.zig");
+const Rect = renderer_mod.Rect;
+const RenderOrder = renderer_mod.RenderOrder;
+const Renderer = renderer_mod.Renderer;
+const Sprite = renderer_mod.Sprite;
+const TextureId = renderer_mod.TextureId;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 const AssetStore = @import("../assets/assets.zig").AssetStore;
 const sprite_atlas_meta = @import("../assets/sprite_atlas_meta.zig");
@@ -29,11 +30,6 @@ const render_depth = @import("render_depth.zig");
 const WorldSystem = @import("world_system.zig").WorldSystem;
 const level_z_step = @import("world_system.zig").level_z_step;
 const k_max_dense_submit_stack_cap = @import("world_system.zig").k_max_dense_submit_stack_cap;
-// Test-only: constructs a headless CPU-only SpriteBatch/DrawGroup fixture for a
-// Renderer built without a live GPU device. Mirrors world_system.zig's existing
-// direct sprite_batch.zig import for the same CPU-only-parity reason.
-const sprite_batch = @import("../render/sprite_batch.zig");
-const mergeDrawList = @import("../render/renderer.zig").mergeDrawList;
 const SimulationTier = @import("simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
@@ -1438,6 +1434,13 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
 
+    // Test-only: headless SpriteBatch construction (no live GPU). Kept inside the
+    // test so production game code stays on the renderer facade (L6).
+    const sprite_batch = @import("../render/sprite_batch.zig");
+    const Material = renderer_mod.Material;
+    const DrawGroup = renderer_mod.DrawGroup;
+    const mergeDrawList = renderer_mod.mergeDrawList;
+
     // Headless Renderer: device/pipeline/sampler are never dereferenced by the
     // CPU-only static-geometry path this test exercises. Mirrors renderer.zig's
     // own headless test fixtures.
@@ -1474,14 +1477,14 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     try submitLayeredWorld(scene, &prep, &renderer, &runtime_assets);
 
     try std.testing.expectEqual(@as(usize, 2), renderer.static_groups.items.len);
-    try std.testing.expectEqual(sprite_batch.Material.tilemap, renderer.static_groups.items[0].material);
-    try std.testing.expectEqual(sprite_batch.Material.tilemap, renderer.static_groups.items[1].material);
+    try std.testing.expectEqual(Material.tilemap, renderer.static_groups.items[0].material);
+    try std.testing.expectEqual(Material.tilemap, renderer.static_groups.items[1].material);
     // The deeper level (holding the sparse tile) composites first (further
     // back); the shallower level composites last (in front) — the sparse tile's
     // own dynamic draw sits between them in the merged list.
     try std.testing.expect(renderer.static_groups.items[0].order.depth < renderer.static_groups.items[1].order.depth);
 
-    var merged: std.ArrayList(sprite_batch.DrawGroup) = .empty;
+    var merged: std.ArrayList(DrawGroup) = .empty;
     defer merged.deinit(allocator);
     try mergeDrawList(&merged, allocator, renderer.static_groups.items, &.{});
     try std.testing.expectEqual(@as(usize, 2), merged.items.len);
@@ -1527,6 +1530,9 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
+
+    // Test-only headless SpriteBatch (see L6 note on the layered-world test).
+    const sprite_batch = @import("../render/sprite_batch.zig");
 
     var renderer = Renderer{
         .allocator = allocator,

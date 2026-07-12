@@ -538,3 +538,39 @@ test "serial response math uses simd chunks and scalar tails" {
         try std.testing.expectApproxEqAbs(@as(f32, -10), body.velocity.x, 0.001);
     }
 }
+
+test "multi-contact stacking applies ordered solid corrections to one dynamic" {
+    // Two statics + one dynamic: ordered contacts push the dynamic on X then Y.
+    // Final pose is the sum of sequential corrections (not a single merged resolve).
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addEntity(&data, 10, 20, 15, 12, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    const static_a = try addEntity(&data, 40, 20, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    const static_b = try addEntity(&data, 10, 50, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const dyn_index = data.movementBodyDenseIndex(dynamic).?;
+    const a_index = data.movementBodyDenseIndex(static_a).?;
+    const b_index = data.movementBodyDenseIndex(static_b).?;
+    const contacts = [_]CollisionContact{
+        makeContact(dynamic, static_a, dyn_index, a_index, -1, 0, 3),
+        makeContact(dynamic, static_b, dyn_index, b_index, 0, -1, 2),
+    };
+    try writeContacts(&frame, &contacts);
+
+    var system = CollisionResponseSystem.init(std.testing.allocator);
+    defer system.deinit();
+    const stats = try system.update(&data, &frame);
+
+    try std.testing.expectEqual(@as(usize, 2), stats.contact_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
+    const body = data.movementBodyConst(dynamic).?;
+    // (10,20) + (-1,0)*3 + (0,-1)*2 = (7, 18); both approaching velocities zeroed.
+    try std.testing.expectApproxEqAbs(@as(f32, 7), body.position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), body.position.y, 0.001);
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
+    // Statics stay put.
+    try std.testing.expectApproxEqAbs(@as(f32, 40), data.movementBodyConst(static_a).?.position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), data.movementBodyConst(static_b).?.position.y, 0.001);
+}

@@ -184,13 +184,15 @@ pub const State = struct {
 };
 
 pub const StateTransitions = struct {
-    allocator: std.mem.Allocator,
-    requests: std.ArrayList(Request) = .empty,
-
     // Per-frame transitions come from a small number of sources (a couple of
     // queued events plus the active state's update), so a modest reserve keeps
     // the queue allocation-free from frame 0 without over-allocating.
     pub const default_capacity = 8;
+
+    allocator: std.mem.Allocator,
+    requests: std.ArrayList(Request) = .empty,
+    /// Hard per-frame bound. `reserve` raises this; enqueue fails loud past it.
+    max_requests: usize = default_capacity,
 
     const Request = union(enum) {
         none,
@@ -218,7 +220,9 @@ pub const StateTransitions = struct {
     /// Reserves the per-frame request bound up front so queuing transitions during
     /// event/update dispatch is allocation-free from frame 0.
     pub fn reserve(self: *StateTransitions, capacity: usize) !void {
-        try self.requests.ensureTotalCapacity(self.allocator, capacity);
+        const bound = @max(capacity, 1);
+        try self.requests.ensureTotalCapacity(self.allocator, bound);
+        self.max_requests = bound;
     }
 
     pub fn clear(self: *StateTransitions) void {
@@ -237,7 +241,7 @@ pub const StateTransitions = struct {
 
     pub fn replaceOwnedState(self: *StateTransitions, state: State, policy: StatePolicy) !void {
         errdefer state.destroy(self.allocator);
-        try self.requests.append(self.allocator, .{ .replace = .{ .state = state, .policy = policy } });
+        try self.enqueue(.{ .replace = .{ .state = state, .policy = policy } });
         log.debug("queued state transition replace type={s} policy={s} pending={d}", .{
             state.type_name,
             policyLabel(policy),
@@ -252,7 +256,7 @@ pub const StateTransitions = struct {
     pub fn push(self: *StateTransitions, comptime T: type, value: T, policy: StatePolicy) !void {
         const state = try State.create(T, self.allocator, value);
         errdefer state.destroy(self.allocator);
-        try self.requests.append(self.allocator, .{ .push = .{ .state = state, .policy = policy } });
+        try self.enqueue(.{ .push = .{ .state = state, .policy = policy } });
         log.debug("queued state transition push type={s} policy={s} pending={d}", .{
             state.type_name,
             policyLabel(policy),
@@ -273,18 +277,31 @@ pub const StateTransitions = struct {
     }
 
     pub fn remove(self: *StateTransitions, handle: StateHandle) !void {
-        try self.requests.append(self.allocator, .{ .remove = handle });
+        try self.enqueue(.{ .remove = handle });
         log.debug("queued state transition remove handle={d} pending={d}", .{ handle.id, self.requests.items.len });
     }
 
     pub fn quit(self: *StateTransitions) !void {
-        try self.requests.append(self.allocator, .quit);
+        try self.enqueue(.quit);
         log.debug("queued state transition quit pending={d}", .{self.requests.items.len});
     }
 
     pub fn pop(self: *StateTransitions) !void {
-        try self.requests.append(self.allocator, .pop);
+        try self.enqueue(.pop);
         log.debug("queued state transition pop pending={d}", .{self.requests.items.len});
+    }
+
+    fn enqueue(self: *StateTransitions, request: Request) !void {
+        if (self.requests.items.len >= self.max_requests) {
+            return error.StateTransitionLimitReached;
+        }
+        // After `reserve()`, capacity is already max_requests and this path is
+        // allocation-free. Without a prior reserve, grow once up to the hard cap
+        // so cold test/init paths still work; the engine always reserves first.
+        if (self.requests.capacity < self.max_requests) {
+            try self.requests.ensureTotalCapacity(self.allocator, self.max_requests);
+        }
+        self.requests.appendAssumeCapacity(request);
     }
 
     fn destroyPendingStates(self: *StateTransitions) void {
@@ -1550,6 +1567,23 @@ test "owned gameplay transition destroys state when enqueue fails" {
     const state = try State.create(TestingState, allocator, .{ .deinit_count = &deinit_count });
     try std.testing.expectError(error.OutOfMemory, transitions.replaceOwnedGameplay(state));
     try std.testing.expectEqual(@as(u32, 1), deinit_count);
+}
+
+test "state transitions enqueue is allocation-free after reserve" {
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    try transitions.reserve(4);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    transitions.allocator = failing.allocator();
+
+    var i: usize = 0;
+    while (i < transitions.max_requests) : (i += 1) {
+        try transitions.pop();
+    }
+    try std.testing.expectEqual(transitions.max_requests, transitions.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectError(error.StateTransitionLimitReached, transitions.pop());
 }
 
 test "reserved modal push consumes only reserved capacity and allocates zero (FailingAllocator)" {

@@ -48,9 +48,11 @@ pub const VertexColor = sprite_batch.VertexColor;
 pub const VertexColumns = sprite_batch.VertexColumns;
 pub const VertexColumnsConst = sprite_batch.VertexColumnsConst;
 pub const writeWorldSpriteQuad = sprite_batch.writeWorldSpriteQuad;
-const DrawGroup = sprite_batch.DrawGroup;
+// Re-exported so game/test code can name draw-list types without importing
+// sprite_batch.zig outside the render facade (L6).
+pub const DrawGroup = sprite_batch.DrawGroup;
 const DrawSource = sprite_batch.DrawSource;
-const Material = sprite_batch.Material;
+pub const Material = sprite_batch.Material;
 pub const TilemapParams = sprite_batch.TilemapParams;
 const CoordinatePresentation = sprite_batch.CoordinatePresentation;
 
@@ -471,13 +473,20 @@ pub const Renderer = struct {
         const end = try std.math.add(usize, self.static_positions.items.len, vertex_count);
         const first_vertex = std.math.cast(u32, self.static_positions.items.len) orelse return error.StaticGeometryTooLarge;
         _ = std.math.cast(u32, end) orelse return error.StaticGeometryTooLarge;
-        try self.static_positions.appendSlice(self.allocator, vertices.positions);
-        try self.static_uvs.appendSlice(self.allocator, vertices.uvs);
-        try self.static_colors.appendSlice(self.allocator, vertices.colors);
+        // ensure-then-assumeCapacity so a prior `reserveStaticGeometry` path is
+        // allocation-free (FailingAllocator success proof in tests). Unreserved
+        // callers still grow here.
+        try self.static_positions.ensureTotalCapacity(self.allocator, end);
+        try self.static_uvs.ensureTotalCapacity(self.allocator, end);
+        try self.static_colors.ensureTotalCapacity(self.allocator, end);
+        try self.static_groups.ensureTotalCapacity(self.allocator, self.static_groups.items.len + 1);
+        self.static_positions.appendSliceAssumeCapacity(vertices.positions);
+        self.static_uvs.appendSliceAssumeCapacity(vertices.uvs);
+        self.static_colors.appendSliceAssumeCapacity(vertices.colors);
         const window_slot: u8 = @intCast(self.tilemap_window_layer_count);
         self.tilemap_window_layers[window_slot] = window_layers;
         self.tilemap_window_layer_count += 1;
-        try self.static_groups.append(self.allocator, .{
+        self.static_groups.appendAssumeCapacity(.{
             .source = .static,
             .material = .tilemap,
             .texture = atlas_texture,
@@ -500,10 +509,23 @@ pub const Renderer = struct {
         return @max(1.0, @max(scale_x, scale_y));
     }
 
+    /// Releases a non-internal texture. Waits for GPU idle first so no in-flight
+    /// frame (up to `frames_in_flight`) still samples the handle. Prefer
+    /// `destroyTextureAssumeIdle` after an explicit bulk sync (e.g. text retire).
     pub fn destroyTexture(self: *Renderer, id: TextureId) void {
         const slot = self.resolveTextureSlot(id) orelse return;
         if (slot.internal) return;
 
+        self.waitForIdle();
+        self.retireTextureSlot(id.index, slot);
+    }
+
+    /// Releases a non-internal texture without waiting for GPU idle. Caller must
+    /// have already synchronized (or the texture was never submitted). Used by
+    /// text bulk-retire after a single `waitForIdle`.
+    pub fn destroyTextureAssumeIdle(self: *Renderer, id: TextureId) void {
+        const slot = self.resolveTextureSlot(id) orelse return;
+        if (slot.internal) return;
         self.retireTextureSlot(id.index, slot);
     }
 
@@ -609,11 +631,18 @@ pub const Renderer = struct {
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
+        // Tile-edit transfer grow (create → WaitForGPUIdle → release-old) also
+        // lives here so a capacity stall never holds an acquired swapchain.
         if (self.batch.positions.items.len > 0) {
             try self.stageVertices();
         }
         if (upload_static) {
             try self.stageStaticVertices();
+        }
+        const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
+        if (upload_tile_edits) {
+            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+            try self.ensureTileEditTransfer(required_bytes);
         }
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
@@ -625,7 +654,6 @@ pub const Renderer = struct {
         });
 
         const upload_dynamic = self.batch.positions.items.len > 0;
-        const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
         if (upload_dynamic or upload_static or upload_tile_edits) {
             self.recordFrameCopyPass(command_buffer, .{
                 .dynamic = upload_dynamic,
@@ -955,8 +983,13 @@ pub const Renderer = struct {
     /// Releases every renderer-owned tile-data storage buffer and resets the
     /// parallel handle/params/count lists. Required before rebuilding the dense
     /// tilemap when the renderer outlives the world that created the buffers; app
-    /// shutdown goes through `deinit`, which performs the same release.
+    /// shutdown goes through `deinit`, which performs the same release. Waits for
+    /// GPU idle first so in-flight frames (up to `frames_in_flight`) finish
+    /// sampling the buffers/transfer before they are freed.
     pub fn releaseTileDataBuffers(self: *Renderer) void {
+        const has_buffers = self.tile_data_buffers.items.len > 0 or self.tile_edit_transfer != null;
+        if (has_buffers) self.waitForIdle();
+
         for (self.tile_data_buffers.items) |buffer| {
             c.SDL_ReleaseGPUBuffer(self.device, buffer);
         }
@@ -972,13 +1005,24 @@ pub const Renderer = struct {
         }
     }
 
+    /// Ensures the reusable tile-edit transfer buffer is large enough. Mirrors
+    /// `ensureBatchCapacity`: create the new transfer first, idle the GPU, then
+    /// release the old one so a creation failure leaves the live transfer
+    /// untouched and no in-flight copy still reads a freed buffer.
     fn ensureTileEditTransfer(self: *Renderer, required_bytes: u32) !void {
-        if (self.tile_edit_transfer) |transfer| {
+        if (self.tile_edit_transfer) |existing| {
             if (self.tile_edit_transfer_byte_size >= required_bytes) return;
-            c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
-            self.tile_edit_transfer = null;
-            self.tile_edit_transfer_byte_size = 0;
+
+            const new_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
+            errdefer c.SDL_ReleaseGPUTransferBuffer(self.device, new_transfer);
+
+            _ = c.SDL_WaitForGPUIdle(self.device);
+            c.SDL_ReleaseGPUTransferBuffer(self.device, existing);
+            self.tile_edit_transfer = new_transfer;
+            self.tile_edit_transfer_byte_size = required_bytes;
+            return;
         }
+
         self.tile_edit_transfer = try gpu_buffer.createVertexTransferBuffer(self.device, required_bytes);
         self.tile_edit_transfer_byte_size = required_bytes;
     }
@@ -1026,6 +1070,9 @@ pub const Renderer = struct {
         return try self.registerTexture(texture, internal);
     }
 
+    /// Replaces a non-internal texture's GPU image. Creates the new upload first,
+    /// then waits for GPU idle before releasing the old handle so in-flight frames
+    /// (up to `frames_in_flight`) never sample a freed texture.
     pub fn replaceTextureFromPixels(
         self: *Renderer,
         id: TextureId,
@@ -1040,6 +1087,7 @@ pub const Renderer = struct {
         const next_texture = try gpu_texture.uploadFromPixels(self.allocator, self.device, pixels, width, height, pitch);
         errdefer c.SDL_ReleaseGPUTexture(self.device, next_texture.texture);
 
+        self.waitForIdle();
         c.SDL_ReleaseGPUTexture(self.device, slot.texture.?);
         slot.texture = next_texture.texture;
         slot.desc = next_texture.desc;
@@ -1247,14 +1295,12 @@ pub const Renderer = struct {
         }
 
         if (work.tile_edits) {
-            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-            try self.ensureTileEditTransfer(required_bytes);
+            // Transfer capacity is ensured pre-acquire; post-acquire only maps
+            // into the already-sized buffer and records the copy. cycle=true
+            // because this transfer is renderer-owned and reused across frames.
             const transfer = self.tile_edit_transfer.?;
-            // Stage immediately before the copy, after swapchain acquire (matches
-            // the working `world` branch timing for dig cell uploads). This
-            // transfer buffer is renderer-owned and reused across frames, so it
-            // must map with cycle=true (like stageVertices) to avoid overwriting
-            // a prior in-flight frame's copy source.
+            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+            std.debug.assert(self.tile_edit_transfer_byte_size >= required_bytes);
             try gpu_buffer.stageStorageRegions(
                 self.device,
                 transfer,
@@ -2019,6 +2065,48 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
     try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
 }
 
+test "reserved static geometry append and mergeDrawList stay allocation-free" {
+    const allocator = std.testing.allocator;
+    var renderer = testRenderer(allocator);
+    defer deinitStaticGeometryTestRenderer(&renderer, allocator);
+    defer renderer.draw_list.deinit(allocator);
+
+    const span_count: usize = 2;
+    const vertex_capacity = span_count * 6;
+    try renderer.reserveStaticGeometry(vertex_capacity, span_count);
+
+    const positions = testStaticQuad();
+    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
+    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
+    const texture = testTextureId(0, 1);
+    const window = Renderer.TilemapWindowLayers{ .count = 1 };
+
+    // Reserved-then-append/merge SUCCESS branch under a hard-failing allocator.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const real_allocator = renderer.allocator;
+    renderer.allocator = failing.allocator();
+    defer renderer.allocator = real_allocator;
+
+    renderer.beginStaticGeometry();
+    for (0..span_count) |i| {
+        try renderer.appendStaticTilemapSpan(
+            texture,
+            RenderOrder.world(@intCast(i)),
+            vertices,
+            @enumFromInt(0),
+            window,
+        );
+    }
+    try mergeDrawList(&renderer.draw_list, renderer.allocator, renderer.static_groups.items, &.{});
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(span_count, renderer.static_groups.items.len);
+    try std.testing.expectEqual(vertex_capacity, renderer.static_positions.items.len);
+    try std.testing.expectEqual(span_count, renderer.draw_list.items.len);
+}
+
 test "merge draw list stays allocation-free when reserved to combined size" {
     const allocator = std.testing.allocator;
     var list: std.ArrayList(DrawGroup) = .empty;
@@ -2037,10 +2125,17 @@ test "merge draw list stays allocation-free when reserved to combined size" {
         testDrawGroup(.dynamic, 1, .logical, RenderOrder.ui(.panel), 6, 6),
     };
 
-    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
-    try mergeDrawList(&list, allocator, &static_groups, &dynamic_groups);
+    // Reserved-then-merge SUCCESS under FailingAllocator (not just capacity equality).
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try mergeDrawList(&list, failing.allocator(), &static_groups, &dynamic_groups);
+    try mergeDrawList(&list, failing.allocator(), &static_groups, &dynamic_groups);
 
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(capacity_before, list.capacity);
+    // Coalesce merges the two contiguous same-texture static world spans; the
+    // two dynamic groups differ in presentation and stay separate → 3 groups.
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
 }
 
 test "draw list does not merge across source and keeps static before dynamic at equal order" {

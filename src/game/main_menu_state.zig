@@ -150,7 +150,16 @@ pub const MainMenuState = struct {
                     self.allocator.destroy(loading_ptr);
                 };
 
-                loading_ptr.* = LoadingState.init(self.allocator, .game_demo, self.width, self.height, default_world_build_config);
+                loading_ptr.* = LoadingState.init(
+                    self.allocator,
+                    .game_demo,
+                    self.width,
+                    self.height,
+                    default_world_build_config,
+                    // Clone by value so a failed load can rebuild MainMenu with
+                    // the same volumes after this menu state is replaced away.
+                    self.audio_settings,
+                );
                 initialized = true;
                 const state = State.fromOwnedPtr(LoadingState, loading_ptr);
                 owned_by_transition = true;

@@ -60,9 +60,10 @@ passes the borrowed audio command buffer through the pipeline-owned
 `AudioController` rather than holding audio policy itself.
 `SimulationPipeline` opens each step with the backbone **scope pass** (stagger
 advance and the tier/halo/stagger gathers that select which entities enter each
-stage; chunk columns are derived in-pass by the movement processor, not a separate
-recompute), builds the shared **spatial index** (`SpatialIndexSystem`, Slice 28)
-from that same cognition-scoped population for AI separation queries, runs the
+stage; chunk columns are derived later in a dedicated `chunk_derive` stage from
+each body's final settled position — not in-pass during movement), builds the
+shared **spatial index** (`SpatialIndexSystem`, Slice 28) from that same
+cognition-scoped population for AI separation queries, runs the
 **perception stage** (`PerceptionSystem`, Slice 29) over the cognition-scoped
 `AiPerception` subset against that same spatial index (range/FOV/line-of-sight,
 writing sensed state to `PerceptionStore`), then the **memory stage**
@@ -77,35 +78,41 @@ mechanism needed), then the **affect stage**
 (appraising this step's just-written perception/memory state, both
 independently optional per row, plus each agent's own `AiAgent.behavior`, into
 four drives — fear, curiosity, aggression, fatigue — decayed toward per-entity
-baselines), then owns
-AI navigation-intent production, steering/path status, pathfinding, sparse
-movement-intent application, movement, bounds clamp, player-vs-world-tile
-gating, collision detection, and collision response — AI, movement, and
-collision run scope-gated through a `scope_dense_indices` option. Collision
-broadphase keeps its own sweep-and-prune structure rather than consuming the
-spatial index (see `docs/architecture.md`). It closes with the
-**simulation-LOD tier policy**, which assigns each entity a
-cognition/locomotion/kinematic/dormant tier by cube distance and emits
+baselines), then owns AI navigation-intent production, steering/path status,
+pathfinding, sparse movement-intent application, movement, collision detection,
+collision response, bounds clamp + world-tile gating, and plane traversal — AI,
+movement, and collision run scope-gated through a `scope_dense_indices` option.
+Collision broadphase keeps its own sweep-and-prune structure rather than
+consuming the spatial index (see `docs/architecture.md`). It closes with
+`chunk_derive` then the **simulation-LOD tier policy**, which assigns each
+entity a cognition/locomotion/kinematic/dormant tier by cube distance and emits
 deferred `set_simulation_tier` commands at the commit seam. See
 `docs/architecture.md` for scope/tier ownership and the gating rules per stage.
 
-The player-vs-tile gate runs right after the bounds clamp and before entity
-collision, so every downstream stage and the camera see the gated position. It
-stops the player from moving into movement-blocking tiles on their current plane
-(the mining mechanic: underground dirt is solid until dug) by resolving X then Y
-against the pre-move position, which yields wall-sliding. It is a no-op on
-level 0 (the surface is fully walkable there).
+Late-stage pose order (after movement integrate):
 
-NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement
-and collision settle, `applyNpcPlaneTraversal` mirrors the player ramp/fall
-cell-entry policy and commits level changes on the main thread. Off-surface NPCs
-are gated by `gateNpcEntitiesToWalkableTiles` against solid tiles on their current
-plane before entity collision runs; both NPC stages skip dormant-tier entities,
-since movement never moves them. Steering and pathfinding read each entity's
-`world_level` for `start_level`; level transitions at link crossings are
-committed by `applyNpcPlaneTraversal` against physical-cell world geometry, not
-by a path-view field (a `PathView.next_cell_level` field was tried and removed
-as an unused duplicate — see archive Slice 25E in
+1. `collision_scope_gather` → `collision_detect` → `collision_respond`
+2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
+3. `plane_traversal` (ramp follow / one-level fall; batches landing-cell tile
+   events into one `finishWrite`)
+4. `chunk_derive` → `tier_policy`
+
+The tile gate runs **after** collision response so a contact push into solid
+underground dirt is re-gated before plane traversal and chunk derive observe the
+pose. Dig still runs first in the step so this step's carves are walkable for
+movement and the gate. The gate resolves X then Y against the pre-move position
+(wall-sliding) and is a no-op on level 0 (surface is fully walkable there).
+
+NPCs carry a `world_level` component in `DataSystem` (Slice 25E). After movement,
+collision, and the tile gate settle, plane traversal mirrors the player
+ramp/fall cell-entry policy for NPCs and commits level changes on the main
+thread. Off-surface entities are gated by `gateNpcEntitiesToWalkableTiles`
+against solid tiles on their current plane; NPC gate and plane-traversal both
+skip dormant-tier entities, since movement never moves them. Steering and
+pathfinding read each entity's `world_level` for `start_level`; level transitions
+at link crossings are committed by plane traversal against physical-cell world
+geometry, not by a path-view field (a `PathView.next_cell_level` field was tried
+and removed as an unused duplicate — see archive Slice 25E in
 `docs/framework-implementation-slices-archive.md`).
 
 ## Stage Ordering Contract
@@ -126,11 +133,11 @@ before it is written fails the build instead of silently corrupting behavior.
   so far, and fails the build (`@compileError`) if any stage's declared reads
   are not a subset of what an earlier stage already wrote.
 - A stage's `stageContract` lists **every** live resource it touches, including
-  this-step values an earlier stage authored: `bounds_and_tile_gate` and
-  `plane_traversal` both read the dig-authored `world_tiles`, and
-  `plane_traversal` also writes `movement_positions` via the fall snap. An
-  under-declared read or write leaves a real dependency invisible to the
-  comptime check, so a reorder compiles clean.
+  this-step values an earlier stage authored: `bounds_and_tile_gate`,
+  `plane_traversal`, and `perception_update` all read the dig-authored
+  `world_tiles`, and `plane_traversal` also writes `movement_positions` via the
+  fall snap. An under-declared read or write leaves a real dependency invisible
+  to the comptime check, so a reorder compiles clean.
 - Not every real ordering dependency is expressible as a `PipelineResource`
   read/write — two stages can depend on call order while sharing no tracked
   resource, and a transient stream with no `PipelineResource` tag at all (e.g.

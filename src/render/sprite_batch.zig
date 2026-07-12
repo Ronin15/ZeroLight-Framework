@@ -302,13 +302,18 @@ pub const SpriteBatch = struct {
         self.camera = camera;
     }
 
+    /// Grows CPU batch storage to at least the requested capacities. Grow-only and
+    /// non-destructive: a mid-grow `OutOfMemory` leaves prior capacity intact so a
+    /// previously reserved frame path stays usable. Does not free on failure.
     pub fn reserveStorage(
         self: *SpriteBatch,
         command_capacity: usize,
         vertex_capacity: usize,
         draw_group_capacity: usize,
     ) !void {
-        errdefer self.deinit();
+        // `ensureTotalCapacity` is non-destructive on failure; do not `errdefer
+        // deinit` here — that would wipe a successful prior reserve when a later
+        // grow attempt OOMs.
         try self.commands.ensureTotalCapacity(self.allocator, command_capacity);
         try self.prepared_commands.ensureTotalCapacity(self.allocator, command_capacity);
         try self.positions.ensureTotalCapacity(self.allocator, vertex_capacity);
@@ -545,8 +550,14 @@ fn fillPreparedRange(
     columns: VertexColumns,
     range: ParallelRange,
 ) void {
+    // Dual write-range bounds: the command slice and the vertex columns the
+    // worker will scatter into. Vertex columns are sized to `commands.len * 6`
+    // before dispatch (`emitVerticesAssumeCapacity`).
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= commands.len);
+    std.debug.assert(range.end * 6 <= columns.positions.len);
+    std.debug.assert(columns.positions.len == columns.uvs.len);
+    std.debug.assert(columns.positions.len == columns.colors.len);
     for (range.start..range.end) |index| {
         writePreparedSpriteVertices(commands[index], columns, index * 6);
     }
@@ -1038,6 +1049,93 @@ test "warmed sprite batch prep does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), batch.draw_groups.items.len);
 }
 
+test "reserveStorage grow failure preserves prior capacity" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    try batch.reserveStorage(8, 48, 8);
+    const commands_capacity = batch.commands.capacity;
+    const positions_capacity = batch.positions.capacity;
+    const draw_groups_capacity = batch.draw_groups.capacity;
+
+    const texture = testTextureId(0, 1);
+    try batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+
+    // Fail the first allocation of a larger reserve. Prior capacity must remain
+    // usable — a blanket errdefer deinit would free the successful reserve.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    batch.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, batch.reserveStorage(4096, 4096 * 6, 4096));
+    batch.allocator = allocator;
+
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(commands_capacity, batch.commands.capacity);
+    try std.testing.expectEqual(positions_capacity, batch.positions.capacity);
+    try std.testing.expectEqual(draw_groups_capacity, batch.draw_groups.capacity);
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+
+    // Prior reserved capacity is still usable for submit + prep.
+    batch.frame_reserved = true;
+    try batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
+    try std.testing.expectEqual(commands_capacity, batch.commands.capacity);
+}
+
+test "reserveStorage mid-list grow failure preserves prior data and capacity" {
+    const allocator = std.testing.allocator;
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    try batch.reserveStorage(8, 48, 8);
+    const commands_capacity = batch.commands.capacity;
+    const prepared_capacity = batch.prepared_commands.capacity;
+    const positions_capacity = batch.positions.capacity;
+    const uvs_capacity = batch.uvs.capacity;
+    const colors_capacity = batch.colors.capacity;
+    const draw_groups_capacity = batch.draw_groups.capacity;
+
+    const texture = testTextureId(0, 1);
+    try batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+    });
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+
+    // reserveStorage grows commands → prepared_commands → positions → …;
+    // fail_index=2 lets the first two ensureTotalCapacity calls succeed (and
+    // possibly enlarge those lists) then OOMs on positions. Prior data and the
+    // later columns' capacity must remain intact — no blanket errdefer deinit.
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    batch.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, batch.reserveStorage(4096, 4096 * 6, 4096));
+    batch.allocator = allocator;
+
+    try std.testing.expect(failing.has_induced_failure);
+    // Early columns may have grown; later ones must still match the prior reserve.
+    try std.testing.expect(batch.commands.capacity >= commands_capacity);
+    try std.testing.expect(batch.prepared_commands.capacity >= prepared_capacity);
+    try std.testing.expectEqual(positions_capacity, batch.positions.capacity);
+    try std.testing.expectEqual(uvs_capacity, batch.uvs.capacity);
+    try std.testing.expectEqual(colors_capacity, batch.colors.capacity);
+    try std.testing.expectEqual(draw_groups_capacity, batch.draw_groups.capacity);
+    try std.testing.expectEqual(@as(usize, 1), batch.commands.items.len);
+
+    batch.frame_reserved = true;
+    try batch.drawSprite(.{
+        .texture = texture,
+        .dest = .{ .x = 1, .y = 0, .w = 1, .h = 1 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), batch.commands.items.len);
+}
+
 test "render order compares domain before depth" {
     const ComparisonDepth = enum(i32) {
         below_ground = -1,
@@ -1142,6 +1240,59 @@ test "sprite prep uses batch owned adaptive tuner instead of thread system fallb
     try std.testing.expect(batch.adaptive_tuner.report().sample_count > 0);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
     try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+}
+
+test "warmed multi-worker sprite prep does not allocate" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const slots = [_]TestTextureSlot{
+        .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+
+    // Enough commands that 4-command range alignment yields multiple ranges and
+    // the thread system actually recruits a worker (not only the serial slot-0 path).
+    const command_capacity: usize = 32;
+    try batch.reserveStorage(command_capacity, command_capacity * 6, command_capacity);
+    for (0..command_capacity) |index| {
+        try batch.drawSprite(.{
+            .texture = testTextureId(0, 1),
+            .dest = .{
+                .x = @floatFromInt(index),
+                .y = @floatFromInt(index % 5),
+                .w = 4,
+                .h = 4,
+            },
+        });
+    }
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = 1,
+    });
+    defer threads.deinit();
+
+    // Reserved-then-build SUCCESS branch under a hard-failing allocator: proves
+    // the multi-worker emit path is allocation-free after reserve (not only the
+    // serial inline branch).
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    batch.allocator = failing.allocator();
+    defer batch.allocator = allocator;
+
+    const stats = batch.buildAssumeCapacity(table.resolver(), &threads, .{
+        .items_per_range = 1,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    try std.testing.expect(stats.batch.active_worker_threads > 0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(command_capacity, batch.commands.items.len);
+    try std.testing.expectEqual(command_capacity * 6, batch.positions.items.len);
 }
 
 fn addParallelParityCommands(batch: *SpriteBatch) !void {

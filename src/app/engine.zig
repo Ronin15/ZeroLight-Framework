@@ -231,9 +231,14 @@ pub const Engine = struct {
                 },
                 else => {},
             }
+            // Drop non-active (and no-open-pad) GAMEPAD_BUTTON_* / AXIS_MOTION
+            // before state handleEvent: menus use actionForPressEvent without a
+            // which filter. Router re-filters as defense-in-depth.
+            const active_gamepad_id = self.gamepad.activeId();
+            if (!input_router.shouldDeliverEvent(&event, active_gamepad_id)) continue;
             const consumed = try self.states.handleEvent(&event, &self.transitions);
             if (!consumed) {
-                input_router.routeEvent(routing_policy, &event, &self.input, &self.commands);
+                input_router.routeEventWithGamepad(routing_policy, &event, &self.input, &self.commands, active_gamepad_id);
             }
         }
         try self.applyTransitions();
@@ -459,7 +464,8 @@ pub const Engine = struct {
         const current_routing = self.states.inputRoutingPolicy();
         if (previous_routing.allowsContext(.gameplay) and !current_routing.allowsContext(.gameplay)) {
             log.debug("releasing held gameplay input because active state routing blocks gameplay", .{});
-            self.input.releaseMovement();
+            // Clear movement + dig + stick; releaseMovement alone leaves dig latched.
+            self.input.releaseHeldGameplay();
         }
         if (result.quit_requested) {
             log.debug("quit requested by state transition", .{});

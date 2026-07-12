@@ -37,6 +37,7 @@ fn hotStoreCapacity(min_len: usize) usize {
 pub const ProxySlice = struct {
     entities: []EntityId,
     movement_indices: []usize,
+    world_levels: []u16,
     min_x: HotF32Slice,
     min_y: HotF32Slice,
     max_x: HotF32Slice,
@@ -50,6 +51,7 @@ pub const ProxySlice = struct {
 pub const ConstProxySlice = struct {
     entities: []const EntityId,
     movement_indices: []const usize,
+    world_levels: []const u16,
     min_x: ConstHotF32Slice,
     min_y: ConstHotF32Slice,
     max_x: ConstHotF32Slice,
@@ -63,6 +65,9 @@ pub const ConstProxySlice = struct {
 const ProxyRow = struct {
     entity: EntityId,
     movement_index: usize,
+    /// Plane index for same-level pair gating. Missing `world_level` component
+    /// defaults to 0 (surface), matching steering/perception.
+    world_level: u16,
     min_x: f32,
     min_y: f32,
     max_x: f32,
@@ -210,6 +215,7 @@ pub const CollisionSystem = struct {
         return .{
             .entities = s.items(.entity),
             .movement_indices = s.items(.movement_index),
+            .world_levels = s.items(.world_level),
             .min_x = s.items(.min_x),
             .min_y = s.items(.min_y),
             .max_x = s.items(.max_x),
@@ -222,6 +228,7 @@ pub const CollisionSystem = struct {
         return .{
             .entities = s.items(.entity),
             .movement_indices = s.items(.movement_index),
+            .world_levels = s.items(.world_level),
             .min_x = s.items(.min_x),
             .min_y = s.items(.min_y),
             .max_x = s.items(.max_x),
@@ -293,6 +300,8 @@ pub const CollisionSystem = struct {
         try self.prepareNarrowphaseRangeBuffers(candidate_pair_count, narrowphase_selection.items_per_range, narrowphase_selection.range_count);
         var context = NarrowphaseJobContext{
             .system = self,
+            .range_count = narrowphase_selection.range_count,
+            .candidate_pair_count = candidate_pair_count,
         };
         const narrowphase_batch = thread_system.parallelForWithOptions(candidate_pair_count, &context, narrowphaseContactsJob, .{
             .max_worker_threads = narrowphase_selection.worker_threads,
@@ -391,9 +400,12 @@ pub const CollisionSystem = struct {
             const size_y = bounds.size_y[bounds_index];
             const min_x = body.position.x + offset_x;
             const min_y = body.position.y + offset_y;
+            // Missing world_level means surface (0); only same-level pairs emit.
+            const world_level = data.worldLevelConst(entity) orelse 0;
             appendProxyRow(&self.rows, &row_slice, .{
                 .entity = entity,
                 .movement_index = movement_index,
+                .world_level = world_level,
                 .min_x = min_x,
                 .min_y = min_y,
                 .max_x = min_x + size_x,
@@ -478,9 +490,11 @@ pub const CollisionSystem = struct {
         }
     }
 
-    /// Shared broadphase pair-capacity heuristic: roughly four candidate pairs
-    /// per swept item in the range, bounded below by one SIMD lane group and
-    /// above by the total sorted item count. Used both to pre-size the
+    /// Shared broadphase pair-capacity WARM heuristic (not a combinatorial
+    /// worst-case ceiling): roughly four candidate pairs per swept item in the
+    /// range, bounded below by one SIMD lane group and above by the total sorted
+    /// item count. Dense/clustered scenes can exceed this; both serial and
+    /// threaded paths grow-and-replay when they do. Used to pre-size the
     /// per-range scratch buffers for the threaded broadphase and to pre-size
     /// `candidate_pairs` for the serial SIMD broadphase, so both paths stay
     /// allocation-free in steady state under the same estimate.
@@ -492,14 +506,17 @@ pub const CollisionSystem = struct {
         return @min(sorted_count, @max(simd.lane_count, estimated_capacity));
     }
 
-    /// Worst-case narrow-phase CONTACT stream capacity for a given body count — the
-    /// collision system's own domain knowledge, not something a caller (e.g. a game
-    /// state sizing `SimulationPipeline.init`'s `contact_capacity`) should independently
-    /// guess a ratio for. Narrow-phase contacts are a SUBSET of broadphase candidate
-    /// pairs (a contact requires actual overlap; a broadphase candidate only requires
-    /// AABB adjacency), so this reuses the same estimate this module already trusts for
-    /// its own broadphase scratch sizing (`estimateBroadphasePairCapacity`) rather than
-    /// inventing a second, independent multiplier.
+    /// Steady-state WARM contact-stream capacity for a given body count — not a
+    /// combinatorial worst-case ceiling. Collision's own domain knowledge for
+    /// callers sizing `SimulationFrame.reserveStreams` / pipeline
+    /// `contact_capacity`: reuses the broadphase scratch estimate
+    /// (`estimateBroadphasePairCapacity`) rather than inventing a second
+    /// multiplier. Narrow-phase contacts are a subset of broadphase candidates,
+    /// but dense clusters can still exceed this warm size; the broadphase
+    /// grow-and-replay paths and `RangeOutputStream.prefix` (which sizes values
+    /// to the live contact count) recover by growing. Treat as a warm target
+    /// that keeps the steady-state path allocation-free when the estimate holds,
+    /// not as a hard drop ceiling (`SimulationEvents` is the stream that drops).
     pub fn estimateContactCapacity(body_count: usize) usize {
         return estimateBroadphasePairCapacity(body_count, body_count);
     }
@@ -633,7 +650,7 @@ pub const CollisionSystem = struct {
                     const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
                     const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
                     inline for (0..simd.lane_count) |lane| {
-                        if (overlaps[lane]) {
+                        if (overlaps[lane] and sameWorldLevel(proxies, proxy_index, candidate_indices[lane])) {
                             self.appendCandidatePairChecked(&required_capacity, .{ .a = proxy_index, .b = candidate_indices[lane] });
                         }
                     }
@@ -645,7 +662,7 @@ pub const CollisionSystem = struct {
                 while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
                     const candidate_index = self.order.items[candidate_sorted_index];
                     if (proxies.min_x[candidate_index] >= proxy_max_x) break;
-                    if (overlapsY(proxies, proxy_index, candidate_index)) {
+                    if (overlapsY(proxies, proxy_index, candidate_index) and sameWorldLevel(proxies, proxy_index, candidate_index)) {
                         self.appendCandidatePairChecked(&required_capacity, .{ .a = proxy_index, .b = candidate_index });
                     }
                 }
@@ -667,7 +684,11 @@ pub const CollisionSystem = struct {
         try self.prepareBroadphaseRangeBuffers(selection.range_count);
         try self.reserveInitialBroadphaseRangeCapacity(selection);
 
-        var context = BroadphaseJobContext{ .system = self };
+        var context = BroadphaseJobContext{
+            .system = self,
+            .range_count = selection.range_count,
+            .sorted_count = self.order.items.len,
+        };
         var result = BroadphaseBuildResult{};
         while (true) {
             for (self.broadphase_ranges.items[0..selection.range_count]) |*slot| {
@@ -678,17 +699,16 @@ pub const CollisionSystem = struct {
                 .range_alignment_items = collision_range_alignment_items,
                 .selected_profile = selection.profile,
             });
-            result.batch = if (result.batch.item_count == 0 and result.batch.range_count == 0)
-                batch
-            else
-                combineStageBatches(result.batch, batch);
 
             // Broadphase jobs do not allocate. If a range overflows its warmed
             // buffer, grow after the batch and replay the stage deterministically.
+            // Failed overflow passes are NOT recorded into broadphase_tuner —
+            // only the final successful batch is returned (and recorded by update).
             if (try self.growBroadphaseRangeBuffersIfNeeded(selection.range_count)) {
                 continue;
             }
 
+            result.batch = batch;
             result.simd_groups = self.broadphaseSimdGroupCount(selection.range_count);
             try self.mergeBroadphaseRangeBuffers(selection.range_count);
             return result;
@@ -707,13 +727,17 @@ const BroadphaseBuildResult = struct {
 
 const BroadphaseJobContext = struct {
     system: *CollisionSystem,
+    range_count: usize,
+    sorted_count: usize,
 };
 
 fn broadphaseCandidatesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *BroadphaseJobContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: prepareBroadphaseRangeBuffers must
-    // have sized broadphase_ranges to at least this dispatch's range count.
-    std.debug.assert(range.index < job.system.broadphase_ranges.items.len);
+    // Dual worker asserts: range.index vs dispatched range count AND range.end
+    // vs the sorted-order buffer this job walks.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.sorted_count);
     writeBroadphaseRangeCandidatesSimd(job.system, range);
 }
 
@@ -742,7 +766,7 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
             const candidate_max_y = simd.gatherFloat4(proxies.max_y, candidate_indices);
             const overlaps = x_active & (simd.splatFloat4(proxy_max_y) > candidate_min_y) & (candidate_max_y > simd.splatFloat4(proxy_min_y));
             inline for (0..simd.lane_count) |lane| {
-                if (overlaps[lane]) {
+                if (overlaps[lane] and sameWorldLevel(proxies, proxy_index, candidate_indices[lane])) {
                     buffer.appendCandidateAssumeCapacity(.{ .a = proxy_index, .b = candidate_indices[lane] });
                 }
             }
@@ -754,7 +778,7 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
         while (candidate_sorted_index < sorted_count) : (candidate_sorted_index += 1) {
             const candidate_index = system.order.items[candidate_sorted_index];
             if (proxies.min_x[candidate_index] >= proxy_max_x) break;
-            if (overlapsY(proxies, proxy_index, candidate_index)) {
+            if (overlapsY(proxies, proxy_index, candidate_index) and sameWorldLevel(proxies, proxy_index, candidate_index)) {
                 buffer.appendCandidateAssumeCapacity(.{ .a = proxy_index, .b = candidate_index });
             }
         }
@@ -763,13 +787,17 @@ fn writeBroadphaseRangeCandidatesSimd(system: *CollisionSystem, range: ParallelR
 
 const NarrowphaseJobContext = struct {
     system: *CollisionSystem,
+    range_count: usize,
+    candidate_pair_count: usize,
 };
 
 fn narrowphaseContactsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *NarrowphaseJobContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: prepareNarrowphaseRangeBuffers must
-    // have sized narrowphase_ranges to at least this dispatch's range count.
-    std.debug.assert(range.index < job.system.narrowphase_ranges.items.len);
+    // Dual worker asserts: range.index vs dispatched range count AND range.end
+    // vs the candidate-pair buffer this job reads.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.candidate_pair_count);
     writeNarrowphaseContactsSimd(job.system, range);
 }
 
@@ -841,6 +869,10 @@ fn writeNarrowphaseContactsSimd(system: *CollisionSystem, range: ParallelRange) 
 
 fn overlapsY(proxies: ConstProxySlice, a: usize, b: usize) bool {
     return proxies.max_y[a] > proxies.min_y[b] and proxies.max_y[b] > proxies.min_y[a];
+}
+
+fn sameWorldLevel(proxies: ConstProxySlice, a: usize, b: usize) bool {
+    return proxies.world_levels[a] == proxies.world_levels[b];
 }
 
 fn contactForCandidate(proxies: ConstProxySlice, a: usize, b: usize) ?CollisionContact {
@@ -941,31 +973,6 @@ fn serialBatch(item_count: usize) BatchStats {
         .range_alignment_items = collision_range_alignment_items,
         .main_thread_ranges = if (item_count > 0) 1 else 0,
         .ran_inline = true,
-    };
-}
-
-fn combineStageBatches(first: BatchStats, second: BatchStats) BatchStats {
-    const total_range_count = first.range_count + second.range_count;
-    const total_worker_ranges = first.worker_thread_ranges + second.worker_thread_ranges;
-    const active_worker_threads = @max(first.active_worker_threads, second.active_worker_threads);
-    const worker_utilization = if (total_range_count == 0 or active_worker_threads == 0)
-        @as(f32, 0)
-    else
-        @as(f32, @floatFromInt(total_worker_ranges)) / @as(f32, @floatFromInt(total_range_count));
-
-    return .{
-        .item_count = first.item_count,
-        .range_count = total_range_count,
-        .items_per_range = first.items_per_range,
-        .range_alignment_items = first.range_alignment_items,
-        .available_worker_threads = @max(first.available_worker_threads, second.available_worker_threads),
-        .active_worker_threads = active_worker_threads,
-        .main_thread_ranges = first.main_thread_ranges + second.main_thread_ranges,
-        .worker_thread_ranges = total_worker_ranges,
-        .worker_utilization = worker_utilization,
-        .batch_duration_ns = first.batch_duration_ns + second.batch_duration_ns,
-        .main_thread_wait_ns = first.main_thread_wait_ns + second.main_thread_wait_ns,
-        .ran_inline = first.ran_inline and second.ran_inline,
     };
 }
 
@@ -1177,11 +1184,21 @@ test "threaded collision matches serial across multiple range splits and worker 
         defer threaded_system.deinit();
         var threaded_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
         defer threaded_contacts.deinit();
-        _ = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
+        const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
             .items_per_range = split.items_per_range,
             .max_worker_threads = split.workers,
             .adaptive = false,
         });
+        // Real workers must partition both stages; a silent inline fallback would
+        // make multi-split parity a false pass of the serial path.
+        try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
+        try std.testing.expect(!threaded_stats.narrowphase_batch.ran_inline);
+        if (threaded_stats.broadphase_batch.range_count > 1) {
+            try std.testing.expect(threaded_stats.broadphase_batch.active_worker_threads > 0);
+        }
+        if (threaded_stats.narrowphase_batch.range_count > 1) {
+            try std.testing.expect(threaded_stats.narrowphase_batch.active_worker_threads > 0);
+        }
         const threaded_items = threaded_contacts.mergedItems();
         try std.testing.expectEqual(serial_items.len, threaded_items.len);
         for (serial_items, threaded_items) |serial, threaded| {
@@ -1425,11 +1442,19 @@ test "threaded collision update reuses warmed range scratch without steady state
     defer threads.deinit();
     if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    _ = try system.update(&data, &contacts, &threads, .{
+    const warmup = try system.update(&data, &contacts, &threads, .{
         .items_per_range = collision_range_alignment_items,
         .max_worker_threads = 2,
         .adaptive = false,
     });
+    // Warmup must have exercised real multi-worker range writes; an inline
+    // fallback would make the FailingAllocator proof a serial false pass.
+    if (warmup.candidate_pair_count > 0) {
+        try std.testing.expect(!warmup.broadphase_batch.ran_inline);
+        try std.testing.expect(!warmup.narrowphase_batch.ran_inline);
+        try std.testing.expect(warmup.broadphase_batch.active_worker_threads > 0);
+        try std.testing.expect(warmup.narrowphase_batch.active_worker_threads > 0);
+    }
 
     const original_system_allocator = system.allocator;
     const original_contacts_allocator = contacts.allocator;
@@ -1449,11 +1474,18 @@ test "threaded collision update reuses warmed range scratch without steady state
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
     try std.testing.expect(contacts.mergedItems().len > 0);
+    if (stats.candidate_pair_count > 0) {
+        try std.testing.expect(!stats.broadphase_batch.ran_inline);
+        try std.testing.expect(!stats.narrowphase_batch.ran_inline);
+        try std.testing.expect(stats.broadphase_batch.active_worker_threads > 0);
+        try std.testing.expect(stats.narrowphase_batch.active_worker_threads > 0);
+    }
 }
 
 fn expectProxyColumnsAligned(proxies: ConstProxySlice) !void {
     const count = proxies.len();
     try std.testing.expectEqual(count, proxies.movement_indices.len);
+    try std.testing.expectEqual(count, proxies.world_levels.len);
     try std.testing.expectEqual(count, proxies.min_x.len);
     try std.testing.expectEqual(count, proxies.min_y.len);
     try std.testing.expectEqual(count, proxies.max_x.len);
@@ -1482,4 +1514,172 @@ test "collision proxy store rounds capacity for cache-line range splitting" {
     try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 3 + 1), proxies.len());
     try std.testing.expectEqual(@as(usize, collision_range_alignment_items * 4), hotStoreCapacity(proxies.len()));
     try std.testing.expectEqual(@as(usize, 0), simd.vectorizedEnd(system.bodyCount()) % simd.lane_count);
+}
+
+test "collision ignores XY overlap across different world_levels" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try addBody(&data, 0, 0, 10);
+    const second = try addBody(&data, 5, 0, 10);
+    try data.setWorldLevel(first, 0);
+    try data.setWorldLevel(second, 1);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const stats = try system.updateSerial(&data, &contacts);
+    try std.testing.expectEqual(@as(usize, 2), stats.body_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.contact_count);
+    try std.testing.expectEqual(@as(usize, 0), contacts.mergedItems().len);
+}
+
+test "collision same world_level still emits XY overlap contacts" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const first = try addBody(&data, 0, 0, 10);
+    const second = try addBody(&data, 5, 0, 10);
+    try data.setWorldLevel(first, 2);
+    try data.setWorldLevel(second, 2);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const stats = try system.updateSerial(&data, &contacts);
+    try std.testing.expectEqual(@as(usize, 1), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.contact_count);
+    try std.testing.expectEqual(first.index, contacts.mergedItems()[0].a.index);
+    try std.testing.expectEqual(second.index, contacts.mergedItems()[0].b.index);
+}
+
+test "collision simd broadphase same-level gate filters mixed world_levels" {
+    // ≥5 mutually X-overlapping proxies so the first body's sweep hits the
+    // 4-wide SIMD group path (broadphase_simd_groups > 0). Levels span 0 and 1
+    // so the same-level gate is exercised inside that SIMD group, not only the
+    // scalar tail / two-body path covered by the other world_level tests.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const e0 = try addBody(&data, 0, 0, 10);
+    const e1 = try addBody(&data, 1, 0, 10);
+    const e2 = try addBody(&data, 2, 0, 10);
+    const e3 = try addBody(&data, 3, 0, 10);
+    const e4 = try addBody(&data, 4, 0, 10);
+    try data.setWorldLevel(e0, 0);
+    try data.setWorldLevel(e1, 0);
+    try data.setWorldLevel(e2, 1);
+    try data.setWorldLevel(e3, 1);
+    try data.setWorldLevel(e4, 0);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const stats = try system.updateSerial(&data, &contacts);
+    try std.testing.expect(stats.broadphase_simd_groups > 0);
+
+    // Same-level only: level-0 pairs among {e0,e1,e4} (3) + level-1 {e2,e3} (1).
+    // All five bodies mutually XY-overlap, so without the gate there would be C(5,2)=10.
+    try std.testing.expectEqual(@as(usize, 4), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 4), stats.contact_count);
+
+    const merged = contacts.mergedItems();
+    try std.testing.expectEqual(@as(usize, 4), merged.len);
+    for (merged) |contact| {
+        const level_a = data.worldLevelConst(contact.a) orelse 0;
+        const level_b = data.worldLevelConst(contact.b) orelse 0;
+        try std.testing.expectEqual(level_a, level_b);
+    }
+}
+
+test "scope_dense_indices limits collision gather to scoped bounds rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Three overlapping bounds rows; only the middle dense index is in scope.
+    _ = try addBody(&data, 0, 0, 10);
+    const middle = try addBody(&data, 0, 0, 10);
+    _ = try addBody(&data, 0, 0, 10);
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+
+    const scope = [_]u32{1};
+    const stats = try system.updateSerialScoped(&data, &contacts, &scope);
+    try std.testing.expectEqual(@as(usize, 1), stats.body_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.candidate_pair_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.contact_count);
+    try std.testing.expectEqual(@as(usize, 0), contacts.mergedItems().len);
+    try std.testing.expect(system.sliceConst().entities[0].eql(middle));
+}
+
+test "narrowphase simd contacts match scalar contactForCandidate" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    // Mix of overlaps, near-misses, axis ties (equal x/y penetration), and
+    // multi-lane counts so both the SIMD chunk and scalar tail are exercised.
+    _ = try addBody(&data, 0, 0, 10); // 0
+    _ = try addBody(&data, 8, 0, 10); // 1: x-axis overlap with 0
+    _ = try addBody(&data, 0, 8, 10); // 2: y-axis overlap with 0
+    _ = try addBody(&data, 5, 5, 10); // 3: equal-ish x/y penetration with 0
+    _ = try addBody(&data, 50, 50, 4); // 4: non-overlap vs others
+    _ = try addBody(&data, 9, 1, 10); // 5: overlap with 0 and 1
+
+    var system = CollisionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.gatherBodies(&data, null);
+    const proxies = system.sliceConst();
+
+    const pairs = [_]CandidatePair{
+        .{ .a = 0, .b = 1 },
+        .{ .a = 0, .b = 2 },
+        .{ .a = 0, .b = 3 },
+        .{ .a = 0, .b = 4 },
+        .{ .a = 0, .b = 5 },
+        .{ .a = 1, .b = 5 },
+        .{ .a = 1, .b = 4 },
+        .{ .a = 2, .b = 3 },
+        .{ .a = 3, .b = 5 },
+    };
+    try system.candidate_pairs.ensureTotalCapacity(std.testing.allocator, pairs.len);
+    for (pairs) |pair| {
+        system.candidate_pairs.appendAssumeCapacity(pair);
+    }
+
+    // Scalar reference: one optional contact per candidate, in pair order.
+    var expected: std.ArrayList(CollisionContact) = .empty;
+    defer expected.deinit(std.testing.allocator);
+    try expected.ensureTotalCapacity(std.testing.allocator, pairs.len);
+    for (pairs) |pair| {
+        if (contactForCandidate(proxies, pair.a, pair.b)) |contact| {
+            expected.appendAssumeCapacity(contact);
+        }
+    }
+
+    // One range over a non-multiple-of-lane-count pair list exercises both the
+    // SIMD chunk loop and the scalar tail inside writeNarrowphaseContactsSimd.
+    try system.prepareNarrowphaseRangeBuffers(pairs.len, pairs.len, 1);
+    writeNarrowphaseContactsSimd(&system, .{ .index = 0, .start = 0, .end = pairs.len });
+
+    var contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer contacts.deinit();
+    const contact_count = try system.mergeNarrowphaseContacts(&contacts, 1);
+    const merged = contacts.mergedItems();
+
+    try std.testing.expectEqual(expected.items.len, contact_count);
+    try std.testing.expectEqual(expected.items.len, merged.len);
+    for (expected.items, merged) |scalar, simd_contact| {
+        try std.testing.expectEqual(scalar.a.index, simd_contact.a.index);
+        try std.testing.expectEqual(scalar.b.index, simd_contact.b.index);
+        try std.testing.expectEqual(scalar.a_movement_index, simd_contact.a_movement_index);
+        try std.testing.expectEqual(scalar.b_movement_index, simd_contact.b_movement_index);
+        try std.testing.expectEqual(scalar.normal_x, simd_contact.normal_x);
+        try std.testing.expectEqual(scalar.normal_y, simd_contact.normal_y);
+        try std.testing.expectApproxEqAbs(scalar.penetration, simd_contact.penetration, 0.001);
+    }
 }

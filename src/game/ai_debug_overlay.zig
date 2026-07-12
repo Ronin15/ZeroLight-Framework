@@ -34,10 +34,6 @@ const text = @import("../render/text.zig");
 const TextService = text.TextService;
 const PreparedText = text.PreparedText;
 const fpsOverlayFontSize = @import("../render/fps_counter.zig").overlayFontSize;
-// Test-only: constructs a headless CPU-only `Renderer` fixture (GPU handles
-// undefined, never dereferenced by the submission-only draw path). Mirrors
-// render_prep.zig's same-reason direct sprite_batch import.
-const sprite_batch = @import("../render/sprite_batch.zig");
 
 /// Maximum agents annotated in a single frame. A fixed constant, deliberately
 /// independent of agent/world/cell count: overflow past the cap is not drawn,
@@ -608,6 +604,11 @@ test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocato
         try data.setAiMemory(entity, full_ring);
     }
 
+    // Test-only: headless SpriteBatch construction (no live GPU). Kept inside
+    // the test so production stays on the renderer facade (L6).
+    const sprite_batch = @import("../render/sprite_batch.zig");
+    const TextureId = renderer_mod.TextureId;
+
     // Headless CPU-only renderer (mirrors render_prep.zig's fixtures): the GPU
     // handles are never dereferenced by the submission-only draw path.
     var renderer = Renderer{
@@ -634,7 +635,7 @@ test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocato
     // label + HUD commands (display-free: a `Sprite` submission never touches the
     // GPU). `labels_ready` short-circuits `ensureLabels`, so the dummy
     // `text_service` pointer passed to `draw` below is never dereferenced.
-    const dummy_label = PreparedText{ .texture = try sprite_batch.TextureId.init(1, 1), .width = 8, .height = 8 };
+    const dummy_label = PreparedText{ .texture = try TextureId.init(1, 1), .width = 8, .height = 8 };
     overlay.behavior_labels = [_]PreparedText{dummy_label} ** behavior_count;
     overlay.tier_labels = [_]PreparedText{dummy_label} ** hud_lines;
     overlay.digits = [_]PreparedText{dummy_label} ** 10;

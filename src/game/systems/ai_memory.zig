@@ -113,9 +113,19 @@ pub const AiMemorySystem = struct {
             system_config.adaptive_tuner = &self.decay_tuner;
         }
 
+        // Pre-select so the job context can dual-assert range.index against
+        // the dispatched range count (mirror affect.zig / collision.zig). Mirrors
+        // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
+        const selection = thread_system.selectBatchProfile(system_config.adaptive_tuner orelse &thread_system.adaptive_tuner, .{
+            .item_count = count,
+            .items_per_range = system_config.items_per_range,
+            .max_worker_threads = system_config.max_worker_threads,
+            .adaptive = system_config.adaptive,
+        });
         var context = AiMemoryDecayContext{
             .slice = data.aiMemorySlice(),
             .indices = self.memory_dense_indices.items,
+            .range_count = selection.range_count,
         };
         // No range_alignment_items: the indexed gather/scatter path processes
         // each row independently of any contiguous-range shape, mirroring
@@ -124,7 +134,8 @@ pub const AiMemorySystem = struct {
             .items_per_range = system_config.items_per_range,
             .max_worker_threads = system_config.max_worker_threads,
             .adaptive = system_config.adaptive,
-            .adaptive_tuner = system_config.adaptive_tuner,
+            .adaptive_tuner = selection.active_tuner,
+            .selected_profile = selection.profile,
         });
 
         return .{
@@ -186,10 +197,15 @@ pub const AiMemorySystem = struct {
 const AiMemoryDecayContext = struct {
     slice: AiMemorySlice,
     indices: []const u32,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 fn aiMemoryDecayJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiMemoryDecayContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig). Bounds on the
+    // indices buffer live in processDecayRange (shared with the serial path).
+    std.debug.assert(range.index < job.range_count);
     processDecayRange(&job.slice, job.indices, range);
 }
 
@@ -205,6 +221,7 @@ fn aiMemoryDecayJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 /// own age+clamp math is itself vectorized as one `Float4` per row, with only
 /// the entity-invalidation check staying scalar.
 fn processDecayRange(slice: *AiMemorySlice, indices: []const u32, range: ParallelRange) void {
+    // Shared serial/threaded buffer bounds (range.index is asserted at the job entry).
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= indices.len);
 
@@ -629,6 +646,7 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
     // Warm-up: sizes memory_dense_indices to steady state.
     frame.beginStep();
     const warmup_stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
+    try testing.expect(!warmup_stats.batch.ran_inline);
     try testing.expect(warmup_stats.batch.active_worker_threads > 0);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
@@ -639,4 +657,6 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
     frame.beginStep();
     const stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
     try testing.expectEqual(@as(usize, 64), stats.processed_count);
+    try testing.expect(!stats.batch.ran_inline);
+    try testing.expect(stats.batch.active_worker_threads > 0);
 }

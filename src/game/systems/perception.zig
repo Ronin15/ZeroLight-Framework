@@ -1218,9 +1218,13 @@ const PerceptionJobContext = struct {
 
 fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *PerceptionJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the observer buffer this job walks.
     // Guards the reserve-before-dispatch invariant: prepareEventRangeBuffers
     // must have sized event_ranges to at least this dispatch's range count.
     std.debug.assert(range.index < job.event_ranges.len);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.entities.len);
     computePerceptionRange(job, range);
 }
 
@@ -2790,6 +2794,158 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
 }
 
+test "multi-range serial/threaded cap=1 keeps the same survivor under identity-swap + acquire" {
+    // M14: observer A identity-swaps (lost then perceived), observer B acquires.
+    // With multi-range dispatch and max_events_per_step=1, both serial and real
+    // multi-worker threaded paths must keep the same single survivor event
+    // (range-ascending, within-range write order — the first of A's lost).
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // items_per_range is aligned up to perception_range_alignment_items (16), so
+    // a two-observer fixture collapses to one range. Pad with silent fillers so
+    // B lands in range 1 while A remains the first writer in range 0.
+    const range_items = perception_range_alignment_items;
+    const filler_count = range_items - 1; // A + fillers fill range 0; B starts range 1.
+
+    const setupObservers = struct {
+        fn run(data: *DataSystem, pad: usize) !struct {
+            observer_a: EntityId,
+            observer_b: EntityId,
+            first_threat: EntityId,
+            second_threat: EntityId,
+            b_threat: EntityId,
+        } {
+            // Observer A at origin; first threat nearby, will be swapped out.
+            const observer_a = try addObserver(data, 0, 0, 10, 0, .player, .{ .vision_range = 500 });
+            const first_threat = try addAgent(data, 10, 0, 0, 0, .hostile);
+            // Silent fillers far from every threat so they emit no transitions.
+            for (0..pad) |i| {
+                const fx: f32 = 4000 + @as(f32, @floatFromInt(i)) * 40;
+                _ = try addObserver(data, fx, 4000, 0, 0, .player, .{ .vision_range = 32 });
+            }
+            // Observer B after the first range so its acquire is a later range write.
+            const observer_b = try addObserver(data, 200, 0, 10, 0, .player, .{ .vision_range = 500 });
+            // B's threat is created later (after the warm step) so only A has a
+            // prev threat for the transition step.
+            return .{
+                .observer_a = observer_a,
+                .observer_b = observer_b,
+                .first_threat = first_threat,
+                .second_threat = EntityId.invalid,
+                .b_threat = EntityId.invalid,
+            };
+        }
+    }.run;
+
+    var serial_data = DataSystem.init(testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(testing.allocator);
+    defer threaded_data.deinit();
+
+    var serial_ids = try setupObservers(&serial_data, filler_count);
+    var threaded_ids = try setupObservers(&threaded_data, filler_count);
+
+    var world = try minimalWorld(testing.allocator, 512, 64, 32);
+    defer world.deinit();
+
+    // Warm step: A acquires first_threat; fillers and B have no threat yet.
+    {
+        var spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+        defer spatial.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        var events = SimulationEvents.init(testing.allocator);
+        defer events.deinit();
+        _ = try sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), spatial.view(), &world, &serial_data, &events, .{});
+        try testing.expectEqual(serial_ids.first_threat.index, serial_data.aiPerceptionConst(serial_ids.observer_a).?.nearest_threat.index);
+    }
+    {
+        var spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+        defer spatial.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        var events = SimulationEvents.init(testing.allocator);
+        defer events.deinit();
+        _ = try sys.updateSerial(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), spatial.view(), &world, &threaded_data, &events, .{});
+        try testing.expectEqual(threaded_ids.first_threat.index, threaded_data.aiPerceptionConst(threaded_ids.observer_a).?.nearest_threat.index);
+    }
+
+    // Transition step setup: A identity-swaps, B acquires a new hostile.
+    inline for (.{ &serial_data, &threaded_data }, .{ &serial_ids, &threaded_ids }) |data, ids| {
+        try data.setMovementBody(ids.first_threat, .{ .position = .{ .x = 5000, .y = 0 }, .previous_position = .{ .x = 5000, .y = 0 }, .velocity = .{}, .speed = 0 });
+        ids.second_threat = try addAgent(data, 12, 0, 0, 0, .hostile);
+        ids.b_threat = try addAgent(data, 210, 0, 0, 0, .hostile);
+    }
+
+    // Aligned range size with A..fillers in range 0 and B in range 1 so the cap
+    // merge walks ranges in order rather than a single serial buffer.
+    const multi_range_cfg = PerceptionConfig{
+        .items_per_range = range_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .max_events_per_step = 1,
+    };
+
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var serial_sys = PerceptionSystem.init(testing.allocator);
+    defer serial_sys.deinit();
+    var serial_events = SimulationEvents.init(testing.allocator);
+    defer serial_events.deinit();
+    // updateSerial always uses range_count=1; drive serial through update with
+    // max_worker_threads=0 so the same multi-range merge path is exercised on both sides.
+    var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
+    defer serial_threads.deinit();
+    const serial_stats = try serial_sys.update(
+        serial_data.aiAgentSliceConst(),
+        serial_data.movementBodySliceConst(),
+        serial_spatial.view(),
+        &world,
+        &serial_data,
+        &serial_events,
+        &serial_threads,
+        multi_range_cfg,
+    );
+
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = range_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var threaded_sys = PerceptionSystem.init(testing.allocator);
+    defer threaded_sys.deinit();
+    var threaded_events = SimulationEvents.init(testing.allocator);
+    defer threaded_events.deinit();
+    const threaded_stats = try threaded_sys.update(
+        threaded_data.aiAgentSliceConst(),
+        threaded_data.movementBodySliceConst(),
+        threaded_spatial.view(),
+        &world,
+        &threaded_data,
+        &threaded_events,
+        &threads,
+        multi_range_cfg,
+    );
+
+    // Both paths: multi-range, cap=1 survivor is A's entity_lost (first write in range 0).
+    try testing.expect(serial_stats.batch.range_count > 1);
+    try testing.expect(threaded_stats.batch.range_count > 1);
+    try testing.expect(!threaded_stats.batch.ran_inline);
+
+    const serial_merged = serial_events.mergedItems();
+    const threaded_merged = threaded_events.mergedItems();
+    try testing.expectEqual(@as(usize, 1), serial_merged.len);
+    try testing.expectEqual(@as(usize, 1), threaded_merged.len);
+    try testing.expectEqualSlices(SimulationEvent, serial_merged, threaded_merged);
+    try testing.expectEqual(SimulationEvent{
+        .stage = .domain_reaction,
+        .payload = .{ .entity_lost = .{ .observer = serial_ids.observer_a, .target = serial_ids.first_threat } },
+    }, serial_merged[0]);
+    // Cap drops the rest of the multi-kind transitions (A's perceived + B's acquire).
+    try testing.expect(serial_stats.dropped_events >= 2);
+    try testing.expectEqual(serial_stats.dropped_events, threaded_stats.dropped_events);
+}
+
 test "serial and threaded PerceptionSystem updates route through identical math" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -2959,6 +3115,8 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     // > 1.
     const warmup_stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
     try testing.expect(warmup_stats.batch.range_count > 1);
+    try testing.expect(!warmup_stats.batch.ran_inline);
+    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
     try testing.expect(sys.level_blocked.items.len > 0);
     try testing.expect(sys.level_blocked.items[0].valid);
 
@@ -2982,6 +3140,8 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
     try testing.expectEqual(@as(usize, 40), stats.observer_count);
     try testing.expect(stats.batch.range_count > 1);
+    try testing.expect(!stats.batch.ran_inline);
+    try testing.expect(stats.batch.active_worker_threads > 0);
 }
 
 test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation after warmup (FailingAllocator)" {

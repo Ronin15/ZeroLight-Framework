@@ -276,6 +276,10 @@ pub const PathfindingSystem = struct {
         // new_obstacle_world_rect) whenever a moving entity stays a static nav obstacle
         // across the change, not just one.
         try self.nav_dirty_cell_spans.ensureTotalCapacity(self.allocator, capacity.max_frame_requests * 2);
+        // Deduped whole-level dirty set: at most one entry per level. Pre-reserve a
+        // fixed small ceiling independent of map size so steady-path level marks are
+        // allocation-free; grows on demand for an unusually multi-level world.
+        try self.nav_dirty_levels.ensureTotalCapacity(self.allocator, @max(capacity.nav_full_relabel_level_threshold, @as(usize, 8)));
         // One scratch slot per threaded participant (workers + main). The configured
         // count is fixed; the slots' O(cells) arrays are sized in the nav build, not
         // lazily on first solve.
@@ -524,14 +528,53 @@ pub const PathfindingSystem = struct {
         try self.nav_dirty_cell_spans.append(self.allocator, .{ .level = level, .span = span });
     }
 
+    // Records one exclusive world-tile rect (e.g. a `world_obstacle_changed` event) as a
+    // single nav-cell span — O(1) append, not an O(tiles) NavCellEdit expand. A no-op when
+    // the rect is empty, fully out of world bounds, or `level` has no built grid. Partial
+    // overlap clamps to the world (mirrors perception dirty-rect clamping) so an
+    // overshooting max corner still dirties the in-bounds portion. Grows rather than
+    // dropping, matching markNavDirty / markNavObstacleRectDirty.
+    pub fn markNavTileRectDirty(
+        self: *PathfindingSystem,
+        world: *const WorldSystem,
+        level: u16,
+        min_x: u16,
+        min_y: u16,
+        max_x_exclusive: u16,
+        max_y_exclusive: u16,
+    ) !void {
+        // Clamp both ends to world so a rect that straddles the edge still dirties the
+        // in-bounds slice; a fully OOB or inverted rect becomes empty and no-ops.
+        const clamped_min_x = @min(min_x, world.width);
+        const clamped_min_y = @min(min_y, world.height);
+        const clamped_max_x = @min(max_x_exclusive, world.width);
+        const clamped_max_y = @min(max_y_exclusive, world.height);
+        if (clamped_min_x >= clamped_max_x or clamped_min_y >= clamped_max_y) return;
+        // Corners are in-bounds by construction after the clamp above.
+        const min_rect = world.cellRect(clamped_min_x, clamped_min_y) orelse return;
+        const max_rect = world.cellRect(clamped_max_x - 1, clamped_max_y - 1) orelse return;
+        try self.markNavObstacleRectDirty(level, .{
+            .min_x = min_rect.x,
+            .min_y = min_rect.y,
+            .max_x = max_rect.x + max_rect.w,
+            .max_y = max_rect.y + max_rect.h,
+        });
+    }
+
     // Marks a whole level for re-derivation next update. Use when a change cannot be reduced to
     // specific cells (e.g. a destroyed static obstacle whose nav cell is no longer resolvable):
     // the level's mask/components and abstract layer are rebuilt from the world. Deduped.
+    // Steady-path marks (within the reserve ceiling) use appendAssumeCapacity so they stay
+    // allocation-free after reserve; an unusually multi-level world grows past that ceiling.
     pub fn markNavLevelDirty(self: *PathfindingSystem, level: u16) !void {
         for (self.nav_dirty_levels.items) |existing| {
             if (existing == level) return;
         }
-        try self.nav_dirty_levels.append(self.allocator, level);
+        if (self.nav_dirty_levels.items.len < self.nav_dirty_levels.capacity) {
+            self.nav_dirty_levels.appendAssumeCapacity(level);
+        } else {
+            try self.nav_dirty_levels.append(self.allocator, level);
+        }
     }
 
     // Defensive fallback for reactToPostCommitNavEvents: an entity-driven obstacle event that
@@ -583,15 +626,16 @@ pub const PathfindingSystem = struct {
             if (!eventInvalidatesNavigation(event)) continue;
             switch (event.payload) {
                 .world_tile_changed => |changed| try self.markNavDirty(changed.level, changed.x, changed.y),
-                .world_obstacle_changed => |changed| {
-                    var y = changed.min_y;
-                    while (y < changed.max_y_exclusive) : (y += 1) {
-                        var x = changed.min_x;
-                        while (x < changed.max_x_exclusive) : (x += 1) {
-                            try self.markNavDirty(changed.level, x, y);
-                        }
-                    }
-                },
+                // One ChangedSpan covering the exclusive tile rect — not an O(tiles)
+                // NavCellEdit loop (markNavObstacleRectDirty path). Empty rects no-op.
+                .world_obstacle_changed => |changed| try self.markNavTileRectDirty(
+                    world,
+                    changed.level,
+                    changed.min_x,
+                    changed.min_y,
+                    changed.max_x_exclusive,
+                    changed.max_y_exclusive,
+                ),
                 .entity_destroyed => |destroyed| {
                     if (destroyed.obstacle_world_rect) |rect| {
                         try self.markNavObstacleRectDirty(entity_nav_level, rect);
@@ -894,13 +938,24 @@ pub const PathfindingSystem = struct {
             else
                 max_workers_for_scratch;
             self.resetSolvedPaths();
-            var context = SolveJobContext{ .system = self };
+            // Pre-select so the job context can dual-assert range.index against
+            // the dispatched range count (mirror affect.zig / collision.zig). Mirrors
+            // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
+            const selection = thread_system.selectBatchProfile(system_config.fallback_adaptive_tuner orelse &thread_system.adaptive_tuner, .{
+                .item_count = self.fallback_indices.items.len,
+                .items_per_range = system_config.items_per_range,
+                .max_worker_threads = scratch_clamped_workers,
+                .range_alignment_items = pathfinding_range_alignment_items,
+                .adaptive = system_config.adaptive,
+            });
+            var context = SolveJobContext{ .system = self, .range_count = selection.range_count };
             stats.fallback_batch = thread_system.parallelForWithOptions(self.fallback_indices.items.len, &context, solveFallbackJob, .{
                 .items_per_range = system_config.items_per_range,
                 .max_worker_threads = scratch_clamped_workers,
                 .range_alignment_items = pathfinding_range_alignment_items,
                 .adaptive = system_config.adaptive,
-                .adaptive_tuner = system_config.fallback_adaptive_tuner,
+                .adaptive_tuner = selection.active_tuner,
+                .selected_profile = selection.profile,
             });
         }
         stats.solve_ns = solve_timer.lap();
@@ -2208,6 +2263,68 @@ test "pathfinding threaded solve matches serial solve" {
     try std.testing.expectEqual(serial_view.status, threaded_view.status);
     try std.testing.expectEqual(serial_view.next_waypoint.x, threaded_view.next_waypoint.x);
     try std.testing.expectEqual(serial_view.next_waypoint.y, threaded_view.next_waypoint.y);
+}
+
+test "pathfinding threaded multi-worker solve has no steady-state allocation after warmup (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const count = 8;
+    var entities: [count]EntityId = undefined;
+    for (0..count) |i| {
+        entities[i] = try addNavBody(&data, .{ .x = 0, .y = @as(f32, @floatFromInt(i)) * 32.0 }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = baselineCapacity();
+    cap.max_frame_requests = count;
+    cap.max_pending_requests = count;
+    cap.max_solved_requests_per_step = count;
+    cap.max_fallback_requests_per_step = count;
+    cap.max_cached_results = count * 2;
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(count, count);
+    for (0..count) |i| {
+        const gy: f32 = @as(f32, @floatFromInt(i)) * 32.0 + 8.0;
+        try appendPathRequest(&stream, .{
+            .entity = entities[i],
+            .start = .{ .x = 8, .y = gy },
+            .goal = .{ .x = 400, .y = gy },
+        });
+    }
+
+    // Warm multi-worker solve path (must not be the inline fallback).
+    const warmup = try system.update(&stream, count, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expect(!warmup.fallback_batch.ran_inline);
+    try std.testing.expect(warmup.fallback_batch.active_worker_threads > 0);
+
+    // Steady-state re-solve under a failing allocator on system + graph (scratch
+    // and path stripes already reserved; no new capacity growth).
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+    defer {
+        system.allocator = original;
+        system.graph.allocator = original;
+    }
+
+    // Drop all cached/pending solve state so the same goals re-enter the
+    // multi-worker fallback path under the failing allocator.
+    system.clearRuntimeState();
+    const stats = try system.update(&stream, count, &threads, .{ .adaptive = false, .items_per_range = 1 });
+    try std.testing.expect(!stats.fallback_batch.ran_inline);
+    try std.testing.expect(stats.fallback_batch.item_count > 0);
 }
 
 test "pathfinding threaded multi-goal solve keeps disjoint per-request paths" {
@@ -3650,6 +3767,209 @@ test "reactToPostCommitNavEvents preserves buffered marks across a failed apply 
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
     try std.testing.expect(!system.hasPendingNavUpdates());
     try std.testing.expect(system.graph.grid(0).?.isBlockedCell(.{ .x = 2, .y = 2 }));
+}
+
+test "reactToPostCommitNavEvents maps world_obstacle_changed to one cell-span (not O(tiles) edits)" {
+    // M15: a multi-tile world_obstacle_changed must append a single ChangedSpan via
+    // markNavTileRectDirty, not one NavCellEdit per tile. Multi-chunk fixture
+    // (nav_chunk_tiles=4) so the dirty rect spans ≥2 abstract chunks and a control
+    // cell in an untouched chunk stays open.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    // 256 world units / 32 cell size = 8 nav cells; with nav_chunk_tiles=4 that is a
+    // 2×2 chunk grid so a rect crossing x=4 spans two chunks on the same row.
+    const extent: f32 = 256;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+    const grid = system.graph.grid(0).?;
+    try std.testing.expect(grid.width >= 8);
+    try std.testing.expectEqual(@as(u16, 4), system.capacity.nav_chunk_tiles);
+
+    // Paint a rect that crosses the chunk boundary at x=4 (tiles 2..5 inclusive).
+    const min_x: u16 = 2;
+    const min_y: u16 = 1;
+    const max_x_exclusive: u16 = 6;
+    const max_y_exclusive: u16 = 3;
+    // Control tile in the bottom-right chunk — never part of the dirty rect.
+    const control_x: u16 = 6;
+    const control_y: u16 = 6;
+    var y: u16 = min_y;
+    while (y < max_y_exclusive) : (y += 1) {
+        var x: u16 = min_x;
+        while (x < max_x_exclusive) : (x += 1) {
+            _ = (try world.setDenseTile(obstacle, x, y, tree)) orelse return error.TestExpectedEqual;
+        }
+    }
+
+    // Expected span = union of per-tile world-rect spans (must match the O(1) mark).
+    var expected_span = grid.cellSpanForWorldRect(0, 0, 0, 0);
+    var first_tile = true;
+    y = min_y;
+    while (y < max_y_exclusive) : (y += 1) {
+        var x: u16 = min_x;
+        while (x < max_x_exclusive) : (x += 1) {
+            const rect = world.cellRect(x, y).?;
+            const tile_span = grid.cellSpanForWorldRect(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h);
+            if (first_tile) {
+                expected_span = tile_span;
+                first_tile = false;
+            } else {
+                expected_span.min_x = @min(expected_span.min_x, tile_span.min_x);
+                expected_span.min_y = @min(expected_span.min_y, tile_span.min_y);
+                expected_span.max_x = @max(expected_span.max_x, tile_span.max_x);
+                expected_span.max_y = @max(expected_span.max_y, tile_span.max_y);
+            }
+        }
+    }
+    // The union itself must cross a nav-chunk boundary (otherwise the multi-chunk claim is vacuous).
+    const ct: usize = system.capacity.nav_chunk_tiles;
+    try std.testing.expect(expected_span.min_x / ct != expected_span.max_x / ct);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.events.appendRequired(.{ .stage = .structural_commit, .payload = .{ .world_obstacle_changed = .{
+        .level = 0,
+        .min_x = min_x,
+        .min_y = min_y,
+        .max_x_exclusive = max_x_exclusive,
+        .max_y_exclusive = max_y_exclusive,
+    } } });
+
+    // Mark only (don't apply): inspect the dirty buffers after the event walk by
+    // forcing ensureCanAppend to fail before applyBufferedNavUpdates, same pattern
+    // as the preserve-buffered-marks test above.
+    frame.events.setCapacityLimit(frame.events.mergedItems().len);
+    try std.testing.expectError(error.EventCapacityExceeded, system.reactToPostCommitNavEvents(&frame, &data, &world, null));
+
+    // One span, zero per-tile edits — O(1) dirty expand, not O(tiles).
+    try std.testing.expectEqual(@as(usize, 0), system.nav_dirty_edits.items.len);
+    try std.testing.expectEqual(@as(usize, 1), system.nav_dirty_cell_spans.items.len);
+    try std.testing.expectEqual(@as(u16, 0), system.nav_dirty_cell_spans.items[0].level);
+    try std.testing.expectEqual(expected_span, system.nav_dirty_cell_spans.items[0].span);
+
+    // Apply the leftover mark: dirty tiles block; control cell in the untouched chunk stays open.
+    frame.events.setCapacityLimit(null);
+    frame.beginStep();
+    const stats = try system.reactToPostCommitNavEvents(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    y = min_y;
+    while (y < max_y_exclusive) : (y += 1) {
+        var x: u16 = min_x;
+        while (x < max_x_exclusive) : (x += 1) {
+            const rect = world.cellRect(x, y).?;
+            const cell = grid.worldToCellClamped(.{
+                .x = rect.x + rect.w * 0.5,
+                .y = rect.y + rect.h * 0.5,
+            });
+            try std.testing.expect(grid.isBlockedCell(cell));
+        }
+    }
+    {
+        const control_rect = world.cellRect(control_x, control_y).?;
+        const control_cell = grid.worldToCellClamped(.{
+            .x = control_rect.x + control_rect.w * 0.5,
+            .y = control_rect.y + control_rect.h * 0.5,
+        });
+        try std.testing.expect(!grid.isBlockedCell(control_cell));
+    }
+}
+
+test "markNavTileRectDirty clamps partial OOB rects instead of dropping them" {
+    // L7: a rect whose max corner is past the world edge still dirties the in-bounds
+    // portion (perception-style clamp), rather than all-or-nothing no-op on cellRect miss.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const tree = try requireTestTile(&meta, "tree_0");
+    const grass = try requireTestTile(&meta, "grass");
+
+    // 128 / tile_size ≈ 4 tiles on a side — small enough that max=100 is clearly OOB.
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 128, 128);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 128, 128, 32, null);
+    const grid = system.graph.grid(0).?;
+
+    // Paint the last two columns so the clamped in-bounds slice actually flips blocked.
+    const in_min_x: u16 = world.width - 2;
+    const in_min_y: u16 = 0;
+    var y: u16 = 0;
+    while (y < world.height) : (y += 1) {
+        var x: u16 = in_min_x;
+        while (x < world.width) : (x += 1) {
+            _ = (try world.setDenseTile(obstacle, x, y, tree)) orelse return error.TestExpectedEqual;
+        }
+    }
+
+    // min in-bounds, max far past the edge — pre-fix dropped the whole mark.
+    try system.markNavTileRectDirty(&world, 0, in_min_x, in_min_y, 1000, 1000);
+    try std.testing.expectEqual(@as(usize, 1), system.nav_dirty_cell_spans.items.len);
+
+    const stats = try system.applyBufferedNavUpdates(&data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    // Every in-bounds tile of the painted strip is blocked after the clamped dirty apply.
+    y = 0;
+    while (y < world.height) : (y += 1) {
+        var x: u16 = in_min_x;
+        while (x < world.width) : (x += 1) {
+            const rect = world.cellRect(x, y).?;
+            const cell = grid.worldToCellClamped(.{
+                .x = rect.x + rect.w * 0.5,
+                .y = rect.y + rect.h * 0.5,
+            });
+            try std.testing.expect(grid.isBlockedCell(cell));
+        }
+    }
+
+    // Fully OOB / empty after clamp still no-ops.
+    try system.markNavTileRectDirty(&world, 0, world.width, world.height, 1000, 1000);
+    try std.testing.expectEqual(@as(usize, 0), system.nav_dirty_cell_spans.items.len);
+}
+
+test "markNavLevelDirty is allocation-free up to the reserved ceiling (FailingAllocator)" {
+    // R14 / L1: reserve pre-warms nav_dirty_levels; marks up to that ceiling must not
+    // allocate. One past the physical capacity still grows (grows-rather-than-drops).
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(baselineCapacity());
+
+    const reserved_cap = system.nav_dirty_levels.capacity;
+    try std.testing.expect(reserved_cap >= 8);
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+
+    var level: u16 = 0;
+    while (level < reserved_cap) : (level += 1) {
+        try system.markNavLevelDirty(level);
+    }
+    try std.testing.expectEqual(reserved_cap, system.nav_dirty_levels.items.len);
+    // Dedup within the reserved set must also stay allocation-free.
+    try system.markNavLevelDirty(0);
+    try std.testing.expectEqual(reserved_cap, system.nav_dirty_levels.items.len);
+
+    system.allocator = original;
+
+    // Past the physical capacity: grow path uses the real allocator (still never drops).
+    try system.markNavLevelDirty(@intCast(reserved_cap));
+    try std.testing.expectEqual(reserved_cap + 1, system.nav_dirty_levels.items.len);
 }
 
 test "pathfinding incremental update is allocation-free at steady state (within init high-water mark)" {

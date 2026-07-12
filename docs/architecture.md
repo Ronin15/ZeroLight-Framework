@@ -403,11 +403,12 @@ The current gameplay fixed-step pipeline is:
    `SpatialIndexSystem`, Slice 28) → `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
-   `apply_ai_movement_intents` → `movement_scope_gather` →
-   `movement_integrate` → `bounds_and_tile_gate` →
+   `apply_ai_movement_intents` → `movement_integrate` →
    `collision_scope_gather` → `collision_detect` → `collision_respond` →
-   `plane_traversal` (ramp/fall/carve/snap) → `tier_policy` (deferred
-   `set_simulation_tier` commands).
+   `bounds_and_tile_gate` (world bounds clamp + solid-tile gate; after
+   collision so a contact push into dirt is re-gated) →
+   `plane_traversal` (ramp/fall/carve/snap) → `chunk_derive` →
+   `tier_policy` (deferred `set_simulation_tier` commands).
 4. Queue contact audio, emit/update transient particles, and merge outputs.
 5. Update the state-owned follow camera and visible world chunks.
 6. Commit deferred structural commands to `DataSystem`, then run the

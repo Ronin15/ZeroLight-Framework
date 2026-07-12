@@ -114,10 +114,12 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // Matches the historical 24/32 == 0.75 surface/total split.
     const surface_movers = mover_count * 3 / 4;
     const underground_movers = mover_count - surface_movers;
-    // Owned by CollisionSystem (this demo has no independent opinion on worst-case
-    // simultaneous contacts for N bodies — that's collision's own domain knowledge, not
-    // a ratio to guess here). A contact-stream overflow is a graceful, counted drop
-    // (RangeOutputStream.stats.dropped), not a crash, so an approximation is fine.
+    // Owned by CollisionSystem (this demo has no independent opinion on simultaneous
+    // contacts for N bodies — that's collision's own domain knowledge, not a ratio to
+    // guess here). `estimateContactCapacity` is a steady-state WARM heuristic, not a
+    // combinatorial worst-case ceiling: contacts grow via RangeOutputStream.prefix
+    // when a step needs more. SimulationEvents (frame.events) is the stream that can
+    // drop under an explicit capacity_limit — not the contact stream.
     const contact_capacity = CollisionSystem.estimateContactCapacity(mover_count + obstacle_count + 1);
     // Every steering agent emits one navigation intent per step unconditionally (unlike
     // path REQUESTS, which are sparse/event-driven) — this must cover the full
@@ -425,6 +427,10 @@ pub const GameDemoState = struct {
         // events (`pop_cap.event_reserve`), not a flat constant unrelated to that budget.
         try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
+        // Plane-traversal batches fall-landing tile events into this scratch (player +
+        // every AI agent can fall in one step). Dig emits at most one stimulus/step.
+        try simulation_frame.reserveWorldTileChangesScratch(pop_cap.mover_count + 1);
+        try simulation_frame.stimuli.reserve(1, 1);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = pop_cap.mover_count,
             .static_obstacle_capacity = obstacle_count,
@@ -1467,7 +1473,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame); // seed player_last_cell = (3,3)
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
@@ -1477,7 +1483,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     // Walk into the hole -> fall exactly one level onto the dirt plane.
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(1), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
@@ -1487,14 +1493,14 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expect(!demo.world.denseTileBlocksMovement(floor1, 4, 3));
 
     // Standing put: no second fall.
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
@@ -1509,12 +1515,12 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
 
     // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     try digFacedForTest(&demo, .ramp);
@@ -1525,7 +1531,7 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
 
     // The link still climbs planes via the world tier (independent of the abstract graph).
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 }
 
@@ -1535,12 +1541,12 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame); // seed player_last_cell = (3,3)
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
 
     // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
@@ -1550,7 +1556,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     // Walk into it -> fall one more level onto the void plane (level 2).
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 2), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(2), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 

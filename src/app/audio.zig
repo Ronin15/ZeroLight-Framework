@@ -172,7 +172,13 @@ pub const AudioCommandBuffer = struct {
         if (self.commands.items.len >= self.max_commands) {
             return error.AudioCommandLimitReached;
         }
-        try self.commands.append(self.allocator, command);
+        // After `reserve()`, capacity is max_commands and this path is allocation-free.
+        // Without a prior reserve, grow once up to the hard cap so cold test/init
+        // paths still work; the engine always reserves before the first step.
+        if (self.commands.capacity < self.max_commands) {
+            try self.commands.ensureTotalCapacity(self.allocator, self.max_commands);
+        }
+        self.commands.appendAssumeCapacity(command);
     }
 
     fn copySfxRequest(request: PlaySfxRequest) OwnedPlaySfxRequest {
@@ -1095,6 +1101,25 @@ test "audio command buffer stores stable ids and clamps command values" {
     try std.testing.expectEqual(@as(f32, 1.0), commands.items()[0].play_sfx.frequency_ratio);
 }
 
+test "audio command buffer append is allocation-free after reserve" {
+    var commands = AudioCommandBuffer.init(std.testing.allocator, 4);
+    defer commands.deinit();
+    try commands.reserve();
+
+    // fail_index 0 turns any allocation into an immediate error, so a succeeding
+    // append proves the reserved appendAssumeCapacity path allocates zero times.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    commands.allocator = failing.allocator();
+
+    var i: usize = 0;
+    while (i < commands.max_commands) : (i += 1) {
+        try commands.playSfx(.{ .asset = .collision_sfx });
+    }
+    try std.testing.expectEqual(commands.max_commands, commands.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectError(error.AudioCommandLimitReached, commands.playSfx(.{ .asset = .player_jet_sfx }));
+}
+
 test "audio command buffer clamps invalid sfx frequency ratios" {
     var commands = AudioCommandBuffer.init(std.testing.allocator, 4);
     defer commands.deinit();
@@ -1153,6 +1178,40 @@ test "audio service init cleans up music track when first sfx track creation fai
     try std.testing.expectEqual(@as(u32, 1), fake.create_track_calls);
     try std.testing.expectEqual(@as(u32, 1), fake.destroy_track_calls);
     try std.testing.expectEqual(@as(usize, 0), fake.tracks.count());
+}
+
+test "audio createTracks sfx append is allocation-free after capacity reserve" {
+    var fake = FakeBackendContext.init(std.testing.allocator);
+    defer fake.deinit();
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(
+        std.testing.allocator,
+        asset_store,
+        .{ .max_sfx_tracks = 3 },
+        FakeBackendContext.backend(),
+        @ptrCast(&fake),
+    );
+    defer service.deinit();
+
+    // Keep the capacity createTracks established at init (no external pre-reserve):
+    // free backend handles and clear length only, then re-run createTracks under a
+    // FailingAllocator so the reserved-then-appendAssumeCapacity success path is
+    // proven allocation-free by createTracks itself.
+    for (service.sfx_tracks.items) |track| {
+        service.backend.destroy_track(service.backend_context, track.handle);
+    }
+    service.sfx_tracks.clearRetainingCapacity();
+    if (service.music_track != invalid_backend_handle) {
+        service.backend.destroy_track(service.backend_context, service.music_track);
+        service.music_track = invalid_backend_handle;
+    }
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    service.allocator = failing.allocator();
+    try service.createTracks();
+    try std.testing.expectEqual(service.config.max_sfx_tracks, service.sfx_tracks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(service.music_track != invalid_backend_handle);
 }
 
 test "audio service init cleans up partially created sfx tracks" {

@@ -255,3 +255,22 @@ test "simd range helpers cover movement body vector and scalar tail counts" {
     try std.testing.expectEqual(@as(usize, simd.lane_count * 2), simd.vectorizedEnd(simd.lane_count * 2 + 1));
     try std.testing.expectEqual(@as(usize, 1), simd.tailLen(simd.lane_count * 2 + 1));
 }
+
+test "MovementBodyStore append is allocation-free after ensureCapacity reserves" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}

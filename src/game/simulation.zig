@@ -313,6 +313,15 @@ pub const SimulationEvents = struct {
         }
     }
 
+    /// Preflights the capacity limit and buffer growth for `count` more events
+    /// without writing. Call before a world mutate that must emit matching
+    /// events so a capacity miss cannot leave the world changed without an event.
+    pub fn ensureEventAppendCapacity(self: *SimulationEvents, count: usize) !void {
+        if (count == 0) return;
+        try self.ensureCanAppend(count);
+        try self.reserveAppendCapacity(1, count);
+    }
+
     fn pendingCountFrom(self: *const SimulationEvents, first_range: usize) usize {
         var count: usize = 0;
         for (self.stream.counts.items[first_range..]) |range_count| {
@@ -474,6 +483,9 @@ pub const SimulationFrame = struct {
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
     structural_changes_scratch: std.ArrayList(StructuralChange) = .empty,
+    // Reused by plane-traversal to batch fall-landing tile events into one
+    // finishWrite (see publishWorldTileChanges); cleared each beginStep.
+    world_tile_changes_scratch: std.ArrayList(WorldTileChangedEvent) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
@@ -491,6 +503,7 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
+        self.world_tile_changes_scratch.deinit(self.allocator);
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.stimuli.deinit();
@@ -521,6 +534,7 @@ pub const SimulationFrame = struct {
         self.stimuli.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
         self.structural_changes_scratch.clearRetainingCapacity();
+        self.world_tile_changes_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -541,10 +555,39 @@ pub const SimulationFrame = struct {
         try self.structural_commands.reserve(range_count, structural_command_capacity);
     }
 
+    /// Preflights buffer growth for one `appendStimulus` (one range, `value_count`
+    /// values) so a capacity miss cannot leave a dig tile changed without a
+    /// matching stimulus. Call before any world mutate that must emit one.
+    pub fn ensureStimulusAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
+        if (value_count == 0) return;
+        // Use stimuli.allocator (same as appendRangeCounts/prefix) so a swapped
+        // stream allocator in tests and production stays consistent.
+        const alloc = self.stimuli.allocator;
+        const new_range_count = self.stimuli.counts.items.len + 1;
+        try self.stimuli.counts.ensureTotalCapacity(alloc, new_range_count);
+        try self.stimuli.offsets.ensureTotalCapacity(alloc, new_range_count);
+        try self.stimuli.write_offsets.ensureTotalCapacity(alloc, new_range_count);
+        const new_value_count = if (self.stimuli.prefix_ready)
+            self.stimuli.mergedItems().len + value_count
+        else blk: {
+            var pending: usize = 0;
+            for (self.stimuli.counts.items) |count| pending += count;
+            break :blk pending + value_count;
+        };
+        try self.stimuli.values.ensureTotalCapacity(alloc, new_value_count);
+    }
+
+    /// Warms the plane-traversal tile-change batch buffer. Sized for the worst
+    /// case of player + every AI agent falling in one step (`mover_count + 1`).
+    pub fn reserveWorldTileChangesScratch(self: *SimulationFrame, capacity: usize) !void {
+        try self.world_tile_changes_scratch.ensureTotalCapacity(self.allocator, capacity);
+    }
+
     /// Single-value append for main-thread producers (dig is not threaded).
     /// `stimuli` is not part of `reserveStreams`: its per-step count is a fixed
-    /// producer invariant (dig emits at most one), not scene-scale-dependent,
-    /// so it grows lazily on first use like `PerceptionSystem`'s own buffers.
+    /// producer invariant (dig emits at most one), not scene-scale-dependent.
+    /// Dig preflights via `ensureStimulusAppendCapacity` before world mutate;
+    /// demo init may also warm with `stimuli.reserve(1, 1)`.
     pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
         const first_range = try self.stimuli.appendRangeCounts(1);
         self.stimuli.addCount(first_range, 1);
@@ -633,6 +676,27 @@ pub const SimulationFrame = struct {
                         .new_obstacle_world_rect = changed.new_obstacle_world_rect,
                     } },
                 },
+            });
+        }
+        writer.finish();
+        self.events.finishWrite();
+    }
+
+    /// Publishes fall/dig landing tile changes in a single event range with one
+    /// finishWrite. Mirrors publishStructuralChanges so N plane-traversal carves
+    /// stay O(N) rather than O(N^2) from per-event appendRequired.
+    pub fn publishWorldTileChanges(self: *SimulationFrame, changes: []const WorldTileChangedEvent) !void {
+        if (changes.len == 0) return;
+        try self.events.ensureCanAppend(changes.len);
+        try self.events.reserveAppendCapacity(1, changes.len);
+        const first_range = try self.events.appendRangeCounts(1);
+        self.events.addCount(first_range, changes.len);
+        try self.events.prefixAppendedRanges(first_range);
+        var writer = self.events.rangeWriter(first_range);
+        for (changes) |changed| {
+            writer.write(.{
+                .stage = .structural_commit,
+                .payload = .{ .world_tile_changed = changed },
             });
         }
         writer.finish();
@@ -1341,6 +1405,23 @@ test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems refl
     try std.testing.expectEqual(@as(u16, 1), merged[1].level);
 }
 
+test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 4, 4, 4, 4);
+
+    const changes = [_]WorldTileChangedEvent{
+        .{ .level = 1, .x = 2, .y = 3, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 1, .x = 4, .y = 5, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 0, .y = 1, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = true, .new_blocks_movement = false },
+    };
+    const ranges_before = frame.events.rangeCount();
+    try frame.publishWorldTileChanges(&changes);
+    try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
+    try std.testing.expectEqual(@as(usize, 3), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 3), frame.events.stats.world_tile_changed);
+}
+
 test "SimulationFrame.clearRetainingCapacity clears stimuli" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -1367,4 +1448,44 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
 
     try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.ensureStimulusAppendCapacity(1);
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveWorldTileChangesScratch(2);
+
+    const original = frame.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.allocator = failing.allocator();
+    defer frame.allocator = original;
+
+    const change = WorldTileChangedEvent{
+        .level = 1,
+        .x = 2,
+        .y = 3,
+        .old_tile_id = 1,
+        .new_tile_id = 2,
+        .old_blocks_movement = true,
+        .new_blocks_movement = false,
+    };
+    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
+    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
+    try std.testing.expectEqual(@as(usize, 2), frame.world_tile_changes_scratch.items.len);
 }

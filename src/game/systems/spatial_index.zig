@@ -540,6 +540,7 @@ pub const SpatialIndexSystem = struct {
             .data = data,
             .scope_dense_indices = config.scope_dense_indices,
             .ranges = self.gather_ranges.items[0..selection.range_count],
+            .item_count = n,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, spatialGatherJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -810,6 +811,9 @@ const SpatialGatherContext = struct {
     data: *const DataSystem,
     scope_dense_indices: ?[]const u32,
     ranges: []RowRangeSlot,
+    /// Candidate count the dispatch was shaped for (scoped subset or full AI
+    /// population); dual-asserted against `range.end` at job entry.
+    item_count: usize,
 };
 
 /// Scattered/branchy per-entity resolution: `movementBodyDenseIndex` is a
@@ -822,8 +826,12 @@ const SpatialGatherContext = struct {
 /// `docs/coding-standards.md`'s SIMD section calls for.
 fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpatialGatherContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the candidate buffer this job walks.
     // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
     std.debug.assert(range.index < job.ranges.len);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.item_count);
     const buffer = &job.ranges[range.index].buffer;
     for (range.start..range.end) |k| {
         const i: usize = if (job.scope_dense_indices) |idx| idx[k] else k;
@@ -1351,13 +1359,18 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = 6 });
     defer threads.deinit();
+    // Without real workers the threaded build falls back to inline on the main
+    // thread and this proof becomes a silent serial false pass.
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
     try sys.reserve(24, .{});
 
     // Warmup: one threaded build (warms `gather_ranges`) and one serial build.
-    _ = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
+    const warmup_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
+    try testing.expect(!warmup_stats.batch.ran_inline);
+    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
     _ = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
@@ -1367,6 +1380,8 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     const threaded_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
     try testing.expectEqual(@as(usize, 24), threaded_stats.entity_count);
+    try testing.expect(!threaded_stats.batch.ran_inline);
+    try testing.expect(threaded_stats.batch.active_worker_threads > 0);
     const serial_stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
     try testing.expectEqual(@as(usize, 24), serial_stats.entity_count);
 

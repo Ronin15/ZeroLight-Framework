@@ -135,6 +135,25 @@ pub const FacingStore = struct {
     }
 };
 
+test "FacingStore append is allocation-free after ensureCapacity reserves" {
+    var store: FacingStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{ .direction = .right });
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
 pub const PrimitiveVisualStore = struct {
     rows: std.MultiArrayList(PrimitiveVisualRow) = .{},
 
@@ -262,6 +281,30 @@ pub const PrimitiveVisualStore = struct {
         try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
+
+test "PrimitiveVisualStore append is allocation-free after ensureCapacity reserves" {
+    var store: PrimitiveVisualStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+    const visual = PrimitiveVisual{
+        .size = .{ .x = 8, .y = 8 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    };
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, visual);
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
 
 pub const AssetReferenceStore = struct {
     rows: std.MultiArrayList(AssetReferenceRow) = .{},
