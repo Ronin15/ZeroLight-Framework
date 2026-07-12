@@ -1251,12 +1251,16 @@ pub const Renderer = struct {
             try self.ensureTileEditTransfer(required_bytes);
             const transfer = self.tile_edit_transfer.?;
             // Stage immediately before the copy, after swapchain acquire (matches
-            // the working `world` branch timing for dig cell uploads).
+            // the working `world` branch timing for dig cell uploads). This
+            // transfer buffer is renderer-owned and reused across frames, so it
+            // must map with cycle=true (like stageVertices) to avoid overwriting
+            // a prior in-flight frame's copy source.
             try gpu_buffer.stageStorageRegions(
                 self.device,
                 transfer,
                 self.tile_edit_transfer_byte_size,
                 self.tile_edit_scratch.items,
+                true,
             );
             try gpu_buffer.recordStorageRegionsInPass(
                 copy_pass_scope.pass,

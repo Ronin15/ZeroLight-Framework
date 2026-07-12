@@ -116,6 +116,20 @@ a silent OOB write in ReleaseFast rather than a Debug/ReleaseSafe panic. The
 threaded path fails as a concurrent shared-allocator call (a data race), not a
 clean single-threaded OOM.
 
+A partitioned processor that **emits an event stream** (not just scatters values
+into disjoint slots) under a per-step cap has a second requirement beyond
+disjoint writes: the merged emit order — and therefore which events survive the
+cap — is canonical and partition-independent. Such processors emit in a stable
+key order (per row, with a row's sub-kinds grouped, as
+`PerceptionSystem.emitTransitionsForRange` and `AffectSystem`'s per-row crossing
+emit do), or sort the merged buffer by that key before applying the cap. Emitting
+one sub-kind or column at a time across a whole range makes both the merged order
+and the capped membership depend on how many ranges the tuner picked, so
+serial/threaded output diverges even though the scatter is race-free. Parity
+tests for these processors cross two or more event kinds for entities in
+different ranges and include a capped case — a single-kind fixture is row-ordered
+identically in both paths and hides the divergence.
+
 Allocators are owned explicitly: every allocating struct takes an
 `std.mem.Allocator` at `init` and stores it as a field, set immediately —
 never left `undefined` until a later call sets it. Do not reach for

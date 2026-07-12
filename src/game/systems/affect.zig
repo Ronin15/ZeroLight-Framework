@@ -442,9 +442,13 @@ fn affectRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 
 /// Shared serial/threaded per-range compute function: one vectorized pass per
 /// drive column (fear, aggression, curiosity, fatigue), each over the same
-/// row range. Order across the four passes is fixed and does not matter for
-/// correctness (the drives are independent), only for event-append order
-/// within the range's scratch buffer.
+/// row range, scattering the final drive value only. Threshold-crossing events
+/// are then emitted by a single per-row pass (`emitRangeCrossings`) so the
+/// merged event stream is row-ordered and partition-independent: emitting one
+/// drive column at a time would make both the merged order AND the surviving
+/// set under `max_events_per_step` depend on how many ranges the tuner chose,
+/// silently breaking serial/threaded byte-identity. Mirrors
+/// PerceptionSystem.emitTransitionsForRange's per-row emit.
 fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
     std.debug.assert(range.index < job.event_ranges.len);
     std.debug.assert(range.start <= range.end);
@@ -453,6 +457,7 @@ fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
     processAggressionColumn(job, range);
     processCuriosityColumn(job, range);
     processFatigueColumn(job, range);
+    emitRangeCrossings(job, range);
 }
 
 /// prev + delta, decayed toward baseline, clamped to [0, 1]. Shared by every
@@ -522,11 +527,9 @@ fn visibilityRatioScalar(dist: f32, vision_range: f32) f32 {
 fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
-    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -537,7 +540,6 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_fear, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_fear, lanes);
-        const threshold = simd.gatherFloat4(s.threshold_fear, lanes);
         const prev = simd.gatherFloat4(s.fear, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -547,7 +549,6 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fear, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fear, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -555,22 +556,16 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const prev = s.fear[index];
         const visible = target_visible_f[k] > 0.5;
         const delta = if (visible) gain_fear * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
-        const final = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
-        s.fear[index] = final;
-        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fear), final, s.threshold_fear[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .fear, rising);
-        }
+        s.fear[index] = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
     }
 }
 
 fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
-    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -581,7 +576,6 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_aggression, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_aggression, lanes);
-        const threshold = simd.gatherFloat4(s.threshold_aggression, lanes);
         const prev = simd.gatherFloat4(s.aggression, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -591,7 +585,6 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.aggression, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .aggression, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -599,22 +592,16 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const prev = s.aggression[index];
         const visible = target_visible_f[k] > 0.5;
         const delta = if (visible) gain_aggression * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
-        const final = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
-        s.aggression[index] = final;
-        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.aggression), final, s.threshold_aggression[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .aggression, rising);
-        }
+        s.aggression[index] = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
     }
 }
 
 fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const heard_stimulus_f = job.heard_stimulus_f;
     const familiarity = job.familiarity;
-    const buffer = &job.event_ranges[range.index].buffer;
 
     const one = simd.splatFloat4(1);
     const zero = simd.splatFloat4(0);
@@ -627,7 +614,6 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_curiosity, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_curiosity, lanes);
-        const threshold = simd.gatherFloat4(s.threshold_curiosity, lanes);
         const prev = simd.gatherFloat4(s.curiosity, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -641,7 +627,6 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.curiosity, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .curiosity, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -650,20 +635,14 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
         const heard_and_not_visible = target_visible_f[k] <= 0.5 and heard_stimulus_f[k] > 0.5;
         const delta = (if (heard_and_not_visible) gain_curiosity_hearing else @as(f32, 0)) +
             gain_curiosity_novelty * (1 - familiarity[k]);
-        const final = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
-        s.curiosity[index] = final;
-        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.curiosity), final, s.threshold_curiosity[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .curiosity, rising);
-        }
+        s.curiosity[index] = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
     }
 }
 
 fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
-    const entities = job.entities;
     const behavior_exertion_f = job.behavior_exertion_f;
-    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -674,7 +653,6 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_fatigue, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_fatigue, lanes);
-        const threshold = simd.gatherFloat4(s.threshold_fatigue, lanes);
         const prev = simd.gatherFloat4(s.fatigue, lanes);
 
         // Fatigue's own input is this row's AiAgent.active_behavior, not
@@ -689,38 +667,62 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
-        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fatigue, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
         const index = indices[k];
         const prev = s.fatigue[index];
         const delta: f32 = if (behavior_exertion_f[k] > 0.5) gain_fatigue else 0;
-        const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
-        s.fatigue[index] = final;
-        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
-            appendCrossingEvent(buffer, entities[k], .fatigue, rising);
+        s.fatigue[index] = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
+    }
+}
+
+/// Per-row threshold-crossing emit, run after all four drive columns have
+/// scattered their final values. Emitting per-row (all four drives grouped in
+/// row order) rather than per-column keeps the merged event stream — and the
+/// set that survives `max_events_per_step` — identical between the serial
+/// (one range) and threaded (R ranges) paths regardless of the tuner's split.
+/// Drives are checked in enum order (fear, curiosity, aggression, fatigue) so
+/// the within-row order is also fixed.
+fn emitRangeCrossings(job: *AffectJobContext, range: ParallelRange) void {
+    const s = job.affect_slice;
+    const indices = job.affect_dense_index;
+    const entities = job.entities;
+    const buffer = &job.event_ranges[range.index].buffer;
+
+    var k = range.start;
+    while (k < range.end) : (k += 1) {
+        const index = indices[k];
+        const entity = entities[k];
+        const mask = &s.above_threshold_mask[index];
+        inline for ([_]AiAffectDrive{ .fear, .curiosity, .aggression, .fatigue }) |drive| {
+            const final = driveValue(s, drive)[index];
+            const threshold = driveThreshold(s, drive)[index];
+            if (checkThresholdCrossing(mask, driveBit(drive), final, threshold)) |rising| {
+                appendCrossingEvent(buffer, entity, drive, rising);
+            }
         }
     }
 }
 
-fn emitCrossings(
-    buffer: *AffectEventRangeBuffer,
-    entities: []const EntityId,
-    dense_indices: []const u32,
-    above_threshold_mask: []u8,
-    k: usize,
-    drive: AiAffectDrive,
-    final: [simd.lane_count]f32,
-    threshold: [simd.lane_count]f32,
-) void {
-    const bit = driveBit(drive);
-    inline for (0..simd.lane_count) |lane| {
-        const dense_index = dense_indices[k + lane];
-        if (checkThresholdCrossing(&above_threshold_mask[dense_index], bit, final[lane], threshold[lane])) |rising| {
-            appendCrossingEvent(buffer, entities[k + lane], drive, rising);
-        }
-    }
+/// The scattered final-value column for `drive`.
+fn driveValue(s: AiAffectSlice, comptime drive: AiAffectDrive) []const f32 {
+    return switch (drive) {
+        .fear => s.fear,
+        .curiosity => s.curiosity,
+        .aggression => s.aggression,
+        .fatigue => s.fatigue,
+    };
+}
+
+/// The per-drive threshold column for `drive`.
+fn driveThreshold(s: AiAffectSlice, comptime drive: AiAffectDrive) []const f32 {
+    return switch (drive) {
+        .fear => s.threshold_fear,
+        .curiosity => s.threshold_curiosity,
+        .aggression => s.threshold_aggression,
+        .fatigue => s.threshold_fatigue,
+    };
 }
 
 const StageWorkSelection = struct {
@@ -1167,6 +1169,87 @@ test "serial and threaded updates are byte-identical" {
     try testing.expectEqualSlices(f32, slice_a.fatigue, slice_b.fatigue);
     try testing.expectEqualSlices(u8, slice_a.above_threshold_mask, slice_b.above_threshold_mask);
     try testing.expectEqualSlices(SimulationEvent, events_a.mergedItems(), events_b.mergedItems());
+}
+
+test "serial and threaded emit identical order and cap membership when different drives cross across ranges" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // 20 agents span two ranges at items_per_range=16: [0,16) and [16,20).
+    // Agent 0 (range 0) crosses aggression only; agent 16 (range 1) crosses
+    // fear only. Per-column emission would order these by drive (fear before
+    // aggression), making the serial (one range) stream disagree with the
+    // threaded (range-ascending) stream; per-row emission must yield row order
+    // (aggression@0 before fear@16) in both — and the cap must then truncate
+    // the same tail element in both.
+    var data_serial = DataSystem.init(testing.allocator);
+    defer data_serial.deinit();
+    var data_threaded = DataSystem.init(testing.allocator);
+    defer data_threaded.deinit();
+
+    for ([_]*DataSystem{ &data_serial, &data_threaded }) |data| {
+        for (0..20) |i| {
+            const visible = i == 0 or i == 16;
+            var affect: AiAffect = .{};
+            if (i == 0) affect.threshold_aggression = 0.06;
+            if (i == 16) affect.threshold_fear = 0.1;
+            _ = try addAgentWithPerceptionMemoryAffect(
+                data,
+                .{ .active_behavior = .wander },
+                .{ .vision_range = 100, .target_visible = visible, .nearest_threat_dist = 0, .heard_stimulus = false },
+                .{ .familiarity = 1 },
+                affect,
+            );
+        }
+    }
+
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = affect_range_alignment_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var sys_serial = AffectSystem.init(testing.allocator);
+    defer sys_serial.deinit();
+    var sys_threaded = AffectSystem.init(testing.allocator);
+    defer sys_threaded.deinit();
+    var events_serial = SimulationEvents.init(testing.allocator);
+    defer events_serial.deinit();
+    var events_threaded = SimulationEvents.init(testing.allocator);
+    defer events_threaded.deinit();
+
+    _ = try sys_serial.updateSerial(data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{});
+    _ = try sys_threaded.update(data_threaded.aiAgentSliceConst(), &data_threaded, &events_threaded, &threads, .{
+        .items_per_range = affect_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    const serial_items = events_serial.mergedItems();
+    try testing.expectEqualSlices(SimulationEvent, serial_items, events_threaded.mergedItems());
+    try testing.expectEqual(@as(usize, 2), serial_items.len);
+    // Row order: aggression (row 0) before fear (row 16), independent of partition.
+    try testing.expectEqual(AiAffectDrive.aggression, serial_items[0].payload.affect_threshold_crossed.drive);
+    try testing.expectEqual(AiAffectDrive.fear, serial_items[1].payload.affect_threshold_crossed.drive);
+
+    // Cap membership must also be partition-independent: cap=1 keeps the row-0
+    // aggression crossing (not the range-ascending or column-first winner) in
+    // both paths.
+    events_serial.clearRetainingCapacity();
+    events_threaded.clearRetainingCapacity();
+    // Reset the above-threshold masks so both drives re-cross this step.
+    for ([_]*DataSystem{ &data_serial, &data_threaded }) |data| {
+        const slice = data.aiAffectSlice();
+        @memset(slice.above_threshold_mask, 0);
+    }
+    _ = try sys_serial.updateSerial(data_serial.aiAgentSliceConst(), &data_serial, &events_serial, .{ .max_events_per_step = 1 });
+    _ = try sys_threaded.update(data_threaded.aiAgentSliceConst(), &data_threaded, &events_threaded, &threads, .{
+        .items_per_range = affect_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .max_events_per_step = 1,
+    });
+    const capped_serial = events_serial.mergedItems();
+    try testing.expectEqualSlices(SimulationEvent, capped_serial, events_threaded.mergedItems());
+    try testing.expectEqual(@as(usize, 1), capped_serial.len);
+    try testing.expectEqual(AiAffectDrive.aggression, capped_serial[0].payload.affect_threshold_crossed.drive);
 }
 
 test "an entity outside scope_dense_indices is untouched" {

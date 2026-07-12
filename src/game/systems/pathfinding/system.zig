@@ -1171,10 +1171,24 @@ pub const PathfindingSystem = struct {
         }
     }
 
+    // True when `key` is still a live above-threshold group request this step,
+    // i.e. its own crowd is actively being serviced. Such a slot represents a
+    // distinct concurrent goal, not a moved-away one, so it must never be rekeyed
+    // out from under its crowd.
+    fn isActiveGroupGoal(self: *const PathfindingSystem, key: PathQueryKey) bool {
+        const index = self.group_key_map.find(key) orelse return false;
+        return self.group_requests.items[index].count >= self.groupFieldThreshold();
+    }
+
     // A stale slot targets the same agent class/version/goal-level but a different
-    // goal cell. When several such slots exist, the one whose stored goal is
-    // nearest the new goal cell is chosen so rebuild selection is deterministic and
-    // reuses the most relevant field rather than an arbitrary first match.
+    // goal cell whose own crowd is no longer an active above-threshold request —
+    // the moving-goal case (the declared goal crossed into a new cell, orphaning
+    // the old field), NOT a second live crowd. Skipping still-active goals is what
+    // stops two distinct same-class goals from evicting each other's field while
+    // free slots exist. When several orphaned slots qualify, the one whose stored
+    // goal is nearest the new goal cell is chosen so rebuild selection is
+    // deterministic and reuses the most relevant field rather than an arbitrary
+    // first match.
     fn staleGroupSlot(self: *PathfindingSystem, key: PathQueryKey) ?usize {
         var best_index: ?usize = null;
         var best_dist: i64 = std.math.maxInt(i64);
@@ -1184,6 +1198,7 @@ pub const PathfindingSystem = struct {
             if (field.key.agent_class != key.agent_class) continue;
             if (field.key.nav_version != key.nav_version) continue;
             if (field.key.goal_level != key.goal_level) continue;
+            if (self.isActiveGroupGoal(field.key)) continue;
             const dx: i64 = field.key.goal.x - key.goal.x;
             const dy: i64 = field.key.goal.y - key.goal.y;
             const dist = dx * dx + dy * dy;
@@ -1924,6 +1939,53 @@ test "pathfinding group field reuses within a nav cell and throttles cross-cell 
     // throttle bounds rebuilds well below the step count.
     try std.testing.expect(rebuild_count >= 1);
     try std.testing.expect(rebuild_count <= steps / capacity.group_field_rebuild_min_steps + 2);
+}
+
+test "pathfinding distinct same-class group goals keep separate fields without ping-pong" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+    const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var capacity = baselineCapacity();
+    // Three slots for two distinct goals: a free slot must remain, never a steal.
+    capacity.max_group_fields = 3;
+    capacity.min_group_field_agents = 1;
+    // A short throttle so the slot-stealing bug (if present) would rebuild every
+    // step and be plainly visible in the build count.
+    capacity.group_field_rebuild_min_steps = 1;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    // Two persistent same-class group goals in distinct nav cells (32px cells):
+    // (100,100) -> cell (3,3), (220,100) -> cell (6,3).
+    const goal_a = math.Vec2{ .x = 100, .y = 100 };
+    const goal_b = math.Vec2{ .x = 220, .y = 100 };
+
+    var built_total: usize = 0;
+    for (0..4) |_| {
+        var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+        defer stream.deinit();
+        try stream.reserve(2, 2);
+        try appendPathRequest(&stream, .{ .entity = a, .kind = .group, .start = .{ .x = 8, .y = 8 }, .goal = goal_a });
+        try appendPathRequest(&stream, .{ .entity = b, .kind = .group, .start = .{ .x = 40, .y = 8 }, .goal = goal_b });
+        const stats = try system.updateSerial(&stream, 8, .{});
+        built_total += stats.group_fields_built;
+    }
+
+    // Each distinct goal holds its own ready field simultaneously — the second
+    // goal takes the free empty slot rather than evicting the first.
+    var ready: usize = 0;
+    for (system.group_fields.items) |field| {
+        if (field.state == .ready) ready += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), ready);
+    // Exactly one build per goal. Under the slot-stealing bug the two live goals
+    // would rekey each other's slot every throttle window, so the running build
+    // count would climb well past two.
+    try std.testing.expectEqual(@as(usize, 2), built_total);
 }
 
 test "pathfinding group field latches via cross-step accumulation when intake is staggered" {

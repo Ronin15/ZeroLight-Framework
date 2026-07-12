@@ -125,16 +125,28 @@ before it is written fails the build instead of silently corrupting behavior.
 - A `comptime` block walks `stage_order`, accumulating the resources written
   so far, and fails the build (`@compileError`) if any stage's declared reads
   are not a subset of what an earlier stage already wrote.
+- A stage's `stageContract` lists **every** live resource it touches, including
+  this-step values an earlier stage authored: `bounds_and_tile_gate` and
+  `plane_traversal` both read the dig-authored `world_tiles`, and
+  `plane_traversal` also writes `movement_positions` via the fall snap. An
+  under-declared read or write leaves a real dependency invisible to the
+  comptime check, so a reorder compiles clean.
 - Not every real ordering dependency is expressible as a `PipelineResource`
   read/write — two stages can depend on call order while sharing no tracked
-  resource. Those dependencies are proven by targeted causal-effect tests
-  co-located in `simulation_pipeline.zig`: each sets up a scenario where the
-  wrong order would produce an observably different result and asserts the
-  correct one. See "pipeline commits the dig stage's world edit before plane
-  traversal reads it in the same step", "pipeline runs ai_memory after
-  perception and before ai, feeding memory into AI's cold-seek retarget", and
-  "pipeline runs affect after perception and ai_memory, before ai" for the
-  pattern.
+  resource, and a transient stream with no `PipelineResource` tag at all (e.g.
+  the `WorldStimulus` values dig writes into `frame.stimuli` and
+  `perception_update` reads the same step) carries a producer→consumer
+  dependency the comptime check cannot see. Every such untagged same-step
+  dependency is pinned by a causal-effect test co-located in
+  `simulation_pipeline.zig`: each sets up a scenario where the wrong order
+  produces an observably different result and asserts the correct one. See
+  "pipeline commits the dig stage's world edit before the tile gate reads
+  walkability in the same step", "pipeline commits the dig stage's stimulus
+  before perception reads it in the same step", "pipeline commits the dig
+  stage's world edit before plane traversal reads it in the same step",
+  "pipeline runs ai_memory after perception and before ai, feeding memory into
+  AI's cold-seek retarget", and "pipeline runs affect after perception and
+  ai_memory, before ai" for the pattern.
 
 Checklist for adding or reordering a stage:
 

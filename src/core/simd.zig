@@ -313,9 +313,12 @@ pub fn lengthSquared2Float4(x: Float4, y: Float4) Float4 {
 }
 
 /// Normalizes per-lane 2D vectors, returning zero for lanes whose squared
-/// length is at or below `epsilon`. Matches scalar normalize-or-zero semantics
-/// and never produces inf/NaN: the divisor is floored before the reciprocal,
-/// and short lanes are masked to zero afterward.
+/// length is at or below `epsilon`. Matches `math.normalizeOrZero` (the
+/// unguarded scalar form) exactly, including on non-finite input: the divisor
+/// floor + short-lane mask only guarantee no divide-by-zero/short-length
+/// inf/NaN — a non-finite INPUT still propagates (e.g. x=inf,y=0 gives
+/// inf*rsqrt(inf)=inf*0=NaN, and the positive mask keeps it). Callers whose
+/// vectors can be non-finite must pre-mask or use `math.normalizeOrZeroFinite`.
 pub fn normalizeOrZero2Float4(x: Float4, y: Float4, epsilon: f32) Vec2x4 {
     const len2 = lengthSquared2Float4(x, y);
     const positive = greaterThanFloat4(len2, splatFloat4(epsilon));

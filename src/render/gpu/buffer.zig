@@ -204,11 +204,18 @@ pub fn validateStorageRegion(edit: StorageRegion) error{GpuUploadOutOfBounds}!vo
 }
 
 /// Maps edit values into `transfer_buffer` (sized to `storageByteSize(edits.len)`).
+/// `cycle` is a property of the transfer buffer's lifetime, mirroring the
+/// destination-upload `cycle` note above: a persistent transfer buffer reused
+/// across frames MUST map with `cycle=true` so this frame's re-stage rotates to
+/// fresh backing rather than overwriting the memory a prior frame's still-in-flight
+/// copy is reading from. Only a fresh one-shot transfer buffer (allocated for a
+/// single upload) may map `cycle=false`.
 pub fn stageStorageRegions(
     device: *c.SDL_GPUDevice,
     transfer_buffer: *c.SDL_GPUTransferBuffer,
     transfer_byte_size: u32,
     edits: []const StorageRegion,
+    cycle: bool,
 ) !void {
     if (edits.len == 0) return;
     const required_bytes = try storageByteSize(edits.len);
@@ -217,7 +224,7 @@ pub fn stageStorageRegions(
         try validateStorageRegion(edit);
     }
 
-    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, false) orelse {
+    const mapped = c.SDL_MapGPUTransferBuffer(device, transfer_buffer, cycle) orelse {
         return sdlError("SDL_MapGPUTransferBuffer");
     };
     const values = @as([*]StorageElement, @ptrCast(@alignCast(mapped)))[0..edits.len];
@@ -280,7 +287,8 @@ pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegi
     const transfer = try createVertexTransferBuffer(device, total_bytes);
     defer c.SDL_ReleaseGPUTransferBuffer(device, transfer);
 
-    try stageStorageRegions(device, transfer, total_bytes, edits);
+    // Fresh transfer buffer used exactly once, so no cross-frame reuse hazard.
+    try stageStorageRegions(device, transfer, total_bytes, edits, false);
 
     const command_buffer = c.SDL_AcquireGPUCommandBuffer(device) orelse {
         return sdlError("SDL_AcquireGPUCommandBuffer");

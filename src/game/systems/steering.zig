@@ -1769,6 +1769,95 @@ test "steering serial and real threaded workers produce identical movement inten
     }
 }
 
+test "steering serial matches threaded intents across multiple range splits and worker counts" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
+    // instead picks range/worker counts dynamically, and its probe-driven choice is not
+    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
+    // every explicit partition and worker count must reproduce the serial reference. The
+    // read-only inputs (data, obstacles, nav grid, intents) are shared; only the mutated
+    // output frame and system are rebuilt per split.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var intents = std.ArrayList(NavigationIntent).empty;
+    defer intents.deinit(std.testing.allocator);
+    try intents.ensureTotalCapacity(std.testing.allocator, 128);
+
+    for (0..128) |index| {
+        const x: f32 = @floatFromInt(index % 16);
+        const y: f32 = @floatFromInt(index / 16);
+        const entity = try addSteeredEntity(&data, .{ .x = x * 14.0, .y = y * 14.0 });
+        intents.appendAssumeCapacity(.{
+            .entity = entity,
+            .goal = .{ .x = 420, .y = 220 },
+            .direct_direction_x = if (index % 2 == 0) 1 else -1,
+            .direct_direction_y = if (index % 3 == 0) 0.25 else -0.15,
+            .priority = 1,
+        });
+    }
+    _ = try addStaticObstacle(&data, .{ .x = 72, .y = 32 }, .{ .x = 36, .y = 96 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+    try serial_frame.reservePathRequests(16, 128);
+    serial_frame.beginStep();
+    try appendNavigationIntents(&serial_frame, intents.items);
+    var serial_system = SteeringSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    try serial_system.reserve(128);
+    _ = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, .{});
+    const serial = serial_frame.intents.mergedItems();
+    try std.testing.expect(serial.len > 0);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = steering_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = steering_range_alignment_items * 2, .workers = 2 },
+        .{ .items_per_range = steering_range_alignment_items, .workers = 4 },
+        .{ .items_per_range = steering_range_alignment_items * 3, .workers = 3 },
+    };
+    for (splits) |split| {
+        var threaded_frame = SimulationFrame.init(std.testing.allocator);
+        defer threaded_frame.deinit();
+        try threaded_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+        try threaded_frame.reservePathRequests(16, 128);
+        threaded_frame.beginStep();
+        try appendNavigationIntents(&threaded_frame, intents.items);
+        var threaded_system = SteeringSystem.init(std.testing.allocator);
+        defer threaded_system.deinit();
+        try threaded_system.reserve(128);
+        const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        // Real workers processed the batch, so this split exercised the multi-worker
+        // path it claims to.
+        try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
+        const threaded = threaded_frame.intents.mergedItems();
+        try std.testing.expectEqual(serial.len, threaded.len);
+        for (serial, threaded) |a, b| {
+            try std.testing.expectEqual(a.movement.entity.index, b.movement.entity.index);
+            try std.testing.expectEqual(a.movement.entity.generation, b.movement.entity.generation);
+            try std.testing.expectEqual(a.movement.direction_x, b.movement.direction_x);
+            try std.testing.expectEqual(a.movement.direction_y, b.movement.direction_y);
+        }
+    }
+}
+
 test "steering update is allocation-free after reserves and warmup" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

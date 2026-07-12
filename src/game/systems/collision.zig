@@ -1167,6 +1167,135 @@ test "threaded collision matches serial contact order" {
     }
 }
 
+test "threaded collision matches serial across multiple range splits and worker counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // The other parity test pins a single fixed split; the AdaptiveWorkTuner instead
+    // chooses the range count/worker count dynamically (and its probe-driven choice is
+    // not deterministically reproducible in a unit test). This asserts the split-
+    // INVARIANCE the tuner relies on: every explicit partition and worker count must
+    // reproduce the serial reference bit-for-bit.
+    var serial_data = DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    for (0..96) |index| {
+        const x: f32 = @floatFromInt((index % 16) * 6);
+        const y: f32 = @floatFromInt((index / 16) * 6);
+        _ = try addBody(&serial_data, x, y, 8);
+    }
+    var serial_system = CollisionSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
+    const serial_items = serial_contacts.mergedItems();
+    try std.testing.expect(serial_items.len > 0);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = collision_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = collision_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = collision_range_alignment_items * 2, .workers = 2 },
+        .{ .items_per_range = collision_range_alignment_items, .workers = 4 },
+        .{ .items_per_range = collision_range_alignment_items * 3, .workers = 3 },
+    };
+    for (splits) |split| {
+        var threaded_data = DataSystem.init(std.testing.allocator);
+        defer threaded_data.deinit();
+        for (0..96) |index| {
+            const x: f32 = @floatFromInt((index % 16) * 6);
+            const y: f32 = @floatFromInt((index / 16) * 6);
+            _ = try addBody(&threaded_data, x, y, 8);
+        }
+        var threaded_system = CollisionSystem.init(std.testing.allocator);
+        defer threaded_system.deinit();
+        var threaded_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+        defer threaded_contacts.deinit();
+        _ = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        const threaded_items = threaded_contacts.mergedItems();
+        try std.testing.expectEqual(serial_items.len, threaded_items.len);
+        for (serial_items, threaded_items) |serial, threaded| {
+            try std.testing.expectEqual(serial.a.index, threaded.a.index);
+            try std.testing.expectEqual(serial.b.index, threaded.b.index);
+            try std.testing.expectEqual(serial.normal_x, threaded.normal_x);
+            try std.testing.expectEqual(serial.normal_y, threaded.normal_y);
+            try std.testing.expectApproxEqAbs(serial.penetration, threaded.penetration, 0.001);
+        }
+    }
+}
+
+test "threaded collision broadphase overflow-replay matches serial contacts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var serial_data = DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(std.testing.allocator);
+    defer threaded_data.deinit();
+
+    // 64 tightly clustered bodies (jitter << body size, so all mutually overlap):
+    // candidate pairs (~N^2) far exceed each range's body-count-based broadphase
+    // reservation, forcing the multi-worker grow-and-replay path. 64 bodies keep the
+    // batch off the inline fallback so real workers run the replay.
+    for (0..64) |index| {
+        const xj: f32 = @floatFromInt(index % 3);
+        const yj: f32 = @floatFromInt(index % 5);
+        _ = try addBody(&serial_data, xj * 0.25, yj * 0.25, 8);
+        _ = try addBody(&threaded_data, xj * 0.25, yj * 0.25, 8);
+    }
+
+    var serial_system = CollisionSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    var threaded_system = CollisionSystem.init(std.testing.allocator);
+    defer threaded_system.deinit();
+    var serial_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer serial_contacts.deinit();
+    var threaded_contacts = RangeOutputStream(CollisionContact).init(std.testing.allocator);
+    defer threaded_contacts.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = collision_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    _ = try serial_system.updateSerial(&serial_data, &serial_contacts);
+    const threaded_stats = try threaded_system.update(&threaded_data, &threaded_contacts, &threads, .{
+        .items_per_range = collision_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+
+    // The batch ran on real workers and the fixture actually overflowed a range's
+    // reservation (candidate pairs exceed body count), so the cross-worker
+    // regrow+replay path was exercised — not just the happy no-overflow path.
+    try std.testing.expect(!threaded_stats.broadphase_batch.ran_inline);
+    try std.testing.expect(threaded_stats.candidate_pair_count > threaded_stats.body_count);
+
+    // Despite the multi-worker overflow-replay, the threaded broadphase yields the
+    // same deterministic candidate order and thus contacts bit-identical to serial.
+    const serial_items = serial_contacts.mergedItems();
+    const threaded_items = threaded_contacts.mergedItems();
+    try std.testing.expectEqual(serial_items.len, threaded_items.len);
+    try std.testing.expect(serial_items.len > 0);
+    for (serial_items, threaded_items) |serial, threaded| {
+        try std.testing.expectEqual(serial.a.index, threaded.a.index);
+        try std.testing.expectEqual(serial.b.index, threaded.b.index);
+        try std.testing.expectEqual(serial.a_movement_index, threaded.a_movement_index);
+        try std.testing.expectEqual(serial.b_movement_index, threaded.b_movement_index);
+        try std.testing.expectEqual(serial.normal_x, threaded.normal_x);
+        try std.testing.expectEqual(serial.normal_y, threaded.normal_y);
+        try std.testing.expectApproxEqAbs(serial.penetration, threaded.penetration, 0.001);
+    }
+}
+
 test "narrowphase range buffers merge deterministic contacts and skip rejected candidates" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

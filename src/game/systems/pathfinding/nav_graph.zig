@@ -1524,8 +1524,16 @@ pub const NavGraph = struct {
             // leaves the graph object exactly as it stands right now. Re-zero the counts so a
             // reader in that window sees empty (not dangling/stale) adjacency for this chunk
             // instead of a CSR range whose content was never refreshed for the new topology.
+            // Also pin each slot's start back to ebase: the prefix sum above walked `running`
+            // past ebase+ecap, so a later slot's start can exceed portal_edges.len; a reader
+            // slices [start, start+count). With count re-zeroed, start must stay in-bounds or
+            // that empty slice traps (Debug/ReleaseSafe) / is UB (ReleaseFast). ebase is the
+            // chunk's window base, always < len, so [ebase, ebase) is a safe empty slice.
             var zero_slot = pbase;
-            while (zero_slot < pbase + pcap) : (zero_slot += 1) lg.portal_edge_count.items[zero_slot] = 0;
+            while (zero_slot < pbase + pcap) : (zero_slot += 1) {
+                lg.portal_edge_count.items[zero_slot] = 0;
+                lg.portal_edge_start.items[zero_slot] = ebase;
+            }
             return true;
         }
         // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start. Uses
@@ -2411,6 +2419,59 @@ test "compactChunkEdges zeroes the chunk's edge counts on overflow instead of le
     // patchChunk's clearChunkSlots + re-discovery left in portal_edges for this window.
     for (system.graph.level_graphs.items[0].portal_edge_count.items[pbase .. pbase + pcap]) |count| {
         try std.testing.expectEqual(@as(u32, 0), count);
+    }
+}
+
+test "compactChunkEdges keeps portal_edge_start in-bounds for the last chunk on overflow" {
+    // The last chunk's edge window ends exactly at portal_edges.len, so an overflow whose
+    // prefix sum climbs `running` past ebase+ecap leaves a later slot's start beyond the
+    // buffer. With counts re-zeroed but start left stale, a reader slicing
+    // [start, start+count) traps (Debug/ReleaseSafe) / is UB (ReleaseFast). Pinning start
+    // back to ebase keeps every count-0 slot's slice a safe in-bounds empty range.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+
+    const lg = &system.graph.level_graphs.items[0];
+    const chunk: u32 = @intCast(system.graph.chunkCount() - 1);
+    const pbase = system.graph.chunk_portal_base.items[chunk];
+    const pcap = system.graph.chunk_portal_cap.items[chunk];
+    const ebase = system.graph.chunk_edge_base.items[chunk];
+    const ecap = system.graph.chunk_edge_cap.items[chunk];
+    // Precondition for the OOB: this chunk's window ends at the very end of the arena, and
+    // it has at least two slots so a later slot's start can climb past the buffer.
+    try std.testing.expectEqual(system.graph.total_edge_slots, ebase + ecap);
+    try std.testing.expect(pcap >= 2);
+
+    // Synthesize a transient edge list that overflows the window: ecap+4 edges all on the
+    // chunk's first slot, so the prefix sum pushes every later slot's start past the arena.
+    const scratch = &system.graph.patch_scratch.items[0];
+    scratch.edges.clearRetainingCapacity();
+    var e: u32 = 0;
+    while (e < ecap + 4) : (e += 1) {
+        try scratch.edges.append(system.graph.allocator, .{ .from = pbase, .edge = .{ .target = 0, .cost = 1 } });
+    }
+
+    const overflowed = try system.graph.compactChunkEdges(0, chunk, scratch);
+    try std.testing.expect(overflowed);
+
+    // Every slot must yield an in-bounds empty CSR slice — reading it must not trap.
+    const edges_len = lg.portal_edges.items.len;
+    var slot = pbase;
+    while (slot < pbase + pcap) : (slot += 1) {
+        const begin = lg.portal_edge_start.items[slot];
+        const count = lg.portal_edge_count.items[slot];
+        try std.testing.expectEqual(@as(u32, 0), count);
+        try std.testing.expect(begin <= edges_len);
+        try std.testing.expectEqual(@as(usize, 0), lg.portal_edges.items[begin .. begin + count].len);
     }
 }
 

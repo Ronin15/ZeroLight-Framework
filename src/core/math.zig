@@ -268,6 +268,21 @@ test "normalizeOrZeroFinite zeroes non-finite inputs" {
     try std.testing.expectEqual(@as(f32, 0), infinite.y);
 }
 
+test "SIMD normalize shares the unguarded scalar's non-finite propagation" {
+    const simd = @import("simd.zig");
+    const epsilon: f32 = 1.0e-3;
+    // The SIMD kernel matches math.normalizeOrZero (unguarded), NOT
+    // normalizeOrZeroFinite: a non-finite INPUT propagates to NaN in both
+    // (x=inf,y=0 -> inf*rsqrt(inf) = inf*0 = NaN, kept by the positive mask).
+    // Only the *Finite variants sanitize inf/NaN; this pins the shared semantics
+    // so the kernel's contract isn't mistaken for the guarded one.
+    const inf = std.math.inf(f32);
+    const scalar = normalizeOrZero(.{ .x = inf, .y = 0 }, epsilon);
+    const vector = simd.normalizeOrZero2Float4(simd.splatFloat4(inf), simd.splatFloat4(0), epsilon);
+    try std.testing.expect(std.math.isNan(scalar.x));
+    try std.testing.expect(std.math.isNan(vector.x[0]));
+}
+
 test "normalizeOrDefaultFinite falls back on degenerate inputs" {
     const default = Vec2{ .x = 1, .y = 0 };
     const normalized = normalizeOrDefaultFinite(3, 4, 1.0e-4, default);

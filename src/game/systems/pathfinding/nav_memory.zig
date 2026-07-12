@@ -122,6 +122,21 @@ pub const NavMemoryBudget = struct {
             (abstract_open_capacity *| @sizeOf(OpenNode)) +|
             (self.max_abstract_nodes *| abstract_corridor_bytes);
         const abstract_scratch_bytes = self.worker_participant_count *| per_participant_abstract_bytes;
+        // Per-participant incremental-dig BUILD scratch, reserved by rebuild AFTER this gate
+        // passes (nav_graph.zig:531-543), one slot per worker participant like the search
+        // scratch above. patch_scratch reserves its edge list to max_transient_edges =
+        // max_portal_cap^2 EdgeScratch entries plus a max_portal_cap compaction cursor;
+        // remask_scratch reserves a chunk_tiles^2 BFS queue. max_portal_cap is bounded by a
+        // chunk's 4*ct perimeter slots plus its interior link tails (<= 2*link_count in the
+        // worst case all endpoints land in one chunk), matching chunk_portal_cap's own
+        // 4*ct + link-count sizing. Counting it keeps the gate honest: a tight ceiling that
+        // passed the gate must not then let rebuild reserve past max_bytes.
+        const ct = @max(@as(usize, 1), self.chunk_tiles);
+        const portal_cap_bound = (4 *| ct) +| (2 *| self.link_count);
+        const per_participant_build_bytes = (portal_cap_bound *| portal_cap_bound *| edge_scratch_bytes) +|
+            (portal_cap_bound *| @sizeOf(u32)) +|
+            (ct *| ct *| @sizeOf(usize));
+        const build_scratch_bytes = self.worker_participant_count *| per_participant_build_bytes;
         // Goal-keyed completed-path cache pool.
         const result_path_bytes = self.max_cached_results *| self.max_stored_path_cells *| @sizeOf(u32);
         // Per-request worker path stripes.
@@ -134,7 +149,8 @@ pub const NavMemoryBudget = struct {
         // portals/edges are estimated from border structure, not a per-cell worst case).
         const abstract_bytes = self.abstractGraphBytes(width, height, levels);
         return static_bytes +| group_registry_bytes +|
-            scratch_bytes +| abstract_scratch_bytes +| result_path_bytes +| worker_path_bytes +| stitched_bytes +|
+            scratch_bytes +| abstract_scratch_bytes +| build_scratch_bytes +|
+            result_path_bytes +| worker_path_bytes +| stitched_bytes +|
             abstract_bytes;
     }
 
@@ -350,6 +366,36 @@ test "autoSizedMaxNavMemoryBytes covers the gate's ceiling caps and counts level
     const without_links = budgetForCapacity(capacity, 2, 0).requiredBytes(512, 512);
     const with_links = budgetForCapacity(capacity, 2, 64).requiredBytes(512, 512);
     try std.testing.expect(with_links > without_links);
+}
+
+test "requiredBytes counts per-participant chunk-patch/remask build scratch reserved after the gate" {
+    // patch_scratch (max_portal_cap^2 EdgeScratch + max_portal_cap cursor) and
+    // remask_scratch (chunk_tiles^2 queue) are reserved per worker participant in
+    // rebuild AFTER memory_budget.check passes. A real memory-safety gate must
+    // account for every buffer a rebuild reserves, including these.
+    //
+    // worker_participant_count scales ONLY the three per-participant terms (local A*
+    // scratch, abstract scratch, and this build scratch), so the delta from adding one
+    // participant equals exactly one copy of them. On a 1x1 world with the node-budget
+    // caps zeroed, the A* and abstract per-participant contributions shrink to a few
+    // hundred bytes, while the patch edge buffer alone reserves (4*chunk_tiles)^2
+    // EdgeScratch entries (~hundreds of KB). Asserting the delta is at least that
+    // patch-edge size fails loudly if the build-scratch term is dropped.
+    var one = testBudget(std.math.maxInt(usize));
+    one.worker_participant_count = 1;
+    one.chunk_tiles = 64;
+    one.link_count = 0;
+    one.max_explored_nodes = 0;
+    one.max_stored_path_cells = 0;
+    one.max_abstract_nodes = 0;
+    var two = one;
+    two.worker_participant_count = 2;
+    const per_participant_delta = two.requiredBytes(1, 1) - one.requiredBytes(1, 1);
+
+    const edge_scratch_bytes = @sizeOf(u32) + @sizeOf(AbstractEdge);
+    const portal_cap = 4 * one.chunk_tiles;
+    const patch_edge_bytes = portal_cap * portal_cap * edge_scratch_bytes;
+    try std.testing.expect(per_participant_delta >= patch_edge_bytes);
 }
 
 test "requiredBytes counts AbstractScratch memory: a bigger max_abstract_nodes raises the estimate" {

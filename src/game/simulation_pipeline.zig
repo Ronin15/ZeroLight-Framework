@@ -138,7 +138,11 @@ fn stageContract(stage: StageId) StageContract {
         .collision_scope_gather => .{ .reads = .empty, .writes = resources(&.{.collision_scope_indices}) },
         .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
         .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
-        .plane_traversal => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{ .world_tiles, .world_level, .events }) },
+        // A fall snaps the body's position/previous columns to the destination level
+        // (dig_controller.setEntityLevel), so movement_positions is a real write here,
+        // not read-only — declare it so the resource graph records plane_traversal as a
+        // producer for any future stage that needs post-traversal positions.
+        .plane_traversal => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
         .tier_policy => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.structural_commands}) },
     };
 }
@@ -1933,4 +1937,180 @@ test "pipeline perception events truncate instead of throwing when the shared ev
     try std.testing.expectEqual(@as(usize, 1), stats.perception.perceived_events + stats.perception.lost_events);
     try std.testing.expectEqual(@as(usize, 1), stats.perception.dropped_events);
     try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+}
+
+test "pipeline commits the dig stage's world edit before the tile gate reads walkability in the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // `dig_world_edit` and `bounds_and_tile_gate` share no `PipelineResource`
+    // (dig authors the tile change directly on the borrowed `WorldSystem`, which
+    // the gate reads live via `rectOverlapsSolidTile` -> `levelBlocksMovement`),
+    // so the comptime reads-before-writes check cannot see this dependency. Prove
+    // the real call-site order runs dig before the gate: an underground NPC walks
+    // horizontally into a cell this step's dig mines walkable, and the gate must
+    // NOT revert it. Underground (level 1) is required because the gate is a
+    // deliberate no-op on the surface; a purely-horizontal same-level scenario is
+    // otherwise fully expressible there.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+    try world.addUndergroundLevels(&meta);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 1;
+    // Player stands underground at cell (5,3) facing right, so this step's dig
+    // mines a walkable tunnel at (6,3) -- the cell the NPC crosses into.
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    // Level 1 is solid dirt: the forward cell blocks movement until dig mines it.
+    try std.testing.expect(world.levelBlocksMovement(1, 6, 3));
+
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(npc, 1);
+    try data.setSimulationTier(npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        // 2000 * 0.016 == one 32px tile: integration lands the body in cell (6,3).
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    frame.dig_intent = .hole;
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // The dig mined (6,3) walkable this step, so the gate let the NPC keep its
+    // move into that cell. A misordering would leave (6,3) solid when the gate
+    // read it and revert the NPC back to cell (5,3).
+    try std.testing.expect(!world.levelBlocksMovement(1, 6, 3));
+    const npc_body = data.movementBodyPtr(npc).?;
+    const npc_cell = world.cellContaining(npc_body.position_x.* + 16, npc_body.position_y.* + 16).?;
+    try std.testing.expectEqual(@as(u16, 6), npc_cell.x);
+    try std.testing.expectEqual(@as(u16, 3), npc_cell.y);
+    // The mined cell is a walkable tunnel (not a hole), so the NPC stays on level 1.
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+}
+
+test "pipeline commits the dig stage's stimulus before perception reads it in the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // `dig_world_edit` appends a `.dig` `WorldStimulus` to `frame.stimuli`, which
+    // `perception_update` consumes for hearing. The two share no tracked
+    // `PipelineResource`, and `frame.stimuli` is cleared each `beginStep`, so a
+    // stimulus produced after perception would be silently dropped. Prove the real
+    // order runs dig first: an in-earshot AI observer hears this step's dig.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    defer world.deinit();
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    // Player at cell (5,3) facing right punches a hole at (6,3) on level 0, whose
+    // cell-center is the stimulus position.
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    // Cognition-tier AiPerception observer at cell (7,3) -- within earshot of the
+    // dig cell (6,3), same level, but far enough that it never steps onto the hole.
+    // gain_pursue 0 with only neutral factions present means no visible target.
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 7 * 32, .y = 3 * 32 }, .previous_position = .{ .x = 7 * 32, .y = 3 * 32 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer, 0);
+    try data.setAiPerception(observer, .{ .hearing_range = 1000 });
+
+    // Sanity: the observer does not hear anything before the step runs.
+    try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .perception_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    frame.dig_intent = .hole;
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    // The observer heard this step's dig, which is only possible if dig produced
+    // the stimulus before perception read `frame.stimuli` this step -- perception
+    // running first would find the (freshly cleared) stimulus stream empty.
+    try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
 }

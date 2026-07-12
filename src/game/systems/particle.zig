@@ -766,6 +766,48 @@ test "threaded particle update matches serial update" {
     try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
 }
 
+test "threaded particle update matches serial across multiple range splits and worker counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
+    // instead picks range/worker counts dynamically, and its probe-driven choice is not
+    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
+    // every explicit partition and worker count must reproduce the serial reference.
+    const item_count = particle_range_alignment_items * 8;
+    var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
+    defer serial_particles.deinit();
+    fillParticles(&serial_particles, item_count);
+    _ = serial_particles.updateSerial(0.25);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = particle_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = particle_range_alignment_items * 2, .workers = 2 },
+        .{ .items_per_range = particle_range_alignment_items, .workers = 4 },
+        .{ .items_per_range = particle_range_alignment_items * 3, .workers = 3 },
+    };
+    for (splits) |split| {
+        var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
+        defer threaded_particles.deinit();
+        fillParticles(&threaded_particles, item_count);
+        const stats = threaded_particles.update(&threads, 0.25, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        // Real workers partitioned the batch (not the inline fallback), so this split
+        // exercised the multi-range, multi-worker path it claims to.
+        try std.testing.expect(!stats.batch.ran_inline);
+        try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
+    }
+}
+
 test "particle explicit items_per_range bypasses tuner" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
