@@ -9,9 +9,11 @@ world data (`DataSystem`, `WorldSystem`), with a state-owned
 `SimulationPipeline`, scoped simulation tiers, and multithreaded/SIMD processors
 for movement, AI, steering, collision, pathfinding, and particles.
 
-Do not duplicate full repo documentation here. Read the canonical docs below
-for details and update those docs when architecture, workflow, or roadmap
-content changes.
+Shared repo contract (snapshot, docs routing, module ownership, working rules,
+build commands) mirrors `CLAUDE.md`. Keep both in sync when those sections
+change. Do not duplicate full repo documentation here — read the canonical
+`docs/` entries below for details and update them when architecture, workflow,
+or roadmap content changes.
 
 ## Source Of Truth (`docs/`)
 
@@ -118,7 +120,7 @@ boundaries just to make a local change easier.
   (e.g. a `FailingAllocator` reserve-proof test). Fast, small fixtures keep
   `zig build test` fast as the suite grows.
 
-## Build & Validation
+## Build & Validation Commands
 
 Run `zig build verify` before considering a slice or broad change complete.
 
@@ -144,15 +146,33 @@ release candidates. **Packaged builds ship `ReleaseFast`** — see
 `docs/development-workflow.md` for the required pre-release ReleaseSafe
 soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 
+## Claude Code Setup (`.claude/`)
+
+| Layer | Path | Role |
+|-------|------|------|
+| Global contract | `CLAUDE.md` | Shared guardrails (mirrors this file's core sections) |
+| Subagents | `.claude/agents/zig-*.md` | Specialist prompts (source of truth; mirrored in `.cursor/agents/`) |
+| Workflows | `.claude/workflows/*.js` | Orchestrated multi-phase review/assessment passes |
+
+| Workflow script | Agent | When |
+|-----------------|-------|------|
+| `pathfinder-review.js` | `zig-review-specialist` × N | Pathfinder module coherency/cohesion/standards pass |
+| `architecture-assessment.js` | general + synthesis | Emergent-gameplay architecture readiness report |
+| `zig-best-practices-review.js` | `zig-review-specialist` × N | Hot-subsystem Zig best-practice pass with verify/synthesize |
+| `zig-deep-correctness-review-pass.js` | `zig-review-specialist` × N | Concurrency, algorithms, determinism, test-gap deep pass |
+
 ## Cursor Setup (`.cursor/`)
 
 | Layer | Path | Role |
 |-------|------|------|
 | Global contract | `AGENTS.md` | Repo guardrails, docs routing, build commands |
 | Workflows | `.cursor/skills/zig-workflows/SKILL.md` | When to delegate; inline vs subagent |
-| Subagents | `.cursor/agents/zig-*.md` | Specialist behavior (implement, review, debug, design) |
+| Subagents | `.cursor/agents/zig-*.md` | Specialist behavior (mirrors `.claude/agents/`) |
 | File rules | `.cursor/rules/*.mdc` | Auto-attach for `src/game/**` and `src/render/**` |
-| Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Pathfinder multi-review units |
+| Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables |
+
+Claude Code also ships `.claude/workflows/*.js` for orchestrated multi-phase passes; Cursor
+approximates those via Task subagents + presets in `module-presets.md`.
 
 Workflows in `zig-workflows` auto-invoke when tasks match. You can also ask directly
 ("use zig-review-specialist", "review my branch", "fix this test failure").
@@ -165,6 +185,8 @@ Workflows in `zig-workflows` auto-invoke when tasks match. You can also ask dire
 | Review | `zig-review-specialist` | PR/diff review |
 | Architecture assessment | `zig-design-specialist` | Emergent-gameplay readiness report |
 | Module review | `zig-review-specialist` × N | Module-wide pass (pathfinder preset) |
+| Best-practices review | `zig-review-specialist` × N | Hot-subsystem Zig best-practice pass |
+| Deep-correctness review | `zig-review-specialist` × N | Concurrency, algorithms, determinism, test gaps |
 
 ## Agent Working Practices
 

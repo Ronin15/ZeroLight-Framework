@@ -16,4 +16,6 @@ Read @AGENTS.md and `docs/coding-standards.md` before editing.
 - `reserve` + `assumeCapacity` requires a `FailingAllocator` proof test in the same change
 - Vector/named math via `src/core/simd.zig` and `src/core/math.zig` only
 - Structural commits, SDL/GPU, and asset load stay on deferred/main-thread boundaries
+- `SimulationEvents`/`RangeOutputStream`: write all ranges, then `finishWrite` once — not per record
+- Advance edge/latch state only on fallible operation success paths
 - No test-only enum tags, marker fields, or fixture hooks in production APIs
