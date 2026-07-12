@@ -200,7 +200,10 @@ pub const AffectSystem = struct {
     // job context, except their own reserved event scratch range).
     rows: std.MultiArrayList(AffectGatherRow) = .{},
     event_ranges: AffectEventRangeSlotList = .empty,
-    range_take_counts: std.ArrayList(usize) = .empty,
+    // Gathers every range's emitted crossings for one canonical sort before the
+    // per-step cap, so merged order and cap membership are partition-independent.
+    // Reserved to the same worst case as the range buffers combined.
+    merge_scratch: std.ArrayList(SimulationEvent) = .empty,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     pub fn init(allocator: std.mem.Allocator) AffectSystem {
@@ -211,7 +214,7 @@ pub const AffectSystem = struct {
     }
 
     pub fn deinit(self: *AffectSystem) void {
-        self.range_take_counts.deinit(self.allocator);
+        self.merge_scratch.deinit(self.allocator);
         for (self.event_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
         self.event_ranges.deinit(self.allocator);
         self.rows.deinit(self.allocator);
@@ -365,6 +368,9 @@ pub const AffectSystem = struct {
             // in the same step, so this exact reserve can never overflow.
             try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * 4);
         }
+        // Holds every range's crossings at once for the canonical sort; the same
+        // all-drives-cross-every-row worst case as the range buffers combined.
+        try self.merge_scratch.ensureTotalCapacity(self.allocator, item_count * 4);
     }
 
     /// Serial merge after the parallel/serial compute pass: sums each range's
@@ -380,36 +386,28 @@ pub const AffectSystem = struct {
         range_count: usize,
         max_events_per_step: usize,
     ) !AffectEventMergeResult {
-        try self.range_take_counts.ensureTotalCapacity(self.allocator, range_count);
-        self.range_take_counts.clearRetainingCapacity();
-
-        var total: usize = 0;
-        for (self.event_ranges.items[0..range_count]) |*slot| total += slot.buffer.events.items.len;
-        const capped_total = @min(total, max_events_per_step);
-        const dropped = total - capped_total;
-
-        var remaining = capped_total;
+        // Gather every range's crossings, then sort into one canonical order so the
+        // merged stream and the cap's surviving set are independent of how many
+        // ranges the tuner chose (serial == threaded byte-for-byte). Emission stays
+        // per-column in the hot compute pass; this pass only touches the crossings
+        // that actually fired, so the common no-event step sorts an empty slice.
+        self.merge_scratch.clearRetainingCapacity();
         for (self.event_ranges.items[0..range_count]) |*slot| {
-            const take = @min(slot.buffer.events.items.len, remaining);
-            self.range_take_counts.appendAssumeCapacity(take);
-            remaining -= take;
+            self.merge_scratch.appendSliceAssumeCapacity(slot.buffer.events.items);
         }
+        std.mem.sort(SimulationEvent, self.merge_scratch.items, {}, lessThanCrossing);
 
-        const first_range = try events.appendRangeCounts(range_count);
-        for (self.range_take_counts.items, 0..) |take, range_index| {
-            events.addCount(first_range + range_index, take);
-        }
+        const total = self.merge_scratch.items.len;
+        const crossed = @min(total, max_events_per_step);
+        const dropped = total - crossed;
+
+        const first_range = try events.appendRangeCounts(1);
+        events.addCount(first_range, crossed);
         try events.prefixAppendedRanges(first_range);
 
-        var crossed: usize = 0;
-        for (self.event_ranges.items[0..range_count], self.range_take_counts.items, 0..) |*slot, take, range_index| {
-            var writer = events.rangeWriter(first_range + range_index);
-            for (slot.buffer.events.items[0..take]) |event| {
-                writer.write(event);
-                crossed += 1;
-            }
-            writer.finish();
-        }
+        var writer = events.rangeWriter(first_range);
+        for (self.merge_scratch.items[0..crossed]) |event| writer.write(event);
+        writer.finish();
         events.finishWrite();
         events.stats.dropped += dropped;
 
@@ -421,6 +419,19 @@ const AffectEventMergeResult = struct {
     crossed: usize,
     dropped: usize,
 };
+
+/// Total order over affect crossings by (entity, drive): partition-independent
+/// and unique per event (a drive crosses at most once per entity per step), so
+/// the sort is deterministic regardless of the range partition that produced it.
+/// Affect only ever emits `affect_threshold_crossed`, so the payload access is
+/// total.
+fn lessThanCrossing(_: void, a: SimulationEvent, b: SimulationEvent) bool {
+    const ca = a.payload.affect_threshold_crossed;
+    const cb = b.payload.affect_threshold_crossed;
+    if (ca.entity.index != cb.entity.index) return ca.entity.index < cb.entity.index;
+    if (ca.entity.generation != cb.entity.generation) return ca.entity.generation < cb.entity.generation;
+    return @intFromEnum(ca.drive) < @intFromEnum(cb.drive);
+}
 
 const AffectJobContext = struct {
     entities: []const EntityId,
@@ -442,13 +453,9 @@ fn affectRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
 
 /// Shared serial/threaded per-range compute function: one vectorized pass per
 /// drive column (fear, aggression, curiosity, fatigue), each over the same
-/// row range, scattering the final drive value only. Threshold-crossing events
-/// are then emitted by a single per-row pass (`emitRangeCrossings`) so the
-/// merged event stream is row-ordered and partition-independent: emitting one
-/// drive column at a time would make both the merged order AND the surviving
-/// set under `max_events_per_step` depend on how many ranges the tuner chose,
-/// silently breaking serial/threaded byte-identity. Mirrors
-/// PerceptionSystem.emitTransitionsForRange's per-row emit.
+/// row range. Order across the four passes is fixed and does not matter for
+/// correctness (the drives are independent), only for event-append order
+/// within the range's scratch buffer.
 fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
     std.debug.assert(range.index < job.event_ranges.len);
     std.debug.assert(range.start <= range.end);
@@ -457,7 +464,6 @@ fn processAffectRange(job: *AffectJobContext, range: ParallelRange) void {
     processAggressionColumn(job, range);
     processCuriosityColumn(job, range);
     processFatigueColumn(job, range);
-    emitRangeCrossings(job, range);
 }
 
 /// prev + delta, decayed toward baseline, clamped to [0, 1]. Shared by every
@@ -527,9 +533,11 @@ fn visibilityRatioScalar(dist: f32, vision_range: f32) f32 {
 fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
+    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
+    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -540,6 +548,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_fear, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_fear, lanes);
+        const threshold = simd.gatherFloat4(s.threshold_fear, lanes);
         const prev = simd.gatherFloat4(s.fear, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -549,6 +558,7 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fear, lanes, final);
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fear, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -556,16 +566,22 @@ fn processFearColumn(job: *AffectJobContext, range: ParallelRange) void {
         const prev = s.fear[index];
         const visible = target_visible_f[k] > 0.5;
         const delta = if (visible) gain_fear * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
-        s.fear[index] = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
+        const final = combineDriveScalar(prev, delta, s.baseline_fear[index], s.decay_rate_fear[index]);
+        s.fear[index] = final;
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fear), final, s.threshold_fear[index])) |rising| {
+            appendCrossingEvent(buffer, entities[k], .fear, rising);
+        }
     }
 }
 
 fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
+    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const dist = job.nearest_threat_dist;
     const vision_range = job.vision_range;
+    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -576,6 +592,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_aggression, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_aggression, lanes);
+        const threshold = simd.gatherFloat4(s.threshold_aggression, lanes);
         const prev = simd.gatherFloat4(s.aggression, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -585,6 +602,7 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.aggression, lanes, final);
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .aggression, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -592,16 +610,22 @@ fn processAggressionColumn(job: *AffectJobContext, range: ParallelRange) void {
         const prev = s.aggression[index];
         const visible = target_visible_f[k] > 0.5;
         const delta = if (visible) gain_aggression * visibilityRatioScalar(dist[k], vision_range[k]) else 0;
-        s.aggression[index] = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
+        const final = combineDriveScalar(prev, delta, s.baseline_aggression[index], s.decay_rate_aggression[index]);
+        s.aggression[index] = final;
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.aggression), final, s.threshold_aggression[index])) |rising| {
+            appendCrossingEvent(buffer, entities[k], .aggression, rising);
+        }
     }
 }
 
 fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
+    const entities = job.entities;
     const target_visible_f = job.target_visible_f;
     const heard_stimulus_f = job.heard_stimulus_f;
     const familiarity = job.familiarity;
+    const buffer = &job.event_ranges[range.index].buffer;
 
     const one = simd.splatFloat4(1);
     const zero = simd.splatFloat4(0);
@@ -614,6 +638,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_curiosity, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_curiosity, lanes);
+        const threshold = simd.gatherFloat4(s.threshold_curiosity, lanes);
         const prev = simd.gatherFloat4(s.curiosity, lanes);
 
         const visible_f = simd.loadFloat4(target_visible_f[k..]);
@@ -627,6 +652,7 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.curiosity, lanes, final);
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .curiosity, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
@@ -635,14 +661,20 @@ fn processCuriosityColumn(job: *AffectJobContext, range: ParallelRange) void {
         const heard_and_not_visible = target_visible_f[k] <= 0.5 and heard_stimulus_f[k] > 0.5;
         const delta = (if (heard_and_not_visible) gain_curiosity_hearing else @as(f32, 0)) +
             gain_curiosity_novelty * (1 - familiarity[k]);
-        s.curiosity[index] = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
+        const final = combineDriveScalar(prev, delta, s.baseline_curiosity[index], s.decay_rate_curiosity[index]);
+        s.curiosity[index] = final;
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.curiosity), final, s.threshold_curiosity[index])) |rising| {
+            appendCrossingEvent(buffer, entities[k], .curiosity, rising);
+        }
     }
 }
 
 fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
     const s = job.affect_slice;
     const indices = job.affect_dense_index;
+    const entities = job.entities;
     const behavior_exertion_f = job.behavior_exertion_f;
+    const buffer = &job.event_ranges[range.index].buffer;
 
     const zero = simd.splatFloat4(0);
     const half = simd.splatFloat4(0.5);
@@ -653,6 +685,7 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
         const lanes = [simd.lane_count]usize{ indices[k], indices[k + 1], indices[k + 2], indices[k + 3] };
         const baseline = simd.gatherFloat4(s.baseline_fatigue, lanes);
         const decay_rate = simd.gatherFloat4(s.decay_rate_fatigue, lanes);
+        const threshold = simd.gatherFloat4(s.threshold_fatigue, lanes);
         const prev = simd.gatherFloat4(s.fatigue, lanes);
 
         // Fatigue's own input is this row's AiAgent.active_behavior, not
@@ -667,62 +700,38 @@ fn processFatigueColumn(job: *AffectJobContext, range: ParallelRange) void {
 
         const final = combineDrive(prev, delta, baseline, decay_rate);
         simd.scatterFloat4(s.fatigue, lanes, final);
+        emitCrossings(buffer, entities, indices, s.above_threshold_mask, k, .fatigue, simd.toFloatArray(final), simd.toFloatArray(threshold));
     }
 
     while (k < range.end) : (k += 1) {
         const index = indices[k];
         const prev = s.fatigue[index];
         const delta: f32 = if (behavior_exertion_f[k] > 0.5) gain_fatigue else 0;
-        s.fatigue[index] = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
-    }
-}
-
-/// Per-row threshold-crossing emit, run after all four drive columns have
-/// scattered their final values. Emitting per-row (all four drives grouped in
-/// row order) rather than per-column keeps the merged event stream — and the
-/// set that survives `max_events_per_step` — identical between the serial
-/// (one range) and threaded (R ranges) paths regardless of the tuner's split.
-/// Drives are checked in enum order (fear, curiosity, aggression, fatigue) so
-/// the within-row order is also fixed.
-fn emitRangeCrossings(job: *AffectJobContext, range: ParallelRange) void {
-    const s = job.affect_slice;
-    const indices = job.affect_dense_index;
-    const entities = job.entities;
-    const buffer = &job.event_ranges[range.index].buffer;
-
-    var k = range.start;
-    while (k < range.end) : (k += 1) {
-        const index = indices[k];
-        const entity = entities[k];
-        const mask = &s.above_threshold_mask[index];
-        inline for ([_]AiAffectDrive{ .fear, .curiosity, .aggression, .fatigue }) |drive| {
-            const final = driveValue(s, drive)[index];
-            const threshold = driveThreshold(s, drive)[index];
-            if (checkThresholdCrossing(mask, driveBit(drive), final, threshold)) |rising| {
-                appendCrossingEvent(buffer, entity, drive, rising);
-            }
+        const final = combineDriveScalar(prev, delta, s.baseline_fatigue[index], s.decay_rate_fatigue[index]);
+        s.fatigue[index] = final;
+        if (checkThresholdCrossing(&s.above_threshold_mask[index], driveBit(.fatigue), final, s.threshold_fatigue[index])) |rising| {
+            appendCrossingEvent(buffer, entities[k], .fatigue, rising);
         }
     }
 }
 
-/// The scattered final-value column for `drive`.
-fn driveValue(s: AiAffectSlice, comptime drive: AiAffectDrive) []const f32 {
-    return switch (drive) {
-        .fear => s.fear,
-        .curiosity => s.curiosity,
-        .aggression => s.aggression,
-        .fatigue => s.fatigue,
-    };
-}
-
-/// The per-drive threshold column for `drive`.
-fn driveThreshold(s: AiAffectSlice, comptime drive: AiAffectDrive) []const f32 {
-    return switch (drive) {
-        .fear => s.threshold_fear,
-        .curiosity => s.threshold_curiosity,
-        .aggression => s.threshold_aggression,
-        .fatigue => s.threshold_fatigue,
-    };
+fn emitCrossings(
+    buffer: *AffectEventRangeBuffer,
+    entities: []const EntityId,
+    dense_indices: []const u32,
+    above_threshold_mask: []u8,
+    k: usize,
+    drive: AiAffectDrive,
+    final: [simd.lane_count]f32,
+    threshold: [simd.lane_count]f32,
+) void {
+    const bit = driveBit(drive);
+    inline for (0..simd.lane_count) |lane| {
+        const dense_index = dense_indices[k + lane];
+        if (checkThresholdCrossing(&above_threshold_mask[dense_index], bit, final[lane], threshold[lane])) |rising| {
+            appendCrossingEvent(buffer, entities[k + lane], drive, rising);
+        }
+    }
 }
 
 const StageWorkSelection = struct {
