@@ -1473,8 +1473,8 @@ pub const WorldSystem = struct {
     }
 
     /// Canonical world-space float position → chunk coordinate, clamped to world
-    /// bounds. The movement processor folds an inline copy of this formula in its
-    /// integration pass (`writeChunkRow`), kept in parity by the scoped-movement test.
+    /// bounds. The scope chunk-derivation pass (`SimulationScopeSystem.deriveChunks`)
+    /// mirrors this formula over the movement-body range each step.
     pub fn chunkCoordForWorldPos(self: *const WorldSystem, world_x: f32, world_y: f32) ChunkCoord {
         const tx: u16 = @intCast(math.worldPosToCell(world_x, self.tile_size, self.width));
         const ty: u16 = @intCast(math.worldPosToCell(world_y, self.tile_size, self.height));

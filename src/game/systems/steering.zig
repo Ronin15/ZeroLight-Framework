@@ -8,8 +8,8 @@
 //! jobs read immutable slices and write range-owned movement intents.
 
 const std = @import("std");
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -909,13 +909,7 @@ const PathDirection = struct {
     progress_distance: f32 = 0,
 };
 
-const SteeringWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
+const SteeringWorkSelection = BatchSelection;
 
 const SteeringJobContext = struct {
     // Worker context is immutable input plus range-indexed output columns and a
@@ -1131,48 +1125,16 @@ fn selectSteeringWork(
     system: *SteeringSystem,
 ) SteeringWorkSelection {
     // Steering owns its tuner because avoidance cost differs from movement,
-    // pathfinding, and render-prep work even when item counts are similar.
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(config.max_worker_threads orelse available_workers, available_workers);
-    const requested_items_per_range = config.items_per_range orelse thread_system.config.items_per_range;
-    const active_tuner = if (config.adaptive and config.items_per_range == null and max_worker_threads > 0)
-        config.adaptive_tuner orelse &system.adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = steering_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), steering_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+    // pathfinding, and render-prep work even when item counts are similar. Shape is
+    // resolved through the single tuner-owned entry point so pre-sizing and dispatch
+    // agree exactly.
+    return thread_system.selectBatchProfile(config.adaptive_tuner orelse &system.adaptive_tuner, .{
+        .item_count = item_count,
+        .items_per_range = config.items_per_range,
+        .max_worker_threads = config.max_worker_threads,
+        .range_alignment_items = steering_range_alignment_items,
+        .adaptive = config.adaptive,
+    });
 }
 
 fn steeringAgentAt(slice: ConstSteeringAgentSlice, index: usize) SteeringAgentView {

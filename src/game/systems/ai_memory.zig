@@ -14,8 +14,8 @@
 //! as a downstream consumer of perception, never running for a memory-only
 //! entity. The gathered set is memory's own `ai_memories` dense-index list
 //! (not entities, not ai rows), a scattered subset of that store, so decay
-//! uses the same SIMD gather/scatter indexed idiom `movement.zig`'s
-//! `processIndexedRange` uses for its own scoped subset.
+//! uses a SIMD gather/scatter indexed idiom: four scattered rows gather into
+//! lanes, decay, and scatter back.
 //!
 //! Ordering within one `update`/`updateSerial` call: decay runs BEFORE the
 //! event refresh pass, so a same-step reacquisition lands at `staleness == 0`
@@ -197,9 +197,9 @@ fn aiMemoryDecayJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 /// climbs by one step clamped to `max_ai_memory_staleness`, familiarity
 /// relaxes toward zero by `ai_memory_familiarity_decay_rate`. The indices are
 /// scattered (a subset of the memory store's own row order), so four rows at
-/// a time gather into lanes, decay as `Float4`, and scatter back — the same
-/// SIMD-gather/scatter shape `movement.zig`'s `processIndexedRange` uses for
-/// its own scoped subset. A scalar tail covers the remainder. Ring aging
+/// a time gather into lanes, decay as `Float4`, and scatter back — a
+/// SIMD-gather/scatter shape over its own scoped subset. A scalar tail covers
+/// the remainder. Ring aging
 /// (`ageRingForRow`) is a separate per-row step, run once per row regardless
 /// of whether that row was reached via the vector or scalar path here; its
 /// own age+clamp math is itself vectorized as one `Float4` per row, with only

@@ -70,7 +70,7 @@ const PipelineResource = enum {
     movement_intents,
     path_requests,
     movement_positions,
-    movement_scope_indices,
+    chunk_columns,
     collision_scope_indices,
     contacts,
     collision_triggers,
@@ -98,8 +98,8 @@ const StageId = enum {
     steering_update,
     pathfinding_update,
     apply_ai_movement_intents,
-    movement_scope_gather,
     movement_integrate,
+    chunk_derive,
     bounds_and_tile_gate,
     collision_scope_gather,
     collision_detect,
@@ -132,8 +132,14 @@ fn stageContract(stage: StageId) StageContract {
         .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
         .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
-        .movement_scope_gather => .{ .reads = .empty, .writes = resources(&.{.movement_scope_indices}) },
-        .movement_integrate => .{ .reads = resources(&.{ .movement_positions, .movement_scope_indices }), .writes = resources(&.{.movement_positions}) },
+        // Movement integrates the full contiguous range (non-moving rows are
+        // zero-velocity no-ops), so there is no movement scope filter to read.
+        .movement_integrate => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.movement_positions}) },
+        // Recomputes each body's chunk from its final settled position, after every
+        // movement_positions writer (integrate, bounds/tile gate, collision respond,
+        // plane traversal) has run — hence ordered late, right before tier_policy,
+        // which reads these columns for LOD banding.
+        .chunk_derive => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.chunk_columns}) },
         .bounds_and_tile_gate => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.movement_positions}) },
         .collision_scope_gather => .{ .reads = .empty, .writes = resources(&.{.collision_scope_indices}) },
         .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
@@ -143,14 +149,33 @@ fn stageContract(stage: StageId) StageContract {
         // not read-only — declare it so the resource graph records plane_traversal as a
         // producer for any future stage that needs post-traversal positions.
         .plane_traversal => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
-        .tier_policy => .{ .reads = resources(&.{.movement_positions}), .writes = resources(&.{.structural_commands}) },
+        .tier_policy => .{ .reads = resources(&.{ .movement_positions, .chunk_columns }), .writes = resources(&.{.structural_commands}) },
+    };
+}
+
+/// A resource a stage computes purely from other same-step resources. Declaring
+/// it lets the comptime freshness check below prove the derived value still
+/// reflects its inputs when a later stage reads it: no stage between the producer
+/// and a consumer may overwrite an input. Reads-before-writes proves a producer
+/// EXISTS; this proves the produced value is not stale by the time it is used.
+const Derivation = struct { output: PipelineResource, inputs: ResourceSet };
+
+/// Derivations a stage produces (most stages produce none).
+fn stageDerivations(stage: StageId) []const Derivation {
+    return switch (stage) {
+        // chunk_columns is recomputed from movement_positions; every position
+        // writer (integrate, bounds/tile gate, collision respond, plane traversal)
+        // must run before this so tier_policy reads chunks matching final positions.
+        .chunk_derive => &.{.{ .output = .chunk_columns, .inputs = resources(&.{.movement_positions}) }},
+        else => &.{},
     };
 }
 
 /// The pipeline's concrete fixed-step stage order. Reads-before-writes ordering
-/// is enforced at comptime below; ordering it cannot see (e.g. two stages that
-/// share no `PipelineResource`) is proven by causal-effect tests further down
-/// in this file, the same technique the other stage-order tests use.
+/// and derived-resource freshness (see `stageDerivations`) are enforced at
+/// comptime below; ordering the contract cannot see (e.g. two stages that share
+/// no `PipelineResource`) is proven by causal-effect tests further down in this
+/// file, the same technique the other stage-order tests use.
 const stage_order = [_]StageId{
     .dig_world_edit,
     .scope_advance_and_ai_gather,
@@ -162,13 +187,13 @@ const stage_order = [_]StageId{
     .steering_update,
     .pathfinding_update,
     .apply_ai_movement_intents,
-    .movement_scope_gather,
     .movement_integrate,
     .bounds_and_tile_gate,
     .collision_scope_gather,
     .collision_detect,
     .collision_respond,
     .plane_traversal,
+    .chunk_derive,
     .tier_policy,
 };
 
@@ -182,6 +207,26 @@ comptime {
                 "' reads a resource no earlier stage writes — fix stage_order or stageContract()");
         }
         produced.setUnion(contract.writes);
+    }
+
+    // Freshness: a derived resource must still reflect its inputs when consumed.
+    // For each derivation, no stage between the producing stage and any later
+    // consumer of the output may overwrite one of the inputs — otherwise the
+    // consumer reads a value computed from superseded inputs.
+    for (stage_order, 0..) |producer_stage, producer_i| {
+        for (stageDerivations(producer_stage)) |derivation| {
+            for (stage_order[producer_i + 1 ..], producer_i + 1..) |consumer_stage, consumer_i| {
+                if (!stageContract(consumer_stage).reads.contains(derivation.output)) continue;
+                for (stage_order[producer_i + 1 .. consumer_i]) |between_stage| {
+                    if (stageContract(between_stage).writes.intersectWith(derivation.inputs).count() != 0) {
+                        @compileError("SimulationPipeline: derived resource '" ++ @tagName(derivation.output) ++
+                            "' from '" ++ @tagName(producer_stage) ++ "' is stale before consumer '" ++
+                            @tagName(consumer_stage) ++ "': stage '" ++ @tagName(between_stage) ++
+                            "' overwrites an input in between — move the deriving stage after the last input writer that precedes the consumer");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -244,6 +289,7 @@ pub const SimulationPipelineStats = struct {
     steering: SteeringStats = .{},
     pathfinding: PathfindingStats = .{},
     movement: MovementStats = .{},
+    chunk_derive: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
 
@@ -334,6 +380,7 @@ pub const SimulationPipelineStats = struct {
 
         perf.recordMetric(.movement_bodies, metric(movement_stats.body_count));
         perf.recordBatch(.movement, movement_stats.batch);
+        perf.recordBatch(.chunk_derive, self.chunk_derive);
 
         perf.recordMetric(.collision_bodies, metric(collision_stats.body_count));
         perf.recordMetric(.collision_candidate_pairs, metric(collision_stats.candidate_pair_count));
@@ -763,25 +810,16 @@ pub const SimulationPipeline = struct {
         applyAiMovementIntents(data, frame);
         apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
 
-        // Movement gates on tier only (no chunk filter): every non-dormant entity
-        // integrates, on- or off-screen. Null = full-active warm SIMD range. Movement
-        // also derives each integrated body's chunk in-pass via chunk_grid, so chunk
-        // stays exact every step with no separate recompute.
-        const movement_scope_indices = (try self.scope.gatherMovementBodyIndices(data, context.thread_system, .{})).indices;
-        const scope_columns = data.scopeColumnsSlice();
+        // Movement is a pure position integrator over the full contiguous SoA range:
+        // non-moving rows carry zero velocity (DataSystem zeros it on entry to a
+        // non-moving tier) so they integrate as no-ops — no scattered skip-path.
+        // Chunk maintenance is deliberately NOT here: chunk columns are consumed by
+        // tier policy (LOD) and render prep, not by movement, and must reflect the
+        // final settled position after bounds/tile gating, collision response, and
+        // plane traversal — so it runs as its own pass just before tier policy below.
         var movement_slice = data.movementBodySlice();
         var movement_timer = StageTimer.start();
-        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{
-            .scope_dense_indices = movement_scope_indices,
-            .chunk_grid = .{
-                .chunk_x = scope_columns.chunk_x,
-                .chunk_y = scope_columns.chunk_y,
-                .tile_size = context.world.tile_size,
-                .chunk_size_tiles = context.world.chunk_size_tiles,
-                .width = context.world.width,
-                .height = context.world.height,
-            },
-        });
+        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
         movement_timer.stop(context.perf, .pipeline_movement);
 
         var clamp_timer = StageTimer.start();
@@ -817,6 +855,20 @@ pub const SimulationPipeline = struct {
         try self.dig.applyPlaneTraversal(context.world, data, context.player, frame);
         try applyNpcPlaneTraversal(&self.dig, context.world, data, frame);
 
+        // Chunk maintenance: recompute each body's (chunk_x, chunk_y) from its now
+        // settled position. Positions are final here — all of movement, bounds/tile
+        // gating, collision response, and plane traversal have run. Consumers are the
+        // tier policy just below (LOD banding) and render prep; movement never reads
+        // it. Own timer keeps this scope work out of the movement stage measurement.
+        var chunk_derive_timer = StageTimer.start();
+        const chunk_derive_stats = self.scope.deriveChunks(data, context.thread_system, .{
+            .tile_size = context.world.tile_size,
+            .chunk_size_tiles = context.world.chunk_size_tiles,
+            .width = context.world.width,
+            .height = context.world.height,
+        }, .{});
+        chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
+
         // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
         // kinematic/dormant by its cube distance from the visible region, applied
         // via deferred structural commands on the frame stream for the commit seam.
@@ -831,7 +883,6 @@ pub const SimulationPipeline = struct {
             data,
             cognition_region,
             ai_indices,
-            movement_scope_indices,
             collision_scope_indices,
             steering_stats,
         );
@@ -846,6 +897,7 @@ pub const SimulationPipeline = struct {
             .steering = steering_stats,
             .pathfinding = pathfinding_stats,
             .movement = movement_stats,
+            .chunk_derive = chunk_derive_stats,
             .collision = collision_stats,
             .collision_response = collision_response_stats,
         };
@@ -859,7 +911,6 @@ pub const SimulationPipeline = struct {
         data: *const DataSystem,
         cognition_region: ?ActiveRegion,
         ai_indices: []const u32,
-        movement_scope_indices: ?[]const u32,
         collision_scope_indices: ?[]const u32,
         steering_stats: SteeringStats,
     ) SimulationScope {
@@ -868,7 +919,9 @@ pub const SimulationPipeline = struct {
         // Steering is transitively scoped via AI's intents; its real participation
         // is the count of movement intents it actually emitted this step.
         stats.steering_stage_entities = steering_stats.movement_intent_count;
-        if (movement_scope_indices) |idx| stats.movement_stage_entities = idx.len;
+        // Movement integrates the full contiguous range every step (non-moving rows
+        // are zero-velocity no-ops), so its stage entity count is the full-active
+        // default set above — there is no movement scope filter to narrow it.
         if (collision_scope_indices) |idx| stats.collision_stage_entities = idx.len;
         stats.stagger_skips = self.scope.stagger_skips;
         stats.chunk_filtered_entities = self.scope.chunk_filtered_entities;

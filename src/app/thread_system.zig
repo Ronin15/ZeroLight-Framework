@@ -71,6 +71,30 @@ pub const AdaptiveWorkProfile = struct {
     items_per_range: usize = (ThreadSystemConfig{}).items_per_range,
 };
 
+/// Inputs to `ThreadSystem.selectBatchProfile` — the single entry point every stage
+/// (and `parallelForWithOptions`) uses to resolve a batch's shape. `available` and
+/// the config fallback are filled from the ThreadSystem.
+pub const BatchWorkRequest = struct {
+    item_count: usize,
+    /// Explicit range size opts out of the adaptive tuner (fixed shape).
+    items_per_range: ?usize = null,
+    max_worker_threads: ?usize = null,
+    range_alignment_items: usize = 1,
+    adaptive: bool = true,
+};
+
+/// Fully resolved batch shape: worker count, range size, and the tuner (if any) the
+/// caller must `record` this batch's `BatchStats` back to so it keeps learning.
+/// `profile` mirrors `worker_threads`/`items_per_range` for callers that forward it
+/// as a `selected_profile` after pre-sizing per-range output buffers.
+pub const BatchSelection = struct {
+    profile: AdaptiveWorkProfile,
+    items_per_range: usize,
+    worker_threads: usize,
+    range_count: usize,
+    active_tuner: ?*AdaptiveWorkTuner = null,
+};
+
 pub const AdaptiveWorkTunerConfig = struct {
     // Tuning is measurement-driven. These limits shape probing and settling, but
     // do not impose static item-count floors for threaded participation.
@@ -82,7 +106,6 @@ pub const AdaptiveWorkTunerConfig = struct {
     threaded_commit_threshold_percent: u8 = 5,
     item_count_reset_percent: u8 = 25,
     threaded_batch_ns: u64 = 50_000,
-    settle_after_failed_profiles: usize = 2,
     retune_after_settled_windows: usize = 120,
     min_ranges_per_participant: usize = 1,
     max_ranges_per_participant: usize = 16,
@@ -115,7 +138,6 @@ pub const AdaptiveWorkReport = struct {
     sample_count: usize = 0,
     sample_window: usize = 1,
     failed_profile_count: usize = 0,
-    settle_after_failed_profiles: usize = 1,
     settled_window_count: usize = 0,
     retune_after_settled_windows: usize = 1,
     best_mean_batch_duration_ns: u64 = 0,
@@ -137,7 +159,10 @@ pub const AdaptiveWorkTuner = struct {
     baseline_mean_batch_duration_ns: u64 = 0,
     has_threaded_profile: bool = false,
     sample_count: usize = 0,
-    sample_total_ns: u128 = 0,
+    // Representative batch duration for phase decisions is the window MINIMUM, not
+    // the mean: the min is immune to cold-start and contention spikes, so a
+    // steady-state-cheap batch is not pushed into threading by one slow frame.
+    sample_min_ns: u64 = std.math.maxInt(u64),
     failed_profile_count: usize = 0,
     settled_window_count: usize = 0,
     inline_probe_cooldown_windows: usize = 0,
@@ -152,6 +177,13 @@ pub const AdaptiveWorkTuner = struct {
     model_range_overhead_ns: f64 = 0,
     model_imbalance_work_ns: f64 = 0,
     last_predicted_profile: ?AdaptiveWorkProfile = null,
+    // Worker hill-climb: once a threaded profile is committed, probe adjacent worker
+    // counts and keep the fastest, converging on the measured optimum instead of the
+    // sqrt guess. `climb_direction` is the step (-1 fewer, +1 more) tried next;
+    // `climb_reversed` marks that the other direction was already tried since the
+    // last improvement, so the next loss settles on the best.
+    climb_direction: i8 = -1,
+    climb_reversed: bool = false,
 
     pub fn init(config: AdaptiveWorkTunerConfig) AdaptiveWorkTuner {
         const normalized = normalizeWorkTunerConfig(config);
@@ -201,15 +233,15 @@ pub const AdaptiveWorkTuner = struct {
         self.sampled_profile = profile;
 
         self.sample_count += 1;
-        self.sample_total_ns += stats.batch_duration_ns;
+        self.sample_min_ns = @min(self.sample_min_ns, stats.batch_duration_ns);
         self.updateCostModel(stats);
         if (self.sample_count < self.config.sample_window) return;
 
-        const sample_mean_ns: u64 = @intCast(self.sample_total_ns / self.sample_count);
+        const sample_ns = self.sample_min_ns;
         switch (self.phase) {
-            .learning => self.finishLearningWindow(sample_mean_ns),
-            .probing => self.finishProfileWindow(sample_mean_ns),
-            .settled => self.finishSettledWindow(sample_mean_ns),
+            .learning => self.finishLearningWindow(sample_ns),
+            .probing => self.finishProfileWindow(sample_ns),
+            .settled => self.finishSettledWindow(sample_ns),
         }
         self.resetSamples();
     }
@@ -224,7 +256,6 @@ pub const AdaptiveWorkTuner = struct {
             .sample_count = self.sample_count,
             .sample_window = self.config.sample_window,
             .failed_profile_count = self.failed_profile_count,
-            .settle_after_failed_profiles = self.config.settle_after_failed_profiles,
             .settled_window_count = self.settled_window_count,
             .retune_after_settled_windows = self.config.retune_after_settled_windows,
             .best_mean_batch_duration_ns = self.best_mean_batch_duration_ns,
@@ -264,37 +295,70 @@ pub const AdaptiveWorkTuner = struct {
     }
 
     // A probe only becomes policy after it beats the baseline by the commit
-    // threshold. Failed probes either settle or try another predicted shape.
+    // threshold. On a win the worker hill-climb continues in the same direction from
+    // the new best; on a loss it tries the opposite direction once, then settles on
+    // the best — converging on the measured-optimal worker count.
     fn finishProfileWindow(self: *AdaptiveWorkTuner, sample_mean_ns: u64) void {
+        const request = self.last_request orelse {
+            self.settle();
+            return;
+        };
         const candidate = self.candidate_profile orelse {
             self.settle();
             return;
         };
 
-        const commit_candidate = self.shouldCommitCandidate(candidate, sample_mean_ns);
-        if (commit_candidate) {
+        if (self.shouldCommitCandidate(candidate, sample_mean_ns)) {
             self.recordBest(candidate, sample_mean_ns);
             self.current_profile = candidate;
             self.baseline_mean_batch_duration_ns = sample_mean_ns;
             self.failed_profile_count = 0;
             self.inline_probe_cooldown_windows = 0;
-            self.startPredictedProbe(candidate, sample_mean_ns);
+            // Keep climbing the same direction from the new best; re-allow the
+            // opposite direction if this one later stalls.
+            self.climb_reversed = false;
+            if (self.nextClimbCandidate(request)) |next| {
+                self.candidate_profile = next;
+            } else {
+                self.settle();
+            }
             return;
         }
 
         self.failed_profile_count += 1;
         if (!self.has_threaded_profile) {
+            // First-ever threaded probe lost: stay inline and cool down before retry.
             self.inline_probe_cooldown_windows = self.config.retune_after_settled_windows;
             self.settle();
             return;
         }
-        if (self.failed_profile_count >= self.config.settle_after_failed_profiles) {
-            self.settle();
-            return;
+        // This direction stalled. Try the opposite once from the best; else settle.
+        if (!self.climb_reversed) {
+            self.climb_reversed = true;
+            self.climb_direction = -self.climb_direction;
+            self.current_profile = self.best_profile;
+            self.baseline_mean_batch_duration_ns = self.best_mean_batch_duration_ns;
+            if (self.nextClimbCandidate(request)) |next| {
+                self.candidate_profile = next;
+                return;
+            }
         }
-        self.current_profile = self.best_profile;
-        self.baseline_mean_batch_duration_ns = self.best_mean_batch_duration_ns;
-        self.startPredictedProbe(self.best_profile, self.best_mean_batch_duration_ns);
+        self.settle();
+    }
+
+    // Next worker count to probe: one step from the current best in climb_direction,
+    // shaped through profileForParticipants. Null when the step leaves the valid
+    // range or does not change the profile (that direction is exhausted).
+    fn nextClimbCandidate(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) ?AdaptiveWorkProfile {
+        const best_workers = self.best_profile.worker_threads;
+        if (best_workers == 0) return null;
+        const target_i = @as(i64, @intCast(best_workers)) + self.climb_direction;
+        if (target_i < 1) return null;
+        const target_workers: usize = @intCast(target_i);
+        if (target_workers > request.max_worker_threads) return null;
+        const candidate = self.profileForParticipants(request, target_workers + 1);
+        if (candidate.worker_threads == 0 or profilesEqual(candidate, self.best_profile)) return null;
+        return candidate;
     }
 
     // Settled profiles keep sampling. After enough windows, or when inline work
@@ -318,6 +382,18 @@ pub const AdaptiveWorkTuner = struct {
             self.startPredictedProbe(profile, sample_mean_ns);
             return;
         }
+        // Conservative per-window demotion with NO inline backprobe. The threaded
+        // duration times the participant count is an upper bound on the serial
+        // (inline) cost — it over-counts by all the parallel overhead. If even that
+        // upper bound is below the gate, inline is provably cheap enough, so drop
+        // back to inline. Using only the threaded measurement, this catches both a
+        // shrinking item count and a genuine per-item cost collapse, without the
+        // frozen-while-threaded inline cost model the previous prediction relied on.
+        const participants = profile.worker_threads + 1;
+        if (@as(u128, sample_mean_ns) * participants < self.config.threaded_batch_ns) {
+            self.demoteToInline();
+            return;
+        }
         if (self.settled_window_count >= self.config.retune_after_settled_windows) {
             self.startPredictedProbe(profile, sample_mean_ns);
             return;
@@ -338,9 +414,17 @@ pub const AdaptiveWorkTuner = struct {
             self.recordBest(normalized_baseline, baseline_mean_ns);
         }
         self.baseline_mean_batch_duration_ns = baseline_mean_ns;
+        // A fresh probe starts the hill-climb over from the sqrt ballpark, descending
+        // first (the sqrt guess tends to over-shoot medium workloads).
+        self.climb_direction = -1;
+        self.climb_reversed = false;
 
         const predicted = self.predictProfile(request);
         self.last_predicted_profile = predicted;
+        // A fresh predicted-inline here does not demote: a just-committed threaded
+        // profile won by MEASUREMENT, and the model's inline estimate can transiently
+        // disagree. Demotion happens only once settled (see finishSettledWindow),
+        // where a predicted-inline means the workload genuinely shrank.
         if (predicted.worker_threads == 0 or (self.has_threaded_profile and profilesEqual(predicted, normalized_baseline))) {
             self.settle();
             return;
@@ -351,13 +435,10 @@ pub const AdaptiveWorkTuner = struct {
     }
 
     fn predictProfile(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) AdaptiveWorkProfile {
-        if (request.max_worker_threads == 0) {
-            return self.normalizedProfile(.{
-                .worker_threads = 0,
-                .items_per_range = request.fallback_items_per_range,
-            }, request);
-        }
+        return self.profileForParticipants(request, self.predictParticipants(request));
+    }
 
+    fn estimatedWorkNs(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) f64 {
         const item_count_f: f64 = @floatFromInt(request.item_count);
         const work_ns_per_item = if (self.model_work_ns_per_item > 0)
             self.model_work_ns_per_item
@@ -365,38 +446,44 @@ pub const AdaptiveWorkTuner = struct {
             @as(f64, @floatFromInt(self.baseline_mean_batch_duration_ns)) / item_count_f
         else
             @as(f64, @floatFromInt(self.config.threaded_batch_ns)) / item_count_f;
-        const estimated_work_ns = @max(work_ns_per_item * item_count_f, 1);
-        if (estimated_work_ns < @as(f64, @floatFromInt(self.config.threaded_batch_ns))) {
-            return self.normalizedProfile(.{
-                .worker_threads = 0,
-                .items_per_range = request.fallback_items_per_range,
-            }, request);
-        }
+        return @max(work_ns_per_item * item_count_f, 1);
+    }
 
-        // The model chooses participants from observed work, participant
-        // overhead, range overhead, and tail wait. Item-count floors are kept
-        // out of this path so production scheduling stays measurement-driven.
+    // Sqrt cost-model estimate of the ideal participant count (main thread + workers)
+    // for the measured work — a starting ballpark only. Returns 1 (inline) below the
+    // threaded gate or when threading is not predicted to win. There is deliberately
+    // NO item-count floor and NO per-participant floor here: the count is refined
+    // against real timings by the worker hill-climb in finishProfileWindow, so a
+    // static floor would only fight that measurement (it made small batches
+    // over-thread and medium batches under-thread).
+    fn predictParticipants(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest) usize {
+        if (request.max_worker_threads == 0) return 1;
+        const estimated_work_ns = self.estimatedWorkNs(request);
+        if (estimated_work_ns < @as(f64, @floatFromInt(self.config.threaded_batch_ns))) return 1;
         const participant_overhead_ns = @max(self.model_participant_overhead_ns, default_participant_overhead_ns);
         const ideal_participants_f = @sqrt(estimated_work_ns / participant_overhead_ns);
         const max_participants = request.max_worker_threads + 1;
-        const predicted_participants = clampUsize(
-            roundedUsize(ideal_participants_f),
-            1,
-            max_participants,
-        );
-        const predicted_threaded_ns = estimated_work_ns / @as(f64, @floatFromInt(predicted_participants)) +
-            participant_overhead_ns * @as(f64, @floatFromInt(predicted_participants - 1));
-        if (predicted_participants <= 1 or predicted_threaded_ns >= estimated_work_ns) {
-            return self.normalizedProfile(.{
-                .worker_threads = 0,
-                .items_per_range = request.fallback_items_per_range,
-            }, request);
-        }
+        const participants = clampUsize(roundedUsize(ideal_participants_f), 1, max_participants);
+        if (participants <= 1) return 1;
+        const predicted_threaded_ns = estimated_work_ns / @as(f64, @floatFromInt(participants)) +
+            participant_overhead_ns * @as(f64, @floatFromInt(participants - 1));
+        if (predicted_threaded_ns >= estimated_work_ns) return 1;
+        return participants;
+    }
 
+    // Shapes the batch (range size + final worker count) for a target participant
+    // count, using the learned range-overhead model. Returns inline when the count
+    // is one or the aligned range count leaves no room for a worker. The hill-climb
+    // walks `participants` up/down and shapes each step through here.
+    fn profileForParticipants(self: *const AdaptiveWorkTuner, request: AdaptiveWorkRequest, participants: usize) AdaptiveWorkProfile {
+        const inline_profile = AdaptiveWorkProfile{ .worker_threads = 0, .items_per_range = request.fallback_items_per_range };
+        if (participants <= 1 or request.max_worker_threads == 0) return self.normalizedProfile(inline_profile, request);
+        const clamped_participants = @min(participants, request.max_worker_threads + 1);
+        const estimated_work_ns = self.estimatedWorkNs(request);
         const range_overhead_ns = @max(self.model_range_overhead_ns, default_range_overhead_ns);
-        const work_per_participant_ns = estimated_work_ns / @as(f64, @floatFromInt(predicted_participants));
+        const work_per_participant_ns = estimated_work_ns / @as(f64, @floatFromInt(clamped_participants));
         const ranges_per_participant_f = if (self.model_imbalance_work_ns > 0)
-            @sqrt(self.model_imbalance_work_ns / (range_overhead_ns * @as(f64, @floatFromInt(predicted_participants))))
+            @sqrt(self.model_imbalance_work_ns / (range_overhead_ns * @as(f64, @floatFromInt(clamped_participants))))
         else
             @sqrt(work_per_participant_ns / range_overhead_ns);
         const ranges_per_participant = clampUsize(
@@ -404,43 +491,18 @@ pub const AdaptiveWorkTuner = struct {
             self.config.min_ranges_per_participant,
             self.config.max_ranges_per_participant,
         );
-        const target_ranges = saturatingMul(predicted_participants, ranges_per_participant);
+        const target_ranges = saturatingMul(clamped_participants, ranges_per_participant);
         const predicted_items_per_range = self.normalizedItemsPerRange(
             targetRangeSizeForRangeCount(request.item_count, target_ranges),
             request.range_alignment_items,
         );
-        const worker_threads = maxUsefulWorkersForRange(
-            request.item_count,
-            predicted_items_per_range,
-            request.max_worker_threads,
+        // Clamp to clamped_participants - 1 so the range count cannot re-derive a
+        // larger worker count from max_worker_threads (main thread is one participant).
+        const worker_threads = @min(
+            maxUsefulWorkersForRange(request.item_count, predicted_items_per_range, request.max_worker_threads),
+            clamped_participants - 1,
         );
-        if (worker_threads == 0) {
-            return self.normalizedProfile(.{
-                .worker_threads = 0,
-                .items_per_range = request.fallback_items_per_range,
-            }, request);
-        }
-
-        if (self.model_participant_overhead_ns > 0) {
-            const actual_participants = worker_threads + 1;
-            const actual_range_count = rangeCount(request.item_count, predicted_items_per_range);
-            const actual_ranges_per_participant = @max(@as(usize, 1), ceilDiv(actual_range_count, actual_participants));
-            const predicted_imbalance_ns = if (self.model_imbalance_work_ns > 0)
-                self.model_imbalance_work_ns / @as(f64, @floatFromInt(actual_ranges_per_participant))
-            else
-                0;
-            const full_threaded_ns = estimated_work_ns / @as(f64, @floatFromInt(actual_participants)) +
-                participant_overhead_ns * @as(f64, @floatFromInt(worker_threads)) +
-                range_overhead_ns * @as(f64, @floatFromInt(actual_range_count)) +
-                predicted_imbalance_ns;
-            if (full_threaded_ns >= estimated_work_ns) {
-                return self.normalizedProfile(.{
-                    .worker_threads = 0,
-                    .items_per_range = request.fallback_items_per_range,
-                }, request);
-            }
-        }
-
+        if (worker_threads == 0) return self.normalizedProfile(inline_profile, request);
         return self.normalizedProfile(.{
             .worker_threads = worker_threads,
             .items_per_range = predicted_items_per_range,
@@ -493,10 +555,10 @@ pub const AdaptiveWorkTuner = struct {
             );
         }
 
-        const threaded_work_per_item = duration_ns * @as(f64, @floatFromInt(participants)) / item_count_f;
-        if (threaded_work_per_item < self.model_work_ns_per_item * 1.25) {
-            self.model_work_ns_per_item = ewma(self.model_work_ns_per_item, threaded_work_per_item, 0.10);
-        }
+        // model_work_ns_per_item is learned ONLY from inline batches (early return
+        // above). A threaded reconstruction folds participant/range overhead into the
+        // per-item figure and would inflate it, which both over-predicts workers and
+        // defeats the prediction-driven demotion below.
     }
 
     fn settle(self: *AdaptiveWorkTuner) void {
@@ -506,6 +568,24 @@ pub const AdaptiveWorkTuner = struct {
         self.last_predicted_profile = null;
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
+    }
+
+    // Model predicts inline now beats the committed threaded profile (e.g. item
+    // count drifted down below the threaded gate). Drop the threaded policy so
+    // selectProfile returns inline again, WITHOUT ever running an inline probe while
+    // threaded. The cooldown blocks immediate re-probing off a stale slow sample; a
+    // genuinely expensive later inline window re-enters probing on its own.
+    fn demoteToInline(self: *AdaptiveWorkTuner) void {
+        self.phase = .settled;
+        self.has_threaded_profile = false;
+        self.best_profile = self.initial_profile;
+        self.current_profile = self.initial_profile;
+        self.candidate_profile = null;
+        self.last_predicted_profile = null;
+        self.best_mean_batch_duration_ns = 0;
+        self.failed_profile_count = 0;
+        self.settled_window_count = 0;
+        self.inline_probe_cooldown_windows = self.config.retune_after_settled_windows;
     }
 
     // Workload shifts clear learned policy and samples. The next selection
@@ -522,6 +602,8 @@ pub const AdaptiveWorkTuner = struct {
         self.failed_profile_count = 0;
         self.settled_window_count = 0;
         self.inline_probe_cooldown_windows = 0;
+        self.climb_direction = -1;
+        self.climb_reversed = false;
         self.resetSamples();
     }
 
@@ -593,7 +675,7 @@ pub const AdaptiveWorkTuner = struct {
 
     fn resetSamples(self: *AdaptiveWorkTuner) void {
         self.sample_count = 0;
-        self.sample_total_ns = 0;
+        self.sample_min_ns = std.math.maxInt(u64);
         self.sampled_profile = null;
     }
 };
@@ -693,6 +775,49 @@ pub const ThreadSystem = struct {
         return self.parallelForWithOptions(item_count, context, job_fn, .{});
     }
 
+    /// The one place batch shape is decided. Resolves whether the tuner is active
+    /// (adaptive, no explicit range size, workers available), asks it for a profile
+    /// (or uses the fixed profile otherwise), then applies the shared align/clamp/
+    /// inline-collapse via `shapeBatch`. Both `parallelForWithOptions` and the
+    /// pre-sizing stage helpers call this, so the tuner's decision — and the exact
+    /// `(worker_threads, items_per_range)` it will later see in `record` — is
+    /// computed identically everywhere. Divergence here would make the tuner see a
+    /// "new" profile every frame and never settle.
+    pub fn selectBatchProfile(
+        self: *const ThreadSystem,
+        adaptive_tuner: ?*AdaptiveWorkTuner,
+        request: BatchWorkRequest,
+    ) BatchSelection {
+        const range_alignment_items = @max(request.range_alignment_items, @as(usize, 1));
+        const max_worker_threads = @min(request.max_worker_threads orelse self.workers.len, self.workers.len);
+        const requested_items_per_range = @max(request.items_per_range orelse self.config.items_per_range, @as(usize, 1));
+        const active_tuner = if (request.adaptive and request.items_per_range == null and max_worker_threads > 0)
+            adaptive_tuner
+        else
+            null;
+        const profile = if (active_tuner) |tuner|
+            tuner.selectProfile(.{
+                .item_count = request.item_count,
+                .available_worker_threads = self.workers.len,
+                .max_worker_threads = max_worker_threads,
+                .fallback_items_per_range = requested_items_per_range,
+                .range_alignment_items = range_alignment_items,
+            })
+        else
+            AdaptiveWorkProfile{
+                .worker_threads = max_worker_threads,
+                .items_per_range = requested_items_per_range,
+            };
+        const shape = shapeBatch(request.item_count, profile, max_worker_threads, range_alignment_items, active_tuner != null);
+        return .{
+            .profile = .{ .worker_threads = shape.worker_threads, .items_per_range = shape.items_per_range },
+            .items_per_range = shape.items_per_range,
+            .worker_threads = shape.worker_threads,
+            .range_count = shape.range_count,
+            .active_tuner = active_tuner,
+        };
+    }
+
     pub fn parallelForWithOptions(
         self: *ThreadSystem,
         item_count: usize,
@@ -705,43 +830,32 @@ pub const ThreadSystem = struct {
         if (item_count == 0) return .{};
 
         const range_alignment_items = @max(options.range_alignment_items, @as(usize, 1));
-        const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
-        const requested_items_per_range = @max(options.items_per_range orelse self.config.items_per_range, @as(usize, 1));
-        // Explicit items_per_range opts out of the shared adaptive tuner. Stage
-        // owners that need independent timing should pass their own tuner.
-        const adaptive_tuner = if (options.adaptive and (max_worker_threads > 0 or options.selected_profile != null))
-            if (options.selected_profile != null)
-                options.adaptive_tuner
-            else if (options.items_per_range == null)
-                options.adaptive_tuner orelse &self.adaptive_tuner
-            else
-                null
-        else
-            null;
-        const profile = options.selected_profile orelse if (adaptive_tuner) |tuner|
-            tuner.selectProfile(.{
-                .item_count = item_count,
-                .available_worker_threads = self.workers.len,
-                .max_worker_threads = max_worker_threads,
-                .fallback_items_per_range = requested_items_per_range,
-                .range_alignment_items = range_alignment_items,
-            })
-        else
-            AdaptiveWorkProfile{
-                .worker_threads = max_worker_threads,
-                .items_per_range = requested_items_per_range,
+        // Single selection path. A caller that pre-sized per-range output buffers
+        // passes its already-resolved `selected_profile` (from selectBatchProfile);
+        // everyone else selects here. Both routes shape the batch through the same
+        // tuner-owned logic, so `record` always sees the profile that was selected.
+        const selection = if (options.selected_profile) |selected| blk: {
+            const max_worker_threads = @min(options.max_worker_threads orelse self.workers.len, self.workers.len);
+            const tuner_active = options.adaptive and options.adaptive_tuner != null;
+            const shape = shapeBatch(item_count, selected, max_worker_threads, range_alignment_items, tuner_active);
+            break :blk BatchSelection{
+                .profile = .{ .worker_threads = shape.worker_threads, .items_per_range = shape.items_per_range },
+                .items_per_range = shape.items_per_range,
+                .worker_threads = shape.worker_threads,
+                .range_count = shape.range_count,
+                .active_tuner = if (tuner_active) options.adaptive_tuner else null,
             };
-        const selected_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
-        const selected_range_count = rangeCount(item_count, selected_items_per_range);
-        const active_worker_threads = if (selected_range_count <= 1)
-            @as(usize, 0)
-        else
-            @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-        const items_per_range = if (active_worker_threads == 0 and adaptive_tuner != null and profile.worker_threads == 0)
-            item_count
-        else
-            selected_items_per_range;
-        const range_count = rangeCount(item_count, items_per_range);
+        } else self.selectBatchProfile(options.adaptive_tuner orelse &self.adaptive_tuner, .{
+            .item_count = item_count,
+            .items_per_range = options.items_per_range,
+            .max_worker_threads = options.max_worker_threads,
+            .range_alignment_items = range_alignment_items,
+            .adaptive = options.adaptive,
+        });
+        const items_per_range = selection.items_per_range;
+        const active_worker_threads = selection.worker_threads;
+        const range_count = selection.range_count;
+        const record_tuner = selection.active_tuner;
         var stats = BatchStats{
             .item_count = item_count,
             .range_count = range_count,
@@ -757,7 +871,7 @@ pub const ThreadSystem = struct {
             runInline(item_count, items_per_range, context, job_fn, &stats);
             const batch_end_ns = nowNs(self.shared.io);
             stats.batch_duration_ns = elapsedNs(batch_start_ns, batch_end_ns);
-            if (adaptive_tuner) |tuner| {
+            if (record_tuner) |tuner| {
                 tuner.record(stats);
             }
             return stats;
@@ -812,7 +926,7 @@ pub const ThreadSystem = struct {
         stats.main_thread_wait_ns = elapsedNs(wait_start_ns, wait_end_ns);
         stats.batch_duration_ns = elapsedNs(batch_start_ns, batch_end_ns);
         stats.worker_utilization = workerUtilization(stats.worker_thread_ranges, active_worker_threads, range_count);
-        if (adaptive_tuner) |tuner| {
+        if (record_tuner) |tuner| {
             tuner.record(stats);
         }
 
@@ -957,6 +1071,35 @@ pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
     return (item_count + items_per_range - 1) / items_per_range;
 }
 
+const BatchShape = struct {
+    items_per_range: usize,
+    worker_threads: usize,
+    range_count: usize,
+};
+
+// The shared align/clamp/collapse applied to any chosen profile: align the range
+// size to the caller's alignment, drop workers a single-range batch can't use, and
+// collapse a tuner-selected inline batch to one full-width range. `tuner_active`
+// gates only the inline collapse — a fixed (non-adaptive) inline batch keeps its
+// requested range size so its range count stays meaningful.
+fn shapeBatch(item_count: usize, profile: AdaptiveWorkProfile, max_worker_threads: usize, range_alignment_items: usize, tuner_active: bool) BatchShape {
+    const aligned = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), range_alignment_items);
+    const aligned_range_count = rangeCount(item_count, aligned);
+    const worker_threads = if (aligned_range_count <= 1)
+        @as(usize, 0)
+    else
+        @min(profile.worker_threads, @min(max_worker_threads, aligned_range_count - 1));
+    const items_per_range = if (worker_threads == 0 and tuner_active and profile.worker_threads == 0)
+        item_count
+    else
+        aligned;
+    return .{
+        .items_per_range = items_per_range,
+        .worker_threads = worker_threads,
+        .range_count = rangeCount(item_count, items_per_range),
+    };
+}
+
 pub fn alignItemCount(item_count: usize, alignment: usize) usize {
     std.debug.assert(alignment > 0);
     if (alignment == 1) return item_count;
@@ -1035,7 +1178,6 @@ fn normalizeWorkTunerConfig(config: AdaptiveWorkTunerConfig) AdaptiveWorkTunerCo
     normalized.improvement_threshold_percent = @min(normalized.improvement_threshold_percent, @as(u8, 100));
     normalized.threaded_commit_threshold_percent = @min(normalized.threaded_commit_threshold_percent, @as(u8, 100));
     normalized.item_count_reset_percent = @min(normalized.item_count_reset_percent, @as(u8, 100));
-    normalized.settle_after_failed_profiles = @max(normalized.settle_after_failed_profiles, @as(usize, 1));
     normalized.retune_after_settled_windows = @max(normalized.retune_after_settled_windows, @as(usize, 1));
     normalized.min_ranges_per_participant = @max(normalized.min_ranges_per_participant, @as(usize, 1));
     normalized.max_ranges_per_participant = @max(normalized.max_ranges_per_participant, normalized.min_ranges_per_participant);
@@ -1289,8 +1431,11 @@ test "parallel for options use provided adaptive work tuner" {
 
     const report = adaptive_tuner.report();
     try std.testing.expect(stats.item_count == hits.len);
+    // The provided tuner recorded this batch (proving it, not the ThreadSystem's
+    // built-in tuner, drove selection). It does not assert a threaded commit: ~128
+    // trivial items is far below any threading benefit, so correct policy keeps it
+    // inline.
     try std.testing.expect(report.sample_count > 0 or report.baseline_mean_batch_duration_ns > 0);
-    try std.testing.expect(report.has_threaded_profile);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().best_mean_batch_duration_ns);
     for (&hits) |*hit| {
         try std.testing.expectEqual(@as(u32, 1), hit.load(.monotonic));
@@ -1495,16 +1640,18 @@ test "adaptive work tuner default threshold requires full slow inline window" {
     });
     const request = tunerTestRequest(1024, 4, 16, 64);
 
+    // 150µs so the work-per-participant floor still justifies threading (a batch
+    // barely over the 50µs gate no longer fans out — that is the floor working).
     var sample_index: usize = 0;
     while (sample_index < tuner.config.sample_window - 1) : (sample_index += 1) {
         const selected = tuner.selectProfile(request);
         try std.testing.expectEqual(@as(usize, 0), selected.worker_threads);
-        tuner.record(tunerTestBatchWithProfile(1024, selected, 60_000));
+        tuner.record(tunerTestBatchWithProfile(1024, selected, 150_000));
         try std.testing.expectEqual(AdaptiveWorkPhase.learning, tuner.report().phase);
     }
 
     const final_inline = tuner.selectProfile(request);
-    tuner.record(tunerTestBatchWithProfile(1024, final_inline, 60_000));
+    tuner.record(tunerTestBatchWithProfile(1024, final_inline, 150_000));
     try std.testing.expectEqual(AdaptiveWorkPhase.probing, tuner.report().phase);
 }
 
@@ -1571,6 +1718,113 @@ test "adaptive work tuner commits verified predicted profile" {
     try std.testing.expectEqual(candidate.worker_threads, report.current_profile.worker_threads);
     try std.testing.expectEqual(candidate.items_per_range, report.current_profile.items_per_range);
     try std.testing.expectEqual(@as(u64, 800), report.best_mean_batch_duration_ns);
+}
+
+test "adaptive work tuner ignores a cold-start spike and stays inline" {
+    // The window MINIMUM gates threading, so one slow (cold-start/contention) frame
+    // among cheap frames must not push a steady-state-cheap batch into threading.
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
+        .sample_window = 3,
+        .threaded_batch_ns = 50_000,
+    });
+    const request = tunerTestRequest(1024, 4, 16, 64);
+
+    const cheap_ns = 10_000;
+    const spike_ns = 200_000; // window mean would exceed the 50µs gate; the min does not
+    const inline_profile = tuner.selectProfile(request);
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, cheap_ns));
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, spike_ns));
+    tuner.record(tunerTestBatchWithProfile(1024, inline_profile, cheap_ns));
+
+    const report = tuner.report();
+    try std.testing.expectEqual(AdaptiveWorkPhase.settled, report.phase);
+    try std.testing.expect(!report.has_threaded_profile);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(request).worker_threads);
+}
+
+test "adaptive work tuner demotes threaded to inline when the threaded cost collapses" {
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 64,
+        .smallest_range_items = 16,
+        .largest_range_items = 256,
+        .sample_window = 1,
+        .threaded_batch_ns = 50_000,
+        .improvement_threshold_percent = 5,
+    });
+
+    // Drive to a settled threaded profile from a genuinely expensive batch: the
+    // first threaded window wins vs inline, then the worker hill-climb converges
+    // (equal-time neighbors do not improve, so it settles on the committed profile).
+    const req = tunerTestRequest(2048, 4, 16, 64);
+    const inline_profile = tuner.selectProfile(req);
+    tuner.record(tunerTestBatchWithProfile(2048, inline_profile, 200_000));
+    var settle_guard: usize = 0;
+    while (!tuner.isSettled() and settle_guard < 128) : (settle_guard += 1) {
+        const sel = tuner.selectProfile(req);
+        const dur: u64 = if (sel.worker_threads == 0) 200_000 else 80_000;
+        tuner.record(tunerTestBatchWithProfile(2048, sel, dur));
+    }
+    try std.testing.expect(tuner.isSettled());
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    const participants = tuner.report().best_profile.worker_threads + 1;
+
+    // Work collapses. The threaded batch is now so cheap that duration × participants
+    // is below the gate — an upper bound proving inline would also be below it. Only
+    // threaded batches are ever recorded (no inline probe), yet the tuner demotes to
+    // inline from that measurement alone.
+    const cheap_dur: u64 = (50_000 / participants) / 2;
+    var demoted = false;
+    var guard: usize = 0;
+    while (guard < 16) : (guard += 1) {
+        const selected = tuner.selectProfile(req);
+        if (selected.worker_threads == 0) {
+            demoted = true;
+            break;
+        }
+        tuner.record(tunerTestBatchWithProfile(2048, selected, cheap_dur));
+    }
+
+    try std.testing.expect(demoted);
+    try std.testing.expect(!tuner.report().has_threaded_profile);
+    try std.testing.expectEqual(@as(usize, 0), tuner.selectProfile(req).worker_threads);
+}
+
+test "adaptive work tuner worker hill-climb converges to a cheaper neighbor" {
+    // The sqrt guess is only a ballpark; the climb probes adjacent worker counts and
+    // keeps the fastest. Here a 2-worker profile is fastest, so from a higher sqrt
+    // start the tuner descends to it and settles there.
+    var tuner = AdaptiveWorkTuner.init(.{
+        .initial_range_items = 16,
+        .smallest_range_items = 16,
+        .largest_range_items = 4096,
+        .sample_window = 1,
+        .threaded_batch_ns = 1000,
+        .improvement_threshold_percent = 1,
+        .threaded_commit_threshold_percent = 5,
+    });
+    const request = tunerTestRequest(8192, 10, 16, 64);
+
+    const inline_profile = tuner.selectProfile(request);
+    tuner.record(tunerTestBatchWithProfile(8192, inline_profile, 1_000_000));
+
+    // Synthetic timing: fewer workers is always a bit faster (min at 1 worker), so
+    // the descend climb keeps winning until it can descend no further.
+    var guard: usize = 0;
+    while (!tuner.isSettled() and guard < 256) : (guard += 1) {
+        const selected = tuner.selectProfile(request);
+        const workers = selected.worker_threads;
+        const duration: u64 = if (workers == 0) 1_000_000 else 40_000 + @as(u64, workers) * 5_000;
+        tuner.record(tunerTestBatchWithProfile(8192, selected, duration));
+    }
+
+    try std.testing.expect(tuner.isSettled());
+    try std.testing.expect(tuner.report().has_threaded_profile);
+    // Settled below the initial sqrt guess: the climb found a cheaper worker count.
+    try std.testing.expect(tuner.report().best_profile.worker_threads >= 1);
+    try std.testing.expect(tuner.report().best_profile.worker_threads <= 2);
 }
 
 test "adaptive work tuner computes more workers for larger measured work" {

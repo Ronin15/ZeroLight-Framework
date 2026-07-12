@@ -161,6 +161,7 @@ pub const Timing = enum {
     pipeline_clamp_bounds,
     pipeline_collision,
     pipeline_collision_response,
+    pipeline_chunk_derive,
     gameplay_input,
     gameplay_audio,
     gameplay_particles,
@@ -190,6 +191,7 @@ pub const BatchStage = enum {
     steering,
     path_fallback,
     movement,
+    chunk_derive,
     collision_broadphase,
     collision_narrowphase,
     particles,
@@ -441,8 +443,9 @@ const EnabledRuntimePerfLog = struct {
         const pipeline_clamp_timing = self.timingValue(.pipeline_clamp_bounds);
         const pipeline_collision_timing = self.timingValue(.pipeline_collision);
         const pipeline_collision_response_timing = self.timingValue(.pipeline_collision_response);
+        const pipeline_chunk_derive_timing = self.timingValue(.pipeline_chunk_derive);
         log.debug(
-            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3}",
+            "perf {d:.1}s pipeline spatial_index_avg_ms={d:.3} spatial_index_max_ms={d:.3} perception_avg_ms={d:.3} perception_max_ms={d:.3} ai_memory_avg_ms={d:.3} ai_memory_max_ms={d:.3} ai_affect_avg_ms={d:.3} ai_affect_max_ms={d:.3} ai_avg_ms={d:.3} ai_max_ms={d:.3} steering_avg_ms={d:.3} steering_max_ms={d:.3} pathfinding_avg_ms={d:.3} pathfinding_max_ms={d:.3} apply_intents_avg_ms={d:.3} apply_intents_max_ms={d:.3} movement_avg_ms={d:.3} movement_max_ms={d:.3} clamp_avg_ms={d:.3} clamp_max_ms={d:.3} collision_avg_ms={d:.3} collision_max_ms={d:.3} response_avg_ms={d:.3} response_max_ms={d:.3} chunk_derive_avg_ms={d:.3} chunk_derive_max_ms={d:.3}",
             .{
                 elapsed_s,
                 millis(pipeline_spatial_index_timing.averageNs()),
@@ -469,6 +472,8 @@ const EnabledRuntimePerfLog = struct {
                 millis(pipeline_collision_timing.max_ns),
                 millis(pipeline_collision_response_timing.averageNs()),
                 millis(pipeline_collision_response_timing.max_ns),
+                millis(pipeline_chunk_derive_timing.averageNs()),
+                millis(pipeline_chunk_derive_timing.max_ns),
             },
         );
         const gameplay_input_timing = self.timingValue(.gameplay_input);

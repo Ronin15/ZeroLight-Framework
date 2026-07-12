@@ -5,7 +5,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const data = @import("../data_system.zig");
-const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
@@ -13,34 +12,11 @@ const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 
-/// Chunk grid parameters + destination columns for in-pass chunk derivation.
-/// Movement already streams each integrated body's new position, so it writes the
-/// position-derived chunk in the same pass — exact every step at any speed, with
-/// no separate O(N) recompute. The formula mirrors `WorldSystem.chunkCoordForWorldPos`;
-/// movement takes the grid as plain scalars rather than importing the world.
-pub const ChunkGridParams = struct {
-    chunk_x: data.HotI32Slice,
-    chunk_y: data.HotI32Slice,
-    tile_size: f32,
-    chunk_size_tiles: u16,
-    width: u16,
-    height: u16,
-};
-
 pub const MovementConfig = struct {
     items_per_range: ?usize = null,
     max_worker_threads: ?usize = null,
     adaptive: bool = true,
     adaptive_tuner: ?*AdaptiveWorkTuner = null,
-    /// When non-null, only these dense movement indices integrate this step (the
-    /// scope system excludes dormant entities). Null = the full contiguous SoA
-    /// range, which keeps the warm SIMD path. The indexed path is taken only when
-    /// dormant entities actually exist, so its per-row scalar cost is bounded.
-    scope_dense_indices: ?[]const u32 = null,
-    /// When set, movement derives each integrated body's chunk from its new
-    /// position into these columns. Null skips chunk maintenance (e.g. isolated
-    /// movement benchmarks/tests with no scope grid).
-    chunk_grid: ?ChunkGridParams = null,
 };
 
 pub const MovementStats = struct {
@@ -76,6 +52,18 @@ pub const MovementSystem = struct {
     }
 };
 
+/// Integrates every movement body over one contiguous SIMD range. Non-moving
+/// (dormant/kinematic) rows carry zero velocity — DataSystem zeros it on entry to a
+/// non-moving tier — so they integrate as no-ops; movement needs no scattered
+/// skip-path and the warm contiguous SIMD load stays intact. Chunk maintenance is a
+/// separate pass (SimulationScopeSystem.deriveChunks); movement only integrates
+/// position, so its benchmark exercises exactly this production path.
+///
+/// Only x/y are snapshotted for render interpolation: z is a discrete plane index,
+/// not integrated here and not interpolated by the renderer, and `previous_z ==
+/// position_z` is held by `snapZ` at every z-change (see data_system/types.zig). So
+/// movement never touches z — copying it here would be dead work that also breaks
+/// the vectorized loop with a scalar per-lane store.
 fn updateMovementBodies(
     slice: *data.MovementBodySlice,
     thread_system: *ThreadSystem,
@@ -84,30 +72,9 @@ fn updateMovementBodies(
 ) MovementStats {
     if (slice.entities.len == 0) return .{};
 
-    if (config.scope_dense_indices) |indices| {
-        // Scoped path: integrate only the selected rows. Index ranges break the
-        // contiguous SIMD load, so each row integrates scalar; still threaded so a
-        // large active subset fans out. Range alignment is irrelevant here.
-        if (indices.len == 0) return .{ .body_count = 0 };
-        var indexed = MovementIndexedJobContext{
-            .slice = slice.*,
-            .indices = indices,
-            .delta_seconds = delta_seconds,
-            .chunk_grid = config.chunk_grid,
-        };
-        const batch = thread_system.parallelForWithOptions(indices.len, &indexed, movementIndexedJob, .{
-            .items_per_range = config.items_per_range,
-            .max_worker_threads = config.max_worker_threads,
-            .adaptive = config.adaptive,
-            .adaptive_tuner = config.adaptive_tuner,
-        });
-        return .{ .body_count = indices.len, .batch = batch };
-    }
-
     var context = MovementJobContext{
         .slice = slice.*,
         .delta_seconds = delta_seconds,
-        .chunk_grid = config.chunk_grid,
     };
     const batch = thread_system.parallelForWithOptions(slice.entities.len, &context, movementJob, .{
         .items_per_range = config.items_per_range,
@@ -123,24 +90,7 @@ fn updateMovementBodies(
 }
 
 pub fn updateSerial(slice: *data.MovementBodySlice, delta_seconds: f32) void {
-    updateSerialScoped(slice, delta_seconds, null, null);
-}
-
-/// Single-threaded integration with the same scope/chunk dispatch as `update`:
-/// a non-null `scope_dense_indices` integrates only the selected rows (indexed
-/// SIMD-gather path), otherwise the full contiguous range. Lets the serial
-/// benchmark case measure the same scoped workload as the threaded cases.
-pub fn updateSerialScoped(
-    slice: *data.MovementBodySlice,
-    delta_seconds: f32,
-    scope_dense_indices: ?[]const u32,
-    chunk_grid: ?ChunkGridParams,
-) void {
-    if (scope_dense_indices) |indices| {
-        processIndexedRange(slice, indices, .{ .index = 0, .start = 0, .end = indices.len }, delta_seconds, chunk_grid);
-    } else {
-        processRange(slice, .{ .start = 0, .end = slice.entities.len }, delta_seconds, chunk_grid);
-    }
+    processRange(slice, .{ .start = 0, .end = slice.entities.len }, delta_seconds);
 }
 
 pub fn syncPreviousPositions(slice: *data.MovementBodySlice) void {
@@ -157,22 +107,10 @@ fn syncPreviousPositionsImpl(slice: *data.MovementBodySlice) void {
 
 fn movementJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *MovementJobContext = @ptrCast(@alignCast(context));
-    processRange(&job.slice, range, job.delta_seconds, job.chunk_grid);
+    processRange(&job.slice, range, job.delta_seconds);
 }
 
-/// Position → chunk for one row, written into the scope chunk columns. Mirrors
-/// `WorldSystem.chunkCoordForWorldPos` (clamp to world bounds, then cell/chunk
-/// division). Kept inline here so movement derives chunk in-pass without importing
-/// the world; the formula is stable. Worker ranges own disjoint rows, so the write
-/// is range-disjoint exactly like the position write beside it.
-inline fn writeChunkRow(grid: ChunkGridParams, index: usize, x: f32, y: f32) void {
-    const tx = math.worldPosToCell(x, grid.tile_size, grid.width);
-    const ty = math.worldPosToCell(y, grid.tile_size, grid.height);
-    grid.chunk_x[index] = @intCast(tx / grid.chunk_size_tiles);
-    grid.chunk_y[index] = @intCast(ty / grid.chunk_size_tiles);
-}
-
-fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32, chunk_grid: ?ChunkGridParams) void {
+fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seconds: f32) void {
     std.debug.assert(range.start <= range.end);
     std.debug.assert(range.end <= slice.entities.len);
 
@@ -188,19 +126,8 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
 
         simd.storeFloat4Slice(slice.previous_x[index..], position_x);
         simd.storeFloat4Slice(slice.previous_y[index..], position_y);
-        for (index..index + simd.lane_count) |z_index| {
-            slice.previous_z[z_index] = slice.position_z[z_index];
-        }
         simd.storeFloat4Slice(slice.position_x[index..], next_x);
         simd.storeFloat4Slice(slice.position_y[index..], next_y);
-        // Derive chunk from the just-computed new positions (reuse the vectors).
-        if (chunk_grid) |grid| {
-            const nx = simd.toFloatArray(next_x);
-            const ny = simd.toFloatArray(next_y);
-            inline for (0..simd.lane_count) |lane| {
-                writeChunkRow(grid, index + lane, nx[lane], ny[lane]);
-            }
-        }
     }
 
     while (index < range.end) : (index += 1) {
@@ -208,12 +135,8 @@ fn processRange(slice: *data.MovementBodySlice, range: ParallelRange, delta_seco
         const position_y = slice.position_y[index];
         slice.previous_x[index] = position_x;
         slice.previous_y[index] = position_y;
-        slice.previous_z[index] = slice.position_z[index];
-        const next_x = position_x + slice.velocity_x[index] * delta_seconds;
-        const next_y = position_y + slice.velocity_y[index] * delta_seconds;
-        slice.position_x[index] = next_x;
-        slice.position_y[index] = next_y;
-        if (chunk_grid) |grid| writeChunkRow(grid, index, next_x, next_y);
+        slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
+        slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
     }
 }
 
@@ -226,7 +149,6 @@ fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delt
         const position_y = slice.position_y[index];
         slice.previous_x[index] = position_x;
         slice.previous_y[index] = position_y;
-        slice.previous_z[index] = slice.position_z[index];
         slice.position_x[index] = position_x + slice.velocity_x[index] * delta_seconds;
         slice.position_y[index] = position_y + slice.velocity_y[index] * delta_seconds;
     }
@@ -235,76 +157,6 @@ fn processRangeScalar(slice: *data.MovementBodySlice, range: ParallelRange, delt
 const MovementJobContext = struct {
     slice: data.MovementBodySlice,
     delta_seconds: f32,
-    chunk_grid: ?ChunkGridParams,
-};
-
-fn movementIndexedJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *MovementIndexedJobContext = @ptrCast(@alignCast(context));
-    processIndexedRange(&job.slice, job.indices, range, job.delta_seconds, job.chunk_grid);
-}
-
-/// Integrates only the rows named by `indices[range.start..range.end]`. The indices
-/// are not contiguous, so this gathers four scattered rows into lanes with
-/// `simd.gatherFloat4`, integrates them as `Float4`, and scatters the results back —
-/// the SIMD-gather path the plan specifies. A scalar tail covers the remainder.
-/// The scope gather emits each dense index at most once, so the four lane indices in
-/// a block are distinct (required by `scatterFloat4`) and worker ranges are disjoint.
-fn processIndexedRange(slice: *data.MovementBodySlice, indices: []const u32, range: ParallelRange, delta_seconds: f32, chunk_grid: ?ChunkGridParams) void {
-    std.debug.assert(range.start <= range.end);
-    std.debug.assert(range.end <= indices.len);
-
-    const dt = simd.splatFloat4(delta_seconds);
-    var k = range.start;
-    while (k + simd.lane_count <= range.end) : (k += simd.lane_count) {
-        const lanes = [simd.lane_count]usize{
-            indices[k], indices[k + 1], indices[k + 2], indices[k + 3],
-        };
-        const position_x = simd.gatherFloat4(slice.position_x, lanes);
-        const position_y = simd.gatherFloat4(slice.position_y, lanes);
-        const velocity_x = simd.gatherFloat4(slice.velocity_x, lanes);
-        const velocity_y = simd.gatherFloat4(slice.velocity_y, lanes);
-        const next_x = simd.addFloat4(position_x, simd.mulFloat4(velocity_x, dt));
-        const next_y = simd.addFloat4(position_y, simd.mulFloat4(velocity_y, dt));
-
-        simd.scatterFloat4(slice.previous_x, lanes, position_x);
-        simd.scatterFloat4(slice.previous_y, lanes, position_y);
-        // Movement leaves z unchanged; previous_z follows it. No signed-int scatter
-        // helper, so the four z lanes copy scalar.
-        inline for (0..simd.lane_count) |lane| {
-            slice.previous_z[lanes[lane]] = slice.position_z[lanes[lane]];
-        }
-        simd.scatterFloat4(slice.position_x, lanes, next_x);
-        simd.scatterFloat4(slice.position_y, lanes, next_y);
-
-        if (chunk_grid) |grid| {
-            const nx = simd.toFloatArray(next_x);
-            const ny = simd.toFloatArray(next_y);
-            inline for (0..simd.lane_count) |lane| {
-                writeChunkRow(grid, lanes[lane], nx[lane], ny[lane]);
-            }
-        }
-    }
-
-    while (k < range.end) : (k += 1) {
-        const index: usize = indices[k];
-        const position_x = slice.position_x[index];
-        const position_y = slice.position_y[index];
-        slice.previous_x[index] = position_x;
-        slice.previous_y[index] = position_y;
-        slice.previous_z[index] = slice.position_z[index];
-        const next_x = position_x + slice.velocity_x[index] * delta_seconds;
-        const next_y = position_y + slice.velocity_y[index] * delta_seconds;
-        slice.position_x[index] = next_x;
-        slice.position_y[index] = next_y;
-        if (chunk_grid) |grid| writeChunkRow(grid, index, next_x, next_y);
-    }
-}
-
-const MovementIndexedJobContext = struct {
-    slice: data.MovementBodySlice,
-    indices: []const u32,
-    delta_seconds: f32,
-    chunk_grid: ?ChunkGridParams,
 };
 
 fn fillMovementData(data_system: *data.DataSystem, count: usize) !void {
@@ -517,7 +369,7 @@ test "movement range only writes assigned items" {
     try fillMovementData(&game_data, 8);
 
     var slice = game_data.movementBodySlice();
-    processRange(&slice, .{ .start = 2, .end = 6 }, 1.0, null);
+    processRange(&slice, .{ .start = 2, .end = 6 }, 1.0);
 
     for (0..slice.entities.len) |index| {
         const base: f32 = @floatFromInt(index);
@@ -533,6 +385,27 @@ test "movement range only writes assigned items" {
             try std.testing.expectEqual(base * -3, slice.position_y[index]);
         }
     }
+}
+
+test "integrate leaves the discrete z plane untouched" {
+    // z is not integrated or interpolated; previous_z == position_z is held by snapZ.
+    // Movement must not write z, so a body already on a plane keeps both z values.
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+
+    const entity = try game_data.createEntity();
+    try game_data.setMovementBody(entity, .{ .position = .{ .x = 10, .y = 20 }, .velocity = .{ .x = 5, .y = -5 } });
+    game_data.movementBodyPtr(entity).?.snapZ(3);
+
+    var slice = game_data.movementBodySlice();
+    updateSerial(&slice, 0.5);
+
+    const body = game_data.movementBodyConst(entity).?;
+    try std.testing.expectEqual(@as(i32, 3), body.position_z);
+    try std.testing.expectEqual(@as(i32, 3), body.previous_z);
+    // x/y still integrated + snapshotted as before.
+    try std.testing.expectEqual(@as(f32, 10), body.previous_position.x);
+    try std.testing.expectEqual(@as(f32, 10 + 5 * 0.5), body.position.x);
 }
 
 test "warmed movement update does not allocate" {
@@ -562,4 +435,34 @@ test "warmed movement update does not allocate" {
     });
     try std.testing.expectEqual(@as(usize, 32), stats.body_count);
     try std.testing.expect(stats.batch.ran_inline);
+}
+
+test "dormant rows carry zero velocity and stay frozen across a full-range integrate" {
+    // Movement integrates the full contiguous SoA range (no scattered skip-path).
+    // Correctness for non-moving rows relies on DataSystem zeroing their velocity on
+    // entry to a non-moving tier, so integrating them here is a no-op.
+    var game_data = data.DataSystem.init(std.testing.allocator);
+    defer game_data.deinit();
+
+    const moving = try game_data.createEntity();
+    try game_data.setMovementBody(moving, .{ .position = .{ .x = 100, .y = 200 }, .velocity = .{ .x = 40, .y = -20 } });
+    const going_dormant = try game_data.createEntity();
+    try game_data.setMovementBody(going_dormant, .{ .position = .{ .x = 300, .y = 400 }, .velocity = .{ .x = 64, .y = 64 } });
+    try game_data.setSimulationTier(going_dormant, .dormant);
+
+    // Tier entry must have zeroed the dormant row's velocity.
+    const dormant_body = game_data.movementBodyConst(going_dormant).?;
+    try std.testing.expectEqual(@as(f32, 0), dormant_body.velocity.x);
+    try std.testing.expectEqual(@as(f32, 0), dormant_body.velocity.y);
+
+    var slice = game_data.movementBodySlice();
+    updateSerial(&slice, 0.5);
+
+    // Dormant row unmoved; moving row integrated pos + vel*dt exactly.
+    const after_dormant = game_data.movementBodyConst(going_dormant).?;
+    try std.testing.expectEqual(@as(f32, 300), after_dormant.position.x);
+    try std.testing.expectEqual(@as(f32, 400), after_dormant.position.y);
+    const after_moving = game_data.movementBodyConst(moving).?;
+    try std.testing.expectEqual(@as(f32, 100 + 40 * 0.5), after_moving.position.x);
+    try std.testing.expectEqual(@as(f32, 200 - 20 * 0.5), after_moving.position.y);
 }

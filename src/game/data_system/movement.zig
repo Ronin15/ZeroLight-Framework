@@ -161,6 +161,12 @@ pub const MovementBodyStore = struct {
         s.items(.previous_z)[index] = s.items(.position_z)[index];
     }
 
+    pub fn zeroVelocity(self: *MovementBodyStore, index: usize) void {
+        const s = self.rows.slice();
+        s.items(.velocity_x)[index] = 0;
+        s.items(.velocity_y)[index] = 0;
+    }
+
     pub fn removeAt(self: *MovementBodyStore, index: usize) ?EntityId {
         const s = self.rows.slice();
         const last = self.rows.len - 1;

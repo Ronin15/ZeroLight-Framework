@@ -262,13 +262,16 @@ pub const DataSystem = struct {
         self.snapInterpolationIfStill(di, tier);
     }
 
-    /// When an entity enters a non-moving tier, movement stops updating its
-    /// previous position while its position stays frozen — render interpolation
-    /// (lerp previous→position) would otherwise oscillate. Snap previous=position
-    /// so the row renders static until it moves again.
+    /// When an entity enters a non-moving tier, snap previous=position so render
+    /// interpolation (lerp previous→position) does not oscillate, and zero its
+    /// velocity. Zeroing is what lets the movement processor integrate the full
+    /// contiguous SoA range every step: a non-moving row integrates as a no-op
+    /// instead of drifting on a stale velocity, so movement needs no scattered
+    /// skip-path. Velocity is re-established by AI intents when the row reactivates.
     fn snapInterpolationIfStill(self: *DataSystem, di: usize, tier: SimulationTier) void {
         if (tier.allowsMovement()) return;
         self.movement_bodies.snapPreviousToPosition(di);
+        self.movement_bodies.zeroVelocity(di);
     }
 
     /// Mutable dense scope columns (chunk_x/y written in-pass by the movement processor).
