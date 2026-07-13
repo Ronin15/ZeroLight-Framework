@@ -1,297 +1,214 @@
 # ZeroLight-Framework
 
-Primary project rules for **Grok Build** (also consumed by Cursor/Claude Code
-compat). ZeroLight-Framework is a 2D game framework built on **Zig 0.16** and
-**SDL3 / SDL_GPU**. It runs a thin executable timing layer over a fixed-step
-**60Hz** simulation, a state stack with policy-driven input routing, and
-atlas-backed runtime assets addressed by stable IDs. Gameplay is data-oriented:
-dense **SoA** stores for entities and world data (`DataSystem`, `WorldSystem`),
-with a state-owned `SimulationPipeline`, scoped simulation tiers, and
-multithreaded/SIMD processors for movement, AI, steering, collision,
-pathfinding, and particles.
+Grok Build project rules (primary). Also used by Cursor Agent CLI via
+`AGENTS.md`. **Do not invent architecture** — read the owning `docs/` file and
+live `src/` before editing.
 
-Shared repo contract (snapshot, docs routing, module ownership, working rules,
-build commands) mirrors `CLAUDE.md`. Keep both in sync when those sections
-change. Do not duplicate full repo documentation here — read the canonical
-`docs/` entries below for details and update them when architecture, workflow,
-or roadmap content changes.
+**Stack:** Zig **0.16**, **SDL3 / SDL_GPU**, fixed-step **60Hz** sim, state stack
+with policy-driven input, atlas assets by stable IDs, data-oriented SoA
+(`DataSystem`, `WorldSystem`), state-owned `SimulationPipeline`, threaded/SIMD
+processors (movement, AI, steering, collision, pathfinding, particles).
 
-## Grok model routing (plan/review vs code)
+---
 
-Use two models by role. This is **project policy**; Grok does not switch the
-parent session model from markdown alone — pin subagents in
-`~/.grok/config.toml` and use `/model` (or start the session on the right model)
-for the parent.
+## Grok Build — layout and routing
 
-| Role | Model | Use for |
-|------|--------|---------|
-| **Plan / design / review** | **Grok 4.5** (`grok-4.5`) | Architecture, design docs, multi-agent review, residual-diff review, synthesis, adversarial checking of findings, roadmap/slice planning |
-| **Implement / debug / code** | **Composer 2.5** (`grok-composer-2.5-fast`) | Writing/editing Zig, fixing compile/test failures, mechanical refactors, applying an already-approved plan |
+Native project assets (edit these first):
 
-### How agents should behave
+| Path | Role |
+|------|------|
+| `.grok/agents/zig-*.md` | Subagent types for `spawn_subagent` |
+| `.grok/skills/zig-workflows/` | Inline vs delegate; design/implement/debug/review |
+| `.grok/skills/pathfinder-review/` | Multi-agent pathfinder module review |
+| `.grok/skills/architecture-assessment/` | Emergent-gameplay readiness assessment |
+| `.grok/skills/zig-best-practices-review/` | Hot-subsystem best practices + durable guidance |
+| `.grok/skills/zig-deep-correctness-review/` | Concurrency / determinism / test-gap deep pass |
+| `.grok/skills/zig-workflows/references/module-presets.md` | Review unit file tables |
+| `.grok/config.toml` | Project MCP / permissions only (**not** model defaults) |
 
-- **Parent session on Grok 4.5:** prefer planning, review, and orchestration; when implementation is needed, **delegate coding to** `zig-specialist` / `zig-debug-specialist` (Composer-pinned) rather than bulk-editing the tree yourself unless the change is tiny (1–2 files, no design risk).
-- **Parent session on Composer 2.5:** implement and debug against an agreed plan; for non-trivial design or a full review pass, say so and prefer Grok 4.5 (or spawn `zig-design-specialist` / `zig-review-specialist`).
-- **Never** treat model choice as a reason to skip `docs/` ownership, coding standards, or `zig build verify`.
+Cursor mirrors (secondary): `.cursor/agents/`, `.cursor/skills/`, `.cursor/rules/`.
+Claude Code is **archived** — ignore `.claude/` unless the user says otherwise.
+`Claude.md` is a stub so it is not a second contract.
 
-### Enforce subagent models (user config)
+### Subagents (`spawn_subagent`)
 
-Project `.grok/config.toml` cannot set models (Grok loads model settings only from
-`~/.grok/config.toml`). Recommended pin:
+| Type | Mode | Use |
+|------|------|-----|
+| `zig-design-specialist` | read-only / plan | Non-trivial design, pipeline/ECS contracts |
+| `zig-specialist` | full | Implement in owning modules |
+| `zig-debug-specialist` | full | Build, test, shader, SDL/GPU, runtime failures |
+| `zig-review-specialist` | read-only / plan | PR/diff/module review (no edits unless asked) |
+
+**Rules:**
+
+- Only the **parent** may spawn (depth 1). Multi-phase skills are parent-orchestrated.
+- Work **inline** for 1–2 file local fixes with no architecture/pipeline change.
+- **Delegate** for non-trivial features, named specialists, failures, PR review,
+  hot-path/threading/pipeline work, or multi-phase skills.
+- Prefer `background: true` for parallel units; collect with
+  `get_command_or_subagent_output`.
+- Design/review: `capability_mode: "read-only"` (agents also set `permission_mode: plan`).
+- Do not restate full guardrails in child prompts — agents load `agents_md`.
+- Multi-phase: run the matching skill (`/pathfinder-review`, etc.), not an ad-hoc
+  partial review, unless the user narrows scope.
+
+| Ask / signal | Action |
+|--------------|--------|
+| Design before coding | `zig-design-specialist` |
+| Implement slice / feature | Design if contracts unclear → `zig-specialist` |
+| Build/test/GPU failure | `zig-debug-specialist` |
+| Review branch / PR / diff | `zig-review-specialist` |
+| Pathfinder module review | `/pathfinder-review` |
+| Emergent gameplay readiness | `/architecture-assessment` |
+| Best-practices / durable lint | `/zig-best-practices-review` |
+| Deep races/determinism/tests | `/zig-deep-correctness-review` |
+
+### Model routing (policy only)
+
+Grok does **not** switch the parent model from this file. Pin subagents in
+**user** `~/.grok/config.toml` (`[subagents.models]`). Project `.grok/config.toml`
+cannot set models.
+
+| Role | Model | Subagents |
+|------|--------|-----------|
+| Plan / design / review | `grok-4.5` | `plan`, `explore`, `zig-design-specialist`, `zig-review-specialist` |
+| Implement / debug | `grok-composer-2.5-fast` | `general-purpose`, `zig-specialist`, `zig-debug-specialist` |
+
+Recommended pins:
 
 ```toml
 # ~/.grok/config.toml
 [subagents.models]
-# Plan / review (Grok 4.5)
 plan = "grok-4.5"
 explore = "grok-4.5"
 zig-design-specialist = "grok-4.5"
 zig-review-specialist = "grok-4.5"
-# Code / debug (Composer 2.5)
 general-purpose = "grok-composer-2.5-fast"
 zig-specialist = "grok-composer-2.5-fast"
 zig-debug-specialist = "grok-composer-2.5-fast"
 ```
 
-Parent default is still your choice, e.g. `default = "grok-4.5"` for
-review-heavy sessions or `default = "grok-composer-2.5-fast"` for implement-heavy
-days. Switch anytime with `/model grok-4.5` or `/model grok-composer-2.5-fast`.
-Confirm with `grok models` and `grok inspect`.
+- Parent on **Grok 4.5:** orchestrate, design, review; delegate coding to
+  `zig-specialist` / `zig-debug-specialist` unless the change is tiny.
+- Parent on **Composer:** implement/debug; spawn design/review specialists for
+  non-trivial design or full review passes.
+- Model choice never skips `docs/`, coding standards, or `zig build verify`.
+- Confirm with `grok models` and `grok inspect`.
 
-## Source Of Truth (`docs/`)
+---
 
-Read the doc that owns the area before editing — these are canonical, not notes.
+## Source of truth (`docs/`)
 
-- `docs/architecture.md` — source layout, ownership boundaries, frame flow.
-- `docs/coding-standards.md` — Zig style, performance, comments, tests.
-- `docs/development-workflow.md` — build options, commands, shaders, packaging.
-- `docs/setup.md` — toolchain and SDL3 dependency setup per platform.
-- `docs/state-stack-and-input.md` — state contracts, transitions, input routing.
-- `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
-- `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
-- `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
-  priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
-  18–25E, 26–31, 34, 36) are in
-  `docs/framework-implementation-slices-archive.md`.
-- `docs/changelogs/` — per-branch feature changelog summaries (latest:
-  `docs/changelogs/world.md`).
-- `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
+Read the owning doc before editing. Do not invent architecture from memory.
 
-## Module Ownership (`src/`)
+| Doc | Owns |
+|-----|------|
+| `docs/architecture.md` | Source layout, ownership, frame flow |
+| `docs/coding-standards.md` | Zig style, performance, comments, tests |
+| `docs/development-workflow.md` | Build options, shaders, packaging, ReleaseFast gate |
+| `docs/setup.md` | Toolchain and SDL3 per platform |
+| `docs/state-stack-and-input.md` | States, transitions, input routing |
+| `docs/rendering-assets-shaders.md` | SDL_GPU rendering, resources, shaders |
+| `docs/simulation-tiers-and-pipeline.md` | Fixed-step simulation contracts |
+| `docs/atlas-asset-workflow.md` | Atlas packing, JSON sidecars, art swaps |
+| `docs/framework-implementation-slices.md` | Live roadmap / open slices |
+| `docs/framework-implementation-slices-archive.md` | Settled slices (0–8, 9–17, 18–25E, 26–31, 34, 36) |
+| `docs/changelogs/` | Per-branch feature summaries |
+| `docs/reviews/` | Module deep-dives (pathfinder, GPU, …) |
 
-Add new code under the module that owns the concern. Do not move ownership
-boundaries just to make a local change easier.
+---
 
-- `src/main.zig` — thin entry/timing: builds `AppConfig`, inits `Engine`, runs
-  the fixed-step loop. Keep it thin.
-- `src/config.zig` — shared `AppConfig`, presentation options, clear color, and
-  thread-system defaults consumed by build options and runtime startup.
-- `src/app/` — app coordination: `engine.zig`, `state.zig` (state stack),
-  `input.zig` + `input_router.zig`, `time_loop.zig` (60Hz), `frame_pacer.zig`,
-  `pause_controller.zig`, `audio.zig`, `thread_system.zig`, `resolution.zig`,
-  `runtime_perf_log.zig`.
-- `src/render/` — SDL_GPU rendering: `renderer.zig` is the game-facing facade;
-  also `camera.zig`, `resources.zig`, `sprite_batch.zig`, `text.zig`, debug
-  overlay. Do **not** import `src/render/gpu/*` outside the render/platform
-  boundary.
-- `src/assets/` — runtime asset catalog, safe path resolution, image decode,
-  cache, `manifest.zig` (stable sprite/audio IDs), atlas metadata.
-- `src/game/` — gameplay: states/menus, `world_system.zig`, the `data_system/`
-  subpackage fronted by `data_system.zig`, `simulation*.zig` (pipeline, scope),
-  `player.zig`, pipeline-owned controllers
-  `dig_controller.zig`/`audio_controller.zig`, `render_prep.zig`/`render_depth.zig`,
-  and `systems/` (movement, ai, steering, collision, collision_response, particle,
-  perception, and the `pathfinding/` subpackage fronted by `pathfinding.zig`).
-  The `PathfindingSystem` owns nav-invalidation classification and the
-  post-commit nav reaction; the state only invokes it via the pipeline.
-- `src/core/` — shared math, SIMD, logging. `src/platform/` — SDL imports and
-  GPU smoke probe. `src/benchmarks/` — CPU gameplay, pathfinding, nav-update,
-  scope, perception, and render-prep benchmarks.
+## Module ownership (`src/`)
 
-## Working Rules
+Add code under the module that owns the concern. Do not move ownership to make a
+local change easier.
 
-- Read the live owning files before editing. Do not rely on stale roadmap memory
-  or prior chat summaries for exact implementation details.
-- Follow `docs/coding-standards.md`: `zig fmt`, camelCase functions, snake_case
-  variables/fields, PascalCase types, direct declaration imports, explicit error
-  sets.
-- Treat performance as correctness on hot/frame-adjacent paths. Hot paths must
-  be **allocation-free after init/reserve/warmup**, and every such claim needs
-  a `std.testing.FailingAllocator` proof test, not just a comment — this
-  project ships **ReleaseFast**, which strips the assert backing
-  `assumeCapacity`, so an unproven reserve is a silent-corruption risk, not a
-  missed optimization. Avoid per-frame string lookups, hash-map dispatch,
-  broad dynamic dispatch, formatted logging, and resource churn unless the
-  cost is measured, bounded, and isolated.
-- **Per-query/per-frame work budgets (search node caps, solve ceilings, and
-  similar) must be fixed constants — never derived from or scaled to world
-  size, map size, cell count, portal count, or any other measured "current
-  scale."** Worlds vary in size; a budget that scales with it means
-  correctness/performance silently depends on which map happens to be loaded.
-  This is a load-bearing, explicitly tested invariant in several modules (grep
-  for `independent of` and `regardless of world size` before touching a
-  budget/capacity constant — e.g. `src/game/systems/pathfinding/`'s abstract
-  A* node budget and `nav_graph.zig`'s incremental-dig chunk-patch tests). When
-  a fixed budget is chronically insufficient for a hard case, the fix is
-  graceful degradation (deterministic deferral / a bounded retry ladder that
-  gives up cleanly) or an algorithmic change that keeps the SAME fixed budget
-  sufficient — never a bigger number picked because one particular map needed
-  it.
-- Threaded writes into a shared buffer must be partitioned (disjoint
-  per-worker/per-range slots) and reserved before dispatch, never after or
-  during. Allocators are explicit fields set at `init`, never a global reached
-  for mid-function. See `docs/coding-standards.md` for the full
-  allocator-discipline rules.
-- Keep runtime asset paths relative and traversal-safe. Persist gameplay data by
-  stable asset IDs (e.g. `SpriteAssetId`, `AudioAssetId`), not string paths,
-  live renderer/SDL handles, or prepared draw records.
-- Production contracts expose runtime concepts only. Do **not** add test-only
-  enum tags, union payloads, marker fields, fake stages, or fixture hooks to
-  production APIs. Tests use private helpers, local fixtures, mocks, or real
-  payloads.
-- Treat implementation slices as full features: runtime behavior, docs, tests,
-  and acceptance checks all integrated before marking complete.
-- Never edit generated output: `zig-out/` and `.zig-cache/`.
-- **Tests only: keep `WorldSystem`/`DataSystem` test fixtures at the smallest
-  size that still exercises the behavior under test** — do not build out a
-  full/large game world per test. `chunksX`/`chunksY` is `ceilDiv(width,
-  chunk_size_tiles)`, so a `1x1` (or otherwise minimal) `WorldSystem` still
-  yields exactly one real chunk, enough for chunk-gate/visibility tests
-  without a bigger tile grid. Reserve a larger populated world for the one
-  test that specifically needs structural growth/capacity behavior at scale
-  (e.g. a `FailingAllocator` reserve-proof test). Fast, small fixtures keep
-  `zig build test` fast as the suite grows.
+| Path | Owns |
+|------|------|
+| `src/main.zig` | Thin entry/timing: `AppConfig`, `Engine`, fixed-step loop |
+| `src/config.zig` | `AppConfig`, presentation, clear color, thread defaults |
+| `src/app/` | Engine, state stack, input + router, 60Hz time loop, frame pacer, pause, audio, thread system, resolution, perf log |
+| `src/render/` | SDL_GPU facade (`renderer.zig`), camera, resources, sprite batch, text, debug. **Do not** import `src/render/gpu/*` outside render/platform |
+| `src/assets/` | Catalog, safe paths, decode, cache, `manifest.zig` IDs, atlas metadata |
+| `src/game/` | Gameplay states, `world_system`, `data_system/`, simulation pipeline/scope, player, dig/audio controllers, render_prep/depth, `systems/` (movement, ai, steering, collision, particles, perception, pathfinding). Pathfinding owns nav invalidation + post-commit nav reaction; state only invokes via pipeline |
+| `src/core/` | Math, SIMD, logging |
+| `src/platform/` | SDL imports, GPU smoke probe |
+| `src/benchmarks/` | CPU gameplay, pathfinding, nav-update, scope, perception, render-prep benches |
 
-## Build & Validation Commands
+---
 
-Run `zig build verify` before considering a slice or broad change complete.
+## Working rules
+
+- Read live owning files before editing. No stale roadmap/chat memory for details.
+- Style: `docs/coding-standards.md` — `zig fmt`, camelCase functions, snake_case
+  vars/fields, PascalCase types, direct declaration imports, explicit error sets.
+- **Hot paths = allocation-free after init/reserve/warmup**, proven with
+  `std.testing.FailingAllocator` (not comments). Ships **ReleaseFast** (strips
+  `assumeCapacity` asserts). Avoid per-frame string lookups, hash-map dispatch,
+  broad dynamic dispatch, formatted logging, resource churn unless measured and
+  bounded.
+- **Work budgets are fixed constants** — never scaled to world/map/cell/portal
+  size. Grep `independent of` / `regardless of world size` before changing
+  budgets. If a budget is chronically tight: graceful degradation or algorithm
+  change under the **same** fixed budget — not a larger constant for one map.
+- Threaded shared-buffer writes: disjoint per-worker ranges, reserve **before**
+  dispatch. Allocators are init-time fields, never mid-function globals.
+- Runtime asset paths: relative, traversal-safe. Persist stable IDs
+  (`SpriteAssetId`, `AudioAssetId`), not paths or live GPU/SDL handles.
+- Production APIs: runtime concepts only — no test-only tags, marker fields, or
+  fixture hooks. Tests use private helpers, local fixtures, mocks, or real payloads.
+- Slices ship complete: behavior + docs + tests + acceptance.
+- Never edit `zig-out/` or `.zig-cache/`.
+- **Tests:** smallest `WorldSystem`/`DataSystem` fixtures that still prove the
+  behavior (`1x1` world ⇒ one chunk). Large worlds only for structural
+  growth / reserve-proof tests.
+
+---
+
+## Build and validation
+
+Gate: `zig build verify` before a slice or broad change is done.
 
 ```sh
-zig build            # build and install app, runtime assets, and shaders
-zig build run        # build, install, and run the app
-zig build dev        # shaders + assets + run (edit/run loop)
-zig build check      # compile coverage (game, gpu-smoke, bench) — no install
-zig build test       # run Zig unit tests
-zig build bench      # CPU gameplay and render-prep benchmarks
-zig build verify     # full gate: check + test + shaders + atlas + idiom lint
-zig build fmt        # format build.zig, build.zig.zon, and src/
-zig build shaders    # compile GLSL sources to platform GPU shaders
-zig build gpu-smoke  # display-gated renderer pipeline smoke (needs a display)
-zig build package    # install selected-mode binaries and runtime assets
-zig build assets-lint # lint runtime atlases and source sprite consistency
-zig build idiom-lint # lint Zig naming, stdlib currency, unsafe catch unreachable
-zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cache
+zig build            # app + assets + shaders
+zig build run        # build, install, run
+zig build dev        # shaders + assets + run
+zig build check      # compile coverage (no install)
+zig build test       # unit tests (correctness only)
+zig build bench      # perf / OOM benches only
+zig build verify     # check + test + shaders + atlas + idiom-lint
+zig build fmt        # format build.zig*, src/
+zig build shaders    # GLSL → platform shaders
+zig build gpu-smoke  # display-gated GPU smoke
+zig build package    # release-mode install
+zig build assets-lint
+zig build idiom-lint
+zig build fetch-sdl  # Windows SDL package cache
 ```
 
-Default optimize mode is `Debug`. Use `--release=safe|fast|small` only for
-release candidates. **Packaged builds ship `ReleaseFast`** — see
-`docs/development-workflow.md` for the required pre-release ReleaseSafe
-soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
+Default optimize: `Debug`. Use `--release=safe|fast|small` for release candidates
+only. Packaged builds ship **ReleaseFast** — ReleaseSafe soak first (see
+`docs/development-workflow.md`). Minimum toolchain: **Zig 0.16.0**.
 
-## Grok Build Setup
+### Agent working practices
 
-Grok loads this file as project rules (`AGENTS.md` / `Agents.md`). With Cursor
-compat on (default), it also uses `.cursor/agents/` and
-`.cursor/skills/zig-workflows/`. Claude compat can load `.claude/` mirrors.
+- After edits: `zig build fmt`. Before finish: `zig build verify` (or targeted
+  green first when debugging).
+- Iterate with `zig build check`; use `zig build gpu-smoke` only for display/GPU.
+- Search the owning module before adding utilities.
+- Scope to the requested change — no drive-by refactors/reformats.
+- Benches: always `zig build bench -- --group <name>` (optional `--case` /
+  `--items`). Never run full bench suite and filter.
+- **`test` ≠ `bench`:** no hand-rolled timing in tests (not even
+  `-Doptimize=ReleaseFast`). No test code may call `src/benchmarks/*.zig`
+  (except `suite.zig` pure utility tests). Correctness → small fixtures in the
+  owning module; perf → add/extend a bench case.
 
-| Layer | Path | Role |
-|-------|------|------|
-| Global contract | `AGENTS.md` (this file) | Guardrails, docs routing, model routing, build commands |
-| Shared twin | `CLAUDE.md` | Claude Code contract; keep shared sections in sync |
-| Workflows | `.cursor/skills/zig-workflows/SKILL.md` | When to design / implement / debug / review |
-| Subagents | `.cursor/agents/zig-*.md` | Specialist prompts (mirrored under `.claude/agents/`) |
-| File rules | `.cursor/rules/*.mdc` | Auto-attach context for `src/game/**`, `src/render/**` |
-| Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables |
-| Project Grok cfg | `.grok/config.toml` | MCP / permissions only — **not** model defaults |
+---
 
-### What Grok needs from this file (checklist)
+## Cursor Agent CLI (secondary)
 
-- [x] Project snapshot + Zig 0.16 / SDL3 stack
-- [x] Canonical `docs/` map (do not invent architecture)
-- [x] Module ownership (`src/` boundaries)
-- [x] Working rules (hot path, budgets, allocators, fixtures)
-- [x] Build & verify commands
-- [x] Specialist workflow table + when to delegate
-- [x] Model routing (Grok 4.5 plan/review vs Composer 2.5 code)
-- [x] Bench vs test separation
-- [ ] Hard subagent model pins live in **user** `~/.grok/config.toml` (see above)
-
-Workflows in `zig-workflows` auto-invoke when tasks match. You can also ask
-directly ("use zig-review-specialist", "review my branch", "fix this test
-failure").
-
-| Workflow | Subagent | Preferred model | When |
-|----------|----------|-----------------|------|
-| Design | `zig-design-specialist` | Grok 4.5 | Before non-trivial gameplay/ECS/pipeline work |
-| Implement | `zig-specialist` | Composer 2.5 | Zig implementation in owning modules |
-| Debug | `zig-debug-specialist` | Composer 2.5 | Build/test/shader/SDL/GPU/runtime failures |
-| Review | `zig-review-specialist` | Grok 4.5 | PR/diff / residual-diff review |
-| Architecture assessment | `zig-design-specialist` | Grok 4.5 | Emergent-gameplay readiness report |
-| Module review | `zig-review-specialist` × N | Grok 4.5 | Module-wide pass (pathfinder preset) |
-| Best-practices review | `zig-review-specialist` × N | Grok 4.5 | Hot-subsystem Zig best-practice pass |
-| Deep-correctness review | `zig-review-specialist` × N | Grok 4.5 | Concurrency, algorithms, determinism, test gaps |
-
-## Claude Code Setup (`.claude/`)
-
-| Layer | Path | Role |
-|-------|------|------|
-| Global contract | `CLAUDE.md` | Shared guardrails (mirrors this file's core sections) |
-| Subagents | `.claude/agents/zig-*.md` | Specialist prompts (source of truth; mirrored in `.cursor/agents/`) |
-| Workflows | `.claude/workflows/*.js` | Orchestrated multi-phase review/assessment passes |
-
-| Workflow script | Agent | When |
-|-----------------|-------|------|
-| `pathfinder-review.js` | `zig-review-specialist` × N | Pathfinder module coherency/cohesion/standards pass |
-| `architecture-assessment.js` | general + synthesis | Emergent-gameplay architecture readiness report |
-| `zig-best-practices-review.js` | `zig-review-specialist` × N | Hot-subsystem Zig best-practice pass with verify/synthesize |
-| `zig-deep-correctness-review-pass.js` | `zig-review-specialist` × N | Concurrency, algorithms, determinism, test-gap deep pass |
-
-## Cursor Setup (`.cursor/`)
-
-| Layer | Path | Role |
-|-------|------|------|
-| Global contract | `AGENTS.md` | Repo guardrails, docs routing, build commands |
-| Workflows | `.cursor/skills/zig-workflows/SKILL.md` | When to delegate; inline vs subagent |
-| Subagents | `.cursor/agents/zig-*.md` | Specialist behavior (mirrors `.claude/agents/`) |
-| File rules | `.cursor/rules/*.mdc` | Auto-attach for `src/game/**` and `src/render/**` |
-| Module presets | `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables |
-
-Claude Code also ships `.claude/workflows/*.js` for orchestrated multi-phase
-passes; Grok/Cursor approximate those via Task subagents + presets in
-`module-presets.md`.
-
-## Agent Working Practices
-
-- Run `zig build fmt` after edits and `zig build verify` before finishing.
-- Prefer `zig build check` for fast compile feedback while iterating; reserve
-  `zig build gpu-smoke` for actual display/GPU validation.
-- Reuse existing utilities and patterns before adding new code — search the
-  owning module first.
-- Keep changes scoped to the requested slice. Do not reformat or refactor
-  unrelated code.
-- Always run a targeted benchmark with `zig build bench -- --group <name>`
-  (optionally `--case`/`--items`) unless explicitly told to run the full suite.
-  Do not run the whole `zig build bench` and filter its output.
-- **`zig build bench` is for perf and OOM/leak-sweep checks; `zig build test`
-  is for fast contract/correctness checks only.** Never measure or report
-  performance/timing by hand-rolling a timer inside a `zig build test` test —
-  not even temporarily, not even with `-Doptimize=ReleaseFast`. All
-  performance numbers must come from `zig build bench`, which already
-  provides warmup, repeated iterations, and adaptive-settle statistics
-  (`src/benchmarks/suite.zig`) that a one-off timed test block does not.
-  **Test code must never call into `src/benchmarks/*.zig` functions at all**
-  — not just to avoid hand-timing: a benchmark file's fixture builders
-  (`createFixture`, `initFixture`, etc.) and case runners build large
-  synthetic fixtures meant for throughput measurement, not fast correctness
-  checks, and calling them from `zig build test` makes the whole suite slow
-  even without any timing code in the test itself. The one exception is
-  `suite.zig`'s own tests, which cover only its pure utility logic (arg
-  parsing, formatting, alignment math) against hand-built stubs, never a real
-  fixture. If a correctness property belongs in production code, test it in
-  the owning production module with a small hand-built fixture; if it's
-  benchmark-fixture-specific (e.g. does this fixture shape still assert
-  correctly), rely on the module's own internal `std.debug.assert` firing
-  during an actual `zig build bench` run instead of wrapping it in a test. If
-  a perf question needs answering and no benchmark case covers it yet, add or
-  extend one under `src/benchmarks/` and run it via `zig build bench`.
+Cursor uses this file plus `.cursor/agents/`, `.cursor/skills/`, and
+`.cursor/rules/`. Multi-phase playbooks live under `.grok/skills/` — follow those
+steps; map Grok `spawn_subagent` to Cursor Task/subagents when needed.
+Keep agent prompt bodies in sync with `.grok/agents/` when specialists change.
