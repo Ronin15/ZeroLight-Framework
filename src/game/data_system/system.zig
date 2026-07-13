@@ -34,6 +34,7 @@ const AssetReference = types.AssetReference;
 const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
 const RenderEntityComponentIndices = types.RenderEntityComponentIndices;
 const RenderCollectIndices = types.RenderCollectIndices;
+const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
 const CollisionBounds = types.CollisionBounds;
 const ConstCollisionBoundsSlice = types.ConstCollisionBoundsSlice;
 const CollisionResponseMode = types.CollisionResponseMode;
@@ -543,6 +544,18 @@ pub const DataSystem = struct {
         const slot = self.resolveSlotConst(id) orelse return null;
         const dense_index = slot.primitive_visual_index orelse return null;
         return @intCast(dense_index);
+    }
+
+    /// One slot resolve → dense movement + visual row indices for SoA clamp/gate.
+    /// Null if the entity is missing either component (or is not alive).
+    pub fn movementVisualDenseIndices(self: *const DataSystem, id: EntityId) ?MovementVisualDenseIndices {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const movement = slot.movement_body_index orelse return null;
+        const visual = slot.primitive_visual_index orelse return null;
+        return .{
+            .movement = @intCast(movement),
+            .visual = @intCast(visual),
+        };
     }
 
     pub fn setAssetReference(self: *DataSystem, id: EntityId, asset_ref: AssetReference) !void {
@@ -1445,6 +1458,27 @@ test "render entity component indices resolve movement asset and facing slots" {
     try std.testing.expectEqual(with_facing.movement_body, full.movement_body);
 
     try std.testing.expect(data.renderEntityComponentIndices(EntityId.invalid) == null);
+}
+
+test "movementVisualDenseIndices resolves both rows from one slot lookup" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+    try std.testing.expect(data.movementVisualDenseIndices(entity) == null);
+
+    try data.setPrimitiveVisual(entity, .{
+        .size = .{ .x = 16, .y = 16 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 0, .g = 0, .b = 0, .a = 0 },
+    });
+    const indices = data.movementVisualDenseIndices(entity).?;
+    try std.testing.expectEqual(@as(usize, 0), indices.movement);
+    try std.testing.expectEqual(@as(usize, 0), indices.visual);
+    try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
+    try std.testing.expectEqual(data.primitiveVisualDenseIndex(entity).?, indices.visual);
+    try std.testing.expect(data.movementVisualDenseIndices(EntityId.invalid) == null);
 }
 
 test "render collect indices resolve drawable rows from movement dense index" {

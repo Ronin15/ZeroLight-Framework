@@ -148,16 +148,25 @@ zig build -Dgpu-debug=false
 zig build -Dgpu-debug=true
 ```
 
-Runtime diagnostics use Zig `std.log` filtering. The default `auto` level keeps
-Debug builds at `debug` and release builds at `warn`, which still includes
-errors. Debug logs can include detailed startup and fallback context, but
-warning and error logs should stay rare and actionable. Override the level when
-you need a different signal:
+Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
+
+- **Debug** and **ReleaseSafe** → `debug` (full diagnostics + 60s runtime perf
+  dumps from `runtime_perf_log`)
+- **ReleaseFast** / **ReleaseSmall** → `warn` (ship/package; runtime perf is
+  fully compiled out)
+
+Debug logs can include detailed startup and fallback context, but warning and
+error logs should stay rare and actionable. Override the level when you need a
+different signal:
 
 ```sh
 zig build -Dlog-level=warn
 zig build -Dlog-level=debug
-zig build --release=safe -Dlog-level=err
+# Optimized soak with 60s perf dumps (prefer -Doptimize= for this project):
+zig build run -Doptimize=ReleaseSafe
+zig build dev -Doptimize=ReleaseSafe
+# Quiet Safe build (perf counters still compile in; dumps need debug-level logs):
+zig build run -Doptimize=ReleaseSafe -Dlog-level=err
 ```
 
 ## Atlas Packing

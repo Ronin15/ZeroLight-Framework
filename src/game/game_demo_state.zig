@@ -78,7 +78,9 @@ const demo_test_viewport_height: f32 = 256;
 // running demo and fast tests don't have to share one global constant.
 const default_demo_mover_count: usize = 32;
 // Only initProceduralWithRuntimeAssets (the real game, not tests) passes this.
-const procedural_demo_mover_count: usize = 200;
+// Max battle-scale target for runtime perf / capacity tuning; tests stay on
+// `default_demo_mover_count` so the suite does not pay battle-scale spawn cost.
+const battle_scale_demo_mover_count: usize = 2048;
 const obstacle_count = 4;
 
 /// Every mover-count-dependent capacity this demo needs, derived from a single runtime
@@ -346,7 +348,7 @@ pub const GameDemoState = struct {
             thread_system.participantSlotCount(),
             proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
             thread_system,
-            procedural_demo_mover_count,
+            battle_scale_demo_mover_count,
             asset_store,
         );
         errdefer state.deinit();

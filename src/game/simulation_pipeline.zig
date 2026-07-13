@@ -16,6 +16,7 @@ const DataSystem = @import("data_system.zig").DataSystem;
 const EntityId = @import("data_system.zig").EntityId;
 const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
+const MovementBodySlice = @import("data_system.zig").MovementBodySlice;
 const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
@@ -955,13 +956,39 @@ fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void
     }
 }
 
-/// Stops one body from moving into solid world tiles on `level`. No-op on level 0
-/// (the surface is fully walkable and pre-existing decos/water are intentionally
-/// pass-through there). Resolves X then Y independently against the pre-move
-/// position so a diagonal push into a wall slides along it. The body is one tile
-/// wide; sampling the four AABB corners (with an epsilon so a flush right/bottom
-/// edge stays in the covered cell) is exact for the sub-tile motion this produces.
-/// Allocation-free, single entity, scalar. Shared by the player and NPC gates.
+/// Stops one dense movement row from moving into solid world tiles on `level`.
+/// No-op on level 0 (the surface is fully walkable and pre-existing decos/water
+/// are intentionally pass-through there). Resolves X then Y independently against
+/// the pre-move position so a diagonal push into a wall slides along it. The body
+/// is one tile wide; sampling the four AABB corners (with an epsilon so a flush
+/// right/bottom edge stays in the covered cell) is exact for the sub-tile motion
+/// this produces. Allocation-free, scalar. Shared by the player and NPC gates.
+fn gateBodyColumnsToWalkableTiles(
+    world: *const WorldSystem,
+    level: u16,
+    movement: *MovementBodySlice,
+    movement_index: usize,
+    size_x: f32,
+    size_y: f32,
+) void {
+    if (level == 0) return;
+    const pre_x = movement.previous_x[movement_index];
+    const pre_y = movement.previous_y[movement_index];
+    const post_x = movement.position_x[movement_index];
+    const post_y = movement.position_y[movement_index];
+
+    var resolved_x = post_x;
+    if (rectOverlapsSolidTile(world, level, post_x, pre_y, size_x, size_y)) resolved_x = pre_x;
+    var resolved_y = post_y;
+    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, size_x, size_y)) resolved_y = pre_y;
+
+    if (resolved_x != post_x) movement.velocity_x[movement_index] = 0;
+    if (resolved_y != post_y) movement.velocity_y[movement_index] = 0;
+    movement.position_x[movement_index] = resolved_x;
+    movement.position_y[movement_index] = resolved_y;
+}
+
+/// Pointer wrapper for the single-entity player gate (same math as the dense path).
 fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: MovementBodyPtr, visual: PrimitiveVisual) void {
     if (level == 0) return;
     const w = visual.size.x;
@@ -985,16 +1012,24 @@ fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: Movement
 fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
     const ai_slice = data.aiAgentSliceConst();
     const scope_columns = data.scopeColumnsSliceConst();
+    const visuals = data.primitiveVisualSliceConst();
+    var movement = data.movementBodySlice();
+    // One slot resolve per AI → dense columns. Tier/level come from the movement
+    // scope row (kept in sync with world_level), not extra entity lookups.
     for (ai_slice.entities) |entity| {
+        const indices = data.movementVisualDenseIndices(entity) orelse continue;
+        const mi = indices.movement;
         // Dormant NPCs never move this step (movement itself skips writing their
         // position), so gating them against world tiles is dead work — skip.
-        if (data.movementBodyDenseIndex(entity)) |dense_index| {
-            if (!scope_columns.tier[dense_index].allowsMovement()) continue;
-        }
-        const level = data.worldLevelConst(entity) orelse 0;
-        const body = data.movementBodyPtr(entity) orelse continue;
-        const visual = data.primitiveVisualConst(entity) orelse continue;
-        gateBodyToWalkableTiles(world, level, body, visual);
+        if (!scope_columns.tier[mi].allowsMovement()) continue;
+        gateBodyColumnsToWalkableTiles(
+            world,
+            scope_columns.level[mi],
+            &movement,
+            mi,
+            visuals.size_x[indices.visual],
+            visuals.size_y[indices.visual],
+        );
     }
 }
 
@@ -1110,22 +1145,29 @@ fn rectOverlapsSolidTile(world: *const WorldSystem, level: u16, x: f32, y: f32, 
 
 fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: f32) void {
     const ai_slice = data.aiAgentSliceConst();
-    // Read only the size columns from the dense visual store rather than
-    // rebuilding the whole PrimitiveVisual struct per AI entity each step.
+    const scope_columns = data.scopeColumnsSliceConst();
+    // Size columns only — no PrimitiveVisual struct rebuild per entity.
     const visuals = data.primitiveVisualSliceConst();
+    var movement = data.movementBodySlice();
+    // One slot resolve per AI → dense movement/visual indices, then pure SoA
+    // column writes. Matches the tile-gate path so bounds + gate share the same
+    // index resolve shape (not dual movementBodyPtr + visual index lookups).
     for (ai_slice.entities) |entity| {
-        const body = data.movementBodyPtr(entity) orelse continue;
-        const visual_index = data.primitiveVisualDenseIndex(entity) orelse continue;
+        const indices = data.movementVisualDenseIndices(entity) orelse continue;
+        const mi = indices.movement;
+        // Dormant rows did not integrate this step; re-clamping settled poses is
+        // dead work (same skip policy as gateNpcEntitiesToWalkableTiles).
+        if (!scope_columns.tier[mi].allowsMovement()) continue;
 
-        const max_x = bounds_width - visuals.size_x[visual_index];
-        const new_x = math.clamp(body.position_x.*, 0, max_x);
-        if (new_x != body.position_x.*) body.velocity_x.* = 0;
-        body.position_x.* = new_x;
+        const max_x = bounds_width - visuals.size_x[indices.visual];
+        const new_x = math.clamp(movement.position_x[mi], 0, max_x);
+        if (new_x != movement.position_x[mi]) movement.velocity_x[mi] = 0;
+        movement.position_x[mi] = new_x;
 
-        const max_y = bounds_height - visuals.size_y[visual_index];
-        const new_y = math.clamp(body.position_y.*, 0, max_y);
-        if (new_y != body.position_y.*) body.velocity_y.* = 0;
-        body.position_y.* = new_y;
+        const max_y = bounds_height - visuals.size_y[indices.visual];
+        const new_y = math.clamp(movement.position_y[mi], 0, max_y);
+        if (new_y != movement.position_y[mi]) movement.velocity_y[mi] = 0;
+        movement.position_y[mi] = new_y;
     }
 }
 

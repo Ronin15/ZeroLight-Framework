@@ -341,15 +341,18 @@ engine/gameplay diagnostics (`std.debug.print` is for `src/benchmarks/` CLI
 stdout only). `info`/`debug` for lifecycle/config/fallback, `warn` for recovered
 degradation, `err` for real failures; keep pure helpers/validation log-free.
 
-Hot and frame-adjacent paths carry no logging in release — a release binary has
-zero per-frame/update/event/draw/entity/iteration log calls. Such instrumentation
-must be comptime-gated so it compiles out to a zero-sized no-op, not skipped at
-runtime; `src/app/runtime_perf_log.zig` is the reference (`enabled` folds
-`builtin.mode == .Debug and logging.enabled(.debug)`, the type and its `Context`
-go zero-sized when disabled, per-frame work is counter increments, and the
-formatted emit runs once per interval in Debug only). `logging.enabled(level)` is
-comptime, so gate any non-trivially-formatted diagnostic behind it — call and
-formatting both drop when the level is off.
+Hot and frame-adjacent paths carry no logging in **shipping** release
+(`ReleaseFast` / `ReleaseSmall`) — those binaries have zero
+per-frame/update/event/draw/entity/iteration log or perf-counter work. Such
+instrumentation must be comptime-gated so it compiles out to a zero-sized no-op,
+not skipped at runtime; `src/app/runtime_perf_log.zig` is the reference
+(`enabled` is true for `Debug` and `ReleaseSafe`, false for
+`ReleaseFast`/`ReleaseSmall`; the type and its `Context` go zero-sized when
+disabled; per-frame work is counter increments; the formatted emit runs once per
+interval). Use ReleaseSafe soaks for realistic scale numbers with safety checks;
+use ReleaseFast for package builds. `logging.enabled(level)` is comptime, so gate
+any non-trivially-formatted diagnostic behind it — call and formatting both drop
+when the level is off.
 
 ## Comments
 

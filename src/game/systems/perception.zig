@@ -80,6 +80,7 @@ const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const stance = @import("../faction.zig").stance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -104,6 +105,12 @@ const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
 
 pub const perception_range_alignment_items: usize = movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const perception_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = 64,
+    .smallest_range_items = perception_range_alignment_items,
+};
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, perception_range_alignment_items);
@@ -482,7 +489,7 @@ pub const PerceptionSystem = struct {
     event_ranges: PerceptionEventRangeSlotList = .empty,
     range_stats: PerceptionRangeStatsSlotList = .empty,
     range_take_counts: std.ArrayList(usize) = .empty,
-    compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     // Per-level LOS-blocked bitmap cache, indexed directly by level (see
     // `LevelBlockedSlot`). Sized/reused across steps (never deinit between
     // steps) — only the per-level `blocked` bitmap contents are refreshed,
@@ -505,7 +512,7 @@ pub const PerceptionSystem = struct {
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
         return .{
             .allocator = allocator,
-            .compute_tuner = AdaptiveWorkTuner.init(.{}),
+            .compute_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
         };
     }
 
@@ -1703,6 +1710,14 @@ fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
     };
     _ = try world.addLevel(0);
     return world;
+}
+
+test "perception production compute tuner uses central gate and range alignment" {
+    var system = PerceptionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.compute_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(@as(usize, 64), system.compute_tuner.config.initial_range_items);
+    try std.testing.expectEqual(perception_range_alignment_items, system.compute_tuner.config.smallest_range_items);
 }
 
 test "fovTestScalar accepts squarely ahead, boundary, and rejects squarely behind" {

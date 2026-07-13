@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -32,6 +33,13 @@ const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("pathfinding.zig").PathfindingSystem;
 
 pub const steering_range_alignment_items: usize = @import("../data_system.zig").movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = steering_range_alignment_items,
+    .smallest_range_items = steering_range_alignment_items,
+};
+
 pub const HotF32Slice = []f32;
 pub const ConstHotF32Slice = []const f32;
 
@@ -117,10 +125,7 @@ pub const SteeringSystem = struct {
     // entries + sorted ranges are rebuilt only when this changes, not every step.
     obstacle_index_signature: u64 = 0,
     obstacle_index_valid: bool = false,
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{
-        .initial_range_items = steering_range_alignment_items,
-        .smallest_range_items = steering_range_alignment_items,
-    }),
+    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
         return .{ .allocator = allocator };
@@ -2105,6 +2110,14 @@ test "steering bounds dense obstacle candidate checks" {
     try std.testing.expect(stats.obstacle_candidate_checks <= max_obstacle_candidate_checks);
     try std.testing.expect(stats.obstacle_candidate_checks > 0);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+}
+
+test "steering production adaptive tuner uses central gate and range alignment" {
+    var system = SteeringSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.adaptive_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(steering_range_alignment_items, system.adaptive_tuner.config.initial_range_items);
+    try std.testing.expectEqual(steering_range_alignment_items, system.adaptive_tuner.config.smallest_range_items);
 }
 
 fn addSteeredEntity(data: *DataSystem, position: math.Vec2) !EntityId {

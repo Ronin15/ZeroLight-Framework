@@ -10,6 +10,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const AdaptiveWorkTuner = @import("../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../app/thread_system.zig").AdaptiveWorkTunerConfig;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const sprite_prep_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = 64,
+    .smallest_range_items = 16,
+};
 const BatchStats = @import("../app/thread_system.zig").BatchStats;
 const Camera2D = @import("camera.zig").Camera2D;
 const config = @import("../config.zig");
@@ -251,13 +258,13 @@ pub const SpriteBatch = struct {
     frame_reserved: bool = false,
     camera: Camera2D = .{},
     last_order: ?RenderOrder = null,
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(sprite_prep_adaptive_tuner_config),
     last_prep_stats: SpritePrepStats = .{},
 
     pub fn init(allocator: std.mem.Allocator) SpriteBatch {
         return .{
             .allocator = allocator,
-            .adaptive_tuner = AdaptiveWorkTuner.init(.{}),
+            .adaptive_tuner = AdaptiveWorkTuner.init(sprite_prep_adaptive_tuner_config),
         };
     }
 
@@ -1240,6 +1247,46 @@ test "sprite prep uses batch owned adaptive tuner instead of thread system fallb
     try std.testing.expect(batch.adaptive_tuner.report().sample_count > 0);
     try std.testing.expectEqual(@as(u64, 0), threads.adaptive_tuner.report().baseline_mean_batch_duration_ns);
     try std.testing.expectEqual(@as(usize, 0), threads.adaptive_tuner.report().sample_count);
+}
+
+test "sprite prep adaptive gate keeps cheap batches inline" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const slots = [_]TestTextureSlot{
+        .{ .id = testTextureId(0, 1), .desc = .{ .width = 16, .height = 16 } },
+    };
+    const table = TestTextureTable{ .slots = &slots };
+    var batch = SpriteBatch.init(allocator);
+    defer batch.deinit();
+    try batch.reserveStorage(90, 90 * 6, 90);
+    for (0..90) |index| {
+        try batch.drawSprite(.{
+            .texture = testTextureId(0, 1),
+            .dest = .{
+                .x = @floatFromInt(index),
+                .y = @floatFromInt(index % 11),
+                .w = 8,
+                .h = 8,
+            },
+        });
+    }
+
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{
+        .max_worker_threads = 9,
+        .items_per_range = 1,
+    });
+    defer threads.deinit();
+
+    const warmup_windows = batch.adaptive_tuner.report().sample_window * 4;
+    var last_stats: SpritePrepStats = .{};
+    var window: usize = 0;
+    while (window < warmup_windows) : (window += 1) {
+        last_stats = try batch.build(table.resolver(), &threads, .{});
+    }
+
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, batch.adaptive_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(@as(usize, 0), last_stats.batch.active_worker_threads);
 }
 
 test "warmed multi-worker sprite prep does not allocate" {

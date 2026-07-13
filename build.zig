@@ -659,8 +659,10 @@ fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
 fn parseLogLevel(value: []const u8, optimize: std.builtin.OptimizeMode) std.log.Level {
     if (std.mem.eql(u8, value, "auto")) {
         return switch (optimize) {
-            .Debug => .debug,
-            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .warn,
+            // Debug + ReleaseSafe: full diagnostics and runtime perf dumps (see
+            // runtime_perf_log.enabled). Fast/Small stay quiet for ship/package.
+            .Debug, .ReleaseSafe => .debug,
+            .ReleaseFast, .ReleaseSmall => .warn,
         };
     }
     if (std.mem.eql(u8, value, "err")) return .err;

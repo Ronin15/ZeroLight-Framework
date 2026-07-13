@@ -272,6 +272,14 @@ pub const RenderCollectIndices = struct {
     facing_index: ?usize = null,
 };
 
+/// Dense movement + primitive-visual row indices from a single entity slot resolve.
+/// Used by bounds clamp / tile gate so the hot path does one hash lookup, then pure
+/// SoA column writes (not `movementBodyPtr` + `primitiveVisualDenseIndex` per entity).
+pub const MovementVisualDenseIndices = struct {
+    movement: usize,
+    visual: usize,
+};
+
 pub const CollisionBounds = struct {
     offset: math.Vec2 = .{},
     size: math.Vec2,

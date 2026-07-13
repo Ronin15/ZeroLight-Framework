@@ -11,7 +11,17 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
 const log = logging.perf;
 
-pub const enabled = builtin.mode == .Debug and logging.enabled(.debug);
+// Instrumented soaks: Debug (iterate) and ReleaseSafe (optimized + safety, real
+// scale numbers). Fully compiled out of ReleaseFast/ReleaseSmall packages —
+// zero-sized types, no StageTimer, no per-frame counters.
+//
+// Emit uses `log.debug`; ReleaseSafe's build `auto` log level is `.debug` so
+// `zig build run -Doptimize=ReleaseSafe` (or `dev`) prints the 60s dumps
+// without an extra -Dlog-level.
+pub const enabled = switch (builtin.mode) {
+    .Debug, .ReleaseSafe => true,
+    .ReleaseFast, .ReleaseSmall => false,
+};
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
 pub const FrameResult = enum {

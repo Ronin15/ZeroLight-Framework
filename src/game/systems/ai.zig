@@ -36,6 +36,7 @@ const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
@@ -68,6 +69,12 @@ const stance = @import("../faction.zig").stance;
 const arbitration = @import("arbitration.zig");
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = ai_range_alignment_items,
+    .smallest_range_items = ai_range_alignment_items,
+};
 
 /// Fixed hysteresis distance for the demo's live-player chase: 1.75x
 /// pathfinding's nav cell size (`pathfinding/types.zig`'s `default_cell_size`
@@ -342,8 +349,8 @@ pub const AiSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
     rows: std.MultiArrayList(AiGatherRow) = .{},
-    separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
+    intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     // Broadcast goal-requantization state (see `requantizeGoal`); one scalar
     // pair since every default-target row shares this same broadcast value.
     snapped_goal: AiDir = .{ .x = 0, .y = 0 },
@@ -352,8 +359,8 @@ pub const AiSystem = struct {
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
             .allocator = allocator,
-            .separation_tuner = AdaptiveWorkTuner.init(.{}),
-            .intent_tuner = AdaptiveWorkTuner.init(.{}),
+            .separation_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
+            .intent_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
         };
     }
 
@@ -1598,6 +1605,62 @@ test "ai processor appends navigation intents without clearing existing stream o
     try std.testing.expectEqual(@as(usize, 2), intents.len);
     try std.testing.expectEqual(@as(i16, -1), intents[0].priority);
     try std.testing.expectEqual(entity.index, intents[1].entity.index);
+}
+
+test "ai production adaptive tuners use central gate and range alignment" {
+    var system = AiSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.separation_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.intent_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(ai_range_alignment_items, system.separation_tuner.config.initial_range_items);
+    try std.testing.expectEqual(ai_range_alignment_items, system.intent_tuner.config.smallest_range_items);
+}
+
+test "ai adaptive gate keeps demo-scale batches inline" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 8,
+        .items_per_range = 1,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent_count: usize = 64;
+    for (0..agent_count) |i| {
+        const x: f32 = @floatFromInt(i);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = 0 },
+            .previous_position = .{ .x = x, .y = 0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = 10 });
+    }
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 0, agent_count, 0, 0, 0);
+
+    const warmup_windows = ai_sys.intent_tuner.report().sample_window * 4;
+    var last_stats: AiStats = .{};
+    var window: usize = 0;
+    while (window < warmup_windows) : (window += 1) {
+        frame.beginStep();
+        last_stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{ .intent_seed = 1 });
+    }
+
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, ai_sys.intent_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(@as(usize, 0), last_stats.separation_batch.active_worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), last_stats.intent_batch.active_worker_threads);
 }
 
 test "ai processor uses committed adaptive threaded profiles with default thread worker config" {

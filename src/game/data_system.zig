@@ -40,6 +40,7 @@ pub const AssetReference = @import("data_system/types.zig").AssetReference;
 pub const ConstAssetReferenceSlice = @import("data_system/types.zig").ConstAssetReferenceSlice;
 pub const RenderEntityComponentIndices = @import("data_system/types.zig").RenderEntityComponentIndices;
 pub const RenderCollectIndices = @import("data_system/types.zig").RenderCollectIndices;
+pub const MovementVisualDenseIndices = @import("data_system/types.zig").MovementVisualDenseIndices;
 pub const CollisionBounds = @import("data_system/types.zig").CollisionBounds;
 pub const CollisionBoundsCommand = @import("data_system/types.zig").CollisionBoundsCommand;
 pub const ConstCollisionBoundsSlice = @import("data_system/types.zig").ConstCollisionBoundsSlice;
