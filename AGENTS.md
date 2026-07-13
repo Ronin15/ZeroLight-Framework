@@ -1,8 +1,18 @@
 # ZeroLight-Framework
 
-Grok Build project rules (primary). Also used by Cursor Agent CLI via
-`AGENTS.md`. **Do not invent architecture** — read the owning `docs/` file and
-live `src/` before editing.
+Shared project contract for agents in this repo.
+
+| Harness | Role | Specialist tooling |
+|---------|------|--------------------|
+| **Grok Build** | **Primary** | `.grok/agents/`, `.grok/skills/` |
+| **Cursor Agent CLI** | Secondary | `.cursor/agents/`, `.cursor/skills/`, `.cursor/rules/` |
+
+Engineering rules below (docs, ownership, hot path, build, bench≠test) apply to
+**both**. Harness-specific layout and spawn mechanics differ; do not require one
+tree to load the other.
+
+**Do not invent architecture** — read the owning `docs/` file and live `src/`
+before editing.
 
 **Stack:** Zig **0.16**, **SDL3 / SDL_GPU**, fixed-step **60Hz** sim, state stack
 with policy-driven input, atlas assets by stable IDs, data-oriented SoA
@@ -11,9 +21,10 @@ processors (movement, AI, steering, collision, pathfinding, particles).
 
 ---
 
-## Grok Build — layout and routing
+## Grok Build — layout and routing (primary)
 
-Native project assets (edit these first):
+Grok specialist behavior is **self-contained under `.grok/`** (prompts, presets,
+and multi-phase workflows do not depend on `.cursor/`):
 
 | Path | Role |
 |------|------|
@@ -25,10 +36,6 @@ Native project assets (edit these first):
 | `.grok/skills/zig-deep-correctness-review/` | Concurrency / determinism / test-gap deep pass |
 | `.grok/skills/zig-workflows/references/module-presets.md` | Review unit file tables |
 | `.grok/config.toml` | Project MCP / permissions only (**not** model defaults) |
-
-Cursor mirrors (secondary): `.cursor/agents/`, `.cursor/skills/`, `.cursor/rules/`.
-Claude Code is **archived** — ignore `.claude/` unless the user says otherwise.
-`Claude.md` is a stub so it is not a second contract.
 
 ### Subagents (`spawn_subagent`)
 
@@ -94,6 +101,33 @@ zig-debug-specialist = "grok-composer-2.5-fast"
   non-trivial design or full review passes.
 - Model choice never skips `docs/`, coding standards, or `zig build verify`.
 - Confirm with `grok models` and `grok inspect`.
+
+---
+
+## Cursor Agent CLI (secondary)
+
+Cursor loads this file as project rules (`AGENTS.md` / `Agents.md`) and uses its
+own harness paths:
+
+| Path | Role |
+|------|------|
+| `.cursor/agents/zig-*.md` | Specialist prompts (same names as Grok) |
+| `.cursor/skills/zig-workflows/` | Inline vs delegate; design / implement / debug / review |
+| `.cursor/skills/zig-workflows/module-presets.md` | Multi-review unit tables (when used) |
+| `.cursor/rules/*.mdc` | Auto-attach context for `src/game/**`, `src/render/**` |
+
+**Shared with Grok (this file):** docs map, module ownership, working rules,
+build/verify, bench≠test, same specialist roles and when to inline vs delegate.
+
+**Cursor-specific:**
+
+- Spawn via Cursor **Task / subagents** and `.cursor/agents/`, not Grok
+  `spawn_subagent` or `.grok/skills/` slash commands.
+- Multi-phase passes (pathfinder, architecture assessment, best-practices, deep
+  correctness): follow `.cursor/skills/zig-workflows/` (and presets there). Grok
+  multi-phase slash skills under `.grok/skills/` are for Grok Build sessions.
+- Keep specialist **roles and contracts** aligned with this file when editing
+  either agent tree; do not assume the two trees are auto-synced.
 
 ---
 
@@ -203,12 +237,3 @@ only. Packaged builds ship **ReleaseFast** — ReleaseSafe soak first (see
   `-Doptimize=ReleaseFast`). No test code may call `src/benchmarks/*.zig`
   (except `suite.zig` pure utility tests). Correctness → small fixtures in the
   owning module; perf → add/extend a bench case.
-
----
-
-## Cursor Agent CLI (secondary)
-
-Cursor uses this file plus `.cursor/agents/`, `.cursor/skills/`, and
-`.cursor/rules/`. Multi-phase playbooks live under `.grok/skills/` — follow those
-steps; map Grok `spawn_subagent` to Cursor Task/subagents when needed.
-Keep agent prompt bodies in sync with `.grok/agents/` when specialists change.

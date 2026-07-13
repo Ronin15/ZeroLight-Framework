@@ -2,15 +2,13 @@
 
 Path prefix `src/game/systems/pathfinding/` unless noted.
 
-Subagent prompts live in `.grok/agents/zig-review-specialist.md` (mirrored under
-`.cursor/agents/` and `.claude/agents/` for harness compat). Before each review
-unit, read `docs/coding-standards.md`, `docs/simulation-tiers-and-pipeline.md`,
-and `docs/architecture.md`.
+Subagent prompts live in `.grok/agents/zig-review-specialist.md`. Before each
+review unit, read `docs/coding-standards.md`,
+`docs/simulation-tiers-and-pipeline.md`, and `docs/architecture.md`.
 
 ## pathfinder
 
-Used by the `/pathfinder-review` skill (Grok-native). Claude Code equivalent:
-`.claude/workflows/pathfinder-review.js`.
+Used by the `/pathfinder-review` skill.
 
 ### Per-unit (phase 1)
 
@@ -39,8 +37,7 @@ Synthesize: merge severity-ordered report; drop spurious findings.
 
 ## best-practices-review
 
-Used by the `/zig-best-practices-review` skill. Claude Code equivalent:
-`.claude/workflows/zig-best-practices-review.js`. Weight toward mechanizable /
+Used by the `/zig-best-practices-review` skill. Weight toward mechanizable /
 generalizable best-practice issues, not one-off gameplay logic bugs.
 
 ### Per-unit (phase 1)
@@ -71,8 +68,7 @@ the specialist prompts.
 
 ## deep-correctness-review
 
-Used by the `/zig-deep-correctness-review` skill. Claude Code equivalent:
-`.claude/workflows/zig-deep-correctness-review-pass.js`. Pass 3: behavioral
+Used by the `/zig-deep-correctness-review` skill. Pass 3: behavioral
 correctness beyond idiom/surface — concurrency, algorithms, SIMD parity, pipeline
 determinism, resource lifetime, test gaps.
 
