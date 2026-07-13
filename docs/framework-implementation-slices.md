@@ -183,22 +183,43 @@ world depth, or cognition-track scope.
 
 **Battle-scale perf watch (2048 movers)**
 
-Context from ReleaseSafe soaks at `battle_scale_demo_mover_count = 2048`:
-gameplay ~1.6–1.8ms, present-bound frame; cognition ~330 selected / ~140
-observers per step (not full population). Sub-stage timers `steering_setup` /
-`collision_setup` name setup vs batch. **Fix cycles:** Debug. **Soaks:**
-ReleaseSafe one dump after load — not multi-minute dual cycles unless needed.
+**How to use:** fix cycles in **Debug**; intentional soaks in **ReleaseSafe**
+(`zig build run -Doptimize=ReleaseSafe`), **one** 60s dump after load (not
+multi-minute dual cycles unless comparing load vs settle). Same pop
+(`battle_scale_demo_mover_count = 2048`), similar play. Diff new dumps against
+the control table below: if stage lines move while selected/observer counts
+stay similar → suspect **net-new code**; if selected/observers jump → **scope
+density of the feature**. Sub-stage lines `steering_setup` / `collision_setup`
+separate setup from batch. Do not min-max sub-ms when gameplay stays in band.
 
-- [x] **Steering main-thread setup + event-driven static obstacles.** Instrumented
-      select / snapshot / directions; select uses one-slot
-      `movementSteeringDenseIndices`; path start level from dense
-      `scope.level[mi]`; agent snapshot+cell bin fused; static obstacle
-      snapshot/spatial **retained until** `reactToPostCommitSteeringEvents`
-      (structural_commit: destroy / movement / bounds / mobility for static
-      nav obstacles — same predicate as pathfinding) or cell-size change.
-      Not a per-step identity poll. Remaining: agent grid still rebuilds every
-      step; Slice 35 avoidance SIMD when batch math dominates
-      (`steering.zig`, Slice 35).
+**ReleaseSafe control baseline (post-load, ~60s, 2048 movers)**
+
+| Metric | Control band |
+|--------|----------------|
+| gameplay avg | **1.6–1.9 ms** |
+| frame (present-bound) | **~8.3 ms** (~120 FPS); cap_hits **0–1** |
+| steering stage | **~0.65–0.70 ms** |
+| steering select / snapshot / directions | **~0.03 / ~0.33–0.34 / ~0.17–0.20 ms** |
+| steering batch | **~0.40 ms** |
+| collision stage | **~0.21 ms** |
+| collision gather / sort | **~0.09 / ~0.02 ms** |
+| AI stage | **~0.15–0.20 ms** |
+| perception stage | **~0.16–0.20 ms** |
+| pathfinding avg (steady; ignore load max) | **~0.05–0.06 ms** |
+| cognition selected / observers (per step) | **~330 / ~140** |
+| movers (per step) | **~2000–2050** |
+
+Known costs inside that band (document, don’t thrash unless denser cognition
+forces a move): full agent snapshot every cognition step (~0.33 ms Safe);
+avoidance batch (~0.40 ms → Slice 35); collision gather (~0.09 ms Safe).
+
+- [x] **Steering main-thread setup + event-driven caches.** Instrumented
+      select / snapshot / directions; select one-slot resolve; path start from
+      `scope.level[mi]`; **steering→movement dense index cache** (rebuild only
+      on structural create/destroy/steering|movement component change); agent
+      cell bins via dense SIMD assign + pdqsort; static obstacle spatial
+      retained until post-commit invalidation or cell-size change. Remaining:
+      Slice 35 avoidance SIMD when batch math dominates (`steering.zig`).
 - [ ] **Collision full-sort under melee density.** Mid-pack soaks saw
       `full_sorts` jump (e.g. 1→24) while stage avg stayed ~0.21ms; broadphase
       batch ~0.09ms. Use `collision_setup` gather/sort timings +
