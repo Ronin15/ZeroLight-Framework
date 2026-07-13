@@ -17,6 +17,8 @@ const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
+const StageTimer = runtime_perf_log.StageTimer;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const hot_soa_column_alignment = @import("../data_system.zig").hot_soa_column_alignment;
@@ -108,6 +110,9 @@ pub const CollisionStats = struct {
     broadphase_batch: BatchStats = .{},
     narrowphase_batch: BatchStats = .{},
     used_full_sort: bool = false,
+    // Main-thread phases before the broadphase batch (ns); zero when perf is off.
+    gather_ns: u64 = 0,
+    sort_ns: u64 = 0,
 };
 
 const CandidatePair = struct {
@@ -243,14 +248,18 @@ pub const CollisionSystem = struct {
         thread_system: *ThreadSystem,
         config: CollisionConfig,
     ) !CollisionStats {
+        var gather_timer = StageTimer.start();
         try self.gatherBodies(data, config.scope_dense_indices);
+        const gather_ns = gather_timer.lap();
         const body_count = self.rows.len;
         if (body_count <= 1) {
             contacts.clearRetainingCapacity();
-            return .{ .body_count = body_count };
+            return .{ .body_count = body_count, .gather_ns = gather_ns };
         }
 
+        var sort_timer = StageTimer.start();
         const used_full_sort = self.sortWarm(config.full_sort_disorder_percent);
+        const sort_ns = sort_timer.lap();
         var system_config = config;
         if (system_config.adaptive) {
             if (system_config.broadphase_adaptive_tuner == null and system_config.broadphase_items_per_range == null and system_config.items_per_range == null) {
@@ -285,6 +294,8 @@ pub const CollisionSystem = struct {
                 .broadphase_simd_groups = broadphase.simd_groups,
                 .broadphase_batch = broadphase.batch,
                 .used_full_sort = used_full_sort,
+                .gather_ns = gather_ns,
+                .sort_ns = sort_ns,
             };
         }
 
@@ -319,6 +330,8 @@ pub const CollisionSystem = struct {
             .broadphase_batch = broadphase.batch,
             .narrowphase_batch = narrowphase_batch,
             .used_full_sort = used_full_sort,
+            .gather_ns = gather_ns,
+            .sort_ns = sort_ns,
         };
     }
 

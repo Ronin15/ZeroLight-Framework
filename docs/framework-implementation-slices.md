@@ -181,6 +181,46 @@ world depth, or cognition-track scope.
       pipeline scope; the active world uses chunk + halo rules (Slice 22
       deferred).
 
+**Battle-scale perf watch (2048 movers)**
+
+Context from ReleaseSafe soaks at `battle_scale_demo_mover_count = 2048`:
+gameplay ~1.6–1.8ms, present-bound frame; cognition ~330 selected / ~140
+observers per step (not full population). Sub-stage timers `steering_setup` /
+`collision_setup` name setup vs batch. **Fix cycles:** Debug. **Soaks:**
+ReleaseSafe one dump after load — not multi-minute dual cycles unless needed.
+
+- [x] **Steering main-thread setup + event-driven static obstacles.** Instrumented
+      select / snapshot / directions; select uses one-slot
+      `movementSteeringDenseIndices`; path start level from dense
+      `scope.level[mi]`; agent snapshot+cell bin fused; static obstacle
+      snapshot/spatial **retained until** `reactToPostCommitSteeringEvents`
+      (structural_commit: destroy / movement / bounds / mobility for static
+      nav obstacles — same predicate as pathfinding) or cell-size change.
+      Not a per-step identity poll. Remaining: agent grid still rebuilds every
+      step; Slice 35 avoidance SIMD when batch math dominates
+      (`steering.zig`, Slice 35).
+- [ ] **Collision full-sort under melee density.** Mid-pack soaks saw
+      `full_sorts` jump (e.g. 1→24) while stage avg stayed ~0.21ms; broadphase
+      batch ~0.09ms. Use `collision_setup` gather/sort timings +
+      `full_sort_disorder_percent` (default 12%) to decide if full sort is
+      expected melee disorder or a retune. Do not change SAP order without
+      measured parity. (`collision.zig`)
+- [ ] **AI separation density.** Sep samples ~2–3× when running through the
+      pack; scales with denser cognition. Confirm gather vs sep batch owner via
+      existing ai_separation batch line; vectorize with Slice 35 when math
+      dominates. Keep candidate/sample caps fixed (world-size independent).
+      (`ai.zig`, Slice 35)
+- [ ] **Path group fields + cache pressure.** `group_built=0` at 2048 is
+      intentional: demo pins `min_group_field_agents = 2000` after measuring
+      that pending-dedup/cache already serves shared-goal bursts (see
+      `proceduralPathfindingCapacity`). Re-measure eviction rate (~20k/min)
+      and group payoff only when simultaneous same-goal demand from
+      relationships/ships exists — do not lower the pin without a fresh 60s
+      capture. (`game_demo_state.zig`, pathfinding capacity)
+- [ ] **Perception tail.** Stage avg ~0.16ms, max ~2.4ms. Only if denser
+      observers fill the tail; gather multi-lookup polish optional; FOV path
+      already partially SIMD. (`perception.zig`)
+
 **Branch / packaging residuals**
 
 - [x] **Slice 23A merge — settled.** GPU tilemap hardening (archive Slice 23A)

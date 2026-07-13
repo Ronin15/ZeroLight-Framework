@@ -349,10 +349,10 @@ not skipped at runtime; `src/app/runtime_perf_log.zig` is the reference
 (`enabled` is true for `Debug` and `ReleaseSafe`, false for
 `ReleaseFast`/`ReleaseSmall`; the type and its `Context` go zero-sized when
 disabled; per-frame work is counter increments; the formatted emit runs once per
-interval). Use ReleaseSafe soaks for realistic scale numbers with safety checks;
-use ReleaseFast for package builds. `logging.enabled(level)` is comptime, so gate
-any non-trivially-formatted diagnostic behind it — call and formatting both drop
-when the level is off.
+interval). Fix cycles use Debug; intentional soaks use ReleaseSafe (not every
+edit — slow compile); ReleaseFast packages stay silent.
+`logging.enabled(level)` is comptime, so gate any non-trivially-formatted
+diagnostic behind it — call and formatting both drop when the level is off.
 
 ## Comments
 

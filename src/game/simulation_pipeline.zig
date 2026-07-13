@@ -362,6 +362,9 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
         perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
         perf.recordBatch(.steering, steering_stats.batch);
+        perf.recordTiming(.steering_select, steering_stats.select_ns);
+        perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
+        perf.recordTiming(.steering_directions, steering_stats.directions_ns);
 
         perf.recordMetric(.path_accepted_requests, metric(pathfinding_stats.accepted_requests));
         perf.recordMetric(.path_duplicate_requests, metric(pathfinding_stats.duplicate_requests));
@@ -401,6 +404,8 @@ pub const SimulationPipelineStats = struct {
         if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
+        perf.recordTiming(.collision_gather, collision_stats.gather_ns);
+        perf.recordTiming(.collision_sort, collision_stats.sort_ns);
 
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
@@ -624,6 +629,17 @@ pub const SimulationPipeline = struct {
         world: *const WorldSystem,
     ) !void {
         return self.perception.reactToPostCommitPerceptionEvents(frame, world);
+    }
+
+    /// Orchestrates the post-commit static-obstacle spatial invalidation for
+    /// steering local avoidance. Same structural_commit event family as nav/
+    /// perception; call order among the three post-commit reactions does not
+    /// matter (disjoint state).
+    pub fn reactToPostCommitSteeringEvents(
+        self: *SimulationPipeline,
+        frame: *const SimulationFrame,
+    ) void {
+        self.steering.reactToPostCommitSteeringEvents(frame);
     }
 
     /// Whether any pending structural command may invalidate navigation once

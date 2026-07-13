@@ -155,6 +155,16 @@ Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
 - **ReleaseFast** / **ReleaseSmall** → `warn` (ship/package; runtime perf is
   fully compiled out)
 
+**Fix cycles:** Debug — `zig build dev` / `zig build run`. Fast compile, full
+safety, behavior and unit work. Not the authority for scale timing.
+
+**Soaking / scale perf:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
+one 60s dump after load when you deliberately want ranking and absolute numbers.
+Longer compile; do not use for every edit. Multi-cycle soaks only when comparing
+settle vs load, not as the default.
+
+**Ship:** ReleaseFast packages (runtime perf fully compiled out).
+
 Debug logs can include detailed startup and fallback context, but warning and
 error logs should stay rare and actionable. Override the level when you need a
 different signal:
@@ -162,11 +172,8 @@ different signal:
 ```sh
 zig build -Dlog-level=warn
 zig build -Dlog-level=debug
-# Optimized soak with 60s perf dumps (prefer -Doptimize= for this project):
-zig build run -Doptimize=ReleaseSafe
-zig build dev -Doptimize=ReleaseSafe
-# Quiet Safe build (perf counters still compile in; dumps need debug-level logs):
-zig build run -Doptimize=ReleaseSafe -Dlog-level=err
+zig build run -Doptimize=ReleaseSafe              # intentional soak
+zig build run -Doptimize=ReleaseSafe -Dlog-level=err  # quiet Safe; no perf dumps
 ```
 
 ## Atlas Packing

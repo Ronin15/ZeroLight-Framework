@@ -280,6 +280,13 @@ pub const MovementVisualDenseIndices = struct {
     visual: usize,
 };
 
+/// Dense movement + steering-agent row indices from a single entity slot resolve.
+/// Used by steering intent selection so the hot path does one lookup, not two.
+pub const MovementSteeringDenseIndices = struct {
+    movement: usize,
+    steering: usize,
+};
+
 pub const CollisionBounds = struct {
     offset: math.Vec2 = .{},
     size: math.Vec2,

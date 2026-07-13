@@ -11,13 +11,14 @@ const SpritePrepStats = @import("../render/renderer.zig").SpritePrepStats;
 
 const log = logging.perf;
 
-// Instrumented soaks: Debug (iterate) and ReleaseSafe (optimized + safety, real
-// scale numbers). Fully compiled out of ReleaseFast/ReleaseSmall packages —
-// zero-sized types, no StageTimer, no per-frame counters.
+// Instrumented in Debug and ReleaseSafe; fully compiled out of
+// ReleaseFast/ReleaseSmall (zero-sized types, no StageTimer, no counters).
 //
-// Emit uses `log.debug`; ReleaseSafe's build `auto` log level is `.debug` so
-// `zig build run -Doptimize=ReleaseSafe` (or `dev`) prints the 60s dumps
-// without an extra -Dlog-level.
+// Debug (`dev` / `run`): fix cycles — iterate code and behavior. Perf lines may
+// appear but are not the soak authority (Debug is heavily pessimistic).
+// ReleaseSafe: intentional soaks for ranking and absolute scale numbers (slow
+// compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
+// level includes debug.
 pub const enabled = switch (builtin.mode) {
     .Debug, .ReleaseSafe => true,
     .ReleaseFast, .ReleaseSmall => false,
@@ -184,6 +185,14 @@ pub const Timing = enum {
     pathfinding_group_service,
     pathfinding_solve,
     pathfinding_publish,
+    // Steering prepareUpdate breakdown (main-thread setup before the avoidance
+    // batch). Compare against batch steering avg_ms to isolate serial overhead.
+    steering_select,
+    steering_snapshot,
+    steering_directions,
+    // Collision update breakdown before/around the broadphase batch.
+    collision_gather,
+    collision_sort,
     state_transitions,
     audio_drain,
     loading_build,
@@ -529,6 +538,34 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.path_group_field_rebuild_throttled),
                 self.metricValue(.path_group_field_samples),
                 self.metricValue(.path_max_distinct_group_keys),
+            },
+        );
+        const steering_select_timing = self.timingValue(.steering_select);
+        const steering_snapshot_timing = self.timingValue(.steering_snapshot);
+        const steering_directions_timing = self.timingValue(.steering_directions);
+        log.debug(
+            "perf {d:.1}s steering_setup select_avg_ms={d:.3} select_max_ms={d:.3} snapshot_avg_ms={d:.3} snapshot_max_ms={d:.3} directions_avg_ms={d:.3} directions_max_ms={d:.3}",
+            .{
+                elapsed_s,
+                millis(steering_select_timing.averageNs()),
+                millis(steering_select_timing.max_ns),
+                millis(steering_snapshot_timing.averageNs()),
+                millis(steering_snapshot_timing.max_ns),
+                millis(steering_directions_timing.averageNs()),
+                millis(steering_directions_timing.max_ns),
+            },
+        );
+        const collision_gather_timing = self.timingValue(.collision_gather);
+        const collision_sort_timing = self.timingValue(.collision_sort);
+        log.debug(
+            "perf {d:.1}s collision_setup gather_avg_ms={d:.3} gather_max_ms={d:.3} sort_avg_ms={d:.3} sort_max_ms={d:.3} full_sorts={}",
+            .{
+                elapsed_s,
+                millis(collision_gather_timing.averageNs()),
+                millis(collision_gather_timing.max_ns),
+                millis(collision_sort_timing.averageNs()),
+                millis(collision_sort_timing.max_ns),
+                self.metricValue(.collision_full_sorts),
             },
         );
         log.debug(

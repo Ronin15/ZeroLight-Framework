@@ -35,6 +35,7 @@ const ConstAssetReferenceSlice = types.ConstAssetReferenceSlice;
 const RenderEntityComponentIndices = types.RenderEntityComponentIndices;
 const RenderCollectIndices = types.RenderCollectIndices;
 const MovementVisualDenseIndices = types.MovementVisualDenseIndices;
+const MovementSteeringDenseIndices = types.MovementSteeringDenseIndices;
 const CollisionBounds = types.CollisionBounds;
 const ConstCollisionBoundsSlice = types.ConstCollisionBoundsSlice;
 const CollisionResponseMode = types.CollisionResponseMode;
@@ -555,6 +556,18 @@ pub const DataSystem = struct {
         return .{
             .movement = @intCast(movement),
             .visual = @intCast(visual),
+        };
+    }
+
+    /// One slot resolve → dense movement + steering-agent indices for steering select.
+    /// Null if the entity is missing either component (or is not alive).
+    pub fn movementSteeringDenseIndices(self: *const DataSystem, id: EntityId) ?MovementSteeringDenseIndices {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const movement = slot.movement_body_index orelse return null;
+        const steering = slot.steering_agent_index orelse return null;
+        return .{
+            .movement = @intCast(movement),
+            .steering = @intCast(steering),
         };
     }
 
@@ -1479,6 +1492,23 @@ test "movementVisualDenseIndices resolves both rows from one slot lookup" {
     try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
     try std.testing.expectEqual(data.primitiveVisualDenseIndex(entity).?, indices.visual);
     try std.testing.expect(data.movementVisualDenseIndices(EntityId.invalid) == null);
+}
+
+test "movementSteeringDenseIndices resolves both rows from one slot lookup" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, testBody(1));
+    try std.testing.expect(data.movementSteeringDenseIndices(entity) == null);
+
+    try data.setSteeringAgent(entity, .{});
+    const indices = data.movementSteeringDenseIndices(entity).?;
+    try std.testing.expectEqual(@as(usize, 0), indices.movement);
+    try std.testing.expectEqual(@as(usize, 0), indices.steering);
+    try std.testing.expectEqual(data.movementBodyDenseIndex(entity).?, indices.movement);
+    try std.testing.expectEqual(data.steeringAgentDenseIndex(entity).?, indices.steering);
+    try std.testing.expect(data.movementSteeringDenseIndices(EntityId.invalid) == null);
 }
 
 test "render collect indices resolve drawable rows from movement dense index" {
