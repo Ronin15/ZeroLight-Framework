@@ -90,7 +90,10 @@ pub fn build(b: *std.Build) void {
     // for bench troubleshooting, same as it does for the game build.
     const bench_log_level = parseLogLevel(log_level_arg, .ReleaseFast);
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
-    const force_llvm_lld = forceLlvmLldForTarget(target);
+    // Full LTO needs LLVM+LLD. Zig 0.16 rejects LLD for Mach-O, so Darwin
+    // ReleaseFast stays without LTO; Linux/Windows ship with `-flto=full`.
+    const release_lto = optimize == .ReleaseFast and ltoSupportedForTarget(target.result);
+    const force_llvm_lld: ?bool = if (release_lto) true else forceLlvmLldForTarget(target);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
 
     const buildOptions = b.addOptions();
@@ -152,6 +155,15 @@ pub fn build(b: *std.Build) void {
         .use_llvm = force_llvm_lld,
         .use_lld = force_llvm_lld,
     });
+
+    // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
+    // dead-code elimination when the target supports it (see `release_lto`).
+    if (release_lto) {
+        exe.lto = .full;
+        gpu_smoke_exe.lto = .full;
+        bench_exe.lto = .full;
+        unit_tests.lto = .full;
+    }
 
     b.installArtifact(exe);
     const windows_sdl_runtime = addWindowsSdlRuntimeDependencies(b, windows_sdl, &.{
@@ -654,6 +666,11 @@ fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
     }
 
     return null;
+}
+
+/// Zig 0.16 LTO requires LLD; LLD cannot link Mach-O object files.
+fn ltoSupportedForTarget(target: std.Target) bool {
+    return target.ofmt != .macho;
 }
 
 fn parseLogLevel(value: []const u8, optimize: std.builtin.OptimizeMode) std.log.Level {

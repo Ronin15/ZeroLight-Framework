@@ -73,12 +73,18 @@ enabled by the current `--fetch` mode.
 backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
 bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
 discipline rules for the `FailingAllocator` proof-test coverage this requires
-before hot-path code can rely on it safely. Before cutting a ReleaseFast
-release candidate, run an extended soak session in `--release=safe` (not just
-`zig build test`) across realistic-to-extreme entity counts and spawn/despawn
-churn. A clean multi-hour ReleaseSafe run is the actual release gate:
-ReleaseFast itself will not report a capacity or bounds violation if one
-exists, it will just corrupt memory silently.
+before hot-path code can rely on it safely. On non-Mach-O targets
+(Linux/Windows), `build.zig` also enables full link-time optimization
+(`-flto=full`) for every Compile step in `ReleaseFast` (app, gpu-smoke,
+benchmarks, and unit-test binaries) and forces the LLVM backend plus LLD,
+which LTO requires. Mach-O targets (macOS) skip LTO in Zig 0.16 because
+LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
+local iteration and size-focused builds stay predictable. Before cutting a
+ReleaseFast release candidate, run an extended soak session in
+`--release=safe` (not just `zig build test`) across realistic-to-extreme
+entity counts and spawn/despawn churn. A clean multi-hour ReleaseSafe run is
+the actual release gate: ReleaseFast itself will not report a capacity or
+bounds violation if one exists, it will just corrupt memory silently.
 
 ## Build Options
 
