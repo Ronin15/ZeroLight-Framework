@@ -297,6 +297,15 @@ test "loading state build failure latches failed phase without rethrowing" {
     var runtime_assets = RuntimeAssets.init(std.testing.allocator);
     // Missing world tileset metadata is an expected build failure: stay on the
     // loading screen in `.failed` instead of aborting the fixed-step loop.
+    //
+    // Suppress warn printing for this negative path. Production still uses
+    // `log.warn` (not `err`) so real runs surface the recovery; Zig's test
+    // runner only fails on `.err`, but any stderr (including `.warn`) is shown
+    // as a red "w" / "failed command" in `zig build test` even when all tests
+    // pass.
+    const previous_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = previous_log_level;
     try loading.update(.{
         .input = &input,
         .audio = &audio,
