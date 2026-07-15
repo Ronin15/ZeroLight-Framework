@@ -935,6 +935,7 @@ pub const SimulationPipeline = struct {
             // behaviors partly off these, so feelings can change which
             // behavior wins independent of what's perceived/remembered.
             .affect_slice = data.aiAffectSliceConst(),
+            .interest_markers = &context.world.interest_markers,
         });
         ai_timer.stop(context.perf, .pipeline_ai);
 

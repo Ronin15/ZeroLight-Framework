@@ -54,6 +54,7 @@ comptime {
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/world_system.zig");
+    _ = @import("game/world_interest.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");

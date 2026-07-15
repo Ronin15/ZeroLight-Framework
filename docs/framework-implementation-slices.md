@@ -85,14 +85,14 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
 | **39** | Landed | Sensory stimulus ecosystem — multi-producer `WorldStimulus` bus (dig, footstep, deferred impact) |
 | **40** | Not started | Action/interaction intent substrate |
-| **41** | Not started | World interest / affordance markers |
+| **41** | Landed | — (archive) |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood |
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer, independent of AI slices 33/35/37-42) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 (app/input layer) |
 | **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on Slice 40 |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
 
-**Recently settled (archive only):** 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -117,10 +117,10 @@ follow **Suggested Order** and the open items in the target slice section.
   aggression, fatigue feed arbitration's weight table every cognition step via
   `AiConfig.affect_slice`; `stageContract(.ai_decide)` reads `affect_drives`.
   Slice 42 is how the **feeling set and coupling grow** without rewriting AI.
-- **Next implementation slice: 33** (archetypes + debug) so personalities
-  (including affect baselines and future appraisal gains) and tuning are
-  data-driven and observable — required before claiming live "emergent" demo
-  interplay.
+- **Next implementation slice: 40** (action/interaction intent substrate) —
+  parallel non-locomotion intent stream so emergence is not limited to
+  `NavigationIntent`. Slice 33 (archetypes + debug) is landed (visual/`gpu-smoke`
+  confirmation only pending); Slice 41 (world interest markers) is landed.
 - **Keep systems expandable (standing rule, not just a 32 requirement):** the
   weight-resolution and per-agent goal-resolution contract Slice 32 landed
   (`scoreBehaviors`/`selectSticky`/`resolveGoal` in `arbitration.zig`) is
@@ -129,11 +129,11 @@ follow **Suggested Order** and the open items in the target slice section.
   that freezes the four-drive set. Do not lock agents to the player as the only
   goal, do not replace utility with an exclusive FSM, and do not grow
   production APIs with test-only tags.
-- **After the locomotion AI closed loop (32–33):** Slice 39 stimulus bus is
-  landed; **41** (world interest), **40** (action intents), and **42** (affect
-  expansion) unlock
-  richer senses, non-locomotion emergence, and more feelings. Render slices
-  37–38 and SIMD restructure 35 are independent tracks — interleave by need.
+- **After the locomotion AI closed loop (32–33 + 39 + 41):** multi-source
+  investigate goals (stimulus + world markers + memory) are in place. **40**
+  (action intents), **45** (first consumer), and **42** (affect expansion)
+  unlock non-locomotion emergence and more feelings. Render slices 37–38 and
+  SIMD restructure 35 are independent tracks — interleave by need.
 - **Component headroom:** 13 of 32 `Component` tags used (`enum(u5)` +
   `ComponentMask = u32`). No widening required for Slices 32–33; promote a
   widening slice only when a new tag would exceed 32 (see Scaling Gaps).
@@ -165,6 +165,11 @@ world depth, or cognition-track scope.
 
 **Simulation scale**
 
+- [ ] **Interest marker consumers beyond investigate.** Slice 41 stores
+      `cover` / `resource` / `patrol` kinds and nearest-k query, but only
+      `investigate` is wired into AI. Promote when ready: cover-aware flee/pursue
+      (locomotion AI follow-up), resource/patrol action targets via Slice 40/45
+      action intents — do not half-wire into `NavigationIntent`.
 - [ ] **Movement contiguous-path vs scoped LOD.** Any dormant movement row
       disables the contiguous SIMD movement fast path for the whole step. At
       steady-state LOD with routine off-camera sleepers, revisit compacted-dense
@@ -344,10 +349,10 @@ by Slice 24.
 | Memory | 30 | Landed | Last-known + ring + familiarity; cold-seek retarget in AI |
 | **Emotion / affect** | **31** | **Landed** | **fear / curiosity / aggression / fatigue** SoA drives, per-entity baselines/decay/thresholds, Schmitt threshold events; **consumed by arbitration (32)** |
 | **Arbitration** | **32** | **Landed** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
-| Archetypes / debug | 33 | Open | JSON personalities + overlay (incl. drive bars / affect blocks) |
+| Archetypes / debug | 33 | Landed (visual pending) | JSON personalities + overlay (incl. drive bars / affect blocks) |
 | Stimulus ecosystem | 39 | Landed | Multi-producer bus (dig, footstep, deferred impact) |
 | Action intents | 40 | Open | Non-locomotion intent stream (attack/interact/use) |
-| World interest | 41 | Open | Durable investigate/cover/resource markers |
+| World interest | 41 | Landed | Durable investigate/cover/resource/patrol markers on `WorldSystem` |
 | **Affect expansion** | **42** | Open | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
 ### Emotion / feelings model (landed + expandability)
@@ -856,6 +861,10 @@ Checklist:
 - [ ] Migrate `dig_controller.zig`'s two `level == 0` / `current_level == 0`
       call sites and `simulation_pipeline.zig`'s `gateBodyToWalkableTiles` to
       `levelElevation(...) == 0`.
+- [ ] Migrate demo interest-marker placement
+      (`game_demo_state.placeDemoInterestMarkers`) off hardcoded `level = 0` to
+      the surface elevation (`levelElevation(...) == 0` / surface level index)
+      so elevated stacks above the surface do not leave POIs on the wrong tier.
 - [ ] Replace `digRamp`'s raw index-0 "nothing above" check with an
       elevation-adjacency lookup (a reachable level at
       `levelElevation(level) + 1`), verified against a real multi-tier
@@ -979,53 +988,6 @@ pub/sub bus.
 - [ ] Movement-only demos unchanged when no action producers run.
 - [ ] Action stream is deterministic and allocation-free after reserve.
 - [ ] NavigationIntent contract untouched.
-- [ ] `zig build verify` passes.
-
-## Slice 41: World Interest And Affordance Markers
-
-**Status: not started.** Best after Slices 32–33 (agents can investigate) and
-usable with 39 (stimuli) without requiring 40.
-
-Goal: give agents durable, world-authored **interest points** (investigate
-hooks, cover, resource nodes, patrol anchors) as persistent facts in
-`WorldSystem` or compact `DataSystem` markers — so goal selection is not limited
-to living entities, dig noise, and the player.
-
-### Problem
-
-- Perception tracks entities + transient stimuli; memory rings remember
-  entities. There is no first-class "point of interest" for curiosity,
-  garrison, loot, or cover.
-- Without this, investigate/pursue content stays combatant-centric and
-  demo-shaped.
-
-### Architecture notes
-
-- Prefer **world-owned SoA markers** (stable id, kind enum, level, cell/xy,
-  optional faction filter, optional radius) over per-agent heap lists.
-- Agents query markers through a bounded spatial structure (reuse chunk
-  hashing or a frame-built index — do not N² scan the world on the hot path).
-- Slice 32's investigate resolver should be written so a future "best interest
-  marker" signal slots in as another score input without rewriting arbitration.
-- Rendering of markers is optional/debug; gameplay facts must not require GPU
-  handles.
-
-### Checklist
-
-- [ ] Define marker storage + kind enum + add/remove at load or via structural/
-      world APIs; tests for level isolation and capacity.
-- [ ] Bounded query API for cognition agents (max K markers in radius).
-- [ ] Wire investigate (and optionally pursue/flee cover) scoring to consume
-      markers when present; fixtures without markers preserve prior behavior.
-- [ ] Demo or content path places a few markers; archetypes (33) can bias
-      curiosity toward marker kinds.
-- [ ] Docs: ownership in WorldSystem vs DataSystem decision recorded in
-      architecture.md.
-
-### Acceptance checks
-
-- [ ] Agents investigate markers without entity targets present.
-- [ ] Queries bounded and allocation-free after warmup; determinism holds.
 - [ ] `zig build verify` passes.
 
 ## Slice 42: Affect Expansion — More Feelings, Coupling, And Mood
@@ -1473,8 +1435,8 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 32. AI behavior arbitration (**consume emotion drives**) — landed.
 33. Data-driven AI archetypes and debug introspection (incl. affect blocks). — landed (visual/GPU-smoke verification pending).
 39. Sensory stimulus ecosystem (richer hearing/investigate inputs). — landed.
-41. World interest / affordance markers (multi-source goals). **← next**
-40. Action and interaction intent substrate (non-locomotion emergence).
+40. Action and interaction intent substrate (non-locomotion emergence). **← next**
+41. World interest / affordance markers (multi-source goals). — landed.
 45. First action-intent consumer domain controller / destructibles (after 40).
 42. Affect expansion (more feelings, coupling, appraisal gains, optional mood).
 35. AI and steering hot-loop SIMD restructure (after 32 reshapes AI loops).

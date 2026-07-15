@@ -40,8 +40,15 @@ game-specific behavior under `src/game/`.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
 - `src/game/world_system.zig` owns state-local world/tile data in SoA stores
-  for levels, dense layers, sparse tiles, catalog source rects, and chunk
-  visibility.
+  for levels, dense layers, sparse tiles, catalog source rects, chunk
+  visibility, and durable **interest/affordance markers** (`world_interest.zig`,
+  Slice 41). Markers are world-authored POIs with fixed inline slot capacity
+  (allocation-free by construction) — not `DataSystem` components and not
+  ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
+  the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
+  tags until a later consumer lands. Cognition discovery uses a fixed query
+  radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
+  not the discovery gate. Queries return nearest-k (dist², then slot index).
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
   affect, structural, system) and owns state-local persistent entity data in
@@ -586,8 +593,13 @@ selected behavior — pursue and flee prefer a visible or freshly-remembered
 hostile-faction entity (perception's faction-generic `nearest_threat`, not a
 player special case) over the opt-in `AiConfig.focus_target`/`focus_entity`
 fallback, which only applies as a last resort when the agent's pursue gain is
-nonzero and no better signal exists; investigate prefers a heard stimulus over
-the freshest `AiMemory` ring contact; cohere reads a friendly-neighbor mean
+nonzero and no better signal exists; investigate resolves goals in priority
+order **heard stimulus → nearest in-range world interest marker → freshest
+`AiMemory` ring contact** (stimulus still wins short-term over markers;
+`investigate_interest_marker_bonus` sits between ring and stimulus scoring).
+`AiSystem` gathers markers read-only from `WorldSystem.interest_markers` via a
+bounded nearest-marker query (fixed radius constant, not world-sized), only for
+rows with `gain_investigate > 0`; cohere reads a friendly-neighbor mean
 gathered from the same shared spatial index. This utility arbitration decides
 *what* an agent wants (a behavior and a goal); it is a distinct mechanism from
 `SteeringSystem`'s stream-priority arbitration below, which decides *which*

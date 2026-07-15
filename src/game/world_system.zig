@@ -41,6 +41,7 @@ const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
+const world_interest = @import("world_interest.zig");
 
 pub const TileId = u16;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
@@ -403,6 +404,8 @@ pub const WorldSystem = struct {
     max_dense_tile_gpu_bytes: usize = 0,
     dense_bands_per_level: std.ArrayList(u8) = .empty,
 
+    interest_markers: world_interest.InterestMarkerStore = .{},
+
     pub fn initDemo(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
@@ -607,7 +610,35 @@ pub const WorldSystem = struct {
         if (self.owned_tileset_meta) |*meta| meta.deinit();
         self.owned_tileset_meta = null;
         self.tileset_meta = null;
+        self.interest_markers.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn addInterestMarker(self: *WorldSystem, spec: world_interest.InterestMarkerSpec) !world_interest.InterestMarkerId {
+        return self.interest_markers.addMarker(spec);
+    }
+
+    pub fn removeInterestMarker(self: *WorldSystem, id: world_interest.InterestMarkerId) bool {
+        return self.interest_markers.removeMarker(id);
+    }
+
+    pub fn interestMarkerCount(self: *const WorldSystem) usize {
+        return self.interest_markers.count();
+    }
+
+    /// Bounded nearest-k interest query (dist², then slot index). See
+    /// `world_interest.InterestMarkerStore.queryMarkersInRadius`.
+    pub fn queryInterestMarkers(
+        self: *const WorldSystem,
+        level: u16,
+        x: f32,
+        y: f32,
+        radius: f32,
+        agent_faction: ?@import("faction.zig").Faction,
+        out: []world_interest.InterestMarkerHit,
+        max_k: usize,
+    ) usize {
+        return self.interest_markers.queryMarkersInRadius(level, x, y, radius, agent_faction, out, max_k);
     }
 
     /// Dynamic sprite-command budget the world contributes per frame. Dense tiles

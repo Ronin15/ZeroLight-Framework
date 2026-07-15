@@ -402,6 +402,7 @@ pub const GameDemoState = struct {
             player_body.previous_x.* = start_x;
             player_body.previous_y.* = start_y;
         }
+        try placeDemoInterestMarkers(&world);
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
         const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap, &archetype_catalog);
@@ -879,6 +880,31 @@ fn undergroundSpawnCellForIndex(underground_index: usize) SpawnCellCoord {
 fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.TileId, level: u16, cell: SpawnCellCoord) !void {
     const floor_layer = world.denseFloorLayerForLevel(level) orelse return error.InvalidWorldLevel;
     _ = try world.setDenseTile(floor_layer, cell.x, cell.y, tunnel_tile);
+}
+
+/// Places durable investigate POIs on the surface level (index 0 today).
+/// When Slice 38 lands elevation stacks above the surface, rebind this to the
+/// level whose `levelElevation` is 0 rather than hardcoding storage index 0.
+fn placeDemoInterestMarkers(world: *WorldSystem) !void {
+    const w = world.worldWidthPixels();
+    const h = world.worldHeightPixels();
+    // radius = influence footprint only; AI discovery uses a separate fixed
+    // query radius (see `interest_marker_query_radius` in ai.zig).
+    const markers = [_]struct { x: f32, y: f32 }{
+        .{ .x = w * 0.25, .y = h * 0.5 },
+        .{ .x = w * 0.42, .y = h * 0.48 },
+        .{ .x = w * 0.58, .y = h * 0.52 },
+        .{ .x = 96, .y = h * 0.5 },
+    };
+    for (markers) |m| {
+        _ = try world.addInterestMarker(.{
+            .kind = .investigate,
+            .level = 0,
+            .x = m.x,
+            .y = m.y,
+            .radius = 64,
+        });
+    }
 }
 
 fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, index: usize) !EntityId {

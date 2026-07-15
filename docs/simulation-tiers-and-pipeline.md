@@ -143,7 +143,9 @@ before it is written fails the build instead of silently corrupting behavior.
   resource, and a transient stream with no `PipelineResource` tag at all (e.g.
   the `WorldStimulus` values producers write into `frame.stimuli` and
   `perception_update` reads the same step) carries a producer→consumer
-  dependency the comptime check cannot see. Every such untagged same-step
+  dependency the comptime check cannot see. Durable world interest markers
+  (Slice 41) are read-only inputs on `ai_decide` via `WorldSystem.interest_markers`
+  — not frame streams and not `PipelineResource`-tagged. Every such untagged same-step
   dependency is pinned by a causal-effect test co-located in
   `simulation_pipeline.zig`: each sets up a scenario where the wrong order
   produces an observably different result and asserts the correct one. See
