@@ -29,6 +29,7 @@ const CellCoord = @import("world_system.zig").CellCoord;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const StimulusKind = @import("simulation.zig").StimulusKind;
+const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const DigIntent = @import("simulation.zig").DigIntent;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
@@ -159,7 +160,7 @@ pub const DigController = struct {
         });
         try frame.appendStimulus(.{
             .position = cellCenterWorldPos(world, cell),
-            .intensity = 1.0,
+            .intensity = defaultStimulusIntensity(.dig),
             .kind = .dig,
             .level = player.current_level,
         });

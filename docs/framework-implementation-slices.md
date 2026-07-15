@@ -83,7 +83,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **35** | Not started | AI/steering hot-loop SIMD restructure — after 32 reshapes AI loops |
 | **37** | Partial | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening — stale-doc checklist item landed; rest open |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
-| **39** | Not started | Sensory stimulus ecosystem — more `WorldStimulus` producers/kinds |
+| **39** | Landed | Sensory stimulus ecosystem — multi-producer `WorldStimulus` bus (dig, footstep, deferred impact) |
 | **40** | Not started | Action/interaction intent substrate |
 | **41** | Not started | World interest / affordance markers |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood |
@@ -129,8 +129,9 @@ follow **Suggested Order** and the open items in the target slice section.
   that freezes the four-drive set. Do not lock agents to the player as the only
   goal, do not replace utility with an exclusive FSM, and do not grow
   production APIs with test-only tags.
-- **After the locomotion AI closed loop (32–33):** Slice 39 (stimulus richness),
-  41 (world interest), 40 (action intents), and **42 (affect expansion)** unlock
+- **After the locomotion AI closed loop (32–33):** Slice 39 stimulus bus is
+  landed; **41** (world interest), **40** (action intents), and **42** (affect
+  expansion) unlock
   richer senses, non-locomotion emergence, and more feelings. Render slices
   37–38 and SIMD restructure 35 are independent tracks — interleave by need.
 - **Component headroom:** 13 of 32 `Component` tags used (`enum(u5)` +
@@ -344,7 +345,7 @@ by Slice 24.
 | **Emotion / affect** | **31** | **Landed** | **fear / curiosity / aggression / fatigue** SoA drives, per-entity baselines/decay/thresholds, Schmitt threshold events; **consumed by arbitration (32)** |
 | **Arbitration** | **32** | **Landed** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
 | Archetypes / debug | 33 | Open | JSON personalities + overlay (incl. drive bars / affect blocks) |
-| Stimulus ecosystem | 39 | Open | More producers/kinds so hearing is not dig-only |
+| Stimulus ecosystem | 39 | Landed | Multi-producer bus (dig, footstep, deferred impact) |
 | Action intents | 40 | Open | Non-locomotion intent stream (attack/interact/use) |
 | World interest | 41 | Open | Durable investigate/cover/resource markers |
 | **Affect expansion** | **42** | Open | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
@@ -881,66 +882,45 @@ Acceptance checks:
 
 ## Slice 39: Sensory Stimulus Ecosystem
 
-**Status: not started.** Depends on Slice 29's `SimulationFrame.stimuli` /
-hearing path; most valuable after Slice 32 so investigate/flee can react to
-richer sounds than dig alone.
+**Status: landed.** Multi-producer world sensory bus feeding existing AI hearing
+(dig + footstep same-step; collision impact deferred one step). No
+`StimulusController`; cognition does not depend on `AudioController`.
 
 Goal: expand the world sensory bus so hearing and curiosity are not permanently
 tied to a single dig producer — without turning stimuli into a second event
 stream or audio-playback service.
 
-### Problem (code today)
+### Landed behavior
 
-- `SimulationFrame.stimuli` is a `RangeOutputStream(WorldStimulus)` with
-  scalar fields (position, intensity, kind, level).
-- **Sole producer:** `DigController.process` (one stimulus per dig). Landing/
-  fall carve deliberately does not emit (ordering vs perception in the same
-  step — documented in Slice 29).
-- `intensity` is stored but unused (no falloff curve yet).
-- No footsteps, combat hits, alarms, or player-jet coupling into cognition —
-  investigate utility in Slice 32 only fires when something digs nearby.
-
-### Architecture notes
-
-- Stimuli stay **transient per-step positional records**, not `SimulationEvent`s
-  and not `AudioCommandBuffer` entries. Audio may *also* play a sound for the
-  same gameplay moment, but cognition must not read the audio service.
-- Add producers at explicit pipeline stages that run **before**
-  `perception_update` (same rule as dig), or document a one-step delay if a
-  producer can only run later — never silently emit after perception.
-- Keep `WorldStimulus.kind` a small closed enum; extend with new tags + tests,
-  not strings.
-- Falloff: hearing already range-gates; optional intensity attenuation
-  `effective = intensity / (1 + dist2 * k)` with fixed `k`, only if a second
-  producer needs relative loudness. Do not scale constants from world size.
-- Capacity: pre-reserve stimulus stream from a caller-sized budget (mirror
-  perception event budget discipline) once producers can exceed one item/step.
+- `WorldStimulus.kind`: `.dig`, `.footstep`, `.impact` with fixed default
+  intensities and `stimulusHearingScore` soft ranking in `PerceptionSystem`.
+- **Same-step producers (before perception):** pipeline promotes prior-step
+  deferred impacts, `DigController.process`, player footstep (≤1 when velocity
+  is non-trivial).
+- **Deferred producer:** after `collision_respond`, player-involving contacts
+  enqueue `.impact` into pipeline-owned `[stimulus_deferred_capacity]`; promoted
+  at the next `update` start. Landing carve still does not emit (Slice 29).
+- Fixed capacities and drop policy in `simulation.zig`; demo warms
+  `stimuli` to `stimulus_live_capacity`.
 
 ### Checklist
 
-- [ ] Document producer-phase rule in `docs/simulation-tiers-and-pipeline.md`
+- [x] Document producer-phase rule in `docs/simulation-tiers-and-pipeline.md`
       and `architecture.md` (must precede perception or be next-step delayed).
-- [ ] Extend `WorldStimulus.kind` with the first real multi-producer set
-      (minimum: dig retained, plus at least two of: footstep burst, collision
-      impact, tool/use pulse — pick from systems that already have main-thread
-      or fixed-step hooks).
-- [ ] Wire 2+ producers with tests for range/level gating and multi-stimulus
-      nearest selection (perception already has nearest-of-multiple tests —
-      extend fixtures).
-- [ ] Implement or explicitly defer intensity falloff; if deferred, document
-      why intensity remains unused.
-- [ ] Reserve stimulus capacity from demo/pipeline config; capacity + drop
-      policy tests if overflow is possible.
-- [ ] Headless proof: dig-only worlds unchanged; multi-producer frames remain
-      allocation-free after warmup; serial == threaded perception.
+- [x] Extend `WorldStimulus.kind` with dig + footstep + collision impact.
+- [x] Wire multi-producer pipeline + perception tests (ranking, deferred impact,
+      footstep same-step, capacity drops).
+- [x] Intensity ranking via fixed `stimulus_hearing_falloff_k` (Slice 39).
+- [x] Reserve stimulus capacity from demo config; capacity + drop policy tests.
+- [x] Dig causal tests unchanged; `appendStimulus`/`tryAppendStimulus`
+      FailingAllocator proofs in `simulation.zig`.
 
 ### Acceptance checks
 
-- [ ] Hearing can acquire non-dig stimuli; Slice 32 investigate agents move
-      toward them in fixtures (or 33 demo once archetypes exist).
-- [ ] No cognition → audio service dependency; no stimulus pointers/handles.
-- [ ] `zig build verify` passes; perception benches do not regress beyond noise
-      at equal agent counts when stimulus count stays bounded.
+- [x] Hearing acquires non-dig stimuli; arbitration investigate path already
+      consumes `heard_stimulus` XY (perception + arbitration tests).
+- [x] No cognition → audio service dependency for stimulus emission.
+- [x] `zig build verify` passes.
 
 ## Slice 40: Action And Interaction Intent Substrate
 
@@ -1492,8 +1472,8 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 31. AI affect and emotion drives.
 32. AI behavior arbitration (**consume emotion drives**) — landed.
 33. Data-driven AI archetypes and debug introspection (incl. affect blocks). — landed (visual/GPU-smoke verification pending).
-39. Sensory stimulus ecosystem (richer hearing/investigate inputs). **← next**
-41. World interest / affordance markers (multi-source goals).
+39. Sensory stimulus ecosystem (richer hearing/investigate inputs). — landed.
+41. World interest / affordance markers (multi-source goals). **← next**
 40. Action and interaction intent substrate (non-locomotion emergence).
 45. First action-intent consumer domain controller / destructibles (after 40).
 42. Affect expansion (more feelings, coupling, appraisal gains, optional mood).

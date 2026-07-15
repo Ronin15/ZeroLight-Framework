@@ -400,9 +400,12 @@ The current gameplay fixed-step pipeline is:
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
    "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
-   `dig_world_edit` (author world-tile edits from player digging) →
-   `scope_advance_and_ai_gather` → `spatial_index_build` (shared
-   `SpatialIndexSystem`, Slice 28) → `perception_update` (vision/hearing,
+   at step open: promote prior-step deferred impacts onto the live bus, then
+   `dig_world_edit` (author world-tile edits from player digging), then at most
+   one player footstep when velocity is non-trivial — all before
+   `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
+   `spatial_index_build` (shared `SpatialIndexSystem`, Slice 28) →
+   `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
    `apply_ai_movement_intents` → `movement_integrate` →
@@ -550,7 +553,11 @@ and `hasLineOfSight` itself walks every grid cell a ray's segment actually
 crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
 into the same per-agent pass as a same-level squared-distance check against
 `SimulationFrame.stimuli`, a transient per-step positional buffer that
-`DigController` is the sole producer for. Dense per-step results (visibility,
+`SimulationPipeline` sensory producers feed (Slice 39): deferred-promoted
+`.impact`, same-step `.dig` from `DigController`, and same-step `.footstep`
+from player velocity — all before `PerceptionSystem` hearing. Cognition does
+not read `AudioCommandBuffer`; audio may play in parallel for presentation
+only. Dense per-step results (visibility,
 last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
 hot columns; only acquisition/loss transitions emit low-volume
 `entity_perceived`/`entity_lost` domain events, capped per step by

@@ -47,7 +47,13 @@ const PerceptionSystem = @import("systems/perception.zig").PerceptionSystem;
 const PlayerPerceptionCandidate = @import("systems/perception.zig").PlayerPerceptionCandidate;
 const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
+const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const WorldStimulus = @import("simulation.zig").WorldStimulus;
+const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
+const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
+const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
+const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -304,6 +310,14 @@ pub const SimulationPipelineStats = struct {
     chunk_derive: BatchStats = .{},
     collision: CollisionStats = .{},
     collision_response: CollisionResponseStats = .{},
+    /// Live-bus stimuli dropped this step (promote and footstep optional
+    /// appends when `stimulus_live_capacity` is full). Dig uses required
+    /// `appendStimulus`, not soft drop.
+    stimuli_live_dropped: usize = 0,
+    /// Deferred impact stimuli dropped this step when the pipeline buffer is full.
+    stimuli_deferred_dropped: usize = 0,
+    /// Deferred impacts promoted onto the live bus at the start of this step.
+    stimuli_promoted: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -410,11 +424,103 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_response_contacts, metric(collision_response_stats.contact_count));
         perf.recordMetric(.collision_response_intents, metric(collision_response_stats.intent_count));
         perf.recordMetric(.collision_response_triggers, metric(collision_response_stats.trigger_count));
+
+        perf.recordMetric(.stimuli_live_dropped, metric(self.stimuli_live_dropped));
+        perf.recordMetric(.stimuli_deferred_dropped, metric(self.stimuli_deferred_dropped));
+        perf.recordMetric(.stimuli_promoted, metric(self.stimuli_promoted));
     }
 };
 
 fn metric(value: usize) u64 {
     return @intCast(value);
+}
+
+/// Squared speed threshold for emitting one player footstep per step.
+const footstep_velocity_sq_threshold: f32 = 1.0;
+
+fn contactInvolvesEntity(contact: CollisionContact, entity: EntityId) bool {
+    return contact.a.eql(entity) or contact.b.eql(entity);
+}
+
+fn contactStimulusPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
+    const a = data.movementBodyConst(contact.a) orelse return null;
+    const b = data.movementBodyConst(contact.b) orelse return null;
+    return .{
+        .x = (a.position.x + b.position.x) * 0.5,
+        .y = (a.position.y + b.position.y) * 0.5,
+    };
+}
+
+fn impactStimulusIntensity(contact: CollisionContact) f32 {
+    const scale = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
+    return defaultStimulusIntensity(.impact) * scale;
+}
+
+/// Moves pipeline-deferred impacts onto the live per-step bus before perception.
+fn promoteDeferredStimuli(
+    pipeline: *SimulationPipeline,
+    frame: *SimulationFrame,
+    live_dropped: *usize,
+) usize {
+    const pending = pipeline.deferred_stimulus_count;
+    var promoted: usize = 0;
+    for (pipeline.deferred_stimuli[0..pending]) |stimulus| {
+        if (frame.tryAppendStimulus(stimulus, stimulus_live_capacity)) {
+            promoted += 1;
+        } else {
+            live_dropped.* += 1;
+        }
+    }
+    pipeline.deferred_stimulus_count = 0;
+    return promoted;
+}
+
+/// At most one footstep when the player's movement body carries non-trivial velocity.
+fn tryAppendPlayerFootstepStimulus(
+    frame: *SimulationFrame,
+    data: *const DataSystem,
+    player: Player,
+    live_dropped: *usize,
+) void {
+    const body = data.movementBodyConst(player.entity) orelse return;
+    const vel_sq = body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y;
+    if (vel_sq < footstep_velocity_sq_threshold) return;
+    const appended = frame.tryAppendStimulus(.{
+        .position = body.position,
+        .intensity = defaultStimulusIntensity(.footstep),
+        .kind = .footstep,
+        .level = player.current_level,
+    }, stimulus_live_capacity);
+    if (!appended) live_dropped.* += 1;
+}
+
+/// Enqueues player-involving collision contacts as next-step impact stimuli.
+fn enqueuePlayerCollisionImpactsToDeferred(
+    pipeline: *SimulationPipeline,
+    frame: *const SimulationFrame,
+    data: *const DataSystem,
+    player_entity: EntityId,
+    player_level: u16,
+    deferred_dropped: *usize,
+) void {
+    var enqueued: usize = 0;
+    for (frame.contacts.mergedItems()) |contact| {
+        if (enqueued >= stimulus_max_impacts_per_step) break;
+        if (!contactInvolvesEntity(contact, player_entity)) continue;
+        const position = contactStimulusPosition(data, contact) orelse continue;
+        if (pipeline.deferred_stimulus_count >= stimulus_deferred_capacity) {
+            deferred_dropped.* += 1;
+            continue;
+        }
+        pipeline.deferred_stimuli[pipeline.deferred_stimulus_count] = .{
+            .position = position,
+            .intensity = impactStimulusIntensity(contact),
+            .kind = .impact,
+            .level = player_level,
+        };
+        pipeline.deferred_stimulus_count += 1;
+        enqueued += 1;
+    }
 }
 
 /// Fixed-step simulation owner for one gameplay state instance.
@@ -457,6 +563,10 @@ pub const SimulationPipeline = struct {
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
     affect_max_events_per_step: usize,
+    /// Pipeline-owned deferred impact buffer (Slice 39): survives `beginStep`
+    /// until promoted before perception on the next `update`.
+    deferred_stimuli: [stimulus_deferred_capacity]WorldStimulus = undefined,
+    deferred_stimulus_count: usize = 0,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -693,9 +803,14 @@ pub const SimulationPipeline = struct {
         const frame = context.frame;
 
         frame.phase = .processors;
-        // Player-authored world edit. Runs first; its world_tile_changed event is
-        // deferred and re-masks navigation in merge_outputs regardless of order.
+        var stimuli_live_dropped: usize = 0;
+        var stimuli_deferred_dropped: usize = 0;
+        const stimuli_promoted = promoteDeferredStimuli(self, frame, &stimuli_live_dropped);
+        // Player-authored world edit. Runs after deferred promote; its
+        // world_tile_changed event is deferred and re-masks navigation in
+        // merge_outputs regardless of order.
         try self.dig.process(context.world, data, context.player.*, frame);
+        tryAppendPlayerFootstepStimulus(frame, data, context.player.*, &stimuli_live_dropped);
 
         // Backbone scope pass. Advance the stagger clock, derive the camera
         // cognition halo, and select the cognition (AI/steering) subset for this
@@ -864,6 +979,14 @@ pub const SimulationPipeline = struct {
         var collision_response_timer = StageTimer.start();
         const collision_response_stats = try self.collision_response.update(data, frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
+        enqueuePlayerCollisionImpactsToDeferred(
+            self,
+            frame,
+            data,
+            context.player.entity,
+            context.player.current_level,
+            &stimuli_deferred_dropped,
+        );
 
         var clamp_timer = StageTimer.start();
         clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
@@ -927,6 +1050,9 @@ pub const SimulationPipeline = struct {
             .chunk_derive = chunk_derive_stats,
             .collision = collision_stats,
             .collision_response = collision_response_stats,
+            .stimuli_live_dropped = stimuli_live_dropped,
+            .stimuli_deferred_dropped = stimuli_deferred_dropped,
+            .stimuli_promoted = stimuli_promoted,
         };
     }
 
@@ -2548,4 +2674,462 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     // the stimulus before perception read `frame.stimuli` this step -- perception
     // running first would find the (freshly cleared) stimulus stream empty.
     try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
+test "pipeline promotes deferred impacts before perception on the following step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+
+    const impact_x: f32 = 200;
+    const impact_y: f32 = 220;
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{
+        .position = .{ .x = impact_x + 40, .y = impact_y },
+        .previous_position = .{ .x = impact_x + 40, .y = impact_y },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer, 0);
+    try data.setSimulationTier(observer, .cognition);
+    try data.setAiPerception(observer, .{ .hearing_range = 500 });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .perception_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    // Simulate a collision impact deferred at the end of the prior step.
+    pipeline.deferred_stimuli[0] = .{
+        .position = .{ .x = impact_x, .y = impact_y },
+        .intensity = defaultStimulusIntensity(.impact),
+        .kind = .impact,
+        .level = 0,
+    };
+    pipeline.deferred_stimulus_count = 1;
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try std.testing.expect(perception.heard_stimulus);
+    try std.testing.expectApproxEqAbs(impact_x, perception.heard_stimulus_x, 0.01);
+    try std.testing.expectApproxEqAbs(impact_y, perception.heard_stimulus_y, 0.01);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+}
+
+test "pipeline defers player collision impacts until the next step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    const body = data.movementBodyPtr(player.entity).?;
+    body.position_x.* = 100;
+    body.position_y.* = 100;
+    body.previous_x.* = 100;
+    body.previous_y.* = 100;
+    body.velocity_x.* = 0;
+    body.velocity_y.* = 0;
+
+    const blocker = try data.createEntity();
+    try data.setMovementBody(blocker, .{
+        .position = .{ .x = 110, .y = 100 },
+        .previous_position = .{ .x = 110, .y = 100 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(blocker, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setSimulationTier(blocker, .locomotion);
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{
+        .position = .{ .x = 130, .y = 100 },
+        .previous_position = .{ .x = 130, .y = 100 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer, 0);
+    try data.setSimulationTier(observer, .cognition);
+    try data.setAiPerception(observer, .{ .hearing_range = 500 });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 8,
+        .movement_body_capacity = 8,
+        .perception_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+    try std.testing.expect(stats.collision.contact_count > 0);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+    try std.testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
+test "pipeline emits player footstep stimulus before perception in the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const pbody = data.movementBodyPtr(player.entity).?;
+    pbody.position_x.* = 5 * 32;
+    pbody.position_y.* = 3 * 32;
+    pbody.previous_x.* = 5 * 32;
+    pbody.previous_y.* = 3 * 32;
+    pbody.velocity_x.* = 120;
+    pbody.velocity_y.* = 0;
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{
+        .position = .{ .x = 7 * 32, .y = 3 * 32 },
+        .previous_position = .{ .x = 7 * 32, .y = 3 * 32 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer, 0);
+    try data.setSimulationTier(observer, .cognition);
+    try data.setAiPerception(observer, .{ .hearing_range = 1000 });
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .perception_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    frame.dig_intent = .none;
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try std.testing.expect(perception.heard_stimulus);
+    try std.testing.expectApproxEqAbs(@as(f32, 5 * 32), perception.heard_stimulus_x, 0.01);
+}
+
+test "deferred impact enqueue drops newest when deferred buffer is full" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    const other = try data.createEntity();
+    try data.setMovementBody(other, .{
+        .position = .{ .x = 10, .y = 10 },
+        .previous_position = .{ .x = 10, .y = 10 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(other, .{ .size = .{ .x = 32, .y = 32 } });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.contacts.reserve(1, 1);
+    const writer = try frame.contacts.appendRangeCounts(1);
+    frame.contacts.addCount(writer, 1);
+    try frame.contacts.prefixAppendedRanges(writer);
+    var contact_writer = frame.contacts.rangeWriter(writer);
+    contact_writer.write(.{
+        .a = player.entity,
+        .b = other,
+        .a_movement_index = 0,
+        .b_movement_index = 1,
+        .normal_x = -1,
+        .normal_y = 0,
+        .penetration = 4,
+    });
+    contact_writer.finish();
+    frame.contacts.finishWrite();
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+    pipeline.deferred_stimulus_count = stimulus_deferred_capacity;
+
+    var deferred_dropped: usize = 0;
+    enqueuePlayerCollisionImpactsToDeferred(
+        &pipeline,
+        &frame,
+        &data,
+        player.entity,
+        0,
+        &deferred_dropped,
+    );
+    try std.testing.expectEqual(@as(usize, 1), deferred_dropped);
+    try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.deferred_stimulus_count);
+}
+
+test "promote drops deferred impacts when live bus is already full" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+
+    for (0..stimulus_live_capacity) |i| {
+        try frame.appendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .dig,
+            .level = 0,
+        });
+    }
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+    pipeline.deferred_stimuli[0] = .{
+        .position = .{ .x = 200, .y = 0 },
+        .intensity = defaultStimulusIntensity(.impact),
+        .kind = .impact,
+        .level = 0,
+    };
+    pipeline.deferred_stimulus_count = 1;
+
+    var live_dropped: usize = 0;
+    const promoted = promoteDeferredStimuli(&pipeline, &frame, &live_dropped);
+    try std.testing.expectEqual(@as(usize, 0), promoted);
+    try std.testing.expectEqual(@as(usize, 1), live_dropped);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
+}
+
+test "player footstep drops when live bus is full" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    const body = data.movementBodyPtr(player.entity).?;
+    body.velocity_x.* = 120;
+    body.velocity_y.* = 0;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    for (0..stimulus_live_capacity) |i| {
+        try frame.appendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .dig,
+            .level = 0,
+        });
+    }
+
+    var live_dropped: usize = 0;
+    tryAppendPlayerFootstepStimulus(&frame, &data, player, &live_dropped);
+    try std.testing.expectEqual(@as(usize, 1), live_dropped);
+    try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
+}
+
+test "player collision impacts enqueue at most stimulus_max_impacts_per_step per step" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    const pbody = data.movementBodyPtr(player.entity).?;
+    pbody.position_x.* = 0;
+    pbody.position_y.* = 0;
+
+    const contact_count = stimulus_max_impacts_per_step + 4;
+    var others: [contact_count]EntityId = undefined;
+    for (&others, 0..) |*entity, i| {
+        entity.* = try data.createEntity();
+        try data.setMovementBody(entity.*, .{
+            .position = .{ .x = @floatFromInt(20 + i), .y = 0 },
+            .previous_position = .{ .x = @floatFromInt(20 + i), .y = 0 },
+            .velocity = .{},
+            .speed = 0,
+        });
+        try data.setCollisionBounds(entity.*, .{ .size = .{ .x = 32, .y = 32 } });
+    }
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.contacts.reserve(1, contact_count);
+    const writer = try frame.contacts.appendRangeCounts(1);
+    frame.contacts.addCount(writer, contact_count);
+    try frame.contacts.prefixAppendedRanges(writer);
+    var contact_writer = frame.contacts.rangeWriter(writer);
+    for (others, 0..) |other, i| {
+        contact_writer.write(.{
+            .a = player.entity,
+            .b = other,
+            .a_movement_index = 0,
+            .b_movement_index = @intCast(i + 1),
+            .normal_x = -1,
+            .normal_y = 0,
+            .penetration = @floatFromInt(4 + i),
+        });
+    }
+    contact_writer.finish();
+    frame.contacts.finishWrite();
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    var deferred_dropped: usize = 0;
+    enqueuePlayerCollisionImpactsToDeferred(
+        &pipeline,
+        &frame,
+        &data,
+        player.entity,
+        0,
+        &deferred_dropped,
+    );
+    try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), deferred_dropped);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    // First contact in merged order wins the first deferred slot (midpoint x = 10).
+    try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
 }

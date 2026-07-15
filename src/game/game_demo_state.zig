@@ -44,6 +44,7 @@ const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedM
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
@@ -430,9 +431,11 @@ pub const GameDemoState = struct {
         try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
         // Plane-traversal batches fall-landing tile events into this scratch (player +
-        // every AI agent can fall in one step). Dig emits at most one stimulus/step.
+        // every AI agent can fall in one step).
         try simulation_frame.reserveWorldTileChangesScratch(pop_cap.mover_count + 1);
-        try simulation_frame.stimuli.reserve(1, 1);
+        // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
+        // fixed live ceiling so optional emitters stay allocation-free after init.
+        try simulation_frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = pop_cap.mover_count,
             .static_obstacle_capacity = obstacle_count,

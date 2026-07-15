@@ -114,6 +114,9 @@ pub const Metric = enum {
     collision_response_contacts,
     collision_response_intents,
     collision_response_triggers,
+    stimuli_live_dropped,
+    stimuli_deferred_dropped,
+    stimuli_promoted,
     particle_active_before,
     particle_active_after,
     particle_removed,
@@ -607,7 +610,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_promoted={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
                 self.metricValue(.ai_entities),
@@ -624,6 +627,9 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.collision_contacts),
                 self.metricValue(.collision_response_intents),
                 self.metricValue(.collision_response_triggers),
+                self.metricValue(.stimuli_live_dropped),
+                self.metricValue(.stimuli_deferred_dropped),
+                self.metricValue(.stimuli_promoted),
                 self.metricValue(.particle_active_before),
                 averagePer(self.metricValue(.particle_active_before), update_count),
                 self.metricValue(.particle_active_after),

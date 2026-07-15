@@ -450,12 +450,52 @@ pub const CollisionContact = struct {
 /// cross-plane link to climb up.
 pub const DigIntent = enum { none, hole, ramp, down };
 
-pub const StimulusKind = enum { dig };
+/// Closed sensory-bus kind enum (Slice 39). Append tags when a real producer
+/// exists — no speculative empty tags, no strings. Kind is bus/metadata only
+/// for the AI path today: perception still writes position-only heard columns.
+pub const StimulusKind = enum {
+    dig,
+    footstep,
+    impact,
+};
+
+/// Default relative loudness per kind. Fixed constants, never scaled by map size.
+pub fn defaultStimulusIntensity(kind: StimulusKind) f32 {
+    return switch (kind) {
+        .dig => 1.0,
+        .impact => 0.85,
+        .footstep => 0.35,
+    };
+}
+
+/// Hearing soft-rank falloff: `score = intensity / (1 + dist2 * k)`.
+/// Fixed `k`, independent of world/map size. Higher score wins among stimuli
+/// that already pass same-level + hard hearing-range gates.
+pub const stimulus_hearing_falloff_k: f32 = 1.0 / (256.0 * 256.0);
+
+/// Soft ranking score for one stimulus vs an observer. Callers must already
+/// enforce same-level and hard `hearing_range` gates. `intensity <= 0` scores
+/// as non-selectable (-inf).
+pub fn stimulusHearingScore(intensity: f32, dist2: f32) f32 {
+    if (intensity <= 0) return -std.math.inf(f32);
+    return intensity / (1.0 + dist2 * stimulus_hearing_falloff_k);
+}
+
+/// Fixed per-step live-bus ceiling (world-size independent). Demo/pipeline
+/// warm `stimuli` to this; optional emitters drop when full.
+pub const stimulus_live_capacity: usize = 32;
+
+/// Pipeline deferred-impact buffer size (survives `beginStep` until promote).
+pub const stimulus_deferred_capacity: usize = 16;
+
+/// Max collision impacts enqueued into deferred storage in one step (may be less
+/// than `stimulus_deferred_capacity` so one step cannot fill the whole buffer).
+pub const stimulus_max_impacts_per_step: usize = 8;
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
-/// every step, so it carries no entity identity and is not a
-/// `SimulationEvent`. `intensity` is unused until a second producer exists to
-/// calibrate a falloff.
+/// every step on the live bus, so it carries no entity identity and is not a
+/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking
+/// (Slice 39); `kind` is producer metadata on the bus (not a perception column).
 pub const WorldStimulus = struct {
     position: math.Vec2,
     intensity: f32,
@@ -583,11 +623,21 @@ pub const SimulationFrame = struct {
         try self.world_tile_changes_scratch.ensureTotalCapacity(self.allocator, capacity);
     }
 
+    /// Live stimulus count already written this step (after any `prefix`/finish).
+    pub fn stimulusLiveCount(self: *const SimulationFrame) usize {
+        if (self.stimuli.prefix_ready) return self.stimuli.mergedItems().len;
+        var pending: usize = 0;
+        for (self.stimuli.counts.items) |count| pending += count;
+        return pending;
+    }
+
     /// Single-value append for main-thread producers (dig is not threaded).
-    /// `stimuli` is not part of `reserveStreams`: its per-step count is a fixed
-    /// producer invariant (dig emits at most one), not scene-scale-dependent.
-    /// Dig preflights via `ensureStimulusAppendCapacity` before world mutate;
-    /// demo init may also warm with `stimuli.reserve(1, 1)`.
+    /// Multi-producer bus (Slice 39): dig, footstep, and promoted deferred
+    /// impacts share this path. Dig preflights via `ensureStimulusAppendCapacity`
+    /// before world mutate; optional emitters use `tryAppendStimulus` so a full
+    /// bus drops sensory noise without failing the step. Demo/pipeline warm
+    /// with `stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity)`
+    /// (one range per append).
     pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
         const first_range = try self.stimuli.appendRangeCounts(1);
         self.stimuli.addCount(first_range, 1);
@@ -596,6 +646,16 @@ pub const SimulationFrame = struct {
         writer.write(stimulus);
         writer.finish();
         self.stimuli.finishWrite();
+    }
+
+    /// Capacity-aware optional append: drops when live count is already at
+    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
+    /// or when buffer growth fails after warmup (should not happen if reserved).
+    pub fn tryAppendStimulus(self: *SimulationFrame, stimulus: WorldStimulus, capacity: usize) bool {
+        if (capacity == 0 or self.stimulusLiveCount() >= capacity) return false;
+        self.ensureStimulusAppendCapacity(1) catch return false;
+        self.appendStimulus(stimulus) catch return false;
+        return true;
     }
 
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
@@ -1405,6 +1465,33 @@ test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems refl
     try std.testing.expectEqual(@as(u16, 1), merged[1].level);
 }
 
+test "stimulusHearingScore prefers nearer equal intensities and louder equal distances" {
+    try std.testing.expect(stimulusHearingScore(1.0, 20 * 20) > stimulusHearingScore(1.0, 40 * 40));
+    try std.testing.expect(stimulusHearingScore(1.0, 30 * 30) > stimulusHearingScore(0.35, 30 * 30));
+    try std.testing.expect(stimulusHearingScore(0, 0) < 0);
+}
+
+test "tryAppendStimulus drops when live capacity is full" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.stimuli.reserve(1, 4);
+
+    try std.testing.expect(frame.tryAppendStimulus(.{
+        .position = .{ .x = 0, .y = 0 },
+        .intensity = 1,
+        .kind = .dig,
+        .level = 0,
+    }, 1));
+    try std.testing.expect(!frame.tryAppendStimulus(.{
+        .position = .{ .x = 1, .y = 0 },
+        .intensity = 1,
+        .kind = .footstep,
+        .level = 0,
+    }, 1));
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+    try std.testing.expectEqual(StimulusKind.dig, frame.stimuli.mergedItems()[0].kind);
+}
+
 test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -1437,8 +1524,7 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    // Warm up: sizes stimuli's counts/offsets/write_offsets/values to one step's use.
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
     frame.clearRetainingCapacity();
 
     const original_allocator = frame.stimuli.allocator;
@@ -1463,6 +1549,60 @@ test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is alloca
 
     try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    // Representative multi-producer step: promoted impact + dig + footstep.
+    const kinds = [_]StimulusKind{ .impact, .dig, .footstep };
+    for (kinds, 0..) |kind, i| {
+        try frame.appendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = kind,
+            .level = 0,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 3), frame.stimuli.mergedItems().len);
+}
+
+test "tryAppendStimulus returns false at live capacity without allocating (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    for (0..stimulus_live_capacity) |i| {
+        try std.testing.expect(frame.tryAppendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .footstep,
+            .level = 0,
+        }, stimulus_live_capacity));
+    }
+    try std.testing.expectEqual(@as(usize, stimulus_live_capacity), frame.stimuli.mergedItems().len);
+    try std.testing.expect(!frame.tryAppendStimulus(.{
+        .position = .{ .x = 99, .y = 0 },
+        .intensity = 1,
+        .kind = .footstep,
+        .level = 0,
+    }, stimulus_live_capacity));
 }
 
 test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocation-free (FailingAllocator)" {

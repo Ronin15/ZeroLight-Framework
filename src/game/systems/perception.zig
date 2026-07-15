@@ -100,6 +100,7 @@ const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
+const stimulusHearingScore = @import("../simulation.zig").stimulusHearingScore;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
@@ -1545,12 +1546,20 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var heard_stimulus = false;
     var heard_x: f32 = 0;
     var heard_y: f32 = 0;
+    // Soft ranking (Slice 39): max intensity / (1 + dist2 * k) among same-level
+    // stimuli inside the hard hearing range. Equal intensities reduce to nearest.
+    // Kind is not stored on perception columns — bus-only metadata.
+    var best_score = -std.math.inf(f32);
     var best_dist2 = std.math.inf(f32);
     for (job.stimuli) |stim| {
         if (stim.level != observer_level) continue;
+        if (stim.intensity <= 0) continue;
         const dist2 = math.lengthSquared(.{ .x = stim.position.x - ox, .y = stim.position.y - oy });
-        if (dist2 <= hearing_range_sq and dist2 < best_dist2) {
+        if (dist2 > hearing_range_sq) continue;
+        const score = stimulusHearingScore(stim.intensity, dist2);
+        if (score > best_score or (score == best_score and dist2 < best_dist2)) {
             heard_stimulus = true;
+            best_score = score;
             best_dist2 = dist2;
             heard_x = stim.position.x;
             heard_y = stim.position.y;
@@ -2008,6 +2017,26 @@ test "hearing detects an in-range same-level stimulus" {
     try testing.expectEqual(@as(f32, 0), perception.heard_stimulus_y);
 }
 
+test "hearing ignores zero-intensity in-range stimulus" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 0, .kind = .dig, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
 test "hearing ignores an out-of-range stimulus" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -2071,6 +2100,63 @@ test "hearing picks the nearest of multiple in-range stimuli" {
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.heard_stimulus);
     try testing.expectEqual(@as(f32, 20), perception.heard_stimulus_x);
+}
+
+test "hearing intensity ranking prefers louder stimulus over nearer quieter one" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 100 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    // Near quiet footstep at x=10 vs far loud dig at x=50. With k = 1/256^2,
+    // intensity dominates modest distance differences within range.
+    const stimuli = [_]WorldStimulus{
+        .{ .position = .{ .x = 10, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 },
+        .{ .position = .{ .x = 50, .y = 0 }, .intensity = 1.0, .kind = .dig, .level = 0 },
+    };
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(perception.heard_stimulus);
+    // At k=1/65536: score(0.35, 100) ≈ 0.3495, score(1.0, 2500) ≈ 0.963 → dig wins.
+    try testing.expectEqual(@as(f32, 50), perception.heard_stimulus_x);
+}
+
+test "hearing acquires non-dig footstep and impact kinds" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const foot = [_]WorldStimulus{.{ .position = .{ .x = 25, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &foot });
+    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 25), data.aiPerceptionConst(observer).?.heard_stimulus_x);
+
+    // Clear heard by running with empty stimuli
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &.{} });
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+
+    const impact = [_]WorldStimulus{.{ .position = .{ .x = 15, .y = 0 }, .intensity = 0.85, .kind = .impact, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &impact });
+    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 15), data.aiPerceptionConst(observer).?.heard_stimulus_x);
 }
 
 test "LOS gating skips a blocked nearer candidate in favor of a farther clear one" {

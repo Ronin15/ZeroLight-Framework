@@ -141,7 +141,7 @@ before it is written fails the build instead of silently corrupting behavior.
 - Not every real ordering dependency is expressible as a `PipelineResource`
   read/write — two stages can depend on call order while sharing no tracked
   resource, and a transient stream with no `PipelineResource` tag at all (e.g.
-  the `WorldStimulus` values dig writes into `frame.stimuli` and
+  the `WorldStimulus` values producers write into `frame.stimuli` and
   `perception_update` reads the same step) carries a producer→consumer
   dependency the comptime check cannot see. Every such untagged same-step
   dependency is pinned by a causal-effect test co-located in
@@ -149,7 +149,9 @@ before it is written fails the build instead of silently corrupting behavior.
   produces an observably different result and asserts the correct one. See
   "pipeline commits the dig stage's world edit before the tile gate reads
   walkability in the same step", "pipeline commits the dig stage's stimulus
-  before perception reads it in the same step", "pipeline commits the dig
+  before perception reads it in the same step", "pipeline emits player footstep
+  stimulus before perception in the same step", "pipeline promotes deferred
+  impacts before perception on the following step", "pipeline commits the dig
   stage's world edit before plane traversal reads it in the same step",
   "pipeline runs ai_memory after perception and before ai, feeding memory into
   AI's cold-seek retarget", and "pipeline runs affect after perception and
@@ -198,14 +200,21 @@ part of the contract: count and write phases must stay consistent.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
 - `structural_commands`: deferred entity/component changes.
-- `stimuli`: transient per-step positional stimuli AI hearing can sense (e.g.
-  dig noise), read by `PerceptionSystem`. Cleared every `beginStep` and never
-  promoted to an event, since a stimulus carries no stable entity identity to
-  transition against. Appended via a dedicated `appendStimulus` single-value
-  helper rather than the batch `reserveStreams`/`reservePathRequests`
-  pattern: its per-step count is a fixed producer invariant (at most one,
-  from `DigController`), not scene-scale-dependent, so it grows lazily on
-  first use like `PerceptionSystem`'s own gather buffers.
+- `stimuli`: transient per-step positional sensory bus AI hearing can sense,
+  read by `PerceptionSystem`. Cleared every `beginStep` and never promoted to
+  an event, since a stimulus carries no stable entity identity to transition
+  against. **Producer phase (before `perception_update`):** the pipeline
+  promotes deferred impacts from the prior step, then `DigController.process`
+  may append `.dig`, then the pipeline may append at most one `.footstep`
+  when the player's movement body carries non-trivial velocity. **Deferred
+  producer:** player-involving collision contacts enqueue `.impact` into a
+  pipeline-owned fixed buffer after `collision_respond`; they are promoted
+  onto the live bus at the start of the *next* step so perception never reads
+  same-step impacts. Capacities are fixed constants (`stimulus_live_capacity`,
+  `stimulus_deferred_capacity`, `stimulus_max_impacts_per_step` in
+  `simulation.zig`); overflow drops newest optional/live entries
+  deterministically. Callers warm `stimuli` to `stimulus_live_capacity` during
+  state init (demo/pipeline), not scene-scale-derived counts.
 
 High-volume data should stay in its specialized stream. Do not collapse
 contacts, movement intents, navigation intents, path requests, render-prep
