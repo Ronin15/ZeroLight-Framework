@@ -521,7 +521,7 @@ pub const GameDemoState = struct {
         var input_timer = StageTimer.start();
         try self.player.applyInput(&self.data, context.input);
         self.pipeline.captureDigIntent(context.input, &self.simulation_frame);
-        self.pipeline.captureActionIntent(context.input, &self.simulation_frame, self.player.entity);
+        self.pipeline.captureActionIntent(context.input, &self.simulation_frame, self.player, &self.data, &self.world);
         input_timer.stop(context.perf, .gameplay_input);
 
         var ambient_audio_timer = StageTimer.start();

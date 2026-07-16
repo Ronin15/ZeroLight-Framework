@@ -3922,8 +3922,10 @@ pub/sub bus.
 
 - `ActionKind` / `ActionIntent` (scalar/enum only) and
   `action_intents: RangeOutputStream(ActionIntent)` on `SimulationFrame`.
-- `SimulationIntent` gained an `action` variant for typed evolution; producers
-  write **only** to `action_intents` (no dual-write into `intents`).
+- Producers write **only** to the specialized `action_intents` stream.
+  `SimulationIntent` stays movement-only (`union(enum){ movement }`) — no
+  dual-write into `intents` and no dead `action` union arm on the hot
+  movement-intent stream.
 - Fixed capacity `action_intent_live_capacity` (64); dual-axis warm
   `reserveActionIntents(cap, cap)` (one range per sequential append, like
   stimuli); `appendActionIntent` / `tryAppendActionIntent`.

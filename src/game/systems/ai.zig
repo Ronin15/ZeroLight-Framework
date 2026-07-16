@@ -2170,6 +2170,59 @@ test "ai investigate targets world interest marker without entity goal" {
     try std.testing.expect(intents[0].direct_direction_x > 0);
 }
 
+test "ai investigate ignores cover resource and patrol markers for goals" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{ .kind = .cover, .level = 0, .x = 200, .y = 50, .radius = 256 });
+    _ = try markers.addMarker(.{ .kind = .resource, .level = 0, .x = 210, .y = 50, .radius = 256 });
+    _ = try markers.addMarker(.{ .kind = .patrol, .level = 0, .x = 220, .y = 50, .radius = 256 });
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setWorldLevel(entity, 0);
+    try data.setAiAgent(entity, .{
+        .active_behavior = .investigate,
+        .wander_amplitude = 0,
+        .gain_investigate = 2.0,
+        .gain_wander = 0,
+    });
+    try data.setAiAffect(entity, .{ .curiosity = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 0x41,
+        .affect_slice = data.aiAffectSliceConst(),
+        .interest_markers = &markers,
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expect(intents[0].goal.x != 200);
+    try std.testing.expect(intents[0].goal.x != 210);
+    try std.testing.expect(intents[0].goal.x != 220);
+}
+
 test "ai null interest_markers leaves investigate on stimulus and ring only" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();

@@ -21,6 +21,7 @@ const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
+const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const AudioController = @import("audio_controller.zig").AudioController;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
@@ -55,6 +56,8 @@ const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntens
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const stimulus_max_impacts_per_step = @import("simulation.zig").stimulus_max_impacts_per_step;
+const stimulus_sticky_capacity = @import("simulation.zig").stimulus_sticky_capacity;
+const cognition_stagger_n = @import("simulation_scope.zig").cognition_stagger_n;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SimulationScope = @import("simulation_scope.zig").SimulationScope;
 const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
@@ -128,11 +131,11 @@ const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
 fn stageContract(stage: StageId) StageContract {
     return switch (stage) {
         .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
-        // Contract-only handoff: real appends happen in `main_thread_inputs`
-        // via `captureActionIntent` before `update` (not at this stage's wall
-        // clock). Declared early so `action_react` can read the resource under
-        // the comptime producer graph. Stage order is not the wall-clock emit
-        // site — dig process still runs first inside `update`.
+        // Contract-only resource handoff — NOT a wall-clock stage body.
+        // Wall-clock emit: `main_thread_inputs` → `captureActionIntent` before
+        // `update()` (before dig). `stage_order` may list this tag after dig for
+        // graph bookkeeping only; do not schedule dig-dependent action logic
+        // as if capture runs after dig process.
         .action_intent_capture => .{ .reads = .empty, .writes = resources(&.{.action_intents}) },
         .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_scope_indices}) },
         .spatial_index_build => .{ .reads = resources(&.{.ai_scope_indices}), .writes = resources(&.{.spatial_index}) },
@@ -458,6 +461,12 @@ fn metric(value: usize) u64 {
 /// Squared speed threshold for emitting one player footstep per step.
 const footstep_velocity_sq_threshold: f32 = 1.0;
 
+/// Minimum penetration before a zero-velocity contact may still enqueue impact
+/// (only when relative velocity is also non-trivial).
+const impact_min_penetration: f32 = 1.0;
+
+const hearing_stimuli_scratch_capacity: usize = stimulus_live_capacity + stimulus_sticky_capacity;
+
 fn contactInvolvesEntity(contact: CollisionContact, entity: EntityId) bool {
     return contact.a.eql(entity) or contact.b.eql(entity);
 }
@@ -476,6 +485,25 @@ fn impactStimulusIntensity(contact: CollisionContact) f32 {
     return defaultStimulusIntensity(.impact) * scale;
 }
 
+fn contactRelativeVelocitySq(data: *const DataSystem, contact: CollisionContact) ?f32 {
+    const a = data.movementBodyConst(contact.a) orelse return null;
+    const b = data.movementBodyConst(contact.b) orelse return null;
+    const rel_x = a.velocity.x - b.velocity.x;
+    const rel_y = a.velocity.y - b.velocity.y;
+    return rel_x * rel_x + rel_y * rel_y;
+}
+
+fn contactEligibleForImpactStimulus(data: *const DataSystem, contact: CollisionContact) bool {
+    const a = data.movementBodyConst(contact.a) orelse return false;
+    const b = data.movementBodyConst(contact.b) orelse return false;
+    const vel_a_sq = a.velocity.x * a.velocity.x + a.velocity.y * a.velocity.y;
+    const vel_b_sq = b.velocity.x * b.velocity.x + b.velocity.y * b.velocity.y;
+    if (vel_a_sq >= footstep_velocity_sq_threshold or vel_b_sq >= footstep_velocity_sq_threshold) return true;
+    if (contact.penetration < impact_min_penetration) return false;
+    const rel_sq = contactRelativeVelocitySq(data, contact) orelse return false;
+    return rel_sq >= footstep_velocity_sq_threshold;
+}
+
 /// Moves pipeline-deferred impacts onto the live per-step bus before perception.
 fn promoteDeferredStimuli(
     pipeline: *SimulationPipeline,
@@ -484,15 +512,63 @@ fn promoteDeferredStimuli(
 ) usize {
     const pending = pipeline.deferred_stimulus_count;
     var promoted: usize = 0;
+    var retained: usize = 0;
     for (pipeline.deferred_stimuli[0..pending]) |stimulus| {
         if (frame.tryAppendStimulus(stimulus, stimulus_live_capacity)) {
             promoted += 1;
         } else {
+            pipeline.deferred_stimuli[retained] = stimulus;
+            retained += 1;
             live_dropped.* += 1;
         }
     }
-    pipeline.deferred_stimulus_count = 0;
+    pipeline.deferred_stimulus_count = retained;
     return promoted;
+}
+
+fn rebuildHearingStimuliScratch(pipeline: *SimulationPipeline, frame: *const SimulationFrame) []const WorldStimulus {
+    const live = frame.stimuli.mergedItems();
+    var len: usize = 0;
+    for (live) |stimulus| {
+        std.debug.assert(len < hearing_stimuli_scratch_capacity);
+        pipeline.hearing_stimuli_scratch[len] = stimulus;
+        len += 1;
+    }
+    for (0..pipeline.sticky_count) |i| {
+        if (pipeline.sticky_remaining[i] == 0) continue;
+        std.debug.assert(len < hearing_stimuli_scratch_capacity);
+        pipeline.hearing_stimuli_scratch[len] = pipeline.sticky_stimuli[i];
+        len += 1;
+    }
+    pipeline.hearing_stimuli_scratch_len = len;
+    return pipeline.hearing_stimuli_scratch[0..len];
+}
+
+fn ageStickyStimuli(pipeline: *SimulationPipeline) void {
+    var write: usize = 0;
+    for (0..pipeline.sticky_count) |i| {
+        const remaining = pipeline.sticky_remaining[i];
+        if (remaining <= 1) continue;
+        pipeline.sticky_stimuli[write] = pipeline.sticky_stimuli[i];
+        pipeline.sticky_remaining[write] = remaining - 1;
+        write += 1;
+    }
+    pipeline.sticky_count = write;
+}
+
+fn captureOneShotStickyFromLiveBus(pipeline: *SimulationPipeline, frame: *const SimulationFrame) void {
+    const linger = cognition_stagger_n - 1;
+    if (linger == 0) return;
+    for (frame.stimuli.mergedItems()) |stimulus| {
+        switch (stimulus.kind) {
+            .dig, .impact => {},
+            .footstep => continue,
+        }
+        if (pipeline.sticky_count >= stimulus_sticky_capacity) continue;
+        pipeline.sticky_stimuli[pipeline.sticky_count] = stimulus;
+        pipeline.sticky_remaining[pipeline.sticky_count] = linger;
+        pipeline.sticky_count += 1;
+    }
 }
 
 /// At most one footstep when the player's movement body carries non-trivial velocity.
@@ -525,8 +601,12 @@ fn enqueuePlayerCollisionImpactsToDeferred(
 ) void {
     var enqueued: usize = 0;
     for (frame.contacts.mergedItems()) |contact| {
-        if (enqueued >= stimulus_max_impacts_per_step) break;
         if (!contactInvolvesEntity(contact, player_entity)) continue;
+        if (!contactEligibleForImpactStimulus(data, contact)) continue;
+        if (enqueued >= stimulus_max_impacts_per_step) {
+            deferred_dropped.* += 1;
+            continue;
+        }
         const position = contactStimulusPosition(data, contact) orelse continue;
         if (pipeline.deferred_stimulus_count >= stimulus_deferred_capacity) {
             deferred_dropped.* += 1;
@@ -587,6 +667,12 @@ pub const SimulationPipeline = struct {
     /// until promoted before perception on the next `update`.
     deferred_stimuli: [stimulus_deferred_capacity]WorldStimulus = undefined,
     deferred_stimulus_count: usize = 0,
+    /// One-shot dig/impact linger for cognition stagger (not cleared on `beginStep`).
+    sticky_stimuli: [stimulus_sticky_capacity]WorldStimulus = undefined,
+    sticky_remaining: [stimulus_sticky_capacity]u8 = undefined,
+    sticky_count: usize = 0,
+    hearing_stimuli_scratch: [hearing_stimuli_scratch_capacity]WorldStimulus = undefined,
+    hearing_stimuli_scratch_len: usize = 0,
     /// Rising-edge latch for `Action.interact` (one press per fixed step).
     /// Advanced only after a successful append so a soft-dropped press can retry.
     interact_held_last: bool = false,
@@ -816,13 +902,29 @@ pub const SimulationPipeline = struct {
     /// Captures non-locomotion action intents on held-input rising edges. Called
     /// in the main-thread input phase alongside `captureDigIntent`. On soft-drop
     /// (full bus), the latch stays open so a later step can retry while held.
-    pub fn captureActionIntent(self: *SimulationPipeline, input: *const InputState, frame: *SimulationFrame, player_entity: EntityId) void {
+    pub fn captureActionIntent(
+        self: *SimulationPipeline,
+        input: *const InputState,
+        frame: *SimulationFrame,
+        player: Player,
+        data: *const DataSystem,
+        world: *const WorldSystem,
+    ) void {
         const interact_held = input.isHeld(.interact);
         if (interact_held and !self.interact_held_last) {
-            const appended = frame.tryAppendActionIntent(.{
-                .entity = player_entity,
+            const ActionIntent = @import("simulation.zig").ActionIntent;
+            var intent: ActionIntent = .{
+                .entity = player.entity,
                 .kind = .interact,
-            }, action_intent_live_capacity);
+            };
+            // Same faced-cell probe as dig so Slice 45 consumers match dig targeting.
+            if (facedCellForEntity(world, data, player.entity)) |cell| {
+                intent.level = player.current_level;
+                intent.cell_x = cell.x;
+                intent.cell_y = cell.y;
+                intent.has_cell = true;
+            }
+            const appended = frame.tryAppendActionIntent(intent, action_intent_live_capacity);
             if (appended) {
                 self.interact_held_last = true;
             } else {
@@ -904,14 +1006,17 @@ pub const SimulationPipeline = struct {
         else
             null;
 
+        const hearing_stimuli = rebuildHearingStimuliScratch(self, frame);
         var perception_timer = StageTimer.start();
         const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
             .scope_dense_indices = ai_indices,
             .player_candidate = perception_player_candidate,
-            .stimuli = frame.stimuli.mergedItems(),
+            .stimuli = hearing_stimuli,
             .max_events_per_step = self.perception_max_events_per_step,
         });
         perception_timer.stop(context.perf, .pipeline_perception);
+        ageStickyStimuli(self);
+        captureOneShotStickyFromLiveBus(self, frame);
 
         // Decays staleness/familiarity/ring contacts and refreshes from this
         // step's perception acquisition events, over the same cognition-scoped
@@ -2706,6 +2811,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
@@ -2842,8 +2948,8 @@ test "pipeline defers player collision impacts until the next step" {
     try data.setMovementBody(blocker, .{
         .position = .{ .x = 110, .y = 100 },
         .previous_position = .{ .x = 110, .y = 100 },
-        .velocity = .{},
-        .speed = 0,
+        .velocity = .{ .x = -80, .y = 0 },
+        .speed = 80,
     });
     try data.setCollisionBounds(blocker, .{ .size = .{ .x = 32, .y = 32 } });
     try data.setSimulationTier(blocker, .locomotion);
@@ -3003,6 +3109,9 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
     defer data.deinit();
     const player = try Player.spawn(&data);
     try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    const pbody = data.movementBodyPtr(player.entity).?;
+    pbody.velocity_x.* = 50;
+    pbody.velocity_y.* = 0;
     const other = try data.createEntity();
     try data.setMovementBody(other, .{
         .position = .{ .x = 10, .y = 10 },
@@ -3099,7 +3208,7 @@ test "promote drops deferred impacts when live bus is already full" {
     const promoted = promoteDeferredStimuli(&pipeline, &frame, &live_dropped);
     try std.testing.expectEqual(@as(usize, 0), promoted);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
 
@@ -3137,6 +3246,8 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
     const pbody = data.movementBodyPtr(player.entity).?;
     pbody.position_x.* = 0;
     pbody.position_y.* = 0;
+    pbody.velocity_x.* = 50;
+    pbody.velocity_y.* = 0;
 
     const contact_count = stimulus_max_impacts_per_step + 4;
     var others: [contact_count]EntityId = undefined;
@@ -3195,7 +3306,7 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
         &deferred_dropped,
     );
     try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.deferred_stimulus_count);
-    try std.testing.expectEqual(@as(usize, 0), deferred_dropped);
+    try std.testing.expectEqual(@as(usize, 4), deferred_dropped);
     try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
     // First contact in merged order wins the first deferred slot (midpoint x = 10).
     try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
@@ -3220,6 +3331,15 @@ test "consumeActionIntentsStub counts merged action intents" {
 test "captureActionIntent appends interact on rising edge only and does not dual-write intents" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
+    const player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
@@ -3238,28 +3358,93 @@ test "captureActionIntent appends interact on rising edge only and does not dual
     });
     defer pipeline.deinit();
 
-    const player_entity = EntityId{ .index = 1, .generation = 1 };
     var input = InputState{};
     input.setHeld(.interact, true);
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
     try std.testing.expectEqual(@import("simulation.zig").ActionKind.interact, frame.action_intents.mergedItems()[0].kind);
     try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
 
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
 
     input.setHeld(.interact, false);
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     input.setHeld(.interact, true);
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, 2), frame.actionIntentLiveCount());
     try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
+}
+
+test "captureActionIntent stamps faced cell matching dig targeting" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    // Large enough that body at (96,96) facing right probes cell (4,3) in-bounds
+    // (same fixture geometry as dig_controller faced-cell tests).
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 8,
+        .height = 8,
+        .tile_size = 32,
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    placePlayerFlush(&data, player, .{ 3, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+    player.current_level = 2;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 256, 256, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
+
+    const intent = frame.action_intents.mergedItems()[0];
+    try std.testing.expect(intent.has_cell);
+    try std.testing.expectEqual(@as(u16, 4), intent.cell_x);
+    try std.testing.expectEqual(@as(u16, 3), intent.cell_y);
+    try std.testing.expectEqual(@as(u16, 2), intent.level);
+
+    // Facing change must move the stamp (shared dig helper).
+    frame.beginStep();
+    pipeline.interact_held_last = false;
+    data.facingPtr(player.entity).?.* = .down;
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
+    const down_intent = frame.action_intents.mergedItems()[0];
+    try std.testing.expect(down_intent.has_cell);
+    try std.testing.expectEqual(@as(u16, 3), down_intent.cell_x);
+    try std.testing.expectEqual(@as(u16, 4), down_intent.cell_y);
 }
 
 test "captureActionIntent keeps latch open when tryAppend soft-drops" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
+    const player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
@@ -3281,16 +3466,15 @@ test "captureActionIntent keeps latch open when tryAppend soft-drops" {
     });
     defer pipeline.deinit();
 
-    const player_entity = EntityId{ .index = 1, .generation = 1 };
     var input = InputState{};
     input.setHeld(.interact, true);
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, action_intent_live_capacity), frame.actionIntentLiveCount());
     try std.testing.expectEqual(@as(usize, 1), pipeline.action_intents_dropped_step);
     try std.testing.expect(!pipeline.interact_held_last);
 
     // Still held: rising-edge path retries (latch never advanced on soft-drop).
-    pipeline.captureActionIntent(&input, &frame, player_entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, 2), pipeline.action_intents_dropped_step);
 }
 
@@ -3334,7 +3518,7 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     frame.beginStep();
     var input = InputState{};
     input.setHeld(.interact, true);
-    pipeline.captureActionIntent(&input, &frame, player.entity);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
     try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
 
     const stats = try pipeline.update(.{
@@ -3349,4 +3533,255 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     });
     try std.testing.expectEqual(@as(usize, 1), stats.action_intents_consumed);
     try std.testing.expectEqual(@as(usize, 0), stats.action_intents_dropped);
+}
+
+test "captureActionIntent soft-drop recovers after beginStep while held" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    for (0..action_intent_live_capacity) |_| {
+        try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .signal });
+    }
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
+    try std.testing.expect(!pipeline.interact_held_last);
+
+    frame.beginStep();
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
+    try std.testing.expect(pipeline.interact_held_last);
+    try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
+}
+
+test "pipeline.update reports action_intents_dropped after capture soft-drop" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    for (0..action_intent_live_capacity) |_| {
+        try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .signal });
+    }
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player, &data, &world);
+
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.action_intents_dropped);
+}
+
+test "standing player collision does not enqueue deferred impact without motion" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    const other = try data.createEntity();
+    try data.setMovementBody(other, .{
+        .position = .{ .x = 10, .y = 10 },
+        .previous_position = .{ .x = 10, .y = 10 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(other, .{ .size = .{ .x = 32, .y = 32 } });
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.contacts.reserve(1, 1);
+    const writer = try frame.contacts.appendRangeCounts(1);
+    frame.contacts.addCount(writer, 1);
+    try frame.contacts.prefixAppendedRanges(writer);
+    var contact_writer = frame.contacts.rangeWriter(writer);
+    contact_writer.write(.{
+        .a = player.entity,
+        .b = other,
+        .a_movement_index = 0,
+        .b_movement_index = 1,
+        .normal_x = -1,
+        .normal_y = 0,
+        .penetration = 6,
+    });
+    contact_writer.finish();
+    frame.contacts.finishWrite();
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    var deferred_dropped: usize = 0;
+    enqueuePlayerCollisionImpactsToDeferred(&pipeline, &frame, &data, player.entity, 0, &deferred_dropped);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+}
+
+test "sticky dig linger lets stagger phase-1 observer hear after phase-0 dig step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 800, .h = 450 }, cognition_halo_chunks);
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    const dig_stimulus_x: f32 = 6 * 32 + 16;
+    const dig_stimulus_y: f32 = 3 * 32 + 16;
+
+    const observer_phase0 = try data.createEntity();
+    try data.setMovementBody(observer_phase0, .{
+        .position = .{ .x = 7 * 32, .y = 3 * 32 },
+        .previous_position = .{ .x = 7 * 32, .y = 3 * 32 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setAiAgent(observer_phase0, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer_phase0, 0);
+    try data.setSimulationTier(observer_phase0, .cognition);
+    try data.setAiPerception(observer_phase0, .{ .hearing_range = 1000 });
+    try data.setSimulationMetadata(observer_phase0, .{ .tier = .cognition, .chunk = .{ .x = 0, .y = 0 }, .stagger_phase = 0 });
+
+    const observer_phase1 = try data.createEntity();
+    try data.setMovementBody(observer_phase1, .{
+        .position = .{ .x = 7 * 32, .y = 4 * 32 },
+        .previous_position = .{ .x = 7 * 32, .y = 4 * 32 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setAiAgent(observer_phase1, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(observer_phase1, 0);
+    try data.setSimulationTier(observer_phase1, .cognition);
+    try data.setAiPerception(observer_phase1, .{ .hearing_range = 1000 });
+    try data.setSimulationMetadata(observer_phase1, .{ .tier = .cognition, .chunk = .{ .x = 0, .y = 0 }, .stagger_phase = 1 });
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .dig = dig_config,
+        .perception_max_events_per_step = 8,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    const ctx = SimulationPipelineUpdateContext{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    };
+
+    // Next advance lands on stagger slot 0 (phase-0 cohort); dig once there.
+    pipeline.scope.step_count = 3;
+    try data.setAiPerception(observer_phase1, .{ .hearing_range = 1000 });
+    frame.beginStep();
+    frame.dig_intent = .hole;
+    _ = try pipeline.update(ctx);
+    try std.testing.expect(data.aiPerceptionConst(observer_phase0).?.heard_stimulus);
+    try std.testing.expect(!data.aiPerceptionConst(observer_phase1).?.heard_stimulus);
+
+    // Following step runs stagger slot 1; sticky dig should reach phase-1.
+    frame.beginStep();
+    frame.dig_intent = .none;
+    _ = try pipeline.update(ctx);
+    try std.testing.expect(data.aiPerceptionConst(observer_phase1).?.heard_stimulus);
+    try std.testing.expectApproxEqAbs(dig_stimulus_x, data.aiPerceptionConst(observer_phase1).?.heard_stimulus_x, 1.0);
+    try std.testing.expectApproxEqAbs(dig_stimulus_y, data.aiPerceptionConst(observer_phase1).?.heard_stimulus_y, 1.0);
 }

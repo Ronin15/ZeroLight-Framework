@@ -505,6 +505,25 @@ test "InterestMarkerStore is allocation-free by fixed inline storage" {
     _ = store.queryMarkersInRadius(0, 0, 0, 64, null, &hits, 4);
 }
 
+test "InterestMarkerStore queryMarkersInRadius caps at interest_query_max_k" {
+    var store = InterestMarkerStore.init(testing.allocator);
+    defer store.deinit(testing.allocator);
+
+    for (0..5) |i| {
+        _ = try store.addMarker(.{
+            .kind = .investigate,
+            .level = 0,
+            .x = @floatFromInt(i * 10),
+            .y = 0,
+            .radius = 1,
+        });
+    }
+
+    var hits: [8]InterestMarkerHit = undefined;
+    const n = store.queryMarkersInRadius(0, 0, 0, 500, null, &hits, 8);
+    try testing.expectEqual(interest_query_max_k, n);
+}
+
 test "InterestMarkerStore rejects invalid radius and non-finite position" {
     var store = InterestMarkerStore.init(testing.allocator);
     defer store.deinit(testing.allocator);

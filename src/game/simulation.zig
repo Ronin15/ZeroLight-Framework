@@ -452,7 +452,6 @@ pub const action_intent_live_capacity: usize = 64;
 
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
-    action: ActionIntent,
 };
 
 pub const CollisionContact = struct {
@@ -517,6 +516,11 @@ pub const stimulus_deferred_capacity: usize = 16;
 /// Max collision impacts enqueued into deferred storage in one step (may be less
 /// than `stimulus_deferred_capacity` so one step cannot fill the whole buffer).
 pub const stimulus_max_impacts_per_step: usize = 8;
+
+/// Pipeline-owned sticky one-shot dig/impact linger slots (world-size independent).
+/// One-shots linger `cognition_stagger_n` hearing windows so each stagger cohort
+/// gets a chance; footsteps stay live-bus only.
+pub const stimulus_sticky_capacity: usize = 16;
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
 /// every step on the live bus, so it carries no entity identity and is not a

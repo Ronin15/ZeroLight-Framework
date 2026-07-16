@@ -119,15 +119,7 @@ pub const DigController = struct {
         std.debug.assert(self.ramp_tile != invalid_tile_id);
         std.debug.assert(self.tunnel_tile != invalid_tile_id);
 
-        const body = data.movementBodyConst(player.entity) orelse return;
-        const facing = data.facingConst(player.entity) orelse return;
-        const visual = data.primitiveVisualConst(player.entity) orelse return;
-
-        const offset = facingOffset(facing.direction);
-        const faced_x = body.position.x + visual.size.x * 0.5 + offset.x * world.tile_size;
-        const faced_y = body.position.y + visual.size.y * 0.5 + offset.y * world.tile_size;
-        const target = world.cellContaining(faced_x, faced_y) orelse return;
-        const cell = CellCoord{ .x = target.x, .y = target.y };
+        const cell = facedCellForEntity(world, data, player.entity) orelse return;
 
         const floor_layer = world.denseFloorLayerForLevel(player.current_level) orelse return;
         // Intentional no-ops that never mutate return before the event preflight
@@ -314,6 +306,25 @@ fn setEntityLevel(world: *const WorldSystem, data: *DataSystem, entity: EntityId
     body.position_y.* = snap_y;
     body.previous_x.* = snap_x;
     body.previous_y.* = snap_y;
+}
+
+/// World cell the entity faces from body center + facing × tile size.
+/// Null when body/facing/visual is missing or the probe is off-world.
+/// Shared by dig process and action-intent capture so interact/destructible
+/// targets stay aligned with dig's faced-cell contract.
+pub fn facedCellForEntity(
+    world: *const WorldSystem,
+    data: *const DataSystem,
+    entity: EntityId,
+) ?CellCoord {
+    const body = data.movementBodyConst(entity) orelse return null;
+    const facing = data.facingConst(entity) orelse return null;
+    const visual = data.primitiveVisualConst(entity) orelse return null;
+    const offset = facingOffset(facing.direction);
+    const faced_x = body.position.x + visual.size.x * 0.5 + offset.x * world.tile_size;
+    const faced_y = body.position.y + visual.size.y * 0.5 + offset.y * world.tile_size;
+    const target = world.cellContaining(faced_x, faced_y) orelse return null;
+    return .{ .x = target.x, .y = target.y };
 }
 
 fn facingOffset(direction: Facing) math.Vec2 {

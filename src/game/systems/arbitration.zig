@@ -599,6 +599,17 @@ test "resolveGoal flee inverts direction away from the threat position" {
     try testing.expectApproxEqAbs(@as(f32, -flee_lead_distance), goal.goal_x, 1e-3);
 }
 
+test "scoreBehaviors investigate interest marker bonus is 0.35 with unit gains" {
+    const signals = Signals{
+        .interest_present = true,
+        .interest_x = 10,
+        .interest_y = 0,
+    };
+    const scores = scoreBehaviors(signals, unitGains());
+    const investigate_idx = @intFromEnum(AiBehavior.investigate);
+    try testing.expectApproxEqAbs(investigate_interest_marker_bonus, scores[investigate_idx], 0.001);
+}
+
 test "resolveGoal investigate prefers stimulus over interest marker over ring memory" {
     var signals = Signals{
         .heard_stimulus = true,

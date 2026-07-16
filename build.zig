@@ -160,9 +160,6 @@ pub fn build(b: *std.Build) void {
     // dead-code elimination when the target supports it (see `release_lto`).
     if (release_lto) {
         exe.lto = .full;
-        gpu_smoke_exe.lto = .full;
-        bench_exe.lto = .full;
-        unit_tests.lto = .full;
     }
 
     b.installArtifact(exe);

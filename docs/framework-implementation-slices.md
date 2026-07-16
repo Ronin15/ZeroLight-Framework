@@ -1173,8 +1173,7 @@ content.
 
 - Archive **Slice 40** landed `ActionIntent` / `ActionKind`,
   `SimulationFrame.action_intents` (`RangeOutputStream`),
-  `SimulationIntent.action` (union variant; producers write **only** the
-  specialized stream), `action_intent_capture` + stub `action_react`, and
+  specialized stream only (no `SimulationIntent` dual-write), `action_intent_capture` + stub `action_react`, and
   player **R** rising-edge interact capture. Replace the stub consumer — do
   not invent a second bus.
 - `src/game/dig_controller.zig` is the template for a pipeline-owned controller

@@ -49,8 +49,8 @@ current working directory; (2) the same relative root resolved from the
 directory containing the executable (exe-relative fallback). The fallback fires
 only when the configured root directory does not exist at all, not when
 individual files are missing. To use it, place a full `assets/` tree beside
-the binary, or invoke with `-Dasset-root=<absolute-path>` at build time to
-bake an absolute path into the binary.
+the binary. The asset root must stay a **relative**, traversal-safe path
+(default `assets`); `AppConfig` rejects absolute roots at startup.
 
 ## Release Modes
 
@@ -74,10 +74,10 @@ backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
 bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
 discipline rules for the `FailingAllocator` proof-test coverage this requires
 before hot-path code can rely on it safely. On non-Mach-O targets
-(Linux/Windows), `build.zig` also enables full link-time optimization
-(`-flto=full`) for every Compile step in `ReleaseFast` (app, gpu-smoke,
-benchmarks, and unit-test binaries) and forces the LLVM backend plus LLD,
-which LTO requires. Mach-O targets (macOS) skip LTO in Zig 0.16 because
+(Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
+for the shipped **app executable only** in `ReleaseFast` and forces the LLVM
+backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
+binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.16 because
 LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
 local iteration and size-focused builds stay predictable. Before cutting a
 ReleaseFast release candidate, run an extended soak session in

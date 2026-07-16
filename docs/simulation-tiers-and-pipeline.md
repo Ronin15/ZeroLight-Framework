@@ -214,9 +214,8 @@ part of the contract: count and write phases must stay consistent.
   `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
   (one range slot per sequential append, same shape as stimuli). Optional
   producers use `tryAppendActionIntent` so a full bus drops cleanly.
-- `intents`: movement intents (`SimulationIntent.movement`); the union also
-  carries an `action` variant for typed movement-stream evolution, but action
-  producers must use `action_intents` instead of dual-writing here.
+- `intents`: movement intents (`SimulationIntent.movement` only). Non-locomotion
+  producers must use `action_intents` — never dual-write here.
 - `path_requests`: frame-delayed pathfinding requests.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
@@ -228,10 +227,15 @@ part of the contract: count and write phases must stay consistent.
   promotes deferred impacts from the prior step, then `DigController.process`
   may append `.dig`, then the pipeline may append at most one `.footstep`
   when the player's movement body carries non-trivial velocity. **Deferred
-  producer:** player-involving collision contacts enqueue `.impact` into a
-  pipeline-owned fixed buffer after `collision_respond`; they are promoted
-  onto the live bus at the start of the *next* step so perception never reads
-  same-step impacts. Capacities are fixed constants (`stimulus_live_capacity`,
+  producer:** player-involving collision contacts with non-trivial relative
+  motion (or penetration plus relative velocity above fixed thresholds) enqueue
+  `.impact` into a pipeline-owned fixed buffer after `collision_respond`; they
+  are promoted onto the live bus at the start of the *next* step so perception
+  never reads same-step impacts. **Sticky one-shots:** after `perception_update`,
+  the pipeline captures live `.dig` and `.impact` into a fixed sticky buffer for
+  `cognition_stagger_n - 1` additional steps (feeds a hearing scratch merged
+  with the live bus before perception). Footsteps are live-only. Capacities are
+  fixed constants (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
   `stimulus_deferred_capacity`, `stimulus_max_impacts_per_step` in
   `simulation.zig`); overflow drops newest optional/live entries
   deterministically. Callers warm `stimuli` to `stimulus_live_capacity` during
