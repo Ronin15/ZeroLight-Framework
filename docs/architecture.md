@@ -508,6 +508,11 @@ processors with typed `DataSystem` views. They should not become hidden
 per-entity stores, own renderer/audio/SDL handles, or replace SoA processors for
 hot/reusable loops.
 
+Non-locomotion player/AI requests flow through `SimulationFrame.action_intents`
+(Slice 40), consumed at explicit `action_react` pipeline stages by combat/rules
+controllers — not through `NavigationIntent` or the pathfinder. Locomotion stays
+on `navigation_intents` → steering → `intents` (movement).
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are

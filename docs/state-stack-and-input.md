@@ -164,6 +164,7 @@ Held gameplay input:
 - `digHole`
 - `digRamp`
 - `digDown`
+- `interact`
 
 One-frame commands:
 
@@ -185,6 +186,7 @@ Default bindings are:
 
 - WASD for movement
 - E/Q/F for dig hole/ramp/down
+- R for interact (rising-edge action intent in gameplay; Slice 40 substrate)
 - Arrow keys for menu navigation (up/down/left/right)
 - P for pause or resume
 - Enter or Space for resume (also used as confirm/activate inside menus)

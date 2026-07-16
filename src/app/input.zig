@@ -22,6 +22,7 @@ pub const Action = enum(usize) {
     dig_hole,
     dig_ramp,
     dig_down,
+    interact,
 };
 
 const action_count = @typeInfo(Action).@"enum".fields.len;
@@ -48,6 +49,7 @@ pub const default_key_bindings = [_]KeyBinding{
     .{ .key = c.SDLK_E, .action = .dig_hole },
     .{ .key = c.SDLK_Q, .action = .dig_ramp },
     .{ .key = c.SDLK_F, .action = .dig_down },
+    .{ .key = c.SDLK_R, .action = .interact },
 };
 
 pub const GamepadButtonBinding = struct {
@@ -67,6 +69,7 @@ pub const default_gamepad_bindings = [_]GamepadButtonBinding{
     .{ .button = c.SDL_GAMEPAD_BUTTON_NORTH, .action = .dig_ramp },
     .{ .button = c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, .action = .dig_down },
     .{ .button = c.SDL_GAMEPAD_BUTTON_BACK, .action = .toggle_debug_overlay },
+    .{ .button = c.SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, .action = .interact },
 };
 
 /// Radial deadzone applied to the raw left-stick axes before they contribute
@@ -95,6 +98,7 @@ pub const InputState = struct {
         self.held_actions.set(.dig_hole, false);
         self.held_actions.set(.dig_ramp, false);
         self.held_actions.set(.dig_down, false);
+        self.held_actions.set(.interact, false);
     }
 
     /// Gamepad-disconnect path: same clear as `releaseHeldGameplay`. A dig
@@ -183,7 +187,7 @@ const movement_actions = [_]Action{
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => true,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down, .interact => true,
         else => false,
     };
 }
@@ -267,6 +271,10 @@ test "default key bindings map keyboard keys to actions" {
     try std.testing.expectEqual(Action.menu_down, actionForKey(c.SDLK_DOWN).?);
     try std.testing.expectEqual(Action.menu_left, actionForKey(c.SDLK_LEFT).?);
     try std.testing.expectEqual(Action.menu_right, actionForKey(c.SDLK_RIGHT).?);
+    try std.testing.expectEqual(Action.dig_hole, actionForKey(c.SDLK_E).?);
+    try std.testing.expectEqual(Action.dig_ramp, actionForKey(c.SDLK_Q).?);
+    try std.testing.expectEqual(Action.dig_down, actionForKey(c.SDLK_F).?);
+    try std.testing.expectEqual(Action.interact, actionForKey(c.SDLK_R).?);
 }
 
 test "input key mapping tracks held gameplay actions" {
@@ -462,6 +470,7 @@ test "actionForGamepadButton resolves every default binding and rejects unmapped
     try std.testing.expectEqual(Action.dig_ramp, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_NORTH).?);
     try std.testing.expectEqual(Action.dig_down, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER).?);
     try std.testing.expectEqual(Action.toggle_debug_overlay, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_BACK).?);
+    try std.testing.expectEqual(Action.interact, actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_LEFT_SHOULDER).?);
     try std.testing.expectEqual(@as(?Action, null), actionForGamepadButton(c.SDL_GAMEPAD_BUTTON_GUIDE));
 }
 

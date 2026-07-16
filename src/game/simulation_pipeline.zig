@@ -49,6 +49,7 @@ const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const WorldStimulus = @import("simulation.zig").WorldStimulus;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const stimulus_deferred_capacity = @import("simulation.zig").stimulus_deferred_capacity;
@@ -75,6 +76,7 @@ const PipelineResource = enum {
     ai_scope_indices,
     spatial_index,
     navigation_intents,
+    action_intents,
     movement_intents,
     path_requests,
     movement_positions,
@@ -97,6 +99,7 @@ fn resources(comptime items: []const PipelineResource) ResourceSet {
 
 const StageId = enum {
     dig_world_edit,
+    action_intent_capture,
     scope_advance_and_ai_gather,
     spatial_index_build,
     perception_update,
@@ -113,6 +116,7 @@ const StageId = enum {
     collision_detect,
     collision_respond,
     plane_traversal,
+    action_react,
     tier_policy,
 };
 
@@ -124,6 +128,12 @@ const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
 fn stageContract(stage: StageId) StageContract {
     return switch (stage) {
         .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
+        // Contract-only handoff: real appends happen in `main_thread_inputs`
+        // via `captureActionIntent` before `update` (not at this stage's wall
+        // clock). Declared early so `action_react` can read the resource under
+        // the comptime producer graph. Stage order is not the wall-clock emit
+        // site — dig process still runs first inside `update`.
+        .action_intent_capture => .{ .reads = .empty, .writes = resources(&.{.action_intents}) },
         .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{.ai_scope_indices}) },
         .spatial_index_build => .{ .reads = resources(&.{.ai_scope_indices}), .writes = resources(&.{.spatial_index}) },
         // Queries the spatial index for hostile candidates and writes sensed state; also
@@ -162,6 +172,8 @@ fn stageContract(stage: StageId) StageContract {
         // (writes world_tiles + events) and snaps body x/y/z on fall
         // (writes movement_positions + world_level).
         .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
+        // Slice 40 stub: count-only consumer; Slice 45 will apply domain reactions.
+        .action_react => .{ .reads = resources(&.{.action_intents}), .writes = .empty },
         .tier_policy => .{ .reads = resources(&.{ .movement_positions, .chunk_columns }), .writes = resources(&.{.structural_commands}) },
     };
 }
@@ -196,6 +208,7 @@ fn stageDerivations(stage: StageId) []const Derivation {
 /// walkable for movement + gate. Bounds clamp shares the gate stage.
 const stage_order = [_]StageId{
     .dig_world_edit,
+    .action_intent_capture,
     .scope_advance_and_ai_gather,
     .spatial_index_build,
     .perception_update,
@@ -212,6 +225,7 @@ const stage_order = [_]StageId{
     .bounds_and_tile_gate,
     .plane_traversal,
     .chunk_derive,
+    .action_react,
     .tier_policy,
 };
 
@@ -318,6 +332,10 @@ pub const SimulationPipelineStats = struct {
     stimuli_deferred_dropped: usize = 0,
     /// Deferred impacts promoted onto the live bus at the start of this step.
     stimuli_promoted: usize = 0,
+    /// Action intents observed by the Slice 40 stub consumer (`action_react`).
+    action_intents_consumed: usize = 0,
+    /// Optional action-intent appends dropped (full bus / ensure failure).
+    action_intents_dropped: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -428,6 +446,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.stimuli_live_dropped, metric(self.stimuli_live_dropped));
         perf.recordMetric(.stimuli_deferred_dropped, metric(self.stimuli_deferred_dropped));
         perf.recordMetric(.stimuli_promoted, metric(self.stimuli_promoted));
+        perf.recordMetric(.action_intents_consumed, metric(self.action_intents_consumed));
+        perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
     }
 };
 
@@ -567,6 +587,11 @@ pub const SimulationPipeline = struct {
     /// until promoted before perception on the next `update`.
     deferred_stimuli: [stimulus_deferred_capacity]WorldStimulus = undefined,
     deferred_stimulus_count: usize = 0,
+    /// Rising-edge latch for `Action.interact` (one press per fixed step).
+    /// Advanced only after a successful append so a soft-dropped press can retry.
+    interact_held_last: bool = false,
+    /// Soft-drops from `tryAppendActionIntent` this step (reset each `update`).
+    action_intents_dropped_step: usize = 0,
 
     /// Initializes owned systems, reserves their cold capacities, and builds
     /// the current static navigation grid from the state-owned `DataSystem`.
@@ -788,6 +813,26 @@ pub const SimulationPipeline = struct {
         self.dig.captureIntent(input, frame);
     }
 
+    /// Captures non-locomotion action intents on held-input rising edges. Called
+    /// in the main-thread input phase alongside `captureDigIntent`. On soft-drop
+    /// (full bus), the latch stays open so a later step can retry while held.
+    pub fn captureActionIntent(self: *SimulationPipeline, input: *const InputState, frame: *SimulationFrame, player_entity: EntityId) void {
+        const interact_held = input.isHeld(.interact);
+        if (interact_held and !self.interact_held_last) {
+            const appended = frame.tryAppendActionIntent(.{
+                .entity = player_entity,
+                .kind = .interact,
+            }, action_intent_live_capacity);
+            if (appended) {
+                self.interact_held_last = true;
+            } else {
+                self.action_intents_dropped_step += 1;
+            }
+            return;
+        }
+        if (!interact_held) self.interact_held_last = false;
+    }
+
     /// Synchronizes interpolation history for pipeline-owned movement state.
     /// State-owned visual effects still synchronize at their own owner.
     pub fn syncPreviousPositions(self: *SimulationPipeline, data: *DataSystem) void {
@@ -805,12 +850,18 @@ pub const SimulationPipeline = struct {
         frame.phase = .processors;
         var stimuli_live_dropped: usize = 0;
         var stimuli_deferred_dropped: usize = 0;
+        // Capture-phase soft-drops accumulate on the pipeline field before update;
+        // fold into this step's stats and clear for the next input phase.
+        const action_intents_dropped = self.action_intents_dropped_step;
+        self.action_intents_dropped_step = 0;
         const stimuli_promoted = promoteDeferredStimuli(self, frame, &stimuli_live_dropped);
         // Player-authored world edit. Runs after deferred promote; its
         // world_tile_changed event is deferred and re-masks navigation in
         // merge_outputs regardless of order.
         try self.dig.process(context.world, data, context.player.*, frame);
         tryAppendPlayerFootstepStimulus(frame, data, context.player.*, &stimuli_live_dropped);
+        // `action_intent_capture` is a contract-only stage: intents were already
+        // appended in `main_thread_inputs` (before this function).
 
         // Backbone scope pass. Advance the stagger clock, derive the camera
         // cognition halo, and select the cognition (AI/steering) subset for this
@@ -1020,6 +1071,8 @@ pub const SimulationPipeline = struct {
         }, .{});
         chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
 
+        const action_intents_consumed = consumeActionIntentsStub(frame);
+
         // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
         // kinematic/dormant by its cube distance from the visible region, applied
         // via deferred structural commands on the frame stream for the commit seam.
@@ -1054,6 +1107,8 @@ pub const SimulationPipeline = struct {
             .stimuli_live_dropped = stimuli_live_dropped,
             .stimuli_deferred_dropped = stimuli_deferred_dropped,
             .stimuli_promoted = stimuli_promoted,
+            .action_intents_consumed = action_intents_consumed,
+            .action_intents_dropped = action_intents_dropped,
         };
     }
 
@@ -1084,6 +1139,17 @@ pub const SimulationPipeline = struct {
 };
 
 const StageTimer = runtime_perf_log.StageTimer;
+
+/// Slice 40 stub consumer: counts action intents only — no `DataSystem` or world
+/// mutation. Slice 45 replaces this with a real domain controller.
+fn consumeActionIntentsStub(frame: *const SimulationFrame) usize {
+    var count: usize = 0;
+    for (frame.action_intents.mergedItems()) |intent| {
+        _ = intent;
+        count += 1;
+    }
+    return count;
+}
 
 fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
     for (frame.intents.mergedItems()) |item| {
@@ -3133,4 +3199,154 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
     try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
     // First contact in merged order wins the first deferred slot (midpoint x = 10).
     try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
+}
+
+test "consumeActionIntentsStub counts zero when no action producers ran" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    frame.beginStep();
+    try std.testing.expectEqual(@as(usize, 0), consumeActionIntentsStub(&frame));
+}
+
+test "consumeActionIntentsStub counts merged action intents" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), consumeActionIntentsStub(&frame));
+}
+
+test "captureActionIntent appends interact on rising edge only and does not dual-write intents" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(1, 0, 4, 0, 0, 0);
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    const player_entity = EntityId{ .index = 1, .generation = 1 };
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
+    try std.testing.expectEqual(@import("simulation.zig").ActionKind.interact, frame.action_intents.mergedItems()[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
+
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
+
+    input.setHeld(.interact, false);
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    try std.testing.expectEqual(@as(usize, 2), frame.actionIntentLiveCount());
+    try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
+}
+
+test "captureActionIntent keeps latch open when tryAppend soft-drops" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    // Fill the live bus so the next interact rising edge soft-drops.
+    for (0..action_intent_live_capacity) |_| {
+        try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .signal });
+    }
+
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .pathfinding = .{
+            .max_frame_requests = 1,
+            .max_pending_requests = 1,
+            .max_cached_results = 1,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 1,
+            .max_fallback_requests_per_step = 1,
+        },
+    });
+    defer pipeline.deinit();
+
+    const player_entity = EntityId{ .index = 1, .generation = 1 };
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    try std.testing.expectEqual(@as(usize, action_intent_live_capacity), frame.actionIntentLiveCount());
+    try std.testing.expectEqual(@as(usize, 1), pipeline.action_intents_dropped_step);
+    try std.testing.expect(!pipeline.interact_held_last);
+
+    // Still held: rising-edge path retries (latch never advanced on soft-drop).
+    pipeline.captureActionIntent(&input, &frame, player_entity);
+    try std.testing.expectEqual(@as(usize, 2), pipeline.action_intents_dropped_step);
+}
+
+test "captureActionIntent then pipeline.update reports action_intents_consumed" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 2, 2, 4, 2, 2);
+    try frame.reservePathRequests(2, 2);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .steering_agent_capacity = 0,
+        .static_obstacle_capacity = 0,
+        .contact_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    var input = InputState{};
+    input.setHeld(.interact, true);
+    pipeline.captureActionIntent(&input, &frame, player.entity);
+    try std.testing.expectEqual(@as(usize, 1), frame.actionIntentLiveCount());
+
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.action_intents_consumed);
+    try std.testing.expectEqual(@as(usize, 0), stats.action_intents_dropped);
 }

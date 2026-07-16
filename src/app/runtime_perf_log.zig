@@ -117,6 +117,8 @@ pub const Metric = enum {
     stimuli_live_dropped,
     stimuli_deferred_dropped,
     stimuli_promoted,
+    action_intents_consumed,
+    action_intents_dropped,
     particle_active_before,
     particle_active_after,
     particle_removed,

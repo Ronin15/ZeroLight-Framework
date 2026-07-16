@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39, 41) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only. Landed slices that still need
@@ -84,14 +84,13 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **35** | Not started | AI/steering hot-loop SIMD restructure — unblocked (Slice 32 landed); measure at battle scale |
 | **37** | Partial | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening — stale-doc checklist item landed; rest open |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
-| **40** | Not started | Action/interaction intent substrate — **next primary implementation slice** |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood (needs real appraisal signals) |
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
-| **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on Slice 40 |
+| **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on archive Slice 40; **next primary** |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
 
-**Recently settled (archive only):** 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -109,7 +108,7 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
 
 | Track | Slices | Notes |
 | --- | --- | --- |
-| **Primary — action/interaction** | **40 → 45** | Parallel non-locomotion intent stream, then first domain controller (destructibles). **40 is next.** |
+| **Primary — action/interaction** | **45** (after archive **40**) | Action-intent substrate landed; first domain controller (destructibles) is **next.** |
 | **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
 | **World / render verticality** | **37 → 38** | Cap raise + shader sync, then elevation-above-surface semantics. Independent of AI. |
 | **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
@@ -342,8 +341,8 @@ by Slice 24.
 | Archetypes / debug | 33 | Landed (visual residual on frontier) | JSON personalities + overlay (drive bars / affect blocks) |
 | Stimulus ecosystem | 39 | Landed (archive) | Multi-producer bus (dig, footstep, deferred impact) |
 | World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
-| Action intents | 40 | **Open** | Non-locomotion intent stream (attack/interact/use) |
-| First action consumer | 45 | **Open** | Domain controller (destructibles) consuming 40 |
+| Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R + stub `action_react` |
+| First action consumer | 45 | **Open** | Domain controller (destructibles) consuming 40; **next primary** |
 | **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
 ### Emotion / feelings model (landed + expandability)
@@ -422,9 +421,9 @@ footstep / deferred impact) and world interest markers (41: investigate wired;
 - **Slice 33** — authoring/tuning infrastructure (landed; visual/`gpu-smoke`
   residual only).
 - **Slices 39, 41** — richer senses + world-authored investigate POIs (landed).
-- **Open post-loop expandability:** **40** (action intents), **45** (first
-  action consumer), **42** (more/coupled feelings). Each is a full slice —
-  do not half-wire into 32 or overload `NavigationIntent`.
+- **Open post-loop expandability:** **45** (first action consumer; **next**),
+  **42** (more/coupled feelings). Action intents (**40**) are landed. Each is
+  a full slice — do not half-wire into 32 or overload `NavigationIntent`.
 
 Shared design contracts for the whole track:
 
@@ -877,65 +876,6 @@ Acceptance checks:
       is the one non-mechanical change in this slice).
 - [ ] `zig build verify` passes.
 
-## Slice 40: Action And Interaction Intent Substrate
-
-**Status: not started.** Depends on Slice 32 for a stable locomotion intent
-path; do not block 32 on this slice.
-
-Goal: add a **parallel, typed action-intent stream** for non-locomotion
-gameplay (attack, interact, use, signal) so emergent systems can express more
-than movement without overloading `NavigationIntent` or inventing a string
-pub/sub bus.
-
-### Problem
-
-- `SimulationIntent` today is effectively movement-only
-  (`simulation.zig`: `union(enum) { movement: MovementIntent }`).
-- `NavigationIntent` is the high-level AI → steering handoff for **where to
-  go**. Cramming "attack target X" into goal XY or priority bits would lock
-  combat into pathfinding and break expandability.
-- Architecture already describes domain controllers for combat/rules/spawning
-  (`architecture.md`) but no intent substrate exists for their outputs.
-
-### Architecture notes
-
-- New stream on `SimulationFrame`, e.g. `action_intents:
-  RangeOutputStream(ActionIntent)`, same count/prefix/write / range merge
-  model as navigation intents.
-- `ActionIntent` payload: entity, kind enum, optional target `EntityId`,
-  optional cell/level scalars, priority, cooldown key — **scalar/enum only**.
-- Producers: AI arbitration (later extension), player input controller, future
-  combat controller. Consumers: domain controllers at explicit reaction phases
-  after merge — not the pathfinder.
-- **Do not** require Slice 32 to emit actions. Slice 32 may leave a documented
-  extension point (e.g. score term reserved) but shipping attack from 32 is
-  out of scope.
-- Structural mutations from successful actions still go through deferred
-  structural commands / world edits — action intents request consideration,
-  they do not mutate `DataSystem` inside worker ranges.
-
-### Checklist
-
-- [ ] Define `ActionIntent` + kind enum + stream on `SimulationFrame`; reserve
-      API; stats counters; docs for when to use action vs navigation vs domain
-      events.
-- [ ] Pipeline phase: declare producer stage(s) and consumer reaction point(s)
-      in `stage_order` / contracts without breaking existing stage resources.
-- [ ] Player or test harness emits at least one action kind end-to-end
-      (e.g. interact-noop or attack-request that a stub consumer counts).
-- [ ] Capacity, deterministic merge, serial/threaded parity, payload purity
-      tests (no pointers/handles).
-- [ ] Document expansion path: AI arbitration may later emit actions when a
-      pursue agent is in range — separate checklist item / future slice, not a
-      silent partial in 40's "done" claim unless fully tested.
-
-### Acceptance checks
-
-- [ ] Movement-only demos unchanged when no action producers run.
-- [ ] Action stream is deterministic and allocation-free after reserve.
-- [ ] NavigationIntent contract untouched.
-- [ ] `zig build verify` passes.
-
 ## Slice 42: Affect Expansion — More Feelings, Coupling, And Mood
 
 **Status: not started.** Depends on Slice 32 (drives must already be consumed
@@ -1220,8 +1160,8 @@ the device-agnostic `Action` contract keyboard and gamepad already share.
 
 ## Slice 45: First Action-Intent Consumer Domain Controller (Destructibles)
 
-**Status: not started.** Depends on Slice 40 (action-intent substrate). Do not
-start before 40's `action_intents` stream exists.
+**Status: not started.** Depends on archive Slice 40 (action-intent substrate
+— landed). **Next primary implementation slice.**
 
 Goal: land the **first pipeline-owned domain controller** that consumes Slice
 40's action intents into an actual gameplay domain, proving the substrate end to
@@ -1231,9 +1171,12 @@ content.
 
 ### Current foundation (do not rebuild)
 
-- Slice 40 grows `SimulationIntent` (`simulation.zig`, today
-  `union(enum){ movement }`) with an action variant and an `action_intents`
-  `RangeOutputStream` on `SimulationFrame`.
+- Archive **Slice 40** landed `ActionIntent` / `ActionKind`,
+  `SimulationFrame.action_intents` (`RangeOutputStream`),
+  `SimulationIntent.action` (union variant; producers write **only** the
+  specialized stream), `action_intent_capture` + stub `action_react`, and
+  player **R** rising-edge interact capture. Replace the stub consumer — do
+  not invent a second bus.
 - `src/game/dig_controller.zig` is the template for a pipeline-owned controller
   that reacts at a fixed stage, emits `world_tile_changed`, and routes structural
   edits through deferred `StructuralCommand`s + world edits — never mutating
@@ -1390,9 +1333,10 @@ only stable IDs and enum/scalar columns, never paths or live handles.
     (archive).
 41. World interest / affordance markers (multi-source goals). — landed
     (archive).
-40. Action and interaction intent substrate (non-locomotion emergence).
-    **← next primary**
+40. Action and interaction intent substrate (non-locomotion emergence). —
+    landed (archive).
 45. First action-intent consumer domain controller / destructibles (after 40).
+    **← next primary**
 42. Affect expansion (more feelings, coupling, appraisal gains, optional mood)
     — only when a real appraisal signal exists.
 35. AI and steering hot-loop SIMD restructure (unblocked; measure at battle

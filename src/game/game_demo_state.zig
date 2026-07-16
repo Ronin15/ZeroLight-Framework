@@ -45,6 +45,7 @@ const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
+const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
@@ -437,6 +438,9 @@ pub const GameDemoState = struct {
         // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
         // fixed live ceiling so optional emitters stay allocation-free after init.
         try simulation_frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+        // One range per sequential main-thread append (same shape as stimuli): warm
+        // both range slots and value slots to the fixed live ceiling.
+        try simulation_frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = pop_cap.mover_count,
             .static_obstacle_capacity = obstacle_count,
@@ -517,6 +521,7 @@ pub const GameDemoState = struct {
         var input_timer = StageTimer.start();
         try self.player.applyInput(&self.data, context.input);
         self.pipeline.captureDigIntent(context.input, &self.simulation_frame);
+        self.pipeline.captureActionIntent(context.input, &self.simulation_frame, self.player.entity);
         input_timer.stop(context.perf, .gameplay_input);
 
         var ambient_audio_timer = StageTimer.start();

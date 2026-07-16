@@ -196,8 +196,27 @@ part of the contract: count and write phases must stay consistent.
 `SimulationFrame` owns these streams:
 
 - `events`: lower-volume typed domain/system signals.
-- `navigation_intents`: high-level AI navigation goals.
-- `intents`: movement intents and future simulation intents.
+- `navigation_intents`: high-level AI navigation goals (locomotion handoff to
+  steering/pathfinding — not attack/interact/use).
+- `action_intents`: non-locomotion gameplay requests (`ActionIntent`: entity,
+  kind, optional target/cell scalars, priority, cooldown key). Producers append
+  only to this stream (never dual-write into `intents`). **Producer phase:**
+  main-thread input capture (`captureActionIntent` rising edges today; latch
+  advances only on successful append so soft-drops retry while held). Future
+  AI arbitration may emit multi-range writes when in-range attack/interact is
+  added in a later slice. **Consumer phase:** explicit domain reaction after
+  merge (`action_react` in `stage_order`; Slice 40 stub counts only — Slice 45
+  will consume for destructibles/combat). The `action_intent_capture` stage is
+  a **contract-only** resource handoff (writes declared so `action_react` can
+  read); wall-clock appends happen in `main_thread_inputs` before `update`.
+  Capacity is the fixed constant `action_intent_live_capacity` in
+  `simulation.zig` (64), not map-scaled. Callers warm with
+  `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
+  (one range slot per sequential append, same shape as stimuli). Optional
+  producers use `tryAppendActionIntent` so a full bus drops cleanly.
+- `intents`: movement intents (`SimulationIntent.movement`); the union also
+  carries an `action` variant for typed movement-stream evolution, but action
+  producers must use `action_intents` instead of dual-writing here.
 - `path_requests`: frame-delayed pathfinding requests.
 - `contacts`: collision contacts for same-step response.
 - `collision_triggers`: collision trigger records.
@@ -222,9 +241,17 @@ High-volume data should stay in its specialized stream. Do not collapse
 contacts, movement intents, navigation intents, path requests, render-prep
 commands, or structural commands into generic events just for uniformity.
 
-Use `reserveStreams`, `reservePathRequests`, and
-`reserveNavigationIntents` during state/system initialization or warmup so
-steady fixed-step producers do not allocate unexpectedly.
+Use `reserveStreams`, `reservePathRequests`, `reserveNavigationIntents`, and
+`reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
+during state/system initialization or warmup so steady fixed-step producers do
+not allocate unexpectedly.
+
+**When to use which intent channel:** `NavigationIntent` = where to go (AI →
+steering). `SimulationIntent.movement` = how to move this step (steering →
+movement apply). `action_intents` = what non-locomotion action to consider
+(interact/attack/use/signal). `SimulationEvent` = durable transitions and
+post-commit reactions (perception, affect, nav invalidation) — not per-step
+action spam.
 
 ## Simulation Events
 

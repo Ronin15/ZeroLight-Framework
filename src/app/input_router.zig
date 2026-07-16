@@ -162,7 +162,7 @@ fn routeAction(policy: InputRoutingPolicy, action: Action, is_down: bool, is_rep
 
 pub fn contextForAction(action: Action) InputContext {
     return switch (action) {
-        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => .gameplay,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down, .interact => .gameplay,
         .pause, .resume_game, .quit => .app,
         .toggle_debug_overlay => .debug,
         .menu_up, .menu_down, .menu_left, .menu_right => .ui,
@@ -191,7 +191,7 @@ pub const ContextFlags = struct {
 
 fn isGameplayAction(action: Action) bool {
     return switch (action) {
-        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down => true,
+        .move_left, .move_right, .move_up, .move_down, .dig_hole, .dig_ramp, .dig_down, .interact => true,
         else => false,
     };
 }

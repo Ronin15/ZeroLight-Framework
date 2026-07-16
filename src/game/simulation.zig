@@ -425,8 +425,34 @@ pub const NavigationIntent = struct {
     priority: i16 = 0,
 };
 
+pub const ActionKind = enum {
+    interact,
+    attack,
+    use,
+    signal,
+};
+
+/// Per-step non-locomotion request. Scalar/enum only — no pointers/handles/slices.
+pub const ActionIntent = struct {
+    entity: EntityId,
+    kind: ActionKind,
+    /// Optional target; EntityId.invalid means none.
+    target: EntityId = EntityId.invalid,
+    cell_x: u16 = 0,
+    cell_y: u16 = 0,
+    level: u16 = 0,
+    has_cell: bool = false,
+    priority: i16 = 0,
+    cooldown_key: u16 = 0,
+};
+
+/// Fixed per-step live action-intent ceiling (world-size independent). Demo/pipeline
+/// warm `action_intents` to this; optional producers drop when full.
+pub const action_intent_live_capacity: usize = 64;
+
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
+    action: ActionIntent,
 };
 
 pub const CollisionContact = struct {
@@ -513,6 +539,7 @@ pub const SimulationFrame = struct {
     // after the producer stage has finished.
     events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
+    action_intents: RangeOutputStream(ActionIntent),
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),
@@ -532,6 +559,7 @@ pub const SimulationFrame = struct {
             .allocator = allocator,
             .events = SimulationEvents.init(allocator),
             .navigation_intents = RangeOutputStream(NavigationIntent).init(allocator),
+            .action_intents = RangeOutputStream(ActionIntent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
             .path_requests = RangeOutputStream(PathRequest).init(allocator),
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
@@ -552,6 +580,7 @@ pub const SimulationFrame = struct {
         self.contacts.deinit();
         self.path_requests.deinit();
         self.intents.deinit();
+        self.action_intents.deinit();
         self.navigation_intents.deinit();
         self.events.deinit();
         self.* = undefined;
@@ -566,6 +595,7 @@ pub const SimulationFrame = struct {
         self.dig_intent = .none;
         self.events.clearRetainingCapacity();
         self.navigation_intents.clearRetainingCapacity();
+        self.action_intents.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();
         self.path_requests.clearRetainingCapacity();
         self.contacts.clearRetainingCapacity();
@@ -664,6 +694,62 @@ pub const SimulationFrame = struct {
 
     pub fn reserveNavigationIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
         try self.navigation_intents.reserve(range_count, intent_capacity);
+    }
+
+    pub fn reserveActionIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
+        try self.action_intents.reserve(range_count, intent_capacity);
+    }
+
+    /// Preflights buffer growth for one `appendActionIntent` (one range, one value).
+    pub fn ensureActionIntentAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
+        if (value_count == 0) return;
+        const alloc = self.action_intents.allocator;
+        const new_range_count = self.action_intents.counts.items.len + 1;
+        try self.action_intents.counts.ensureTotalCapacity(alloc, new_range_count);
+        try self.action_intents.offsets.ensureTotalCapacity(alloc, new_range_count);
+        try self.action_intents.write_offsets.ensureTotalCapacity(alloc, new_range_count);
+        const new_value_count = if (self.action_intents.prefix_ready)
+            self.action_intents.mergedItems().len + value_count
+        else blk: {
+            var pending: usize = 0;
+            for (self.action_intents.counts.items) |count| pending += count;
+            break :blk pending + value_count;
+        };
+        try self.action_intents.values.ensureTotalCapacity(alloc, new_value_count);
+    }
+
+    /// Live action-intent count already written this step (after any `prefix`/finish).
+    pub fn actionIntentLiveCount(self: *const SimulationFrame) usize {
+        if (self.action_intents.prefix_ready) return self.action_intents.mergedItems().len;
+        var pending: usize = 0;
+        for (self.action_intents.counts.items) |count| pending += count;
+        return pending;
+    }
+
+    /// Single-value append for main-thread producers (player input capture is not
+    /// threaded). Each call uses one range slot (stimuli pattern). Warm with
+    /// `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
+    /// so multi-append stays allocation-free. Future AI producers may use
+    /// multi-range writes; they must use `action_intents` only — not dual-write
+    /// into `intents`.
+    pub fn appendActionIntent(self: *SimulationFrame, intent: ActionIntent) !void {
+        const first_range = try self.action_intents.appendRangeCounts(1);
+        self.action_intents.addCount(first_range, 1);
+        try self.action_intents.prefixAppendedRanges(first_range);
+        var writer = self.action_intents.rangeWriter(first_range);
+        writer.write(intent);
+        writer.finish();
+        self.action_intents.finishWrite();
+    }
+
+    /// Capacity-aware optional append: drops when live count is already at
+    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
+    /// or when buffer growth fails after warmup (should not happen if reserved).
+    pub fn tryAppendActionIntent(self: *SimulationFrame, intent: ActionIntent, capacity: usize) bool {
+        if (capacity == 0 or self.actionIntentLiveCount() >= capacity) return false;
+        self.ensureActionIntentAppendCapacity(1) catch return false;
+        self.appendActionIntent(intent) catch return false;
+        return true;
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
@@ -1308,10 +1394,12 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
 
     try frame.reserveStreams(2, 2, 2, 2, 2, 1);
     try frame.stimuli.reserve(2, 2);
+    try frame.reserveActionIntents(2, 2);
 
     const original_allocator = frame.allocator;
     const original_events_allocator = frame.events.stream.allocator;
     const original_navigation_intents_allocator = frame.navigation_intents.allocator;
+    const original_action_intents_allocator = frame.action_intents.allocator;
     const original_intents_allocator = frame.intents.allocator;
     const original_triggers_allocator = frame.collision_triggers.allocator;
     const original_commands_allocator = frame.structural_commands.allocator;
@@ -1321,6 +1409,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.allocator = fail;
     frame.events.stream.allocator = fail;
     frame.navigation_intents.allocator = fail;
+    frame.action_intents.allocator = fail;
     frame.intents.allocator = fail;
     frame.collision_triggers.allocator = fail;
     frame.structural_commands.allocator = fail;
@@ -1329,6 +1418,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
         frame.allocator = original_allocator;
         frame.events.stream.allocator = original_events_allocator;
         frame.navigation_intents.allocator = original_navigation_intents_allocator;
+        frame.action_intents.allocator = original_action_intents_allocator;
         frame.intents.allocator = original_intents_allocator;
         frame.collision_triggers.allocator = original_triggers_allocator;
         frame.structural_commands.allocator = original_commands_allocator;
@@ -1368,6 +1458,18 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     });
     navigation_writer.finish();
     frame.navigation_intents.finishWrite();
+
+    try frame.action_intents.prepareRangeCounts(2);
+    frame.action_intents.addCount(0, 1);
+    frame.action_intents.addCount(1, 1);
+    try frame.action_intents.prefix();
+    var action_writer = frame.action_intents.rangeWriter(0);
+    action_writer.write(.{ .entity = EntityId.invalid, .kind = .interact });
+    action_writer.finish();
+    action_writer = frame.action_intents.rangeWriter(1);
+    action_writer.write(.{ .entity = EntityId.invalid, .kind = .attack });
+    action_writer.finish();
+    frame.action_intents.finishWrite();
 
     try frame.intents.prepareRangeCounts(2);
     frame.intents.addCount(0, 1);
@@ -1628,4 +1730,123 @@ test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocatio
     frame.world_tile_changes_scratch.appendAssumeCapacity(change);
     frame.world_tile_changes_scratch.appendAssumeCapacity(change);
     try std.testing.expectEqual(@as(usize, 2), frame.world_tile_changes_scratch.items.len);
+}
+
+test "ActionIntent fields are scalar or enum only" {
+    comptime {
+        const fields = @typeInfo(ActionIntent).@"struct".fields;
+        for (fields) |field| {
+            const info = @typeInfo(field.type);
+            const allowed: bool = switch (info) {
+                .int, .float, .bool => true,
+                .@"enum" => true,
+                .@"struct" => field.type == EntityId,
+                else => false,
+            };
+            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field.name);
+        }
+    }
+}
+
+test "SimulationFrame action_intents merge preserves range index order" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(2, 4);
+
+    try frame.action_intents.prepareRangeCounts(2);
+    frame.action_intents.addCount(0, 1);
+    frame.action_intents.addCount(1, 2);
+    try frame.action_intents.prefix();
+    var writer = frame.action_intents.rangeWriter(0);
+    writer.write(.{ .entity = EntityId.invalid, .kind = .interact, .priority = 1 });
+    writer.finish();
+    writer = frame.action_intents.rangeWriter(1);
+    writer.write(.{ .entity = EntityId.invalid, .kind = .attack, .priority = 2 });
+    writer.write(.{ .entity = EntityId.invalid, .kind = .use, .priority = 3 });
+    writer.finish();
+    frame.action_intents.finishWrite();
+
+    const merged = frame.action_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqual(ActionKind.interact, merged[0].kind);
+    try std.testing.expectEqual(ActionKind.attack, merged[1].kind);
+    try std.testing.expectEqual(ActionKind.use, merged[2].kind);
+}
+
+test "SimulationFrame.appendActionIntent has no steady-state allocation after reserveActionIntents (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+}
+
+test "SimulationFrame.ensureActionIntentAppendCapacity then appendActionIntent is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.ensureActionIntentAppendCapacity(1);
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+}
+
+test "SimulationFrame multi-appendActionIntent after live-bus reserve is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    const kinds = [_]ActionKind{ .interact, .attack, .use, .signal };
+    for (kinds) |kind| {
+        try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = kind });
+    }
+    try std.testing.expectEqual(@as(usize, 4), frame.action_intents.mergedItems().len);
+}
+
+test "tryAppendActionIntent drops when at live capacity" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(1, 1);
+
+    try std.testing.expect(frame.tryAppendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .interact,
+    }, 1));
+    try std.testing.expect(!frame.tryAppendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .attack,
+    }, 1));
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+    try std.testing.expectEqual(ActionKind.interact, frame.action_intents.mergedItems()[0].kind);
+}
+
+test "appendActionIntent does not dual-write into SimulationIntent intents stream" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(1, 0, 4, 0, 0, 0);
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
 }
