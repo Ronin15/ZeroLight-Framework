@@ -16,14 +16,13 @@
 //!
 //! **Geometry:** cognition discovery uses `dist <= query_radius` only.
 //! `marker.radius` is the authored influence footprint (interaction/cover size
-//! later); it is not a discovery gate. Query results are **nearest-k** by
-//! distance² with ascending slot index as the tie-break (fixed max_k budget).
+//! later); it is not a discovery gate. `findBestInvestigateMarker` returns the
+//! single nearest in-range investigate marker (dist², then ascending slot).
 
 const std = @import("std");
 const Faction = @import("faction.zig").Faction;
 
 pub const interest_marker_capacity: usize = 128;
-pub const interest_query_max_k: usize = 4;
 
 pub const InterestMarkerKind = enum {
     /// Consumed by AI investigate scoring / goal resolution.
@@ -61,16 +60,6 @@ pub const InterestMarker = struct {
     faction_filter: ?Faction = null,
 };
 
-pub const InterestMarkerSpec = InterestMarker;
-
-pub const InterestMarkerHit = struct {
-    id: InterestMarkerId,
-    kind: InterestMarkerKind,
-    x: f32,
-    y: f32,
-    dist2: f32 = 0,
-};
-
 pub const InterestMarkerStore = struct {
     /// Non-zero while a marker occupies the slot (id generation for that slot).
     generations: [interest_marker_capacity]u16 = [_]u16{0} ** interest_marker_capacity,
@@ -95,10 +84,6 @@ pub const InterestMarkerStore = struct {
     pub fn deinit(self: *InterestMarkerStore, _: std.mem.Allocator) void {
         self.* = .{};
     }
-
-    /// No-op: capacity is compile-time fixed. Present for call-site symmetry
-    /// with heap-backed world stores; safe to call before add bursts.
-    pub fn ensureCapacity(_: *InterestMarkerStore, _: std.mem.Allocator, _: usize) !void {}
 
     pub fn count(self: *const InterestMarkerStore) usize {
         return self.live_count;
@@ -137,7 +122,7 @@ pub const InterestMarkerStore = struct {
         return dx * dx + dy * dy;
     }
 
-    pub fn addMarker(self: *InterestMarkerStore, spec: InterestMarkerSpec) !InterestMarkerId {
+    pub fn addMarker(self: *InterestMarkerStore, spec: InterestMarker) !InterestMarkerId {
         if (!std.math.isFinite(spec.x) or !std.math.isFinite(spec.y)) return error.InvalidInterestMarkerPosition;
         if (!std.math.isFinite(spec.radius) or spec.radius <= 0) return error.InvalidInterestMarkerRadius;
         if (self.live_count >= interest_marker_capacity) return error.InterestMarkerCapacityExceeded;
@@ -181,77 +166,6 @@ pub const InterestMarkerStore = struct {
         std.debug.assert(self.live_count > 0);
         self.live_count -= 1;
         return true;
-    }
-
-    /// Bounded **nearest-k** query: fills `out` with up to
-    /// `min(out.len, max_k, interest_query_max_k)` in-range hits ordered by
-    /// ascending dist² then ascending slot index. No allocation.
-    pub fn queryMarkersInRadius(
-        self: *const InterestMarkerStore,
-        level: u16,
-        x: f32,
-        y: f32,
-        radius: f32,
-        agent_faction: ?Faction,
-        out: []InterestMarkerHit,
-        max_k: usize,
-    ) usize {
-        if (!std.math.isFinite(radius) or radius <= 0) return 0;
-        const cap = @min(out.len, max_k, interest_query_max_k);
-        if (cap == 0) return 0;
-
-        var written: usize = 0;
-        for (0..interest_marker_capacity) |index| {
-            if (!self.slotLive(index)) continue;
-            if (self.levels[index] != level) continue;
-            if (!self.factionAccepts(index, agent_faction)) continue;
-            if (!self.inQueryRange(index, x, y, radius)) continue;
-
-            const d2 = self.dist2To(index, x, y);
-            const candidate = InterestMarkerHit{
-                .id = .{ .index = @intCast(index), .generation = self.generations[index] },
-                .kind = self.kinds[index],
-                .x = self.xs[index],
-                .y = self.ys[index],
-                .dist2 = d2,
-            };
-            written = insertNearestHit(out[0..cap], written, candidate);
-        }
-        return written;
-    }
-
-    /// Insert `candidate` into a sorted (dist2, slot) buffer of length `len`,
-    /// keeping at most `buf.len` entries. Returns the new length.
-    fn insertNearestHit(buf: []InterestMarkerHit, len: usize, candidate: InterestMarkerHit) usize {
-        // Find insertion index: first position where candidate is strictly better
-        // (smaller dist2, or equal dist2 and smaller slot index).
-        var insert_at = len;
-        var i: usize = 0;
-        while (i < len) : (i += 1) {
-            if (candidateBetter(candidate, buf[i])) {
-                insert_at = i;
-                break;
-            }
-        }
-        if (insert_at >= buf.len) {
-            // Worse than every kept entry and buffer full.
-            if (len >= buf.len) return len;
-            buf[len] = candidate;
-            return len + 1;
-        }
-        // Shift tail right, dropping last if already full.
-        var j = if (len < buf.len) len else buf.len - 1;
-        while (j > insert_at) : (j -= 1) {
-            buf[j] = buf[j - 1];
-        }
-        buf[insert_at] = candidate;
-        return if (len < buf.len) len + 1 else buf.len;
-    }
-
-    fn candidateBetter(a: InterestMarkerHit, b: InterestMarkerHit) bool {
-        if (a.dist2 < b.dist2) return true;
-        if (a.dist2 > b.dist2) return false;
-        return a.id.index < b.id.index;
     }
 
     /// Nearest in-range `investigate` marker (dist², then ascending slot).
@@ -344,53 +258,20 @@ test "InterestMarkerStore rejects capacity overflow" {
     try testing.expectEqual(interest_marker_capacity, store.count());
 }
 
-test "InterestMarkerStore level isolation and max_k bound" {
+test "InterestMarkerStore findBest level isolation" {
     var store = InterestMarkerStore.init(testing.allocator);
     defer store.deinit(testing.allocator);
 
     _ = try store.addMarker(.{ .kind = .investigate, .level = 0, .x = 0, .y = 0, .radius = 100 });
-    _ = try store.addMarker(.{ .kind = .investigate, .level = 1, .x = 1, .y = 1, .radius = 100 });
+    _ = try store.addMarker(.{ .kind = .investigate, .level = 1, .x = 5, .y = 5, .radius = 100 });
 
-    var hits: [8]InterestMarkerHit = undefined;
-    const n = store.queryMarkersInRadius(0, 0, 0, 200, null, &hits, 8);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expectEqual(@as(u16, 0), store.levels[hits[0].id.index]);
+    const on_surface = store.findBestInvestigateMarker(0, 0, 0, 200, null);
+    try testing.expect(on_surface != null);
+    try testing.expectEqual(@as(f32, 0), on_surface.?.x);
 
-    _ = try store.addMarker(.{ .kind = .cover, .level = 0, .x = 2, .y = 0, .radius = 100 });
-    _ = try store.addMarker(.{ .kind = .resource, .level = 0, .x = 3, .y = 0, .radius = 100 });
-    const capped = store.queryMarkersInRadius(0, 0, 0, 200, null, &hits, 2);
-    try testing.expectEqual(@as(usize, 2), capped);
-}
-
-test "InterestMarkerStore query is nearest-k not first-slot-k" {
-    var store = InterestMarkerStore.init(testing.allocator);
-    defer store.deinit(testing.allocator);
-
-    // Slot 0 is far; slot 1 is near. max_k=1 must keep the nearer marker.
-    _ = try store.addMarker(.{ .kind = .investigate, .level = 0, .x = 100, .y = 0, .radius = 8 });
-    _ = try store.addMarker(.{ .kind = .investigate, .level = 0, .x = 10, .y = 0, .radius = 8 });
-
-    var hits: [4]InterestMarkerHit = undefined;
-    const n = store.queryMarkersInRadius(0, 0, 0, 200, null, &hits, 1);
-    try testing.expectEqual(@as(usize, 1), n);
-    try testing.expectEqual(@as(f32, 10), hits[0].x);
-    try testing.expectEqual(@as(u16, 1), hits[0].id.index);
-}
-
-test "InterestMarkerStore query order is ascending dist then slot" {
-    var store = InterestMarkerStore.init(testing.allocator);
-    defer store.deinit(testing.allocator);
-
-    _ = try store.addMarker(.{ .kind = .investigate, .level = 0, .x = 30, .y = 0, .radius = 1 });
-    _ = try store.addMarker(.{ .kind = .patrol, .level = 0, .x = 10, .y = 0, .radius = 1 });
-    _ = try store.addMarker(.{ .kind = .cover, .level = 0, .x = 20, .y = 0, .radius = 1 });
-
-    var hits: [4]InterestMarkerHit = undefined;
-    const n = store.queryMarkersInRadius(0, 0, 0, 200, null, &hits, 4);
-    try testing.expectEqual(@as(usize, 3), n);
-    try testing.expectEqual(@as(f32, 10), hits[0].x);
-    try testing.expectEqual(@as(f32, 20), hits[1].x);
-    try testing.expectEqual(@as(f32, 30), hits[2].x);
+    const on_level_1 = store.findBestInvestigateMarker(1, 0, 0, 200, null);
+    try testing.expect(on_level_1 != null);
+    try testing.expectEqual(@as(f32, 5), on_level_1.?.x);
 }
 
 test "InterestMarkerStore discovery uses query radius not marker radius" {
@@ -400,16 +281,13 @@ test "InterestMarkerStore discovery uses query radius not marker radius" {
     // Small influence footprint; agent at dist 50 with query 100 still discovers.
     _ = try store.addMarker(.{ .kind = .investigate, .level = 0, .x = 50, .y = 0, .radius = 8 });
 
-    var hits: [2]InterestMarkerHit = undefined;
-    const n = store.queryMarkersInRadius(0, 0, 0, 100, null, &hits, 2);
-    try testing.expectEqual(@as(usize, 1), n);
+    const discovered = store.findBestInvestigateMarker(0, 0, 0, 100, null);
+    try testing.expect(discovered != null);
+    try testing.expectEqual(@as(f32, 50), discovered.?.x);
 
-    const none = store.queryMarkersInRadius(0, 0, 0, 40, null, &hits, 2);
-    try testing.expectEqual(@as(usize, 0), none);
-
-    const best = store.findBestInvestigateMarker(0, 0, 0, 100, null);
-    try testing.expect(best != null);
-    try testing.expectEqual(@as(f32, 50), best.?.x);
+    // Query radius 40 < dist 50: out of discovery range despite the marker's
+    // footprint.
+    try testing.expect(store.findBestInvestigateMarker(0, 0, 0, 40, null) == null);
 }
 
 test "InterestMarkerStore findBestInvestigateMarker nearest and equal-dist slot tie-break" {
@@ -457,38 +335,31 @@ test "InterestMarkerStore faction filter restricted unless proven" {
         .faction_filter = null,
     });
 
-    var hits: [4]InterestMarkerHit = undefined;
-    // No agent faction: only unfiltered markers.
-    const open_only = store.queryMarkersInRadius(0, 0, 0, 100, null, &hits, 4);
-    try testing.expectEqual(@as(usize, 1), open_only);
-    try testing.expectEqual(@as(f32, 5), hits[0].x);
+    // No agent faction: restricted markers never pass, so the unfiltered one wins.
+    const open = store.findBestInvestigateMarker(0, 0, 0, 100, null);
+    try testing.expect(open != null);
+    try testing.expectEqual(@as(f32, 5), open.?.x);
 
-    const ally_hits = store.queryMarkersInRadius(0, 0, 0, 100, .ally, &hits, 4);
-    try testing.expectEqual(@as(usize, 2), ally_hits);
+    // Ally agent: the ally-restricted marker at the origin is nearer and passes.
+    const ally = store.findBestInvestigateMarker(0, 0, 0, 100, .ally);
+    try testing.expect(ally != null);
+    try testing.expectEqual(@as(f32, 0), ally.?.x);
 
-    const hostile_hits = store.queryMarkersInRadius(0, 0, 0, 100, .hostile, &hits, 4);
-    try testing.expectEqual(@as(usize, 1), hostile_hits);
-    try testing.expectEqual(@as(f32, 5), hits[0].x);
-
-    try testing.expect(store.findBestInvestigateMarker(0, 0, 0, 100, null) != null);
-    try testing.expectEqual(@as(f32, 5), store.findBestInvestigateMarker(0, 0, 0, 100, null).?.x);
-    try testing.expectEqual(@as(f32, 0), store.findBestInvestigateMarker(0, 0, 0, 100, .ally).?.x);
+    // Hostile agent: only the unfiltered marker passes.
+    const hostile = store.findBestInvestigateMarker(0, 0, 0, 100, .hostile);
+    try testing.expect(hostile != null);
+    try testing.expectEqual(@as(f32, 5), hostile.?.x);
 }
 
 test "InterestMarkerStore is allocation-free by fixed inline storage" {
-    // Proof by construction: add/query take no allocator; storage is fixed arrays.
-    // ensureCapacity is a documented no-op (API parity only).
+    // Proof by construction: add and query take no allocator; storage is fixed arrays.
     var store = InterestMarkerStore.init(testing.allocator);
     defer store.deinit(testing.allocator);
-    try store.ensureCapacity(testing.allocator, interest_marker_capacity);
 
-    const info = @typeInfo(@TypeOf(InterestMarkerStore.addMarker)).@"fn";
-    inline for (info.params) |param| {
-        try testing.expect(param.type != std.mem.Allocator);
-    }
-    const qinfo = @typeInfo(@TypeOf(InterestMarkerStore.queryMarkersInRadius)).@"fn";
-    inline for (qinfo.params) |param| {
-        try testing.expect(param.type != std.mem.Allocator);
+    inline for (.{ InterestMarkerStore.addMarker, InterestMarkerStore.findBestInvestigateMarker }) |func| {
+        inline for (@typeInfo(@TypeOf(func)).@"fn".params) |param| {
+            try testing.expect(param.type != std.mem.Allocator);
+        }
     }
 
     var i: usize = 0;
@@ -501,27 +372,7 @@ test "InterestMarkerStore is allocation-free by fixed inline storage" {
             .radius = 32,
         });
     }
-    var hits: [4]InterestMarkerHit = undefined;
-    _ = store.queryMarkersInRadius(0, 0, 0, 64, null, &hits, 4);
-}
-
-test "InterestMarkerStore queryMarkersInRadius caps at interest_query_max_k" {
-    var store = InterestMarkerStore.init(testing.allocator);
-    defer store.deinit(testing.allocator);
-
-    for (0..5) |i| {
-        _ = try store.addMarker(.{
-            .kind = .investigate,
-            .level = 0,
-            .x = @floatFromInt(i * 10),
-            .y = 0,
-            .radius = 1,
-        });
-    }
-
-    var hits: [8]InterestMarkerHit = undefined;
-    const n = store.queryMarkersInRadius(0, 0, 0, 500, null, &hits, 8);
-    try testing.expectEqual(interest_query_max_k, n);
+    _ = store.findBestInvestigateMarker(0, 0, 0, 64, null);
 }
 
 test "InterestMarkerStore rejects invalid radius and non-finite position" {

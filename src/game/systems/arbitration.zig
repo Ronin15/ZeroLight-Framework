@@ -46,7 +46,6 @@ pub const Signals = struct {
     // this step (perception's last_seen_x/y), not a relative offset.
     nearest_threat_x: f32 = 0,
     nearest_threat_y: f32 = 0,
-    nearest_threat_dist: f32 = std.math.inf(f32),
     heard_stimulus: bool = false,
     heard_stimulus_x: f32 = 0,
     heard_stimulus_y: f32 = 0,

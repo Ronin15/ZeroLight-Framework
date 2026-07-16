@@ -464,6 +464,11 @@ pub const CollisionContact = struct {
     normal_x: f32,
     normal_y: f32,
     penetration: f32,
+    /// Pre-response velocity snapshot taken at broadphase proxy build, before
+    /// CollisionResponseSystem zeroes the approach axis. Impact-stimulus
+    /// eligibility reads these so a solved head-on hit still registers.
+    pre_response_max_speed_sq: f32 = 0,
+    pre_response_relative_speed_sq: f32 = 0,
 };
 
 /// Per-step player dig request captured in the `main_thread_inputs` phase and

@@ -67,8 +67,7 @@ const SpatialIndexView = spatial_index.SpatialIndexView;
 const NeighborVisitResult = spatial_index.NeighborVisitResult;
 const stance = @import("../faction.zig").stance;
 const arbitration = @import("arbitration.zig");
-const world_interest = @import("../world_interest.zig");
-const InterestMarkerStore = world_interest.InterestMarkerStore;
+const InterestMarkerStore = @import("../world_interest.zig").InterestMarkerStore;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -285,7 +284,6 @@ pub const AiConfig = struct {
     adaptive: bool = true,
     separation_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
     /// Current fixed-step counter (see `SimulationScopeSystem.currentStep()`),
     /// combined with `intent_seed` and each entity's dense index to key
@@ -774,7 +772,7 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
             &system.separation_tuner
         else
             null,
-        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse config.adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
+        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
             &system.intent_tuner
         else
             null,
@@ -2168,6 +2166,49 @@ test "ai investigate targets world interest marker without entity goal" {
     try std.testing.expectApproxEqAbs(marker_x, intents[0].goal.x, 1e-3);
     try std.testing.expectApproxEqAbs(marker_y, intents[0].goal.y, 1e-3);
     try std.testing.expect(intents[0].direct_direction_x > 0);
+}
+
+test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    // In range of interest_marker_query_radius (400) for an agent at the origin.
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 200, .y = 50, .radius = 256 });
+
+    // Same position and marker; only gain_investigate differs. The zero-gain row
+    // must leave interest absent (gate skips the scan); the positive-gain row must
+    // find the very same in-range marker, proving range is not what suppresses it.
+    const zero_gain = try data.createEntity();
+    try data.setMovementBody(zero_gain, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(zero_gain, 0);
+    try data.setAiAgent(zero_gain, .{ .active_behavior = .wander, .gain_investigate = 0, .gain_wander = 1 });
+
+    const positive_gain = try data.createEntity();
+    try data.setMovementBody(positive_gain, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(positive_gain, 0);
+    try data.setAiAgent(positive_gain, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, &markers);
+
+    const rows = ai_sys.rows.slice();
+    const entities = rows.items(.entity);
+    const interest = rows.items(.interest);
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    for (entities, interest) |ent, marker| {
+        if (ent.index == zero_gain.index) {
+            try std.testing.expect(!marker.present);
+        } else {
+            try std.testing.expect(marker.present);
+            try std.testing.expectApproxEqAbs(@as(f32, 200), marker.x, 1e-3);
+        }
+    }
 }
 
 test "ai investigate ignores cover resource and patrol markers for goals" {

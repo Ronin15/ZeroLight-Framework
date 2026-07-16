@@ -614,31 +614,8 @@ pub const WorldSystem = struct {
         self.* = undefined;
     }
 
-    pub fn addInterestMarker(self: *WorldSystem, spec: world_interest.InterestMarkerSpec) !world_interest.InterestMarkerId {
+    pub fn addInterestMarker(self: *WorldSystem, spec: world_interest.InterestMarker) !world_interest.InterestMarkerId {
         return self.interest_markers.addMarker(spec);
-    }
-
-    pub fn removeInterestMarker(self: *WorldSystem, id: world_interest.InterestMarkerId) bool {
-        return self.interest_markers.removeMarker(id);
-    }
-
-    pub fn interestMarkerCount(self: *const WorldSystem) usize {
-        return self.interest_markers.count();
-    }
-
-    /// Bounded nearest-k interest query (dist², then slot index). See
-    /// `world_interest.InterestMarkerStore.queryMarkersInRadius`.
-    pub fn queryInterestMarkers(
-        self: *const WorldSystem,
-        level: u16,
-        x: f32,
-        y: f32,
-        radius: f32,
-        agent_faction: ?@import("faction.zig").Faction,
-        out: []world_interest.InterestMarkerHit,
-        max_k: usize,
-    ) usize {
-        return self.interest_markers.queryMarkersInRadius(level, x, y, radius, agent_faction, out, max_k);
     }
 
     /// Dynamic sprite-command budget the world contributes per frame. Dense tiles

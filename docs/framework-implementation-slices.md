@@ -89,6 +89,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
 | **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on archive Slice 40; **next primary** |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
+| **47** | Not started | **Live perception defect:** un-stagger the shared spatial index / perception candidate set so cognition NPCs can perceive each other (stagger gates thinking only). **Highest-priority correctness item on the AI track** |
+| **48** | Not started | SimulationPipeline thin-composer restoration — bind `stage_order` to execution, extract `SensoryBus`, evict movement/world domain logic, own event/allocation budgets. Land as independent steps |
 
 **Recently settled (archive only):** 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
@@ -342,6 +344,7 @@ by Slice 24.
 | Stimulus ecosystem | 39 | Landed (archive) | Multi-producer bus (dig, footstep, deferred impact) |
 | World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
 | Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R + stub `action_react` |
+| Sensing substrate fix | 47 | **Open (live defect)** | Un-stagger the shared spatial index / perception candidates so cognition NPCs perceive each other; stagger gates thinking only |
 | First action consumer | 45 | **Open** | Domain controller (destructibles) consuming 40; **next primary** |
 | **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
@@ -1286,6 +1289,179 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 - [ ] Serialized form contains no handles or filesystem paths (payload-purity
       inspection/test); `zig build verify` passes.
 
+## Slice 47: Un-Stagger The Shared Sensing Substrate
+
+**Status: not started. Live perception defect** surfaced by the architecture
+review — perception-carrying NPCs cannot perceive one another in the shipped
+demo. Highest-priority correctness item on the AI track; land it before Slice 48.
+
+Goal: build the shared spatial index and perception candidate set over the full
+cognition-halo population, using cognition stagger only to choose which agents
+*think* this step — so two observers on different stagger phases can sense each
+other, and a timid `.ally` can see the hostile it is meant to flee.
+
+### Problem (verified against live code)
+
+- `simulation_pipeline.zig`'s `update()` hands the stagger-filtered
+  `ai_indices` to `spatial_index.build`, and perception re-walks the same list.
+  The shared neighbor grid and the perception candidate set therefore contain
+  only one stagger cohort per step.
+- `ai_archetypes.archetype_count = 8` and `simulation_scope.cognition_stagger_n
+  = 4`, and demo spawns cycle archetypes by index, so archetype slot permanently
+  pins stagger phase. The perception-carrying demo archetypes land on distinct
+  phases → no observer can ever appear in another observer's candidate set.
+- `perception.zig` gates the unconditional player fold-in on hostile stance, so
+  the `.ally` timid archetype (designed to flee hostiles) has no candidates at
+  all once its own cohort is filtered out.
+- This is broken today, not a latent risk. The sticky-stimulus linger and the
+  unconditional player candidate are the two demo-visible patches over the same
+  hazard class; this slice fixes the general case.
+
+### Architecture notes
+
+- Split the two roles the single `ai_indices` list conflates: build the spatial
+  index and perception's candidate table over the full cognition-halo population
+  (tier + halo, **no** stagger filter); pass the stagger-filtered list only as
+  the observer/decider (thinking) set. Think budget stays ~N/4; the candidate
+  set becomes complete. The index build is the SIMD/threaded pass, so it is the
+  cheapest stage to un-stagger.
+- Coupling cost (verified): `ai.zig`'s `cohereNeighborVisit` indexes
+  `ctx.candidate_faction[candidate_index]` with a **spatial** row index, so it
+  hard-requires index-row == AI-row identity. Un-staggering requires giving
+  `ai.zig` a candidates side table + `spatial_self_index` mapping — the pattern
+  `perception.zig` already implements; copy it. Preserve serial==threaded and
+  scalar==SIMD parity.
+- Optional diagnostic dividend (coordinate with Slice 48): rename
+  `.ai_scope_indices` into `ai_halo_indices` (index/candidate population) vs
+  `ai_cognition_indices` (thinking population) so the two populations are
+  distinct names in the comptime graph.
+- All per-step caps stay fixed and world-size-independent; determinism preserved.
+
+### Checklist
+
+- [ ] `spatial_index.build` and perception's candidate gather run over the
+      unstaggered cognition-halo population.
+- [ ] Cognition stagger applies only to the observer/decider (thinking) set.
+- [ ] `ai.zig` gains a candidates side table + `spatial_self_index` mapping so
+      cohere neighbor queries no longer assume index-row == AI-row.
+- [ ] Test with a non-null `cognition_region` and two observers on different
+      stagger phases asserting mutual perception (whole class untested today —
+      fixtures pass null).
+- [ ] Verify a timid `.ally` perceives a hostile once its cohort is not filtered.
+
+### Acceptance checks
+
+- [ ] Two cognition observers on distinct stagger phases perceive each other in
+      the same step.
+- [ ] Serial==threaded and scalar==SIMD parity hold; think budget stays ~N/4.
+- [ ] No AI/perception bench regression at battle scale; `zig build verify` passes.
+
+## Slice 48: SimulationPipeline Thin-Composer Restoration
+
+**Status: not started.** Structural refactor surfaced by the architecture
+review. Land as independently-shippable steps in the listed order, never as one
+change; each step is separately bisectable.
+
+Goal: restore [architecture.md](architecture.md)'s thin-composer contract by
+binding `stage_order` to execution, extracting the sensory bus into a controller,
+evicting movement/world domain logic to its owning systems, and moving event and
+allocation budgets to their producers — so the comptime stage graph governs what
+actually runs and the composer stops owning cross-step state and policy.
+
+### Problem (verified against live code)
+
+- `update()` is ~270 straight-line lines mixing four altitudes. The pipeline
+  owns cross-step sensory state (`deferred_stimuli`, `sticky_*`,
+  `interact_held_last`, hearing scratch) plus policy (lifetime rules, the impact
+  penetration curve, an eligibility gate, the interact latch).
+- Four sensory mutations run as untagged wall-clock statements the comptime
+  reads-before-writes check cannot see; `.action_intent_capture` is a declared
+  stage whose real work happens before `update()`. `stage_order` binds to no
+  executor (`runStage`/dispatch), so it governs nothing: the review panel
+  reordered load-bearing stage pairs and the whole suite still passed.
+- ~230 lines of movement/world domain logic and four serial, scalar,
+  random-access full-AI-population scans sit in the composer — precisely because
+  they live here instead of a system that would inherit the threading/SIMD/scope
+  conventions (`simulation_pipeline.zig` has zero `@Vector` uses).
+
+### Checklist (each step independently landable)
+
+- [ ] **Contract vocabulary** (declaration-only): add a `carried` field to
+      `StageContract` (checked disjoint from `reads`, required to be written by
+      some stage) so `.reads = .empty` regains its meaning; split `.events` into
+      `perception_events`/`affect_events`/`world_events`/`structural_events` (a
+      stage-0-written tag must not vacuously satisfy every downstream read); add
+      `.stimuli`/`.interest_markers`/`.ai_behavior` tags and `ai_decide`'s
+      missing write; add a `stage_order` permutation comptime check.
+- [ ] **Bind the graph**: add `StepState`, one private `stage<Name>` method per
+      stage (carrying its own `StageTimer`), `runStage(comptime id)` with an
+      exhaustive switch, and `inline for (stage_order) |id| try runStage(...)`;
+      `update()` drops to ~6 lines. Delete `.action_intent_capture` (no body) →
+      `carried = {action_intents}` on `.action_react`. Watch `zig build check`
+      eval-branch quota; if it bites, split the switch by stage-half — never a
+      runtime dispatch table on the frame path.
+- [ ] **Extract `SensoryBus`** (`src/game/sensory_bus.zig`, in the
+      DigController/AudioController mold): move the sensory state fields + the
+      free functions (already written with `pipeline: *SimulationPipeline`
+      first) + thresholds; add `StimulusConfig` mirroring `DigConfig`; split
+      `footstep_velocity_sq_threshold` into `footstep_min_speed_sq` +
+      `impact_min_approach_speed_sq`. Extract `contact_query.zig` as a shared
+      leaf both `sensory_bus` and `audio_controller` import (including the
+      duplicated `clamp(penetration/18, 0.25, 1)` curve). Decide sticky sizing:
+      either fixed `(stimulus_max_impacts_per_step + 1) * (cognition_stagger_n -
+      1)` with a comptime assert, or priority-aware capture (dig before impact).
+      *(Bounded-drop + a counted `stimuli_sticky_dropped` metric already landed;
+      this step chooses the permanent capacity, never a bigger number for one
+      map.)*
+- [ ] **Evict domain logic**: plane traversal (`applyPlaneTraversalStage` +
+      helpers) → `DigController`, replacing the live-population
+      `ensureTotalCapacity` carve scratch with a fixed init-sized buffer
+      (`config.movement_body_capacity + 1`); the gate/clamp/`rectOverlap` family
+      → a new `src/game/systems/world_gate.zig` (thread/SIMD it in a **separate
+      benched** follow-up, so a perf change never rides inside a structural one);
+      `applyAiMovementIntents` → `MovementSystem.applyIntents`.
+- [ ] **Own the budgets**: add `SimulationPipeline.reserve(frame, pop)`; add
+      `reserve` to `ai`/`perception`/`affect`/`ai_memory` called from `init`
+      (they have no reserve seam today — allocation-freedom is "after warmup at a
+      fixed population," not "after init"), and convert their `FailingAllocator`
+      tests from warm-then-run to reserve-then-run; add an exhaustive
+      `EventProducerId` + `maxEventsPerStep` so an unbudgeted producer will not
+      compile; add the first composite `FailingAllocator` test over
+      `pipeline.update()` on a minimal 1x1 fixture with dig + falls + contacts live.
+- [ ] **Ordering-backstop tests** (belt-and-braces once the graph is bound):
+      the affect-before-ai test must assert an AI-visible consequence of drives,
+      not `fear > 0`; add a `chunk_derive` causal test (a body pushed across a
+      chunk boundary by collision response, asserting the chunk column matches
+      the settled position after `update()`); add a perception→ai_memory causal
+      test where perception actually acquires so `ai_memory` refreshes
+      `last_known` from this step's `last_seen`; fold the `RowInterest` column
+      into the `ai` serial/threaded parity test.
+- [ ] **Follow-ups** (independently landable, none blocking): route every
+      producer through `SensoryBus.emit` and delete
+      `SimulationFrame.appendStimulus`/`tryAppendStimulus`, making `live <= 32` a
+      type invariant (ships with its own dig-behavior-change test); extend the AI
+      bench to the full production config (memory/affect/populated
+      `interest_markers`) and correct the roadmap AI-stage band; move
+      `findBestInvestigateMarker`'s scan out of the serial gather into
+      `writeAiSeparationJob`.
+- [ ] Update [architecture.md](architecture.md) and
+      [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md): the
+      contributor checklist gains the `carried` rule and the "a tag written by
+      stage 0 cannot constrain anything downstream" rule; record the SensoryBus
+      controller's stage placement.
+
+### Acceptance checks
+
+- [ ] `update()` is a short `runStage` loop; no untagged sensory mutation
+      remains; reordering `stage_order` either fails to compile or fails a causal
+      test.
+- [ ] The sensory bus, `world_gate`, and movement-intent apply live in their
+      owning modules; the pipeline composes them like `DigController`.
+- [ ] Every per-step budget stays fixed/world-size-independent; the composite
+      `update()` path is proven allocation-free-after-reserve by `FailingAllocator`.
+- [ ] No bench regression from the moves (the `world_gate` SIMD pass is a
+      separate benched follow-up); `zig build verify` passes.
+
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1347,6 +1523,10 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 44. Input rebinding UI + extended gamepad controls (after 43).
 46. Save/load persistence (independent; benefits from 44 for binding
     persistence).
+47. Un-stagger the shared sensing substrate (live perception defect; before 48).
+48. SimulationPipeline thin-composer restoration (after 47; independent landable
+    steps — contract vocab → bind graph → extract SensoryBus → evict domain
+    logic → own budgets).
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents

@@ -44,6 +44,8 @@ pub const ProxySlice = struct {
     min_y: HotF32Slice,
     max_x: HotF32Slice,
     max_y: HotF32Slice,
+    velocity_x: HotF32Slice,
+    velocity_y: HotF32Slice,
 
     pub fn len(self: ProxySlice) usize {
         return self.entities.len;
@@ -58,6 +60,8 @@ pub const ConstProxySlice = struct {
     min_y: ConstHotF32Slice,
     max_x: ConstHotF32Slice,
     max_y: ConstHotF32Slice,
+    velocity_x: ConstHotF32Slice,
+    velocity_y: ConstHotF32Slice,
 
     pub fn len(self: ConstProxySlice) usize {
         return self.entities.len;
@@ -74,6 +78,10 @@ const ProxyRow = struct {
     min_y: f32,
     max_x: f32,
     max_y: f32,
+    /// Pre-response velocity, so contacts can carry an approach-speed snapshot
+    /// the collision-response pass has not yet zeroed.
+    velocity_x: f32,
+    velocity_y: f32,
 };
 
 fn appendProxyRow(
@@ -225,6 +233,8 @@ pub const CollisionSystem = struct {
             .min_y = s.items(.min_y),
             .max_x = s.items(.max_x),
             .max_y = s.items(.max_y),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
         };
     }
 
@@ -238,6 +248,8 @@ pub const CollisionSystem = struct {
             .min_y = s.items(.min_y),
             .max_x = s.items(.max_x),
             .max_y = s.items(.max_y),
+            .velocity_x = s.items(.velocity_x),
+            .velocity_y = s.items(.velocity_y),
         };
     }
 
@@ -423,6 +435,8 @@ pub const CollisionSystem = struct {
                 .min_y = min_y,
                 .max_x = min_x + size_x,
                 .max_y = min_y + size_y,
+                .velocity_x = body.velocity.x,
+                .velocity_y = body.velocity.y,
             });
         }
         try self.ensureOrder();
@@ -922,6 +936,14 @@ fn contactForResolved(
     normal_y: f32,
     penetration: f32,
 ) CollisionContact {
+    const va_x = proxies.velocity_x[a];
+    const va_y = proxies.velocity_y[a];
+    const vb_x = proxies.velocity_x[b];
+    const vb_y = proxies.velocity_y[b];
+    const speed_a_sq = va_x * va_x + va_y * va_y;
+    const speed_b_sq = vb_x * vb_x + vb_y * vb_y;
+    const rel_x = va_x - vb_x;
+    const rel_y = va_y - vb_y;
     return .{
         .a = proxies.entities[a],
         .b = proxies.entities[b],
@@ -930,6 +952,8 @@ fn contactForResolved(
         .normal_x = normal_x,
         .normal_y = normal_y,
         .penetration = penetration,
+        .pre_response_max_speed_sq = @max(speed_a_sq, speed_b_sq),
+        .pre_response_relative_speed_sq = rel_x * rel_x + rel_y * rel_y,
     };
 }
 

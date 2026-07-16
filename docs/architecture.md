@@ -62,8 +62,8 @@ game-specific behavior under `src/game/`.
   counters.
 - `src/game/systems/simulation_scope.zig` owns `SimulationScopeSystem`, the
   backbone scope processor: tier/halo/stagger gathers and the auto tier wake/sleep
-  policy (entity chunk columns are derived in-pass by movement, not a separate
-  recompute).
+  policy (entity chunk columns are derived by the dedicated late `chunk_derive`
+  stage after positions settle, not in the scope pass).
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
@@ -448,8 +448,9 @@ movement rows so they exist exactly for simulated entities and the O(N) scope
 passes read/write aligned columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
 that derives the camera cognition halo from `WorldSystem` and selects which entities
-enter each stage; entity chunk columns are derived in-pass by the movement processor
-(not a separate scope recompute).
+enter each stage; entity chunk columns are derived by the dedicated late `chunk_derive`
+stage, ordered after every `movement_positions` writer so tier policy and render prep
+read chunks matching each body's final settled position.
 Processors keep their hot loops and receive a `scope_dense_indices` option
 (null = full-active) instead of learning world/chunk policy. Movement and
 collision gate on tier only (no chunk filter, so off-screen entities keep moving
