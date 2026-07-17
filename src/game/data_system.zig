@@ -93,6 +93,9 @@ pub const AiAffect = @import("data_system/types.zig").AiAffect;
 pub const AiAffectCommand = @import("data_system/types.zig").AiAffectCommand;
 pub const ConstAiAffectSlice = @import("data_system/types.zig").ConstAiAffectSlice;
 pub const AiAffectSlice = @import("data_system/types.zig").AiAffectSlice;
+pub const Destructible = @import("data_system/types.zig").Destructible;
+pub const DestructibleCommand = @import("data_system/types.zig").DestructibleCommand;
+pub const ConstDestructibleSlice = @import("data_system/types.zig").ConstDestructibleSlice;
 pub const StructuralCommand = @import("data_system/types.zig").StructuralCommand;
 pub const StructuralCommitStats = @import("data_system/types.zig").StructuralCommitStats;
 pub const ObstacleWorldRect = @import("data_system/types.zig").ObstacleWorldRect;
@@ -112,6 +115,7 @@ test {
     _ = @import("data_system/perception.zig");
     _ = @import("data_system/memory.zig");
     _ = @import("data_system/affect.zig");
+    _ = @import("data_system/destructible.zig");
     _ = @import("data_system/structural.zig");
     _ = @import("data_system/system.zig");
 }

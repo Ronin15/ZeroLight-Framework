@@ -72,6 +72,7 @@ pub const Component = enum(u5) {
     ai_perception,
     ai_memory,
     ai_affect,
+    destructible,
 };
 
 pub const ComponentMask = u32;
@@ -90,6 +91,7 @@ pub const component_masks = struct {
     pub const ai_perception = componentMask(.ai_perception);
     pub const ai_memory = componentMask(.ai_memory);
     pub const ai_affect = componentMask(.ai_affect);
+    pub const destructible = componentMask(.destructible);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -651,6 +653,27 @@ pub const AiAffectCommand = struct {
     affect: AiAffect,
 };
 
+/// Compact destructible fact for action-intent consumers (Slice 45). Demo crates
+/// use `hit_points = 1` (one interact/attack destroys). Multi-hit entities keep
+/// remaining HP via deferred `set_destructible` until zero → `destroy_entity`.
+pub const Destructible = struct {
+    hit_points: u8 = 1,
+    destroy_on_interact: bool = true,
+    destroy_on_attack: bool = true,
+};
+
+pub const DestructibleCommand = struct {
+    entity: EntityId,
+    destructible: Destructible,
+};
+
+pub const ConstDestructibleSlice = struct {
+    entities: []const EntityId,
+    hit_points: []const u8,
+    destroy_on_interact: []const bool,
+    destroy_on_attack: []const bool,
+};
+
 pub const ConstAiAffectSlice = struct {
     entities: []const EntityId,
     baseline_fear: ConstHotF32Slice,
@@ -722,6 +745,7 @@ pub const EntityTemplate = struct {
     ai_perception: ?AiPerception = null,
     ai_memory: ?AiMemory = null,
     ai_affect: ?AiAffect = null,
+    destructible: ?Destructible = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -774,6 +798,7 @@ pub const StructuralCommand = union(enum) {
     set_ai_perception: AiPerceptionCommand,
     set_ai_memory: AiMemoryCommand,
     set_ai_affect: AiAffectCommand,
+    set_destructible: DestructibleCommand,
 };
 
 pub const StructuralCommitStats = struct {

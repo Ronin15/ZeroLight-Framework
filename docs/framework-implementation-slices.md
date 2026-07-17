@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only. Landed slices that still need
@@ -87,12 +87,11 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood (needs real appraisal signals) |
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
-| **45** | Not started | First action-intent consumer domain controller (destructibles) — depends on archive Slice 40; **next primary** |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
 | **47** | Not started | **Live perception defect:** un-stagger the shared spatial index / perception candidate set so cognition NPCs can perceive each other (stagger gates thinking only). **Highest-priority correctness item on the AI track** |
 | **48** | Not started | SimulationPipeline thin-composer restoration — bind `stage_order` to execution, extract `SensoryBus`, evict movement/world domain logic, own event/allocation budgets. Land as independent steps |
 
-**Recently settled (archive only):** 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -110,7 +109,7 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
 
 | Track | Slices | Notes |
 | --- | --- | --- |
-| **Primary — action/interaction** | **45** (after archive **40**) | Action-intent substrate landed; first domain controller (destructibles) is **next.** |
+| **Primary — action/interaction** | archive **40** + **45** | Action-intent substrate + first domain controller (destructibles) landed; future combat/rules consumers reuse the same bus. |
 | **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
 | **World / render verticality** | **37 → 38** | Cap raise + shader sync, then elevation-above-surface semantics. Independent of AI. |
 | **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
@@ -122,10 +121,9 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
   over `AiAffectDrive`**, not a permanent `if (fear) flee` tree. Goals stay
   per-agent and multi-source (not broadcast player-only). Utility + sticky
   select over exclusive FSMs. No test-only production API tags.
-- **Component headroom:** 13 of 32 `Component` tags used (`enum(u5)` +
-  `ComponentMask = u32`). Slice 41 used `WorldSystem` interest markers, not a
-  new tag. First likely new tag is a destructible/affordance fact in **45**
-  (or an action-related component if 40 chooses one) — see Scaling Gaps.
+- **Component headroom:** 14 of 32 `Component` tags used (`enum(u5)` +
+  `ComponentMask = u32`). Slice 45 added `destructible`. Slice 41 used
+  `WorldSystem` interest markers, not a new tag — see Scaling Gaps.
 - Guard CPU paths with existing benches; keep SDL_GPU submit on the render
   thread. Reuse state-owned `SimulationPipeline`; persistent data in
   `DataSystem`; structural changes through `SimulationFrame`.
@@ -165,12 +163,10 @@ world depth, or cognition-track scope.
       scope level / render cull alignment). Residual multi-floor chase policy
       is product work on open slices, not a missing column.
 - [ ] **Component storage headroom.** `Component` is `enum(u5)` (32 tags) and
-      `ComponentMask` is `u32` — **13 tags used** (`movement_body`…`ai_affect`).
-      Slice 32–33 consumed existing stores; Slice 41 stored interest markers on
-      `WorldSystem`, not a new `Component` tag. First likely new tag is a
-      destructible / affordance fact in **Slice 45** (or an action-related
-      component if Slice 40 chooses one). Promote a widening slice only when
-      the first new tag would exceed 32.
+      `ComponentMask` is `u32` — **14 tags used** (`movement_body`…`destructible`).
+      Slice 45 added `destructible`; Slice 41 stored interest markers on
+      `WorldSystem`, not a new tag. Promote a widening slice only when the
+      first new tag would exceed 32.
 - [ ] **Multi-world scope policy.** Inactive world instances stay out of
       pipeline scope; the active world uses chunk + halo rules (Slice 22
       deferred).
@@ -343,9 +339,9 @@ by Slice 24.
 | Archetypes / debug | 33 | Landed (visual residual on frontier) | JSON personalities + overlay (drive bars / affect blocks) |
 | Stimulus ecosystem | 39 | Landed (archive) | Multi-producer bus (dig, footstep, deferred impact) |
 | World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
-| Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R + stub `action_react` |
+| Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R capture |
+| First action consumer | 45 | Landed (archive) | `DestructibleController` at `action_react`; deferred destroy + domain event |
 | Sensing substrate fix | 47 | **Open (live defect)** | Un-stagger the shared spatial index / perception candidates so cognition NPCs perceive each other; stagger gates thinking only |
-| First action consumer | 45 | **Open** | Domain controller (destructibles) consuming 40; **next primary** |
 | **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
 ### Emotion / feelings model (landed + expandability)
@@ -1161,69 +1157,6 @@ the device-agnostic `Action` contract keyboard and gamepad already share.
 - [ ] Keyboard-only and default-binding paths are byte-for-byte unchanged.
 - [ ] `zig build verify` passes.
 
-## Slice 45: First Action-Intent Consumer Domain Controller (Destructibles)
-
-**Status: not started.** Depends on archive Slice 40 (action-intent substrate
-— landed). **Next primary implementation slice.**
-
-Goal: land the **first pipeline-owned domain controller** that consumes Slice
-40's action intents into an actual gameplay domain, proving the substrate end to
-end. Destructibles / explosions are the exemplar (a confirmed future direction),
-but the slice's real contract is the controller pattern, not the specific
-content.
-
-### Current foundation (do not rebuild)
-
-- Archive **Slice 40** landed `ActionIntent` / `ActionKind`,
-  `SimulationFrame.action_intents` (`RangeOutputStream`),
-  specialized stream only (no `SimulationIntent` dual-write), `action_intent_capture` + stub `action_react`, and
-  player **R** rising-edge interact capture. Replace the stub consumer — do
-  not invent a second bus.
-- `src/game/dig_controller.zig` is the template for a pipeline-owned controller
-  that reacts at a fixed stage, emits `world_tile_changed`, and routes structural
-  edits through deferred `StructuralCommand`s + world edits — never mutating
-  `DataSystem` inside worker ranges.
-- `docs/architecture.md` already describes "light domain controllers" for
-  combat / spawning / rules / encounters as the intended slot for exactly this.
-
-### Architecture notes
-
-- New controller owned by `SimulationPipeline`, consuming **merged**
-  `ActionIntent`s at a reaction phase after intent merge — not inside worker
-  ranges, not before the merge barrier.
-- Destruction results (tile removal, entity despawn, debris/particle spawn) go
-  through deferred `StructuralCommand`s and world edits; the controller requests
-  consideration, it does not directly mutate stores on the hot path.
-- Emit a typed `SimulationEvent` for the destruction moment (scalar payload only,
-  per the Slice 21 event contract). Reuse the existing `world_tile_changed`
-  reaction so pathfinding nav-invalidation and perception caches update locally,
-  not via a whole-level rebuild.
-- No renderer / audio / SDL handles in the controller; audio & particles are
-  driven through the existing `AudioController` / particle system.
-- Keep locomotion (`NavigationIntent`) and this action-consumer stream separate —
-  this slice must not overload navigation fields.
-
-### Checklist
-
-- [ ] Define a compact destructible fact (a `DataSystem` column or world marker)
-      — may be the first `Component` tag past 13/32; coordinate with the widening
-      note in Scaling Gaps if so.
-- [ ] Controller consumes action intents → deferred destruction commands; local
-      nav re-mask + destruction `SimulationEvent`; particle/audio via existing
-      controllers.
-- [ ] Capacity / determinism / serial==threaded parity tests; payload-purity
-      test (no pointers/handles in the event).
-- [ ] Docs: `docs/simulation-tiers-and-pipeline.md` records the controller's
-      stage placement and the action-intent → deferred-command contract.
-
-### Acceptance checks
-
-- [ ] An action intent targeting a destructible destroys it deterministically
-      through deferred commands; nav updates locally.
-- [ ] No action producers running → world unchanged (movement-only demos
-      unaffected).
-- [ ] `NavigationIntent` contract untouched; `zig build verify` passes.
-
 ## Slice 46: Save/Load Persistence
 
 **Status: not started.** Completes the design intent from archive **Slice 10**,
@@ -1238,10 +1171,10 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 
 ### Current foundation (do not rebuild)
 
-- `DataSystem` holds ~15 default-initialized SoA stores (`movement_bodies`,
+- `DataSystem` holds default-initialized SoA stores (`movement_bodies`,
   `facings`, `asset_refs`, `collision_*`, `ai_agents`, `steering_agents`,
-  `world_levels`, `factions`, `ai_perceptions`, `ai_memories`, `ai_affects`, …)
-  plus entity slots + generations.
+  `world_levels`, `factions`, `ai_perceptions`, `ai_memories`, `ai_affects`,
+  `destructibles`, …) plus entity slots + generations.
 - `WorldSystem` owns tile / level storage; `player.zig` owns player state;
   `core/rng.zig` owns deterministic per-entity RNG; `RuntimeAssets` /
   `manifest.zig` own stable `SpriteAssetId` / `AudioAssetId`.
@@ -1511,7 +1444,7 @@ actually runs and the composer stops owning cross-step state and policy.
 40. Action and interaction intent substrate (non-locomotion emergence). —
     landed (archive).
 45. First action-intent consumer domain controller / destructibles (after 40).
-    **← next primary**
+    — landed (archive).
 42. Affect expansion (more feelings, coupling, appraisal gains, optional mood)
     — only when a real appraisal signal exists.
 35. AI and steering hot-loop SIMD restructure (unblocked; measure at battle

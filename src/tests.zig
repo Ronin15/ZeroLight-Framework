@@ -41,6 +41,7 @@ comptime {
     _ = @import("game/audio_controller.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/dig_controller.zig");
+    _ = @import("game/destructible_controller.zig");
     _ = @import("game/game_demo_state.zig");
     _ = @import("game/loading_state.zig");
     _ = @import("game/main_menu_state.zig");

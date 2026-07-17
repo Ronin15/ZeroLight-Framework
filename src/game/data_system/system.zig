@@ -96,6 +96,9 @@ const validateAiAffect = affect.validateAiAffect;
 const AiAffect = types.AiAffect;
 const ConstAiAffectSlice = types.ConstAiAffectSlice;
 const AiAffectSlice = types.AiAffectSlice;
+const DestructibleStore = @import("destructible.zig").DestructibleStore;
+const Destructible = types.Destructible;
+const ConstDestructibleSlice = types.ConstDestructibleSlice;
 const structural = @import("structural.zig");
 const StructuralPlanScratch = structural.StructuralPlanScratch;
 const NullStructuralChangeSink = structural.NullStructuralChangeSink;
@@ -127,12 +130,14 @@ pub const DataSystem = struct {
     ai_perceptions: PerceptionStore = .{},
     ai_memories: AiMemoryStore = .{},
     ai_affects: AiAffectStore = .{},
+    destructibles: DestructibleStore = .{},
 
     pub fn init(allocator: std.mem.Allocator) DataSystem {
         return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *DataSystem) void {
+        self.destructibles.deinit(self.allocator);
         self.ai_affects.deinit(self.allocator);
         self.ai_memories.deinit(self.allocator);
         self.ai_perceptions.deinit(self.allocator);
@@ -191,6 +196,7 @@ pub const DataSystem = struct {
         if (slot.ai_perception_index) |dense_index| self.removeAiPerceptionAt(@intCast(dense_index));
         if (slot.ai_memory_index) |dense_index| self.removeAiMemoryAt(@intCast(dense_index));
         if (slot.ai_affect_index) |dense_index| self.removeAiAffectAt(@intCast(dense_index));
+        if (slot.destructible_index) |dense_index| self.removeDestructibleAt(@intCast(dense_index));
 
         // tier_counts is decremented in removeMovementBodyAt (called above) since
         // the tier now lives on the dense movement-body scope row, not the slot.
@@ -212,6 +218,7 @@ pub const DataSystem = struct {
         retired_slot.ai_perception_index = null;
         retired_slot.ai_memory_index = null;
         retired_slot.ai_affect_index = null;
+        retired_slot.destructible_index = null;
         self.first_free_slot = index;
         self.free_slot_count += 1;
         return true;
@@ -347,6 +354,7 @@ pub const DataSystem = struct {
     pub fn clearRetainingCapacity(self: *DataSystem) void {
         // Reset invalidates all existing IDs while keeping allocated component
         // columns warm for the next state/session.
+        self.destructibles.clearRetainingCapacity();
         self.ai_affects.clearRetainingCapacity();
         self.ai_memories.clearRetainingCapacity();
         self.ai_perceptions.clearRetainingCapacity();
@@ -382,6 +390,7 @@ pub const DataSystem = struct {
             slot.ai_perception_index = null;
             slot.ai_memory_index = null;
             slot.ai_affect_index = null;
+            slot.destructible_index = null;
             self.first_free_slot = @intCast(index);
         }
     }
@@ -888,6 +897,36 @@ pub const DataSystem = struct {
         return self.ai_affects.slice();
     }
 
+    pub fn setDestructible(self: *DataSystem, id: EntityId, value: Destructible) !void {
+        const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
+        if (slot.destructible_index) |index| {
+            self.destructibles.set(@intCast(index), value);
+            return;
+        }
+
+        const dense_index = try self.destructibles.append(self.allocator, id, value);
+        slot.destructible_index = dense_index;
+        slot.addComponent(.destructible);
+    }
+
+    pub fn destructibleConst(self: *const DataSystem, id: EntityId) ?Destructible {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.destructible_index orelse return null;
+        return self.destructibles.get(@intCast(dense_index));
+    }
+
+    pub fn destructibleSliceConst(self: *const DataSystem) ConstDestructibleSlice {
+        return self.destructibles.sliceConst();
+    }
+
+    /// Dense `DestructibleStore` row index for `id`, or `null` when the entity
+    /// carries no `Destructible` component.
+    pub fn destructibleDenseIndex(self: *const DataSystem, id: EntityId) ?usize {
+        const slot = self.resolveSlotConst(id) orelse return null;
+        const dense_index = slot.destructible_index orelse return null;
+        return @intCast(dense_index);
+    }
+
     fn syncScopeLevelFromWorldLevel(self: *DataSystem, id: EntityId, level: u16) !void {
         const metadata = self.simulationMetadata(id) orelse return;
         if (metadata.level == level) return;
@@ -1019,6 +1058,11 @@ pub const DataSystem = struct {
         const moved = self.ai_affects.removeAt(index);
         if (moved) |entity| self.slots.items[@intCast(entity.index)].ai_affect_index = @intCast(index);
     }
+
+    fn removeDestructibleAt(self: *DataSystem, index: usize) void {
+        const moved = self.destructibles.removeAt(index);
+        if (moved) |entity| self.slots.items[@intCast(entity.index)].destructible_index = @intCast(index);
+    }
 };
 
 const EntitySlot = struct {
@@ -1041,6 +1085,7 @@ const EntitySlot = struct {
     ai_perception_index: ?u32 = null,
     ai_memory_index: ?u32 = null,
     ai_affect_index: ?u32 = null,
+    destructible_index: ?u32 = null,
 
     fn addComponent(self: *EntitySlot, component: Component) void {
         self.component_mask |= componentMask(component);
@@ -2683,6 +2728,24 @@ test "ai memory survives entity destruction and reuse with generational correctn
     try data.setAiMemory(reused, .{ .staleness = 222 });
     try std.testing.expectEqual(@as(f32, 222), data.aiMemoryConst(reused).?.staleness);
     try std.testing.expectEqual(@as(?AiMemory, null), data.aiMemoryConst(original));
+}
+
+test "destructible round-trips through set/get and clears on destroy" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    try data.setDestructible(first, .{ .hit_points = 3, .destroy_on_interact = false });
+    try std.testing.expect(data.hasComponents(first, component_masks.destructible));
+    try std.testing.expectEqual(@as(u8, 3), data.destructibleConst(first).?.hit_points);
+    try std.testing.expect(!data.destructibleConst(first).?.destroy_on_interact);
+
+    try data.setDestructible(first, .{ .hit_points = 1 });
+    try std.testing.expectEqual(@as(u8, 1), data.destructibleConst(first).?.hit_points);
+    try std.testing.expect(data.destructibleConst(first).?.destroy_on_interact);
+
+    try std.testing.expect(data.destroyEntity(first));
+    try std.testing.expectEqual(@as(?Destructible, null), data.destructibleConst(first));
 }
 
 test "ai affect round-trips through set/get, retunes cold-only, and rejects invalid fields" {

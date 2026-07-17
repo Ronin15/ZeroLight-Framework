@@ -105,6 +105,18 @@ pub const AffectThresholdCrossedEvent = struct {
     rising: bool,
 };
 
+/// Emitted at `domain_reaction` by `DestructibleController` while the target is
+/// still alive (before the deferred `destroy_entity` structural commit). Scalar
+/// payload only — no pointers/handles. Commit still emits `entity_destroyed`
+/// for nav local re-mask of static obstacles.
+pub const DestructibleDestroyedEvent = struct {
+    entity: EntityId,
+    level: u16,
+    cell_x: u16,
+    cell_y: u16,
+    cause: ActionKind,
+};
+
 pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
     entity_destroyed: EntityDestroyedEvent,
@@ -115,6 +127,7 @@ pub const SimulationEventPayload = union(enum) {
     entity_perceived: EntityPerceivedEvent,
     entity_lost: EntityLostEvent,
     affect_threshold_crossed: AffectThresholdCrossedEvent,
+    destructible_destroyed: DestructibleDestroyedEvent,
 };
 
 pub const SimulationEvent = struct {
@@ -134,6 +147,7 @@ pub const SimulationEventStats = struct {
     entity_perceived: usize = 0,
     entity_lost: usize = 0,
     affect_threshold_crossed: usize = 0,
+    destructible_destroyed: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
 
@@ -153,6 +167,7 @@ pub const SimulationEventStats = struct {
             .entity_perceived => self.entity_perceived += 1,
             .entity_lost => self.entity_lost += 1,
             .affect_threshold_crossed => self.affect_threshold_crossed += 1,
+            .destructible_destroyed => self.destructible_destroyed += 1,
         }
     }
 
@@ -167,6 +182,7 @@ pub const SimulationEventStats = struct {
         self.entity_perceived += produced.entity_perceived;
         self.entity_lost += produced.entity_lost;
         self.affect_threshold_crossed += produced.affect_threshold_crossed;
+        self.destructible_destroyed += produced.destructible_destroyed;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
@@ -183,6 +199,7 @@ pub const SimulationEventStats = struct {
         perf.recordMetric(.simulation_events_entity_perceived, metric(self.entity_perceived));
         perf.recordMetric(.simulation_events_entity_lost, metric(self.entity_lost));
         perf.recordMetric(.simulation_events_affect_threshold_crossed, metric(self.affect_threshold_crossed));
+        perf.recordMetric(.simulation_events_destructible_destroyed, metric(self.destructible_destroyed));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
     }

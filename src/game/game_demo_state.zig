@@ -133,7 +133,10 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // trigger count is bounded by contact count — collision_response's own domain
     // knowledge, not a second independent ratio for this demo to guess).
     const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
-    const structural_reserve = mover_count + 16;
+    // Tier policy can emit one set_simulation_tier per mover, plus fixed headroom for
+    // dig/create bursts and Slice 45 destructible destroys (bounded by action-intent
+    // live capacity — fixed, not map-scaled).
+    const structural_reserve = mover_count + 16 + action_intent_live_capacity;
     // Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining event and
     // every structural-commit event shares this one budget for the step (cleared only at
     // `beginStep`), so it must cover the worst case of all of them landing in the same
@@ -148,11 +151,12 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // drive per step, 4 drives, per cognition agent) for the `demoArchetypeForIndex`
     // subset that now carries `AiPerception`/`AiAffect` — see
     // `demoCognitionAgentCount`/`perception_max_events_per_step`/
-    // `affect_max_events_per_step` below.
+    // `affect_max_events_per_step` below. Plus fixed `action_intent_live_capacity`
+    // headroom for `destructible_destroyed` domain events (Slice 45).
     const cognition_agents = demoCognitionAgentCount(mover_count);
     const perception_event_reserve = cognition_agents * 2;
     const affect_event_reserve = cognition_agents * 4;
-    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve;
+    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve + action_intent_live_capacity;
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -538,6 +542,7 @@ pub const GameDemoState = struct {
             .bounds_width = self.bounds_width,
             .bounds_height = self.bounds_height,
             .perf = context.perf,
+            .particles = &self.particles,
         });
 
         var collision_audio_timer = StageTimer.start();
@@ -1089,6 +1094,8 @@ fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count
         try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+        // Slice 45: demo crates are one-shot destructibles (R / interact).
+        try data.setDestructible(entity, .{ .hit_points = 1 });
         entities[index] = entity;
     }
     return entities;
@@ -1125,6 +1132,7 @@ fn spawnObstaclesCompact(data: *DataSystem) ![obstacle_count]EntityId {
         try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+        try data.setDestructible(entity, .{ .hit_points = 1 });
         entities[index] = entity;
     }
     return entities;
@@ -2044,15 +2052,17 @@ test "demo event capacity covers every NPC falling plus player fall, mining, str
     // the same step: `applyNpcPlaneTraversal` walks every AI agent and can emit up
     // to `default_demo_mover_count` fall events, plus the player's own plane-traversal
     // fall (1) and dig-mining event (1), plus up to the derived structural reserve
-    // structural-commit events, plus the post-commit nav-invalidation headroom (1),
+    // structural-commit events (tier + fixed dig/create + action_intent_live_capacity
+    // destructible destroys), plus the post-commit nav-invalidation headroom (1),
     // plus the `demoArchetypeForIndex` cognition subset's worst-case perception
-    // (2/agent) and affect (4/agent) events.
+    // (2/agent) and affect (4/agent) events, plus action_intent_live_capacity for
+    // destructible_destroyed domain events (Slice 45).
     //
-    // The 155 below is a hard-coded expectation, not re-derived from
+    // The 283 below is a hard-coded expectation, not re-derived from
     // deriveDemoPopulationCapacity: re-deriving it here would make this assertion pass
     // trivially even if that formula drifted, since both sides would drift together.
     // A literal catches that.
-    const worst_case_event_count: usize = 155;
+    const worst_case_event_count: usize = 283;
     try std.testing.expectEqual(worst_case_event_count, deriveDemoPopulationCapacity(default_demo_mover_count).event_reserve);
 
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;

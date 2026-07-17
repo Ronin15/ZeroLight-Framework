@@ -120,6 +120,8 @@ pub const Metric = enum {
     stimuli_promoted,
     action_intents_consumed,
     action_intents_dropped,
+    destructibles_destroyed,
+    destructibles_hit,
     particle_active_before,
     particle_active_after,
     particle_removed,
@@ -150,6 +152,7 @@ pub const Metric = enum {
     simulation_events_entity_perceived,
     simulation_events_entity_lost,
     simulation_events_affect_threshold_crossed,
+    simulation_events_destructible_destroyed,
     simulation_events_structural_commit_stage,
     simulation_events_domain_reaction_stage,
 };
@@ -613,7 +616,7 @@ const EnabledRuntimePerfLog = struct {
             },
         );
         log.debug(
-            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
+            "perf {d:.1}s gameplay ai_entities={} ai_avg={d:.1} ai_intents={} ai_nav={} steering_selected={} steering_move={} movement_bodies={} movement_avg={d:.1} collision_bodies={} collision_avg={d:.1} collision_pairs={} collision_contacts={} response_intents={} response_triggers={} stimuli_live_dropped={} stimuli_deferred_dropped={} stimuli_sticky_dropped={} stimuli_promoted={} action_intents_consumed={} action_intents_dropped={} destructibles_destroyed={} destructibles_hit={} particles_before={} particles_avg={d:.1} particles_after={} particles_removed={} structural created={} destroyed={} components={} stale={}",
             .{
                 elapsed_s,
                 self.metricValue(.ai_entities),
@@ -636,6 +639,8 @@ const EnabledRuntimePerfLog = struct {
                 self.metricValue(.stimuli_promoted),
                 self.metricValue(.action_intents_consumed),
                 self.metricValue(.action_intents_dropped),
+                self.metricValue(.destructibles_destroyed),
+                self.metricValue(.destructibles_hit),
                 self.metricValue(.particle_active_before),
                 averagePer(self.metricValue(.particle_active_before), update_count),
                 self.metricValue(.particle_active_after),

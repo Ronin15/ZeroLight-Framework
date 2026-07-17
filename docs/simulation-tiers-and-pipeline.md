@@ -205,12 +205,22 @@ part of the contract: count and write phases must stay consistent.
   advances only on successful append so soft-drops retry while held). Future
   AI arbitration may emit multi-range writes when in-range attack/interact is
   added in a later slice. **Consumer phase:** explicit domain reaction after
-  merge (`action_react` in `stage_order`; Slice 40 stub counts only — Slice 45
-  will consume for destructibles/combat). The `action_intent_capture` stage is
-  a **contract-only** resource handoff (writes declared so `action_react` can
-  read); wall-clock appends happen in `main_thread_inputs` before `update`.
-  Capacity is the fixed constant `action_intent_live_capacity` in
-  `simulation.zig` (64), not map-scaled. Callers warm with
+  merge (`action_react` in `stage_order`). **Slice 45 consumer:** pipeline-owned
+  `DestructibleController` reads merged intents, resolves interact/attack
+  against `Component.destructible` entities (target ID or cell-center collision
+  AABB; lowest entity index/generation on ties), accumulates same-step multi-hit
+  damage in a fixed scratch of size `action_intent_live_capacity`, and queues
+  deferred `StructuralCommand`s (`destroy_entity` / `set_destructible`) plus a
+  scalar `destructible_destroyed` domain event (entity still alive at emit;
+  commit still emits `entity_destroyed` for nav local re-mask). Ignores
+  `.use`/`.signal`. Structural + event capacity is preflighted before queuing
+  (dig pattern). `tier_policy` may append more `structural_commands` afterward
+  via `RangeOutputStream` multi-producer append — action_react does not own the
+  stream exclusively. The `action_intent_capture` stage is a **contract-only**
+  resource handoff (writes declared so `action_react` can read); wall-clock
+  appends happen in `main_thread_inputs` before `update`. Capacity is the fixed
+  constant `action_intent_live_capacity` in `simulation.zig` (64), not
+  map-scaled. Callers warm with
   `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
   (one range slot per sequential append, same shape as stimuli). Optional
   producers use `tryAppendActionIntent` so a full bus drops cleanly.
@@ -273,6 +283,7 @@ Current event payloads are:
 - `nav_region_invalidated`
 - `entity_perceived` / `entity_lost` (Slice 29 perception acquire/lose transitions)
 - `affect_threshold_crossed` (Slice 31 drive rising/falling-edge transitions)
+- `destructible_destroyed` (Slice 45 domain reaction: entity, level, cell, cause)
 
 Current event stages are:
 

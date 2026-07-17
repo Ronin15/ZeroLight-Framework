@@ -22,7 +22,9 @@ const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
+const DestructibleController = @import("destructible_controller.zig").DestructibleController;
 const AudioController = @import("audio_controller.zig").AudioController;
+const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
@@ -176,8 +178,14 @@ fn stageContract(stage: StageId) StageContract {
         // (writes world_tiles + events) and snaps body x/y/z on fall
         // (writes movement_positions + world_level).
         .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
-        // Slice 40 stub: count-only consumer; Slice 45 will apply domain reactions.
-        .action_react => .{ .reads = resources(&.{.action_intents}), .writes = .empty },
+        // DestructibleController consumes merged action intents and queues
+        // structural commands + domain events. Target resolve reads settled poses
+        // and world_level columns. tier_policy also writes structural_commands
+        // afterward via RangeOutputStream multi-producer append.
+        .action_react => .{
+            .reads = resources(&.{ .action_intents, .movement_positions, .world_level }),
+            .writes = resources(&.{ .structural_commands, .events }),
+        },
         .tier_policy => .{ .reads = resources(&.{ .movement_positions, .chunk_columns }), .writes = resources(&.{.structural_commands}) },
     };
 }
@@ -311,6 +319,8 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Borrowed runtime perf sink. Stage timers are zero-cost when perf
     /// logging is disabled at comptime, so the hot path stays clean.
     perf: runtime_perf_log.Context = .{},
+    /// Optional particle system for soft-drop destroy bursts (Slice 45).
+    particles: ?*ParticleSystem = null,
 };
 
 /// Aggregated outputs from one pipeline step. Runtime perf and tests consume
@@ -338,10 +348,14 @@ pub const SimulationPipelineStats = struct {
     stimuli_sticky_dropped: usize = 0,
     /// Deferred impacts promoted onto the live bus at the start of this step.
     stimuli_promoted: usize = 0,
-    /// Action intents observed by the Slice 40 stub consumer (`action_react`).
+    /// Action intents observed by the `action_react` consumer.
     action_intents_consumed: usize = 0,
     /// Optional action-intent appends dropped (full bus / ensure failure).
     action_intents_dropped: usize = 0,
+    /// Destructible entities destroyed this step (queued structural destroy).
+    destructibles_destroyed: usize = 0,
+    /// Destructible entities hit but not destroyed this step.
+    destructibles_hit: usize = 0,
 
     pub fn recordTo(self: SimulationPipelineStats, perf: runtime_perf_log.Context) void {
         const scope_stats = self.scope.stats;
@@ -455,6 +469,8 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.stimuli_promoted, metric(self.stimuli_promoted));
         perf.recordMetric(.action_intents_consumed, metric(self.action_intents_consumed));
         perf.recordMetric(.action_intents_dropped, metric(self.action_intents_dropped));
+        perf.recordMetric(.destructibles_destroyed, metric(self.destructibles_destroyed));
+        perf.recordMetric(.destructibles_hit, metric(self.destructibles_hit));
     }
 };
 
@@ -660,6 +676,7 @@ pub const SimulationPipeline = struct {
     /// stage only appraises and decays them.
     affect: AffectSystem,
     dig: DigController,
+    destructible: DestructibleController,
     audio_controller: AudioController,
     nav_cell_size: f32,
     /// See `SimulationPipelineConfig.perception_max_events_per_step`.
@@ -747,6 +764,7 @@ pub const SimulationPipeline = struct {
             .ai_memory = ai_memory,
             .affect = affect,
             .dig = DigController.init(config.dig),
+            .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
             .perception_max_events_per_step = config.perception_max_events_per_step,
@@ -1177,7 +1195,15 @@ pub const SimulationPipeline = struct {
         }, .{});
         chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
 
-        const action_intents_consumed = consumeActionIntentsStub(frame);
+        // action_react: first domain consumer of merged action intents (destructibles).
+        // Queues structural_commands + domain events; tier_policy may append more
+        // structural_commands afterward (RangeOutputStream multi-producer).
+        const destructible_stats = try self.destructible.process(
+            frame,
+            data,
+            context.world,
+            context.particles,
+        );
 
         // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
         // kinematic/dormant by its cube distance from the visible region, applied
@@ -1214,8 +1240,10 @@ pub const SimulationPipeline = struct {
             .stimuli_deferred_dropped = stimuli_deferred_dropped,
             .stimuli_sticky_dropped = stimuli_sticky_dropped,
             .stimuli_promoted = stimuli_promoted,
-            .action_intents_consumed = action_intents_consumed,
+            .action_intents_consumed = destructible_stats.intents_consumed,
             .action_intents_dropped = action_intents_dropped,
+            .destructibles_destroyed = destructible_stats.destroyed,
+            .destructibles_hit = destructible_stats.hits,
         };
     }
 
@@ -1246,17 +1274,6 @@ pub const SimulationPipeline = struct {
 };
 
 const StageTimer = runtime_perf_log.StageTimer;
-
-/// Slice 40 stub consumer: counts action intents only — no `DataSystem` or world
-/// mutation. Slice 45 replaces this with a real domain controller.
-fn consumeActionIntentsStub(frame: *const SimulationFrame) usize {
-    var count: usize = 0;
-    for (frame.action_intents.mergedItems()) |intent| {
-        _ = intent;
-        count += 1;
-    }
-    return count;
-}
 
 fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
     for (frame.intents.mergedItems()) |item| {
@@ -3402,20 +3419,44 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
     try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
 }
 
-test "consumeActionIntentsStub counts zero when no action producers ran" {
+test "action_react consumer reports zero intents when no action producers ran" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(2, 2, 0, 0, 0, 2);
     frame.beginStep();
-    try std.testing.expectEqual(@as(usize, 0), consumeActionIntentsStub(&frame));
+    const stats = try DestructibleController.init().process(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 0), stats.intents_consumed);
 }
 
-test "consumeActionIntentsStub counts merged action intents" {
+test "action_react consumer counts merged action intents" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(2, 2, 0, 0, 0, 2);
     try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
-    try std.testing.expectEqual(@as(usize, 1), consumeActionIntentsStub(&frame));
+    const stats = try DestructibleController.init().process(&frame, &data, &world, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.intents_consumed);
 }
 
 test "captureActionIntent appends interact on rising edge only and does not dual-write intents" {
