@@ -4,17 +4,18 @@ Completed, settled slices split out of
 [framework-implementation-slices.md](framework-implementation-slices.md) to keep
 the live roadmap focused on the open frontier. Every slice here is done and
 verified (checklist/acceptance historical record). The live roadmap owns current
-priorities, Scaling Gaps, Suggested Order, and open slices (currently 33,
-35, 37–42, plus residual 23A merge backlog).
+priorities, Scaling Gaps, Suggested Order, and open/residual slices (currently
+**33** visual residual, **35**, **37–38**, **42**, **44**, **46–48**; **43** HW residual).
 
-**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36.
+**Archived coverage:** Slices 0–7, 8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45.
 
-> Residual follow-ups from archived slices (e.g. Slice 23A `expand2`→`world`
-> merge, optional `mergeDrawList` micro-opt, Slice 30 deferred `memory_expired`
-> event, Slice 32's cohere `.group` upgrade and optional `behavior_changed`
-> event) live as open work in the live roadmap's **Scaling Gaps**, **Next
-> Priority Tracks**, or the consuming open slice (33/42) — not as incomplete
-> archive checklists.
+> Residual follow-ups from archived slices (e.g. optional `mergeDrawList`
+> micro-opt, Slice 30 deferred `memory_expired` event, Slice 32's cohere
+> `.group` upgrade and optional `behavior_changed` event, interest-marker
+> consumers beyond investigate) live as open work in the live roadmap's
+> **Scaling Gaps**, **Next Priority Tracks**, or the consuming open slice
+> (42) — not as incomplete archive checklists. The Slice 23A
+> `expand2`→`world` merge is settled.
 
 ---
 
@@ -3822,3 +3823,210 @@ throughput regression from the pre-arbitration baseline.
   personalities is **Slice 33** (JSON archetypes replace the hardcoded
   `demoArchetypeForIndex` bundles).
 
+## Slice 41: World Interest And Affordance Markers
+
+**Status: landed.**
+
+Goal: durable world-authored interest points so investigate goals are not
+limited to entities, dig stimuli, and demo player fallback.
+
+**Ownership:** `src/game/world_interest.zig` embedded in `WorldSystem`
+(`interest_markers`). Markers ≠ ephemeral `WorldStimulus`; not `DataSystem`
+components.
+
+Checklist:
+
+- [x] Marker storage + kind enum + add/remove; level isolation and capacity tests.
+- [x] Bounded query API (`interest_query_max_k`, fixed `interest_marker_capacity`).
+- [x] Investigate scoring/goal resolution: stimulus > marker > ring; null store
+      preserves prior behavior.
+- [x] Demo places surface investigate markers; pipeline passes read-only store to
+      `AiConfig.interest_markers`.
+- [x] `docs/architecture.md` records ownership and investigate priority.
+
+Acceptance checks:
+
+- [x] Agents investigate markers without entity targets (`ai.zig` serial test).
+- [x] Queries allocation-free by construction (fixed inline arrays; hot add/query
+      take no allocator — proven in `world_interest.zig` signature/layout tests).
+- [x] `zig build verify` passes.
+
+**Review follow-ups (landed with the store):** nearest-k public query, discovery
+geometry = query radius only, faction filter restricted-unless-proven, null-store
+preserves stimulus/ring, gain-gated AI gather.
+
+## Slice 39: Sensory Stimulus Ecosystem
+
+**Status: landed.** Multi-producer world sensory bus feeding existing AI hearing
+(dig + footstep same-step; collision impact deferred one step). No
+`StimulusController`; cognition does not depend on `AudioController`.
+
+Goal: expand the world sensory bus so hearing and curiosity are not permanently
+tied to a single dig producer — without turning stimuli into a second event
+stream or audio-playback service.
+
+### Landed behavior
+
+- `WorldStimulus.kind`: `.dig`, `.footstep`, `.impact` with fixed default
+  intensities and `stimulusHearingScore` soft ranking in `PerceptionSystem`.
+- **Same-step producers (before perception):** pipeline promotes prior-step
+  deferred impacts, `DigController.process`, player footstep (≤1 when velocity
+  is non-trivial).
+- **Deferred producer:** after `collision_respond`, player-involving contacts
+  enqueue `.impact` into pipeline-owned `[stimulus_deferred_capacity]`; promoted
+  at the next `update` start. Landing carve still does not emit (Slice 29).
+- Fixed capacities and drop policy in `simulation.zig`; demo warms
+  `stimuli` to `stimulus_live_capacity`.
+
+### Checklist
+
+- [x] Document producer-phase rule in `docs/simulation-tiers-and-pipeline.md`
+      and `architecture.md` (must precede perception or be next-step delayed).
+- [x] Extend `WorldStimulus.kind` with dig + footstep + collision impact.
+- [x] Wire multi-producer pipeline + perception tests (ranking, deferred impact,
+      footstep same-step, capacity drops).
+- [x] Intensity ranking via fixed `stimulus_hearing_falloff_k` (Slice 39).
+- [x] Reserve stimulus capacity from demo config; capacity + drop policy tests.
+- [x] Dig causal tests unchanged; `appendStimulus`/`tryAppendStimulus`
+      FailingAllocator proofs in `simulation.zig`.
+
+### Acceptance checks
+
+- [x] Hearing acquires non-dig stimuli; arbitration investigate path already
+      consumes `heard_stimulus` XY (perception + arbitration tests).
+- [x] No cognition → audio service dependency for stimulus emission.
+- [x] `zig build verify` passes.
+
+## Slice 40: Action And Interaction Intent Substrate
+
+**Status: complete (archived).** Depends on Slice 32 for a stable locomotion
+intent path (landed). AI action emission remains a documented future extension
+— not half-wired in 40. First real consumer is Slice 45 (destructibles).
+
+Goal: add a **parallel, typed action-intent stream** for non-locomotion
+gameplay (attack, interact, use, signal) so emergent systems can express more
+than movement without overloading `NavigationIntent` or inventing a string
+pub/sub bus.
+
+### Problem (pre-slice)
+
+- `SimulationIntent` was movement-only
+  (`union(enum) { movement: MovementIntent }`).
+- `NavigationIntent` is the high-level AI → steering handoff for **where to
+  go**. Cramming "attack target X" into goal XY or priority bits would lock
+  combat into pathfinding and break expandability.
+- Architecture already described domain controllers for combat/rules/spawning
+  (`architecture.md`) but no intent substrate existed for their outputs.
+
+### What landed
+
+- `ActionKind` / `ActionIntent` (scalar/enum only) and
+  `action_intents: RangeOutputStream(ActionIntent)` on `SimulationFrame`.
+- Producers write **only** to the specialized `action_intents` stream.
+  `SimulationIntent` stays movement-only (`union(enum){ movement }`) — no
+  dual-write into `intents` and no dead `action` union arm on the hot
+  movement-intent stream.
+- Fixed capacity `action_intent_live_capacity` (64); dual-axis warm
+  `reserveActionIntents(cap, cap)` (one range per sequential append, like
+  stimuli); `appendActionIntent` / `tryAppendActionIntent`.
+- Pipeline: `action_intent_capture` is a **contract-only** stage (real appends
+  run in `main_thread_inputs` before `update`); `action_react` stub counts
+  merged intents — no DataSystem/world mutation.
+- Player **R** / left shoulder rising-edge → `.interact` via
+  `captureActionIntent` (latch advances only on successful append; soft-drop
+  retries while held).
+- Tests: multi-append FailingAllocator after dual-axis reserve, multi-range
+  merge order, payload purity, capacity drop, dual-write guard
+  (`intents` empty), stub count 0/1, rising-edge + soft-drop latch, capture →
+  `pipeline.update` → `action_intents_consumed`.
+
+### Architecture notes
+
+- Consumers: domain controllers at explicit reaction phases after merge — not
+  the pathfinder.
+- Structural mutations from successful actions still go through deferred
+  structural commands / world edits — action intents request consideration,
+  they do not mutate `DataSystem` inside worker ranges.
+- **AI expansion path (not implemented in 40):** arbitration may later emit
+  actions when a pursue agent is in range — separate slice/checklist; must not
+  overload `NavigationIntent`.
+
+### Checklist
+
+- [x] Define `ActionIntent` + kind enum + stream on `SimulationFrame`; reserve
+      API; stats counters; docs for when to use action vs navigation vs domain
+      events.
+- [x] Pipeline phase: declare producer stage(s) and consumer reaction point(s)
+      in `stage_order` / contracts without breaking existing stage resources.
+- [x] Player or test harness emits at least one action kind end-to-end
+      (e.g. interact-noop or attack-request that a stub consumer counts).
+- [x] Capacity, deterministic multi-range merge order (serial stream contract),
+      payload purity tests (no pointers/handles). Threaded multi-producer
+      parity is deferred until a threaded action emitter exists (future AI
+      slice) — same model as the stimuli sequential-append bus.
+- [x] Document expansion path: AI arbitration may later emit actions when a
+      pursue agent is in range — separate checklist item / future slice, not a
+      silent partial in 40's "done" claim unless fully tested.
+
+### Acceptance checks
+
+- [x] Movement-only demos unchanged when no action producers run.
+- [x] Action stream is deterministic and allocation-free after reserve.
+- [x] NavigationIntent contract untouched.
+- [x] `zig build verify` passes.
+
+
+## Slice 45: First Action-Intent Consumer Domain Controller (Destructibles)
+
+**Status: complete (archived).** Depends on archive Slice 40 (action-intent
+substrate). First pipeline-owned domain controller that consumes
+`action_intents` into real gameplay.
+
+Goal: prove the Slice 40 substrate end to end with destructible entity crates —
+controller pattern, deferred structural commands, domain event, local nav
+reaction via existing `entity_destroyed` path.
+
+### What landed
+
+- `Component.destructible` (14/32 tags) + dense `DestructibleStore`
+  (`hit_points`, `destroy_on_interact`, `destroy_on_attack`); structural
+  `set_destructible` / `EntityTemplate.destructible`; DataSystem set/get/const.
+- Pipeline-owned `DestructibleController` at `action_react`:
+  - Accepts `.interact` / `.attack` (flag-gated); ignores `.use` / `.signal`.
+  - Target resolve: explicit alive destructible target, else cell-center/AABB
+    scan on intent level (missing `world_level` → 0); lowest entity index then
+    generation on ties.
+  - Same-step multi-hit pending HP scratch sized to
+    `action_intent_live_capacity`; net one `destroy_entity` or
+    `set_destructible` per entity.
+  - Preflights structural + event capacity before queue (dig pattern).
+  - Emits scalar `destructible_destroyed` at `.domain_reaction` while entity
+    still alive; commit emits `entity_destroyed` (nav local re-mask for static
+    obstacles).
+  - Optional soft-drop particle burst at body center; no SDL/audio handles.
+- `stageContract(.action_react)` reads `{action_intents}`, writes
+  `{structural_commands, events}`; multi-producer coexistence with
+  `tier_policy` via `RangeOutputStream.appendRangeCounts`.
+- Demo obstacles marked destructible (`hit_points = 1`); particles passed into
+  pipeline update context; fixed event/structural headroom for destroys
+  (`action_intent_live_capacity`, not map-scaled).
+- Tests: store FailingAllocator, controller no-intent / cell destroy / multi-hit
+  / flags / deterministic multi-candidate / payload purity / no dual-write
+  NavigationIntent; pipeline stub tests replaced by real consumer counts.
+
+### Checklist
+
+- [x] Destructible `DataSystem` component (tag 14/32) + store + structural
+      wiring.
+- [x] Controller consumes action intents → deferred destruction commands;
+      domain event; optional particles.
+- [x] Capacity / determinism / payload-purity / NavigationIntent-untouched
+      tests; Slice 40 stub consumer replaced.
+- [x] Docs: `simulation-tiers-and-pipeline.md`, `architecture.md`.
+
+### Acceptance checks
+
+- [x] Action intent targeting a destructible destroys it deterministically
+      through deferred commands; nav updates locally via `entity_destroyed`.
+- [x] No action producers running → world unchanged.
+- [x] `NavigationIntent` contract untouched; `zig build verify` passes.

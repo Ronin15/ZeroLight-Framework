@@ -184,12 +184,22 @@ fn scaleFor(output_extent: u32, logical_extent: u32) f32 {
 }
 
 fn scaledExtent(logical_extent: u32, scale: f32) u32 {
-    return @max(1, @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(logical_extent)) * scale))));
+    // Clamp into the u32 range before narrowing: `@intFromFloat` is illegal
+    // behavior on NaN or an out-of-range float, and a pathological/huge drawable
+    // size can drive the scaled extent past u32. Normal in-range results are
+    // unchanged.
+    const scaled = @floor(@as(f32, @floatFromInt(logical_extent)) * scale);
+    if (std.math.isNan(scaled) or scaled < 1) return 1;
+    if (scaled >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(scaled);
 }
 
 fn centeredOffset(outer: u32, inner: u32) i32 {
     const difference = @as(i64, @intCast(outer)) - @as(i64, @intCast(inner));
-    return @intCast(@divFloor(difference, 2));
+    // Clamp into the i32 range before narrowing so a pathological extent can
+    // never make `@intCast` overflow. Normal drawable sizes stay in range.
+    const half = @min(@max(@divFloor(difference, 2), std.math.minInt(i32)), std.math.maxInt(i32));
+    return @intCast(half);
 }
 
 fn pointInViewport(point: Point, viewport: Viewport) bool {

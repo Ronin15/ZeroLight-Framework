@@ -100,7 +100,9 @@ pub const PauseController = struct {
         errdefer pause_state.destroy(states.allocator);
 
         states.pauseActive();
-        input.releaseMovement();
+        // Clear movement + dig + stick so held dig cannot stick under the
+        // modal pause overlay (releaseMovement alone leaves dig latched).
+        input.releaseHeldGameplay();
         self.handle = states.pushModalOwnedAfterReserve(pause_state);
         self.source = source;
         time_loop.reset(now_ns);
@@ -115,7 +117,9 @@ pub const PauseController = struct {
     ) void {
         if (states.removeIfPresent(&self.handle)) {
             self.source = .none;
-            input.releaseMovement();
+            // Clear again on exit so any dig that was pressed under a policy
+            // that still allowed UP-clear, or residual stick, cannot resume.
+            input.releaseHeldGameplay();
             states.resumeActive();
             time_loop.reset(now_ns);
         }
@@ -175,7 +179,11 @@ test "pause controller enter and exit are idempotent" {
     var pause_count: u32 = 0;
     var resume_count: u32 = 0;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.dig_hole, true);
+    input.setHeld(.dig_ramp, true);
+    input.setHeld(.dig_down, true);
+    input.handleGamepadAxis(12000, -8000);
     var time_loop = TimeLoop.init(0);
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns * 2;
     var states = StateStack.init(std.testing.allocator);
@@ -190,10 +198,18 @@ test "pause controller enter and exit are idempotent" {
     try std.testing.expect(!pause.isPolicyPaused());
     try std.testing.expectEqual(@as(usize, 2), states.len());
     try std.testing.expectEqual(@as(u32, 1), pause_count);
-    try std.testing.expect(!input.isHeld(.moveRight));
+    try std.testing.expect(!input.isHeld(.move_right));
+    try std.testing.expect(!input.isHeld(.dig_hole));
+    try std.testing.expect(!input.isHeld(.dig_ramp));
+    try std.testing.expect(!input.isHeld(.dig_down));
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
+    try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
     try std.testing.expectEqual(@as(u64, 10), time_loop.last_time_ns);
     try std.testing.expectEqual(@as(u64, 0), time_loop.accumulator_ns);
 
+    // Re-hold dig under pause (e.g. accidental press that UP-clear missed)
+    // and confirm exit also clears via releaseHeldGameplay.
+    input.setHeld(.dig_hole, true);
     pause.exit(&states, &input, &time_loop, 30);
     pause.exit(&states, &input, &time_loop, 40);
 
@@ -201,7 +217,54 @@ test "pause controller enter and exit are idempotent" {
     try std.testing.expectEqual(@as(usize, 1), states.len());
     try std.testing.expectEqual(@as(u32, 1), pause_count);
     try std.testing.expectEqual(@as(u32, 1), resume_count);
+    try std.testing.expect(!input.isHeld(.dig_hole));
     try std.testing.expectEqual(@as(u64, 30), time_loop.last_time_ns);
+}
+
+test "pause enter clears held dig so dig cannot stick across pause" {
+    const TestingState = struct {
+        pub fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        pub fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        pub fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    var input = InputState{};
+    input.setHeld(.dig_hole, true);
+    input.setHeld(.dig_ramp, true);
+    input.setHeld(.dig_down, true);
+    var time_loop = TimeLoop.init(0);
+    var states = StateStack.init(std.testing.allocator);
+    defer states.deinit();
+    _ = try states.replaceGameplay(TestingState, .{});
+    var pause = PauseController.init(800, 450);
+
+    try pause.enterUser(&states, &input, &time_loop, 10);
+
+    try std.testing.expect(pause.isPaused());
+    try std.testing.expect(!input.isHeld(.dig_hole));
+    try std.testing.expect(!input.isHeld(.dig_ramp));
+    try std.testing.expect(!input.isHeld(.dig_down));
 }
 
 test "pause controller applies forced pause policy once" {
@@ -526,7 +589,7 @@ test "pause enter does not mutate gameplay when modal allocation fails" {
 
     var pause_count: u32 = 0;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
     var time_loop = TimeLoop.init(42);
     time_loop.accumulator_ns = TimeLoop.fixed_delta_ns;
     var states = StateStack.init(std.testing.allocator);
@@ -543,7 +606,7 @@ test "pause enter does not mutate gameplay when modal allocation fails" {
     try std.testing.expect(!pause.isPaused());
     try std.testing.expectEqual(@as(usize, 1), states.len());
     try std.testing.expectEqual(@as(u32, 0), pause_count);
-    try std.testing.expect(input.isHeld(.moveRight));
+    try std.testing.expect(input.isHeld(.move_right));
     try std.testing.expectEqual(@as(u64, 42), time_loop.last_time_ns);
     try std.testing.expectEqual(TimeLoop.fixed_delta_ns, time_loop.accumulator_ns);
 }

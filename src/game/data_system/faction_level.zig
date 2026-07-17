@@ -148,3 +148,41 @@ pub const WorldLevelStore = struct {
         try self.rows.ensureTotalCapacity(allocator, capacity);
     }
 };
+
+test "FactionStore append is allocation-free after ensureCapacity reserves" {
+    var store: FactionStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .neutral);
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "WorldLevelStore append is allocation-free after ensureCapacity reserves" {
+    var store: WorldLevelStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, 0);
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}

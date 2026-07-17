@@ -23,8 +23,10 @@ pub fn validateCollisionBounds(bounds: CollisionBounds) !void {
 }
 
 pub fn validateCollisionResponse(response: CollisionResponse) !void {
-    if (!std.math.isFinite(response.restitution)) return error.InvalidCollisionResponse;
-    if (response.restitution < 0) return error.InvalidCollisionResponse;
+    // Restitution is a coefficient of restitution bounded to [0, 1]; a value > 1
+    // injects energy on every bounce and destabilizes the collision solver, so
+    // reject it on both ends like the sibling scalar validators.
+    if (!std.math.isFinite(response.restitution) or response.restitution < 0 or response.restitution > 1) return error.InvalidCollisionResponse;
 }
 
 const CollisionBoundsRow = struct {
@@ -187,3 +189,41 @@ pub const CollisionResponseStore = struct {
         try self.rows.ensureTotalCapacity(allocator, hotStoreCapacity(capacity));
     }
 };
+
+test "CollisionBoundsStore append is allocation-free after ensureCapacity reserves" {
+    var store: CollisionBoundsStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{ .size = .{ .x = 8, .y = 8 } });
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "CollisionResponseStore append is allocation-free after ensureCapacity reserves" {
+    var store: CollisionResponseStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}

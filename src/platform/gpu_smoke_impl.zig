@@ -63,10 +63,10 @@ pub fn main(init: std.process.Init) !void {
     };
     const tile_data = try renderer.createTileDataBuffer(&tiles, tile_params);
 
-    // Pre-existing gap unrelated to this smoke test's tilemap coverage: every
-    // sprite submit path requires reserving capacity first (see
-    // Renderer.reserveSpriteCommands doc), or the Debug-only high-water assert
-    // in ensureFrameBatchCapacity trips on the very first submitted rect.
+    // Sprite submit is reserve-first for allocation-free frames (see
+    // Renderer.reserveSpriteCommands). Without this, the first rect still
+    // works via the grow fallback in ensureFrameBatchCapacity, but the smoke
+    // path should exercise the reserved production contract.
     try renderer.reserveSpriteCommands(1);
 
     try renderer.reserveStaticGeometry(6, 1);

@@ -78,6 +78,9 @@ pub const ComponentChangedEvent = struct {
     // covered nav cells instead of the whole level.
     old_obstacle_world_rect: ?ObstacleWorldRect = null,
     new_obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at change time (`world_level`, else 0). Multi-level nav readiness;
+    /// defaults 0 when missing so level-0 demos stay correct.
+    level: u16 = 0,
 };
 
 pub const EntityDestroyedEvent = struct {
@@ -87,6 +90,9 @@ pub const EntityDestroyedEvent = struct {
     // World-space obstacle rect at destroy time, when the entity was a static navigation
     // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
     obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at destroy time (`world_level`, else 0). Multi-level nav readiness;
+    /// defaults 0 when missing so level-0 demos stay correct.
+    level: u16 = 0,
 };
 
 pub const EntityPerceivedEvent = struct {
@@ -105,6 +111,18 @@ pub const AffectThresholdCrossedEvent = struct {
     rising: bool,
 };
 
+/// Emitted at `domain_reaction` by `DestructibleController` while the target is
+/// still alive (before the deferred `destroy_entity` structural commit). Scalar
+/// payload only — no pointers/handles. Commit still emits `entity_destroyed`
+/// for nav local re-mask of static obstacles.
+pub const DestructibleDestroyedEvent = struct {
+    entity: EntityId,
+    level: u16,
+    cell_x: u16,
+    cell_y: u16,
+    cause: ActionKind,
+};
+
 pub const SimulationEventPayload = union(enum) {
     entity_created: EntityId,
     entity_destroyed: EntityDestroyedEvent,
@@ -115,6 +133,7 @@ pub const SimulationEventPayload = union(enum) {
     entity_perceived: EntityPerceivedEvent,
     entity_lost: EntityLostEvent,
     affect_threshold_crossed: AffectThresholdCrossedEvent,
+    destructible_destroyed: DestructibleDestroyedEvent,
 };
 
 pub const SimulationEvent = struct {
@@ -134,6 +153,7 @@ pub const SimulationEventStats = struct {
     entity_perceived: usize = 0,
     entity_lost: usize = 0,
     affect_threshold_crossed: usize = 0,
+    destructible_destroyed: usize = 0,
     structural_commit_stage: usize = 0,
     domain_reaction_stage: usize = 0,
 
@@ -153,6 +173,7 @@ pub const SimulationEventStats = struct {
             .entity_perceived => self.entity_perceived += 1,
             .entity_lost => self.entity_lost += 1,
             .affect_threshold_crossed => self.affect_threshold_crossed += 1,
+            .destructible_destroyed => self.destructible_destroyed += 1,
         }
     }
 
@@ -167,6 +188,7 @@ pub const SimulationEventStats = struct {
         self.entity_perceived += produced.entity_perceived;
         self.entity_lost += produced.entity_lost;
         self.affect_threshold_crossed += produced.affect_threshold_crossed;
+        self.destructible_destroyed += produced.destructible_destroyed;
         self.structural_commit_stage += produced.structural_commit_stage;
         self.domain_reaction_stage += produced.domain_reaction_stage;
     }
@@ -183,6 +205,7 @@ pub const SimulationEventStats = struct {
         perf.recordMetric(.simulation_events_entity_perceived, metric(self.entity_perceived));
         perf.recordMetric(.simulation_events_entity_lost, metric(self.entity_lost));
         perf.recordMetric(.simulation_events_affect_threshold_crossed, metric(self.affect_threshold_crossed));
+        perf.recordMetric(.simulation_events_destructible_destroyed, metric(self.destructible_destroyed));
         perf.recordMetric(.simulation_events_structural_commit_stage, metric(self.structural_commit_stage));
         perf.recordMetric(.simulation_events_domain_reaction_stage, metric(self.domain_reaction_stage));
     }
@@ -313,6 +336,15 @@ pub const SimulationEvents = struct {
         }
     }
 
+    /// Preflights the capacity limit and buffer growth for `count` more events
+    /// without writing. Call before a world mutate that must emit matching
+    /// events so a capacity miss cannot leave the world changed without an event.
+    pub fn ensureEventAppendCapacity(self: *SimulationEvents, count: usize) !void {
+        if (count == 0) return;
+        try self.ensureCanAppend(count);
+        try self.reserveAppendCapacity(1, count);
+    }
+
     fn pendingCountFrom(self: *const SimulationEvents, first_range: usize) usize {
         var count: usize = 0;
         for (self.stream.counts.items[first_range..]) |range_count| {
@@ -416,6 +448,31 @@ pub const NavigationIntent = struct {
     priority: i16 = 0,
 };
 
+pub const ActionKind = enum {
+    interact,
+    attack,
+    use,
+    signal,
+};
+
+/// Per-step non-locomotion request. Scalar/enum only — no pointers/handles/slices.
+pub const ActionIntent = struct {
+    entity: EntityId,
+    kind: ActionKind,
+    /// Optional target; EntityId.invalid means none.
+    target: EntityId = EntityId.invalid,
+    cell_x: u16 = 0,
+    cell_y: u16 = 0,
+    level: u16 = 0,
+    has_cell: bool = false,
+    priority: i16 = 0,
+    cooldown_key: u16 = 0,
+};
+
+/// Fixed per-step live action-intent ceiling (world-size independent). Demo/pipeline
+/// warm `action_intents` to this; optional producers drop when full.
+pub const action_intent_live_capacity: usize = 64;
+
 pub const SimulationIntent = union(enum) {
     movement: MovementIntent,
 };
@@ -430,6 +487,11 @@ pub const CollisionContact = struct {
     normal_x: f32,
     normal_y: f32,
     penetration: f32,
+    /// Pre-response velocity snapshot taken at broadphase proxy build, before
+    /// CollisionResponseSystem zeroes the approach axis. Impact-stimulus
+    /// eligibility reads these so a solved head-on hit still registers.
+    pre_response_max_speed_sq: f32 = 0,
+    pre_response_relative_speed_sq: f32 = 0,
 };
 
 /// Per-step player dig request captured in the `main_thread_inputs` phase and
@@ -441,12 +503,57 @@ pub const CollisionContact = struct {
 /// cross-plane link to climb up.
 pub const DigIntent = enum { none, hole, ramp, down };
 
-pub const StimulusKind = enum { dig };
+/// Closed sensory-bus kind enum (Slice 39). Append tags when a real producer
+/// exists — no speculative empty tags, no strings. Kind is bus/metadata only
+/// for the AI path today: perception still writes position-only heard columns.
+pub const StimulusKind = enum {
+    dig,
+    footstep,
+    impact,
+};
+
+/// Default relative loudness per kind. Fixed constants, never scaled by map size.
+pub fn defaultStimulusIntensity(kind: StimulusKind) f32 {
+    return switch (kind) {
+        .dig => 1.0,
+        .impact => 0.85,
+        .footstep => 0.35,
+    };
+}
+
+/// Hearing soft-rank falloff: `score = intensity / (1 + dist2 * k)`.
+/// Fixed `k`, independent of world/map size. Higher score wins among stimuli
+/// that already pass same-level + hard hearing-range gates.
+pub const stimulus_hearing_falloff_k: f32 = 1.0 / (256.0 * 256.0);
+
+/// Soft ranking score for one stimulus vs an observer. Callers must already
+/// enforce same-level and hard `hearing_range` gates. `intensity <= 0` scores
+/// as non-selectable (-inf).
+pub fn stimulusHearingScore(intensity: f32, dist2: f32) f32 {
+    if (intensity <= 0) return -std.math.inf(f32);
+    return intensity / (1.0 + dist2 * stimulus_hearing_falloff_k);
+}
+
+/// Fixed per-step live-bus ceiling (world-size independent). Demo/pipeline
+/// warm `stimuli` to this; optional emitters drop when full.
+pub const stimulus_live_capacity: usize = 32;
+
+/// Pipeline deferred-impact buffer size (survives `beginStep` until promote).
+pub const stimulus_deferred_capacity: usize = 16;
+
+/// Max collision impacts enqueued into deferred storage in one step (may be less
+/// than `stimulus_deferred_capacity` so one step cannot fill the whole buffer).
+pub const stimulus_max_impacts_per_step: usize = 8;
+
+/// Pipeline-owned sticky one-shot dig/impact linger slots (world-size independent).
+/// One-shots linger `cognition_stagger_n` hearing windows so each stagger cohort
+/// gets a chance; footsteps stay live-bus only.
+pub const stimulus_sticky_capacity: usize = 16;
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
-/// every step, so it carries no entity identity and is not a
-/// `SimulationEvent`. `intensity` is unused until a second producer exists to
-/// calibrate a falloff.
+/// every step on the live bus, so it carries no entity identity and is not a
+/// `SimulationEvent`. `intensity` is relative loudness used by hearing ranking
+/// (Slice 39); `kind` is producer metadata on the bus (not a perception column).
 pub const WorldStimulus = struct {
     position: math.Vec2,
     intensity: f32,
@@ -464,6 +571,7 @@ pub const SimulationFrame = struct {
     // after the producer stage has finished.
     events: SimulationEvents,
     navigation_intents: RangeOutputStream(NavigationIntent),
+    action_intents: RangeOutputStream(ActionIntent),
     intents: RangeOutputStream(SimulationIntent),
     path_requests: RangeOutputStream(PathRequest),
     contacts: RangeOutputStream(CollisionContact),
@@ -474,12 +582,16 @@ pub const SimulationFrame = struct {
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
     structural_changes_scratch: std.ArrayList(StructuralChange) = .empty,
+    // Reused by plane-traversal to batch fall-landing tile events into one
+    // finishWrite (see publishWorldTileChanges); cleared each beginStep.
+    world_tile_changes_scratch: std.ArrayList(WorldTileChangedEvent) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
             .allocator = allocator,
             .events = SimulationEvents.init(allocator),
             .navigation_intents = RangeOutputStream(NavigationIntent).init(allocator),
+            .action_intents = RangeOutputStream(ActionIntent).init(allocator),
             .intents = RangeOutputStream(SimulationIntent).init(allocator),
             .path_requests = RangeOutputStream(PathRequest).init(allocator),
             .contacts = RangeOutputStream(CollisionContact).init(allocator),
@@ -491,6 +603,7 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
+        self.world_tile_changes_scratch.deinit(self.allocator);
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.stimuli.deinit();
@@ -499,6 +612,7 @@ pub const SimulationFrame = struct {
         self.contacts.deinit();
         self.path_requests.deinit();
         self.intents.deinit();
+        self.action_intents.deinit();
         self.navigation_intents.deinit();
         self.events.deinit();
         self.* = undefined;
@@ -513,6 +627,7 @@ pub const SimulationFrame = struct {
         self.dig_intent = .none;
         self.events.clearRetainingCapacity();
         self.navigation_intents.clearRetainingCapacity();
+        self.action_intents.clearRetainingCapacity();
         self.intents.clearRetainingCapacity();
         self.path_requests.clearRetainingCapacity();
         self.contacts.clearRetainingCapacity();
@@ -521,6 +636,7 @@ pub const SimulationFrame = struct {
         self.stimuli.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
         self.structural_changes_scratch.clearRetainingCapacity();
+        self.world_tile_changes_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -541,10 +657,49 @@ pub const SimulationFrame = struct {
         try self.structural_commands.reserve(range_count, structural_command_capacity);
     }
 
+    /// Preflights buffer growth for one `appendStimulus` (one range, `value_count`
+    /// values) so a capacity miss cannot leave a dig tile changed without a
+    /// matching stimulus. Call before any world mutate that must emit one.
+    pub fn ensureStimulusAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
+        if (value_count == 0) return;
+        // Use stimuli.allocator (same as appendRangeCounts/prefix) so a swapped
+        // stream allocator in tests and production stays consistent.
+        const alloc = self.stimuli.allocator;
+        const new_range_count = self.stimuli.counts.items.len + 1;
+        try self.stimuli.counts.ensureTotalCapacity(alloc, new_range_count);
+        try self.stimuli.offsets.ensureTotalCapacity(alloc, new_range_count);
+        try self.stimuli.write_offsets.ensureTotalCapacity(alloc, new_range_count);
+        const new_value_count = if (self.stimuli.prefix_ready)
+            self.stimuli.mergedItems().len + value_count
+        else blk: {
+            var pending: usize = 0;
+            for (self.stimuli.counts.items) |count| pending += count;
+            break :blk pending + value_count;
+        };
+        try self.stimuli.values.ensureTotalCapacity(alloc, new_value_count);
+    }
+
+    /// Warms the plane-traversal tile-change batch buffer. Sized for the worst
+    /// case of player + every AI agent falling in one step (`mover_count + 1`).
+    pub fn reserveWorldTileChangesScratch(self: *SimulationFrame, capacity: usize) !void {
+        try self.world_tile_changes_scratch.ensureTotalCapacity(self.allocator, capacity);
+    }
+
+    /// Live stimulus count already written this step (after any `prefix`/finish).
+    pub fn stimulusLiveCount(self: *const SimulationFrame) usize {
+        if (self.stimuli.prefix_ready) return self.stimuli.mergedItems().len;
+        var pending: usize = 0;
+        for (self.stimuli.counts.items) |count| pending += count;
+        return pending;
+    }
+
     /// Single-value append for main-thread producers (dig is not threaded).
-    /// `stimuli` is not part of `reserveStreams`: its per-step count is a fixed
-    /// producer invariant (dig emits at most one), not scene-scale-dependent,
-    /// so it grows lazily on first use like `PerceptionSystem`'s own buffers.
+    /// Multi-producer bus (Slice 39): dig, footstep, and promoted deferred
+    /// impacts share this path. Dig preflights via `ensureStimulusAppendCapacity`
+    /// before world mutate; optional emitters use `tryAppendStimulus` so a full
+    /// bus drops sensory noise without failing the step. Demo/pipeline warm
+    /// with `stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity)`
+    /// (one range per append).
     pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
         const first_range = try self.stimuli.appendRangeCounts(1);
         self.stimuli.addCount(first_range, 1);
@@ -555,12 +710,78 @@ pub const SimulationFrame = struct {
         self.stimuli.finishWrite();
     }
 
+    /// Capacity-aware optional append: drops when live count is already at
+    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
+    /// or when buffer growth fails after warmup (should not happen if reserved).
+    pub fn tryAppendStimulus(self: *SimulationFrame, stimulus: WorldStimulus, capacity: usize) bool {
+        if (capacity == 0 or self.stimulusLiveCount() >= capacity) return false;
+        self.ensureStimulusAppendCapacity(1) catch return false;
+        self.appendStimulus(stimulus) catch return false;
+        return true;
+    }
+
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
         try self.path_requests.reserve(range_count, request_capacity);
     }
 
     pub fn reserveNavigationIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
         try self.navigation_intents.reserve(range_count, intent_capacity);
+    }
+
+    pub fn reserveActionIntents(self: *SimulationFrame, range_count: usize, intent_capacity: usize) !void {
+        try self.action_intents.reserve(range_count, intent_capacity);
+    }
+
+    /// Preflights buffer growth for one `appendActionIntent` (one range, one value).
+    pub fn ensureActionIntentAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
+        if (value_count == 0) return;
+        const alloc = self.action_intents.allocator;
+        const new_range_count = self.action_intents.counts.items.len + 1;
+        try self.action_intents.counts.ensureTotalCapacity(alloc, new_range_count);
+        try self.action_intents.offsets.ensureTotalCapacity(alloc, new_range_count);
+        try self.action_intents.write_offsets.ensureTotalCapacity(alloc, new_range_count);
+        const new_value_count = if (self.action_intents.prefix_ready)
+            self.action_intents.mergedItems().len + value_count
+        else blk: {
+            var pending: usize = 0;
+            for (self.action_intents.counts.items) |count| pending += count;
+            break :blk pending + value_count;
+        };
+        try self.action_intents.values.ensureTotalCapacity(alloc, new_value_count);
+    }
+
+    /// Live action-intent count already written this step (after any `prefix`/finish).
+    pub fn actionIntentLiveCount(self: *const SimulationFrame) usize {
+        if (self.action_intents.prefix_ready) return self.action_intents.mergedItems().len;
+        var pending: usize = 0;
+        for (self.action_intents.counts.items) |count| pending += count;
+        return pending;
+    }
+
+    /// Single-value append for main-thread producers (player input capture is not
+    /// threaded). Each call uses one range slot (stimuli pattern). Warm with
+    /// `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
+    /// so multi-append stays allocation-free. Future AI producers may use
+    /// multi-range writes; they must use `action_intents` only — not dual-write
+    /// into `intents`.
+    pub fn appendActionIntent(self: *SimulationFrame, intent: ActionIntent) !void {
+        const first_range = try self.action_intents.appendRangeCounts(1);
+        self.action_intents.addCount(first_range, 1);
+        try self.action_intents.prefixAppendedRanges(first_range);
+        var writer = self.action_intents.rangeWriter(first_range);
+        writer.write(intent);
+        writer.finish();
+        self.action_intents.finishWrite();
+    }
+
+    /// Capacity-aware optional append: drops when live count is already at
+    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
+    /// or when buffer growth fails after warmup (should not happen if reserved).
+    pub fn tryAppendActionIntent(self: *SimulationFrame, intent: ActionIntent, capacity: usize) bool {
+        if (capacity == 0 or self.actionIntentLiveCount() >= capacity) return false;
+        self.ensureActionIntentAppendCapacity(1) catch return false;
+        self.appendActionIntent(intent) catch return false;
+        return true;
     }
 
     pub fn applyStructuralCommands(self: *SimulationFrame, data: *DataSystem) !StructuralCommitStats {
@@ -594,8 +815,21 @@ pub const SimulationFrame = struct {
     }
 
     fn publishStructuralChanges(self: *SimulationFrame, changes: []const StructuralChange) !void {
+        if (changes.len == 0) return;
+        // Publish every change in a single appended event range with one
+        // finishWrite. finishWrite rebuilds event stats over all ranges
+        // (O(ranges)) and survives ReleaseFast, so one appendRequired per change
+        // would be O(N^2). This is the batched form of appendRequired: reserve,
+        // append one range counted for the whole slice, prefix it, write every
+        // event, then finish the write exactly once.
+        try self.events.ensureCanAppend(changes.len);
+        try self.events.reserveAppendCapacity(1, changes.len);
+        const first_range = try self.events.appendRangeCounts(1);
+        self.events.addCount(first_range, changes.len);
+        try self.events.prefixAppendedRanges(first_range);
+        var writer = self.events.rangeWriter(first_range);
         for (changes) |change| {
-            try self.events.appendRequired(switch (change) {
+            writer.write(switch (change) {
                 .entity_created => |entity| .{
                     .stage = .structural_commit,
                     .payload = .{ .entity_created = entity },
@@ -607,6 +841,7 @@ pub const SimulationFrame = struct {
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
                         .obstacle_world_rect = destroyed.obstacle_world_rect,
+                        .level = destroyed.level,
                     } },
                 },
                 .component_changed => |changed| .{
@@ -618,10 +853,34 @@ pub const SimulationFrame = struct {
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
                         .old_obstacle_world_rect = changed.old_obstacle_world_rect,
                         .new_obstacle_world_rect = changed.new_obstacle_world_rect,
+                        .level = changed.level,
                     } },
                 },
             });
         }
+        writer.finish();
+        self.events.finishWrite();
+    }
+
+    /// Publishes fall/dig landing tile changes in a single event range with one
+    /// finishWrite. Mirrors publishStructuralChanges so N plane-traversal carves
+    /// stay O(N) rather than O(N^2) from per-event appendRequired.
+    pub fn publishWorldTileChanges(self: *SimulationFrame, changes: []const WorldTileChangedEvent) !void {
+        if (changes.len == 0) return;
+        try self.events.ensureCanAppend(changes.len);
+        try self.events.reserveAppendCapacity(1, changes.len);
+        const first_range = try self.events.appendRangeCounts(1);
+        self.events.addCount(first_range, changes.len);
+        try self.events.prefixAppendedRanges(first_range);
+        var writer = self.events.rangeWriter(first_range);
+        for (changes) |changed| {
+            writer.write(.{
+                .stage = .structural_commit,
+                .payload = .{ .world_tile_changed = changed },
+            });
+        }
+        writer.finish();
+        self.events.finishWrite();
     }
 };
 
@@ -1169,10 +1428,12 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
 
     try frame.reserveStreams(2, 2, 2, 2, 2, 1);
     try frame.stimuli.reserve(2, 2);
+    try frame.reserveActionIntents(2, 2);
 
     const original_allocator = frame.allocator;
     const original_events_allocator = frame.events.stream.allocator;
     const original_navigation_intents_allocator = frame.navigation_intents.allocator;
+    const original_action_intents_allocator = frame.action_intents.allocator;
     const original_intents_allocator = frame.intents.allocator;
     const original_triggers_allocator = frame.collision_triggers.allocator;
     const original_commands_allocator = frame.structural_commands.allocator;
@@ -1182,6 +1443,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     frame.allocator = fail;
     frame.events.stream.allocator = fail;
     frame.navigation_intents.allocator = fail;
+    frame.action_intents.allocator = fail;
     frame.intents.allocator = fail;
     frame.collision_triggers.allocator = fail;
     frame.structural_commands.allocator = fail;
@@ -1190,6 +1452,7 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
         frame.allocator = original_allocator;
         frame.events.stream.allocator = original_events_allocator;
         frame.navigation_intents.allocator = original_navigation_intents_allocator;
+        frame.action_intents.allocator = original_action_intents_allocator;
         frame.intents.allocator = original_intents_allocator;
         frame.collision_triggers.allocator = original_triggers_allocator;
         frame.structural_commands.allocator = original_commands_allocator;
@@ -1229,6 +1492,18 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     });
     navigation_writer.finish();
     frame.navigation_intents.finishWrite();
+
+    try frame.action_intents.prepareRangeCounts(2);
+    frame.action_intents.addCount(0, 1);
+    frame.action_intents.addCount(1, 1);
+    try frame.action_intents.prefix();
+    var action_writer = frame.action_intents.rangeWriter(0);
+    action_writer.write(.{ .entity = EntityId.invalid, .kind = .interact });
+    action_writer.finish();
+    action_writer = frame.action_intents.rangeWriter(1);
+    action_writer.write(.{ .entity = EntityId.invalid, .kind = .attack });
+    action_writer.finish();
+    frame.action_intents.finishWrite();
 
     try frame.intents.prepareRangeCounts(2);
     frame.intents.addCount(0, 1);
@@ -1326,6 +1601,50 @@ test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems refl
     try std.testing.expectEqual(@as(u16, 1), merged[1].level);
 }
 
+test "stimulusHearingScore prefers nearer equal intensities and louder equal distances" {
+    try std.testing.expect(stimulusHearingScore(1.0, 20 * 20) > stimulusHearingScore(1.0, 40 * 40));
+    try std.testing.expect(stimulusHearingScore(1.0, 30 * 30) > stimulusHearingScore(0.35, 30 * 30));
+    try std.testing.expect(stimulusHearingScore(0, 0) < 0);
+}
+
+test "tryAppendStimulus drops when live capacity is full" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.stimuli.reserve(1, 4);
+
+    try std.testing.expect(frame.tryAppendStimulus(.{
+        .position = .{ .x = 0, .y = 0 },
+        .intensity = 1,
+        .kind = .dig,
+        .level = 0,
+    }, 1));
+    try std.testing.expect(!frame.tryAppendStimulus(.{
+        .position = .{ .x = 1, .y = 0 },
+        .intensity = 1,
+        .kind = .footstep,
+        .level = 0,
+    }, 1));
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+    try std.testing.expectEqual(StimulusKind.dig, frame.stimuli.mergedItems()[0].kind);
+}
+
+test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 4, 4, 4, 4);
+
+    const changes = [_]WorldTileChangedEvent{
+        .{ .level = 1, .x = 2, .y = 3, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 1, .x = 4, .y = 5, .old_tile_id = 1, .new_tile_id = 2, .old_blocks_movement = true, .new_blocks_movement = false },
+        .{ .level = 2, .x = 0, .y = 1, .old_tile_id = 3, .new_tile_id = 4, .old_blocks_movement = true, .new_blocks_movement = false },
+    };
+    const ranges_before = frame.events.rangeCount();
+    try frame.publishWorldTileChanges(&changes);
+    try std.testing.expectEqual(ranges_before + 1, frame.events.rangeCount());
+    try std.testing.expectEqual(@as(usize, 3), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 3), frame.events.stats.world_tile_changed);
+}
+
 test "SimulationFrame.clearRetainingCapacity clears stimuli" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -1341,8 +1660,7 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    // Warm up: sizes stimuli's counts/offsets/write_offsets/values to one step's use.
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
     frame.clearRetainingCapacity();
 
     const original_allocator = frame.stimuli.allocator;
@@ -1352,4 +1670,217 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
 
     try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.ensureStimulusAppendCapacity(1);
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
+}
+
+test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    // Representative multi-producer step: promoted impact + dig + footstep.
+    const kinds = [_]StimulusKind{ .impact, .dig, .footstep };
+    for (kinds, 0..) |kind, i| {
+        try frame.appendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = kind,
+            .level = 0,
+        });
+    }
+    try std.testing.expectEqual(@as(usize, 3), frame.stimuli.mergedItems().len);
+}
+
+test "tryAppendStimulus returns false at live capacity without allocating (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original_stimuli = frame.stimuli.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = original_stimuli;
+
+    for (0..stimulus_live_capacity) |i| {
+        try std.testing.expect(frame.tryAppendStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .footstep,
+            .level = 0,
+        }, stimulus_live_capacity));
+    }
+    try std.testing.expectEqual(@as(usize, stimulus_live_capacity), frame.stimuli.mergedItems().len);
+    try std.testing.expect(!frame.tryAppendStimulus(.{
+        .position = .{ .x = 99, .y = 0 },
+        .intensity = 1,
+        .kind = .footstep,
+        .level = 0,
+    }, stimulus_live_capacity));
+}
+
+test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveWorldTileChangesScratch(2);
+
+    const original = frame.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.allocator = failing.allocator();
+    defer frame.allocator = original;
+
+    const change = WorldTileChangedEvent{
+        .level = 1,
+        .x = 2,
+        .y = 3,
+        .old_tile_id = 1,
+        .new_tile_id = 2,
+        .old_blocks_movement = true,
+        .new_blocks_movement = false,
+    };
+    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
+    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
+    try std.testing.expectEqual(@as(usize, 2), frame.world_tile_changes_scratch.items.len);
+}
+
+test "ActionIntent fields are scalar or enum only" {
+    comptime {
+        const fields = @typeInfo(ActionIntent).@"struct".fields;
+        for (fields) |field| {
+            const info = @typeInfo(field.type);
+            const allowed: bool = switch (info) {
+                .int, .float, .bool => true,
+                .@"enum" => true,
+                .@"struct" => field.type == EntityId,
+                else => false,
+            };
+            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field.name);
+        }
+    }
+}
+
+test "SimulationFrame action_intents merge preserves range index order" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(2, 4);
+
+    try frame.action_intents.prepareRangeCounts(2);
+    frame.action_intents.addCount(0, 1);
+    frame.action_intents.addCount(1, 2);
+    try frame.action_intents.prefix();
+    var writer = frame.action_intents.rangeWriter(0);
+    writer.write(.{ .entity = EntityId.invalid, .kind = .interact, .priority = 1 });
+    writer.finish();
+    writer = frame.action_intents.rangeWriter(1);
+    writer.write(.{ .entity = EntityId.invalid, .kind = .attack, .priority = 2 });
+    writer.write(.{ .entity = EntityId.invalid, .kind = .use, .priority = 3 });
+    writer.finish();
+    frame.action_intents.finishWrite();
+
+    const merged = frame.action_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqual(ActionKind.interact, merged[0].kind);
+    try std.testing.expectEqual(ActionKind.attack, merged[1].kind);
+    try std.testing.expectEqual(ActionKind.use, merged[2].kind);
+}
+
+test "SimulationFrame.appendActionIntent has no steady-state allocation after reserveActionIntents (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+}
+
+test "SimulationFrame.ensureActionIntentAppendCapacity then appendActionIntent is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.ensureActionIntentAppendCapacity(1);
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+}
+
+test "SimulationFrame multi-appendActionIntent after live-bus reserve is allocation-free (FailingAllocator)" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    frame.clearRetainingCapacity();
+
+    const original = frame.action_intents.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    frame.action_intents.allocator = failing.allocator();
+    defer frame.action_intents.allocator = original;
+
+    const kinds = [_]ActionKind{ .interact, .attack, .use, .signal };
+    for (kinds) |kind| {
+        try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = kind });
+    }
+    try std.testing.expectEqual(@as(usize, 4), frame.action_intents.mergedItems().len);
+}
+
+test "tryAppendActionIntent drops when at live capacity" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(1, 1);
+
+    try std.testing.expect(frame.tryAppendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .interact,
+    }, 1));
+    try std.testing.expect(!frame.tryAppendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .attack,
+    }, 1));
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+    try std.testing.expectEqual(ActionKind.interact, frame.action_intents.mergedItems()[0].kind);
+}
+
+test "appendActionIntent does not dual-write into SimulationIntent intents stream" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(1, 0, 4, 0, 0, 0);
+
+    try frame.appendActionIntent(.{ .entity = EntityId.invalid, .kind = .interact });
+    try std.testing.expectEqual(@as(usize, 1), frame.action_intents.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.intents.mergedItems().len);
 }

@@ -7,13 +7,19 @@ const Renderer = @import("renderer.zig").Renderer;
 const TextService = @import("text.zig").TextService;
 
 pub const DebugOverlay = struct {
+    // Parity with the real overlay's toggle field so `RenderContext` wiring
+    // compiles when the overlay is built out; the stub never flips it.
+    visible: bool = false,
+
     pub fn init(text_service: *TextService) DebugOverlay {
         _ = text_service;
         return .{};
     }
 
-    pub fn deinit(self: *DebugOverlay) void {
+    pub fn deinit(self: *DebugOverlay, text_service: *TextService, renderer: *Renderer) void {
         _ = self;
+        _ = text_service;
+        _ = renderer;
     }
 
     pub fn applyCommands(self: *DebugOverlay, commands: *const FrameCommands) void {

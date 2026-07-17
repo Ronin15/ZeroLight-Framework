@@ -9,17 +9,25 @@ zig build dev       # build shaders, install assets, and run the app
 zig build check     # compile the game, GPU smoke, and benchmark executables
 zig build test      # run Zig unit tests
 zig build bench     # run CPU gameplay and render-prep benchmarks
-zig build verify    # run check, test, shader compilation, and atlas lint
+zig build verify    # run check, test, shader compilation, atlas + idiom lint
 zig build package   # install selected-mode binaries and runtime assets
 ```
 
 Useful supporting commands:
 
 ```sh
-zig build fmt       # format build.zig, build.zig.zon, and src/
-zig build shaders   # compile GLSL shader sources to platform GPU shaders
-zig build gpu-smoke # run a display-gated renderer pipeline smoke
+zig build fmt        # format build.zig, build.zig.zon, and src/
+zig build shaders    # compile GLSL shader sources to platform GPU shaders
+zig build gpu-smoke  # run a display-gated renderer pipeline smoke
+zig build assets-lint # lint runtime atlases and source sprite consistency
+zig build idiom-lint # lint Zig naming, stdlib currency, and unsafe catch unreachable
 ```
+
+`zig build idiom-lint` (`tools/lint_idioms.py`, also part of `verify`) enforces
+the naming/currency/`catch unreachable` rules from `docs/coding-standards.md`:
+snake_case fields/params, `k_snake_case` constants, current stdlib spellings, and
+`catch`/`orelse unreachable` only on a sanctioned handle constructor, inside a
+`test` block, or with a `// lint:allow catch-unreachable: <reason>` annotation.
 
 `zig build package` installs the selected-mode game binary and runtime assets.
 It does not install the `gpu-smoke` development executable.
@@ -41,8 +49,8 @@ current working directory; (2) the same relative root resolved from the
 directory containing the executable (exe-relative fallback). The fallback fires
 only when the configured root directory does not exist at all, not when
 individual files are missing. To use it, place a full `assets/` tree beside
-the binary, or invoke with `-Dasset-root=<absolute-path>` at build time to
-bake an absolute path into the binary.
+the binary. The asset root must stay a **relative**, traversal-safe path
+(default `assets`); `AppConfig` rejects absolute roots at startup.
 
 ## Release Modes
 
@@ -65,12 +73,18 @@ enabled by the current `--fetch` mode.
 backing every `assumeCapacity`/`addOneAssumeCapacity` call and disables
 bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
 discipline rules for the `FailingAllocator` proof-test coverage this requires
-before hot-path code can rely on it safely. Before cutting a ReleaseFast
-release candidate, run an extended soak session in `--release=safe` (not just
-`zig build test`) across realistic-to-extreme entity counts and spawn/despawn
-churn. A clean multi-hour ReleaseSafe run is the actual release gate:
-ReleaseFast itself will not report a capacity or bounds violation if one
-exists, it will just corrupt memory silently.
+before hot-path code can rely on it safely. On non-Mach-O targets
+(Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
+for the shipped **app executable only** in `ReleaseFast` and forces the LLVM
+backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
+binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.16 because
+LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
+local iteration and size-focused builds stay predictable. Before cutting a
+ReleaseFast release candidate, run an extended soak session in
+`--release=safe` (not just `zig build test`) across realistic-to-extreme
+entity counts and spawn/despawn churn. A clean multi-hour ReleaseSafe run is
+the actual release gate: ReleaseFast itself will not report a capacity or
+bounds violation if one exists, it will just corrupt memory silently.
 
 ## Build Options
 
@@ -140,16 +154,32 @@ zig build -Dgpu-debug=false
 zig build -Dgpu-debug=true
 ```
 
-Runtime diagnostics use Zig `std.log` filtering. The default `auto` level keeps
-Debug builds at `debug` and release builds at `warn`, which still includes
-errors. Debug logs can include detailed startup and fallback context, but
-warning and error logs should stay rare and actionable. Override the level when
-you need a different signal:
+Runtime diagnostics use Zig `std.log` filtering. The default `auto` level is:
+
+- **Debug** and **ReleaseSafe** → `debug` (full diagnostics + 60s runtime perf
+  dumps from `runtime_perf_log`)
+- **ReleaseFast** / **ReleaseSmall** → `warn` (ship/package; runtime perf is
+  fully compiled out)
+
+**Fix cycles:** Debug — `zig build dev` / `zig build run`. Fast compile, full
+safety, behavior and unit work. Not the authority for scale timing.
+
+**Soaking / scale perf:** ReleaseSafe — `zig build run -Doptimize=ReleaseSafe`,
+one 60s dump after load when you deliberately want ranking and absolute numbers.
+Longer compile; do not use for every edit. Multi-cycle soaks only when comparing
+settle vs load, not as the default.
+
+**Ship:** ReleaseFast packages (runtime perf fully compiled out).
+
+Debug logs can include detailed startup and fallback context, but warning and
+error logs should stay rare and actionable. Override the level when you need a
+different signal:
 
 ```sh
 zig build -Dlog-level=warn
 zig build -Dlog-level=debug
-zig build --release=safe -Dlog-level=err
+zig build run -Doptimize=ReleaseSafe              # intentional soak
+zig build run -Doptimize=ReleaseSafe -Dlog-level=err  # quiet Safe; no perf dumps
 ```
 
 ## Atlas Packing
@@ -182,6 +212,44 @@ registered runtime atlas PNG/JSON sidecars. When `source_assets/` is present,
 lint also compares the source-driven generated manifests against the runtime
 sidecars so additions and art swaps are caught before commit.
 
+## AI Archetypes
+
+Demo AI personalities are data, not code. `assets/ai/archetypes.json` holds one
+self-declaring entry per `AiArchetypeId` (`src/game/ai_archetypes.zig`); the
+loader parses it at load time (strict — an unknown or misspelled key fails the
+load) into a fixed enum → prevalidated component-bundle table, and
+`GameDemoState` spawns from that table. Editing the JSON changes behavior with
+no recompile.
+
+Each entry sets a `faction` and optional `agent` / `perception` / `memory` /
+`affect` blocks. Within a block, only non-default fields need to be written —
+omitted numeric fields fall back to the component's own struct defaults, so an
+entry stays terse. Out-of-range values are rejected at load by the same
+`validateAi*` checks the runtime uses.
+
+To tune a personality's **feelings**, edit its `affect` block: the four drive
+baselines (`baseline_fear` / `baseline_curiosity` / `baseline_aggression` /
+`baseline_fatigue`, each `0..1`) set resting emotion, and optional `decay_rate_*`
+/ `threshold_*` control how fast a drive relaxes and when it crosses into
+above-threshold behavior. Higher `baseline_fear` biases toward flee, higher
+`baseline_curiosity` toward investigate, and so on — arbitration maps drives to
+behavior through the weight table in `src/game/systems/arbitration.zig`. Under
+`agent`, non-zero `commitment_max_steps` / `sticky_bonus` keep a chosen behavior
+from flapping every fixed step (shipped timid / aggressive / curious set these).
+Give an archetype a `perception` block with a longer `vision_range` (keen-eyed
+sentry) or a near-zero `vision_range` with a large `hearing_range` (blind
+tracker) to differentiate senses. After editing, run `zig build test` to
+re-validate the catalog.
+
+Press **F2** (or gamepad **BACK**) at runtime to toggle the debug overlay: it
+draws each nearby agent's vision cone, emotion drive bars, memory markers, and
+active behavior label, plus scope/tier counts — read-only, so it never changes
+simulation.
+
+In gameplay, **R** or gamepad **left shoulder** is interact (rising-edge action
+intent); dig and move keep their existing keyboard / stick bindings — see
+[state stack and input](state-stack-and-input.md).
+
 ## Testing
 
 Tests follow Zig conventions: small unit tests live beside the code they cover
@@ -200,7 +268,8 @@ zig build test
 zig build verify
 ```
 
-`verify` runs compile coverage, unit tests, shader compilation, and atlas lint.
+`verify` runs compile coverage, unit tests, shader compilation, atlas lint, and
+idiom lint.
 
 Coding style, performance standards, comment policy, test standards, and
 generated-output rules live in `docs/coding-standards.md`.

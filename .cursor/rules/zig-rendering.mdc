@@ -9,7 +9,7 @@ alwaysApply: false
 Read `docs/rendering-assets-shaders.md` and @AGENTS.md before editing.
 
 - `Renderer` is the facade — game code does not import `src/render/gpu/*`
-- Pair GPU resource create/destroy; `errdefer` on partial init
+- Pair GPU resource create/destroy; `errdefer` on partial init (register `deinit` first when taking by-value ownership)
 - `SpriteBatch` consumes pre-sorted ordered streams — not a fallback sorter
 - Do not hold swapchain acquisition across substantial CPU prep
 - Per-frame render path: no avoidable allocation, string lookup, or hash-map dispatch

@@ -11,6 +11,7 @@ const AudioCommandBuffer = @import("audio.zig").AudioCommandBuffer;
 const FrameCommands = @import("input.zig").FrameCommands;
 const InputState = @import("input.zig").InputState;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
 const runtime_perf_log = @import("runtime_perf_log.zig");
 const log = @import("../core/logging.zig").app;
 const inputRouter = @import("input_router.zig");
@@ -62,6 +63,9 @@ pub const UpdateContext = struct {
     input: *const InputState,
     audio: *AudioCommandBuffer,
     runtime_assets: *const RuntimeAssets,
+    // Path-safe asset reader threaded through to state init (e.g. loading the AI
+    // archetype catalog); a tiny copyable handle, not per-frame render state.
+    asset_store: AssetStore,
     delta_seconds: f32,
     transitions: *StateTransitions,
     thread_system: *ThreadSystem,
@@ -75,6 +79,10 @@ pub const RenderContext = struct {
     interpolation_alpha: f32,
     thread_system: *ThreadSystem,
     ui_stack_order: UiStackOrder = .base,
+    // Mirrors the engine-owned F2 / gamepad-BACK debug toggle
+    // (`debug_overlay.visible`); gameplay states use it to gate render-only AI
+    // introspection viz. Off by default so bench and tests never draw it.
+    debug_overlay_visible: bool = false,
     perf: runtime_perf_log.Context = .{},
 };
 
@@ -176,13 +184,15 @@ pub const State = struct {
 };
 
 pub const StateTransitions = struct {
-    allocator: std.mem.Allocator,
-    requests: std.ArrayList(Request) = .empty,
-
     // Per-frame transitions come from a small number of sources (a couple of
     // queued events plus the active state's update), so a modest reserve keeps
     // the queue allocation-free from frame 0 without over-allocating.
     pub const default_capacity = 8;
+
+    allocator: std.mem.Allocator,
+    requests: std.ArrayList(Request) = .empty,
+    /// Hard per-frame bound. `reserve` raises this; enqueue fails loud past it.
+    max_requests: usize = default_capacity,
 
     const Request = union(enum) {
         none,
@@ -210,7 +220,9 @@ pub const StateTransitions = struct {
     /// Reserves the per-frame request bound up front so queuing transitions during
     /// event/update dispatch is allocation-free from frame 0.
     pub fn reserve(self: *StateTransitions, capacity: usize) !void {
-        try self.requests.ensureTotalCapacity(self.allocator, capacity);
+        const bound = @max(capacity, 1);
+        try self.requests.ensureTotalCapacity(self.allocator, bound);
+        self.max_requests = bound;
     }
 
     pub fn clear(self: *StateTransitions) void {
@@ -229,7 +241,7 @@ pub const StateTransitions = struct {
 
     pub fn replaceOwnedState(self: *StateTransitions, state: State, policy: StatePolicy) !void {
         errdefer state.destroy(self.allocator);
-        try self.requests.append(self.allocator, .{ .replace = .{ .state = state, .policy = policy } });
+        try self.enqueue(.{ .replace = .{ .state = state, .policy = policy } });
         log.debug("queued state transition replace type={s} policy={s} pending={d}", .{
             state.type_name,
             policyLabel(policy),
@@ -244,7 +256,7 @@ pub const StateTransitions = struct {
     pub fn push(self: *StateTransitions, comptime T: type, value: T, policy: StatePolicy) !void {
         const state = try State.create(T, self.allocator, value);
         errdefer state.destroy(self.allocator);
-        try self.requests.append(self.allocator, .{ .push = .{ .state = state, .policy = policy } });
+        try self.enqueue(.{ .push = .{ .state = state, .policy = policy } });
         log.debug("queued state transition push type={s} policy={s} pending={d}", .{
             state.type_name,
             policyLabel(policy),
@@ -265,18 +277,31 @@ pub const StateTransitions = struct {
     }
 
     pub fn remove(self: *StateTransitions, handle: StateHandle) !void {
-        try self.requests.append(self.allocator, .{ .remove = handle });
+        try self.enqueue(.{ .remove = handle });
         log.debug("queued state transition remove handle={d} pending={d}", .{ handle.id, self.requests.items.len });
     }
 
     pub fn quit(self: *StateTransitions) !void {
-        try self.requests.append(self.allocator, .quit);
+        try self.enqueue(.quit);
         log.debug("queued state transition quit pending={d}", .{self.requests.items.len});
     }
 
     pub fn pop(self: *StateTransitions) !void {
-        try self.requests.append(self.allocator, .pop);
+        try self.enqueue(.pop);
         log.debug("queued state transition pop pending={d}", .{self.requests.items.len});
+    }
+
+    fn enqueue(self: *StateTransitions, request: Request) !void {
+        if (self.requests.items.len >= self.max_requests) {
+            return error.StateTransitionLimitReached;
+        }
+        // After `reserve()`, capacity is already max_requests and this path is
+        // allocation-free. Without a prior reserve, grow once up to the hard cap
+        // so cold test/init paths still work; the engine always reserves first.
+        if (self.requests.capacity < self.max_requests) {
+            try self.requests.ensureTotalCapacity(self.allocator, self.max_requests);
+        }
+        self.requests.appendAssumeCapacity(request);
     }
 
     fn destroyPendingStates(self: *StateTransitions) void {
@@ -643,6 +668,7 @@ fn testUpdateContext(
         .input = input,
         .audio = audio,
         .runtime_assets = runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = delta_seconds,
         .transitions = transitions,
         .thread_system = thread_system,
@@ -1102,44 +1128,44 @@ test "state stack input routing follows active state policy" {
     try std.testing.expect(!state_policy.pass_through_overlay.gameplay);
     try std.testing.expect(!state_policy.opaque_screen.gameplay);
 
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
     try std.testing.expect(!stack.inputRoutingPolicy().allowsContext(.ui));
 
     _ = try stack.replaceGameplay(TestingState, .{});
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
 
     const modal_handle = try stack.pushModal(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 
     _ = try stack.pushOverlay(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.quit));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 
     var input = InputState{};
     var commands = FrameCommands{};
     var move_down = testKeyEvent(c.SDL_EVENT_KEY_DOWN, c.SDLK_A, false);
     inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
-    try std.testing.expect(!input.isHeld(.moveLeft));
+    try std.testing.expect(!input.isHeld(.move_left));
 
     try std.testing.expect(stack.remove(modal_handle));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsContext(.ui));
     inputRouter.routeEvent(stack.inputRoutingPolicy(), &move_down, &input, &commands);
-    try std.testing.expect(input.isHeld(.moveLeft));
+    try std.testing.expect(input.isHeld(.move_left));
 
     _ = try stack.pushOpaque(TestingState, .{});
-    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.moveLeft));
+    try std.testing.expect(!stack.inputRoutingPolicy().allowsAction(.move_left));
     try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.pause));
-    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggleDebugOverlay));
+    try std.testing.expect(stack.inputRoutingPolicy().allowsAction(.toggle_debug_overlay));
 }
 
 test "opaque state render policy hides states below it" {
@@ -1541,6 +1567,76 @@ test "owned gameplay transition destroys state when enqueue fails" {
     const state = try State.create(TestingState, allocator, .{ .deinit_count = &deinit_count });
     try std.testing.expectError(error.OutOfMemory, transitions.replaceOwnedGameplay(state));
     try std.testing.expectEqual(@as(u32, 1), deinit_count);
+}
+
+test "state transitions enqueue is allocation-free after reserve" {
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+    try transitions.reserve(4);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    transitions.allocator = failing.allocator();
+
+    var i: usize = 0;
+    while (i < transitions.max_requests) : (i += 1) {
+        try transitions.pop();
+    }
+    try std.testing.expectEqual(transitions.max_requests, transitions.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectError(error.StateTransitionLimitReached, transitions.pop());
+}
+
+test "reserved modal push consumes only reserved capacity and allocates zero (FailingAllocator)" {
+    const TestingState = struct {
+        deinit_count: *u32,
+
+        fn handleEvent(self: *@This(), event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
+            _ = self;
+            _ = event;
+            _ = transitions;
+            return false;
+        }
+
+        fn update(self: *@This(), context: UpdateContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn render(self: *@This(), context: RenderContext) !void {
+            _ = self;
+            _ = context;
+        }
+
+        fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    // Arm the allocator so the next allocation after warmup (the reserve plus the
+    // one State box) would be an induced OOM. `pushModalOwnedAfterReserve` must
+    // consume only the reserved slot, touching the allocator zero more times.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    const allocator = failing.allocator();
+    var stack = StateStack.init(allocator);
+    defer stack.deinit();
+
+    var deinit_count: u32 = 0;
+    try stack.reserveForAdditionalStates(1);
+    const state = try State.create(TestingState, allocator, .{ .deinit_count = &deinit_count });
+
+    const allocations_after_warmup = failing.allocations;
+    const handle = stack.pushModalOwnedAfterReserve(state);
+
+    // The push allocated nothing (no induced failure, no growth in the count) and
+    // still landed the modal state on the stack.
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(allocations_after_warmup, failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), stack.len());
+    try std.testing.expectEqual(handle, stack.activeHandle().?);
 }
 
 test "quit transition reports through apply result" {

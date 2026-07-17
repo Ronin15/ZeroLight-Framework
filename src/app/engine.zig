@@ -15,6 +15,7 @@ const GameDemoState = @import("../game/game_demo_state.zig").GameDemoState;
 const MainMenuState = @import("../game/main_menu_state.zig").MainMenuState;
 const SettingsMenuState = @import("../game/settings_menu_state.zig").SettingsMenuState;
 const frame_pacer = @import("frame_pacer.zig");
+const GamepadManager = @import("gamepad.zig").GamepadManager;
 const input_router = @import("input_router.zig");
 const log = @import("../core/logging.zig").app;
 const Action = @import("input.zig").Action;
@@ -59,6 +60,7 @@ pub const Engine = struct {
     pause: PauseController,
     input: InputState = .{},
     commands: FrameCommands = .{},
+    gamepad: GamepadManager = .{},
     running: bool = true,
     swapchain_blocked: bool = false,
 
@@ -72,9 +74,13 @@ pub const Engine = struct {
         const window_title = try allocator.dupeZ(u8, app_config.window_title);
         defer allocator.free(window_title);
 
-        const sdl_flags = c.SDL_INIT_VIDEO | if (app_config.audio.enabled) c.SDL_INIT_AUDIO else 0;
+        const sdl_flags = c.SDL_INIT_VIDEO | c.SDL_INIT_GAMEPAD | if (app_config.audio.enabled) c.SDL_INIT_AUDIO else 0;
         var sdl_context = try sdl.SdlContext.init(sdl_flags);
         errdefer sdl_context.deinit();
+
+        var gamepad_manager = GamepadManager.init();
+        gamepad_manager.openInitial();
+        errdefer gamepad_manager.deinit();
 
         const logical_size = app_config.resolution_policy.logical_size;
         var window = try sdl.Window.create(
@@ -111,7 +117,7 @@ pub const Engine = struct {
         // a *TextService: Engine is returned by value below, so the address of this
         // local would dangle. Per-frame use takes &self.text_service explicitly.
         var debug_overlay = DebugOverlay.init(&text_service);
-        errdefer debug_overlay.deinit();
+        errdefer debug_overlay.deinit(&text_service, &renderer);
 
         var states = StateStack.init(allocator);
         errdefer states.deinit();
@@ -162,6 +168,7 @@ pub const Engine = struct {
                 @floatFromInt(logical_size.width),
                 @floatFromInt(logical_size.height),
             ),
+            .gamepad = gamepad_manager,
         };
     }
 
@@ -172,7 +179,7 @@ pub const Engine = struct {
         self.transitions.deinit();
         self.states.deinit();
         self.thread_system.deinit();
-        self.debug_overlay.deinit();
+        self.debug_overlay.deinit(&self.text_service, &self.renderer);
         self.text_service.deinit(&self.renderer);
         self.runtime_assets.deinit(&self.asset_cache, &self.renderer);
         self.asset_cache.deinit(&self.renderer);
@@ -180,6 +187,7 @@ pub const Engine = struct {
         self.audio_commands.deinit();
         self.audio_service.deinit();
         self.window.deinit();
+        self.gamepad.deinit();
         self.sdl_context.deinit();
     }
 
@@ -216,11 +224,21 @@ pub const Engine = struct {
                     log.debug("quit requested by SDL event", .{});
                     self.running = false;
                 },
+                c.SDL_EVENT_GAMEPAD_ADDED, c.SDL_EVENT_GAMEPAD_REMOVED => {
+                    if (self.gamepad.handleDeviceEvent(&event) == .disconnected) {
+                        self.input.releaseGamepadInput();
+                    }
+                },
                 else => {},
             }
+            // Drop non-active (and no-open-pad) GAMEPAD_BUTTON_* / AXIS_MOTION
+            // before state handleEvent: menus use actionForPressEvent without a
+            // which filter. Router re-filters as defense-in-depth.
+            const active_gamepad_id = self.gamepad.activeId();
+            if (!input_router.shouldDeliverEvent(&event, active_gamepad_id)) continue;
             const consumed = try self.states.handleEvent(&event, &self.transitions);
             if (!consumed) {
-                input_router.routeEvent(routing_policy, &event, &self.input, &self.commands);
+                input_router.routeEventWithGamepad(routing_policy, &event, &self.input, &self.commands, active_gamepad_id);
             }
         }
         try self.applyTransitions();
@@ -258,7 +276,7 @@ pub const Engine = struct {
         }
         try self.pause.applyWindowPolicy(frame_policy, &self.states, &self.input, time_loop, self.nowNs());
         if (!frame_policy.should_pause_gameplay and self.pause.isPaused() and
-            (self.commands.wasPressed(Action.resumeGame) or self.commands.wasPressed(Action.pause)))
+            (self.commands.wasPressed(Action.resume_game) or self.commands.wasPressed(Action.pause)))
         {
             log.debug("resuming gameplay by input command", .{});
             self.pause.exit(&self.states, &self.input, time_loop, self.nowNs());
@@ -281,6 +299,7 @@ pub const Engine = struct {
             .input = &self.input,
             .audio = &self.audio_commands,
             .runtime_assets = &self.runtime_assets,
+            .asset_store = self.assets,
             .delta_seconds = delta_seconds,
             .transitions = &self.transitions,
             .thread_system = &self.thread_system,
@@ -336,6 +355,7 @@ pub const Engine = struct {
                     .text_service = &self.text_service,
                     .interpolation_alpha = interpolation_alpha,
                     .thread_system = &self.thread_system,
+                    .debug_overlay_visible = self.debug_overlay.visible,
                     .perf = perf_context,
                 });
                 if (comptime runtime_perf_log.enabled) {
@@ -344,7 +364,7 @@ pub const Engine = struct {
                 // Gameplay states reserve stacked UI headroom; this grows for the
                 // debug overlay after all stacked states finish enqueue.
                 try self.renderer.reserveSpriteCommands(
-                    self.renderer.spriteCommandCount() + Renderer.kOverlayCommandHeadroom,
+                    self.renderer.spriteCommandCount() + Renderer.k_overlay_command_headroom,
                 );
                 const perf_overlay_start_ns = if (comptime runtime_perf_log.enabled) self.nowNs() else 0;
                 try self.debug_overlay.prepareForRender(&self.text_service, &self.renderer);
@@ -444,7 +464,8 @@ pub const Engine = struct {
         const current_routing = self.states.inputRoutingPolicy();
         if (previous_routing.allowsContext(.gameplay) and !current_routing.allowsContext(.gameplay)) {
             log.debug("releasing held gameplay input because active state routing blocks gameplay", .{});
-            self.input.releaseMovement();
+            // Clear movement + dig + stick; releaseMovement alone leaves dig latched.
+            self.input.releaseHeldGameplay();
         }
         if (result.quit_requested) {
             log.debug("quit requested by state transition", .{});

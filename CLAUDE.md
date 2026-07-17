@@ -27,10 +27,10 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
 - `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
   priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
-  18–25E, 26–31, 34, 36) are in
+  18–25E, 26–32, 34, 36, 39–41, 45) are in
   `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
-  `docs/changelogs/world.md`).
+  `docs/changelogs/ai_update2.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
 
 ## Module Ownership (`src/`)
@@ -68,8 +68,9 @@ boundaries just to make a local change easier.
 
 - Read the live owning files before editing. Do not rely on stale roadmap memory
   or prior chat summaries for exact implementation details.
-- Follow `docs/coding-standards.md`: `zig fmt`, lowerCamelCase functions/vars,
-  PascalCase types, direct declaration imports, explicit error sets.
+- Follow `docs/coding-standards.md`: `zig fmt`, camelCase functions, snake_case
+  variables/fields, PascalCase types, direct declaration imports, explicit error
+  sets.
 - Treat performance as correctness on hot/frame-adjacent paths. Hot paths must
   be **allocation-free after init/reserve/warmup**, and every such claim needs
   a `std.testing.FailingAllocator` proof test, not just a comment — this
@@ -128,12 +129,13 @@ zig build dev        # shaders + assets + run (edit/run loop)
 zig build check      # compile coverage (game, gpu-smoke, bench) — no install
 zig build test       # run Zig unit tests
 zig build bench      # CPU gameplay and render-prep benchmarks
-zig build verify     # full gate: check + test + shader compile + atlas lint
+zig build verify     # full gate: check + test + shaders + atlas + idiom lint
 zig build fmt        # format build.zig, build.zig.zon, and src/
 zig build shaders    # compile GLSL sources to platform GPU shaders
 zig build gpu-smoke  # display-gated renderer pipeline smoke (needs a display)
 zig build package    # install selected-mode binaries and runtime assets
 zig build assets-lint # lint runtime atlases and source sprite consistency
+zig build idiom-lint # lint Zig naming, stdlib currency, unsafe catch unreachable
 zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cache
 ```
 

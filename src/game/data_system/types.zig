@@ -52,6 +52,10 @@ pub const EntityId = struct {
     pub fn matches(self: EntityId, index: u32, generation: u32) bool {
         return self.isValid() and self.index == index and self.generation == generation;
     }
+
+    pub fn eql(self: EntityId, other: EntityId) bool {
+        return self.index == other.index and self.generation == other.generation;
+    }
 };
 
 pub const Component = enum(u5) {
@@ -68,6 +72,7 @@ pub const Component = enum(u5) {
     ai_perception,
     ai_memory,
     ai_affect,
+    destructible,
 };
 
 pub const ComponentMask = u32;
@@ -86,6 +91,7 @@ pub const component_masks = struct {
     pub const ai_perception = componentMask(.ai_perception);
     pub const ai_memory = componentMask(.ai_memory);
     pub const ai_affect = componentMask(.ai_affect);
+    pub const destructible = componentMask(.destructible);
     pub const render_primitive = movement_body | facing | primitive_visual;
 };
 
@@ -104,7 +110,6 @@ pub const MovementBody = struct {
     position: math.Vec2 = .{},
     previous_position: math.Vec2 = .{},
     position_z: i32 = 0,
-    previous_z: i32 = 0,
     velocity: math.Vec2 = .{},
     speed: f32 = 0,
 };
@@ -115,16 +120,15 @@ pub const MovementBodyPtr = struct {
     position_z: *i32,
     previous_x: *f32,
     previous_y: *f32,
-    previous_z: *i32,
     velocity_x: *f32,
     velocity_y: *f32,
     speed: *f32,
 
-    // z is not interpolated: previous_z must always equal position_z when
-    // snapping a body onto a plane (level-change, spawn, fall, ramp).
+    // z is a discrete depth-sort plane index, not integrated or interpolated
+    // (the renderer orders by position_z directly), so snapping onto a plane
+    // only sets position_z. There is no previous-z interpolation baseline.
     pub fn snapZ(self: MovementBodyPtr, z: i32) void {
         self.position_z.* = z;
-        self.previous_z.* = z;
     }
 };
 
@@ -137,7 +141,6 @@ pub const MovementBodySlice = struct {
     position_z: HotI32Slice,
     previous_x: HotF32Slice,
     previous_y: HotF32Slice,
-    previous_z: HotI32Slice,
     velocity_x: HotF32Slice,
     velocity_y: HotF32Slice,
     speed: HotF32Slice,
@@ -152,7 +155,6 @@ pub const ConstMovementBodySlice = struct {
     position_z: ConstHotI32Slice,
     previous_x: ConstHotF32Slice,
     previous_y: ConstHotF32Slice,
-    previous_z: ConstHotI32Slice,
     velocity_x: ConstHotF32Slice,
     velocity_y: ConstHotF32Slice,
     speed: ConstHotF32Slice,
@@ -270,6 +272,21 @@ pub const RenderCollectIndices = struct {
     visual_index: usize,
     asset_ref_index: ?usize = null,
     facing_index: ?usize = null,
+};
+
+/// Dense movement + primitive-visual row indices from a single entity slot resolve.
+/// Used by bounds clamp / tile gate so the hot path does one hash lookup, then pure
+/// SoA column writes (not `movementBodyPtr` + `primitiveVisualDenseIndex` per entity).
+pub const MovementVisualDenseIndices = struct {
+    movement: usize,
+    visual: usize,
+};
+
+/// Dense movement + steering-agent row indices from a single entity slot resolve.
+/// Used by steering intent selection so the hot path does one lookup, not two.
+pub const MovementSteeringDenseIndices = struct {
+    movement: usize,
+    steering: usize,
 };
 
 pub const CollisionBounds = struct {
@@ -512,6 +529,12 @@ pub const ai_memory_ring_capacity: usize = 4;
 pub const max_ai_memory_staleness: f32 = 3600.0;
 pub const max_ai_memory_familiarity: f32 = 1.0;
 pub const ai_memory_familiarity_decay_rate: f32 = 0.02;
+/// Per-step familiarity rise while the remembered target stays visible (same
+/// identity). Applied after decay so sustained LOS nets a climb; must exceed
+/// the decay's proportional drop at high familiarity for novelty to fall.
+pub const ai_memory_familiarity_gain_rate: f32 = 0.05;
+/// Upper bound for sticky-commitment authoring (10 s at 60 Hz).
+pub const max_ai_commitment_max_steps: u16 = 600;
 
 /// One remembered contact: who, where, and how long ago. Ring slots are
 /// overwritten oldest-first via ring_next_slot; there is no per-entity growth.
@@ -636,6 +659,27 @@ pub const AiAffectCommand = struct {
     affect: AiAffect,
 };
 
+/// Compact destructible fact for action-intent consumers (Slice 45). Demo crates
+/// use `hit_points = 1` (one interact/attack destroys). Multi-hit entities keep
+/// remaining HP via deferred `set_destructible` until zero → `destroy_entity`.
+pub const Destructible = struct {
+    hit_points: u8 = 1,
+    destroy_on_interact: bool = true,
+    destroy_on_attack: bool = true,
+};
+
+pub const DestructibleCommand = struct {
+    entity: EntityId,
+    destructible: Destructible,
+};
+
+pub const ConstDestructibleSlice = struct {
+    entities: []const EntityId,
+    hit_points: []const u8,
+    destroy_on_interact: []const bool,
+    destroy_on_attack: []const bool,
+};
+
 pub const ConstAiAffectSlice = struct {
     entities: []const EntityId,
     baseline_fear: ConstHotF32Slice,
@@ -707,6 +751,7 @@ pub const EntityTemplate = struct {
     ai_perception: ?AiPerception = null,
     ai_memory: ?AiMemory = null,
     ai_affect: ?AiAffect = null,
+    destructible: ?Destructible = null,
 };
 
 pub const MovementBodyCommand = struct {
@@ -759,6 +804,7 @@ pub const StructuralCommand = union(enum) {
     set_ai_perception: AiPerceptionCommand,
     set_ai_memory: AiMemoryCommand,
     set_ai_affect: AiAffectCommand,
+    set_destructible: DestructibleCommand,
 };
 
 pub const StructuralCommitStats = struct {
@@ -791,6 +837,9 @@ pub const StructuralEntityDestroyedChange = struct {
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool,
     obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at destroy time (`world_level` component, else 0).
+    /// Lets post-commit nav invalidation mark the correct multi-level grid.
+    level: u16 = 0,
 };
 
 pub const StructuralComponentChangedChange = struct {
@@ -800,6 +849,9 @@ pub const StructuralComponentChangedChange = struct {
     is_static_navigation_obstacle: bool,
     old_obstacle_world_rect: ?ObstacleWorldRect = null,
     new_obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at change time (`world_level` component, else 0).
+    /// Lets post-commit nav invalidation mark the correct multi-level grid.
+    level: u16 = 0,
 };
 
 pub const StructuralChange = union(enum) {

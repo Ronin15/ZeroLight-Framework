@@ -46,10 +46,14 @@ pub const Signals = struct {
     // this step (perception's last_seen_x/y), not a relative offset.
     nearest_threat_x: f32 = 0,
     nearest_threat_y: f32 = 0,
-    nearest_threat_dist: f32 = std.math.inf(f32),
     heard_stimulus: bool = false,
     heard_stimulus_x: f32 = 0,
     heard_stimulus_y: f32 = 0,
+
+    // World interest marker (Slice 41), gathered read-only from `WorldSystem`.
+    interest_present: bool = false,
+    interest_x: f32 = 0,
+    interest_y: f32 = 0,
 
     // Memory. Absent AiMemory component -> invalid/zero defaults (staleness
     // 0 and max_staleness 0 keep the "fresh" check `staleness < max_staleness`
@@ -115,6 +119,7 @@ const drive_behavior_weight: [drive_count][behavior_count]f32 = .{
 const pursue_visible_target_bonus: f32 = 1.0;
 const flee_visible_threat_bonus: f32 = 1.0;
 const investigate_heard_stimulus_bonus: f32 = 0.5;
+const investigate_interest_marker_bonus: f32 = 0.35;
 const cohere_neighbor_bonus_per_neighbor: f32 = 0.15;
 const cohere_neighbor_bonus_cap: f32 = 0.6;
 const pursue_fresh_memory_bonus: f32 = 0.5;
@@ -142,10 +147,6 @@ fn memoryFresh(signals: Signals) bool {
     return signals.memory_last_known_target.isValid() and signals.memory_staleness < signals.memory_max_staleness;
 }
 
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
-}
-
 /// Fresh memory is only a valid pursue/flee substitute for the *same*
 /// opt-in `focus_target` entity when one is configured — memory of some
 /// other entity this agent glimpsed earlier (e.g. a different hostile) is
@@ -156,7 +157,7 @@ fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
 /// still act on where it last saw it).
 fn memoryMatchesFocus(signals: Signals) bool {
     const wanted = signals.focus_target orelse return true;
-    return entityIdsEqual(signals.memory_last_known_target, wanted);
+    return signals.memory_last_known_target.eql(wanted);
 }
 
 fn hasFreshRingContact(signals: Signals) bool {
@@ -179,7 +180,11 @@ fn perceptionTerm(behavior: AiBehavior, signals: Signals) f32 {
         else
             0,
         .flee => if (signals.target_visible) flee_visible_threat_bonus else 0,
-        .investigate => if (signals.heard_stimulus) investigate_heard_stimulus_bonus else 0,
+        .investigate => blk: {
+            if (signals.heard_stimulus) break :blk investigate_heard_stimulus_bonus;
+            if (signals.interest_present) break :blk investigate_interest_marker_bonus;
+            break :blk 0;
+        },
         .cohere => @min(
             @as(f32, @floatFromInt(signals.cohere_neighbor_count)) * cohere_neighbor_bonus_per_neighbor,
             cohere_neighbor_bonus_cap,
@@ -193,7 +198,10 @@ fn memoryTerm(behavior: AiBehavior, signals: Signals) f32 {
     return switch (behavior) {
         .pursue => if (fresh and memoryMatchesFocus(signals)) pursue_fresh_memory_bonus else 0,
         .flee => if (fresh) flee_fresh_memory_bonus else 0,
-        .investigate => if (!signals.heard_stimulus and hasFreshRingContact(signals)) investigate_fresh_ring_bonus else 0,
+        .investigate => if (!signals.heard_stimulus and !signals.interest_present and hasFreshRingContact(signals))
+            investigate_fresh_ring_bonus
+        else
+            0,
         .wander, .cohere => 0,
     };
 }
@@ -347,6 +355,16 @@ fn resolveInvestigateGoal(signals: Signals) GoalResolution {
         return .{
             .goal_x = signals.heard_stimulus_x,
             .goal_y = signals.heard_stimulus_y,
+            .goal_entity = null,
+            .kind_hint = .individual,
+            .valid = true,
+        };
+    }
+
+    if (signals.interest_present) {
+        return .{
+            .goal_x = signals.interest_x,
+            .goal_y = signals.interest_y,
             .goal_entity = null,
             .kind_hint = .individual,
             .valid = true,
@@ -580,11 +598,25 @@ test "resolveGoal flee inverts direction away from the threat position" {
     try testing.expectApproxEqAbs(@as(f32, -flee_lead_distance), goal.goal_x, 1e-3);
 }
 
-test "resolveGoal investigate prefers heard stimulus over ring memory" {
+test "scoreBehaviors investigate interest marker bonus is 0.35 with unit gains" {
+    const signals = Signals{
+        .interest_present = true,
+        .interest_x = 10,
+        .interest_y = 0,
+    };
+    const scores = scoreBehaviors(signals, unitGains());
+    const investigate_idx = @intFromEnum(AiBehavior.investigate);
+    try testing.expectApproxEqAbs(investigate_interest_marker_bonus, scores[investigate_idx], 0.001);
+}
+
+test "resolveGoal investigate prefers stimulus over interest marker over ring memory" {
     var signals = Signals{
         .heard_stimulus = true,
         .heard_stimulus_x = 5,
         .heard_stimulus_y = 6,
+        .interest_present = true,
+        .interest_x = 50,
+        .interest_y = 60,
     };
     signals.memory_ring_entity[0] = EntityId{ .index = 9, .generation = 1 };
     signals.memory_ring_x[0] = 70;
@@ -597,6 +629,13 @@ test "resolveGoal investigate prefers heard stimulus over ring memory" {
     try testing.expectEqual(@as(f32, 6), stimulus_goal.goal_y);
 
     signals.heard_stimulus = false;
+    const marker_goal = resolveGoal(.investigate, signals);
+    try testing.expect(marker_goal.valid);
+    try testing.expectEqual(@as(f32, 50), marker_goal.goal_x);
+    try testing.expectEqual(@as(f32, 60), marker_goal.goal_y);
+    try testing.expect(marker_goal.goal_entity == null);
+
+    signals.interest_present = false;
     const ring_goal = resolveGoal(.investigate, signals);
     try testing.expect(ring_goal.valid);
     try testing.expectEqual(@as(f32, 70), ring_goal.goal_x);
@@ -606,6 +645,19 @@ test "resolveGoal investigate prefers heard stimulus over ring memory" {
     signals.memory_ring_entity[0] = EntityId.invalid;
     const invalid_goal = resolveGoal(.investigate, signals);
     try testing.expect(!invalid_goal.valid);
+}
+
+test "resolveGoal investigate marker-only produces valid goal without entity" {
+    const signals = Signals{
+        .interest_present = true,
+        .interest_x = 120,
+        .interest_y = 130,
+    };
+    const goal = resolveGoal(.investigate, signals);
+    try testing.expect(goal.valid);
+    try testing.expectEqual(@as(f32, 120), goal.goal_x);
+    try testing.expectEqual(@as(f32, 130), goal.goal_y);
+    try testing.expect(goal.goal_entity == null);
 }
 
 test "resolveGoal investigate picks the lowest-age valid ring entry" {

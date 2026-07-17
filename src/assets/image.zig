@@ -29,9 +29,7 @@ pub const LoadedImage = struct {
 };
 
 pub fn loadPng(assets: AssetStore, relative_path: []const u8) !LoadedImage {
-    const path = assets.resolveReadablePath(relative_path) catch |err| {
-        return err;
-    };
+    const path = try assets.resolveReadablePath(relative_path);
     defer assets.allocator.free(path);
 
     const path_z = try assets.allocator.dupeZ(u8, path);

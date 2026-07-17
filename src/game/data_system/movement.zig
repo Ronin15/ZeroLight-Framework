@@ -36,7 +36,6 @@ const MovementBodyRow = struct {
     position_z: i32,
     previous_x: f32,
     previous_y: f32,
-    previous_z: i32,
     velocity_x: f32,
     velocity_y: f32,
     speed: f32,
@@ -67,7 +66,6 @@ pub const MovementBodyStore = struct {
             .position_z = body.position_z,
             .previous_x = body.previous_position.x,
             .previous_y = body.previous_position.y,
-            .previous_z = body.previous_z,
             .velocity_x = body.velocity.x,
             .velocity_y = body.velocity.y,
             .speed = body.speed,
@@ -88,7 +86,6 @@ pub const MovementBodyStore = struct {
         s.items(.position_z)[index] = body.position_z;
         s.items(.previous_x)[index] = body.previous_position.x;
         s.items(.previous_y)[index] = body.previous_position.y;
-        s.items(.previous_z)[index] = body.previous_z;
         s.items(.velocity_x)[index] = body.velocity.x;
         s.items(.velocity_y)[index] = body.velocity.y;
         s.items(.speed)[index] = body.speed;
@@ -100,7 +97,6 @@ pub const MovementBodyStore = struct {
             .position = .{ .x = s.items(.position_x)[index], .y = s.items(.position_y)[index] },
             .previous_position = .{ .x = s.items(.previous_x)[index], .y = s.items(.previous_y)[index] },
             .position_z = s.items(.position_z)[index],
-            .previous_z = s.items(.previous_z)[index],
             .velocity = .{ .x = s.items(.velocity_x)[index], .y = s.items(.velocity_y)[index] },
             .speed = s.items(.speed)[index],
         };
@@ -114,7 +110,6 @@ pub const MovementBodyStore = struct {
             .position_z = &s.items(.position_z)[index],
             .previous_x = &s.items(.previous_x)[index],
             .previous_y = &s.items(.previous_y)[index],
-            .previous_z = &s.items(.previous_z)[index],
             .velocity_x = &s.items(.velocity_x)[index],
             .velocity_y = &s.items(.velocity_y)[index],
             .speed = &s.items(.speed)[index],
@@ -158,7 +153,12 @@ pub const MovementBodyStore = struct {
         const s = self.rows.slice();
         s.items(.previous_x)[index] = s.items(.position_x)[index];
         s.items(.previous_y)[index] = s.items(.position_y)[index];
-        s.items(.previous_z)[index] = s.items(.position_z)[index];
+    }
+
+    pub fn zeroVelocity(self: *MovementBodyStore, index: usize) void {
+        const s = self.rows.slice();
+        s.items(.velocity_x)[index] = 0;
+        s.items(.velocity_y)[index] = 0;
     }
 
     pub fn removeAt(self: *MovementBodyStore, index: usize) ?EntityId {
@@ -178,7 +178,6 @@ pub const MovementBodyStore = struct {
             .position_z = s.items(.position_z),
             .previous_x = s.items(.previous_x),
             .previous_y = s.items(.previous_y),
-            .previous_z = s.items(.previous_z),
             .velocity_x = s.items(.velocity_x),
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
@@ -195,7 +194,6 @@ pub const MovementBodyStore = struct {
             .position_z = s.items(.position_z),
             .previous_x = s.items(.previous_x),
             .previous_y = s.items(.previous_y),
-            .previous_z = s.items(.previous_z),
             .velocity_x = s.items(.velocity_x),
             .velocity_y = s.items(.velocity_y),
             .speed = s.items(.speed),
@@ -256,4 +254,23 @@ test "simd range helpers cover movement body vector and scalar tail counts" {
     try std.testing.expectEqual(@as(usize, 0), simd.tailLen(simd.lane_count));
     try std.testing.expectEqual(@as(usize, simd.lane_count * 2), simd.vectorizedEnd(simd.lane_count * 2 + 1));
     try std.testing.expectEqual(@as(usize, 1), simd.tailLen(simd.lane_count * 2 + 1));
+}
+
+test "MovementBodyStore append is allocation-free after ensureCapacity reserves" {
+    var store: MovementBodyStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }

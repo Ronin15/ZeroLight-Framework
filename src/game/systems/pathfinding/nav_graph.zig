@@ -219,10 +219,16 @@ const NavPatchJob = struct {
     world: *const WorldSystem,
     level: u16,
     chunks: []const u32,
+    range_count: usize,
 };
 
 fn patchChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *NavPatchJob = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the chunk buffer this job walks.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.chunks.len);
     // Guards the reserve-before-dispatch invariant: patch_scratch was sized to the
     // participant count that patchDirtyChunks checked before dispatching this batch.
     std.debug.assert(worker_id.index < job.graph.patch_scratch.items.len);
@@ -249,10 +255,16 @@ const NavRemaskJob = struct {
     world: *const WorldSystem,
     level: u16,
     chunks: []const u32,
+    range_count: usize,
 };
 
 fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *NavRemaskJob = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the chunk buffer this job walks.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.chunks.len);
     const level_grid = &job.graph.levels.items[job.level];
     // Guards the reserve-before-dispatch invariant: remask_scratch was sized to the
     // participant count that remaskChangedChunks checked before dispatching this batch.
@@ -267,10 +279,16 @@ fn remaskChunkJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId
 const NavLevelMaskJob = struct {
     graph: *NavGraph,
     world: ?*const WorldSystem,
+    range_count: usize,
 };
 
 fn navLevelMaskJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *NavLevelMaskJob = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the level grid buffer this job walks.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.graph.levels.items.len);
     const world_system = job.world orelse return;
     for (range.start..range.end) |level_index| {
         const level_grid = &job.graph.levels.items[level_index];
@@ -491,11 +509,24 @@ pub const NavGraph = struct {
         if (world) |world_system| {
             if (thread_system) |threads| {
                 if (prepared_level_count > 1) {
-                    var mask_job = NavLevelMaskJob{ .graph = self, .world = world };
+                    // Pre-select so the job context can dual-assert range.index against
+                    // the dispatched range count (mirror affect.zig / collision.zig).
+                    const selection = threads.selectBatchProfile(null, .{
+                        .item_count = prepared_level_count,
+                        .items_per_range = 1,
+                        .range_alignment_items = 1,
+                        .adaptive = false,
+                    });
+                    var mask_job = NavLevelMaskJob{
+                        .graph = self,
+                        .world = world,
+                        .range_count = selection.range_count,
+                    };
                     _ = threads.parallelForWithOptions(prepared_level_count, &mask_job, navLevelMaskJob, .{
                         .items_per_range = 1,
                         .range_alignment_items = 1,
                         .adaptive = false,
+                        .selected_profile = selection.profile,
                     });
                 } else {
                     for (self.levels.items) |*level_grid| {
@@ -732,12 +763,27 @@ pub const NavGraph = struct {
             const participants = threads.thread_system.participantSlotCount();
             if (chunks.len > 1 and participants <= self.patch_scratch.items.len) {
                 for (self.patch_scratch.items) |*scratch| scratch.overflow = false;
-                var job = NavPatchJob{ .graph = self, .world = world, .level = level, .chunks = chunks };
-                self.last_patch_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
-                    .adaptive = threads.adaptive,
-                    .adaptive_tuner = threads.tuner,
+                // Pre-select so the job context can dual-assert range.index against
+                // the dispatched range count (mirror affect.zig / collision.zig).
+                const selection = threads.thread_system.selectBatchProfile(threads.tuner, .{
+                    .item_count = chunks.len,
                     .items_per_range = threads.items_per_range,
                     .range_alignment_items = 1,
+                    .adaptive = threads.adaptive,
+                });
+                var job = NavPatchJob{
+                    .graph = self,
+                    .world = world,
+                    .level = level,
+                    .chunks = chunks,
+                    .range_count = selection.range_count,
+                };
+                self.last_patch_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, patchChunkJob, .{
+                    .adaptive = threads.adaptive,
+                    .adaptive_tuner = selection.active_tuner,
+                    .items_per_range = threads.items_per_range,
+                    .range_alignment_items = 1,
+                    .selected_profile = selection.profile,
                 });
                 var overflow = false;
                 for (self.patch_scratch.items) |*scratch| {
@@ -911,12 +957,28 @@ pub const NavGraph = struct {
             const participants = threads.thread_system.participantSlotCount();
             if (chunks.len > 1 and participants <= self.remask_scratch.items.len) {
                 for (self.remask_scratch.items) |*scratch| scratch.blocked_delta = 0;
-                var job = NavRemaskJob{ .graph = self, .data = data, .world = world_system, .level = level, .chunks = chunks };
-                self.last_remask_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, remaskChunkJob, .{
-                    .adaptive = threads.adaptive,
-                    .adaptive_tuner = threads.tuner,
+                // Pre-select so the job context can dual-assert range.index against
+                // the dispatched range count (mirror affect.zig / collision.zig).
+                const selection = threads.thread_system.selectBatchProfile(threads.tuner, .{
+                    .item_count = chunks.len,
                     .items_per_range = threads.items_per_range,
                     .range_alignment_items = 1,
+                    .adaptive = threads.adaptive,
+                });
+                var job = NavRemaskJob{
+                    .graph = self,
+                    .data = data,
+                    .world = world_system,
+                    .level = level,
+                    .chunks = chunks,
+                    .range_count = selection.range_count,
+                };
+                self.last_remask_batch = threads.thread_system.parallelForWithOptions(chunks.len, &job, remaskChunkJob, .{
+                    .adaptive = threads.adaptive,
+                    .adaptive_tuner = selection.active_tuner,
+                    .items_per_range = threads.items_per_range,
+                    .range_alignment_items = 1,
+                    .selected_profile = selection.profile,
                 });
                 for (self.remask_scratch.items) |*scratch| delta += scratch.blocked_delta;
                 applyBlockedDelta(level_grid, delta);
@@ -956,9 +1018,13 @@ pub const NavGraph = struct {
     fn applyBlockedDelta(level_grid: *NavGrid, delta: isize) void {
         const signed: isize = @as(isize, @intCast(level_grid.blocked_count)) + delta;
         // The summed per-worker deltas must keep blocked_count non-negative; a negative
-        // net would mean a remask double-counted an unblock. Assert before the @intCast
-        // would otherwise wrap into a huge usize.
-        std.debug.assert(signed >= 0);
+        // net would mean a remask double-counted an unblock. Saturate to 0 before
+        // @intCast — never wrap a negative isize into a huge usize (ReleaseFast would
+        // otherwise make that wrap silent UB-adjacent corruption of the count).
+        if (signed < 0) {
+            level_grid.blocked_count = 0;
+            return;
+        }
         level_grid.blocked_count = @intCast(signed);
     }
 
@@ -1037,9 +1103,10 @@ pub const NavGraph = struct {
         const run = self.chunk_link_cells.items[lo .. lo + len];
         // slotForCell only reaches here for a non-perimeter portal cell that was already
         // admitted as a portal. Border cells (tryBorderPair) are perimeter; link endpoints are
-        // gated by tryLinkPortal, which skips any interior cell absent from this run. So a miss
-        // is an invariant violation; surface it loudly instead of aliasing onto slot 0.
-        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable;
+        // gated by tryLinkPortal, which skips any interior cell absent from this run, so a miss
+        // is an invariant violation (a Debug/ReleaseSafe panic; the invariant is covered by the
+        // "runtime interior link endpoint is deferred" regression test) rather than a real path.
+        const rel = std.sort.binarySearch(u32, run, @as(u32, @intCast(cell_index)), orderU32) orelse unreachable; // lint:allow catch-unreachable: interior portal cell provably present in run (see above)
         return @intCast(rel);
     }
 
@@ -1523,8 +1590,16 @@ pub const NavGraph = struct {
             // leaves the graph object exactly as it stands right now. Re-zero the counts so a
             // reader in that window sees empty (not dangling/stale) adjacency for this chunk
             // instead of a CSR range whose content was never refreshed for the new topology.
+            // Also pin each slot's start back to ebase: the prefix sum above walked `running`
+            // past ebase+ecap, so a later slot's start can exceed portal_edges.len; a reader
+            // slices [start, start+count). With count re-zeroed, start must stay in-bounds or
+            // that empty slice traps (Debug/ReleaseSafe) / is UB (ReleaseFast). ebase is the
+            // chunk's window base, always < len, so [ebase, ebase) is a safe empty slice.
             var zero_slot = pbase;
-            while (zero_slot < pbase + pcap) : (zero_slot += 1) lg.portal_edge_count.items[zero_slot] = 0;
+            while (zero_slot < pbase + pcap) : (zero_slot += 1) {
+                lg.portal_edge_count.items[zero_slot] = 0;
+                lg.portal_edge_start.items[zero_slot] = ebase;
+            }
             return true;
         }
         // Per-slot write cursor (indexed window-relative) seeded at each slot's edge start. Uses
@@ -1711,6 +1786,26 @@ fn collectParityEdges(graph: *const NavGraph, out: *std.ArrayList(ParityEdge)) !
         }
     }
     std.sort.pdq(ParityEdge, out.items, {}, ParityEdge.lessThan);
+}
+
+test "applyBlockedDelta saturates a negative net to zero (M8)" {
+    // blocked_count=0 + delta=-1 must NOT @intCast-wrap into a huge usize.
+    // Private NavGraph helper is visible same-file via the container name.
+    var grid = NavGrid{ .blocked_count = 0 };
+    NavGraph.applyBlockedDelta(&grid, -1);
+    try std.testing.expectEqual(@as(usize, 0), grid.blocked_count);
+
+    // Over-unblock from a positive count also saturates, never wraps.
+    grid.blocked_count = 3;
+    NavGraph.applyBlockedDelta(&grid, -5);
+    try std.testing.expectEqual(@as(usize, 0), grid.blocked_count);
+
+    // Positive path still accumulates normally.
+    grid.blocked_count = 2;
+    NavGraph.applyBlockedDelta(&grid, 1);
+    try std.testing.expectEqual(@as(usize, 3), grid.blocked_count);
+    NavGraph.applyBlockedDelta(&grid, -1);
+    try std.testing.expectEqual(@as(usize, 2), grid.blocked_count);
 }
 
 // Asserts the incremental graph `a` is identical to the full-rebuild graph `b`:
@@ -2413,6 +2508,59 @@ test "compactChunkEdges zeroes the chunk's edge counts on overflow instead of le
     }
 }
 
+test "compactChunkEdges keeps portal_edge_start in-bounds for the last chunk on overflow" {
+    // The last chunk's edge window ends exactly at portal_edges.len, so an overflow whose
+    // prefix sum climbs `running` past ebase+ecap leaves a later slot's start beyond the
+    // buffer. With counts re-zeroed but start left stale, a reader slicing
+    // [start, start+count) traps (Debug/ReleaseSafe) / is UB (ReleaseFast). Pinning start
+    // back to ebase keeps every count-0 slot's slice a safe in-bounds empty range.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 256, 256);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 256, 256, 32, null);
+
+    const lg = &system.graph.level_graphs.items[0];
+    const chunk: u32 = @intCast(system.graph.chunkCount() - 1);
+    const pbase = system.graph.chunk_portal_base.items[chunk];
+    const pcap = system.graph.chunk_portal_cap.items[chunk];
+    const ebase = system.graph.chunk_edge_base.items[chunk];
+    const ecap = system.graph.chunk_edge_cap.items[chunk];
+    // Precondition for the OOB: this chunk's window ends at the very end of the arena, and
+    // it has at least two slots so a later slot's start can climb past the buffer.
+    try std.testing.expectEqual(system.graph.total_edge_slots, ebase + ecap);
+    try std.testing.expect(pcap >= 2);
+
+    // Synthesize a transient edge list that overflows the window: ecap+4 edges all on the
+    // chunk's first slot, so the prefix sum pushes every later slot's start past the arena.
+    const scratch = &system.graph.patch_scratch.items[0];
+    scratch.edges.clearRetainingCapacity();
+    var e: u32 = 0;
+    while (e < ecap + 4) : (e += 1) {
+        try scratch.edges.append(system.graph.allocator, .{ .from = pbase, .edge = .{ .target = 0, .cost = 1 } });
+    }
+
+    const overflowed = try system.graph.compactChunkEdges(0, chunk, scratch);
+    try std.testing.expect(overflowed);
+
+    // Every slot must yield an in-bounds empty CSR slice — reading it must not trap.
+    const edges_len = lg.portal_edges.items.len;
+    var slot = pbase;
+    while (slot < pbase + pcap) : (slot += 1) {
+        const begin = lg.portal_edge_start.items[slot];
+        const count = lg.portal_edge_count.items[slot];
+        try std.testing.expectEqual(@as(u32, 0), count);
+        try std.testing.expect(begin <= edges_len);
+        try std.testing.expectEqual(@as(usize, 0), lg.portal_edges.items[begin .. begin + count].len);
+    }
+}
+
 test "incremental single-chunk dig patches a constant chunk set independent of world size" {
     // The dirty-bounded work proxy: a one-cell dig in an interior chunk patches that chunk
     // plus its four orthogonal neighbors (5), regardless of how large the level is. If this
@@ -2868,6 +3016,90 @@ test "entity-obstacle rect nav update is allocation-free at steady state" {
     try system.markNavObstacleRectDirty(0, rect);
     const stats = try system.applyBufferedNavUpdates(&data, &world, null);
     try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+
+    system.graph.allocator = original;
+    system.allocator = original;
+}
+
+test "threaded multi-worker chunk patch/remask is allocation-free at steady state (FailingAllocator)" {
+    // The serial slot-0 proof above swaps in a failing allocator with thread_system=null,
+    // so the worker append (scratch.edges.append / setLen on worker threads at
+    // remaskChangedChunks/patchChunkJob) is only ever proven allocation-free on the inline
+    // slot-0 path. This drives the SAME failing-allocator proof through a REAL multi-worker
+    // ThreadSystem so the reserve-before-dispatch invariant (patch/remask scratch sized to
+    // the participant count) is proven on the path that actually fans out to worker threads.
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    const tree = try requireTestTile(&meta, "tree_0");
+
+    const extent: f32 = 512;
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, extent, extent);
+    defer world.deinit();
+    const obstacle = try world.addDenseLayer(0, 0, .obstacle, grass);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = 1 });
+    defer threads.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    var cap = abstractCapacity();
+    cap.worker_participant_count = threads.participantSlotCount();
+    try system.reserve(cap);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, extent, extent, 32, null);
+    // Force the parallel schedule rather than letting the tuner keep the small batch inline,
+    // so the proof exercises the worker-thread append, not the serial slot-0 fallback.
+    system.nav_thread_adaptive = false;
+    system.nav_thread_items_per_range = 1;
+
+    // Five cells in five distinct nav_chunk_tiles=4 chunks, so both the remask changed-chunk
+    // set and the patch dirty set exceed one chunk and actually fan out to workers.
+    const warm_cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 1, .y = 1 },  .{ .x = 13, .y = 1 },
+        .{ .x = 1, .y = 13 }, .{ .x = 13, .y = 13 },
+        .{ .x = 7, .y = 7 },
+    };
+    // A distinct cell in each of the SAME five chunks, dug during the failing-allocator proof
+    // below. Same per-chunk/per-worker footprint as the warmup, so no buffer grows.
+    const proof_cells = [_]struct { x: u16, y: u16 }{
+        .{ .x = 2, .y = 2 },  .{ .x = 14, .y = 1 },
+        .{ .x = 2, .y = 14 }, .{ .x = 14, .y = 14 },
+        .{ .x = 6, .y = 6 },
+    };
+
+    // Warmup: toggle the warm cells on then off through the THREADED path, so every buffer the
+    // threaded remask/patch touches (dirty_set/dirty_stamp, changed spans, per-participant patch
+    // and remask scratch) reaches steady-state capacity before the failing-allocator proof.
+    for ([_]@TypeOf(tree){ tree, grass }) |tile| {
+        for (warm_cells) |cell| {
+            _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tile)) orelse return error.TestExpectedEqual;
+            try system.markNavDirty(0, cell.x, cell.y);
+        }
+        const warm_stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+        try std.testing.expectEqual(@as(usize, 1), warm_stats.incremental_rebuilds);
+        // The warmup itself must have threaded (not fallen back inline), or it would not have
+        // grown the per-participant worker scratch the proof relies on.
+        try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+        try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
+    }
+
+    const original = system.allocator;
+    system.allocator = std.testing.failing_allocator;
+    system.graph.allocator = std.testing.failing_allocator;
+
+    for (proof_cells) |cell| {
+        _ = (try world.setDenseTile(obstacle, cell.x, cell.y, tree)) orelse return error.TestExpectedEqual;
+        try system.markNavDirty(0, cell.x, cell.y);
+    }
+    const stats = try system.applyBufferedNavUpdates(&data, &world, &threads);
+    try std.testing.expectEqual(@as(usize, 1), stats.incremental_rebuilds);
+    // Both stages threaded under the failing allocator: the worker append allocated zero times.
+    try std.testing.expect(!system.graph.last_remask_batch.ran_inline);
+    try std.testing.expect(!system.graph.last_patch_batch.ran_inline);
 
     system.graph.allocator = original;
     system.allocator = original;

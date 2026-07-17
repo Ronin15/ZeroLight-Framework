@@ -90,7 +90,10 @@ pub fn build(b: *std.Build) void {
     // for bench troubleshooting, same as it does for the game build.
     const bench_log_level = parseLogLevel(log_level_arg, .ReleaseFast);
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
-    const force_llvm_lld = forceLlvmLldForTarget(target);
+    // Full LTO needs LLVM+LLD. Zig 0.16 rejects LLD for Mach-O, so Darwin
+    // ReleaseFast stays without LTO; Linux/Windows ship with `-flto=full`.
+    const release_lto = optimize == .ReleaseFast and ltoSupportedForTarget(target.result);
+    const force_llvm_lld: ?bool = if (release_lto) true else forceLlvmLldForTarget(target);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
 
     const buildOptions = b.addOptions();
@@ -152,6 +155,12 @@ pub fn build(b: *std.Build) void {
         .use_llvm = force_llvm_lld,
         .use_lld = force_llvm_lld,
     });
+
+    // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
+    // dead-code elimination when the target supports it (see `release_lto`).
+    if (release_lto) {
+        exe.lto = .full;
+    }
 
     b.installArtifact(exe);
     const windows_sdl_runtime = addWindowsSdlRuntimeDependencies(b, windows_sdl, &.{
@@ -220,11 +229,16 @@ pub fn build(b: *std.Build) void {
     const assets_lint_step = b.step("assets-lint", "Lint registered runtime atlases and source sprite consistency");
     assets_lint_step.dependOn(&assets_lint_cmd.step);
 
+    const idiom_lint_cmd = b.addSystemCommand(&.{ "python3", "tools/lint_idioms.py" });
+    const idiom_lint_step = b.step("idiom-lint", "Lint Zig sources for idiom/currency regressions (naming, deprecated stdlib, unsafe catch unreachable)");
+    idiom_lint_step.dependOn(&idiom_lint_cmd.step);
+
     const verify_step = b.step("verify", "Run non-interactive checks for local development");
     verify_step.dependOn(check_step);
     verify_step.dependOn(test_step);
     verify_step.dependOn(shaders_step);
     verify_step.dependOn(&assets_lint_cmd.step);
+    verify_step.dependOn(&idiom_lint_cmd.step);
 
     const gpu_smoke_run = b.addRunArtifact(gpu_smoke_exe);
     addWindowsSdlRunRuntime(gpu_smoke_run, windows_sdl_runtime);
@@ -651,11 +665,18 @@ fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
     return null;
 }
 
+/// Zig 0.16 LTO requires LLD; LLD cannot link Mach-O object files.
+fn ltoSupportedForTarget(target: std.Target) bool {
+    return target.ofmt != .macho;
+}
+
 fn parseLogLevel(value: []const u8, optimize: std.builtin.OptimizeMode) std.log.Level {
     if (std.mem.eql(u8, value, "auto")) {
         return switch (optimize) {
-            .Debug => .debug,
-            .ReleaseSafe, .ReleaseFast, .ReleaseSmall => .warn,
+            // Debug + ReleaseSafe: full diagnostics and runtime perf dumps (see
+            // runtime_perf_log.enabled). Fast/Small stay quiet for ship/package.
+            .Debug, .ReleaseSafe => .debug,
+            .ReleaseFast, .ReleaseSmall => .warn,
         };
     }
     if (std.mem.eql(u8, value, "err")) return .err;

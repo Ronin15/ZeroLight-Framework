@@ -152,7 +152,7 @@ pub fn parseAnimationValue(
     errdefer deinitAnimationTable(&animations, allocator);
 
     const root = animations_value orelse return animations;
-    if (root != .object) return animations;
+    if (root != .object) return error.InvalidAnimationEntry;
 
     var it = root.object.iterator();
     while (it.next()) |entry| {
@@ -298,6 +298,34 @@ test "parseAnimationValue rejects invalid animation entries" {
         error.InvalidAnimationEntry,
         parseAnimationValue(allocator, parsed.value),
     );
+}
+
+test "parseAnimationValue rejects a present-but-non-object animations field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // A present `animations` value that is not a JSON object (here an array) is
+    // an authoring typo, not an absent field, so it must error rather than
+    // silently yield an empty table.
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\[]
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.InvalidAnimationEntry,
+        parseAnimationValue(allocator, parsed.value),
+    );
+
+    // The absent (null) case remains the legitimate optional-absent path.
+    var empty = try parseAnimationValue(allocator, null);
+    defer deinitAnimationTable(&empty, allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
 }
 
 test "parseAnimationValue rejects out-of-range integer fields" {

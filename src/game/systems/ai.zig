@@ -36,7 +36,8 @@ const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
 const rng = @import("../../core/rng.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -66,8 +67,15 @@ const SpatialIndexView = spatial_index.SpatialIndexView;
 const NeighborVisitResult = spatial_index.NeighborVisitResult;
 const stance = @import("../faction.zig").stance;
 const arbitration = @import("arbitration.zig");
+const InterestMarkerStore = @import("../world_interest.zig").InterestMarkerStore;
 
 pub const ai_range_alignment_items: usize = movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const ai_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = ai_range_alignment_items,
+    .smallest_range_items = ai_range_alignment_items,
+};
 
 /// Fixed hysteresis distance for the demo's live-player chase: 1.75x
 /// pathfinding's nav cell size (`pathfinding/types.zig`'s `default_cell_size`
@@ -142,6 +150,13 @@ const RowDrives = struct {
     fatigue: f32,
 };
 
+/// World interest marker signal (Slice 41), gathered from `WorldSystem`.
+const RowInterest = struct {
+    present: bool = false,
+    x: f32 = 0,
+    y: f32 = 0,
+};
+
 /// Explicit opt-in fallback target (see `AiConfig.focus_target`'s doc
 /// comment) -- gated on `gain_pursue > 0` at gather time, so a null entity
 /// means either no configured focus_target or this agent has no pursue gain.
@@ -199,6 +214,7 @@ const AiGatherRow = struct {
     memory_ring: [ai_memory_ring_capacity]RowMemoryRingSlot,
     drives: RowDrives,
     focus: RowFocus,
+    interest: RowInterest,
     sep_x: f32,
     sep_y: f32,
     separation_neighbor_count: u8,
@@ -236,6 +252,11 @@ const max_cohere_neighbors: u32 = 12;
 const max_cohere_candidate_checks: u16 = 64;
 const cohere_cell_scan_radius: i32 = spatial_index.cellScanRadius(cohere_radius, grid_cell_size);
 
+/// Fixed cognition query radius for world interest markers (independent of
+/// world/map size). Sized near typical hearing range so curious agents can
+/// discover demo POIs without dig stimuli.
+const interest_marker_query_radius: f32 = 400.0;
+
 /// Fixed sticky-selection epsilon (see `arbitration.selectSticky`'s
 /// `min_delta` parameter): a challenger must clear `sticky_bonus + this` to
 /// preempt a held behavior mid-commitment, so two behaviors scoring within
@@ -263,7 +284,6 @@ pub const AiConfig = struct {
     adaptive: bool = true,
     separation_adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_adaptive_tuner: ?*AdaptiveWorkTuner = null,
-    adaptive_tuner: ?*AdaptiveWorkTuner = null,
     intent_seed: u64 = 0,
     /// Current fixed-step counter (see `SimulationScopeSystem.currentStep()`),
     /// combined with `intent_seed` and each entity's dense index to key
@@ -325,6 +345,9 @@ pub const AiConfig = struct {
     /// When non-null, only these dense ai-store indices participate this step
     /// (the scope system's cognition halo + stagger selection). Null = all agents.
     scope_dense_indices: ?[]const u32 = null,
+    /// Read-only world interest markers for investigate goal gathering. Null =
+    /// no marker contribution (prior behavior unchanged).
+    interest_markers: ?*const InterestMarkerStore = null,
 };
 
 pub const AiStats = struct {
@@ -342,8 +365,8 @@ pub const AiSystem = struct {
     allocator: std.mem.Allocator,
     // Gathered work memory (main-thread only; workers read only copies in ctx). Sized to ai ents.
     rows: std.MultiArrayList(AiGatherRow) = .{},
-    separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
-    intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    separation_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
+    intent_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
     // Broadcast goal-requantization state (see `requantizeGoal`); one scalar
     // pair since every default-target row shares this same broadcast value.
     snapped_goal: AiDir = .{ .x = 0, .y = 0 },
@@ -352,8 +375,8 @@ pub const AiSystem = struct {
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
             .allocator = allocator,
-            .separation_tuner = AdaptiveWorkTuner.init(.{}),
-            .intent_tuner = AdaptiveWorkTuner.init(.{}),
+            .separation_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
+            .intent_tuner = AdaptiveWorkTuner.init(ai_adaptive_tuner_config),
         };
     }
 
@@ -375,7 +398,7 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds; // decisions are instantaneous; integration in movement
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
         const entity_count = self.rows.len;
         if (entity_count == 0) {
             // No ai this step; do not touch caller's stream (other emitters may use intents).
@@ -404,7 +427,7 @@ pub const AiSystem = struct {
             system_config.adaptive,
             system_config.separation_adaptive_tuner,
         );
-        var separation_context = buildAiSeparationContext(gathered, spatial);
+        var separation_context = buildAiSeparationContext(gathered, spatial, separation_selection.range_count);
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
             .max_worker_threads = separation_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
@@ -425,7 +448,7 @@ pub const AiSystem = struct {
         const navigation_stream = system_config.navigation_intents orelse &frame.navigation_intents;
         const range_base = try navigation_stream.appendRangeCounts(rcount);
 
-        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base);
+        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base, rcount);
 
         for (0..rcount) |range_index| {
             const start = range_index * intent_selection.items_per_range;
@@ -474,7 +497,7 @@ pub const AiSystem = struct {
     ) !AiStats {
         _ = delta_seconds;
         const held_focus_target = self.resolveFocusTarget(config);
-        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice);
+        try self.gatherAiData(ai_agents, movement, data, config.scope_dense_indices, held_focus_target, config.focus_entity, config.perception_slice, config.memory_slice, config.affect_slice, config.interest_markers);
         const entity_count = self.rows.len;
         if (entity_count == 0) return .{};
         self.resetSeparationScratch();
@@ -487,7 +510,7 @@ pub const AiSystem = struct {
         navigation_stream.addCount(range_base, entity_count);
         try navigation_stream.prefixAppendedRanges(range_base);
 
-        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base);
+        var context = buildAiJobContext(gathered, navigation_stream, data, system_config, range_base, rcount);
         writeAiIntentsJob(&context, .{ .index = 0, .start = 0, .end = entity_count }, WorkerId.main);
 
         navigation_stream.finishWrite();
@@ -532,6 +555,7 @@ pub const AiSystem = struct {
         perception_slice: ?ConstPerceptionSlice,
         memory_slice: ?ConstAiMemorySlice,
         affect_slice: ?ConstAiAffectSlice,
+        interest_markers: ?*const InterestMarkerStore,
     ) !void {
         self.clearWork();
         // n is the candidate count: the scoped subset when the scope system has
@@ -597,6 +621,7 @@ pub const AiSystem = struct {
                     .x = if (has_focus) focus_target.?.x else 0,
                     .y = if (has_focus) focus_target.?.y else 0,
                 },
+                .interest = .{},
                 .sep_x = 0,
                 .sep_y = 0,
                 .separation_neighbor_count = 0,
@@ -656,6 +681,18 @@ pub const AiSystem = struct {
                 }
             }
 
+            // Mirror focus gating: investigate score is multiplied by gain, so a
+            // zero-gain row can never win investigate — skip the marker scan.
+            if (interest_markers) |markers| {
+                if (row.gains.investigate > 0) {
+                    const level = data.worldLevelConst(ent) orelse 0;
+                    const agent_faction = data.factionConst(ent);
+                    if (markers.findBestInvestigateMarker(level, row.pos_x, row.pos_y, interest_marker_query_radius, agent_faction)) |hit| {
+                        row.interest = .{ .present = true, .x = hit.x, .y = hit.y };
+                    }
+                }
+            }
+
             appendAiGatherRow(&self.rows, &row_slice, row);
         }
     }
@@ -704,7 +741,7 @@ pub const AiSystem = struct {
         // independent gathers.
         std.debug.assert(self.rows.len == spatial.pos_x.len);
         const gathered = self.rows.slice();
-        var context = buildAiSeparationContext(gathered, spatial);
+        var context = buildAiSeparationContext(gathered, spatial, 1);
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
@@ -735,7 +772,7 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
             &system.separation_tuner
         else
             null,
-        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse config.adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
+        .intent_adaptive_tuner = config.intent_adaptive_tuner orelse if (config.adaptive and config.intent_items_per_range == null and config.items_per_range == null)
             &system.intent_tuner
         else
             null,
@@ -747,7 +784,7 @@ fn normalizedConfig(config: AiConfig, system: *AiSystem) NormalizedAiConfig {
     };
 }
 
-fn buildAiSeparationContext(gathered: std.MultiArrayList(AiGatherRow).Slice, spatial: SpatialIndexView) AiSeparationContext {
+fn buildAiSeparationContext(gathered: std.MultiArrayList(AiGatherRow).Slice, spatial: SpatialIndexView, range_count: usize) AiSeparationContext {
     return .{
         .pos_x = gathered.items(.pos_x),
         .pos_y = gathered.items(.pos_y),
@@ -759,6 +796,7 @@ fn buildAiSeparationContext(gathered: std.MultiArrayList(AiGatherRow).Slice, spa
         .candidate_counts = gathered.items(.separation_candidate_count),
         .cohere = gathered.items(.cohere),
         .spatial_index = spatial,
+        .range_count = range_count,
     };
 }
 
@@ -774,6 +812,7 @@ fn buildAiJobContext(
     data: *DataSystem,
     system_config: NormalizedAiConfig,
     range_base: usize,
+    range_count: usize,
 ) AiJobContext {
     return .{
         .entities = gathered.items(.entity),
@@ -788,6 +827,7 @@ fn buildAiJobContext(
         .memory_ring = gathered.items(.memory_ring),
         .drives = gathered.items(.drives),
         .focus = gathered.items(.focus),
+        .interest = gathered.items(.interest),
         .sep_x = gathered.items(.sep_x),
         .sep_y = gathered.items(.sep_y),
         .cohere = gathered.items(.cohere),
@@ -798,16 +838,11 @@ fn buildAiJobContext(
         .wander_step = system_config.step / @max(system_config.wander_resample_period_steps, 1),
         .nav_request_kind = system_config.nav_request_kind,
         .range_base = range_base,
+        .range_count = range_count,
     };
 }
 
-const StageWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
+const StageWorkSelection = BatchSelection;
 
 fn selectStageWork(
     thread_system: *const ThreadSystem,
@@ -817,47 +852,15 @@ fn selectStageWork(
     adaptive: bool,
     adaptive_tuner: ?*AdaptiveWorkTuner,
 ) StageWorkSelection {
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
-    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
-        adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = ai_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), ai_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+    // Shapes work through the single tuner-owned entry point so pre-sizing and
+    // dispatch (parallelForWithOptions) resolve an identical batch shape.
+    return thread_system.selectBatchProfile(adaptive_tuner, .{
+        .item_count = item_count,
+        .items_per_range = items_per_range_override,
+        .max_worker_threads = max_worker_threads_override,
+        .range_alignment_items = ai_range_alignment_items,
+        .adaptive = adaptive,
+    });
 }
 
 fn sumU8(values: []const u8) usize {
@@ -976,10 +979,16 @@ const AiSeparationContext = struct {
     /// a second grid.
     cohere: []RowCohere,
     spatial_index: SpatialIndexView,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiSeparationContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig).
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.pos_x.len);
     for (range.start..range.end) |index| {
         const result = computeBoundedSeparation(job, index);
         job.sep_x[index] = result.x;
@@ -1107,11 +1116,6 @@ fn computeCohereNeighbors(job: *const AiSeparationContext, index: usize) RowCohe
 /// Per-row job context for `writeAiIntentsJob`: every input column
 /// `resolveRowArbitration` needs to build a transient `arbitration.Signals`
 /// and call `scoreBehaviors`/`selectSticky`/`resolveGoal`, plus the resolved
-/// output columns and `ai_agent_hot` (arbitration's mutable hot-column
-/// write-back target). See `buildAiJobContext`.
-/// Per-row job context for `writeAiIntentsJob`: every input column
-/// `resolveRowArbitration` needs to build a transient `arbitration.Signals`
-/// and call `scoreBehaviors`/`selectSticky`/`resolveGoal`, plus the resolved
 /// output column and `ai_agent_hot` (arbitration's mutable hot-column
 /// write-back target). See `buildAiJobContext`.
 const AiJobContext = struct {
@@ -1127,6 +1131,7 @@ const AiJobContext = struct {
     memory_ring: []const [ai_memory_ring_capacity]RowMemoryRingSlot,
     drives: []const RowDrives,
     focus: []const RowFocus,
+    interest: []const RowInterest,
     sep_x: []const f32,
     sep_y: []const f32,
     cohere: []const RowCohere,
@@ -1143,17 +1148,21 @@ const AiJobContext = struct {
     wander_step: u32,
     nav_request_kind: PathRequestKind,
     range_base: usize,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 /// Runs arbitration for one row: builds a transient `arbitration.Signals`
 /// from this row's gathered columns (never stored — discarded immediately
 /// after the three calls below), scores behaviors, sticky-selects one, then
-/// resolves a concrete goal. Persists the raw selection to `ai_agent_hot`
-/// (the agent's actual cognitive pick, independent of goal-resolution
-/// success) and writes the row's steering-facing output column: a selected
+/// resolves a concrete goal. Writes the row's steering-facing output column
+/// and persists the *locomotion* behavior to `ai_agent_hot`: a selected
 /// behavior with no resolvable goal this step (e.g. a one-frame perception
-/// gap) degrades to a pure-wander fallback (zero gain) rather than freezing
-/// or chasing a stale goal.
+/// gap) degrades to pure wander (zero gain) for both steering and the hot
+/// `active_behavior` column so affect fatigue does not treat an unresolvable
+/// pursue/flee as exertion. Sticky commitment still records the selection's
+/// countdown when the goal is valid; on invalid goals commitment is cleared
+/// so sticky does not hold an unresolvable pursue/flee across steps.
 fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const threat = job.threat[i];
     const stimulus = job.stimulus[i];
@@ -1161,6 +1170,7 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const ring = job.memory_ring[i];
     const drives = job.drives[i];
     const focus = job.focus[i];
+    const interest = job.interest[i];
     const cohere = job.cohere[i];
     const gains_col = job.gains[i];
     const sticky = job.sticky[i];
@@ -1188,6 +1198,9 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
         .heard_stimulus = stimulus.heard_stimulus,
         .heard_stimulus_x = stimulus.heard_stimulus_x,
         .heard_stimulus_y = stimulus.heard_stimulus_y,
+        .interest_present = interest.present,
+        .interest_x = interest.x,
+        .interest_y = interest.y,
         .memory_last_known_target = memory.last_known_target,
         .memory_last_known_x = memory.last_known_x,
         .memory_last_known_y = memory.last_known_y,
@@ -1227,9 +1240,6 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const goal = arbitration.resolveGoal(selected_behavior, signals);
 
     const agent_index = sticky.agent_dense_index;
-    job.ai_agent_hot.active_behavior[agent_index] = selected_behavior;
-    job.ai_agent_hot.commitment_remaining[agent_index] = selection.new_commitment;
-    job.ai_agent_hot.last_score[agent_index] = scores[selection.index];
 
     if (goal.valid) {
         const resolved_gain: f32 = switch (selected_behavior) {
@@ -1239,6 +1249,9 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
             .investigate => gains_col.investigate,
             .cohere => gains_col.cohere,
         };
+        job.ai_agent_hot.active_behavior[agent_index] = selected_behavior;
+        job.ai_agent_hot.commitment_remaining[agent_index] = selection.new_commitment;
+        job.ai_agent_hot.last_score[agent_index] = scores[selection.index];
         job.resolved[i] = .{
             .behavior = selected_behavior,
             .gain = resolved_gain,
@@ -1248,6 +1261,12 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
             .goal_entity = goal.goal_entity,
         };
     } else {
+        // Locomotion degrades to wander: write that for affect fatigue and sticky
+        // prev_behavior, and clear commitment so an unresolvable pursue/flee is
+        // not held as the active exertion mode.
+        job.ai_agent_hot.active_behavior[agent_index] = .wander;
+        job.ai_agent_hot.commitment_remaining[agent_index] = 0;
+        job.ai_agent_hot.last_score[agent_index] = scores[@intFromEnum(AiBehavior.wander)];
         job.resolved[i] = .{
             .behavior = .wander,
             .gain = 0,
@@ -1261,6 +1280,10 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
 
 fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *AiJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig).
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.entities.len);
     var writer = job.navigation_intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |i| {
         resolveRowArbitration(job, i);
@@ -1278,9 +1301,9 @@ fn writeAiIntentsJob(context: *anyopaque, range: ParallelRange, _: WorkerId) voi
             job.entities[i].index,
             job.wander_step,
         );
-        const sep_x = if (i < job.sep_x.len) job.sep_x[i] else 0;
-        const sep_y = if (i < job.sep_y.len) job.sep_y[i] else 0;
-        const dir = applySeparationAndNormalize(base_dir, sep_x, sep_y);
+        std.debug.assert(i < job.sep_x.len);
+        std.debug.assert(i < job.sep_y.len);
+        const dir = applySeparationAndNormalize(base_dir, job.sep_x[i], job.sep_y[i]);
 
         writer.write(.{
             .entity = job.entities[i],
@@ -1628,6 +1651,62 @@ test "ai processor appends navigation intents without clearing existing stream o
     try std.testing.expectEqual(entity.index, intents[1].entity.index);
 }
 
+test "ai production adaptive tuners use central gate and range alignment" {
+    var system = AiSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.separation_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.intent_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(ai_range_alignment_items, system.separation_tuner.config.initial_range_items);
+    try std.testing.expectEqual(ai_range_alignment_items, system.intent_tuner.config.smallest_range_items);
+}
+
+test "ai adaptive gate keeps demo-scale batches inline" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 8,
+        .items_per_range = 1,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent_count: usize = 64;
+    for (0..agent_count) |i| {
+        const x: f32 = @floatFromInt(i);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x, .y = 0 },
+            .previous_position = .{ .x = x, .y = 0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = 10 });
+    }
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 0, agent_count, 0, 0, 0);
+
+    const warmup_windows = ai_sys.intent_tuner.report().sample_window * 4;
+    var last_stats: AiStats = .{};
+    var window: usize = 0;
+    while (window < warmup_windows) : (window += 1) {
+        frame.beginStep();
+        last_stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, .{ .intent_seed = 1 });
+    }
+
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, ai_sys.intent_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(@as(usize, 0), last_stats.separation_batch.active_worker_threads);
+    try std.testing.expectEqual(@as(usize, 0), last_stats.intent_batch.active_worker_threads);
+}
+
 test "ai processor uses committed adaptive threaded profiles with default thread worker config" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -1844,6 +1923,79 @@ test "ai processor no steady-state allocation (FailingAllocator)" {
     frame.phase = .finished;
 }
 
+test "ai threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..64) |i| {
+        const x: f32 = @floatFromInt(i % 8);
+        const y: f32 = @floatFromInt(i / 8);
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{
+            .position = .{ .x = x * 12.0, .y = y * 12.0 },
+            .previous_position = .{ .x = x * 12.0, .y = y * 12.0 },
+            .velocity = .{},
+            .speed = 20,
+        });
+        try data.setAiAgent(entity, .{
+            .active_behavior = if (i % 2 == 0) .pursue else .wander,
+            .wander_amplitude = 4,
+            .gain_pursue = 0.5,
+        });
+    }
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = ai_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(8, 0, 64, 0, 0, 0);
+
+    const cfg: AiConfig = .{
+        .items_per_range = ai_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .intent_seed = 0xabcd,
+        .focus_target = .{ .x = 100, .y = 100 },
+    };
+
+    // Warm multi-worker path (must not be the inline fallback).
+    frame.beginStep();
+    const warmup = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
+    try std.testing.expect(!warmup.intent_batch.ran_inline);
+    try std.testing.expect(warmup.intent_batch.active_worker_threads > 0);
+    frame.phase = .finished;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_ai = ai_sys.allocator;
+    const original_frame = frame.allocator;
+    const original_nav = frame.navigation_intents.allocator;
+    ai_sys.allocator = failing.allocator();
+    frame.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    defer {
+        ai_sys.allocator = original_ai;
+        frame.allocator = original_frame;
+        frame.navigation_intents.allocator = original_nav;
+    }
+
+    frame.beginStep();
+    const stats = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
+    try std.testing.expect(!stats.intent_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 64), frame.navigation_intents.mergedItems().len);
+    frame.phase = .finished;
+}
+
 test "ai sparse high entity index does not allocate during warmed gather" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1962,6 +2114,230 @@ test "ai memory-retargeted seek has no steady-state allocation after warmup (Fai
     try std.testing.expectEqual(@as(f32, 1), intents[0].direct_direction_y);
 }
 
+test "ai investigate targets world interest marker without entity goal" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const marker_x: f32 = 200;
+    const marker_y: f32 = 50;
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{
+        .kind = .investigate,
+        .level = 0,
+        .x = marker_x,
+        .y = marker_y,
+        .radius = 256,
+    });
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setWorldLevel(entity, 0);
+    try data.setAiAgent(entity, .{
+        .active_behavior = .investigate,
+        .wander_amplitude = 0,
+        .gain_investigate = 2.0,
+        .gain_wander = 0,
+    });
+    try data.setAiAffect(entity, .{ .curiosity = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 0x41,
+        .affect_slice = data.aiAffectSliceConst(),
+        .interest_markers = &markers,
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    frame.phase = .finished;
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectApproxEqAbs(marker_x, intents[0].goal.x, 1e-3);
+    try std.testing.expectApproxEqAbs(marker_y, intents[0].goal.y, 1e-3);
+    try std.testing.expect(intents[0].direct_direction_x > 0);
+}
+
+test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    // In range of interest_marker_query_radius (400) for an agent at the origin.
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 200, .y = 50, .radius = 256 });
+
+    // Same position and marker; only gain_investigate differs. The zero-gain row
+    // must leave interest absent (gate skips the scan); the positive-gain row must
+    // find the very same in-range marker, proving range is not what suppresses it.
+    const zero_gain = try data.createEntity();
+    try data.setMovementBody(zero_gain, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(zero_gain, 0);
+    try data.setAiAgent(zero_gain, .{ .active_behavior = .wander, .gain_investigate = 0, .gain_wander = 1 });
+
+    const positive_gain = try data.createEntity();
+    try data.setMovementBody(positive_gain, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setWorldLevel(positive_gain, 0);
+    try data.setAiAgent(positive_gain, .{ .active_behavior = .investigate, .gain_investigate = 2.0, .gain_wander = 0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, &markers);
+
+    const rows = ai_sys.rows.slice();
+    const entities = rows.items(.entity);
+    const interest = rows.items(.interest);
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    for (entities, interest) |ent, marker| {
+        if (ent.index == zero_gain.index) {
+            try std.testing.expect(!marker.present);
+        } else {
+            try std.testing.expect(marker.present);
+            try std.testing.expectApproxEqAbs(@as(f32, 200), marker.x, 1e-3);
+        }
+    }
+}
+
+test "ai investigate ignores cover resource and patrol markers for goals" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{ .kind = .cover, .level = 0, .x = 200, .y = 50, .radius = 256 });
+    _ = try markers.addMarker(.{ .kind = .resource, .level = 0, .x = 210, .y = 50, .radius = 256 });
+    _ = try markers.addMarker(.{ .kind = .patrol, .level = 0, .x = 220, .y = 50, .radius = 256 });
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setWorldLevel(entity, 0);
+    try data.setAiAgent(entity, .{
+        .active_behavior = .investigate,
+        .wander_amplitude = 0,
+        .gain_investigate = 2.0,
+        .gain_wander = 0,
+    });
+    try data.setAiAffect(entity, .{ .curiosity = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 0x41,
+        .affect_slice = data.aiAffectSliceConst(),
+        .interest_markers = &markers,
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expect(intents[0].goal.x != 200);
+    try std.testing.expect(intents[0].goal.x != 210);
+    try std.testing.expect(intents[0].goal.x != 220);
+}
+
+test "ai null interest_markers leaves investigate on stimulus and ring only" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Marker store is intentionally NOT passed — prior stimulus/ring path only.
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{
+        .kind = .investigate,
+        .level = 0,
+        .x = 999,
+        .y = 999,
+        .radius = 256,
+    });
+
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 20,
+    });
+    try data.setWorldLevel(entity, 0);
+    try data.setAiAgent(entity, .{
+        .active_behavior = .investigate,
+        .wander_amplitude = 0,
+        .gain_investigate = 2.0,
+        .gain_wander = 0,
+    });
+    try data.setAiPerception(entity, .{
+        .heard_stimulus = true,
+        .heard_stimulus_x = 40,
+        .heard_stimulus_y = 0,
+    });
+    try data.setAiAffect(entity, .{ .curiosity = 1.0 });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    const cfg: AiConfig = .{
+        .intent_seed = 0x42,
+        .perception_slice = data.aiPerceptionSliceConst(),
+        .affect_slice = data.aiAffectSliceConst(),
+        .interest_markers = null,
+    };
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
+    frame.phase = .finished;
+
+    const intents = frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), intents.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 40), intents[0].goal.x, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), intents[0].goal.y, 1e-3);
+}
+
 test "ai processor only emits for ai-masked entities using prior positions" {
     // Covered by data_system mask tests + ai determinism/gather tests.
     try std.testing.expect(true);
@@ -2020,68 +2396,82 @@ test "ai gather direct table and separation blend produce correct order + dirs (
 
 test "ai serial and threaded (0 workers) produce identical intents with separation + seek_target" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
-    defer data.deinit();
+    // Two DataSystems: arbitration write-back mutates sticky columns, so serial
+    // and threaded must start from identical unmutated state (L2).
+    var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer threaded_data.deinit();
 
-    const e0 = try data.createEntity();
-    try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
-    try data.setAiAgent(e0, .{ .active_behavior = .pursue, .wander_amplitude = 2, .gain_pursue = 0.9 });
-    const e1 = try data.createEntity();
-    try data.setMovementBody(e1, .{ .position = .{ .x = 55, .y = 58 }, .previous_position = .{ .x = 55, .y = 58 }, .velocity = .{}, .speed = 35 });
-    try data.setAiAgent(e1, .{ .active_behavior = .wander, .wander_amplitude = 12, .gain_pursue = 0.4 });
+    inline for (.{ &serial_data, &threaded_data }) |data| {
+        const e0 = try data.createEntity();
+        try data.setMovementBody(e0, .{ .position = .{ .x = 50, .y = 60 }, .previous_position = .{ .x = 50, .y = 60 }, .velocity = .{}, .speed = 40 });
+        try data.setAiAgent(e0, .{ .active_behavior = .pursue, .wander_amplitude = 2, .gain_pursue = 0.9 });
+        const e1 = try data.createEntity();
+        try data.setMovementBody(e1, .{ .position = .{ .x = 55, .y = 58 }, .previous_position = .{ .x = 55, .y = 58 }, .velocity = .{}, .speed = 35 });
+        try data.setAiAgent(e1, .{ .active_behavior = .wander, .wander_amplitude = 12, .gain_pursue = 0.4 });
+    }
 
-    const ai_slice = data.aiAgentSliceConst();
-    const move_slice = data.movementBodySliceConst();
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
 
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.reserveStreams(1, 0, 3, 0, 0, 0);
-
-    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
-    defer spatial_sys.deinit();
-
-    frame.beginStep();
-    var ai_sys = AiSystem.init(std.testing.allocator);
-    defer ai_sys.deinit();
     const cfg: AiConfig = .{ .intent_seed = 0x1234abcd, .step = 7, .focus_target = .{ .x = 300, .y = 200 } };
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
-    const serial = frame.navigation_intents.mergedItems();
-    try std.testing.expectEqual(@as(usize, 2), serial.len);
-    frame.phase = .finished;
 
-    frame.beginStep();
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    serial_frame.beginStep();
+    var serial_ai = AiSystem.init(std.testing.allocator);
+    defer serial_ai.deinit();
+    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
+    const serial = serial_frame.navigation_intents.mergedItems();
+    try std.testing.expectEqual(@as(usize, 2), serial.len);
+
+    var threaded_frame = SimulationFrame.init(std.testing.allocator);
+    defer threaded_frame.deinit();
+    try threaded_frame.reserveStreams(1, 0, 3, 0, 0, 0);
+    threaded_frame.beginStep();
+    var threaded_ai = AiSystem.init(std.testing.allocator);
+    defer threaded_ai.deinit();
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    _ = try ai_sys.update(ai_slice, move_slice, spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
-    const thr = frame.navigation_intents.mergedItems();
+    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
+    const thr = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, thr.len);
     try std.testing.expectEqual(serial[0].direct_direction_x, thr[0].direct_direction_x);
     try std.testing.expectEqual(serial[0].direct_direction_y, thr[0].direct_direction_y);
     try std.testing.expectEqual(serial[1].direct_direction_x, thr[1].direct_direction_x);
     try std.testing.expectEqual(serial[1].direct_direction_y, thr[1].direct_direction_y);
-    frame.phase = .finished;
 }
 
 test "ai serial and real threaded workers produce identical navigation intents" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    for (0..128) |i| {
-        const x: f32 = @floatFromInt(i % 16);
-        const y: f32 = @floatFromInt(i / 16);
-        const entity = try data.createEntity();
-        try data.setMovementBody(entity, .{
-            .position = .{ .x = x * 9.0, .y = y * 7.0 },
-            .previous_position = .{ .x = x * 9.0, .y = y * 7.0 },
-            .velocity = .{},
-            .speed = 20,
-        });
-        try data.setAiAgent(entity, .{
-            .active_behavior = if (i % 2 == 0) .pursue else .wander,
-            .wander_amplitude = @floatFromInt(i % 13),
-            .gain_pursue = if (i % 2 == 0) 0.7 else 0.2,
-        });
+    // Two DataSystems: arbitration write-back mutates sticky columns, so serial
+    // and threaded must start from identical unmutated state (L2).
+    var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer threaded_data.deinit();
+    inline for (.{ &serial_data, &threaded_data }) |data| {
+        for (0..128) |i| {
+            const x: f32 = @floatFromInt(i % 16);
+            const y: f32 = @floatFromInt(i / 16);
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{
+                .position = .{ .x = x * 9.0, .y = y * 7.0 },
+                .previous_position = .{ .x = x * 9.0, .y = y * 7.0 },
+                .velocity = .{},
+                .speed = 20,
+            });
+            try data.setAiAgent(entity, .{
+                .active_behavior = if (i % 2 == 0) .pursue else .wander,
+                .wander_amplitude = @floatFromInt(i % 13),
+                .gain_pursue = if (i % 2 == 0) 0.7 else 0.2,
+            });
+        }
     }
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
@@ -2099,23 +2489,28 @@ test "ai serial and real threaded workers produce identical navigation intents" 
         .focus_target = .{ .x = 300, .y = 200 },
     };
 
-    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
-    defer spatial_sys.deinit();
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
 
-    var ai_sys = AiSystem.init(std.testing.allocator);
-    defer ai_sys.deinit();
+    var serial_ai = AiSystem.init(std.testing.allocator);
+    defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(8, 0, 128, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &serial_frame, 0.016, cfg);
+    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, cfg);
     const serial = serial_frame.navigation_intents.mergedItems();
 
+    var threaded_ai = AiSystem.init(std.testing.allocator);
+    defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
     try threaded_frame.reserveStreams(8, 0, 128, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &threaded_frame, &threads, 0.016, cfg);
+    const stats = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, cfg);
+    try std.testing.expect(!stats.intent_batch.ran_inline);
     const threaded = threaded_frame.navigation_intents.mergedItems();
 
     try std.testing.expectEqual(serial.len, threaded.len);
@@ -2252,7 +2647,7 @@ test "spatial index and AiSystem gather agree on row-index population order even
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, 4), ai_sys.rows.len);
 
     const ai_entities = ai_sys.rows.slice().items(.entity);
@@ -2325,14 +2720,14 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
     const pos_x = gathered.items(.pos_x);
     const pos_y = gathered.items(.pos_y);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view());
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1);
 
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i);
@@ -2418,7 +2813,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
 
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
-    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null);
+    try ai_sys.gatherAiData(ai_slice, movement_slice, &data, null, null, null, null, null, null, null);
     try std.testing.expectEqual(@as(usize, count), ai_sys.rows.len);
 
     const gathered = ai_sys.rows.slice();
@@ -2442,7 +2837,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
     try std.testing.expect(max_cell_x - min_cell_x >= 3);
     try std.testing.expect(max_cell_y - min_cell_y >= 3);
 
-    const context = buildAiSeparationContext(gathered, spatial_sys.view());
+    const context = buildAiSeparationContext(gathered, spatial_sys.view(), 1);
 
     // Fail loud if no agent ever accumulates >= 2 neighbors: with fewer than
     // two summed `dir` terms, float-summation order can't actually differ,
@@ -2689,53 +3084,60 @@ test "ai memory override does not apply while perception still reports the targe
 
 test "ai serial and threaded (0 workers) agree on a memory-overridden seek target" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
-    defer data.deinit();
+    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer threaded_data.deinit();
 
-    const remembered_target = try data.createEntity();
+    inline for (.{ &serial_data, &threaded_data }) |data| {
+        const remembered_target = try data.createEntity();
+        const e0 = try data.createEntity();
+        try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+        try data.setAiAgent(e0, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
+        try data.setAiPerception(e0, .{ .target_visible = false });
+        try data.setAiMemory(e0, .{
+            .last_known_target = remembered_target,
+            .last_known_x = 0,
+            .last_known_y = 100,
+            .staleness = 10,
+        });
+    }
 
-    const e0 = try data.createEntity();
-    try data.setMovementBody(e0, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
-    try data.setAiAgent(e0, .{ .active_behavior = .pursue, .wander_amplitude = 0, .gain_pursue = 1.0 });
-    try data.setAiPerception(e0, .{ .target_visible = false });
-    try data.setAiMemory(e0, .{
-        .last_known_target = remembered_target,
-        .last_known_x = 0,
-        .last_known_y = 100,
-        .staleness = 10,
-    });
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
 
-    const ai_slice = data.aiAgentSliceConst();
-    const move_slice = data.movementBodySliceConst();
-
-    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
-    defer spatial_sys.deinit();
-
-    const cfg: AiConfig = .{
-        .intent_seed = 1,
-        .focus_target = .{ .x = 100, .y = 0 },
-        .perception_slice = data.aiPerceptionSliceConst(),
-        .memory_slice = data.aiMemorySliceConst(),
-    };
-
-    var ai_sys = AiSystem.init(std.testing.allocator);
-    defer ai_sys.deinit();
-
+    var serial_ai = AiSystem.init(std.testing.allocator);
+    defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(1, 0, 2, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &serial_frame, 0.016, cfg);
+    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
+        .intent_seed = 1,
+        .focus_target = .{ .x = 100, .y = 0 },
+        .perception_slice = serial_data.aiPerceptionSliceConst(),
+        .memory_slice = serial_data.aiMemorySliceConst(),
+    });
     const serial = serial_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), serial.len);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
+    var threaded_ai = AiSystem.init(std.testing.allocator);
+    defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
     try threaded_frame.reserveStreams(1, 0, 2, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try ai_sys.update(ai_slice, move_slice, spatial_sys.view(), &data, &threaded_frame, &threads, 0.016, cfg);
+    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
+        .intent_seed = 1,
+        .focus_target = .{ .x = 100, .y = 0 },
+        .perception_slice = threaded_data.aiPerceptionSliceConst(),
+        .memory_slice = threaded_data.aiMemorySliceConst(),
+    });
     const threaded = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 1), threaded.len);
 
@@ -2836,67 +3238,120 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     try std.testing.expect(data.aiAgentConst(entity).?.active_behavior == .wander);
 }
 
-test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {
-    if (builtin.single_threaded) return error.SkipZigTest;
+test "invalid pursue goal writes wander active_behavior so fatigue does not treat it as exertion" {
     var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
     defer data.deinit();
 
-    for (0..12) |i| {
-        const x: f32 = @floatFromInt(i * 6);
-        const entity = try data.createEntity();
-        try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 30 });
-        try data.setFaction(entity, if (i % 2 == 0) .player else .hostile);
-        try data.setAiAgent(entity, .{
-            .active_behavior = .wander,
-            .wander_amplitude = @floatFromInt(i % 5),
-            .gain_wander = 1.0,
-            .gain_pursue = if (i % 3 == 0) 1.0 else 0,
-            .gain_flee = if (i % 3 == 1) 1.0 else 0,
-            .gain_cohere = if (i % 3 == 2) 1.0 else 0,
-        });
-        try data.setAiPerception(entity, .{
-            .target_visible = i % 4 == 0,
-            .nearest_threat = if (i % 4 == 0) (try data.createEntity()) else EntityId.invalid,
-            .last_seen_x = x + 20,
-            .last_seen_y = 5,
-        });
-        try data.setAiAffect(entity, .{
-            .fear = if (i % 3 == 1) 0.8 else 0,
-            .aggression = if (i % 3 == 0) 0.8 else 0,
-        });
-    }
+    // Sticky-held pursue with commitment remaining, but no visible threat, no
+    // fresh memory, no focus_target: resolveGoal is invalid and locomotion
+    // degrades to wander. active_behavior must become wander (not stay pursue)
+    // so affect's fatigue path does not keep accruing exertion.
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(entity, .{
+        .active_behavior = .pursue,
+        .commitment_remaining = 10,
+        .commitment_max_steps = 30,
+        .sticky_bonus = 0.2,
+        .wander_amplitude = 0,
+        .gain_pursue = 1.0,
+        .gain_wander = 0.1,
+    });
+    try data.setAiPerception(entity, .{ .target_visible = false });
 
     const ai_slice = data.aiAgentSliceConst();
     const move_slice = data.movementBodySliceConst();
     var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
     defer spatial_sys.deinit();
 
-    const cfg: AiConfig = .{
-        .intent_seed = 0x51de51de,
-        .step = 3,
-        .perception_slice = data.aiPerceptionSliceConst(),
-        .memory_slice = data.aiMemorySliceConst(),
-        .affect_slice = data.aiAffectSliceConst(),
-    };
-
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
 
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .perception_slice = data.aiPerceptionSliceConst(),
+    });
+
+    const agent = data.aiAgentConst(entity).?;
+    try std.testing.expect(agent.active_behavior == .wander);
+    try std.testing.expectEqual(@as(u16, 0), agent.commitment_remaining);
+}
+
+test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    // Two DataSystems: arbitration write-back mutates sticky columns (L2).
+    var serial_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer threaded_data.deinit();
+
+    inline for (.{ &serial_data, &threaded_data }) |data| {
+        for (0..12) |i| {
+            const x: f32 = @floatFromInt(i * 6);
+            const entity = try data.createEntity();
+            try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 30 });
+            try data.setFaction(entity, if (i % 2 == 0) .player else .hostile);
+            try data.setAiAgent(entity, .{
+                .active_behavior = .wander,
+                .wander_amplitude = @floatFromInt(i % 5),
+                .gain_wander = 1.0,
+                .gain_pursue = if (i % 3 == 0) 1.0 else 0,
+                .gain_flee = if (i % 3 == 1) 1.0 else 0,
+                .gain_cohere = if (i % 3 == 2) 1.0 else 0,
+            });
+            try data.setAiPerception(entity, .{
+                .target_visible = i % 4 == 0,
+                .nearest_threat = if (i % 4 == 0) (try data.createEntity()) else EntityId.invalid,
+                .last_seen_x = x + 20,
+                .last_seen_y = 5,
+            });
+            try data.setAiAffect(entity, .{
+                .fear = if (i % 3 == 1) 0.8 else 0,
+                .aggression = if (i % 3 == 0) 0.8 else 0,
+            });
+        }
+    }
+
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
+
+    var serial_ai = AiSystem.init(std.testing.allocator);
+    defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
     defer serial_frame.deinit();
     try serial_frame.reserveStreams(4, 0, 12, 0, 0, 0);
     serial_frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &serial_frame, 0.016, cfg);
+    _ = try serial_ai.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), serial_spatial.view(), &serial_data, &serial_frame, 0.016, .{
+        .intent_seed = 0x51de51de,
+        .step = 3,
+        .perception_slice = serial_data.aiPerceptionSliceConst(),
+        .memory_slice = serial_data.aiMemorySliceConst(),
+        .affect_slice = serial_data.aiAffectSliceConst(),
+    });
     const serial = serial_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 12), serial.len);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
+    var threaded_ai = AiSystem.init(std.testing.allocator);
+    defer threaded_ai.deinit();
     var threaded_frame = SimulationFrame.init(std.testing.allocator);
     defer threaded_frame.deinit();
     try threaded_frame.reserveStreams(4, 0, 12, 0, 0, 0);
     threaded_frame.beginStep();
-    _ = try ai_sys.update(ai_slice, move_slice, spatial_sys.view(), &data, &threaded_frame, &threads, 0.016, cfg);
+    _ = try threaded_ai.update(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), threaded_spatial.view(), &threaded_data, &threaded_frame, &threads, 0.016, .{
+        .intent_seed = 0x51de51de,
+        .step = 3,
+        .perception_slice = threaded_data.aiPerceptionSliceConst(),
+        .memory_slice = threaded_data.aiMemorySliceConst(),
+        .affect_slice = threaded_data.aiAffectSliceConst(),
+    });
     const threaded = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, threaded.len);
 

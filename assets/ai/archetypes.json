@@ -1,0 +1,70 @@
+{
+  "archetypes": [
+    {
+      "id": "wanderer",
+      "faction": "hostile",
+      "agent": { "active_behavior": "wander", "wander_amplitude": 58 }
+    },
+    {
+      "id": "pursuer",
+      "faction": "hostile",
+      "agent": { "active_behavior": "pursue", "wander_amplitude": 4, "gain_pursue": 1.2 }
+    },
+    {
+      "id": "inert",
+      "faction": "hostile"
+    },
+    {
+      "id": "timid",
+      "faction": "ally",
+      "agent": {
+        "active_behavior": "wander",
+        "wander_amplitude": 20,
+        "gain_flee": 2.0,
+        "commitment_max_steps": 24,
+        "sticky_bonus": 0.15
+      },
+      "perception": {},
+      "memory": {},
+      "affect": { "baseline_fear": 0.65 }
+    },
+    {
+      "id": "aggressive",
+      "faction": "hostile",
+      "agent": {
+        "active_behavior": "pursue",
+        "wander_amplitude": 6,
+        "gain_pursue": 2.0,
+        "commitment_max_steps": 30,
+        "sticky_bonus": 0.12
+      },
+      "perception": {},
+      "memory": {},
+      "affect": { "baseline_aggression": 0.65 }
+    },
+    {
+      "id": "curious",
+      "faction": "hostile",
+      "agent": {
+        "active_behavior": "wander",
+        "wander_amplitude": 15,
+        "gain_investigate": 2.0,
+        "commitment_max_steps": 20,
+        "sticky_bonus": 0.1
+      },
+      "perception": {},
+      "memory": {},
+      "affect": { "baseline_curiosity": 0.65 }
+    },
+    {
+      "id": "cohesive",
+      "faction": "hostile",
+      "agent": { "active_behavior": "wander", "wander_amplitude": 10, "gain_cohere": 2.0 }
+    },
+    {
+      "id": "pursuer_strong",
+      "faction": "hostile",
+      "agent": { "active_behavior": "pursue", "wander_amplitude": 7, "gain_pursue": 1.55 }
+    }
+  ]
+}

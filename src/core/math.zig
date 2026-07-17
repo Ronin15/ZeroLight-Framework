@@ -154,6 +154,13 @@ pub fn rotate2D(v: Vec2, angle: SinCos) Vec2 {
     };
 }
 
+/// Angle (radians, `[-pi, pi]`) of the vector `(x, y)` measured from +x. The
+/// single project chokepoint for direction -> angle conversion (e.g. baking a
+/// facing vector into a `Sprite.rotation`), so callers never inline the trig.
+pub fn atan2(y: f32, x: f32) f32 {
+    return std.math.atan2(y, x);
+}
+
 test "aabbFromOffsetSize derives min/max corners from origin, offset, and size" {
     const rect = aabbFromOffsetSize(.{ .x = 10, .y = 20 }, .{ .x = 1, .y = 2 }, .{ .x = 8, .y = 4 });
     try std.testing.expectEqual(@as(f32, 11), rect.min_x);
@@ -261,6 +268,21 @@ test "normalizeOrZeroFinite zeroes non-finite inputs" {
     try std.testing.expectEqual(@as(f32, 0), infinite.y);
 }
 
+test "SIMD normalize shares the unguarded scalar's non-finite propagation" {
+    const simd = @import("simd.zig");
+    const epsilon: f32 = 1.0e-3;
+    // The SIMD kernel matches math.normalizeOrZero (unguarded), NOT
+    // normalizeOrZeroFinite: a non-finite INPUT propagates to NaN in both
+    // (x=inf,y=0 -> inf*rsqrt(inf) = inf*0 = NaN, kept by the positive mask).
+    // Only the *Finite variants sanitize inf/NaN; this pins the shared semantics
+    // so the kernel's contract isn't mistaken for the guarded one.
+    const inf = std.math.inf(f32);
+    const scalar = normalizeOrZero(.{ .x = inf, .y = 0 }, epsilon);
+    const vector = simd.normalizeOrZero2Float4(simd.splatFloat4(inf), simd.splatFloat4(0), epsilon);
+    try std.testing.expect(std.math.isNan(scalar.x));
+    try std.testing.expect(std.math.isNan(vector.x[0]));
+}
+
 test "normalizeOrDefaultFinite falls back on degenerate inputs" {
     const default = Vec2{ .x = 1, .y = 0 };
     const normalized = normalizeOrDefaultFinite(3, 4, 1.0e-4, default);
@@ -296,6 +318,15 @@ test "rotate2D rotates points by a precomputed sin/cos pair" {
         rotate2D(point, angle).y,
         1.0e-6,
     );
+}
+
+test "atan2 recovers the angle sinCos rotated a +x unit vector by" {
+    for ([_]f32{ 0, 0.5, 1.2, -0.8, std.math.pi / 2.0, -std.math.pi / 2.0 }) |angle| {
+        const dir = rotate2D(.{ .x = 1, .y = 0 }, sinCos(angle));
+        try std.testing.expectApproxEqAbs(angle, atan2(dir.y, dir.x), 1.0e-6);
+    }
+    try std.testing.expectApproxEqAbs(std.math.pi / 2.0, atan2(1, 0), 1.0e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), atan2(0, 1), 1.0e-6);
 }
 
 test "clampMinMax matches SIMD clamp and tolerates NaN" {

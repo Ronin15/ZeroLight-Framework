@@ -41,6 +41,7 @@ const ActiveRegion = @import("simulation_scope.zig").ActiveRegion;
 const ChunkCoord = @import("simulation_scope.zig").ChunkCoord;
 const render_depth = @import("render_depth.zig");
 const WorldDepth = render_depth.WorldDepth;
+const world_interest = @import("world_interest.zig");
 
 pub const TileId = u16;
 pub const invalid_tile_id: TileId = std.math.maxInt(TileId);
@@ -403,6 +404,8 @@ pub const WorldSystem = struct {
     max_dense_tile_gpu_bytes: usize = 0,
     dense_bands_per_level: std.ArrayList(u8) = .empty,
 
+    interest_markers: world_interest.InterestMarkerStore = .{},
+
     pub fn initDemo(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
@@ -607,7 +610,12 @@ pub const WorldSystem = struct {
         if (self.owned_tileset_meta) |*meta| meta.deinit();
         self.owned_tileset_meta = null;
         self.tileset_meta = null;
+        self.interest_markers.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn addInterestMarker(self: *WorldSystem, spec: world_interest.InterestMarker) !world_interest.InterestMarkerId {
+        return self.interest_markers.addMarker(spec);
     }
 
     /// Dynamic sprite-command budget the world contributes per frame. Dense tiles
@@ -651,13 +659,34 @@ pub const WorldSystem = struct {
     }
 
     pub fn visibleSparseTileCount(self: *const WorldSystem) usize {
+        // The count has no depth-ordering constraint (unlike submitVisibleSparseRange),
+        // so walk only the chunks inside the cached visible window via the per-chunk
+        // sparse index instead of scanning the whole sparse set every visibility
+        // update. The result is identical: every sparse tile in a visible chunk that
+        // also passes the finer per-tile bounds test is counted exactly once.
+        const region = self.visibleChunkRegion() orelse return 0;
         const bounds = self.visibleTileBounds();
-        var visible_sparse_tiles: usize = 0;
-        const sparse_chunks = self.sparse_tiles.items(.chunk_index);
+        const chunks_x = self.chunksX();
+        const chunks_y = self.chunksY();
+        const min_cx: u16 = @intCast(@max(0, region.min.x));
+        const min_cy: u16 = @intCast(@max(0, region.min.y));
+        const max_cx_exclusive: u16 = @intCast(@min(@as(i32, chunks_x), region.max_exclusive.x));
+        const max_cy_exclusive: u16 = @intCast(@min(@as(i32, chunks_y), region.max_exclusive.y));
         const sparse_cells = self.sparse_tiles.items(.cell_index);
-        for (sparse_chunks, sparse_cells) |chunk_index, cell| {
-            if (self.isSparseChunkVisible(chunk_index) and self.cellInVisibleBounds(cell, bounds)) {
-                visible_sparse_tiles += 1;
+        var visible_sparse_tiles: usize = 0;
+        var level: u16 = 0;
+        while (level < self.level_base_z.items.len) : (level += 1) {
+            var cy = min_cy;
+            while (cy < max_cy_exclusive) : (cy += 1) {
+                var cx = min_cx;
+                while (cx < max_cx_exclusive) : (cx += 1) {
+                    const local_chunk_index = @as(u32, cy) * @as(u32, chunks_x) + @as(u32, cx);
+                    for (self.sparseTileIndicesForChunk(level, local_chunk_index)) |sparse_index| {
+                        if (self.cellInVisibleBounds(sparse_cells[sparse_index], bounds)) {
+                            visible_sparse_tiles += 1;
+                        }
+                    }
+                }
             }
         }
         return visible_sparse_tiles;
@@ -1135,6 +1164,10 @@ pub const WorldSystem = struct {
     /// source of truth), queues one GPU cell edit once the combined buffer exists,
     /// and returns the compact change event. Tile-id validity is the caller's
     /// concern, so an empty (`invalid_tile_id`) write is allowed here.
+    ///
+    /// When the GPU buffer exists, edit-queue capacity is reserved *before* any
+    /// CPU tile mutation so an OOM leaves `dense_tile_ids`, `uniform_fill_tile`,
+    /// and the edit queue unchanged and retryable.
     fn writeDenseTileCell(self: *WorldSystem, layer_index: usize, x: u16, y: u16, tile_id: TileId) !?WorldTileChangedEvent {
         if (layer_index >= self.dense_layers.len) return error.InvalidWorldLayer;
         if (x >= self.width or y >= self.height) return error.InvalidWorldCell;
@@ -1143,15 +1176,18 @@ pub const WorldSystem = struct {
         if (old_tile_id == tile_id) return null;
         const old_blocks_movement = self.flagsFor(old_tile_id).blocks_movement;
         const new_blocks_movement = self.flagsFor(tile_id).blocks_movement;
-        self.dense_layers.items(.uniform_fill_tile)[layer_index] = null;
-        self.dense_tile_ids.items[tile_index] = tile_id;
         // Queue the GPU cell update once the combined buffer exists. Before it is
         // built, the initial full upload captures the tile, so no edit is needed.
         // element_index is the global flat offset (matches this buffer's layout),
         // not a per-layer-local index.
         const buffer = self.denseTileDataBuffer();
         if (buffer != .invalid) {
-            try self.dense_tile_edits.append(self.allocator, .{
+            try self.dense_tile_edits.ensureTotalCapacity(self.allocator, self.dense_tile_edits.items.len + 1);
+        }
+        self.dense_layers.items(.uniform_fill_tile)[layer_index] = null;
+        self.dense_tile_ids.items[tile_index] = tile_id;
+        if (buffer != .invalid) {
+            self.dense_tile_edits.appendAssumeCapacity(.{
                 .buffer = buffer,
                 .element_index = tile_index,
                 .value = tile_id,
@@ -1392,9 +1428,32 @@ pub const WorldSystem = struct {
         return false;
     }
 
+    /// Reserves room for `additional` more level links without committing any.
+    /// Call before a world mutate that must pair with `addLevelLink` so an OOM
+    /// cannot leave a ramp tile without its link.
+    pub fn ensureLevelLinkCapacity(self: *WorldSystem, additional: usize) !void {
+        if (additional == 0) return;
+        try self.level_links.ensureTotalCapacity(self.allocator, self.level_links.items.len + additional);
+    }
+
+    /// Reserves room for `additional` GPU dense-tile edits when the combined
+    /// tile-data buffer exists. No-op when the buffer is not built yet (full
+    /// upload captures tiles; no edit queue). Use before a multi-mutate stage
+    /// (e.g. batched plane-traversal falls) so a mid-stage edit-queue OOM cannot
+    /// leave earlier carves without a matching post-commit publish.
+    pub fn ensureDenseTileEditCapacity(self: *WorldSystem, additional: usize) !void {
+        if (additional == 0) return;
+        if (self.denseTileDataBuffer() == .invalid) return;
+        try self.dense_tile_edits.ensureTotalCapacity(
+            self.allocator,
+            self.dense_tile_edits.items.len + additional,
+        );
+    }
+
     // Appends a persistent inter-level link. Validates both level indices and
     // that both cells lie inside the tile grid before storing. Explicit error
-    // set; allocation is bounded to the single append.
+    // set; allocation is bounded to the single append. Prefer
+    // `ensureLevelLinkCapacity` before any paired tile mutate.
     pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
         try self.validateLevelIndex(link.level_a);
         try self.validateLevelIndex(link.level_b);
@@ -1452,8 +1511,8 @@ pub const WorldSystem = struct {
     }
 
     /// Canonical world-space float position → chunk coordinate, clamped to world
-    /// bounds. The movement processor folds an inline copy of this formula in its
-    /// integration pass (`writeChunkRow`), kept in parity by the scoped-movement test.
+    /// bounds. The scope chunk-derivation pass (`SimulationScopeSystem.deriveChunks`)
+    /// mirrors this formula over the movement-body range each step.
     pub fn chunkCoordForWorldPos(self: *const WorldSystem, world_x: f32, world_y: f32) ChunkCoord {
         const tx: u16 = @intCast(math.worldPosToCell(world_x, self.tile_size, self.width));
         const ty: u16 = @intCast(math.worldPosToCell(world_y, self.tile_size, self.height));
@@ -1517,16 +1576,31 @@ pub const WorldSystem = struct {
     /// array (`uploadDenseTileDataBuffer`) and is not incrementally resumable,
     /// so a layer added after that build would compute a valid-looking
     /// `denseLayerOffset` whose cells the GPU buffer never actually contains.
+    ///
+    /// Band headroom is validated without committing, then `dense_layers` and
+    /// `dense_tile_ids` are reserved, and only then are the band counter and
+    /// layer row written. An OOM mid-call leaves band counters, layer lists,
+    /// and tile storage consistent and retryable.
     pub fn addDenseLayer(self: *WorldSystem, level_index: u16, base_z: i32, depth: WorldDepth, fill_tile: TileId) !usize {
         if (self.dense_tile_data_buffer != .invalid) return error.DenseLayerAddedAfterUpload;
         try self.validateLevelIndex(level_index);
         try self.validateTileId(fill_tile);
-        try self.trackDenseBandForLevel(level_index);
+
+        // Ensure the per-level band counter slot exists and check headroom without
+        // permanently incrementing: a later OOM on the layer/tile reserves must leave
+        // the band counters retryable and consistent with dense_layers.
+        try self.ensureDenseBandSlot(level_index);
+        const next_band = self.dense_bands_per_level.items[level_index] +% 1;
+        if (next_band == 0 or next_band > self.max_dense_bands_per_level) return error.DenseLayerWindowExceeded;
+
         const layer_index = self.dense_layers.len;
         const cell_count = self.cellCount();
         const tile_offset = self.dense_tile_ids.items.len;
         try self.dense_layers.ensureTotalCapacity(self.allocator, layer_index + 1);
         try self.dense_tile_ids.ensureTotalCapacity(self.allocator, tile_offset + cell_count);
+
+        // Commit: band count, layer row, and tile fill are all infallible from here.
+        self.dense_bands_per_level.items[level_index] = next_band;
         self.dense_layers.appendAssumeCapacity(.{
             .level_index = level_index,
             .base_z = base_z,
@@ -1917,15 +1991,15 @@ pub const WorldSystem = struct {
         ));
     }
 
-    fn trackDenseBandForLevel(self: *WorldSystem, level_index: u16) error{ DenseLayerWindowExceeded, OutOfMemory }!void {
+    /// Grows `dense_bands_per_level` so `level_index` is addressable, filling new
+    /// slots with zero. Does not increment any band counter — callers validate
+    /// headroom and commit the increment only after later reserves succeed.
+    fn ensureDenseBandSlot(self: *WorldSystem, level_index: u16) error{OutOfMemory}!void {
         const slot = @as(usize, level_index) + 1;
         try self.dense_bands_per_level.ensureTotalCapacity(self.allocator, slot);
         while (self.dense_bands_per_level.items.len < slot) {
             self.dense_bands_per_level.appendAssumeCapacity(0);
         }
-        const next = self.dense_bands_per_level.items[level_index] +% 1;
-        if (next == 0 or next > self.max_dense_bands_per_level) return error.DenseLayerWindowExceeded;
-        self.dense_bands_per_level.items[level_index] = next;
     }
 
     fn denseLayerIndexLessThan(self: *const WorldSystem, a: usize, b: usize) bool {
@@ -2023,6 +2097,14 @@ pub const WorldSystem = struct {
 fn buildProceduralChunk(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const build: *ProceduralBuildContext = @ptrCast(@alignCast(context));
     const chunks_x = ceilDiv(build.width, build.chunk_size_tiles);
+    const chunks_y = ceilDiv(build.height, build.chunk_size_tiles);
+    // Threaded worldgen write-range hardening (mirrors movement/collision/perception
+    // workers): the dispatched range indexes chunks, and this worker writes each
+    // chunk's cells at `y * width + x` (y < height, x < width), so its maximum write
+    // index is bounded by `width * height`, which must fit the shared tile buffer.
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= @as(usize, chunks_x) * @as(usize, chunks_y));
+    std.debug.assert(@as(usize, build.width) * @as(usize, build.height) <= build.tiles.len);
     for (range.start..range.end) |chunk_index| {
         const chunk_x: u16 = @intCast(chunk_index % chunks_x);
         const chunk_y: u16 = @intCast(chunk_index / chunks_x);
@@ -2140,6 +2222,25 @@ fn testWorldMeta() !WorldTilesetMeta {
     return try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
 }
 
+/// Minimal grass-filled surface world (one dense floor layer, one chunk when
+/// `chunk_size_tiles >= max(width,height)`). Prefer this over `initDemoFromMeta`
+/// in unit tests that only need levels/dense layers, not demo terrain paint.
+fn testMinimalSurfaceWorld(meta: *const WorldTilesetMeta, width: u16, height: u16) !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = width,
+        .height = height,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = @max(width, height),
+    };
+    errdefer world.deinit();
+    try world.buildCatalog(meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(meta, "grass");
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    return world;
+}
+
 fn containsDepth(depths: []const i32, value: i32) bool {
     for (depths) |depth| {
         if (depth == value) return true;
@@ -2217,12 +2318,11 @@ test "world render depth index orders sparse tiles by depth then insertion" {
 test "world render depth index refreshes after runtime sparse insert" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
-
-    // Construction leaves the index current.
-    try std.testing.expect(!world.render_index_dirty);
+    // Surface construction dirties the index; rebuild so the test starts clean.
     try world.ensureRenderDepthIndex();
+    try std.testing.expect(!world.render_index_dirty);
 
     const tree = try world.requireTileByName(&meta, "tree_0");
     const new_depth = world.worldZForLevel(0, 0, .effect);
@@ -2320,10 +2420,103 @@ test "setDenseTile queues a GPU cell edit only once the combined buffer exists" 
     try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
 }
 
+test "ensureDenseTileEditCapacity reserves multi-edit budget before batch carves (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(level, 0, .floor, grass);
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    // Preflight N edits, then N setDenseTile calls must stay allocation-free.
+    try world.ensureDenseTileEditCapacity(3);
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+        _ = try world.setDenseTile(layer, 0, 0, water);
+        _ = try world.setDenseTile(layer, 1, 0, water);
+        _ = try world.setDenseTile(layer, 2, 0, water);
+        try std.testing.expectEqual(@as(usize, 3), world.dense_tile_edits.items.len);
+        try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    }
+
+    // No-op when the GPU buffer is not built (full upload path) — capacity may
+    // still be retained from earlier warms; items stay empty after clear.
+    world.dense_tile_data_buffer = .invalid;
+    world.dense_tile_edits.clearRetainingCapacity();
+    const cap_before = world.dense_tile_edits.capacity;
+    try world.ensureDenseTileEditCapacity(8);
+    try std.testing.expectEqual(cap_before, world.dense_tile_edits.capacity);
+    try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
+}
+
+test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(level, 0, .floor, grass);
+
+    // Simulate the combined storage buffer having been built so the edit-queue
+    // path is armed (uploadDenseTileDataBuffer needs a renderer, unavailable headless).
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    const tile_index = world.denseLayerOffset(layer) + world.cellIndex(1, 1);
+    const old_tile = world.dense_tile_ids.items[tile_index];
+    const old_uniform = world.dense_layers.items(.uniform_fill_tile)[layer];
+    const old_edit_len = world.dense_tile_edits.items.len;
+    try std.testing.expectEqual(grass, old_tile);
+    try std.testing.expectEqual(@as(?TileId, grass), old_uniform);
+    try std.testing.expectEqual(@as(usize, 0), old_edit_len);
+
+    {
+        // Block remap (resize_fail_index) as well as fresh alloc: ArrayList growth
+        // may succeed via remap without bumping fail_index's allocation count.
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.setDenseTile(layer, 1, 1, water));
+        // OOM must leave CPU tile storage, uniform-fill marker, and the edit queue
+        // exactly as they were — a partial mutate would desync GPU edits from truth.
+        try std.testing.expectEqual(old_tile, world.dense_tile_ids.items[tile_index]);
+        try std.testing.expectEqual(old_uniform, world.dense_layers.items(.uniform_fill_tile)[layer]);
+        try std.testing.expectEqual(old_edit_len, world.dense_tile_edits.items.len);
+    }
+
+    // Retry with a working allocator succeeds and is consistent.
+    const changed = (try world.setDenseTile(layer, 1, 1, water)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(water, changed.new_tile_id);
+    try std.testing.expectEqual(water, world.dense_tile_ids.items[tile_index]);
+    try std.testing.expectEqual(@as(?TileId, null), world.dense_layers.items(.uniform_fill_tile)[layer]);
+    try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
+}
+
 test "world rejects invalid tile ids before render" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 64, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 2, 2);
     defer world.deinit();
 
     const invalid = invalid_tile_id;
@@ -2335,7 +2528,7 @@ test "world rejects invalid tile ids before render" {
 test "world dense tile mutation returns compact change event" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 2, 2);
     defer world.deinit();
 
     const water = try world.requireTileByName(&meta, "water_1");
@@ -2352,7 +2545,7 @@ test "world dense tile mutation returns compact change event" {
 test "world sparse obstacle mutation returns obstacle event for blockers" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
 
     const tree = try world.requireTileByName(&meta, "tree_0");
@@ -2365,9 +2558,14 @@ test "world sparse obstacle mutation returns obstacle event for blockers" {
 }
 
 test "world chunks map cells by chunk size" {
-    var meta = try testWorldMeta();
-    defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    // Pure coord math: two chunks wide/tall is enough; no catalog or demo paint.
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 16,
+        .height = 16,
+        .tile_size = 32,
+        .chunk_size_tiles = default_chunk_size_tiles,
+    };
     defer world.deinit();
 
     const first = world.chunkCoordForCell(0, 0);
@@ -2463,12 +2661,14 @@ test "world dense and sparse rendering respects z levels and chunk level filteri
 test "visible tile count crops inside visible chunks" {
     var meta = try testWorldMeta();
     defer meta.deinit();
+    // 4×4 tiles, chunk_size=2 → 2×2 chunk grid; each full chunk is 4 cells.
+    const tile_size = meta.tileSize();
     var world = WorldSystem{
         .allocator = std.testing.allocator,
-        .width = 32,
-        .height = 32,
-        .tile_size = meta.tileSize(),
-        .chunk_size_tiles = 16,
+        .width = 4,
+        .height = 4,
+        .tile_size = tile_size,
+        .chunk_size_tiles = 2,
     };
     defer world.deinit();
     try world.buildCatalog(&meta);
@@ -2477,10 +2677,11 @@ test "visible tile count crops inside visible chunks" {
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.addDenseLayer(level, 0, .floor, grass);
 
-    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0);
+    const chunk_pixels = @as(f32, @floatFromInt(2)) * tile_size;
+    world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = chunk_pixels, .h = chunk_pixels }, 0);
     try std.testing.expectEqual(@as(usize, 4), world.visibleTileCount());
 
-    world.setVisibleChunksForWorldRect(.{ .x = 512, .y = 512, .w = 64, .h = 64 }, 0);
+    world.setVisibleChunksForWorldRect(.{ .x = chunk_pixels, .y = chunk_pixels, .w = chunk_pixels, .h = chunk_pixels }, 0);
     try std.testing.expectEqual(@as(usize, 4), world.visibleTileCount());
 }
 
@@ -2751,7 +2952,7 @@ test "levelBlocksMovement scopes sparse obstacles to their own level at the same
 test "addUndergroundLevelStack honors requested depth below an existing surface" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 16, 16);
+    var world = try testMinimalSurfaceWorld(&meta, 1, 1);
     defer world.deinit();
     try world.addUndergroundLevelStack(&meta, 10);
     try std.testing.expectEqual(@as(usize, 11), world.levelCount());
@@ -2761,7 +2962,7 @@ test "addUndergroundLevelStack honors requested depth below an existing surface"
 test "underground demo levels are solid dirt until a cell is dug walkable" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -2783,7 +2984,7 @@ test "underground demo levels are solid dirt until a cell is dug walkable" {
 test "dense layer submit order sorts back to front by render depth" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -2797,7 +2998,7 @@ test "dense layer submit order sorts back to front by render depth" {
 test "underground dense layers append in storage order not ascending render depth" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3112,7 +3313,7 @@ test "collectDenseSubmitLayers deep play follows player level not surface" {
 test "collectDenseSubmitLayers shifts with player level transitions" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3161,7 +3362,7 @@ test "collectDenseSubmitLayers includes every band on an in-window level" {
 test "denseWindowDepthSpan returns the submitted window's shallowest and deepest depth" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3186,7 +3387,7 @@ test "denseWindowDepthSpan returns null when nothing is in window" {
 test "denseWindowDepthSpan caches the span until dirty, level, or window changes" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3241,7 +3442,7 @@ test "denseWindowDepthSpan propagates TooManyDenseLayers instead of swallowing i
 test "partitionDenseCompositeBuckets returns a single bucket with no interleave depths in window" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3374,7 +3575,7 @@ test "partitionDenseCompositeBuckets produces one bucket per cut point at the pr
 test "buildWindowLayers reverses a bucket's deepest-first layers to topmost-first offsets" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 320, 320);
+    var world = try testMinimalSurfaceWorld(&meta, 4, 4);
     defer world.deinit();
     try world.addUndergroundLevels(&meta);
 
@@ -3397,7 +3598,7 @@ test "submitStaticDenseGeometry marks only the bucket holding the shallowest sub
     var meta = try testWorldMeta();
     defer meta.deinit();
 
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, 64, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 2, 2);
     defer world.deinit();
     const grass = try world.requireTileByName(&meta, "grass");
     const level1 = try world.addLevel(-level_z_step);
@@ -3470,10 +3671,84 @@ test "addDenseLayer rejects bands beyond configured per-level cap" {
     try std.testing.expectError(error.DenseLayerWindowExceeded, world.addDenseLayer(level, 0, .effect, grass));
 }
 
+test "addDenseLayer reserves capacities before committing band or layer (FailingAllocator)" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+        .max_dense_bands_per_level = 2,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+
+    // Case 1: first layer ever — fail on the first allocation so no band/layer/tile
+    // state is committed (band slot, dense_layers, or dense_tile_ids).
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addDenseLayer(level, 0, .floor, grass));
+        try std.testing.expectEqual(@as(usize, 0), world.dense_layers.len);
+        try std.testing.expectEqual(@as(usize, 0), world.dense_tile_ids.items.len);
+        // Band slot may have been zero-filled (capacity-only), but the counter must
+        // still read zero so a retry is not blocked by a phantom band.
+        if (world.dense_bands_per_level.items.len > level) {
+            try std.testing.expectEqual(@as(u8, 0), world.dense_bands_per_level.items[level]);
+        }
+    }
+
+    // Warm one real layer so the next case isolates growth of an already-tracked level.
+    _ = try world.addDenseLayer(level, 0, .floor, grass);
+    try std.testing.expectEqual(@as(usize, 1), world.dense_layers.len);
+    try std.testing.expectEqual(@as(u8, 1), world.dense_bands_per_level.items[level]);
+    const warmed_tile_len = world.dense_tile_ids.items.len;
+
+    // Tighten dense_tile_ids to exact len so the next layer's ensureTotalCapacity
+    // must allocate (ArrayList growth from the first layer may leave spare room
+    // that would make fail_index=0 a no-op). Precise capacity keeps the proof
+    // deterministic across allocator growth formulas.
+    {
+        const tight = try std.testing.allocator.alloc(TileId, warmed_tile_len);
+        defer std.testing.allocator.free(tight);
+        @memcpy(tight, world.dense_tile_ids.items);
+        world.dense_tile_ids.deinit(std.testing.allocator);
+        world.dense_tile_ids = .empty;
+        try world.dense_tile_ids.ensureTotalCapacityPrecise(std.testing.allocator, warmed_tile_len);
+        world.dense_tile_ids.appendSliceAssumeCapacity(tight);
+        try std.testing.expectEqual(warmed_tile_len, world.dense_tile_ids.capacity);
+    }
+
+    // Case 2: second band on the same level — OOM must not bump the band counter
+    // or append a half-built layer (old bug: trackDenseBandForLevel committed first).
+    {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        world.allocator = failing.allocator();
+        defer world.allocator = std.testing.allocator;
+
+        try std.testing.expectError(error.OutOfMemory, world.addDenseLayer(level, 0, .obstacle, grass));
+        try std.testing.expectEqual(@as(usize, 1), world.dense_layers.len);
+        try std.testing.expectEqual(@as(u8, 1), world.dense_bands_per_level.items[level]);
+        try std.testing.expectEqual(warmed_tile_len, world.dense_tile_ids.items.len);
+    }
+
+    // Retry is consistent and reaches the per-level cap cleanly.
+    _ = try world.addDenseLayer(level, 0, .obstacle, grass);
+    try std.testing.expectEqual(@as(usize, 2), world.dense_layers.len);
+    try std.testing.expectEqual(@as(u8, 2), world.dense_bands_per_level.items[level]);
+    try std.testing.expectEqual(warmed_tile_len * 2, world.dense_tile_ids.items.len);
+}
+
 test "addDenseLayer fails loud once the combined tile-data buffer already exists" {
     var meta = try testWorldMeta();
     defer meta.deinit();
-    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 64, 64);
+    var world = try testMinimalSurfaceWorld(&meta, 2, 2);
     defer world.deinit();
     const grass = try world.requireTileByName(&meta, "grass");
     const level = try world.addLevel(0);

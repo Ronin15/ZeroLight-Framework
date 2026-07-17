@@ -27,8 +27,11 @@ init/reserve/warmup, and treat performance-sensitive runtime behavior as correct
   unless the user explicitly asks or stdlib/SDL3 genuinely cannot solve the task (PNG
   loading uses core SDL3 — do not add SDL3_image unasked).
 - Follow `docs/coding-standards.md` for Zig style, imports, comments, tests, performance,
-  generated-output rules, and production-contract boundaries. Consult the owning doc when a
-  task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
+  generated-output rules, and production-contract boundaries. Idiomatic Zig naming: camelCase
+  functions/callables, snake_case variables/fields/non-type-constants/enum members, PascalCase
+  types — never camelCase a local, field, or enum tag (enum-tag casing is lint-enforced). Current stdlib spellings only: `std.ArrayList` (the 0.16 unmanaged
+  list, init `= .empty`), never the deprecated `std.ArrayListUnmanaged`. Consult the owning doc
+  when a task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
   `docs/simulation-tiers-and-pipeline.md`, `docs/rendering-assets-shaders.md`,
   `docs/atlas-asset-workflow.md`, `docs/development-workflow.md`,
   `docs/framework-implementation-slices.md`.
@@ -69,17 +72,43 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
    fallback sorter. Keep CPU render prep outside the acquired swapchain interval where
    practical.
 8. Pair SDL/GPU resource creation with cleanup close to the owning site; use `errdefer` for
-   partially initialized resources.
+   partially initialized resources. A function that takes ownership of an already-constructed
+   by-value resource registers its `errdefer <res>.deinit()` as the FIRST statement, before any
+   other fallible step — the caller built it inline and holds no cleanup handle, so an earlier
+   failure leaks it. After a step transfers ownership of an allocation (map `put`, list `append`,
+   lease-slot commit), disarm the earlier free-`errdefer` with a per-iteration bool
+   (`var put_done = false;` set right after the transfer) so exactly one path frees it. A
+   handle-owning setter that overwrites an owned slot asserts the slot empty (or closes the prior
+   handle first), never relying on caller ordering.
 9. Persist gameplay/render-prep data by stable asset IDs (`SpriteAssetId`, `AudioAssetId`),
    not string paths, live renderer/SDL/audio handles, or prepared draw records. Convert
    stable IDs to renderer texture IDs at the render-prep boundary, not in `DataSystem`.
    Keep asset paths relative and traversal-safe.
 10. Every `reserve`/`ensureTotalCapacity` + `assumeCapacity`/`addOneAssumeCapacity` pairing
-    ships a same-change `std.testing.FailingAllocator` proof test that the warmed path
-    allocates zero times — a comment or "allocation-free" claim is not proof (ReleaseFast
-    strips the assert backing `assumeCapacity`). For threaded writes, reserve on the main
-    thread before dispatch, sized from dispatch's own value, and assert each worker's
-    `worker_id`/`range.index` against the buffer length captured at dispatch.
+    ships a same-change `std.testing.FailingAllocator` proof that the warmed path allocates zero
+    times — a comment or "allocation-free" claim is not proof (ReleaseFast strips the assert
+    backing `assumeCapacity`). Prove the path that runs: exercise the real multi-worker
+    `ThreadSystem`, not only the serial slot-0 / inline branch (an undersized threaded reserve
+    fails as a shared-allocator data race, not a clean OOM). For threaded writes, reserve on the
+    main thread before dispatch, sized from dispatch's own value, and open each worker with
+    `std.debug.assert` bounding its write range against the buffer length AND `range.index`
+    against the dispatched range count. When an appendable pool must track a separately reserved
+    fixed-capacity dedup/probe table, gate the append on the shared logical cap, never an
+    `ArrayList`'s physical `.capacity` (`ensureTotalCapacity` rounds up, so the two desync), and
+    honor the probe's insert-bool. Widen signed coordinate/cell spans to `i64`/`usize` before
+    subtracting and `@intCast`-ing to unsigned, clamp while wide, then narrow — saturated
+    float→`i32` makes `@intCast(max - min + 1)` overflow UB. ReleaseFast makes a reached
+    `unreachable`/`catch unreachable`/`orelse unreachable` (incl. `.?`) undefined behavior, not a
+    panic — use only where impossibility is provable by construction (capacity-bounded
+    generational-handle constructors); otherwise return an error. A `.?` on an optional field in a
+    hot/worker loop is invisible to `idiom-lint` — capture it as a non-optional local at dispatch
+    or `assert(field != null)` at entry. `zig build idiom-lint` (part of `verify`) rejects a
+    `catch`/`orelse unreachable` outside a `test` block unless on a sanctioned handle constructor
+    or carrying `// lint:allow catch-unreachable: <reason>`; never annotate to silence a recoverable
+    failure — propagate it (`SpriteBatch.buildSerial` returns `!void` for this reason). When the
+    reserve and its `assumeCapacity` commit live in separate functions/entry points (not one guarded
+    helper), the proof must exercise the reserved-then-push SUCCESS branch — reserve, fail the next
+    allocation, assert the push completes — not just the reserve-fails cleanup branch.
 11. Per-query/per-frame work budgets (search node caps, solve ceilings) are fixed constants —
     never derived from world/map size, cell count, portal count, or other "current scale." A
     chronically insufficient budget gets graceful degradation (deferral / bounded retry) or an
@@ -89,6 +118,14 @@ expose only the small API the game layer needs. Game states never call SDL_GPU d
     log-free. Hot/frame-adjacent paths carry no logging in release — comptime-gate any such
     instrumentation to a zero-sized no-op (`runtime_perf_log.zig` pattern), never runtime-skip it.
 13. Add behavior-focused Zig tests when logic can be tested without opening a window.
+14. Advance edge/latch state only on the fallible operation's SUCCESS path
+    (`enqueue(...) catch return; latch = true;`), never after a swallowed error — a latch that
+    reads "active" while nothing was queued never re-triggers. A config field whose zero default
+    is also a valid domain value (e.g. `TileId` 0 is a real, blocking tile; the invalid sentinel
+    is `maxInt`) defaults to the domain's invalid sentinel and is assert-resolved at the use
+    boundary, so an unconfigured controller fails loudly instead of acting on 0. A boundary/config
+    validator bounds each scalar on BOTH ends where its siblings do; a present-but-wrong-typed
+    optional field is an error, not a treated-as-absent silent drop.
 
 ## ECS / Hot-Path Rules
 
@@ -97,7 +134,13 @@ per `docs/coding-standards.md` Dense SoA storage. Hot-path rules are mandatory: 
 `rows.slice()` once per stage/function and reuse the column slices — never call
 `rows.items(.field)` inside a loop (rebuilds pointers per call; measured large Debug/Release
 regressions). Hot per-row gather loops use the `addOneAssumeCapacity` + `set()` append helper
-(`appendMalRow` pattern), not `rows.appendAssumeCapacity(row)` per row.
+(`appendMalRow` pattern), not `rows.appendAssumeCapacity(row)` per row. A per-row render/collect
+helper takes already-built const column slices from its caller — never call
+`.slice()`/`.sliceConst()` inside the per-row helper: the rebuild hides behind the `pub`
+boundary (invisible to `idiom-lint`) and is dead work in ReleaseFast when it only feeds a
+bounds assert the release build strips. A per-row SoA store append uses a private
+`ensureCapacityForOne` + `appendAssumeCapacity`, never `ensureCapacity(n)` + plain `append`
+(which re-reserves internally — dead work and a pattern that diverges from the sibling stores).
 
 Adding or reordering a `SimulationPipeline` stage requires, in the same change: the
 `PipelineResource` tag(s) it reads/writes in `simulation_pipeline.zig`'s `stageContract()`,
@@ -118,7 +161,11 @@ transitions, SDL/GPU calls, asset loading, save/load, and renderer resource owne
 an explicit deferred/main-thread boundary, and use typed range-owned output buffers
 (count/prefix/contiguous-write/range-index merge/batch commit) over global per-command
 atomics or event buses. Keep a serial fallback; do not gate worker participation with static
-item-count floors. Do not turn the main thread into a dumping ground for scalable work.
+item-count floors. Do not turn the main thread into a dumping ground for scalable work. Drive a
+batched `RangeOutputStream`/`SimulationEvents` producer once per commit — reserve and write every
+range, then call `finishWrite` a single time; a record-per-item publish loop is O(N²) because
+`SimulationEvents.finishWrite` rebuilds stats over all ranges (and, unlike
+`RangeOutputStream.finishWrite`, survives ReleaseFast).
 
 **Never** add test-only enum tags, union variants, marker fields, fake stages, fixture
 payloads, or service shortcuts to production contracts. Tests use private helpers, local
@@ -151,7 +198,8 @@ preserve current behavior; never document deferred runtime behavior as complete.
 - `zig build check` — compile coverage of game, bench, and GPU-smoke executables (no install).
 - `zig build test` — unit behavior and reusable module coverage.
 - `zig build shaders` — after shader source or shader build-wiring changes.
-- `zig build verify` — before considering a larger slice complete (check + test + shaders + atlas lint).
+- `zig build verify` — before considering a larger slice complete (check + test + shaders + atlas + idiom lint).
+- `zig build idiom-lint` — after edits touching naming, stdlib containers, or `catch`/`orelse unreachable`; catches naming/currency drift and unsafe error-swallowing before `verify` does.
 - `zig build gpu-smoke` — only when display/GPU validation is relevant and a display exists.
 - `zig build fmt` — after editing Zig/build files.
 

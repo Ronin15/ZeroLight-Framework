@@ -79,8 +79,9 @@ const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const stance = @import("../faction.zig").stance;
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -99,11 +100,18 @@ const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
+const stimulusHearingScore = @import("../simulation.zig").stimulusHearingScore;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
 
 pub const perception_range_alignment_items: usize = movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const perception_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = 64,
+    .smallest_range_items = perception_range_alignment_items,
+};
 
 fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, perception_range_alignment_items);
@@ -482,7 +490,7 @@ pub const PerceptionSystem = struct {
     event_ranges: PerceptionEventRangeSlotList = .empty,
     range_stats: PerceptionRangeStatsSlotList = .empty,
     range_take_counts: std.ArrayList(usize) = .empty,
-    compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     // Per-level LOS-blocked bitmap cache, indexed directly by level (see
     // `LevelBlockedSlot`). Sized/reused across steps (never deinit between
     // steps) — only the per-level `blocked` bitmap contents are refreshed,
@@ -505,7 +513,7 @@ pub const PerceptionSystem = struct {
     pub fn init(allocator: std.mem.Allocator) PerceptionSystem {
         return .{
             .allocator = allocator,
-            .compute_tuner = AdaptiveWorkTuner.init(.{}),
+            .compute_tuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
         };
     }
 
@@ -1218,9 +1226,13 @@ const PerceptionJobContext = struct {
 
 fn writePerceptionRangeJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *PerceptionJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the observer buffer this job walks.
     // Guards the reserve-before-dispatch invariant: prepareEventRangeBuffers
     // must have sized event_ranges to at least this dispatch's range count.
     std.debug.assert(range.index < job.event_ranges.len);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.entities.len);
     computePerceptionRange(job, range);
 }
 
@@ -1534,12 +1546,20 @@ fn computeOneAgent(job: *PerceptionJobContext, i: usize, range_stats: *Perceptio
     var heard_stimulus = false;
     var heard_x: f32 = 0;
     var heard_y: f32 = 0;
+    // Soft ranking (Slice 39): max intensity / (1 + dist2 * k) among same-level
+    // stimuli inside the hard hearing range. Equal intensities reduce to nearest.
+    // Kind is not stored on perception columns — bus-only metadata.
+    var best_score = -std.math.inf(f32);
     var best_dist2 = std.math.inf(f32);
     for (job.stimuli) |stim| {
         if (stim.level != observer_level) continue;
+        if (stim.intensity <= 0) continue;
         const dist2 = math.lengthSquared(.{ .x = stim.position.x - ox, .y = stim.position.y - oy });
-        if (dist2 <= hearing_range_sq and dist2 < best_dist2) {
+        if (dist2 > hearing_range_sq) continue;
+        const score = stimulusHearingScore(stim.intensity, dist2);
+        if (score > best_score or (score == best_score and dist2 < best_dist2)) {
             heard_stimulus = true;
+            best_score = score;
             best_dist2 = dist2;
             heard_x = stim.position.x;
             heard_y = stim.position.y;
@@ -1613,13 +1633,7 @@ fn emitTransition(buffer: *PerceptionEventRangeBuffer, observer: EntityId, prev:
     }
 }
 
-const StageWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
+const StageWorkSelection = BatchSelection;
 
 // Mirrors ai.zig/spatial_index.zig/collision.zig's selectStageWork verbatim
 // (module-local adaptive-profile resolution), keyed by
@@ -1632,47 +1646,15 @@ fn selectStageWork(
     adaptive: bool,
     adaptive_tuner: ?*AdaptiveWorkTuner,
 ) StageWorkSelection {
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
-    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
-        adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = perception_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), perception_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+    // Shapes work through the single tuner-owned entry point so pre-sizing and
+    // dispatch (parallelForWithOptions) resolve an identical batch shape.
+    return thread_system.selectBatchProfile(adaptive_tuner, .{
+        .item_count = item_count,
+        .items_per_range = items_per_range_override,
+        .max_worker_threads = max_worker_threads_override,
+        .range_alignment_items = perception_range_alignment_items,
+        .adaptive = adaptive,
+    });
 }
 
 // ---- Tests --------------------------------------------------------------------
@@ -1737,6 +1719,14 @@ fn minimalWorld(allocator: std.mem.Allocator, width: u16, height: u16, tile_size
     };
     _ = try world.addLevel(0);
     return world;
+}
+
+test "perception production compute tuner uses central gate and range alignment" {
+    var system = PerceptionSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.compute_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(@as(usize, 64), system.compute_tuner.config.initial_range_items);
+    try std.testing.expectEqual(perception_range_alignment_items, system.compute_tuner.config.smallest_range_items);
 }
 
 test "fovTestScalar accepts squarely ahead, boundary, and rejects squarely behind" {
@@ -2027,6 +2017,26 @@ test "hearing detects an in-range same-level stimulus" {
     try testing.expectEqual(@as(f32, 0), perception.heard_stimulus_y);
 }
 
+test "hearing ignores zero-intensity in-range stimulus" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 30, .y = 0 }, .intensity = 0, .kind = .dig, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+}
+
 test "hearing ignores an out-of-range stimulus" {
     var data = DataSystem.init(testing.allocator);
     defer data.deinit();
@@ -2090,6 +2100,63 @@ test "hearing picks the nearest of multiple in-range stimuli" {
     const perception = data.aiPerceptionConst(observer).?;
     try testing.expect(perception.heard_stimulus);
     try testing.expectEqual(@as(f32, 20), perception.heard_stimulus_x);
+}
+
+test "hearing intensity ranking prefers louder stimulus over nearer quieter one" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 100 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    // Near quiet footstep at x=10 vs far loud dig at x=50. With k = 1/256^2,
+    // intensity dominates modest distance differences within range.
+    const stimuli = [_]WorldStimulus{
+        .{ .position = .{ .x = 10, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 },
+        .{ .position = .{ .x = 50, .y = 0 }, .intensity = 1.0, .kind = .dig, .level = 0 },
+    };
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+
+    const perception = data.aiPerceptionConst(observer).?;
+    try testing.expect(perception.heard_stimulus);
+    // At k=1/65536: score(0.35, 100) ≈ 0.3495, score(1.0, 2500) ≈ 0.963 → dig wins.
+    try testing.expectEqual(@as(f32, 50), perception.heard_stimulus_x);
+}
+
+test "hearing acquires non-dig footstep and impact kinds" {
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const observer = try addObserver(&data, 0, 0, 0, 0, .player, .{ .vision_range = 1, .hearing_range = 50 });
+
+    var spatial_sys = try testSpatialIndex(data.aiAgentSliceConst(), data.movementBodySliceConst(), &data);
+    defer spatial_sys.deinit();
+    var world = try minimalWorld(testing.allocator, 64, 64, 32);
+    defer world.deinit();
+    var sys = PerceptionSystem.init(testing.allocator);
+    defer sys.deinit();
+    var events = SimulationEvents.init(testing.allocator);
+    defer events.deinit();
+
+    const foot = [_]WorldStimulus{.{ .position = .{ .x = 25, .y = 0 }, .intensity = 0.35, .kind = .footstep, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &foot });
+    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 25), data.aiPerceptionConst(observer).?.heard_stimulus_x);
+
+    // Clear heard by running with empty stimuli
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &.{} });
+    try testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
+
+    const impact = [_]WorldStimulus{.{ .position = .{ .x = 15, .y = 0 }, .intensity = 0.85, .kind = .impact, .level = 0 }};
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &impact });
+    try testing.expect(data.aiPerceptionConst(observer).?.heard_stimulus);
+    try testing.expectEqual(@as(f32, 15), data.aiPerceptionConst(observer).?.heard_stimulus_x);
 }
 
 test "LOS gating skips a blocked nearer candidate in favor of a farther clear one" {
@@ -2828,6 +2895,158 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
 }
 
+test "multi-range serial/threaded cap=1 keeps the same survivor under identity-swap + acquire" {
+    // M14: observer A identity-swaps (lost then perceived), observer B acquires.
+    // With multi-range dispatch and max_events_per_step=1, both serial and real
+    // multi-worker threaded paths must keep the same single survivor event
+    // (range-ascending, within-range write order — the first of A's lost).
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // items_per_range is aligned up to perception_range_alignment_items (16), so
+    // a two-observer fixture collapses to one range. Pad with silent fillers so
+    // B lands in range 1 while A remains the first writer in range 0.
+    const range_items = perception_range_alignment_items;
+    const filler_count = range_items - 1; // A + fillers fill range 0; B starts range 1.
+
+    const setupObservers = struct {
+        fn run(data: *DataSystem, pad: usize) !struct {
+            observer_a: EntityId,
+            observer_b: EntityId,
+            first_threat: EntityId,
+            second_threat: EntityId,
+            b_threat: EntityId,
+        } {
+            // Observer A at origin; first threat nearby, will be swapped out.
+            const observer_a = try addObserver(data, 0, 0, 10, 0, .player, .{ .vision_range = 500 });
+            const first_threat = try addAgent(data, 10, 0, 0, 0, .hostile);
+            // Silent fillers far from every threat so they emit no transitions.
+            for (0..pad) |i| {
+                const fx: f32 = 4000 + @as(f32, @floatFromInt(i)) * 40;
+                _ = try addObserver(data, fx, 4000, 0, 0, .player, .{ .vision_range = 32 });
+            }
+            // Observer B after the first range so its acquire is a later range write.
+            const observer_b = try addObserver(data, 200, 0, 10, 0, .player, .{ .vision_range = 500 });
+            // B's threat is created later (after the warm step) so only A has a
+            // prev threat for the transition step.
+            return .{
+                .observer_a = observer_a,
+                .observer_b = observer_b,
+                .first_threat = first_threat,
+                .second_threat = EntityId.invalid,
+                .b_threat = EntityId.invalid,
+            };
+        }
+    }.run;
+
+    var serial_data = DataSystem.init(testing.allocator);
+    defer serial_data.deinit();
+    var threaded_data = DataSystem.init(testing.allocator);
+    defer threaded_data.deinit();
+
+    var serial_ids = try setupObservers(&serial_data, filler_count);
+    var threaded_ids = try setupObservers(&threaded_data, filler_count);
+
+    var world = try minimalWorld(testing.allocator, 512, 64, 32);
+    defer world.deinit();
+
+    // Warm step: A acquires first_threat; fillers and B have no threat yet.
+    {
+        var spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+        defer spatial.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        var events = SimulationEvents.init(testing.allocator);
+        defer events.deinit();
+        _ = try sys.updateSerial(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), spatial.view(), &world, &serial_data, &events, .{});
+        try testing.expectEqual(serial_ids.first_threat.index, serial_data.aiPerceptionConst(serial_ids.observer_a).?.nearest_threat.index);
+    }
+    {
+        var spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+        defer spatial.deinit();
+        var sys = PerceptionSystem.init(testing.allocator);
+        defer sys.deinit();
+        var events = SimulationEvents.init(testing.allocator);
+        defer events.deinit();
+        _ = try sys.updateSerial(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), spatial.view(), &world, &threaded_data, &events, .{});
+        try testing.expectEqual(threaded_ids.first_threat.index, threaded_data.aiPerceptionConst(threaded_ids.observer_a).?.nearest_threat.index);
+    }
+
+    // Transition step setup: A identity-swaps, B acquires a new hostile.
+    inline for (.{ &serial_data, &threaded_data }, .{ &serial_ids, &threaded_ids }) |data, ids| {
+        try data.setMovementBody(ids.first_threat, .{ .position = .{ .x = 5000, .y = 0 }, .previous_position = .{ .x = 5000, .y = 0 }, .velocity = .{}, .speed = 0 });
+        ids.second_threat = try addAgent(data, 12, 0, 0, 0, .hostile);
+        ids.b_threat = try addAgent(data, 210, 0, 0, 0, .hostile);
+    }
+
+    // Aligned range size with A..fillers in range 0 and B in range 1 so the cap
+    // merge walks ranges in order rather than a single serial buffer.
+    const multi_range_cfg = PerceptionConfig{
+        .items_per_range = range_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+        .max_events_per_step = 1,
+    };
+
+    var serial_spatial = try testSpatialIndex(serial_data.aiAgentSliceConst(), serial_data.movementBodySliceConst(), &serial_data);
+    defer serial_spatial.deinit();
+    var serial_sys = PerceptionSystem.init(testing.allocator);
+    defer serial_sys.deinit();
+    var serial_events = SimulationEvents.init(testing.allocator);
+    defer serial_events.deinit();
+    // updateSerial always uses range_count=1; drive serial through update with
+    // max_worker_threads=0 so the same multi-range merge path is exercised on both sides.
+    var serial_threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 0, .items_per_range = range_items });
+    defer serial_threads.deinit();
+    const serial_stats = try serial_sys.update(
+        serial_data.aiAgentSliceConst(),
+        serial_data.movementBodySliceConst(),
+        serial_spatial.view(),
+        &world,
+        &serial_data,
+        &serial_events,
+        &serial_threads,
+        multi_range_cfg,
+    );
+
+    var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
+    defer threaded_spatial.deinit();
+    var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = range_items });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var threaded_sys = PerceptionSystem.init(testing.allocator);
+    defer threaded_sys.deinit();
+    var threaded_events = SimulationEvents.init(testing.allocator);
+    defer threaded_events.deinit();
+    const threaded_stats = try threaded_sys.update(
+        threaded_data.aiAgentSliceConst(),
+        threaded_data.movementBodySliceConst(),
+        threaded_spatial.view(),
+        &world,
+        &threaded_data,
+        &threaded_events,
+        &threads,
+        multi_range_cfg,
+    );
+
+    // Both paths: multi-range, cap=1 survivor is A's entity_lost (first write in range 0).
+    try testing.expect(serial_stats.batch.range_count > 1);
+    try testing.expect(threaded_stats.batch.range_count > 1);
+    try testing.expect(!threaded_stats.batch.ran_inline);
+
+    const serial_merged = serial_events.mergedItems();
+    const threaded_merged = threaded_events.mergedItems();
+    try testing.expectEqual(@as(usize, 1), serial_merged.len);
+    try testing.expectEqual(@as(usize, 1), threaded_merged.len);
+    try testing.expectEqualSlices(SimulationEvent, serial_merged, threaded_merged);
+    try testing.expectEqual(SimulationEvent{
+        .stage = .domain_reaction,
+        .payload = .{ .entity_lost = .{ .observer = serial_ids.observer_a, .target = serial_ids.first_threat } },
+    }, serial_merged[0]);
+    // Cap drops the rest of the multi-kind transitions (A's perceived + B's acquire).
+    try testing.expect(serial_stats.dropped_events >= 2);
+    try testing.expectEqual(serial_stats.dropped_events, threaded_stats.dropped_events);
+}
+
 test "serial and threaded PerceptionSystem updates route through identical math" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
@@ -2997,6 +3216,8 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     // > 1.
     const warmup_stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
     try testing.expect(warmup_stats.batch.range_count > 1);
+    try testing.expect(!warmup_stats.batch.ran_inline);
+    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
     try testing.expect(sys.level_blocked.items.len > 0);
     try testing.expect(sys.level_blocked.items[0].valid);
 
@@ -3020,6 +3241,8 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
     const stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
     try testing.expectEqual(@as(usize, 40), stats.observer_count);
     try testing.expect(stats.batch.range_count > 1);
+    try testing.expect(!stats.batch.ran_inline);
+    try testing.expect(stats.batch.active_worker_threads > 0);
 }
 
 test "PerceptionSystem's dirty-tracked patch path has no steady-state allocation after warmup (FailingAllocator)" {

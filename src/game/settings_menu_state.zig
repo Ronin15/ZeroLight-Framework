@@ -7,6 +7,7 @@ const config = @import("../config.zig");
 const Renderer = @import("../render/renderer.zig").Renderer;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const AssetStore = @import("../assets/assets.zig").AssetStore;
 const RenderContext = @import("../app/state.zig").RenderContext;
 const StateTransitions = @import("../app/state.zig").StateTransitions;
 const UpdateContext = @import("../app/state.zig").UpdateContext;
@@ -87,26 +88,25 @@ pub const SettingsMenuState = struct {
     }
 
     pub fn handleEvent(self: *SettingsMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
-        if (event.type != c.SDL_EVENT_KEY_DOWN or event.key.repeat) return false;
-        const action = inputFile.actionForKey(event.key.key) orelse return false;
+        const action = inputFile.actionForPressEvent(event) orelse return false;
         switch (action) {
-            .menuUp => {
+            .menu_up => {
                 self.changeSelection(-1);
                 return true;
             },
-            .menuDown => {
+            .menu_down => {
                 self.changeSelection(1);
                 return true;
             },
-            .menuLeft => {
+            .menu_left => {
                 self.pending_adjust = -1;
                 return true;
             },
-            .menuRight => {
+            .menu_right => {
                 self.pending_adjust = 1;
                 return true;
             },
-            .resumeGame => {
+            .resume_game => {
                 try self.activate(transitions);
                 return true;
             },
@@ -256,6 +256,7 @@ test "settings volumes clamp and emit gain commands" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -301,20 +302,46 @@ test "settings handleEvent uses named input actions" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    var up = keyEventForAction(.menuUp);
+    var up = keyEventForAction(.menu_up);
     try std.testing.expect(try settings.handleEvent(&up, &transitions));
     try std.testing.expectEqual(@as(usize, 3), settings.selected);
 
-    var down = keyEventForAction(.menuDown);
+    var down = keyEventForAction(.menu_down);
     try std.testing.expect(try settings.handleEvent(&down, &transitions));
     try std.testing.expectEqual(@as(usize, 0), settings.selected);
 
-    var right = keyEventForAction(.menuRight);
+    var right = keyEventForAction(.menu_right);
     try std.testing.expect(try settings.handleEvent(&right, &transitions));
     try std.testing.expectEqual(@as(i32, 1), settings.pending_adjust);
 
     settings.selected = 3;
-    var confirm = keyEventForAction(.resumeGame);
+    var confirm = keyEventForAction(.resume_game);
+    try std.testing.expect(try settings.handleEvent(&confirm, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+}
+
+test "settings handleEvent uses named gamepad input actions identically to keyboard" {
+    var runtime_settings = RuntimeAudioSettings.init(.{});
+    var settings = SettingsMenuState.init(&runtime_settings, 800, 450);
+    defer settings.deinit();
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    var up = gamepadButtonEventForAction(.menu_up);
+    try std.testing.expect(try settings.handleEvent(&up, &transitions));
+    try std.testing.expectEqual(@as(usize, 3), settings.selected);
+
+    var down = gamepadButtonEventForAction(.menu_down);
+    try std.testing.expect(try settings.handleEvent(&down, &transitions));
+    try std.testing.expectEqual(@as(usize, 0), settings.selected);
+
+    var right = gamepadButtonEventForAction(.menu_right);
+    try std.testing.expect(try settings.handleEvent(&right, &transitions));
+    try std.testing.expectEqual(@as(i32, 1), settings.pending_adjust);
+
+    settings.selected = 3;
+    var confirm = gamepadButtonEventForAction(.resume_game);
     try std.testing.expect(try settings.handleEvent(&confirm, &transitions));
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }
@@ -333,7 +360,7 @@ test "settings failed audio command leaves runtime value unchanged" {
     try std.testing.expectEqual(@as(u8, 10), runtime_settings.master);
 }
 
-test "settings back via quit action requests pop" {
+test "settings quit action requests exactly one pop not quit" {
     var runtime_settings = RuntimeAudioSettings.init(.{});
     var settings = SettingsMenuState.init(&runtime_settings, 800, 450);
     defer settings.deinit();
@@ -341,13 +368,16 @@ test "settings back via quit action requests pop" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    // simulate quit (Esc) while on Back or any
-    settings.selected = 3;
-    // We call activate which for Back does pop; or direct
-    try settings.activate(&transitions);
-    // Or via the quit path in real update, here directly test pop request present
-    try transitions.pop();
-    try std.testing.expect(transitions.requests.items.len > 0);
+    const quit_key = keyEventForAction(.quit);
+    try std.testing.expect(try settings.handleEvent(&quit_key, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+    try std.testing.expectEqualStrings("pop", @tagName(transitions.requests.items[0]));
+
+    transitions.clear();
+    const quit_gamepad = gamepadButtonEventForAction(.quit);
+    try std.testing.expect(try settings.handleEvent(&quit_gamepad, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+    try std.testing.expectEqualStrings("pop", @tagName(transitions.requests.items[0]));
 }
 
 fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
@@ -365,6 +395,24 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
                 .raw = 0,
                 .down = true,
                 .repeat = false,
+            } };
+        }
+    }
+    unreachable;
+}
+
+fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
+    for (inputFile.default_gamepad_bindings) |binding| {
+        if (binding.action == action) {
+            return c.SDL_Event{ .gbutton = .{
+                .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+                .reserved = 0,
+                .timestamp = 0,
+                .which = 0,
+                .button = @intCast(binding.button),
+                .down = true,
+                .padding1 = 0,
+                .padding2 = 0,
             } };
         }
     }

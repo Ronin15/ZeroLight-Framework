@@ -17,6 +17,7 @@ comptime {
     _ = @import("assets/sprite_atlas_meta.zig");
     _ = @import("app/audio.zig");
     _ = @import("app/frame_pacer.zig");
+    _ = @import("app/gamepad.zig");
     _ = @import("app/input.zig");
     _ = @import("app/input_router.zig");
     _ = @import("app/pause_controller.zig");
@@ -35,13 +36,17 @@ comptime {
     _ = @import("core/logging.zig");
     _ = @import("core/rng.zig");
     _ = @import("core/simd.zig");
+    _ = @import("game/ai_archetypes.zig");
+    _ = @import("game/ai_debug_overlay.zig");
     _ = @import("game/audio_controller.zig");
     _ = @import("game/data_system.zig");
     _ = @import("game/dig_controller.zig");
+    _ = @import("game/destructible_controller.zig");
     _ = @import("game/game_demo_state.zig");
     _ = @import("game/loading_state.zig");
     _ = @import("game/main_menu_state.zig");
     _ = @import("game/menu_view.zig");
+    _ = @import("game/pause_state.zig");
     _ = @import("game/settings_menu_state.zig");
     _ = @import("game/player.zig");
     _ = @import("game/render_depth.zig");
@@ -50,6 +55,7 @@ comptime {
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");
     _ = @import("game/world_system.zig");
+    _ = @import("game/world_interest.zig");
     _ = @import("game/systems/ai.zig");
     _ = @import("game/systems/ai_memory.zig");
     _ = @import("game/systems/affect.zig");
@@ -72,6 +78,7 @@ comptime {
     _ = @import("render/gpu/tilemap_pipeline.zig");
     _ = @import("render/gpu/texture.zig");
     _ = @import("render/camera.zig");
+    _ = @import("render/fps_counter.zig");
     _ = @import("render/renderer.zig");
     _ = @import("render/resources.zig");
     _ = @import("render/sprite_batch.zig");

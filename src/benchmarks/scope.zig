@@ -3,9 +3,9 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Scoped simulation-processing throughput. This is the Slice 24 evidence bench:
-//! it runs the real per-step processing stages — AI cognition, collision, and
-//! movement (with in-pass chunk derivation) — but gated by the scope system, so
-//! the measured cost reflects the ACTIVE work, not the full entity count.
+//! it runs the real per-step processing stages — AI cognition, collision, movement,
+//! and chunk maintenance — but gated by the scope system, so the measured cost
+//! reflects the ACTIVE work, not the full entity count.
 //!
 //! The fixture spreads N entities across the chunk grid and assigns each its
 //! simulation-LOD tier via the cube `lodDistance` (`tierForChunkDistance`). The x/y
@@ -13,14 +13,17 @@
 //! depth penalty (`level = index % 5`): levels 0-1 cognition, 2 locomotion, 3
 //! kinematic, 4 dormant. So this measures a realistic MIXED-TIER population, not
 //! all-cognition:
-//!   - movement runs on all non-dormant rows (tier gather drops dormant).
+//!   - movement integrates the full contiguous range every step; dormant rows
+//!     carry zero velocity and integrate as no-ops (no tier gather).
 //!   - collision runs on locomotion+cognition (drops dormant+kinematic).
 //!   - AI runs on the cognition subset, further gated by camera halo + stagger.
-//!   - movement derives each integrated body's chunk in-pass (chunk_grid).
+//!   - chunk maintenance (deriveChunks) runs as its own pass over the settled
+//!     positions, recomputing every body's chunk before tier policy reads it.
 //!
 //! `output_count` reports how many entities actually ran cognition this step, so the
 //! gap between that and N is the scope reduction. Note the timed window covers the
-//! whole scoped step (AI + collision + movement + gathers + tier policy), so it is
+//! whole scoped step (AI + collision + movement + chunk derive + gathers + tier
+//! policy), so it is
 //! not directly comparable to the AI-only `ai` group. The shared spatial index build
 //! also runs every step here (AI separation queries it) but its own
 //! wall-clock cost is excluded from this reported window, same as the `ai` group —
@@ -252,7 +255,7 @@ fn allTunersSettled(ai: *const AiSystem, collision: *const CollisionSystem, move
     return move.adaptive_tuner.isSettled() and
         ai.separation_tuner.isSettled() and ai.intent_tuner.isSettled() and
         collision.broadphase_tuner.isSettled() and collision.narrowphase_tuner.isSettled() and
-        scope.movement_gather_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
+        scope.chunk_derive_tuner.isSettled() and scope.collision_gather_tuner.isSettled() and
         scope.ai_gather_tuner.isSettled() and scope.tier_policy_tuner.isSettled() and
         spatial_index.build_tuner.isSettled();
 }
@@ -288,15 +291,12 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     // Scope passes thread the same way as the downstream systems: serial cases run
     // the *Serial variants, threaded cases the adaptive threaded gathers so the
     // scope stage's own tuners train inside the measured window.
-    var move_indices: ?[]const u32 = undefined;
     var collision_indices: ?[]const u32 = undefined;
     var ai_indices: []const u32 = undefined;
     if (thread_system) |ts| {
-        move_indices = (try ctx.scope.gatherMovementBodyIndices(&fixture.data, ts, scope_config)).indices;
         collision_indices = (try ctx.scope.gatherCollisionBoundsIndices(&fixture.data, ts, scope_config)).indices;
         ai_indices = (try ctx.scope.gatherAiAgentIndices(&fixture.data, region, ctx.scope.staggerStep(), ts, scope_config)).indices;
     } else {
-        move_indices = try ctx.scope.gatherMovementBodyIndicesSerial(&fixture.data);
         collision_indices = try ctx.scope.gatherCollisionBoundsIndicesSerial(&fixture.data);
         ai_indices = try ctx.scope.gatherAiAgentIndicesSerial(&fixture.data, region, ctx.scope.staggerStep());
     }
@@ -317,10 +317,7 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
     const excluded_ns = suite.elapsedNs(spatial_start_ns, spatial_end_ns);
     const spatial_view = ctx.spatial_index.view();
 
-    const scope_columns = fixture.data.scopeColumnsSlice();
-    const chunk_grid = movement.ChunkGridParams{
-        .chunk_x = scope_columns.chunk_x,
-        .chunk_y = scope_columns.chunk_y,
+    const chunk_grid = SimulationScopeSystem.ChunkGrid{
         .tile_size = tile_size,
         .chunk_size_tiles = chunk_size_tiles,
         .width = grid_tiles,
@@ -335,8 +332,10 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         });
         _ = try ctx.collision.updateSerialScoped(&fixture.data, &fixture.contacts, collision_indices);
         var slice = fixture.data.movementBodySlice();
-        movement.updateSerialScoped(&slice, delta_seconds, move_indices, chunk_grid);
-        // Tier policy reads the chunk movement just derived; serial path emits one range.
+        movement.updateSerial(&slice, delta_seconds);
+        // Chunk maintenance runs as its own pass over settled positions.
+        ctx.scope.deriveChunksSerial(&fixture.data, chunk_grid);
+        // Tier policy reads the chunk just derived; serial path emits one range.
         try ctx.scope.queueTierChangesSerial(&fixture.data, visibleRegion(), &fixture.frame.structural_commands);
         return .{ .batch = suite.serialBatch(move_slice_const.entities.len, movement_range_alignment_items), .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };
     }
@@ -360,9 +359,10 @@ fn runOnce(ctx: *RunContext, io: std.Io, thread_system: ?*ThreadSystem) !RunResu
         .items_per_range = itemsPerRange(ctx.case, movement_range_alignment_items),
         .max_worker_threads = ctx.case.maxWorkerThreads(),
         .adaptive = ctx.case.adaptive,
-        .scope_dense_indices = move_indices,
-        .chunk_grid = chunk_grid,
     });
+    // Chunk maintenance runs as its own threaded pass over settled positions; its
+    // tuner trains inside the measured window like the other scope passes.
+    _ = ctx.scope.deriveChunks(&fixture.data, thread_system.?, chunk_grid, scope_config);
     // Threaded tier policy trains its own tuner inside the measured window.
     _ = try ctx.scope.queueTierChanges(&fixture.data, visibleRegion(), &fixture.frame.structural_commands, thread_system.?, scope_config);
     return .{ .batch = move_stats.batch, .active_cognition = ai_indices.len, .excluded_ns = excluded_ns };

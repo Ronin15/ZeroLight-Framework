@@ -13,7 +13,8 @@ description: >-
 # Zig Workflows
 
 Canonical guardrails: @AGENTS.md and `docs/coding-standards.md`. Subagent prompts:
-`.cursor/agents/`. Do not restate guardrails in Task prompts.
+`.cursor/agents/` (kept in sync with `.claude/agents/`). Do not restate guardrails in
+Task prompts.
 
 ## Inline vs delegate
 
@@ -34,6 +35,8 @@ Work **inline** (no subagent) when ALL are true:
 | PR, diff, or standards review | Review |
 | Module-wide pass (pathfinder, etc.) | Module review |
 | ECS extensibility / roadmap assessment | Architecture assessment |
+| Large-subsystem best-practice pass | Best-practices review |
+| Deep correctness / concurrency / algorithm pass | Deep-correctness review |
 | Touches hot paths, threading, or pipeline stages | Implement (or Design first if unclear) |
 
 When unsure: **Implement** for coding tasks, **Review** after substantive diffs,
@@ -63,6 +66,8 @@ User says → do:
 - "Design the arbitration system before we code" → **Design**
 - "Implement slice X" → **Design** first if contracts unclear, else **Implement**
 - "Review the pathfinder module" → **Module review**, pathfinder preset
+- "Best-practices review of hot subsystems" → **Best-practices review** preset
+- "Deep correctness pass on threading/pathfinding" → **Deep-correctness review** preset
 - "How ready is this for emergent gameplay?" → **Architecture assessment**
 
 ## Design
@@ -111,14 +116,17 @@ Summarize as a severity-sorted table; do not fix unless asked.
 
 ## Architecture assessment
 
-One `zig-design-specialist` (`readonly: true`). Prompt:
+Multi-phase `zig-design-specialist` (`readonly: true`). Mirrors
+`.claude/workflows/architecture-assessment.js`.
 
-```text
-Assess ZeroLight-Framework for scalable emergent gameplay. Read @AGENTS.md, canonical
-docs/, and live src/game/ + src/app/ modules. Report: executive summary (/10), strengths,
-gaps/risks, scalability, readiness by domain (AI, collision, world, multi-agent, events),
-next steps, top-5 risk register.
-```
+**Phase 1 — docs (parallel):** architecture+simulation, state+standards, roadmap,
+render+assets.
+
+**Phase 2 — code (parallel):** data_system+pipeline, gameplay systems, engine+threads,
+world+pathfinding, controllers+render_prep.
+
+**Phase 3 — synthesize:** executive summary (/10), strengths, gaps/risks, scalability,
+readiness by domain (AI, collision, world, multi-agent, events), next steps, top-5 risk register.
 
 ## Module review (multi-phase)
 
@@ -126,7 +134,20 @@ Multiple `zig-review-specialist` (`readonly: true`) + synthesis. Standards are i
 review subagent — only add file lists from [module-presets.md](module-presets.md).
 
 1. **Per-unit (parallel):** one subagent per preset row
-2. **Cross-cut (parallel):** coherency, cohesion, standards-and-hotpath
+2. **Cross-cut (parallel):** coherency, cohesion, standards-and-hotpath (pathfinder preset)
 3. **Synthesize:** merge severity-ordered report; drop spurious findings
 
-Pathfinder preset: [module-presets.md](module-presets.md#pathfinder).
+Presets: [module-presets.md](module-presets.md) — `pathfinder`, `best-practices-review`,
+`deep-correctness-review`.
+
+## Best-practices review
+
+Multi-phase module review using the `best-practices-review` preset. One
+`zig-review-specialist` per unit (parallel), adversarial verify pass, then synthesize
+durable lint/agent/doc items and ranked one-off fixes.
+
+## Deep-correctness review
+
+Multi-phase theme review using the `deep-correctness-review` preset. Goes beyond
+idiom/surface into concurrency, algorithms, SIMD parity, pipeline determinism, resource
+lifetime, and test-coverage gaps. Verify findings before synthesizing.

@@ -38,6 +38,9 @@ const neighbor_dirs = types.neighbor_dirs;
 
 pub const SolveJobContext = struct {
     system: *PathfindingSystem,
+    /// Dispatched range count from the pre-select that sized this batch; dual-asserted
+    /// against `range.index` at job entry (mirror affect.zig / collision.zig).
+    range_count: usize,
 };
 
 // Fallback workers share the system for read-only graph/pending access but use
@@ -45,6 +48,11 @@ pub const SolveJobContext = struct {
 pub fn solveFallbackJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void {
     const job: *SolveJobContext = @ptrCast(@alignCast(context));
     const system = job.system;
+    // Dual worker asserts: range.index vs dispatched range count AND range.end vs
+    // the fallback-index buffer this job walks.
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= system.fallback_indices.items.len);
     // scratch_slots is never resized during the parallel region (only in applyDerivedCapacity,
     // which runs in beginUpdate before parallelForWithOptions), so this pointer stays valid.
     // Guards the reserve-before-dispatch invariant: applyDerivedCapacity sized scratch_slots to

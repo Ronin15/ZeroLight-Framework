@@ -29,6 +29,11 @@ const movement_range_alignment_items = @import("data_system.zig").movement_range
 const StructuralCommitStats = @import("data_system.zig").StructuralCommitStats;
 const StructuralCommand = @import("data_system.zig").StructuralCommand;
 const SteeringAgent = @import("data_system.zig").SteeringAgent;
+const ai_archetypes = @import("ai_archetypes.zig");
+const AiArchetypeCatalog = ai_archetypes.AiArchetypeCatalog;
+const AiArchetypeId = ai_archetypes.AiArchetypeId;
+const DemoArchetype = ai_archetypes.DemoArchetype;
+const AiDebugOverlay = @import("ai_debug_overlay.zig").AiDebugOverlay;
 const simulation_scope = @import("simulation_scope.zig");
 const InputState = @import("../app/input.zig").InputState;
 const Player = @import("player.zig").Player;
@@ -39,6 +44,8 @@ const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedM
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
+const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
 const SimulationPipeline = @import("simulation_pipeline.zig").SimulationPipeline;
 const CollisionSystem = @import("systems/collision.zig").CollisionSystem;
@@ -70,9 +77,11 @@ const demo_test_viewport_height: f32 = 256;
 // the pathfinding group-field threshold live — that made every test in this file spawn
 // 2048 movers too, taking `zig build test` from ~6s to ~43s. Population is now a
 // runtime parameter (see DemoPopulationCapacity/deriveDemoPopulationCapacity) so the
-// battle-scale exercise and fast tests don't have to share one global constant.
+// running demo and fast tests don't have to share one global constant.
 const default_demo_mover_count: usize = 32;
 // Only initProceduralWithRuntimeAssets (the real game, not tests) passes this.
+// Max battle-scale target for runtime perf / capacity tuning; tests stay on
+// `default_demo_mover_count` so the suite does not pay battle-scale spawn cost.
 const battle_scale_demo_mover_count: usize = 2048;
 const obstacle_count = 4;
 
@@ -109,10 +118,12 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // Matches the historical 24/32 == 0.75 surface/total split.
     const surface_movers = mover_count * 3 / 4;
     const underground_movers = mover_count - surface_movers;
-    // Owned by CollisionSystem (this demo has no independent opinion on worst-case
-    // simultaneous contacts for N bodies — that's collision's own domain knowledge, not
-    // a ratio to guess here). A contact-stream overflow is a graceful, counted drop
-    // (RangeOutputStream.stats.dropped), not a crash, so an approximation is fine.
+    // Owned by CollisionSystem (this demo has no independent opinion on simultaneous
+    // contacts for N bodies — that's collision's own domain knowledge, not a ratio to
+    // guess here). `estimateContactCapacity` is a steady-state WARM heuristic, not a
+    // combinatorial worst-case ceiling: contacts grow via RangeOutputStream.prefix
+    // when a step needs more. SimulationEvents (frame.events) is the stream that can
+    // drop under an explicit capacity_limit — not the contact stream.
     const contact_capacity = CollisionSystem.estimateContactCapacity(mover_count + obstacle_count + 1);
     // Every steering agent emits one navigation intent per step unconditionally (unlike
     // path REQUESTS, which are sparse/event-driven) — this must cover the full
@@ -122,7 +133,10 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // trigger count is bounded by contact count — collision_response's own domain
     // knowledge, not a second independent ratio for this demo to guess).
     const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
-    const structural_reserve = mover_count + 16;
+    // Tier policy can emit one set_simulation_tier per mover, plus fixed headroom for
+    // dig/create bursts and Slice 45 destructible destroys (bounded by action-intent
+    // live capacity — fixed, not map-scaled).
+    const structural_reserve = mover_count + 16 + action_intent_live_capacity;
     // Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining event and
     // every structural-commit event shares this one budget for the step (cleared only at
     // `beginStep`), so it must cover the worst case of all of them landing in the same
@@ -137,11 +151,12 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // drive per step, 4 drives, per cognition agent) for the `demoArchetypeForIndex`
     // subset that now carries `AiPerception`/`AiAffect` — see
     // `demoCognitionAgentCount`/`perception_max_events_per_step`/
-    // `affect_max_events_per_step` below.
+    // `affect_max_events_per_step` below. Plus fixed `action_intent_live_capacity`
+    // headroom for `destructible_destroyed` domain events (Slice 45).
     const cognition_agents = demoCognitionAgentCount(mover_count);
     const perception_event_reserve = cognition_agents * 2;
     const affect_event_reserve = cognition_agents * 4;
-    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve;
+    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve + action_intent_live_capacity;
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -253,6 +268,13 @@ pub const GameDemoState = struct {
     // DemoPopulationCapacity), not a comptime constant, so this can't be a fixed array.
     test_squares: []EntityId,
     obstacles: [obstacle_count]EntityId,
+    // Data-driven AI personalities loaded once from assets/ai/archetypes.json;
+    // spawn resolves a slot to a prevalidated bundle by enum index (value types,
+    // no deinit).
+    archetype_catalog: AiArchetypeCatalog,
+    // Render-only AI introspection viz, drawn from `render` when the engine's F2
+    // debug toggle is on (owns its cached label textures; reads sim state only).
+    ai_overlay: AiDebugOverlay = .{},
     // Last incremental nav-update batch diagnostics, recorded into perf metrics.
     last_nav_update_stats: NavUpdateStats = .{},
     camera_previous: Camera2D = .{},
@@ -265,15 +287,17 @@ pub const GameDemoState = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         bounds_width: f32,
         bounds_height: f32,
     ) !GameDemoState {
-        return try initWithRuntimeAssets(allocator, runtime_assets, bounds_width, bounds_height);
+        return try initWithRuntimeAssets(allocator, runtime_assets, asset_store, bounds_width, bounds_height);
     }
 
     pub fn initWithRuntimeAssets(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         bounds_width: f32,
         bounds_height: f32,
     ) !GameDemoState {
@@ -295,6 +319,7 @@ pub const GameDemoState = struct {
             null,
             null,
             default_demo_mover_count,
+            asset_store,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -304,6 +329,7 @@ pub const GameDemoState = struct {
     pub fn initProceduralWithRuntimeAssets(
         allocator: std.mem.Allocator,
         runtime_assets: *const RuntimeAssets,
+        asset_store: AssetStore,
         world_build_config: world_system.WorldBuildConfig,
         thread_system: *ThreadSystem,
         viewport_width: f32,
@@ -329,6 +355,7 @@ pub const GameDemoState = struct {
             proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
             thread_system,
             battle_scale_demo_mover_count,
+            asset_store,
         );
         errdefer state.deinit();
         try state.validateAtlasReferences(runtime_assets);
@@ -349,10 +376,21 @@ pub const GameDemoState = struct {
         pathfinding_override: ?PathfindingCapacity,
         nav_build_thread_system: ?*ThreadSystem,
         mover_count: usize,
+        asset_store: AssetStore,
     ) !GameDemoState {
-        const pop_cap = deriveDemoPopulationCapacity(mover_count);
+        // Take ownership of the moved-in world before any fallible step. The caller
+        // builds it inline as a call argument, so it has no cleanup handle of its own;
+        // registering this errdefer first means a later failure (capacity derivation,
+        // archetype load, ...) frees it instead of leaking. On the success path
+        // ownership moves into the returned struct's `.world` field and this errdefer
+        // does not fire, so there is no double-deinit.
         var world = world_value;
         errdefer world.deinit();
+        const pop_cap = deriveDemoPopulationCapacity(mover_count);
+        // Cold path: load the data-driven AI archetype catalog once before spawn.
+        // A malformed/missing catalog surfaces as an init error rather than a
+        // silent fallback to hardcoded personalities.
+        const archetype_catalog = try ai_archetypes.load(asset_store, allocator);
         var data = DataSystem.init(allocator);
         errdefer data.deinit();
         const player = try Player.spawn(&data);
@@ -369,9 +407,10 @@ pub const GameDemoState = struct {
             player_body.previous_x.* = start_x;
             player_body.previous_y.* = start_y;
         }
+        try placeDemoInterestMarkers(&world);
         const world_width = simulation_bounds_width;
         const world_height = simulation_bounds_height;
-        const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap);
+        const test_squares = try spawnTestSquares(allocator, &data, &world, dig_config.tunnel_tile, pop_cap, &archetype_catalog);
         errdefer allocator.free(test_squares);
         const obstacles = try spawnObstacles(&data, &world);
         var particles = try ParticleSystem.init(allocator, .{ .capacity = 512 });
@@ -397,6 +436,15 @@ pub const GameDemoState = struct {
         // events (`pop_cap.event_reserve`), not a flat constant unrelated to that budget.
         try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
+        // Plane-traversal batches fall-landing tile events into this scratch (player +
+        // every AI agent can fall in one step).
+        try simulation_frame.reserveWorldTileChangesScratch(pop_cap.mover_count + 1);
+        // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
+        // fixed live ceiling so optional emitters stay allocation-free after init.
+        try simulation_frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+        // One range per sequential main-thread append (same shape as stimuli): warm
+        // both range slots and value slots to the fixed live ceiling.
+        try simulation_frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
         var pipeline = try SimulationPipeline.init(allocator, &data, world_width, world_height, .{
             .steering_agent_capacity = pop_cap.mover_count,
             .static_obstacle_capacity = obstacle_count,
@@ -441,6 +489,7 @@ pub const GameDemoState = struct {
             .scene_prep = scene_prep,
             .test_squares = test_squares,
             .obstacles = obstacles,
+            .archetype_catalog = archetype_catalog,
             .viewport_width = viewport_width,
             .viewport_height = viewport_height,
             .bounds_width = world_width,
@@ -452,6 +501,7 @@ pub const GameDemoState = struct {
     }
 
     pub fn deinit(self: *GameDemoState) void {
+        self.ai_overlay.deinit();
         self.allocator.free(self.test_squares);
         self.scene_prep.deinit();
         self.particles.deinit();
@@ -475,6 +525,7 @@ pub const GameDemoState = struct {
         var input_timer = StageTimer.start();
         try self.player.applyInput(&self.data, context.input);
         self.pipeline.captureDigIntent(context.input, &self.simulation_frame);
+        self.pipeline.captureActionIntent(context.input, &self.simulation_frame, self.player, &self.data, &self.world);
         input_timer.stop(context.perf, .gameplay_input);
 
         var ambient_audio_timer = StageTimer.start();
@@ -491,6 +542,7 @@ pub const GameDemoState = struct {
             .bounds_width = self.bounds_width,
             .bounds_height = self.bounds_height,
             .perf = context.perf,
+            .particles = &self.particles,
         });
 
         var collision_audio_timer = StageTimer.start();
@@ -531,7 +583,11 @@ pub const GameDemoState = struct {
         };
         self.world.setVisibleChunksForWorldRect(camera_rect, world_render_overscan_chunks);
         const scene = self.gameplayScene();
-        try context.renderer.reserveSpriteCommands(render_prep.spriteCommandCapacity(scene));
+        // Always reserve the fixed AI-overlay headroom alongside the gameplay
+        // scene budget (grow-only) so the first F2 toggle draws allocation-free.
+        try context.renderer.reserveSpriteCommands(
+            render_prep.spriteCommandCapacity(scene) + AiDebugOverlay.commandCapacity(),
+        );
         try render_prep.submitGameplayFrame(
             &self.scene_prep,
             scene,
@@ -540,6 +596,9 @@ pub const GameDemoState = struct {
             context.interpolation_alpha,
             camera_rect,
         );
+        if (context.debug_overlay_visible) {
+            try self.ai_overlay.draw(&self.data, camera_rect, context.renderer, context.text_service);
+        }
     }
 
     fn gameplayScene(self: *GameDemoState) render_prep.GameplayScene {
@@ -613,6 +672,7 @@ pub const GameDemoState = struct {
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
         try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
+        self.pipeline.reactToPostCommitSteeringEvents(&self.simulation_frame);
         try render_prep.ensureScenePrepCapacity(&self.scene_prep, self.gameplayScene());
         return stats;
     }
@@ -644,8 +704,8 @@ fn worldUsesCompactDemoSpawn(world: *const WorldSystem) bool {
     return world.width <= 16 and world.height <= 16;
 }
 
-fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, pop_cap: DemoPopulationCapacity) ![]EntityId {
-    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(allocator, data, world, pop_cap);
+fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, tunnel_tile: world_system.TileId, pop_cap: DemoPopulationCapacity, catalog: *const AiArchetypeCatalog) ![]EntityId {
+    if (worldUsesCompactDemoSpawn(world)) return spawnTestSquaresCompact(allocator, data, world, pop_cap, catalog);
     const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
     errdefer allocator.free(entities);
     // Wraps naturally (col = index % cols, row = index / cols) rather than requiring an
@@ -658,7 +718,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = 96 + @as(f32, @floatFromInt(col)) * 96,
@@ -685,7 +745,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
         const underground_index = index - pop_cap.surface_movers;
         const tile = world.tile_size;
         const size: math.Vec2 = .{ .x = 22, .y = 22 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = if (underground_enabled) blk: {
             const level = undergroundSpawnLevelForIndex(world, underground_index, pop_cap.underground_movers);
             const cell = undergroundSpawnCellForIndex(underground_index);
@@ -732,7 +792,7 @@ fn spawnTestSquares(allocator: std.mem.Allocator, data: *DataSystem, world: *Wor
     return entities;
 }
 
-fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, pop_cap: DemoPopulationCapacity) ![]EntityId {
+fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, world: *WorldSystem, pop_cap: DemoPopulationCapacity, catalog: *const AiArchetypeCatalog) ![]EntityId {
     const entities = try allocator.alloc(EntityId, pop_cap.mover_count);
     errdefer allocator.free(entities);
     const cols: usize = 6;
@@ -750,7 +810,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const col = index % cols;
         const row = index / cols;
         const size: math.Vec2 = .{ .x = 20 + @as(f32, @floatFromInt(index % 3)) * 2, .y = 20 + @as(f32, @floatFromInt((index + 1) % 3)) * 2 };
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * step_x,
@@ -783,7 +843,7 @@ fn spawnTestSquaresCompact(allocator: std.mem.Allocator, data: *DataSystem, worl
         const index = pop_cap.surface_movers + underground_index;
         const col = underground_index % underground_cols;
         const row = underground_index / underground_cols;
-        const archetype = demoArchetypeForIndex(index);
+        const archetype = demoArchetypeForIndex(catalog, index);
         const spec = DemoSpawnSpec{
             .position = .{
                 .x = margin + @as(f32, @floatFromInt(col)) * underground_step_x,
@@ -830,6 +890,31 @@ fn undergroundSpawnCellForIndex(underground_index: usize) SpawnCellCoord {
 fn carveUndergroundSpawnPocket(world: *WorldSystem, tunnel_tile: world_system.TileId, level: u16, cell: SpawnCellCoord) !void {
     const floor_layer = world.denseFloorLayerForLevel(level) orelse return error.InvalidWorldLevel;
     _ = try world.setDenseTile(floor_layer, cell.x, cell.y, tunnel_tile);
+}
+
+/// Places durable investigate POIs on the surface level (index 0 today).
+/// When Slice 38 lands elevation stacks above the surface, rebind this to the
+/// level whose `levelElevation` is 0 rather than hardcoding storage index 0.
+fn placeDemoInterestMarkers(world: *WorldSystem) !void {
+    const w = world.worldWidthPixels();
+    const h = world.worldHeightPixels();
+    // radius = influence footprint only; AI discovery uses a separate fixed
+    // query radius (see `interest_marker_query_radius` in ai.zig).
+    const markers = [_]struct { x: f32, y: f32 }{
+        .{ .x = w * 0.25, .y = h * 0.5 },
+        .{ .x = w * 0.42, .y = h * 0.48 },
+        .{ .x = w * 0.58, .y = h * 0.52 },
+        .{ .x = 96, .y = h * 0.5 },
+    };
+    for (markers) |m| {
+        _ = try world.addInterestMarker(.{
+            .kind = .investigate,
+            .level = 0,
+            .x = m.x,
+            .y = m.y,
+            .radius = 64,
+        });
+    }
 }
 
 fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, index: usize) !EntityId {
@@ -900,10 +985,8 @@ fn spawnDemoMover(data: *DataSystem, world: *WorldSystem, spec: DemoSpawnSpec, i
         break :blk e;
     };
 
-    const z = world.levelBaseZ(spec.world_level);
     const body = data.movementBodyPtr(entity).?;
-    body.position_z.* = z;
-    body.previous_z.* = z;
+    body.snapZ(world.levelBaseZ(spec.world_level));
     try data.setSimulationMetadata(entity, .{
         .tier = .cognition,
         .chunk = world.chunkCoordForWorldPos(spec.position.x, spec.position.y),
@@ -925,78 +1008,40 @@ fn demoColorForIndex(index: usize) config.Color {
     return .{ .r = 0.35 + hue * 0.5, .g = 0.45 + (1 - hue) * 0.4, .b = 0.55 + hue * 0.35, .a = 1.0 };
 }
 
-/// Full component bundle for one demo mover's personality. `behavior == null`
-/// means no `AiAgent` at all (a pure physics/collision body); `perception`/
-/// `memory`/`affect` are independently optional so an entity can carry
-/// `AiAgent` without full cognition (arbitration treats an absent component
-/// as zero signal, per `arbitration.zig`).
-const DemoArchetype = struct {
-    behavior: ?AiAgent,
-    perception: ?AiPerception = null,
-    memory: ?AiMemory = null,
-    affect: ?AiAffect = null,
-    faction: Faction = .hostile,
+/// Length of the demo's fixed personality cycle (one slot per `AiArchetypeId`).
+const demo_archetype_cycle_len: usize = ai_archetypes.archetype_count;
+
+/// The demo's 8-slot spawn cycle in slot order. `AiArchetypeId` tags are already
+/// authored in this order, so slot `i` resolves to bundle `demo_slot_ids[i]`:
+/// 0 wanderer (wander-only, zero pursue gain), 1 pursuer (`focus_target`
+/// fallback), 2 inert (no `AiAgent`), 3 timid (`.ally`, high fear/flee, full
+/// cognition), 4 aggressive (high aggression/pursue, full cognition), 5 curious
+/// (high curiosity/investigate, full cognition), 6 cohesive (cohere from the
+/// shared spatial index, no cognition components), 7 pursuer_strong. Slots 3/4/5
+/// are the `demoCognitionAgentCount` subset that attaches `AiPerception` +
+/// `AiAffect`. Bundles are data-driven from `assets/ai/archetypes.json`.
+const demo_slot_ids: [demo_archetype_cycle_len]AiArchetypeId = .{
+    .wanderer,
+    .pursuer,
+    .inert,
+    .timid,
+    .aggressive,
+    .curious,
+    .cohesive,
+    .pursuer_strong,
 };
 
-/// Length of `demoArchetypeForIndex`'s fixed personality cycle.
-const demo_archetype_cycle_len: usize = 8;
+comptime {
+    std.debug.assert(demo_slot_ids.len == 8);
+}
 /// Count of cycle slots that attach `AiPerception` + `AiAffect` (timid,
-/// aggressive, curious) — kept in sync with the switch below by
-/// `demoCognitionAgentCount`'s doc comment; update both together.
+/// aggressive, curious) — kept in sync with `demo_slot_ids`' cognition subset
+/// by `demoCognitionAgentCount`'s doc comment; update both together.
 const demo_cognition_archetypes_per_cycle: usize = 3;
 
-/// Hardcoded personality archetypes for the demo (full data-driven archetype
-/// JSON is Slice 33). A subset of demo movers gets full cognition
-/// (`AiPerception` + `AiMemory` + `AiAffect`) with a distinct emotion
-/// baseline and gain profile each:
-///
-/// - `timid` (index 3, `.ally` faction): high `baseline_fear` / `gain_flee`.
-///   `.ally` faction makes the `.hostile`-faction majority (including
-///   `aggressive`) a genuine perceived threat, so fear/flee has a real
-///   non-player source, not just the demo `focus_target` fallback.
-/// - `aggressive` (index 4): high `baseline_aggression` / `gain_pursue`.
-///   Perceives `timid`'s `.ally` faction as hostile, so it can chase a
-///   non-player target purely from perception.
-/// - `curious` (index 5): high `baseline_curiosity` / `gain_investigate`,
-///   reacts to heard dig stimuli.
-/// - `cohesive` (index 6): high `gain_cohere` only -- cohere's goal comes
-///   from the shared spatial index (`ai.zig`'s neighbor-mean gather), not
-///   perception/memory/affect, so no cognition components are needed.
-///
-/// The remaining slots keep pre-arbitration-style contrast groups: a
-/// wander-only `AiAgent` with zero pursue gain (index 0), two
-/// `focus_target`-fallback pursuers with no cognition components (indices 1
-/// and 7) that only ever reach the player through arbitration's documented
-/// last-resort fallback, and a pure wanderer with no `AiAgent` at all (index
-/// 2). Indices 0/1 intentionally keep a real `AiAgent` (never `null`): a
-/// handful of tests pin `test_squares[0]`/`[1]`/`[3]` as "the AI squares".
-fn demoArchetypeForIndex(index: usize) DemoArchetype {
-    return switch (index % demo_archetype_cycle_len) {
-        0 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 58, .gain_pursue = 0 } },
-        1 => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 4, .gain_pursue = 1.2 } },
-        2 => .{ .behavior = null },
-        3 => .{
-            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 20, .gain_flee = 2.0, .gain_pursue = 0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_fear = 0.65 },
-            .faction = .ally,
-        },
-        4 => .{
-            .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 6, .gain_pursue = 2.0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_aggression = 0.65 },
-        },
-        5 => .{
-            .behavior = .{ .active_behavior = .wander, .wander_amplitude = 15, .gain_investigate = 2.0 },
-            .perception = .{},
-            .memory = .{},
-            .affect = .{ .baseline_curiosity = 0.65 },
-        },
-        6 => .{ .behavior = .{ .active_behavior = .wander, .wander_amplitude = 10, .gain_cohere = 2.0 } },
-        else => .{ .behavior = .{ .active_behavior = .pursue, .wander_amplitude = 7, .gain_pursue = 1.55 } },
-    };
+/// Resolves the data-driven bundle for the demo's cyclic personality slot.
+fn demoArchetypeForIndex(catalog: *const AiArchetypeCatalog, index: usize) DemoArchetype {
+    return catalog.bundleForId(demo_slot_ids[index % demo_archetype_cycle_len]);
 }
 
 fn demoSteeringAgent(size: math.Vec2) SteeringAgent {
@@ -1049,6 +1094,8 @@ fn spawnObstacles(data: *DataSystem, world: *const WorldSystem) ![obstacle_count
         try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+        // Slice 45: demo crates are one-shot destructibles (R / interact).
+        try data.setDestructible(entity, .{ .hit_points = 1 });
         entities[index] = entity;
     }
     return entities;
@@ -1085,6 +1132,7 @@ fn spawnObstaclesCompact(data: *DataSystem) ![obstacle_count]EntityId {
         try data.setAssetReference(entity, .{ .sprite = .demo_tile });
         try data.setCollisionBounds(entity, .{ .size = spec.size });
         try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+        try data.setDestructible(entity, .{ .hit_points = 1 });
         entities[index] = entity;
     }
     return entities;
@@ -1167,6 +1215,7 @@ fn initDemoForTest(allocator: std.mem.Allocator) !GameDemoState {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
 }
 
@@ -1304,6 +1353,7 @@ test "demo spawns atlas-backed moving actors (non-compact world)" {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
     defer demo.deinit();
 
@@ -1371,7 +1421,7 @@ test "demo init validates atlas-backed references at loading boundary" {
     var runtime_assets = try runtimeAssetsWithDemoMetadataForTest();
     defer deinitRuntimeAssetMetadataForTest(&runtime_assets);
 
-    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height);
+    var demo = try GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), demo_test_viewport_width, demo_test_viewport_height);
     defer demo.deinit();
 
     try std.testing.expectEqual(@as(usize, default_demo_mover_count + obstacle_count + 1), demo.data.assetReferenceSliceConst().entities.len);
@@ -1401,6 +1451,7 @@ test "procedural demo uses large world bounds and interpolated follow camera" {
         null,
         null,
         default_demo_mover_count,
+        asset_store,
     );
     defer demo.deinit();
 
@@ -1430,7 +1481,7 @@ test "demo init rejects missing character atlas metadata" {
 
     try std.testing.expectError(
         error.SpriteAtlasMetadataUnavailable,
-        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, demo_test_viewport_width, demo_test_viewport_height),
+        GameDemoState.initWithRuntimeAssets(std.testing.allocator, &runtime_assets, AssetStore.init(std.testing.allocator, std.testing.io, "assets"), demo_test_viewport_width, demo_test_viewport_height),
     );
 }
 
@@ -1450,6 +1501,7 @@ test "demo world tile event invalidates navigation after commit reaction" {
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
     try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
+    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     var nav_invalidated = false;
     for (demo.simulation_frame.events.mergedItems()) |event| {
@@ -1467,7 +1519,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame); // seed player_last_cell = (3,3)
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 
     // Dig a hole in the faced cell on the surface plane.
@@ -1477,7 +1529,7 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
 
     // Walk into the hole -> fall exactly one level onto the dirt plane.
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(1), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
@@ -1487,14 +1539,14 @@ test "demo dig hole drops the player one plane and a ramp climbs back" {
     try std.testing.expect(!demo.world.denseTileBlocksMovement(floor1, 4, 3));
 
     // Standing put: no second fall.
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // On the dirt plane, dig a ramp in the faced cell (5,3), then walk onto it.
     try digFacedForTest(&demo, .ramp);
     try std.testing.expectEqual(@as(u16, 1), demo.world.levelLinks().len);
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(0), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 }
@@ -1509,12 +1561,12 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
 
     // Fall to the dirt plane, then dig a ramp at the faced interior cell (5,3).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     try digFacedForTest(&demo, .ramp);
@@ -1522,10 +1574,11 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     // The real per-step nav re-mask the live game runs each frame. Must not panic.
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
     try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
+    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     // The link still climbs planes via the world tier (independent of the abstract graph).
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
 }
 
@@ -1535,12 +1588,12 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     demo.data.facingPtr(demo.player.entity).?.* = .right;
     placePlayerInCell(&demo, 3, 3); // stands on (3,3), faces (4,3)
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame); // seed player_last_cell = (3,3)
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player); // seed player_last_cell = (3,3)
 
     // Surface hole + fall onto the dirt plane (level 1), landing carved at (4,3).
     try digFacedForTest(&demo, .hole);
     placePlayerInCell(&demo, 4, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
 
     // Dig DOWN through the faced cell (5,3): a see-through hole, not a tunnel carve.
@@ -1550,7 +1603,7 @@ test "demo dig down drops the player through the dirt plane to the void plane" {
 
     // Walk into it -> fall one more level onto the void plane (level 2).
     placePlayerInCell(&demo, 5, 3);
-    try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player, &demo.simulation_frame);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 2), demo.player.current_level);
     try std.testing.expectEqual(demo.world.levelBaseZ(2), demo.data.movementBodyConst(demo.player.entity).?.position_z);
 
@@ -1603,6 +1656,7 @@ test "demo multi-cell obstacle rect event blocks every covered nav cell in one b
 
     demo.last_nav_update_stats = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
     try demo.pipeline.reactToPostCommitPerceptionEvents(&demo.simulation_frame, &demo.world);
+    demo.pipeline.reactToPostCommitSteeringEvents(&demo.simulation_frame);
 
     // The incremental update ran; a pure incremental dig keeps nav_version stable
     // (caches are scope-evicted, not version-invalidated), so no version bump.
@@ -1646,7 +1700,7 @@ test "demo owns and completes a simulation frame during update" {
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
     const player_before = demo.data.movementBodyConst(demo.player.entity).?;
     var square_before: [default_demo_mover_count]math.Vec2 = undefined;
     for (demo.test_squares, 0..) |entity, index| {
@@ -1657,6 +1711,7 @@ test "demo owns and completes a simulation frame during update" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1698,12 +1753,13 @@ test "demo queues jet loop audio only on movement edges" {
     placePlayerInCell(&demo, 3, 3);
     demo.player.syncPreviousPosition(&demo.data);
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
 
     try demo.update(.{
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1716,6 +1772,7 @@ test "demo queues jet loop audio only on movement edges" {
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1723,12 +1780,13 @@ test "demo queues jet loop audio only on movement edges" {
     try std.testing.expect(demo.pipeline.audio_controller.jet_loop_active);
     try std.testing.expectEqual(@as(usize, 1), ambientAudioCommandCount(&audio));
 
-    input.setHeld(.moveRight, false);
+    input.setHeld(.move_right, false);
     audio.beginStep();
     try demo.update(.{
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1761,12 +1819,13 @@ test "demo collision response blocks player against obstacles" {
     player_body.previous_x.* = player_body.position_x.*;
     player_body.previous_y.* = player_body.position_y.*;
     var input = InputState{};
-    input.setHeld(.moveRight, true);
+    input.setHeld(.move_right, true);
 
     try demo.update(.{
         .input = &input,
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1813,6 +1872,7 @@ test "demo ai processor drives non-player squares via intents (seek_target deter
             .input = &InputState{},
             .audio = &audio,
             .runtime_assets = &runtime_assets,
+            .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
             .delta_seconds = 0.016,
             .transitions = &transitions,
             .thread_system = &threads,
@@ -1885,6 +1945,7 @@ test "demo collision response handles player contacts with moving entities" {
         .input = &InputState{},
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1927,6 +1988,7 @@ test "ai squares use consistent math.clamp and zero velocity on bounds (main thr
         .input = &InputState{},
         .audio = &audio,
         .runtime_assets = &runtime_assets,
+        .asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets"),
         .delta_seconds = 0.016,
         .transitions = &transitions,
         .thread_system = &threads,
@@ -1990,15 +2052,17 @@ test "demo event capacity covers every NPC falling plus player fall, mining, str
     // the same step: `applyNpcPlaneTraversal` walks every AI agent and can emit up
     // to `default_demo_mover_count` fall events, plus the player's own plane-traversal
     // fall (1) and dig-mining event (1), plus up to the derived structural reserve
-    // structural-commit events, plus the post-commit nav-invalidation headroom (1),
+    // structural-commit events (tier + fixed dig/create + action_intent_live_capacity
+    // destructible destroys), plus the post-commit nav-invalidation headroom (1),
     // plus the `demoArchetypeForIndex` cognition subset's worst-case perception
-    // (2/agent) and affect (4/agent) events.
+    // (2/agent) and affect (4/agent) events, plus action_intent_live_capacity for
+    // destructible_destroyed domain events (Slice 45).
     //
-    // The 155 below is a hard-coded expectation, not re-derived from
+    // The 283 below is a hard-coded expectation, not re-derived from
     // deriveDemoPopulationCapacity: re-deriving it here would make this assertion pass
     // trivially even if that formula drifted, since both sides would drift together.
     // A literal catches that.
-    const worst_case_event_count: usize = 155;
+    const worst_case_event_count: usize = 283;
     try std.testing.expectEqual(worst_case_event_count, deriveDemoPopulationCapacity(default_demo_mover_count).event_reserve);
 
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;

@@ -67,18 +67,17 @@ pub const MainMenuState = struct {
     }
 
     pub fn handleEvent(self: *MainMenuState, event: *const c.SDL_Event, transitions: *StateTransitions) !bool {
-        if (event.type != c.SDL_EVENT_KEY_DOWN or event.key.repeat) return false;
-        const action = inputFile.actionForKey(event.key.key) orelse return false;
+        const action = inputFile.actionForPressEvent(event) orelse return false;
         switch (action) {
-            .menuUp => {
+            .menu_up => {
                 self.changeSelection(-1);
                 return true;
             },
-            .menuDown => {
+            .menu_down => {
                 self.changeSelection(1);
                 return true;
             },
-            .resumeGame => {
+            .resume_game => {
                 try self.activate(transitions);
                 return true;
             },
@@ -151,13 +150,30 @@ pub const MainMenuState = struct {
                     self.allocator.destroy(loading_ptr);
                 };
 
-                loading_ptr.* = LoadingState.init(self.allocator, .game_demo, self.width, self.height, default_world_build_config);
+                loading_ptr.* = LoadingState.init(
+                    self.allocator,
+                    .game_demo,
+                    self.width,
+                    self.height,
+                    default_world_build_config,
+                    // Clone by value so a failed load can rebuild MainMenu with
+                    // the same volumes after this menu state is replaced away.
+                    self.audio_settings,
+                );
                 initialized = true;
                 const state = State.fromOwnedPtr(LoadingState, loading_ptr);
                 owned_by_transition = true;
                 try transitions.replaceOwnedState(state, state_policy.opaque_screen);
             },
             1 => {
+                // SettingsMenuState borrows a raw pointer into this MainMenuState's
+                // `audio_settings`. That is sound because this MainMenuState must
+                // outlive the modal it pushes: the modal sits above this state on the
+                // state stack, and the stack's LIFO pop / replace-all destruction
+                // semantics guarantee the modal is destroyed no later than its parent.
+                // Each state is separately heap-allocated (State.create), so this
+                // state's address — and thus `&self.audio_settings` — stays stable
+                // even as the stack's backing storage grows.
                 try transitions.pushModal(SettingsMenuState, SettingsMenuState.init(&self.audio_settings, self.width, self.height));
             },
             2 => {
@@ -216,16 +232,37 @@ test "main menu handleEvent uses named input actions" {
     var transitions = StateTransitions.init(std.testing.allocator);
     defer transitions.deinit();
 
-    var up = keyEventForAction(.menuUp);
+    var up = keyEventForAction(.menu_up);
     try std.testing.expect(try menu.handleEvent(&up, &transitions));
     try std.testing.expectEqual(@as(usize, 2), menu.selected);
 
-    var down = keyEventForAction(.menuDown);
+    var down = keyEventForAction(.menu_down);
     try std.testing.expect(try menu.handleEvent(&down, &transitions));
     try std.testing.expectEqual(@as(usize, 0), menu.selected);
 
     menu.selected = 2;
-    var confirm = keyEventForAction(.resumeGame);
+    var confirm = keyEventForAction(.resume_game);
+    try std.testing.expect(try menu.handleEvent(&confirm, &transitions));
+    try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
+}
+
+test "main menu handleEvent uses named gamepad input actions identically to keyboard" {
+    var menu = MainMenuState.init(std.testing.allocator, 800, 450, .{});
+    defer menu.deinit();
+
+    var transitions = StateTransitions.init(std.testing.allocator);
+    defer transitions.deinit();
+
+    var up = gamepadButtonEventForAction(.menu_up);
+    try std.testing.expect(try menu.handleEvent(&up, &transitions));
+    try std.testing.expectEqual(@as(usize, 2), menu.selected);
+
+    var down = gamepadButtonEventForAction(.menu_down);
+    try std.testing.expect(try menu.handleEvent(&down, &transitions));
+    try std.testing.expectEqual(@as(usize, 0), menu.selected);
+
+    menu.selected = 2;
+    var confirm = gamepadButtonEventForAction(.resume_game);
     try std.testing.expect(try menu.handleEvent(&confirm, &transitions));
     try std.testing.expectEqual(@as(usize, 1), transitions.requests.items.len);
 }
@@ -264,6 +301,24 @@ fn keyEventForAction(action: inputFile.Action) c.SDL_Event {
                 .raw = 0,
                 .down = true,
                 .repeat = false,
+            } };
+        }
+    }
+    unreachable;
+}
+
+fn gamepadButtonEventForAction(action: inputFile.Action) c.SDL_Event {
+    for (inputFile.default_gamepad_bindings) |binding| {
+        if (binding.action == action) {
+            return c.SDL_Event{ .gbutton = .{
+                .type = c.SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+                .reserved = 0,
+                .timestamp = 0,
+                .which = 0,
+                .button = @intCast(binding.button),
+                .down = true,
+                .padding1 = 0,
+                .padding2 = 0,
             } };
         }
     }

@@ -42,6 +42,9 @@ pub const Player = struct {
         try data.setPrimitiveVisual(entity, playerVisual());
         try data.setAssetReference(entity, .{ .sprite = .grim_characters, .atlas_entry_id = 0 });
         try data.setFaction(entity, .player);
+        // Pre-attach surface world_level so the first plane-traversal fall cannot
+        // OOM on component growth after carveLandingCell has already mutated a tile.
+        try data.setWorldLevel(entity, 0);
 
         return .{ .entity = entity };
     }
@@ -96,7 +99,6 @@ pub const Player = struct {
         const body = data.movementBodyPtr(self.entity) orelse return;
         body.previous_x.* = body.position_x.*;
         body.previous_y.* = body.position_y.*;
-        body.previous_z.* = body.position_z.*;
     }
 };
 
@@ -113,6 +115,13 @@ fn playerVisual() PrimitiveVisual {
     };
 }
 
+test "player spawn pre-attaches surface world_level" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    try std.testing.expectEqual(@as(?u16, 0), data.worldLevelConst(player.entity));
+}
+
 test "player movement clamps to state bounds" {
     const movement = @import("systems/movement.zig");
     var data = DataSystem.init(std.testing.allocator);
@@ -125,8 +134,8 @@ test "player movement clamps to state bounds" {
         .speed = Player.speed,
     });
     var input = InputState{};
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
     var movement_slice = data.movementBodySlice();
@@ -144,7 +153,7 @@ test "player facing updates from movement and remains while idle" {
     const player = try Player.spawn(&data);
 
     var input = InputState{};
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
     try std.testing.expectEqual(Facing.up, data.facingConst(player.entity).?.direction);
@@ -169,8 +178,8 @@ test "player horizontal facing wins for diagonal movement" {
     const player = try Player.spawn(&data);
 
     var input = InputState{};
-    input.setHeld(.moveRight, true);
-    input.setHeld(.moveUp, true);
+    input.setHeld(.move_right, true);
+    input.setHeld(.move_up, true);
 
     try player.applyInput(&data, &input);
 
@@ -186,23 +195,18 @@ test "player pause and resume sync previous position to current data position" {
     body.position_y.* = 24;
     body.previous_x.* = 2;
     body.previous_y.* = 4;
-    body.position_z.* = 12;
-    body.previous_z.* = 2;
 
     player.onPause(&data);
 
     const paused = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(paused.position.x, paused.previous_position.x);
     try std.testing.expectEqual(paused.position.y, paused.previous_position.y);
-    try std.testing.expectEqual(paused.position_z, paused.previous_z);
 
     body.position_x.* = 48;
     body.position_y.* = 96;
-    body.position_z.* = 24;
     player.onResume(&data);
 
     const resumed = data.movementBodyConst(player.entity).?;
     try std.testing.expectEqual(resumed.position.x, resumed.previous_position.x);
     try std.testing.expectEqual(resumed.position.y, resumed.previous_position.y);
-    try std.testing.expectEqual(resumed.position_z, resumed.previous_z);
 }

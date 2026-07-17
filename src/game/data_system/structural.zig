@@ -31,6 +31,8 @@ const validateSteeringAgent = @import("agents.zig").validateSteeringAgent;
 const validateAiPerception = @import("perception.zig").validateAiPerception;
 const validateAiMemory = @import("memory.zig").validateAiMemory;
 const validateAiAffect = @import("affect.zig").validateAiAffect;
+// Destructible payloads are scalar bools + u8 — no fallible validation beyond
+// StructuralCommand payload shape (see validateStructuralCommands else branch).
 
 pub const NullStructuralChangeSink = struct {
     fn record(_: *NullStructuralChangeSink, _: StructuralChange) void {}
@@ -57,6 +59,7 @@ const StructuralCapacityNeeds = struct {
     ai_perceptions: usize,
     ai_memories: usize,
     ai_affects: usize,
+    destructibles: usize,
 
     fn init(data: *const DataSystem) StructuralCapacityNeeds {
         return .{
@@ -74,6 +77,7 @@ const StructuralCapacityNeeds = struct {
             .ai_perceptions = data.ai_perceptions.len(),
             .ai_memories = data.ai_memories.len(),
             .ai_affects = data.ai_affects.len(),
+            .destructibles = data.destructibles.len(),
         };
     }
 
@@ -92,6 +96,7 @@ const StructuralCapacityNeeds = struct {
         if (self.ai_perceptions > std.math.maxInt(u32)) return error.TooManyAiPerceptionRows;
         if (self.ai_memories > std.math.maxInt(u32)) return error.TooManyAiMemoryRows;
         if (self.ai_affects > std.math.maxInt(u32)) return error.TooManyAiAffectRows;
+        if (self.destructibles > std.math.maxInt(u32)) return error.TooManyDestructibleRows;
     }
 };
 
@@ -138,6 +143,7 @@ const StructuralCapacityProjection = struct {
         if (template.ai_perception != null) try self.addComponent(.ai_perception);
         if (template.ai_memory != null) try self.addComponent(.ai_memory);
         if (template.ai_affect != null) try self.addComponent(.ai_affect);
+        if (template.destructible != null) try self.addComponent(.destructible);
     }
 
     fn addComponent(self: *StructuralCapacityProjection, component: Component) !void {
@@ -168,6 +174,7 @@ const StructuralCapacityProjection = struct {
             .ai_perception => &self.current.ai_perceptions,
             .ai_memory => &self.current.ai_memories,
             .ai_affect => &self.current.ai_affects,
+            .destructible => &self.current.destructibles,
         };
     }
 
@@ -186,6 +193,7 @@ const StructuralCapacityProjection = struct {
             .ai_perception => &self.required.ai_perceptions,
             .ai_memory => &self.required.ai_memories,
             .ai_affect => &self.required.ai_affects,
+            .destructible => &self.required.destructibles,
         };
     }
 };
@@ -296,6 +304,7 @@ fn templateComponentCount(template: EntityTemplate) usize {
     if (template.ai_perception != null) count += 1;
     if (template.ai_memory != null) count += 1;
     if (template.ai_affect != null) count += 1;
+    if (template.destructible != null) count += 1;
     return count;
 }
 
@@ -327,7 +336,10 @@ pub fn applyStructuralCommandsPrepared(
     return try commitStructuralCommands(self, commands, change_sink);
 }
 
-pub fn commitStructuralCommands(
+/// File-private: only `applyStructuralCommandsPrepared` (and its unprepared
+/// wrappers) may commit. Callers must go through preflight/prepared entry points
+/// so capacity is reserved before mutation.
+fn commitStructuralCommands(
     self: *DataSystem,
     commands: []const StructuralCommand,
     change_sink: anytype,
@@ -349,6 +361,8 @@ pub fn commitStructuralCommands(
                 const component_mask = self.componentMaskFor(entity);
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
                 const obstacle_world_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null;
+                // Capture plane before destroy: world_level row is removed with the entity.
+                const level = self.worldLevelConst(entity) orelse 0;
                 if (self.destroyEntity(entity)) {
                     stats.destroyed += 1;
                     change_sink.record(.{ .entity_destroyed = .{
@@ -356,6 +370,7 @@ pub fn commitStructuralCommands(
                         .component_mask = component_mask,
                         .was_static_navigation_obstacle = was_static_navigation_obstacle,
                         .obstacle_world_rect = obstacle_world_rect,
+                        .level = level,
                     } });
                 } else {
                     stats.stale_skipped += 1;
@@ -505,6 +520,16 @@ pub fn commitStructuralCommands(
                 stats.components_set += 1;
                 recordComponentChange(self, change_sink, set.entity, .ai_affect, was_static_navigation_obstacle, null);
             },
+            .set_destructible => |set| {
+                if (!self.isAlive(set.entity)) {
+                    stats.stale_skipped += 1;
+                    continue;
+                }
+                const was_static_navigation_obstacle = self.isStaticNavigationObstacle(set.entity);
+                try self.setDestructible(set.entity, set.destructible);
+                stats.components_set += 1;
+                recordComponentChange(self, change_sink, set.entity, .destructible, was_static_navigation_obstacle, null);
+            },
         }
     }
     return stats;
@@ -560,6 +585,7 @@ pub fn preflightStructuralCommands(
             .set_ai_perception => |set| try preflightSetComponent(self, set.entity, .ai_perception, scratch, &projection, &structural_event_count),
             .set_ai_memory => |set| try preflightSetComponent(self, set.entity, .ai_memory, scratch, &projection, &structural_event_count),
             .set_ai_affect => |set| try preflightSetComponent(self, set.entity, .ai_affect, scratch, &projection, &structural_event_count),
+            .set_destructible => |set| try preflightSetComponent(self, set.entity, .destructible, scratch, &projection, &structural_event_count),
             .set_simulation_tier => {},
         }
     }
@@ -606,6 +632,7 @@ fn reserveStructuralPlanCapacity(self: *DataSystem, plan: StructuralCommitPlan) 
     try self.ai_perceptions.ensureCapacity(self.allocator, plan.capacity_needs.ai_perceptions);
     try self.ai_memories.ensureCapacity(self.allocator, plan.capacity_needs.ai_memories);
     try self.ai_affects.ensureCapacity(self.allocator, plan.capacity_needs.ai_affects);
+    try self.destructibles.ensureCapacity(self.allocator, plan.capacity_needs.destructibles);
 }
 
 pub fn validateStructuralCommands(commands: []const StructuralCommand) !void {
@@ -677,18 +704,23 @@ fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype,
     if (template.ai_perception != null) recordComponentChange(self, change_sink, entity, .ai_perception, false, null);
     if (template.ai_memory != null) recordComponentChange(self, change_sink, entity, .ai_memory, false, null);
     if (template.ai_affect != null) recordComponentChange(self, change_sink, entity, .ai_affect, false, null);
+    if (template.destructible != null) recordComponentChange(self, change_sink, entity, .destructible, false, null);
 }
 
 fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool, old_rect: ?ObstacleWorldRect) void {
     const is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
-    change_sink.record(.{ .component_changed = .{
-        .entity = entity,
-        .component = component,
-        .was_static_navigation_obstacle = was_static_navigation_obstacle,
-        .is_static_navigation_obstacle = is_static_navigation_obstacle,
-        .old_obstacle_world_rect = old_rect,
-        .new_obstacle_world_rect = if (is_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null,
-    } });
+    change_sink.record(.{
+        .component_changed = .{
+            .entity = entity,
+            .component = component,
+            .was_static_navigation_obstacle = was_static_navigation_obstacle,
+            .is_static_navigation_obstacle = is_static_navigation_obstacle,
+            .old_obstacle_world_rect = old_rect,
+            .new_obstacle_world_rect = if (is_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null,
+            // Post-set plane (world_level after this command when that component changed).
+            .level = self.worldLevelConst(entity) orelse 0,
+        },
+    });
 }
 
 fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
@@ -745,6 +777,10 @@ fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: Entity
         try self.setAiAffect(entity, ai_affect);
         components_set += 1;
     }
+    if (template.destructible) |destructible| {
+        try self.setDestructible(entity, destructible);
+        components_set += 1;
+    }
     return components_set;
 }
 
@@ -779,6 +815,14 @@ test "StructuralCapacityNeeds.validateLimits rejects an ai_affects count beyond 
 
     needs.ai_affects = @as(usize, std.math.maxInt(u32)) + 1;
     try std.testing.expectError(error.TooManyAiAffectRows, needs.validateLimits());
+}
+
+test "StructuralCapacityNeeds.validateLimits rejects a destructibles count beyond u32" {
+    var needs = std.mem.zeroes(StructuralCapacityNeeds);
+    try needs.validateLimits();
+
+    needs.destructibles = @as(usize, std.math.maxInt(u32)) + 1;
+    try std.testing.expectError(error.TooManyDestructibleRows, needs.validateLimits());
 }
 
 // Test-local capturing change sink: NullStructuralChangeSink (used by every other test in
@@ -836,6 +880,8 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     const entity = created_entity orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected_rect, create_new_rect orelse return error.TestExpectedEqual);
 
+    // Stamp a non-zero plane so destroy/component-changed carry multi-level readiness.
+    try data.setWorldLevel(entity, 2);
     sink.changes.clearRetainingCapacity();
 
     const moved_position = math.Vec2{ .x = 100, .y = 200 };
@@ -855,6 +901,7 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     const move_change = sink.changes.items[0].component_changed;
     try std.testing.expectEqual(expected_rect, move_change.old_obstacle_world_rect orelse return error.TestExpectedEqual);
     try std.testing.expectEqual(expected_new_rect, move_change.new_obstacle_world_rect orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(@as(u16, 2), move_change.level);
 
     sink.changes.clearRetainingCapacity();
 
@@ -862,4 +909,5 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     try std.testing.expectEqual(@as(usize, 1), sink.changes.items.len);
     const destroy_change = sink.changes.items[0].entity_destroyed;
     try std.testing.expectEqual(expected_new_rect, destroy_change.obstacle_world_rect orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(@as(u16, 2), destroy_change.level);
 }

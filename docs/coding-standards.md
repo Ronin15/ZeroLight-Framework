@@ -7,9 +7,16 @@ treat these as repo standards, not optional style notes.
 ## Zig Style
 
 Follow `zig fmt`; use 4-space indentation and avoid manual alignment that the
-formatter will rewrite. Use lowerCamelCase for variables and functions,
-PascalCase for types, and short descriptive names. Keep error sets explicit
-when practical, as in `error{SdlError}`.
+formatter will rewrite. Follow Zig's standard naming: camelCase for functions
+and other callables, snake_case for variables, struct fields, and non-type
+constants, PascalCase for types (and functions that return a type), and short
+descriptive names. Keep error sets explicit when practical, as in
+`error{SdlError}`. The `*anyopaque` + `anyerror!T` function-pointer vtables at
+type-erased service boundaries (state adapters, asset upload, audio/text
+backends) are the accepted "not practical" exception: the concrete error set
+cannot be named across the erased boundary, and these sit on cold
+setup/service paths, not hot per-frame dispatch, so they do not violate the
+"avoid broad dynamic dispatch" performance rule below.
 
 Prefer direct declaration imports for project types and constants when that
 keeps call sites clear, such as `const Engine = @import("app/engine.zig").Engine;`
@@ -21,6 +28,12 @@ function or namespace lookup, such as `inputFile.actionForKey(...)` or
 Avoid `_mod` suffixes, `const Type = file.Type` bridge aliases, and double names
 such as `thread.ThreadSystem`. Do not rewrite SDL/C symbols, generated
 build-option names, or `std.Build` field names.
+
+Use current standard-library spellings. `std.ArrayList` is the unmanaged list in
+Zig 0.16 (it takes an explicit allocator per operation and initializes as
+`.empty`); do not use the deprecated `std.ArrayListUnmanaged` alias for new or
+edited code. Prefer the modern initializer forms (`= .empty`, `.{}`) over
+removed managed-container constructors.
 
 Keep `Renderer` as the render facade for app/game code. Do not import
 `src/render/gpu/*` outside the render/platform boundary.
@@ -47,7 +60,39 @@ strips the debug assert backing `assumeCapacity`'s capacity check and disables
 bounds/overflow safety checks; an unproven reserve is a silent
 memory-corruption risk in the shipped binary, not a missed optimization. Add
 the proof test in the same change that adds the `assumeCapacity` call — do not
-defer it.
+defer it. When the reserve and its `assumeCapacity` commit live in separate
+functions or public entry points (not one guarded helper), the proof must
+exercise the reserved-then-push **success** branch — reserve, then arm the
+allocator to fail on the next allocation, and assert the push completes — not
+just the reserve-fails cleanup branch, since split sizing can silently desync
+from the push count across a future edit.
+
+The same ReleaseFast safety-strip applies to `unreachable`, `catch unreachable`,
+and `orelse unreachable` (including `.?`, which is `orelse unreachable`): in the
+shipped binary a reached `unreachable` is undefined behavior, not a panic. All
+are permitted only where the state is provably impossible by construction — the
+established use is generational-handle constructors bounded by capacity
+(`TextureId.init(...) catch unreachable`, `EntityId.init(...) catch unreachable`),
+whose failure case cannot occur within the reserved index/generation range. Hold
+`unreachable` to the same "provable, not merely expected" bar as `assumeCapacity`;
+if a failure is recoverable or attacker/data-influenced, return an error or
+assert instead. The same strip makes narrowing casts unsafe: widen signed
+coordinate/cell spans to `i64`/`usize` before subtracting and `@intCast`-ing to
+an unsigned width/capacity, clamp while wide, then narrow — a saturated
+float→`i32` conversion makes `@intCast(max - min + 1)` overflow/out-of-range UB,
+not a panic.
+
+This is enforced by `zig build idiom-lint` (part of `zig build verify`): a
+`catch unreachable` / `orelse unreachable` outside a `test` block is rejected
+unless it is on a sanctioned handle constructor or carries an explicit
+`// lint:allow catch-unreachable: <reason>` justification at the site. Do not add
+the annotation to silence the lint on a genuinely recoverable failure — propagate
+the error instead (the reference case is `SpriteBatch.buildSerial`, which returns
+`!void` rather than folding `ensureFrameStorage`'s allocation error into UB). The
+same lint gate enforces snake_case struct fields/parameters, `k_snake_case`
+constants, and current stdlib spellings (no `std.ArrayListUnmanaged`,
+`usingnamespace`, `std.mem.copy`/`set`, `std.BoundedArray`); its rules live in
+`tools/lint_idioms.py`.
 
 When a collection is written from more than one thread, both of these must
 hold and be verifiable by reading the call site, not just asserted in a
@@ -61,10 +106,29 @@ comment:
    selection/profile value the dispatch itself uses, so buffer size and
    worker/range count cannot drift apart across a future edit.
 
-New threaded hot-path code should add a `std.debug.assert` at the top of the
-worker job comparing its `worker_id`/`range.index` against the buffer length
-captured at dispatch time, so a future refactor that breaks this ordering
-fails loudly in Debug/ReleaseSafe instead of silently in ReleaseFast.
+New threaded hot-path code should open each worker job with a `std.debug.assert`
+covering **both** its write range against the buffer length and `range.index`
+against the dispatched range count, captured at dispatch time — a stage cloned
+from a sibling routinely keeps one and drops the other, and the missing guard is
+a silent OOB write in ReleaseFast rather than a Debug/ReleaseSafe panic. The
+`FailingAllocator` proof above must likewise exercise the real multi-worker
+`ThreadSystem`, not only the serial/inline branch: an undersized reserve on the
+threaded path fails as a concurrent shared-allocator call (a data race), not a
+clean single-threaded OOM.
+
+A partitioned processor that **emits an event stream** (not just scatters values
+into disjoint slots) under a per-step cap has a second requirement beyond
+disjoint writes: the merged emit order — and therefore which events survive the
+cap — is canonical and partition-independent. Such processors emit in a stable
+key order (per row, with a row's sub-kinds grouped, as
+`PerceptionSystem.emitTransitionsForRange` and `AffectSystem`'s per-row crossing
+emit do), or sort the merged buffer by that key before applying the cap. Emitting
+one sub-kind or column at a time across a whole range makes both the merged order
+and the capped membership depend on how many ranges the tuner picked, so
+serial/threaded output diverges even though the scatter is race-free. Parity
+tests for these processors cross two or more event kinds for entities in
+different ranges and include a capped case — a single-kind fixture is row-ordered
+identically in both paths and hides the divergence.
 
 Allocators are owned explicitly: every allocating struct takes an
 `std.mem.Allocator` at `init` and stores it as a field, set immediately —
@@ -83,7 +147,15 @@ if an earlier step fails, and double-frees a field whose own narrow
 `defer`s cleanup after allocating a container (e.g. `allocator.create(T)`)
 must register that full cleanup `defer` only after the fallible `init` call
 succeeds, with a narrower `errdefer` covering just the failure window before
-that.
+that. A function that takes ownership of an already-constructed by-value
+resource registers its `errdefer <res>.deinit()` as the **first** statement,
+before any other fallible step — the caller built it inline and holds no cleanup
+handle, so an earlier failure leaks it. Once a step transfers ownership of an
+allocation onward (a map `put`, list `append`, or lease-slot commit), disarm the
+earlier free-`errdefer` with a per-iteration bool set right after the transfer,
+so exactly one path frees it. A handle-owning setter that overwrites an owned
+slot asserts the slot empty (or closes the prior handle first) rather than
+relying on call-site ordering to avoid a leak.
 
 Avoid per-frame, per-event, per-draw, or per-processor-loop string lookup,
 hash-map dispatch, broad dynamic dispatch, callback chains, repeated descriptor
@@ -269,15 +341,18 @@ engine/gameplay diagnostics (`std.debug.print` is for `src/benchmarks/` CLI
 stdout only). `info`/`debug` for lifecycle/config/fallback, `warn` for recovered
 degradation, `err` for real failures; keep pure helpers/validation log-free.
 
-Hot and frame-adjacent paths carry no logging in release — a release binary has
-zero per-frame/update/event/draw/entity/iteration log calls. Such instrumentation
-must be comptime-gated so it compiles out to a zero-sized no-op, not skipped at
-runtime; `src/app/runtime_perf_log.zig` is the reference (`enabled` folds
-`builtin.mode == .Debug and logging.enabled(.debug)`, the type and its `Context`
-go zero-sized when disabled, per-frame work is counter increments, and the
-formatted emit runs once per interval in Debug only). `logging.enabled(level)` is
-comptime, so gate any non-trivially-formatted diagnostic behind it — call and
-formatting both drop when the level is off.
+Hot and frame-adjacent paths carry no logging in **shipping** release
+(`ReleaseFast` / `ReleaseSmall`) — those binaries have zero
+per-frame/update/event/draw/entity/iteration log or perf-counter work. Such
+instrumentation must be comptime-gated so it compiles out to a zero-sized no-op,
+not skipped at runtime; `src/app/runtime_perf_log.zig` is the reference
+(`enabled` is true for `Debug` and `ReleaseSafe`, false for
+`ReleaseFast`/`ReleaseSmall`; the type and its `Context` go zero-sized when
+disabled; per-frame work is counter increments; the formatted emit runs once per
+interval). Fix cycles use Debug; intentional soaks use ReleaseSafe (not every
+edit — slow compile); ReleaseFast packages stay silent.
+`logging.enabled(level)` is comptime, so gate any non-trivially-formatted
+diagnostic behind it — call and formatting both drop when the level is off.
 
 ## Comments
 

@@ -3,9 +3,18 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Backbone simulation system that determines which entities enter each
-//! fixed-step stage. Runs once per step to recompute chunk coordinates from
-//! settled positions, then builds filtered dense-index lists consumed by the
-//! downstream movement, collision, AI, and steering systems.
+//! fixed-step stage.
+//!
+//! Per-step ownership split (chunk columns vs gathers):
+//!   - **Early gathers** (AI / collision dense-index lists) run at the **start**
+//!     of the step and read chunk columns left by the **prior** step's late
+//!     `deriveChunks`. That one-step lag for the cognition halo is intentional
+//!     (same contract as pathfinding's frame delay): this step's halo uses the
+//!     body's pre-move cell, not mid-step pose thrash.
+//!   - **`deriveChunks`** runs **late**, after movement integrate, collision
+//!     response, bounds/tile gate, and plane traversal have settled poses, so
+//!     tier_policy (same step) and next-step gathers see final world positions.
+//!     Movement/collision gate on tier only — no chunk filter.
 //!
 //! Stage participation rules (Slice 24):
 //!   movement   — tier.allowsMovement()  — no chunk filter
@@ -13,10 +22,6 @@
 //!   ai/steering — tier.allowsCognition() AND chunk inside cognition halo
 //!                 AND stagger_phase == step % cognition_stagger_n
 //!                 (always_active entities bypass halo and stagger)
-//!
-//! Index lists are rebuilt each step from the same-step recomputed chunk coords
-//! (which reflect positions settled at the end of the prior step — one step lag,
-//! identical to the pathfinding frame-delay contract).
 //!
 //! Each O(N)-per-step pass threads like the other processors: the gathers are
 //! stream-compactions (per-range index buffers merged in range order); the tier
@@ -28,17 +33,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const simd = @import("../../core/simd.zig");
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
+const math = @import("../../core/math.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
-const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
 const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
+const HotI32Slice = @import("../data_system.zig").HotI32Slice;
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const SimulationTier = @import("../simulation_scope.zig").SimulationTier;
 const ActiveRegion = @import("../simulation_scope.zig").ActiveRegion;
@@ -85,8 +91,6 @@ pub const SimulationScopeSystem = struct {
     allocator: std.mem.Allocator,
     /// Step counter incremented at the top of each fixed step. Drives stagger.
     step_count: u32,
-    /// Warmed movement dense-index list. null return = full-active (no dormant movers).
-    movement_indices: std.ArrayList(u32) = .empty,
     /// Warmed collision dense-index list. null return = full-active (no dormant/kinematic with bounds).
     collision_indices: std.ArrayList(u32) = .empty,
     /// Warmed AI agent dense-index list (cognition halo + stagger filtered).
@@ -100,12 +104,11 @@ pub const SimulationScopeSystem = struct {
     scope_tier_commands: std.ArrayList(StructuralCommand) = .empty,
     /// Per-range index/command scratch for the threaded passes. Each worker writes
     /// only its assigned slot; the main thread merges serially afterward.
-    movement_gather_ranges: IndexRangeSlotList = .empty,
     collision_gather_ranges: IndexRangeSlotList = .empty,
     ai_gather_ranges: IndexRangeSlotList = .empty,
     tier_command_ranges: CommandRangeSlotList = .empty,
     /// One adaptive tuner per independently-timed threaded pass.
-    movement_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
+    chunk_derive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     collision_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     ai_gather_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
     tier_policy_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -118,7 +121,7 @@ pub const SimulationScopeSystem = struct {
         return .{
             .allocator = allocator,
             .step_count = 0,
-            .movement_gather_tuner = AdaptiveWorkTuner.init(.{}),
+            .chunk_derive_tuner = AdaptiveWorkTuner.init(.{}),
             .collision_gather_tuner = AdaptiveWorkTuner.init(.{}),
             .ai_gather_tuner = AdaptiveWorkTuner.init(.{}),
             .tier_policy_tuner = AdaptiveWorkTuner.init(.{}),
@@ -134,19 +137,15 @@ pub const SimulationScopeSystem = struct {
         self.ai_gather_ranges.deinit(self.allocator);
         for (self.collision_gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
         self.collision_gather_ranges.deinit(self.allocator);
-        for (self.movement_gather_ranges.items) |*slot| slot.buffer.deinit(self.allocator);
-        self.movement_gather_ranges.deinit(self.allocator);
         self.scope_tier_commands.deinit(self.allocator);
         self.ai_indices.deinit(self.allocator);
         self.collision_indices.deinit(self.allocator);
-        self.movement_indices.deinit(self.allocator);
     }
 
     /// Pre-sizes the per-step scratch index/command lists to `capacity` movement
     /// bodies so the serial gathers and tier policy are allocation-free after init.
     /// The threaded per-range slot buffers still warm on their first threaded step.
     pub fn reserve(self: *SimulationScopeSystem, capacity: usize) !void {
-        try self.movement_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.collision_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.ai_indices.ensureTotalCapacity(self.allocator, capacity);
         try self.scope_tier_commands.ensureTotalCapacity(self.allocator, capacity);
@@ -171,62 +170,70 @@ pub const SimulationScopeSystem = struct {
         return self.step_count;
     }
 
-    // Chunk maintenance is folded into the movement processor: it derives each
-    // integrated body's chunk from its new position in the same pass (see
-    // movement.ChunkGridParams), so there is no separate recompute pass here. The
-    // gathers below read the chunk columns movement wrote.
+    // ---- Chunk derivation -----------------------------------------------------
 
-    // ---- Movement gather (threaded compaction) -------------------------------
+    /// Grid scalars for mapping a world position to a chunk coordinate. Mirrors
+    /// `WorldSystem.chunkCoordForWorldPos` (clamp to bounds, then cell/chunk
+    /// division); scope takes the grid as plain scalars rather than importing world.
+    pub const ChunkGrid = struct {
+        tile_size: f32,
+        chunk_size_tiles: u16,
+        width: u16,
+        height: u16,
+    };
 
-    /// Build the movement dense-index list. Returns null indices when all movement
-    /// entities are non-dormant (full-active shortcut — downstream uses the full
-    /// SoA range). Movement has NO chunk filter; all non-dormant entities move.
-    /// Threads the real scan; the O(1) full-active fast path never dispatches work.
-    pub fn gatherMovementBodyIndices(
+    /// Recompute each movement body's chunk coordinate from its settled position,
+    /// once per step, over the full contiguous SoA range. This is the separate pass
+    /// that replaces movement's former in-pass chunk write: movement is now a pure
+    /// position integrator. Non-moving rows recompute the same chunk from their
+    /// frozen position (harmless). Worker ranges own disjoint rows, so the chunk
+    /// writes are range-disjoint; no pre-sized scratch is needed.
+    pub fn deriveChunks(
         self: *SimulationScopeSystem,
-        data: *const DataSystem,
+        data: *DataSystem,
         thread_system: *ThreadSystem,
+        grid: ChunkGrid,
         config: ScopeConfig,
-    ) !ScopeGatherResult {
-        const scope = data.scopeColumnsSliceConst();
-        const n = scope.tier.len;
-        if (n == 0) return .{ .indices = &[_]u32{} };
-        // Fast-path: only .dormant entities are excluded from movement. With none
-        // present, every entity moves → full-active, no per-entity scan.
-        if (data.tierCount(.dormant) == 0) return .{ .indices = null };
-
-        const selection = selectGatherWork(thread_system, n, config, &self.movement_gather_tuner);
-        try prepareIndexRangeBuffers(self.allocator, &self.movement_gather_ranges, n, selection.items_per_range, selection.range_count);
-        var context = MovementGatherContext{
-            .tier = scope.tier,
-            .ranges = self.movement_gather_ranges.items[0..selection.range_count],
+    ) BatchStats {
+        const move = data.movementBodySliceConst();
+        const n = move.entities.len;
+        if (n == 0) return .{};
+        const scope = data.scopeColumnsSlice();
+        var context = DeriveChunksContext{
+            .position_x = move.position_x,
+            .position_y = move.position_y,
+            .chunk_x = scope.chunk_x,
+            .chunk_y = scope.chunk_y,
+            .grid = grid,
         };
-        const batch = thread_system.parallelForWithOptions(n, &context, movementGatherJob, .{
-            .max_worker_threads = selection.worker_threads,
+        const active_tuner = if (config.adaptive and config.items_per_range == null)
+            &self.chunk_derive_tuner
+        else
+            null;
+        return thread_system.parallelForWithOptions(n, &context, deriveChunkJob, .{
+            .items_per_range = config.items_per_range,
+            .max_worker_threads = config.max_worker_threads,
             .range_alignment_items = scope_range_alignment_items,
-            .adaptive_tuner = selection.active_tuner,
-            .selected_profile = selection.profile,
+            .adaptive = config.adaptive,
+            .adaptive_tuner = active_tuner,
         });
-        const merged = try self.mergeIndexRanges(&self.movement_indices, self.movement_gather_ranges.items[0..selection.range_count]);
-        return .{ .indices = if (merged.any_excluded) self.movement_indices.items else null, .batch = batch };
     }
 
-    /// Serial movement gather: same predicate, single pass, no thread system.
-    /// Drives the serial bench/test path and the threaded==serial parity checks.
-    pub fn gatherMovementBodyIndicesSerial(
-        self: *SimulationScopeSystem,
-        data: *const DataSystem,
-    ) !?[]const u32 {
-        const scope = data.scopeColumnsSliceConst();
-        const n = scope.tier.len;
-        if (n == 0) return &[_]u32{};
-        if (data.tierCount(.dormant) == 0) return null;
-
-        self.movement_indices.clearRetainingCapacity();
-        try self.movement_indices.ensureTotalCapacity(self.allocator, n);
-        var any_excluded = false;
-        scanTierAboveThreshold(scope.tier, 0, n, @intFromEnum(SimulationTier.dormant), &self.movement_indices, &any_excluded);
-        return if (any_excluded) self.movement_indices.items else null;
+    /// Serial chunk derivation: same computation over the full range, no thread
+    /// system. Drives the serial bench/test path.
+    pub fn deriveChunksSerial(_: *SimulationScopeSystem, data: *DataSystem, grid: ChunkGrid) void {
+        const move = data.movementBodySliceConst();
+        const n = move.entities.len;
+        if (n == 0) return;
+        const scope = data.scopeColumnsSlice();
+        var context = DeriveChunksContext{
+            .position_x = move.position_x,
+            .position_y = move.position_y,
+            .chunk_x = scope.chunk_x,
+            .chunk_y = scope.chunk_y,
+            .grid = grid,
+        };
+        deriveChunkJob(&context, .{ .index = 0, .start = 0, .end = n }, WorkerId.main);
     }
 
     // ---- Collision gather (threaded compaction) ------------------------------
@@ -585,58 +592,46 @@ fn prepareCommandRangeBuffers(
 
 // ---- Job contexts and functions ---------------------------------------------
 
-const MovementGatherContext = struct {
-    tier: []const SimulationTier,
-    ranges: []IndexRangeSlot,
+const DeriveChunksContext = struct {
+    position_x: []const f32,
+    position_y: []const f32,
+    chunk_x: HotI32Slice,
+    chunk_y: HotI32Slice,
+    grid: SimulationScopeSystem.ChunkGrid,
 };
 
-fn movementGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
-    const job: *MovementGatherContext = @ptrCast(@alignCast(context));
-    // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
-    std.debug.assert(range.index < job.ranges.len);
-    const buffer = &job.ranges[range.index].buffer;
-    // Keep all entities whose tier outranks .dormant (the only tier movement drops).
-    scanTierAboveThreshold(job.tier, range.start, range.end, @intFromEnum(SimulationTier.dormant), &buffer.indices, &buffer.any_excluded);
-}
+fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
+    const job: *DeriveChunksContext = @ptrCast(@alignCast(context));
+    // Worker ranges own disjoint rows; the chunk columns share the movement-body
+    // store length, so a range can never write past them.
+    std.debug.assert(range.end <= job.chunk_x.len);
+    std.debug.assert(range.end <= job.chunk_y.len);
+    const grid = job.grid;
+    const chunk_size: i32 = @intCast(@max(grid.chunk_size_tiles, 1));
+    const chunk_div = simd.splatInt4(chunk_size);
 
-/// SIMD predicate scan over a contiguous tier column: appends each index whose
-/// tier rank exceeds `threshold` to `out`, flags `any_excluded` for the rest.
-/// One `greaterThanInt4` compares lane_count tiers per step; a scalar tail covers
-/// the remainder. Tier ranks are monotonic, so "rank > threshold" expresses every
-/// allows* predicate (movement: > dormant). Reused by the serial and threaded paths.
-fn scanTierAboveThreshold(
-    tier: []const SimulationTier,
-    start: usize,
-    end: usize,
-    threshold: u2,
-    out: *std.ArrayList(u32),
-    any_excluded: *bool,
-) void {
-    const thresh = simd.splatInt4(@intCast(threshold));
-    var i = start;
-    const vend = start + simd.vectorizedEnd(end - start);
+    var i = range.start;
+    const count = range.end - range.start;
+    const vend = range.start + simd.vectorizedEnd(count);
     while (i < vend) : (i += simd.lane_count) {
-        const tiers = simd.int4(
-            @intFromEnum(tier[i]),
-            @intFromEnum(tier[i + 1]),
-            @intFromEnum(tier[i + 2]),
-            @intFromEnum(tier[i + 3]),
-        );
-        const keep = simd.greaterThanInt4(tiers, thresh);
+        // Dense contiguous SoA: load four positions, worldPosToCell4 (floor +
+        // clamp, matching math.worldPosToCell), then truncating cell/chunk divide.
+        const px = simd.loadFloat4(job.position_x[i..]);
+        const py = simd.loadFloat4(job.position_y[i..]);
+        const tx = simd.worldPosToCell4(px, grid.tile_size, grid.width);
+        const ty = simd.worldPosToCell4(py, grid.tile_size, grid.height);
+        const cx = simd.toIntArray(simd.divInt4(tx, chunk_div));
+        const cy = simd.toIntArray(simd.divInt4(ty, chunk_div));
         inline for (0..simd.lane_count) |lane| {
-            if (keep[lane]) {
-                out.appendAssumeCapacity(@intCast(i + lane));
-            } else {
-                any_excluded.* = true;
-            }
+            job.chunk_x[i + lane] = cx[lane];
+            job.chunk_y[i + lane] = cy[lane];
         }
     }
-    while (i < end) : (i += 1) {
-        if (@intFromEnum(tier[i]) > threshold) {
-            out.appendAssumeCapacity(@intCast(i));
-        } else {
-            any_excluded.* = true;
-        }
+    while (i < range.end) : (i += 1) {
+        const tx = math.worldPosToCell(job.position_x[i], grid.tile_size, grid.width);
+        const ty = math.worldPosToCell(job.position_y[i], grid.tile_size, grid.height);
+        job.chunk_x[i] = @intCast(tx / @as(u32, @intCast(chunk_size)));
+        job.chunk_y[i] = @intCast(ty / @as(u32, @intCast(chunk_size)));
     }
 }
 
@@ -781,77 +776,24 @@ fn tierPolicyJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     scanTierPolicy(job.scope, job.region, range.start, range.end, &buffer.commands);
 }
 
-// ---- Work selection (matches collision/ai selectStageWork) ------------------
+// ---- Work selection ---------------------------------------------------------
 
-const StageWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
-
-/// Resolves the pass's owned tuner (when adaptive and no explicit range size) and
-/// selects the work shape for this dispatch.
+/// Resolves the pass's owned tuner and selects the batch shape through the single
+/// tuner-owned entry point (`ThreadSystem.selectBatchProfile`), so every scope pass
+/// shapes work identically to the downstream systems and `parallelForWithOptions`.
 fn selectGatherWork(
     thread_system: *const ThreadSystem,
     item_count: usize,
     config: ScopeConfig,
     owned_tuner: *AdaptiveWorkTuner,
-) StageWorkSelection {
-    const tuner = if (config.adaptive and config.items_per_range == null) owned_tuner else null;
-    return selectStageWork(thread_system, item_count, config.items_per_range, config.max_worker_threads, config.adaptive, tuner);
-}
-
-fn selectStageWork(
-    thread_system: *const ThreadSystem,
-    item_count: usize,
-    items_per_range_override: ?usize,
-    max_worker_threads_override: ?usize,
-    adaptive: bool,
-    adaptive_tuner: ?*AdaptiveWorkTuner,
-) StageWorkSelection {
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
-    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
-        adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = scope_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), scope_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+) BatchSelection {
+    return thread_system.selectBatchProfile(owned_tuner, .{
+        .item_count = item_count,
+        .items_per_range = config.items_per_range,
+        .max_worker_threads = config.max_worker_threads,
+        .range_alignment_items = scope_range_alignment_items,
+        .adaptive = config.adaptive,
+    });
 }
 
 fn paddingForCacheLine(comptime T: type) usize {
@@ -866,46 +808,6 @@ fn rangeLenForIndex(item_count: usize, items_per_range: usize, range_index: usiz
 }
 
 // ---- Tests ------------------------------------------------------------------
-
-test "SimulationScopeSystem movement gather returns null when all non-dormant" {
-    const allocator = std.testing.allocator;
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-
-    const e0 = try data.createEntity();
-    try data.setMovementBody(e0, .{});
-    const e1 = try data.createEntity();
-    try data.setMovementBody(e1, .{});
-
-    var sys = SimulationScopeSystem.init(allocator);
-    defer sys.deinit();
-
-    const result = try sys.gatherMovementBodyIndicesSerial(&data);
-    // All .cognition (default) which allowsMovement → full-active shortcut → null
-    try std.testing.expect(result == null);
-}
-
-test "SimulationScopeSystem movement gather excludes dormant entities" {
-    const allocator = std.testing.allocator;
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-
-    const mover = try data.createEntity();
-    try data.setMovementBody(mover, .{});
-
-    const dormant_ent = try data.createEntity();
-    try data.setMovementBody(dormant_ent, .{});
-    try data.setSimulationMetadata(dormant_ent, .{ .tier = .dormant });
-
-    var sys = SimulationScopeSystem.init(allocator);
-    defer sys.deinit();
-
-    const result = try sys.gatherMovementBodyIndicesSerial(&data);
-    // dormant entity excluded → non-null filtered list with 1 entry (dense index 0)
-    try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(usize, 1), result.?.len);
-    try std.testing.expectEqual(@as(u32, 0), result.?[0]);
-}
 
 test "SimulationScopeSystem AI gather filters halo and stagger" {
     const allocator = std.testing.allocator;
@@ -1074,10 +976,8 @@ test "collectChunkTierChanges is a no-op without a visible region" {
     try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
-test "scoped movement integrates only non-dormant rows and derives chunk in-pass" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+test "deriveChunks recomputes every row's chunk from its settled position" {
     const allocator = std.testing.allocator;
-    const movement = @import("movement.zig");
     const WorldSystem = @import("../world_system.zig").WorldSystem;
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
@@ -1085,53 +985,31 @@ test "scoped movement integrates only non-dormant rows and derives chunk in-pass
 
     var data = DataSystem.init(allocator);
     defer data.deinit();
-    const a = try data.createEntity(); // dense 0
-    try data.setMovementBody(a, .{ .position = .{ .x = 300, .y = 100 }, .velocity = .{ .x = 64, .y = 0 } });
-    const frozen = try data.createEntity(); // dense 1
-    try data.setMovementBody(frozen, .{ .position = .{ .x = 500, .y = 200 }, .velocity = .{ .x = 64, .y = 0 } });
-    try data.setSimulationTier(frozen, .dormant);
-    const b = try data.createEntity(); // dense 2
-    try data.setMovementBody(b, .{ .position = .{ .x = 700, .y = 260 }, .velocity = .{ .x = -32, .y = 16 } });
-
-    var sys = SimulationScopeSystem.init(allocator);
-    defer sys.deinit();
-    const indices = try sys.gatherMovementBodyIndicesSerial(&data);
-    try std.testing.expect(indices != null); // a dormant entity is present
-    try std.testing.expectEqual(@as(usize, 2), indices.?.len);
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 300, .y = 100 } });
+    const dormant = try data.createEntity();
+    try data.setMovementBody(dormant, .{ .position = .{ .x = 500, .y = 200 } });
+    try data.setSimulationTier(dormant, .dormant);
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 700, .y = 260 } });
 
     const tile_size: f32 = 32;
     const chunk_size: u16 = 8;
     const dims: u16 = 64;
-    const scope = data.scopeColumnsSlice();
-    var slice = data.movementBodySlice();
-    var ms = movement.MovementSystem.init();
-    const dt: f32 = 0.5;
-    _ = ms.update(&slice, &threads, dt, .{
-        .scope_dense_indices = indices,
-        .chunk_grid = .{
-            .chunk_x = scope.chunk_x,
-            .chunk_y = scope.chunk_y,
-            .tile_size = tile_size,
-            .chunk_size_tiles = chunk_size,
-            .width = dims,
-            .height = dims,
-        },
-    });
 
-    // Dormant row never integrated (frozen position preserved exactly).
-    try std.testing.expectEqual(@as(f32, 500), data.movementBodyConst(frozen).?.position.x);
+    var sys = SimulationScopeSystem.init(allocator);
+    defer sys.deinit();
+    _ = sys.deriveChunks(&data, &threads, .{
+        .tile_size = tile_size,
+        .chunk_size_tiles = chunk_size,
+        .width = dims,
+        .height = dims,
+    }, .{});
 
-    // Running rows integrated pos + vel*dt (exact for these inputs, so this also
-    // pins the indexed scalar path to the same arithmetic as the full SIMD path).
-    const a_body = data.movementBodyConst(a).?;
-    const b_body = data.movementBodyConst(b).?;
-    try std.testing.expectEqual(@as(f32, 300 + 64 * 0.5), a_body.position.x);
-    try std.testing.expectEqual(@as(f32, 700 - 32 * 0.5), b_body.position.x);
-
-    // Folded chunk for the integrated rows matches the canonical world formula.
+    // Every row's chunk (dormant included) matches the canonical world formula.
     var world = WorldSystem{ .allocator = allocator, .width = dims, .height = dims, .tile_size = tile_size, .chunk_size_tiles = chunk_size };
     defer world.deinit();
-    inline for (.{ a, b }) |ent| {
+    inline for (.{ a, dormant, b }) |ent| {
         const body = data.movementBodyConst(ent).?;
         const meta = data.simulationMetadata(ent).?;
         const expect = world.chunkCoordForWorldPos(body.position.x, body.position.y);
@@ -1140,65 +1018,47 @@ test "scoped movement integrates only non-dormant rows and derives chunk in-pass
     }
 }
 
-test "indexed movement path matches scalar reference across the SIMD block and tail" {
-    if (@import("builtin").single_threaded) return error.SkipZigTest;
+test "threaded deriveChunks matches serial across the range block and tail" {
+    if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    const movement = @import("movement.zig");
 
-    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = scope_range_alignment_items });
     defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
+    const grid = SimulationScopeSystem.ChunkGrid{ .tile_size = 32, .chunk_size_tiles = 8, .width = 256, .height = 256 };
+    const count = scope_range_alignment_items * 8 + 3; // multi-range block + scalar tail
 
-    // Nine bodies with the odd dense rows dormant, so the movement gather yields
-    // five non-contiguous indices (0,2,4,6,8): four run through the 4-lane
-    // gather/scatter block, the fifth through the scalar tail. Values are f32-exact
-    // so the indexed result must equal the hand-computed scalar reference exactly.
-    const Spawn = struct { x: f32, y: f32, vx: f32, vy: f32, dormant: bool };
-    const spawns = [_]Spawn{
-        .{ .x = 10, .y = 20, .vx = 4, .vy = -2, .dormant = false },
-        .{ .x = 30, .y = 40, .vx = 8, .vy = 8, .dormant = true },
-        .{ .x = 50, .y = 60, .vx = -6, .vy = 2, .dormant = false },
-        .{ .x = 70, .y = 80, .vx = 16, .vy = -16, .dormant = true },
-        .{ .x = 90, .y = 100, .vx = 2, .vy = 6, .dormant = false },
-        .{ .x = 110, .y = 120, .vx = -32, .vy = 4, .dormant = true },
-        .{ .x = 130, .y = 140, .vx = 12, .vy = -8, .dormant = false },
-        .{ .x = 150, .y = 160, .vx = 24, .vy = 24, .dormant = true },
-        .{ .x = 170, .y = 180, .vx = -4, .vy = 10, .dormant = false },
-    };
-    var ents: [spawns.len]EntityId = undefined;
-    for (spawns, 0..) |s, i| {
-        ents[i] = try data.createEntity();
-        try data.setMovementBody(ents[i], .{ .position = .{ .x = s.x, .y = s.y }, .velocity = .{ .x = s.vx, .y = s.vy } });
-        if (s.dormant) try data.setSimulationTier(ents[i], .dormant);
+    var threaded_data = DataSystem.init(allocator);
+    defer threaded_data.deinit();
+    var serial_data = DataSystem.init(allocator);
+    defer serial_data.deinit();
+    for (0..count) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const te = try threaded_data.createEntity();
+        try threaded_data.setMovementBody(te, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
+        const se = try serial_data.createEntity();
+        try serial_data.setMovementBody(se, .{ .position = .{ .x = fi * 3.5, .y = fi * 1.25 } });
     }
 
-    var sys = SimulationScopeSystem.init(allocator);
-    defer sys.deinit();
-    const indices = try sys.gatherMovementBodyIndicesSerial(&data);
-    try std.testing.expect(indices != null);
-    try std.testing.expectEqual(@as(usize, 5), indices.?.len); // > 4-lane block → block + tail
+    var threaded_sys = SimulationScopeSystem.init(allocator);
+    defer threaded_sys.deinit();
+    var serial_sys = SimulationScopeSystem.init(allocator);
+    defer serial_sys.deinit();
 
-    var slice = data.movementBodySlice();
-    var ms = movement.MovementSystem.init();
-    const dt: f32 = 0.25;
-    _ = ms.update(&slice, &threads, dt, .{ .scope_dense_indices = indices });
+    const stats = threaded_sys.deriveChunks(&threaded_data, &threads, grid, .{
+        .items_per_range = scope_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expect(!stats.ran_inline); // real workers partitioned the range
+    serial_sys.deriveChunksSerial(&serial_data, grid);
 
-    const after = data.movementBodySliceConst();
-    for (spawns, 0..) |s, i| {
-        if (s.dormant) {
-            // Excluded from the index set: position left untouched.
-            try std.testing.expectEqual(s.x, after.position_x[i]);
-            try std.testing.expectEqual(s.y, after.position_y[i]);
-        } else {
-            // Indexed path scatters next into position and old into previous,
-            // per lane and per column — matches the scalar reference exactly.
-            try std.testing.expectEqual(s.x + s.vx * dt, after.position_x[i]);
-            try std.testing.expectEqual(s.y + s.vy * dt, after.position_y[i]);
-            try std.testing.expectEqual(s.x, after.previous_x[i]);
-            try std.testing.expectEqual(s.y, after.previous_y[i]);
-        }
+    const ts = threaded_data.scopeColumnsSliceConst();
+    const ss = serial_data.scopeColumnsSliceConst();
+    for (0..count) |i| {
+        try std.testing.expectEqual(ss.chunk_x[i], ts.chunk_x[i]);
+        try std.testing.expectEqual(ss.chunk_y[i], ts.chunk_y[i]);
     }
 }
 
@@ -1408,27 +1268,6 @@ fn fillParityPopulation(data: *DataSystem, count: usize) !void {
     }
 }
 
-test "threaded movement gather matches serial" {
-    if (builtin.single_threaded) return error.SkipZigTest;
-    const allocator = std.testing.allocator;
-
-    var data = DataSystem.init(allocator);
-    defer data.deinit();
-    try fillParityPopulation(&data, scope_range_alignment_items * 6);
-
-    var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 0 });
-    defer threads.deinit();
-
-    var serial_sys = SimulationScopeSystem.init(allocator);
-    defer serial_sys.deinit();
-    var threaded_sys = SimulationScopeSystem.init(allocator);
-    defer threaded_sys.deinit();
-
-    const serial = (try serial_sys.gatherMovementBodyIndicesSerial(&data)).?;
-    const threaded = (try threaded_sys.gatherMovementBodyIndices(&data, &threads, .{})).indices.?;
-    try std.testing.expectEqualSlices(u32, serial, threaded);
-}
-
 test "threaded ai gather matches serial including diagnostics" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -1526,11 +1365,6 @@ test "real worker threads match serial across every scope pass" {
     var threaded_sys = SimulationScopeSystem.init(allocator);
     defer threaded_sys.deinit();
 
-    // Movement gather.
-    const move_serial = (try serial_sys.gatherMovementBodyIndicesSerial(&data)).?;
-    const move_threaded = (try threaded_sys.gatherMovementBodyIndices(&data, &threads, fixed)).indices.?;
-    try std.testing.expectEqualSlices(u32, move_serial, move_threaded);
-
     // Collision gather.
     const col_serial = (try serial_sys.gatherCollisionBoundsIndicesSerial(&data)).?;
     const col_threaded = (try threaded_sys.gatherCollisionBoundsIndices(&data, &threads, fixed)).indices.?;
@@ -1613,8 +1447,6 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
     // Warm-up pass with the real allocator: sizes the per-range gather/command
     // scratch, the merged index lists, and the structural-command stream to this
     // step's shape (data does not change afterward, so re-running is identical).
-    const warm_move = try sys.gatherMovementBodyIndices(&data, &threads, .{});
-    try std.testing.expect(warm_move.indices != null);
     const warm_collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expect(warm_collision.indices != null);
     const warm_ai = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});
@@ -1639,8 +1471,6 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
         stream.allocator = original_stream_allocator;
     }
 
-    const move = try sys.gatherMovementBodyIndices(&data, &threads, .{});
-    try std.testing.expectEqualSlices(u32, warm_move.indices.?, move.indices.?);
     const collision = try sys.gatherCollisionBoundsIndices(&data, &threads, .{});
     try std.testing.expectEqualSlices(u32, warm_collision.indices.?, collision.indices.?);
     const ai_result = try sys.gatherAiAgentIndices(&data, ai_region, 0, &threads, .{});

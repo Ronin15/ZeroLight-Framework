@@ -265,9 +265,11 @@ pub const PathView = struct {
 
 // One static-obstacle edit for incremental nav rebuild: a world tile flip on
 // `level` at tile `(x, y)`. Carries only compact coordinates (no world handle), so
-// the caller maps a `world_tile_changed`/`world_obstacle_changed` event into this
-// before feeding `applyNavUpdates`. The world reference is passed alongside the edit
-// batch so the affected level's blocked mask is re-derived from authoritative state.
+// the caller maps a single-cell `world_tile_changed` event into this before feeding
+// `applyNavUpdates`. Multi-cell `world_obstacle_changed` events map to one
+// `ChangedSpan` via `markNavTileRectDirty` instead (not an O(tiles) expand into
+// this form). The world reference is passed alongside the edit batch so the
+// affected level's blocked mask is re-derived from authoritative state.
 pub const NavCellEdit = struct {
     level: u16,
     x: u16,

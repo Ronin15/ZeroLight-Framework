@@ -14,15 +14,18 @@ game-specific behavior under `src/game/`.
   pause controller, input, debug overlay, and thread system.
 - `src/app/audio.zig` owns SDL3_mixer lifecycle, app-level audio tracks,
   loaded audio assets, bus gains, and the fixed-step audio command buffer.
-- `src/app/input.zig` owns named actions, held gameplay input, and one-frame app/debug commands.
+- `src/app/input.zig` owns named actions, keyboard and default gamepad button bindings, held gameplay input (including analog left-stick movement), and one-frame app/debug commands.
 - `src/app/input_router.zig` applies state-policy action contexts before input mutates `InputState` or `FrameCommands`.
+- `src/app/gamepad.zig` owns single active-gamepad device lifecycle: first-connected-wins adoption, hot-plug add/remove reaction, and fallback-to-next-device (or keyboard) on disconnect.
 - `src/app/time_loop.zig` keeps simulation fixed at 60Hz.
 - `src/app/frame_pacer.zig` classifies window visibility and applies fallback frame pacing.
 - `src/app/state.zig` manages state allocation, destruction, policies, and queued transitions.
 - `src/app/pause_controller.zig` owns the pause policy: pushes the modal `PauseState` over gameplay and resets timing on resume.
 - `src/app/thread_system.zig` provides pre-spawned workers for synchronous parallel CPU batches.
 - `src/app/resolution.zig` owns pure logical-resolution, viewport, and coordinate conversion policy.
-- `src/app/runtime_perf_log.zig` records fixed-step runtime perf metrics consumed by states and the debug overlay.
+- `src/app/runtime_perf_log.zig` records fixed-step runtime perf metrics (Debug and
+  ReleaseSafe; fully compiled out of ReleaseFast/Small) consumed by the engine
+  interval dump and related diagnostics.
 - `src/assets/assets.zig` resolves safe runtime asset paths,
   `src/assets/image.zig` decodes PNGs into transient CPU image data,
   `src/assets/cache.zig` caches renderer-backed runtime assets,
@@ -37,12 +40,19 @@ game-specific behavior under `src/game/`.
 - `src/render/debug_overlay.zig`, `src/render/debug_overlay_stub.zig`, and `src/render/fps_counter.zig` draw or compile out the F2 FPS overlay.
 - `src/game/game_demo_state.zig`, `src/game/loading_state.zig`, `src/game/pause_state.zig`, `src/game/main_menu_state.zig`, `src/game/settings_menu_state.zig`, and `src/game/menu_view.zig` are the game/application state and menu modules. Main menu is the default startup state; gameplay is launched from it via a runtime-asset-backed loading transition.
 - `src/game/world_system.zig` owns state-local world/tile data in SoA stores
-  for levels, dense layers, sparse tiles, catalog source rects, and chunk
-  visibility.
+  for levels, dense layers, sparse tiles, catalog source rects, chunk
+  visibility, and durable **interest/affordance markers** (`world_interest.zig`,
+  Slice 41). Markers are world-authored POIs with fixed inline slot capacity
+  (allocation-free by construction) — not `DataSystem` components and not
+  ephemeral `WorldStimulus` dig/footstep/impact events. Kind `investigate` is
+  the AI consumer today; `cover` / `resource` / `patrol` are reserved schema
+  tags until a later consumer lands. Cognition discovery uses a fixed query
+  radius (`dist ≤ query_r`); authored `marker.radius` is influence footprint,
+  not the discovery gate. Queries return nearest-k (dist², then slot index).
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
-  affect, structural, system) and owns state-local persistent entity data in
-  dense SoA stores for gameplay, collision, and render systems.
+  affect, destructible, structural, system) and owns state-local persistent
+  entity data in dense SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -52,12 +62,13 @@ game-specific behavior under `src/game/`.
   counters.
 - `src/game/systems/simulation_scope.zig` owns `SimulationScopeSystem`, the
   backbone scope processor: tier/halo/stagger gathers and the auto tier wake/sleep
-  policy (entity chunk columns are derived in-pass by movement, not a separate
-  recompute).
+  policy (entity chunk columns are derived by the dedicated late `chunk_derive`
+  stage after positions settle, not in the scope pass).
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
-  serial or threaded SIMD-aware ranges.
+  serial or threaded SIMD-aware ranges (world x/y only; discrete vertical plane
+  is `position_z` / `world_level`, not continuous z motion).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
   pipeline-shared per-step uniform grid built once from the cognition-scoped
   population and read by AI separation and perception.
@@ -68,13 +79,22 @@ game-specific behavior under `src/game/`.
   LOS-blocked cache incrementally patched.
 - `src/game/systems/ai_memory.zig` owns `AiMemorySystem`: decays last-known-
   target position, a fixed-capacity recent-contact ring, and spatial
-  familiarity, and refreshes state from perception's acquisition events.
+  familiarity; refreshes last-known from continuous same-identity visibility
+  and perception acquire/lose events; raises familiarity under sustained track.
 - `src/game/systems/affect.zig` owns `AffectSystem`: appraises perception and
   memory into four independent per-entity mood drives (fear, curiosity,
   aggression, fatigue) and emits threshold-crossing events.
-- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
+- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows
+  (arbitration over perception, memory, affect, and world interest markers).
+- `src/game/ai_archetypes.zig` loads data-driven personality bundles from
+  `assets/ai/archetypes.json` at load time into a fixed enum → component table
+  (no hot-path JSON).
+- `src/game/ai_debug_overlay.zig` draws read-only AI introspection (vision,
+  drives, memory, active behavior) under the existing debug toggle; never
+  mutates simulation.
 - `src/game/systems/steering.zig` consumes navigation intents and path status,
-  then emits final NPC movement intents with local avoidance.
+  then emits final NPC movement intents with local avoidance (same-level agent
+  neighbor gating mirrors collision).
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
   response-policy movement corrections.
@@ -82,9 +102,12 @@ game-specific behavior under `src/game/`.
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
 - `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
   (types, nav_grid, nav_graph, caches, group_field, scratch, solve, system,
-  nav_memory, test_support) for frame-delayed Z-aware grid navigation.
+  nav_memory, test_support) for frame-delayed multi-level grid navigation.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
+- `src/game/destructible_controller.zig` is the pipeline-owned controller that
+  consumes `action_intents` (interact/attack) into deferred destructible
+  damage/destroy commands and domain events.
 - `src/game/audio_controller.zig` is the pipeline-owned controller that turns
   per-step input and collision contacts into audio command-buffer intents
   (ambient music, a movement-gated jet loop, and collision SFX with per-pair
@@ -266,12 +289,15 @@ cooldowns — is the pipeline-owned `AudioController`; the gameplay state passes
 borrowed command buffer through the pipeline at its input/contact seams and holds
 no audio-policy state.
 
-Raw keyboard input maps to named actions in `src/app/input.zig`.
-`input_router.zig` applies the active state stack's action contexts before
-mutating held gameplay actions in `InputState` or one-frame UI/app/debug
-commands in `FrameCommands`. State `handleEvent` methods still receive raw SDL
-events according to stack policy, so named-action routing and raw event handling
-stay separate.
+Raw keyboard and gamepad input map to named actions in `src/app/input.zig`;
+`src/app/gamepad.zig` owns the single-active-device lifecycle that decides
+which `*SDL_Gamepad` (if any) supplies gamepad-sourced events. `input_router.zig`
+applies the active state stack's action contexts before mutating held gameplay
+actions in `InputState` or one-frame UI/app/debug commands in `FrameCommands`,
+treating keyboard key events and gamepad button events through the same
+policy/latch path, and gating analog left-stick axis motion on the `.gameplay`
+context. State `handleEvent` methods still receive raw SDL events according to
+stack policy, so named-action routing and raw event handling stay separate.
 
 State policies decide whether lower states receive updates, events, or render
 passes. Transitions are queued through `StateTransitions` and applied after the
@@ -394,16 +420,21 @@ The current gameplay fixed-step pipeline is:
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
    "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
-   `dig_world_edit` (author world-tile edits from player digging) →
-   `scope_advance_and_ai_gather` → `spatial_index_build` (shared
-   `SpatialIndexSystem`, Slice 28) → `perception_update` (vision/hearing,
+   at step open: promote prior-step deferred impacts onto the live bus, then
+   `dig_world_edit` (author world-tile edits from player digging), then at most
+   one player footstep when velocity is non-trivial — all before
+   `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
+   `spatial_index_build` (shared `SpatialIndexSystem`, Slice 28) →
+   `perception_update` (vision/hearing,
    Slice 29) → `ai_memory_update` (Slice 30) → `affect_update` (Slice 31) →
    `ai_decide` → `steering_update` → `pathfinding_update` (frame-delayed) →
-   `apply_ai_movement_intents` → `movement_scope_gather` →
-   `movement_integrate` → `bounds_and_tile_gate` →
+   `apply_ai_movement_intents` → `movement_integrate` →
    `collision_scope_gather` → `collision_detect` → `collision_respond` →
-   `plane_traversal` (ramp/fall/carve/snap) → `tier_policy` (deferred
-   `set_simulation_tier` commands).
+   `bounds_and_tile_gate` (world bounds clamp + solid-tile gate; after
+   collision so a contact push into dirt is re-gated) →
+   `plane_traversal` (ramp/fall/carve/snap) → `chunk_derive` →
+   `action_react` (destructible / action-intent consumers) →
+   `tier_policy` (deferred `set_simulation_tier` commands).
 4. Queue contact audio, emit/update transient particles, and merge outputs.
 5. Update the state-owned follow camera and visible world chunks.
 6. Commit deferred structural commands to `DataSystem`, then run the
@@ -431,8 +462,9 @@ movement rows so they exist exactly for simulated entities and the O(N) scope
 passes read/write aligned columns rather than scattered slots. The pipeline-owned
 `SimulationScopeSystem` (`src/game/systems/simulation_scope.zig`) is the backbone
 that derives the camera cognition halo from `WorldSystem` and selects which entities
-enter each stage; entity chunk columns are derived in-pass by the movement processor
-(not a separate scope recompute).
+enter each stage; entity chunk columns are derived by the dedicated late `chunk_derive`
+stage, ordered after every `movement_positions` writer so tier policy and render prep
+read chunks matching each body's final settled position.
 Processors keep their hot loops and receive a `scope_dense_indices` option
 (null = full-active) instead of learning world/chunk policy. Movement and
 collision gate on tier only (no chunk filter, so off-screen entities keep moving
@@ -491,6 +523,20 @@ processors with typed `DataSystem` views. They should not become hidden
 per-entity stores, own renderer/audio/SDL handles, or replace SoA processors for
 hot/reusable loops.
 
+Landed pipeline-owned domain controllers (beside processors):
+
+- `DigController` — dig intents → world-tile edits + stimuli/events
+- `AudioController` — ambient + collision SFX queues (no SDL in the controller)
+- `DestructibleController` (Slice 45) — first `action_intents` consumer:
+  interact/attack → deferred `destroy_entity`/`set_destructible` +
+  `destructible_destroyed` domain event; optional soft-drop particle burst
+
+Non-locomotion player/AI requests flow through `SimulationFrame.action_intents`
+(Slice 40), consumed at explicit `action_react` by `DestructibleController`
+(and future combat/rules controllers) — not through `NavigationIntent` or the
+pathfinder. Locomotion stays on `navigation_intents` → steering → `intents`
+(movement).
+
 Processors run behind explicit barriers. Each ordered system finishes its serial
 or threaded work, merges any range-owned output in stable order, and only then
 allows the next system to consume the result. Deferred structural commands are
@@ -543,7 +589,11 @@ and `hasLineOfSight` itself walks every grid cell a ray's segment actually
 crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
 into the same per-agent pass as a same-level squared-distance check against
 `SimulationFrame.stimuli`, a transient per-step positional buffer that
-`DigController` is the sole producer for. Dense per-step results (visibility,
+`SimulationPipeline` sensory producers feed (Slice 39): deferred-promoted
+`.impact`, same-step `.dig` from `DigController`, and same-step `.footstep`
+from player velocity — all before `PerceptionSystem` hearing. Cognition does
+not read `AudioCommandBuffer`; audio may play in parallel for presentation
+only. Dense per-step results (visibility,
 last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
 hot columns; only acquisition/loss transitions emit low-volume
 `entity_perceived`/`entity_lost` domain events, capped per step by
@@ -572,8 +622,13 @@ selected behavior — pursue and flee prefer a visible or freshly-remembered
 hostile-faction entity (perception's faction-generic `nearest_threat`, not a
 player special case) over the opt-in `AiConfig.focus_target`/`focus_entity`
 fallback, which only applies as a last resort when the agent's pursue gain is
-nonzero and no better signal exists; investigate prefers a heard stimulus over
-the freshest `AiMemory` ring contact; cohere reads a friendly-neighbor mean
+nonzero and no better signal exists; investigate resolves goals in priority
+order **heard stimulus → nearest in-range world interest marker → freshest
+`AiMemory` ring contact** (stimulus still wins short-term over markers;
+`investigate_interest_marker_bonus` sits between ring and stimulus scoring).
+`AiSystem` gathers markers read-only from `WorldSystem.interest_markers` via a
+bounded nearest-marker query (fixed radius constant, not world-sized), only for
+rows with `gain_investigate > 0`; cohere reads a friendly-neighbor mean
 gathered from the same shared spatial index. This utility arbitration decides
 *what* an agent wants (a behavior and a goal); it is a distinct mechanism from
 `SteeringSystem`'s stream-priority arbitration below, which decides *which*

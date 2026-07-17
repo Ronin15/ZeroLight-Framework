@@ -274,7 +274,7 @@ pub const CollisionResponseSystem = struct {
 };
 
 fn movementIndexForIntent(data: *const DataSystem, movement: MovementBodySlice, entity: EntityId, cached_index: usize) ?usize {
-    if (cached_index < movement.entities.len and entityIdsEqual(movement.entities[cached_index], entity)) {
+    if (cached_index < movement.entities.len and movement.entities[cached_index].eql(entity)) {
         return cached_index;
     }
     return data.movementBodyDenseIndex(entity);
@@ -282,10 +282,6 @@ fn movementIndexForIntent(data: *const DataSystem, movement: MovementBodySlice, 
 
 fn shouldApplyNormalVelocityResponse(velocity: f32, normal: f32) bool {
     return normal != 0 and velocity * normal < 0;
-}
-
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
 }
 
 fn addEntity(
@@ -453,10 +449,10 @@ test "trigger response emits event without physical correction" {
     try std.testing.expectEqual(@as(usize, 0), stats.intent_count);
     try std.testing.expectEqual(@as(usize, 1), stats.trigger_count);
     try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
-    try std.testing.expect(entityIdsEqual(trigger, frame.events.mergedItems()[0].payload.entity_created));
+    try std.testing.expect(trigger.eql(frame.events.mergedItems()[0].payload.entity_created));
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
-    try std.testing.expect(entityIdsEqual(trigger, frame.collision_triggers.mergedItems()[0].a));
-    try std.testing.expect(entityIdsEqual(dynamic, frame.collision_triggers.mergedItems()[0].b));
+    try std.testing.expect(trigger.eql(frame.collision_triggers.mergedItems()[0].a));
+    try std.testing.expect(dynamic.eql(frame.collision_triggers.mergedItems()[0].b));
     try std.testing.expectEqual(@as(f32, 14), data.movementBodyConst(dynamic).?.position.x);
 }
 
@@ -515,6 +511,46 @@ test "warmed response update does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
 }
 
+test "warmed solid response update does not allocate" {
+    // FA proof for the physical-intent path: reserveForContacts then a solid
+    // dynamic-vs-static contact must emit one intent with zero allocations.
+    // The trigger-only FA test above never exercises intent_rows growth.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addEntity(&data, 10, 20, 50, 7, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    const static = try addEntity(&data, 40, 20, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 0, 1, 0, 0);
+    const contacts = [_]CollisionContact{makeContact(
+        dynamic,
+        static,
+        data.movementBodyDenseIndex(dynamic).?,
+        data.movementBodyDenseIndex(static).?,
+        -1,
+        0,
+        3,
+    )};
+    try writeContacts(&frame, &contacts);
+
+    var system = CollisionResponseSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserveForContacts(1);
+
+    const original_system_allocator = system.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_allocator.allocator();
+    defer system.allocator = original_system_allocator;
+
+    const stats = try system.update(&data, &frame);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.trigger_count);
+    const body = data.movementBodyConst(dynamic).?;
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), body.position.x, 0.001);
+}
+
 test "serial response math uses simd chunks and scalar tails" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -541,4 +577,40 @@ test "serial response math uses simd chunks and scalar tails" {
         try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(index * 10)) - @as(f32, @floatFromInt(index + 1)), body.position.x, 0.001);
         try std.testing.expectApproxEqAbs(@as(f32, -10), body.velocity.x, 0.001);
     }
+}
+
+test "multi-contact stacking applies ordered solid corrections to one dynamic" {
+    // Two statics + one dynamic: ordered contacts push the dynamic on X then Y.
+    // Final pose is the sum of sequential corrections (not a single merged resolve).
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addEntity(&data, 10, 20, 15, 12, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    const static_a = try addEntity(&data, 40, 20, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    const static_b = try addEntity(&data, 10, 50, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    const dyn_index = data.movementBodyDenseIndex(dynamic).?;
+    const a_index = data.movementBodyDenseIndex(static_a).?;
+    const b_index = data.movementBodyDenseIndex(static_b).?;
+    const contacts = [_]CollisionContact{
+        makeContact(dynamic, static_a, dyn_index, a_index, -1, 0, 3),
+        makeContact(dynamic, static_b, dyn_index, b_index, 0, -1, 2),
+    };
+    try writeContacts(&frame, &contacts);
+
+    var system = CollisionResponseSystem.init(std.testing.allocator);
+    defer system.deinit();
+    const stats = try system.update(&data, &frame);
+
+    try std.testing.expectEqual(@as(usize, 2), stats.contact_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.intent_count);
+    const body = data.movementBodyConst(dynamic).?;
+    // (10,20) + (-1,0)*3 + (0,-1)*2 = (7, 18); both approaching velocities zeroed.
+    try std.testing.expectApproxEqAbs(@as(f32, 7), body.position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 18), body.position.y, 0.001);
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.y);
+    // Statics stay put.
+    try std.testing.expectApproxEqAbs(@as(f32, 40), data.movementBodyConst(static_a).?.position.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), data.movementBodyConst(static_b).?.position.y, 0.001);
 }

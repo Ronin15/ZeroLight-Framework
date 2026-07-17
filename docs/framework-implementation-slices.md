@@ -6,10 +6,11 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
-track overviews, and open slice sections only.
+track overviews, and open slice sections only. Landed slices that still need
+manual/`gpu-smoke` confirmation (33, 43) stay here until that residual is closed.
 
 ## Ground Rules
 
@@ -79,18 +80,21 @@ Use this index to choose the next slice; **implement from that slice's section**
 
 | Slice | Status | Open work (see slice section for full Checklist) |
 | --- | --- | --- |
-| **33** | **Next** | Data-driven AI archetypes + debug introspection — depends on Slice 32 (landed) |
-| **35** | Not started | AI/steering hot-loop SIMD restructure — after 32 reshapes AI loops |
-| **37** | Not started | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening |
+| **33** | Landed (visual/GPU-smoke verification pending) | Data-driven AI archetypes (JSON→enum bundle table) + debug introspection overlay — implemented and unit-tested; on-screen viz (F2) confirmed only via `gpu-smoke`/manual run |
+| **35** | Not started | AI/steering hot-loop SIMD restructure — unblocked (Slice 32 landed); measure at battle scale |
+| **37** | Partial | Dense render-window ceiling raise (32→128) + shader/host layer-count sync hardening — stale-doc checklist item landed; rest open |
 | **38** | Not started | Elevation above the surface (depends on Slice 37) |
-| **39** | Not started | Sensory stimulus ecosystem — more `WorldStimulus` producers/kinds |
-| **40** | Not started | Action/interaction intent substrate |
-| **41** | Not started | World interest / affordance markers |
-| **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood |
+| **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood (needs real appraisal signals) |
+| **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
+| **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
+| **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
+| **47** | Not started | **Live perception defect:** un-stagger the shared spatial index / perception candidate set so cognition NPCs can perceive each other (stagger gates thinking only). **Highest-priority correctness item on the AI track** |
+| **48** | Not started | SimulationPipeline thin-composer restoration — bind `stage_order` to execution, extract `SensoryBus`, evict movement/world domain logic, own event/allocation budgets. Land as independent steps |
 
-**Recently settled (archive only):** 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
-**Residual non-slice backlog:** 23A `expand2`→`world` merge and optional render
-micro-opts — see **Scaling Gaps** / Next Priority Tracks, not a live slice body.
+**Recently settled (archive only):** 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
+`mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
+`expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
 
 **Bench policy:** 50k bench scales are throughput ceilings, not per-frame targets.
 
@@ -99,44 +103,30 @@ micro-opts — see **Scaling Gaps** / Next Priority Tracks, not a live slice bod
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice section.
 
-- **Slice 32 (behavior arbitration) is landed** — the closed loop that turns
-  perception/memory/**emotion drives** into varied locomotion intents.
-  `arbitration.zig` scores `wander`/`pursue`/`flee`/`investigate`/`cohere` via
-  a table-driven drive×behavior weight matrix, sticky-selects one, and
-  resolves a per-agent goal; the broadcast "everyone seeks the player" path is
-  gone — perception's faction-generic `nearest_threat` is the primary pursue/
-  flee signal, and the player is reachable only through an explicit, opt-in,
-  gain-gated `AiConfig.focus_target`/`focus_entity` fallback. See the archive's
-  Slice 32 entry for the full record.
-- **Emotion substrate (Slice 31) is now consumed** — fear, curiosity,
-  aggression, fatigue feed arbitration's weight table every cognition step via
-  `AiConfig.affect_slice`; `stageContract(.ai_decide)` reads `affect_drives`.
-  Slice 42 is how the **feeling set and coupling grow** without rewriting AI.
-- **Next implementation slice: 33** (archetypes + debug) so personalities
-  (including affect baselines and future appraisal gains) and tuning are
-  data-driven and observable — required before claiming live "emergent" demo
-  interplay.
-- **Keep systems expandable (standing rule, not just a 32 requirement):** the
-  weight-resolution and per-agent goal-resolution contract Slice 32 landed
-  (`scoreBehaviors`/`selectSticky`/`resolveGoal` in `arbitration.zig`) is
-  reusable by future producers, not a one-off. Emotion → behavior mapping stays
-  **table-driven over `AiAffectDrive`**, not a permanent `if (fear) flee` tree
-  that freezes the four-drive set. Do not lock agents to the player as the only
-  goal, do not replace utility with an exclusive FSM, and do not grow
-  production APIs with test-only tags.
-- **After the locomotion AI closed loop (32–33):** Slice 39 (stimulus richness),
-  41 (world interest), 40 (action intents), and **42 (affect expansion)** unlock
-  richer senses, non-locomotion emergence, and more feelings. Render slices
-  37–38 and SIMD restructure 35 are independent tracks — interleave by need.
-- **Component headroom:** 13 of 32 `Component` tags used (`enum(u5)` +
-  `ComponentMask = u32`). No widening required for Slices 32–33; promote a
-  widening slice only when a new tag would exceed 32 (see Scaling Gaps).
-- Guard CPU paths with existing benches; keep SDL_GPU submit on the render thread.
-- Hardening without a slice number: collision-response merge, `SpriteBatch`
-  capacity, text-cache lifetime, 23A `expand2`→`world` merge (track when
-  scheduled as slices).
-- Reuse state-owned `SimulationPipeline`; persistent data in `DataSystem`;
-  structural changes through `SimulationFrame`.
+**Locomotion emergence is closed** (archive 26–32, 39, 41; frontier residual 33
+visual only). Multi-source investigate (stimuli + world markers + memory) and
+table-driven affect→behavior are in place. Open work grows *beside* that loop.
+
+| Track | Slices | Notes |
+| --- | --- | --- |
+| **Primary — action/interaction** | archive **40** + **45** | Action-intent substrate + first domain controller (destructibles) landed; future combat/rules consumers reuse the same bus. |
+| **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
+| **World / render verticality** | **37 → 38** | Cap raise + shader sync, then elevation-above-surface semantics. Independent of AI. |
+| **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
+| **Perf** | **35** + Scaling Gaps | SIMD restructure of existing AI/steering loops when battle soak says math dominates — do not reshape arbitration contracts. |
+| **Persistence** | **46** | Save/load by stable IDs; largely independent. |
+
+- **Slice 32 contract (standing rule):** `scoreBehaviors` / `selectSticky` /
+  `resolveGoal` stay the expandable path. Emotion → behavior is **table-driven
+  over `AiAffectDrive`**, not a permanent `if (fear) flee` tree. Goals stay
+  per-agent and multi-source (not broadcast player-only). Utility + sticky
+  select over exclusive FSMs. No test-only production API tags.
+- **Component headroom:** 14 of 32 `Component` tags used (`enum(u5)` +
+  `ComponentMask = u32`). Slice 45 added `destructible`. Slice 41 used
+  `WorldSystem` interest markers, not a new tag — see Scaling Gaps.
+- Guard CPU paths with existing benches; keep SDL_GPU submit on the render
+  thread. Reuse state-owned `SimulationPipeline`; persistent data in
+  `DataSystem`; structural changes through `SimulationFrame`.
 
 ## Scaling Gaps And Hardening Frontier
 
@@ -160,6 +150,11 @@ world depth, or cognition-track scope.
 
 **Simulation scale**
 
+- [ ] **Interest marker consumers beyond investigate.** Slice 41 stores
+      `cover` / `resource` / `patrol` kinds and nearest-k query, but only
+      `investigate` is wired into AI. Promote when ready: cover-aware flee/pursue
+      (locomotion AI follow-up), resource/patrol action targets via Slice 40/45
+      action intents — do not half-wire into `NavigationIntent`.
 - [ ] **Movement contiguous-path vs scoped LOD.** Any dormant movement row
       disables the contiguous SIMD movement fast path for the whole step. At
       steady-state LOD with routine off-camera sleepers, revisit compacted-dense
@@ -168,21 +163,81 @@ world depth, or cognition-track scope.
       scope level / render cull alignment). Residual multi-floor chase policy
       is product work on open slices, not a missing column.
 - [ ] **Component storage headroom.** `Component` is `enum(u5)` (32 tags) and
-      `ComponentMask` is `u32` — 13 tags used after Slices 26–31
-      (`movement_body`…`ai_affect`). Free headroom covers Slice 32 hot columns
-      on existing stores and Slice 33 authoring without a new component.
-      Promote a widening slice only when the first new tag would exceed 32
-      (likely when action/affordance components land in 40–41 or later).
+      `ComponentMask` is `u32` — **14 tags used** (`movement_body`…`destructible`).
+      Slice 45 added `destructible`; Slice 41 stored interest markers on
+      `WorldSystem`, not a new tag. Promote a widening slice only when the
+      first new tag would exceed 32.
 - [ ] **Multi-world scope policy.** Inactive world instances stay out of
       pipeline scope; the active world uses chunk + halo rules (Slice 22
       deferred).
 
+**Battle-scale perf watch (2048 movers)**
+
+**How to use:** fix cycles in **Debug**; intentional soaks in **ReleaseSafe**
+(`zig build run -Doptimize=ReleaseSafe`), **one** 60s dump after load (not
+multi-minute dual cycles unless comparing load vs settle). Same pop
+(`battle_scale_demo_mover_count = 2048`), similar play. Diff new dumps against
+the control table below: if stage lines move while selected/observer counts
+stay similar → suspect **net-new code**; if selected/observers jump → **scope
+density of the feature**. Sub-stage lines `steering_setup` / `collision_setup`
+separate setup from batch. Do not min-max sub-ms when gameplay stays in band.
+
+**ReleaseSafe control baseline (post-load, ~60s, 2048 movers)**
+
+| Metric | Control band |
+|--------|----------------|
+| gameplay avg | **1.6–1.9 ms** |
+| frame (present-bound) | **~8.3 ms** (~120 FPS); cap_hits **0–1** |
+| steering stage | **~0.65–0.70 ms** |
+| steering select / snapshot / directions | **~0.03 / ~0.33–0.34 / ~0.17–0.20 ms** |
+| steering batch | **~0.40 ms** |
+| collision stage | **~0.21 ms** |
+| collision gather / sort | **~0.09 / ~0.02 ms** |
+| AI stage | **~0.15–0.20 ms** |
+| perception stage | **~0.16–0.20 ms** |
+| pathfinding avg (steady; ignore load max) | **~0.05–0.06 ms** |
+| cognition selected / observers (per step) | **~330 / ~140** |
+| movers (per step) | **~2000–2050** |
+
+Known costs inside that band (document, don’t thrash unless denser cognition
+forces a move): full agent snapshot every cognition step (~0.33 ms Safe);
+avoidance batch (~0.40 ms → Slice 35); collision gather (~0.09 ms Safe).
+
+- [x] **Steering main-thread setup + event-driven caches.** Instrumented
+      select / snapshot / directions; select one-slot resolve; path start from
+      `scope.level[mi]`; **steering→movement dense index cache** (rebuild only
+      on structural create/destroy/steering|movement component change); agent
+      cell bins via dense SIMD assign + pdqsort; static obstacle spatial
+      retained until post-commit invalidation or cell-size change. Remaining:
+      Slice 35 avoidance SIMD when batch math dominates (`steering.zig`).
+- [ ] **Collision full-sort under melee density.** Mid-pack soaks saw
+      `full_sorts` jump (e.g. 1→24) while stage avg stayed ~0.21ms; broadphase
+      batch ~0.09ms. Use `collision_setup` gather/sort timings +
+      `full_sort_disorder_percent` (default 12%) to decide if full sort is
+      expected melee disorder or a retune. Do not change SAP order without
+      measured parity. (`collision.zig`)
+- [ ] **AI separation density.** Sep samples ~2–3× when running through the
+      pack; scales with denser cognition. Confirm gather vs sep batch owner via
+      existing ai_separation batch line; vectorize with Slice 35 when math
+      dominates. Keep candidate/sample caps fixed (world-size independent).
+      (`ai.zig`, Slice 35)
+- [ ] **Path group fields + cache pressure.** `group_built=0` at 2048 is
+      intentional: demo pins `min_group_field_agents = 2000` after measuring
+      that pending-dedup/cache already serves shared-goal bursts (see
+      `proceduralPathfindingCapacity`). Re-measure eviction rate (~20k/min)
+      and group payoff only when simultaneous same-goal demand from
+      relationships/ships exists — do not lower the pin without a fresh 60s
+      capture. (`game_demo_state.zig`, pathfinding capacity)
+- [ ] **Perception tail.** Stage avg ~0.16ms, max ~2.4ms. Only if denser
+      observers fill the tail; gather multi-lookup polish optional; FOV path
+      already partially SIMD. (`perception.zig`)
+
 **Branch / packaging residuals**
 
-- [ ] **Slice 23A merge residual.** GPU tilemap hardening is landed on
-      `expand2` (archive Slice 23A). Remaining: land as a coherent commit stack
-      and merge to `world`; optional O(n) linear `mergeDrawList` micro-opt only
-      after measuring.
+- [x] **Slice 23A merge — settled.** GPU tilemap hardening (archive Slice 23A)
+      is merged into `main` (`expand2`/`world` are ancestors of HEAD). The only
+      remaining item is the optional O(n) linear `mergeDrawList` micro-opt below,
+      to do after measuring — not a merge task.
 
 **Render scale**
 
@@ -206,14 +261,16 @@ world depth, or cognition-track scope.
   passes and scope stats show typical participation stays below bench ceilings.
 - Per-entity depth alignment (archive 25E) is settled before multi-floor
   gameplay scenarios that depend on cross-level entity presence.
-- Slice 32 (arbitration + per-agent goals) is landed; land Slice 33 before
-  shipping data-tuned personalities in the demo.
+- Slice 32 (arbitration + per-agent goals) and multi-source investigate inputs
+  (39, 41) are landed; Slice 33 authoring is landed (close the visual residual
+  before shipping heavily data-tuned demo personalities as a product claim).
 - Do not scale cognition population (archetype swarm stress) until arbitration
   is gated by the existing cognition-scope dense indices and benches report
   intent-selection cost separately from pathfinding.
-- Keep locomotion emergence (32–33) independent of action/combat emergence
-  (40+): NavigationIntent contract stays stable while action intents grow
-  beside it, not inside it.
+- Keep locomotion emergence (32–33 + 39 + 41) independent of action/combat
+  emergence (40+): `NavigationIntent` stays stable while action intents grow
+  beside it, not inside it. Reserved interest kinds (`cover` / `resource` /
+  `patrol`) must not be half-wired into investigate scoring.
 
 ## Long-Term Gameplay Direction
 
@@ -243,8 +300,9 @@ Track Overview** below.
   topics.
 - **Goals are per-agent and multi-source.** Broadcast "everyone seek the player"
   is a demo convenience, not the long-term production path. Goal resolution
-  reads perception threats, memory last-known/ring contacts, stimuli, and later
-  world interest markers (Slice 41).
+  reads perception threats, memory last-known/ring contacts, multi-producer
+  stimuli (Slice 39), and world interest markers (Slice 41; investigate wired;
+  cover/resource/patrol reserved).
 - **Authoring is data, runtime is enums/scalars.** Archetypes (33) resolve at
   load into component bundles and fixed gain tables; hot paths never parse JSON
   or hash string behavior names.
@@ -261,7 +319,7 @@ complete work chunk: read **Goal** → check off **Checklist** items → pass
 to the archive**. Use **Open Frontier Slice Index** to choose N. Settled slices
 are not duplicated here.
 
-## Emergent AI Track Overview (Slices 26–33, +39–42)
+## Emergent AI Track Overview (Slices 26–33, +39–42, +45)
 
 Goal: layer emergent NPC behavior — perception, memory, **feelings/emotions**,
 and richer behavior arbitration — on top of the navigation substrate, while
@@ -273,16 +331,18 @@ by Slice 24.
 
 | Layer | Slice | Status | What it produces |
 | --- | --- | --- | --- |
-| Faction / RNG / spatial index | 26–28 | Landed | Stance table, deterministic draws, shared neighbor index |
-| Perception | 29 | Landed | Vision/hearing columns + acquire/lose events; dig stimuli only |
-| Memory | 30 | Landed | Last-known + ring + familiarity; cold-seek retarget in AI |
-| **Emotion / affect** | **31** | **Landed** | **fear / curiosity / aggression / fatigue** SoA drives, per-entity baselines/decay/thresholds, Schmitt threshold events; **consumed by arbitration (32)** |
-| **Arbitration** | **32** | **Landed** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
-| Archetypes / debug | 33 | Open | JSON personalities + overlay (incl. drive bars / affect blocks) |
-| Stimulus ecosystem | 39 | Open | More producers/kinds so hearing is not dig-only |
-| Action intents | 40 | Open | Non-locomotion intent stream (attack/interact/use) |
-| World interest | 41 | Open | Durable investigate/cover/resource markers |
-| **Affect expansion** | **42** | Open | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
+| Faction / RNG / spatial index | 26–28 | Landed (archive) | Stance table, deterministic draws, shared neighbor index |
+| Perception | 29 | Landed (archive) | Vision/hearing columns + acquire/lose events |
+| Memory | 30 | Landed (archive) | Last-known + ring + familiarity; cold-seek retarget in AI |
+| **Emotion / affect** | **31** | **Landed (archive)** | **fear / curiosity / aggression / fatigue** SoA drives; **consumed by arbitration (32)** |
+| **Arbitration** | **32** | **Landed (archive)** | Utility over 29–31 → per-agent `NavigationIntent`, table-driven drive consumption, sticky selection |
+| Archetypes / debug | 33 | Landed (visual residual on frontier) | JSON personalities + overlay (drive bars / affect blocks) |
+| Stimulus ecosystem | 39 | Landed (archive) | Multi-producer bus (dig, footstep, deferred impact) |
+| World interest | 41 | Landed (archive) | Durable investigate/cover/resource/patrol markers; investigate wired |
+| Action intents | 40 | Landed (archive) | Non-locomotion intent stream (attack/interact/use); player R capture |
+| First action consumer | 45 | Landed (archive) | `DestructibleController` at `action_react`; deferred destroy + domain event |
+| Sensing substrate fix | 47 | **Open (live defect)** | Un-stagger the shared spatial index / perception candidates so cognition NPCs perceive each other; stagger gates thinking only |
+| **Affect expansion** | **42** | **Open** | More drives, cross-drive coupling, data-driven appraisal gains, optional mood |
 
 ### Emotion / feelings model (landed + expandability)
 
@@ -333,38 +393,36 @@ by Slice 24.
 6. If drive count exceeds 8: widen `above_threshold_mask` and consider packing
    drives as `[drive_count]f32` columns instead of named fields (Slice 42).
 
-**Closed-loop status: Slice 32 landed.** The pipeline order
+**Closed-loop status: locomotion emergence landed.** Pipeline order
 `perception → ai_memory → affect → ai_decide → steering → pathfinding`
 (`simulation_pipeline.zig` `stage_order`) is unchanged — no new `StageId` was
-added. `AiSystem`'s `ai_decide` stage now: scores `AiBehavior`'s five
+added for arbitration. `AiSystem`'s `ai_decide` scores `AiBehavior`'s five
 variants (`wander`/`pursue`/`flee`/`investigate`/`cohere`) via
 `arbitration.scoreBehaviors`'s table-driven drive×behavior weight matrix,
 sticky-selects one via `arbitration.selectSticky`, and resolves a per-agent
 goal via `arbitration.resolveGoal` — pursue/flee prefer perception's
 faction-generic `nearest_threat` or fresh `AiMemory` over the opt-in,
 gain-gated `AiConfig.focus_target`/`focus_entity` player fallback; investigate
-prefers heard stimuli over memory-ring contacts; cohere reads the shared
-spatial index for a friendly-neighbor mean. `game_demo_state.zig` now attaches
-`ai_perception`/`ai_memory`/`ai_affect` to a subset of demo movers
-(`demoArchetypeForIndex`: timid/aggressive/curious/cohesive archetypes) with
-sized event budgets. See `docs/framework-implementation-slices-archive.md`'s
-Slice 32 entry for the full implementation record.
+prefers heard stimuli, then world interest markers (41), then memory-ring
+contacts; cohere reads the shared spatial index for a friendly-neighbor mean.
+Demo spawns resolve named archetypes from `assets/ai/archetypes.json` (33).
+See the archive for full Slice 32 / 39 / 41 records.
 
-Slices 39–41 expand the *inputs and outputs* of that loop so emergence is not
-permanently limited to "chase or wander around the player after a dig."
+**Landed loop inputs (do not rebuild):** multi-producer stimuli (39: dig /
+footstep / deferred impact) and world interest markers (41: investigate wired;
+`cover` / `resource` / `patrol` reserved for later consumers).
 
-Sequencing rationale:
+**Sequencing rationale (what remains open on this track):**
 
-- Slices 26–28 are framework foundations (landed).
-- Slices 29–31 are the composing signal stack (landed).
-- **Slice 32** is behavior arbitration — the first consumer of affect and the
-  first per-agent multi-behavior / multi-goal selector (landed).
-- **Slice 33** is authoring/tuning infrastructure so the loop is data-driven
-  and observable (next).
-- **Slices 39–42** are post-loop expandability: richer senses, non-locomotion
-  actions, world-authored interest points, and **more/coupled feelings**. They
-  must not be folded into 32 as half-wired stubs — each is a full slice with
-  its own checklist.
+- Slices 26–28 — framework foundations (landed).
+- Slices 29–31 — composing signal stack (landed).
+- **Slice 32** — behavior arbitration (landed).
+- **Slice 33** — authoring/tuning infrastructure (landed; visual/`gpu-smoke`
+  residual only).
+- **Slices 39, 41** — richer senses + world-authored investigate POIs (landed).
+- **Open post-loop expandability:** **45** (first action consumer; **next**),
+  **42** (more/coupled feelings). Action intents (**40**) are landed. Each is
+  a full slice — do not half-wire into 32 or overload `NavigationIntent`.
 
 Shared design contracts for the whole track:
 
@@ -408,8 +466,15 @@ Shared design contracts for the whole track:
     unless a later slice explicitly owns a contract change.
 ## Slice 33: Data-Driven AI Archetypes And Debug Introspection
 
-**Status: not started.** Depends on Slice 32's behavior set, `AiAgent` gains,
-and hot `active_behavior` columns.
+**Status: landed (on-screen visual/`gpu-smoke` verification pending).** Archetype
+catalog (`src/game/ai_archetypes.zig` + `assets/ai/archetypes.json`) loads at
+init through `UpdateContext.asset_store`, spawns replace the deleted
+`demoArchetypeForIndex` literals with byte-identical parity, and the AI
+introspection overlay (`src/game/ai_debug_overlay.zig`) draws under the existing
+F2 / gamepad-BACK toggle. All checklist/acceptance items are integrated and
+unit-tested; only the on-screen appearance (F2 in a live/`gpu-smoke` run) is
+unconfirmed in a headless environment. Kept in the frontier (not archived) until
+that visual pass, mirroring Slice 43.
 
 Goal: make the closed emergent-AI loop **authorable without recompiling** and
 **observable while tuning**, so personalities (timid / curious / aggressive /
@@ -448,7 +513,7 @@ or string behavior names on the hot path.
 
 ### Checklist
 
-- [ ] Define archetype JSON schema (documented in `docs/` or beside the loader):
+- [x] Define archetype JSON schema (documented in `docs/` or beside the loader):
       faction, optional perception/memory/**affect** blocks (per-drive baseline,
       decay_rate, threshold — and, once Slice 42 lands, appraisal gains),
       `AiAgent` behavior gains and wander amplitude, steering defaults,
@@ -459,23 +524,23 @@ or string behavior names on the hot path.
       `vision_range` near 0 and a large `hearing_range`) — mechanically
       already supported since these are cold per-entity fields, not global
       constants; today's demo archetypes (Slice 32) just don't vary them.
-- [ ] Implement loader + strict validation tests (good file, missing field,
+- [x] Implement loader + strict validation tests (good file, missing field,
       out-of-range gain, unknown behavior key, unknown faction, **unknown
       affect drive key**).
-- [ ] Register archetypes in runtime asset / content path used by
+- [x] Register archetypes in runtime asset / content path used by
       `LoadingState` (same install-tree rules as other assets).
-- [ ] Migrate demo spawns to named archetypes (minimum set: `timid`,
+- [x] Migrate demo spawns to named archetypes (minimum set: `timid`,
       `curious`, `aggressive`, `cohesive`, optional `wanderer`) whose
       **emotion baselines** differ enough to show flee / investigate / pursue /
       cohere under the same world.
-- [ ] Extend debug overlay (gated by existing debug flag):
+- [x] Extend debug overlay (gated by existing debug flag):
       - vision cone / range ring from perception cold+facing
       - **emotion drive bars** (fear/curiosity/aggression/fatigue; above-
         threshold highlight)
       - last-known memory marker + ring ticks
       - active behavior label
       - scope/tier counts from existing scope stats (no new sim policy)
-- [ ] Document authoring workflow in `docs/development-workflow.md` or a short
+- [x] Document authoring workflow in `docs/development-workflow.md` or a short
       `docs` note linked from the atlas/AI sections — include "how to tune a
       personality's feelings" via affect blocks.
 - [ ] Optional: promote deferred `memory_expired` event only if debug or a
@@ -483,16 +548,23 @@ or string behavior names on the hot path.
 
 ### Acceptance checks
 
-- [ ] Archetypes load from data with strict validation; spawns apply component
-      bundles identical to hand-built fixtures for the same numbers.
+- [x] Archetypes load from data with strict validation; spawns apply component
+      bundles identical to hand-built fixtures for the same numbers. (Loader
+      parity test asserts each catalog bundle equals the deleted literals
+      field-for-field.)
 - [ ] Demo shows differentiated behavior under the same world stimuli without
       code edits to gains (**timid fear → flee**, **curious → investigate dig
-      noise**, aggressive pursues, cohesive clumps).
-- [ ] Debug overlay visualizes perception / **emotion drives** / memory /
+      noise**, aggressive pursues, cohesive clumps). (Mechanism verified: the
+      `ai` bench shows all five behaviors emerging from the varied archetype
+      baselines; the on-screen scene is the one item pending a live/`gpu-smoke`
+      run.)
+- [x] Debug overlay visualizes perception / **emotion drives** / memory /
       active behavior / scope without changing serial simulation checksums /
-      intent streams.
-- [ ] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
-      passes.
+      intent streams. (Read-only const-slice gather; determinism test proves the
+      AI columns are byte-identical before/after gather.)
+- [x] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
+      passes. (Spawn resolves `@intFromEnum` → prevalidated bundle; strict
+      load-time parse only.)
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 
 Goal: restructure the existing scalar per-agent / per-neighbor loops in AI and
@@ -500,14 +572,13 @@ steering into packed-SoA-scratch vectorized kernels, so they hold up in heavy
 scenes, large battles, and late-game worlds where they become the dominant cost.
 
 Why deferred (not part of Slice 34): this is optimization, not foundation, and
-its acceptance is defined at target scale. It needs the Slice 34 primitive layer,
-Slice 24 scoping (which determines how many entities actually reach these loops
-per step), and a way to spawn representative agent counts (Slice 33 archetypes or
-a stress spawner) so wins and regressions can be measured at battle scale rather
-than demo scale. Doing it before that is optimizing against guessed load, and the
-emergent-AI slices (29–32) will reshape these systems anyway — new stages are
-built SIMD-first per the track contract, so this slice targets the pre-existing
-loops.
+its acceptance is defined at target scale. Prerequisites are landed: Slice 34
+primitives, Slice 24 scoping (who reaches these loops per step), Slice 32's
+arbitration reshape of AI decide, and Slice 33 archetypes / battle-scale demo
+counts for representative load. New cognition stages stay SIMD-first per the
+track contract; this slice targets the **pre-existing** AI separation /
+decide-blend and steering avoidance scalar loops. Do not use 35 as a reason to
+rewrite the utility/sticky arbitration contract.
 
 Current foundation:
 
@@ -776,6 +847,10 @@ Checklist:
 - [ ] Migrate `dig_controller.zig`'s two `level == 0` / `current_level == 0`
       call sites and `simulation_pipeline.zig`'s `gateBodyToWalkableTiles` to
       `levelElevation(...) == 0`.
+- [ ] Migrate demo interest-marker placement
+      (`game_demo_state.placeDemoInterestMarkers`) off hardcoded `level = 0` to
+      the surface elevation (`levelElevation(...) == 0` / surface level index)
+      so elevated stacks above the surface do not leave POIs on the wrong tier.
 - [ ] Replace `digRamp`'s raw index-0 "nothing above" check with an
       elevation-adjacency lookup (a reachable level at
       `levelElevation(level) + 1`), verified against a real multi-tier
@@ -798,175 +873,6 @@ Acceptance checks:
 - [ ] `digRamp`'s elevation-adjacency replacement is verified against a real
       multi-tier fixture (zig-debug-specialist review recommended given this
       is the one non-mechanical change in this slice).
-- [ ] `zig build verify` passes.
-
-## Slice 39: Sensory Stimulus Ecosystem
-
-**Status: not started.** Depends on Slice 29's `SimulationFrame.stimuli` /
-hearing path; most valuable after Slice 32 so investigate/flee can react to
-richer sounds than dig alone.
-
-Goal: expand the world sensory bus so hearing and curiosity are not permanently
-tied to a single dig producer — without turning stimuli into a second event
-stream or audio-playback service.
-
-### Problem (code today)
-
-- `SimulationFrame.stimuli` is a `RangeOutputStream(WorldStimulus)` with
-  scalar fields (position, intensity, kind, level).
-- **Sole producer:** `DigController.process` (one stimulus per dig). Landing/
-  fall carve deliberately does not emit (ordering vs perception in the same
-  step — documented in Slice 29).
-- `intensity` is stored but unused (no falloff curve yet).
-- No footsteps, combat hits, alarms, or player-jet coupling into cognition —
-  investigate utility in Slice 32 only fires when something digs nearby.
-
-### Architecture notes
-
-- Stimuli stay **transient per-step positional records**, not `SimulationEvent`s
-  and not `AudioCommandBuffer` entries. Audio may *also* play a sound for the
-  same gameplay moment, but cognition must not read the audio service.
-- Add producers at explicit pipeline stages that run **before**
-  `perception_update` (same rule as dig), or document a one-step delay if a
-  producer can only run later — never silently emit after perception.
-- Keep `WorldStimulus.kind` a small closed enum; extend with new tags + tests,
-  not strings.
-- Falloff: hearing already range-gates; optional intensity attenuation
-  `effective = intensity / (1 + dist2 * k)` with fixed `k`, only if a second
-  producer needs relative loudness. Do not scale constants from world size.
-- Capacity: pre-reserve stimulus stream from a caller-sized budget (mirror
-  perception event budget discipline) once producers can exceed one item/step.
-
-### Checklist
-
-- [ ] Document producer-phase rule in `docs/simulation-tiers-and-pipeline.md`
-      and `architecture.md` (must precede perception or be next-step delayed).
-- [ ] Extend `WorldStimulus.kind` with the first real multi-producer set
-      (minimum: dig retained, plus at least two of: footstep burst, collision
-      impact, tool/use pulse — pick from systems that already have main-thread
-      or fixed-step hooks).
-- [ ] Wire 2+ producers with tests for range/level gating and multi-stimulus
-      nearest selection (perception already has nearest-of-multiple tests —
-      extend fixtures).
-- [ ] Implement or explicitly defer intensity falloff; if deferred, document
-      why intensity remains unused.
-- [ ] Reserve stimulus capacity from demo/pipeline config; capacity + drop
-      policy tests if overflow is possible.
-- [ ] Headless proof: dig-only worlds unchanged; multi-producer frames remain
-      allocation-free after warmup; serial == threaded perception.
-
-### Acceptance checks
-
-- [ ] Hearing can acquire non-dig stimuli; Slice 32 investigate agents move
-      toward them in fixtures (or 33 demo once archetypes exist).
-- [ ] No cognition → audio service dependency; no stimulus pointers/handles.
-- [ ] `zig build verify` passes; perception benches do not regress beyond noise
-      at equal agent counts when stimulus count stays bounded.
-
-## Slice 40: Action And Interaction Intent Substrate
-
-**Status: not started.** Depends on Slice 32 for a stable locomotion intent
-path; do not block 32 on this slice.
-
-Goal: add a **parallel, typed action-intent stream** for non-locomotion
-gameplay (attack, interact, use, signal) so emergent systems can express more
-than movement without overloading `NavigationIntent` or inventing a string
-pub/sub bus.
-
-### Problem
-
-- `SimulationIntent` today is effectively movement-only
-  (`simulation.zig`: `union(enum) { movement: MovementIntent }`).
-- `NavigationIntent` is the high-level AI → steering handoff for **where to
-  go**. Cramming "attack target X" into goal XY or priority bits would lock
-  combat into pathfinding and break expandability.
-- Architecture already describes domain controllers for combat/rules/spawning
-  (`architecture.md`) but no intent substrate exists for their outputs.
-
-### Architecture notes
-
-- New stream on `SimulationFrame`, e.g. `action_intents:
-  RangeOutputStream(ActionIntent)`, same count/prefix/write / range merge
-  model as navigation intents.
-- `ActionIntent` payload: entity, kind enum, optional target `EntityId`,
-  optional cell/level scalars, priority, cooldown key — **scalar/enum only**.
-- Producers: AI arbitration (later extension), player input controller, future
-  combat controller. Consumers: domain controllers at explicit reaction phases
-  after merge — not the pathfinder.
-- **Do not** require Slice 32 to emit actions. Slice 32 may leave a documented
-  extension point (e.g. score term reserved) but shipping attack from 32 is
-  out of scope.
-- Structural mutations from successful actions still go through deferred
-  structural commands / world edits — action intents request consideration,
-  they do not mutate `DataSystem` inside worker ranges.
-
-### Checklist
-
-- [ ] Define `ActionIntent` + kind enum + stream on `SimulationFrame`; reserve
-      API; stats counters; docs for when to use action vs navigation vs domain
-      events.
-- [ ] Pipeline phase: declare producer stage(s) and consumer reaction point(s)
-      in `stage_order` / contracts without breaking existing stage resources.
-- [ ] Player or test harness emits at least one action kind end-to-end
-      (e.g. interact-noop or attack-request that a stub consumer counts).
-- [ ] Capacity, deterministic merge, serial/threaded parity, payload purity
-      tests (no pointers/handles).
-- [ ] Document expansion path: AI arbitration may later emit actions when a
-      pursue agent is in range — separate checklist item / future slice, not a
-      silent partial in 40's "done" claim unless fully tested.
-
-### Acceptance checks
-
-- [ ] Movement-only demos unchanged when no action producers run.
-- [ ] Action stream is deterministic and allocation-free after reserve.
-- [ ] NavigationIntent contract untouched.
-- [ ] `zig build verify` passes.
-
-## Slice 41: World Interest And Affordance Markers
-
-**Status: not started.** Best after Slices 32–33 (agents can investigate) and
-usable with 39 (stimuli) without requiring 40.
-
-Goal: give agents durable, world-authored **interest points** (investigate
-hooks, cover, resource nodes, patrol anchors) as persistent facts in
-`WorldSystem` or compact `DataSystem` markers — so goal selection is not limited
-to living entities, dig noise, and the player.
-
-### Problem
-
-- Perception tracks entities + transient stimuli; memory rings remember
-  entities. There is no first-class "point of interest" for curiosity,
-  garrison, loot, or cover.
-- Without this, investigate/pursue content stays combatant-centric and
-  demo-shaped.
-
-### Architecture notes
-
-- Prefer **world-owned SoA markers** (stable id, kind enum, level, cell/xy,
-  optional faction filter, optional radius) over per-agent heap lists.
-- Agents query markers through a bounded spatial structure (reuse chunk
-  hashing or a frame-built index — do not N² scan the world on the hot path).
-- Slice 32's investigate resolver should be written so a future "best interest
-  marker" signal slots in as another score input without rewriting arbitration.
-- Rendering of markers is optional/debug; gameplay facts must not require GPU
-  handles.
-
-### Checklist
-
-- [ ] Define marker storage + kind enum + add/remove at load or via structural/
-      world APIs; tests for level isolation and capacity.
-- [ ] Bounded query API for cognition agents (max K markers in radius).
-- [ ] Wire investigate (and optionally pursue/flee cover) scoring to consume
-      markers when present; fixtures without markers preserve prior behavior.
-- [ ] Demo or content path places a few markers; archetypes (33) can bias
-      curiosity toward marker kinds.
-- [ ] Docs: ownership in WorldSystem vs DataSystem decision recorded in
-      architecture.md.
-
-### Acceptance checks
-
-- [ ] Agents investigate markers without entity targets present.
-- [ ] Queries bounded and allocation-free after warmup; determinism holds.
 - [ ] `zig build verify` passes.
 
 ## Slice 42: Affect Expansion — More Feelings, Coupling, And Mood
@@ -1050,9 +956,10 @@ pressured into half-shipping coupling.
       track overview steps); keep code and docs aligned.
 - [ ] Promote appraisal gains to per-entity cold fields; migrate module
       constants to defaults; archetype JSON (33) gains keys; validation + tests.
-- [ ] Land at least one **new drive** end-to-end only when a real signal exists
-      (or defer the first new tag until combat/stimuli provide one — do not ship
-      a dead drive). If deferred, leave checklist item open with reason.
+- [ ] Land at least one **new drive** end-to-end only when a real appraisal
+      signal exists (e.g. damage/combat from 40/45, or another documented
+      producer). **Do not ship a dead drive tag.** If deferred, leave this
+      checklist item open with the blocking signal named.
 - [ ] Optional: sparse cross-drive coupling matrix + tests (fear dampens
       curiosity; aggression slightly raises fatigue, etc.).
 - [ ] Optional: mood / long-horizon bias layer with scope freeze semantics.
@@ -1067,12 +974,426 @@ pressured into half-shipping coupling.
 
 - [ ] Existing four drives unchanged in default configs (behavior parity
       fixtures from Slice 32 still pass with coupling disabled / zero matrix).
+- [ ] **No production `AiAffectDrive` tag without a wired appraisal path and
+      at least one real producer signal** that can move the drive under test
+      (no placeholder enums).
 - [ ] New drive (when landed) appraises, decays, emits threshold edges, appears
       in archetype/debug, and modulates arbitration through the **same table
       path** as fear/curiosity/aggression/fatigue.
 - [ ] No second emotion subsystem; no hot-path strings; `zig build verify`
       passes; `zig build bench -- --group ai-affect` shows no unexpected
       multi-x regression at equal agent counts.
+
+## Slice 43: SDL3 Gamepad/Controller Support
+
+**Status: landed (runtime behavior + tests + docs), manual hardware
+verification pending.** This is app/input-layer work, independent of the
+AI/render tracks (33, 35, 37–38, 40, 42, 45) — no ordering dependency either
+way.
+
+Goal: single active-device gamepad support that mirrors the existing
+keyboard `Action` model 1:1 with default button bindings, adds true analog
+left-stick movement (deadzone + normalized magnitude, not digital d-pad
+synthesis), and hot-plug add/remove handling with a clean fallback to
+keyboard — no rebind UI (defaults only, a later slice).
+
+### Current foundation
+
+- `src/app/input.zig`'s device-agnostic `Action` enum, `KeyBinding`/
+  `default_key_bindings`, `InputState` (held actions + `movementVector`),
+  `FrameCommands` (one-frame latched commands), and the private
+  `isGameplayAction`/`isCommandAction` classifiers already existed and needed
+  no reshaping — only extension.
+- `src/app/input_router.zig`'s `InputRoutingPolicy` (gameplay/modalUi/
+  passThroughOverlay/opaqueScreen) and `routeEvent` already gated keyboard
+  events through per-state action contexts.
+- `src/platform/sdl.zig`'s `@cImport` already exposed the full SDL3 gamepad
+  API; `init_flag_names` already listed gamepad/joystick flag names for
+  debug logging.
+
+### Architecture notes
+
+- New `src/app/gamepad.zig`: `GamepadManager` owns at most one open
+  `*SDL_Gamepad` + its `SDL_JoystickID`. Pure decision logic
+  (`shouldAdopt`/`isActiveDevice`/`pickFallback`) is unit-tested against
+  synthetic `SDL_JoystickID` values; `SDL_OpenGamepad`/`SDL_GetGamepads`/
+  `SDL_CloseGamepad` glue is thin and untested (no real/virtual hardware in
+  CI, same posture as the display-gated `gpu-smoke` probe).
+  `handleDeviceEvent` reacts to `SDL_EVENT_GAMEPAD_ADDED`/`_REMOVED`,
+  returning `enum { none, connected, disconnected }`.
+- `src/app/input.zig` gained `GamepadButtonBinding`/`default_gamepad_bindings`,
+  `actionForGamepadButton`, and `actionForPressEvent` (resolves a fresh
+  key-down or gamepad-button-down event to an `Action` in one call — used by
+  menu states). `InputState` gained `gamepad_stick_x_raw`/`gamepad_stick_y_raw`,
+  `handleGamepadAxis`, and a scaled-radial-deadzone `movementVector` that adds
+  the normalized stick vector to the keyboard digital direction and clamps
+  each axis independently to `[-1, 1]` (deliberately not clamping combined
+  length, to avoid changing keyboard-only sqrt(2) diagonal feel).
+  `releaseMovement` now also zeroes the raw stick fields; a new
+  `releaseGamepadInput` additionally clears held dig actions for the
+  disconnect path. `FrameCommands` gained a public `press` setter mirroring
+  `InputState.setHeld`.
+- `src/app/input_router.zig` factored a shared `routeAction` helper (policy
+  gate + held-vs-one-frame classification) reused by keyboard key events and
+  new `SDL_EVENT_GAMEPAD_BUTTON_DOWN`/`_UP` cases (gamepad buttons never
+  repeat). A new `SDL_EVENT_GAMEPAD_AXIS_MOTION` case, gated by
+  `policy.allowsContext(.gameplay)`, forwards only
+  `SDL_GAMEPAD_AXIS_LEFTX`/`_LEFTY` to `InputState.handleGamepadAxis`.
+- `src/game/main_menu_state.zig` and `src/game/settings_menu_state.zig` swapped
+  their raw `SDL_EVENT_KEY_DOWN` + `actionForKey` checks for the single
+  `inputFile.actionForPressEvent(event) orelse return false` call, so D-pad
+  nav / South confirm / East cancel work with no per-state gamepad branching.
+- `src/app/engine.zig`: `sdl_flags` now includes `SDL_INIT_GAMEPAD`; `Engine`
+  gained a `gamepad: GamepadManager` field, initialized via `openInitial()`
+  right after `sdl_context` and torn down in `deinit()` before
+  `sdl_context.deinit()`; `handleEvents` reacts to
+  `SDL_EVENT_GAMEPAD_ADDED`/`_REMOVED` and calls
+  `self.input.releaseGamepadInput()` on a `.disconnected` result.
+- No changes were needed in `src/game/player.zig`, `src/game/audio_controller.zig`,
+  or `src/app/pause_controller.zig` — all three already consumed
+  `movementVector()`/`releaseMovement()` through the existing device-agnostic
+  contract.
+- SDL3 header ground truth used during implementation: `SDL_GamepadButtonEvent.button`
+  and `SDL_GamepadAxisEvent.axis` are raw `Uint8` fields (translated to Zig
+  `u8`); `SDL_GamepadButton`/`SDL_GamepadAxis` themselves translate to plain
+  `c_int` (not a genuine Zig `enum`) because `SDL_GAMEPAD_BUTTON_INVALID`/
+  `SDL_GAMEPAD_AXIS_INVALID` are `-1`, so translate-c falls back to an integer
+  alias with comptime constants. The correct cast at every call/construction
+  site is therefore a plain `@intCast` between the `u8` event field and the
+  `c_int` binding/comparison type — never `@enumFromInt`.
+
+### Checklist
+
+- [x] `src/app/gamepad.zig` (new): `GamepadManager` device lifecycle + pure-function
+      unit tests; registered in `src/tests.zig`.
+- [x] `src/app/input.zig`: gamepad button binding table, `actionForGamepadButton`,
+      `actionForPressEvent`, analog stick fields/deadzone/`handleGamepadAxis`,
+      `movementVector` rewrite, `releaseMovement` extension, `releaseGamepadInput`,
+      `FrameCommands.press`; tests for every binding, event shape, deadzone case,
+      and combination case.
+- [x] `src/app/input_router.zig`: shared `routeAction`, gamepad button/axis
+      routing cases; tests mirroring keyboard across all four
+      `InputRoutingPolicy` presets, plus axis gating/no-op tests.
+- [x] `src/game/main_menu_state.zig` / `src/game/settings_menu_state.zig`:
+      swapped to `actionForPressEvent`; extended existing named-action tests
+      with an equivalent gamepad-driven pass.
+- [x] `src/app/engine.zig`: `SDL_INIT_GAMEPAD` flag, `GamepadManager` field +
+      init/deinit wiring, device-add/remove handling in `handleEvents`.
+- [x] Docs updated: this section, `docs/state-stack-and-input.md` `## Gamepad`
+      section (binding table, deadzone/analog contract, hot-plug behavior),
+      `docs/architecture.md` ownership bullets and input-flow sentence.
+
+### Acceptance checks
+
+- [x] `zig build verify` (check + test + shader compile + atlas lint) passes.
+- [x] All tests listed in the Checklist above are present and passing under
+      `zig build test`.
+- [x] Docs updated as listed above.
+- [ ] Manual hardware verification (no headless virtual-gamepad harness exists
+      in this repo, so this is a follow-up outside the automated gate):
+      connect a real controller and confirm (a) an already-connected
+      controller is picked up automatically at startup, (b) movement feels
+      analog through the full deflection range, (c) every binding in the
+      table above matches actual button presses, (d) mid-game unplug releases
+      held movement/dig state cleanly and falls back to keyboard with no stuck
+      input, (e) plugging in a second controller while one is active does not
+      steal input from the first.
+
+## Slice 44: Input Rebinding And Extended Gamepad Controls
+
+**Status: not started.** App/input-layer work, depends on Slice 43 (landed);
+independent of the AI/render tracks — no ordering dependency either way.
+
+Goal: fill the controls Slice 43 deliberately deferred — a rebind capture UI
+(defaults are no longer the only option) and the right-stick / trigger axes it
+left as no-ops — without recompiling to change a binding and without breaking
+the device-agnostic `Action` contract keyboard and gamepad already share.
+
+### Current foundation (do not rebuild)
+
+- `src/app/input.zig`'s `default_key_bindings` / `default_gamepad_bindings` are
+  compile-time `pub const` tables; `actionForKey` / `actionForGamepadButton` /
+  `actionForPressEvent` iterate them. A rebind UI needs a **runtime-mutable**
+  table these resolvers read instead of the const arrays directly.
+- `src/app/input_router.zig`'s `routeAction` + `SDL_EVENT_GAMEPAD_AXIS_MOTION`
+  case forward only `SDL_GAMEPAD_AXIS_LEFTX`/`_LEFTY`; right stick and triggers
+  arrive but are dropped.
+- `src/game/settings_menu_state.zig` already owns a runtime settings struct
+  (`RuntimeAudioSettings`) and menu-driven adjustment flow — the pattern a
+  `RuntimeInputBindings` and its capture UI mirror.
+
+### Architecture notes
+
+- Introduce a runtime binding table (`RuntimeInputBindings`, initialized by
+  copying the `default_*` consts) owned where the menu can mutate it; rewrite
+  `actionForKey`/`actionForGamepadButton` to resolve against it. Keep the const
+  tables as the reset-to-defaults source.
+- Rebind capture (press-a-key-to-bind) lives in `settings_menu_state.zig`; reject
+  conflicting/duplicate bindings loudly rather than silently shadowing an action.
+- Add right-stick and trigger `Action` bindings with new axis cases in
+  `input_router.zig`, gated by the same `InputRoutingPolicy` as the left stick.
+  Right-stick semantics (e.g. camera/aim) stay a thin mapping — no new gameplay
+  contract.
+- **Persistence of custom bindings is deferred to Slice 46** (save/load). Until
+  then bindings reset to defaults each launch — document this explicitly, do not
+  leave it an implicit surprise.
+
+### Checklist
+
+- [ ] `RuntimeInputBindings` runtime table + reset-to-defaults; `actionFor*`
+      resolve against it; tests that a rebound action resolves to the new
+      key/button and that reset restores defaults.
+- [ ] Settings-menu rebind capture flow with conflict/duplicate rejection; tests
+      for the rejection path.
+- [ ] Right-stick / trigger `Action` bindings + `input_router.zig` axis cases,
+      policy-gated; tests mirroring the left-stick gating/no-op tests.
+- [ ] Docs: update `docs/state-stack-and-input.md` `## Gamepad` / rebinding
+      contract; note the reset-each-launch behavior pending Slice 46.
+
+### Acceptance checks
+
+- [ ] A rebound action resolves at runtime with no recompile; right stick /
+      triggers drive their bound actions.
+- [ ] Keyboard-only and default-binding paths are byte-for-byte unchanged.
+- [ ] `zig build verify` passes.
+
+## Slice 46: Save/Load Persistence
+
+**Status: not started.** Completes the design intent from archive **Slice 10**,
+which introduced `DataSystem` as "the state-owned persistent gameplay data
+container **and save/load streaming boundary**" — the boundary exists, the
+serialization was never implemented. Largely independent; benefits from Slice 44
+(to persist custom bindings) but does not require it.
+
+Goal: serialize and restore a running simulation to/from disk so gameplay state
+survives a restart, reconstructing a **byte-identical** simulation — persisting
+only stable IDs and enum/scalar columns, never paths or live handles.
+
+### Current foundation (do not rebuild)
+
+- `DataSystem` holds default-initialized SoA stores (`movement_bodies`,
+  `facings`, `asset_refs`, `collision_*`, `ai_agents`, `steering_agents`,
+  `world_levels`, `factions`, `ai_perceptions`, `ai_memories`, `ai_affects`,
+  `destructibles`, …) plus entity slots + generations.
+- `WorldSystem` owns tile / level storage; `player.zig` owns player state;
+  `core/rng.zig` owns deterministic per-entity RNG; `RuntimeAssets` /
+  `manifest.zig` own stable `SpriteAssetId` / `AudioAssetId`.
+- The atlas / tileset metadata loaders (`world_tileset_meta.zig`,
+  `sprite_atlas_meta.zig`) are the pattern for strict, versioned, load-time
+  validation.
+
+### Architecture notes
+
+- Serialize by **stable asset IDs, entity slot + generation, and enum/scalar
+  columns** — never file paths, live SDL/GPU/mixer handles, or prepared draw
+  records (CLAUDE.md hard rule). This is what makes `DataSystem` the correct
+  boundary rather than the renderer or asset layer.
+- Versioned container: header (magic + format version) and per-store
+  length-prefixed sections; strict validation on load (reject unknown version,
+  out-of-range IDs, length mismatch) with **no partial apply** on failure —
+  mirror the atlas-metadata loader discipline.
+- Round-trip must reproduce an identical simulation checksum: persist enough sim
+  state (step counter, RNG state, deferred-command-free quiescent snapshot point)
+  that `save → load` yields byte-for-byte parity.
+- Serialization is a **cold-path** operation (explicit save/load, not per-frame),
+  so normal allocator use is fine — this is not a hot-path allocation-free
+  constraint — but it must round-trip every persistent store and the world tile
+  grid, not a subset.
+
+### Checklist
+
+- [ ] Versioned save writer over `DataSystem` stores + `WorldSystem` tiles/levels
+      + player + sim step / RNG state; stable-ID mapping (no paths/handles).
+- [ ] Strict-validation reader; corrupt / unknown-version / out-of-range
+      rejection tests with no partial apply.
+- [ ] Round-trip determinism test: `save → load → checksum-equal` against a
+      hand-built fixture world.
+- [ ] Optional: persist Slice 44 custom input bindings if that slice has landed.
+- [ ] Docs: `docs/architecture.md` records the save/load boundary contract
+      (what is persisted, by which stable identifiers, and what is deliberately
+      excluded).
+
+### Acceptance checks
+
+- [ ] Save then load reproduces an identical simulation checksum on a fixture
+      world.
+- [ ] Malformed / version-mismatched saves reject loudly without partially
+      mutating live state.
+- [ ] Serialized form contains no handles or filesystem paths (payload-purity
+      inspection/test); `zig build verify` passes.
+
+## Slice 47: Un-Stagger The Shared Sensing Substrate
+
+**Status: not started. Live perception defect** surfaced by the architecture
+review — perception-carrying NPCs cannot perceive one another in the shipped
+demo. Highest-priority correctness item on the AI track; land it before Slice 48.
+
+Goal: build the shared spatial index and perception candidate set over the full
+cognition-halo population, using cognition stagger only to choose which agents
+*think* this step — so two observers on different stagger phases can sense each
+other, and a timid `.ally` can see the hostile it is meant to flee.
+
+### Problem (verified against live code)
+
+- `simulation_pipeline.zig`'s `update()` hands the stagger-filtered
+  `ai_indices` to `spatial_index.build`, and perception re-walks the same list.
+  The shared neighbor grid and the perception candidate set therefore contain
+  only one stagger cohort per step.
+- `ai_archetypes.archetype_count = 8` and `simulation_scope.cognition_stagger_n
+  = 4`, and demo spawns cycle archetypes by index, so archetype slot permanently
+  pins stagger phase. The perception-carrying demo archetypes land on distinct
+  phases → no observer can ever appear in another observer's candidate set.
+- `perception.zig` gates the unconditional player fold-in on hostile stance, so
+  the `.ally` timid archetype (designed to flee hostiles) has no candidates at
+  all once its own cohort is filtered out.
+- This is broken today, not a latent risk. The sticky-stimulus linger and the
+  unconditional player candidate are the two demo-visible patches over the same
+  hazard class; this slice fixes the general case.
+
+### Architecture notes
+
+- Split the two roles the single `ai_indices` list conflates: build the spatial
+  index and perception's candidate table over the full cognition-halo population
+  (tier + halo, **no** stagger filter); pass the stagger-filtered list only as
+  the observer/decider (thinking) set. Think budget stays ~N/4; the candidate
+  set becomes complete. The index build is the SIMD/threaded pass, so it is the
+  cheapest stage to un-stagger.
+- Coupling cost (verified): `ai.zig`'s `cohereNeighborVisit` indexes
+  `ctx.candidate_faction[candidate_index]` with a **spatial** row index, so it
+  hard-requires index-row == AI-row identity. Un-staggering requires giving
+  `ai.zig` a candidates side table + `spatial_self_index` mapping — the pattern
+  `perception.zig` already implements; copy it. Preserve serial==threaded and
+  scalar==SIMD parity.
+- Optional diagnostic dividend (coordinate with Slice 48): rename
+  `.ai_scope_indices` into `ai_halo_indices` (index/candidate population) vs
+  `ai_cognition_indices` (thinking population) so the two populations are
+  distinct names in the comptime graph.
+- All per-step caps stay fixed and world-size-independent; determinism preserved.
+
+### Checklist
+
+- [ ] `spatial_index.build` and perception's candidate gather run over the
+      unstaggered cognition-halo population.
+- [ ] Cognition stagger applies only to the observer/decider (thinking) set.
+- [ ] `ai.zig` gains a candidates side table + `spatial_self_index` mapping so
+      cohere neighbor queries no longer assume index-row == AI-row.
+- [ ] Test with a non-null `cognition_region` and two observers on different
+      stagger phases asserting mutual perception (whole class untested today —
+      fixtures pass null).
+- [ ] Verify a timid `.ally` perceives a hostile once its cohort is not filtered.
+
+### Acceptance checks
+
+- [ ] Two cognition observers on distinct stagger phases perceive each other in
+      the same step.
+- [ ] Serial==threaded and scalar==SIMD parity hold; think budget stays ~N/4.
+- [ ] No AI/perception bench regression at battle scale; `zig build verify` passes.
+
+## Slice 48: SimulationPipeline Thin-Composer Restoration
+
+**Status: not started.** Structural refactor surfaced by the architecture
+review. Land as independently-shippable steps in the listed order, never as one
+change; each step is separately bisectable.
+
+Goal: restore [architecture.md](architecture.md)'s thin-composer contract by
+binding `stage_order` to execution, extracting the sensory bus into a controller,
+evicting movement/world domain logic to its owning systems, and moving event and
+allocation budgets to their producers — so the comptime stage graph governs what
+actually runs and the composer stops owning cross-step state and policy.
+
+### Problem (verified against live code)
+
+- `update()` is ~270 straight-line lines mixing four altitudes. The pipeline
+  owns cross-step sensory state (`deferred_stimuli`, `sticky_*`,
+  `interact_held_last`, hearing scratch) plus policy (lifetime rules, the impact
+  penetration curve, an eligibility gate, the interact latch).
+- Four sensory mutations run as untagged wall-clock statements the comptime
+  reads-before-writes check cannot see; `.action_intent_capture` is a declared
+  stage whose real work happens before `update()`. `stage_order` binds to no
+  executor (`runStage`/dispatch), so it governs nothing: the review panel
+  reordered load-bearing stage pairs and the whole suite still passed.
+- ~230 lines of movement/world domain logic and four serial, scalar,
+  random-access full-AI-population scans sit in the composer — precisely because
+  they live here instead of a system that would inherit the threading/SIMD/scope
+  conventions (`simulation_pipeline.zig` has zero `@Vector` uses).
+
+### Checklist (each step independently landable)
+
+- [ ] **Contract vocabulary** (declaration-only): add a `carried` field to
+      `StageContract` (checked disjoint from `reads`, required to be written by
+      some stage) so `.reads = .empty` regains its meaning; split `.events` into
+      `perception_events`/`affect_events`/`world_events`/`structural_events` (a
+      stage-0-written tag must not vacuously satisfy every downstream read); add
+      `.stimuli`/`.interest_markers`/`.ai_behavior` tags and `ai_decide`'s
+      missing write; add a `stage_order` permutation comptime check.
+- [ ] **Bind the graph**: add `StepState`, one private `stage<Name>` method per
+      stage (carrying its own `StageTimer`), `runStage(comptime id)` with an
+      exhaustive switch, and `inline for (stage_order) |id| try runStage(...)`;
+      `update()` drops to ~6 lines. Delete `.action_intent_capture` (no body) →
+      `carried = {action_intents}` on `.action_react`. Watch `zig build check`
+      eval-branch quota; if it bites, split the switch by stage-half — never a
+      runtime dispatch table on the frame path.
+- [ ] **Extract `SensoryBus`** (`src/game/sensory_bus.zig`, in the
+      DigController/AudioController mold): move the sensory state fields + the
+      free functions (already written with `pipeline: *SimulationPipeline`
+      first) + thresholds; add `StimulusConfig` mirroring `DigConfig`; split
+      `footstep_velocity_sq_threshold` into `footstep_min_speed_sq` +
+      `impact_min_approach_speed_sq`. Extract `contact_query.zig` as a shared
+      leaf both `sensory_bus` and `audio_controller` import (including the
+      duplicated `clamp(penetration/18, 0.25, 1)` curve). Decide sticky sizing:
+      either fixed `(stimulus_max_impacts_per_step + 1) * (cognition_stagger_n -
+      1)` with a comptime assert, or priority-aware capture (dig before impact).
+      *(Bounded-drop + a counted `stimuli_sticky_dropped` metric already landed;
+      this step chooses the permanent capacity, never a bigger number for one
+      map.)*
+- [ ] **Evict domain logic**: plane traversal (`applyPlaneTraversalStage` +
+      helpers) → `DigController`, replacing the live-population
+      `ensureTotalCapacity` carve scratch with a fixed init-sized buffer
+      (`config.movement_body_capacity + 1`); the gate/clamp/`rectOverlap` family
+      → a new `src/game/systems/world_gate.zig` (thread/SIMD it in a **separate
+      benched** follow-up, so a perf change never rides inside a structural one);
+      `applyAiMovementIntents` → `MovementSystem.applyIntents`.
+- [ ] **Own the budgets**: add `SimulationPipeline.reserve(frame, pop)`; add
+      `reserve` to `ai`/`perception`/`affect`/`ai_memory` called from `init`
+      (they have no reserve seam today — allocation-freedom is "after warmup at a
+      fixed population," not "after init"), and convert their `FailingAllocator`
+      tests from warm-then-run to reserve-then-run; add an exhaustive
+      `EventProducerId` + `maxEventsPerStep` so an unbudgeted producer will not
+      compile; add the first composite `FailingAllocator` test over
+      `pipeline.update()` on a minimal 1x1 fixture with dig + falls + contacts live.
+- [ ] **Ordering-backstop tests** (belt-and-braces once the graph is bound):
+      the affect-before-ai test must assert an AI-visible consequence of drives,
+      not `fear > 0`; add a `chunk_derive` causal test (a body pushed across a
+      chunk boundary by collision response, asserting the chunk column matches
+      the settled position after `update()`); add a perception→ai_memory causal
+      test where perception actually acquires so `ai_memory` refreshes
+      `last_known` from this step's `last_seen`; fold the `RowInterest` column
+      into the `ai` serial/threaded parity test.
+- [ ] **Follow-ups** (independently landable, none blocking): route every
+      producer through `SensoryBus.emit` and delete
+      `SimulationFrame.appendStimulus`/`tryAppendStimulus`, making `live <= 32` a
+      type invariant (ships with its own dig-behavior-change test); extend the AI
+      bench to the full production config (memory/affect/populated
+      `interest_markers`) and correct the roadmap AI-stage band; move
+      `findBestInvestigateMarker`'s scan out of the serial gather into
+      `writeAiSeparationJob`.
+- [ ] Update [architecture.md](architecture.md) and
+      [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md): the
+      contributor checklist gains the `carried` rule and the "a tag written by
+      stage 0 cannot constrain anything downstream" rule; record the SensoryBus
+      controller's stage placement.
+
+### Acceptance checks
+
+- [ ] `update()` is a short `runStage` loop; no untagged sensory mutation
+      remains; reordering `stage_order` either fails to compile or fails a causal
+      test.
+- [ ] The sensory bus, `world_gate`, and movement-intent apply live in their
+      owning modules; the pipeline composes them like `DigController`.
+- [ ] Every per-step budget stays fixed/world-size-independent; the composite
+      `update()` path is proven allocation-free-after-reserve by `FailingAllocator`.
+- [ ] No bench regression from the moves (the `world_gate` SIMD pass is a
+      separate benched follow-up); `zig build verify` passes.
 
 ## Suggested Order
 
@@ -1100,7 +1421,7 @@ pressured into half-shipping coupling.
 21. Typed simulation event system and domain signals.
 22. Simulation pipeline and tier/scope scaffolding.
 23. Atlas-backed world rendering addition.
-23A. GPU tilemap render hardening (`expand2`; merge before depth expansion).
+23A. GPU tilemap render hardening (landed; merged to `main`).
 23B. Multi-depth dense-layer render scaling (~120 levels).
 24. Scoped simulation tiers and chunk policy.
 24B. Render collect hardening (movement dense-index collect + camera-only gates).
@@ -1113,16 +1434,32 @@ pressured into half-shipping coupling.
 29. AI perception substrate.
 30. AI memory and scope-aware AI state policy.
 31. AI affect and emotion drives.
-32. AI behavior arbitration (**consume emotion drives**). **← next**
-33. Data-driven AI archetypes and debug introspection (incl. affect blocks).
-39. Sensory stimulus ecosystem (richer hearing/investigate inputs).
-41. World interest / affordance markers (multi-source goals).
-40. Action and interaction intent substrate (non-locomotion emergence).
-42. Affect expansion (more feelings, coupling, appraisal gains, optional mood).
-35. AI and steering hot-loop SIMD restructure (after 32 reshapes AI loops).
-36. Single-pass dense-layer depth compositing.
+32. AI behavior arbitration (**consume emotion drives**) — landed (archive).
+33. Data-driven AI archetypes and debug introspection (incl. affect blocks). —
+    landed (visual/GPU-smoke residual on frontier).
+39. Sensory stimulus ecosystem (richer hearing/investigate inputs). — landed
+    (archive).
+41. World interest / affordance markers (multi-source goals). — landed
+    (archive).
+40. Action and interaction intent substrate (non-locomotion emergence). —
+    landed (archive).
+45. First action-intent consumer domain controller / destructibles (after 40).
+    — landed (archive).
+42. Affect expansion (more feelings, coupling, appraisal gains, optional mood)
+    — only when a real appraisal signal exists.
+35. AI and steering hot-loop SIMD restructure (unblocked; measure at battle
+    scale — do not reshape arbitration contracts).
+36. Single-pass dense-layer depth compositing. — landed (archive).
 37. Dense render-window ceiling raise + shader/host sync hardening.
-38. Elevation above the surface.
+38. Elevation above the surface (after 37).
+43. SDL3 gamepad/controller support (landed; HW residual on frontier).
+44. Input rebinding UI + extended gamepad controls (after 43).
+46. Save/load persistence (independent; benefits from 44 for binding
+    persistence).
+47. Un-stagger the shared sensing substrate (live perception defect; before 48).
+48. SimulationPipeline thin-composer restoration (after 47; independent landable
+    steps — contract vocab → bind graph → extract SensoryBus → evict domain
+    logic → own budgets).
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents

@@ -572,7 +572,7 @@ pub fn alignItemCount(item_count: usize, alignment: usize) usize {
 /// the benchmark fixtures so each does not re-roll its own ceil-division.
 pub fn rangeCount(item_count: usize, items_per_range: usize) usize {
     if (items_per_range == 0) return 0;
-    return std.math.divCeil(usize, item_count, items_per_range) catch unreachable;
+    return std.math.divCeil(usize, item_count, items_per_range) catch unreachable; // lint:allow catch-unreachable: divisor guarded non-zero above
 }
 
 fn parseProfile(value: []const u8) !Profile {

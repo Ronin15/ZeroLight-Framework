@@ -375,20 +375,32 @@ pub const ParticleSystem = struct {
         if (active_before == 0) return .{};
 
         const particles = self.slice();
-        var context = ParticleJobContext{
-            .particles = particles,
-            .delta_seconds = delta_seconds,
-        };
         const adaptive_tuner = if (update_config.adaptive and update_config.items_per_range == null)
             update_config.adaptive_tuner orelse &self.adaptive_tuner
         else
             null;
+        // Pre-select so the job context can dual-assert range.index against the
+        // dispatched range count (mirror affect.zig / collision.zig). Mirrors
+        // parallelForWithOptions' `adaptive_tuner orelse &self.adaptive_tuner` fallback.
+        const selection = thread_system.selectBatchProfile(adaptive_tuner orelse &thread_system.adaptive_tuner, .{
+            .item_count = active_before,
+            .items_per_range = update_config.items_per_range,
+            .max_worker_threads = update_config.max_worker_threads,
+            .range_alignment_items = particle_range_alignment_items,
+            .adaptive = update_config.adaptive,
+        });
+        var context = ParticleJobContext{
+            .particles = particles,
+            .delta_seconds = delta_seconds,
+            .range_count = selection.range_count,
+        };
         const batch = thread_system.parallelForWithOptions(active_before, &context, particleJob, .{
             .items_per_range = update_config.items_per_range,
             .max_worker_threads = update_config.max_worker_threads,
             .range_alignment_items = particle_range_alignment_items,
             .adaptive = update_config.adaptive,
-            .adaptive_tuner = adaptive_tuner,
+            .adaptive_tuner = selection.active_tuner,
+            .selected_profile = selection.profile,
         });
         const removed = self.removeExpiredSwap();
         return .{
@@ -462,6 +474,9 @@ fn particleJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     // ThreadSystem guarantees ranges do not overlap; processRange only writes
     // columns for the assigned row interval.
     const job: *ParticleJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig). Buffer bounds
+    // also live in processRange (shared with the serial path).
+    std.debug.assert(range.index < job.range_count);
     processRange(&job.particles, range, job.delta_seconds);
 }
 
@@ -563,6 +578,8 @@ fn processParticleScalar(particles: *ParticleSlice, index: usize, delta_seconds:
 const ParticleJobContext = struct {
     particles: ParticleSlice,
     delta_seconds: f32,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 fn updateSerialScalarForTest(system: *ParticleSystem, delta_seconds: f32) ParticleUpdateStats {
@@ -766,6 +783,48 @@ test "threaded particle update matches serial update" {
     try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
 }
 
+test "threaded particle update matches serial across multiple range splits and worker counts" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
+    // instead picks range/worker counts dynamically, and its probe-driven choice is not
+    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
+    // every explicit partition and worker count must reproduce the serial reference.
+    const item_count = particle_range_alignment_items * 8;
+    var serial_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
+    defer serial_particles.deinit();
+    fillParticles(&serial_particles, item_count);
+    _ = serial_particles.updateSerial(0.25);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = particle_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = particle_range_alignment_items * 2, .workers = 2 },
+        .{ .items_per_range = particle_range_alignment_items, .workers = 4 },
+        .{ .items_per_range = particle_range_alignment_items * 3, .workers = 3 },
+    };
+    for (splits) |split| {
+        var threaded_particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = item_count });
+        defer threaded_particles.deinit();
+        fillParticles(&threaded_particles, item_count);
+        const stats = threaded_particles.update(&threads, 0.25, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        // Real workers partitioned the batch (not the inline fallback), so this split
+        // exercised the multi-range, multi-worker path it claims to.
+        try std.testing.expect(!stats.batch.ran_inline);
+        try expectParticlesApproxEqual(&threaded_particles, &serial_particles);
+    }
+}
+
 test "particle explicit items_per_range bypasses tuner" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -901,4 +960,45 @@ test "warmed particle update and emission do not allocate" {
     try std.testing.expectEqual(@as(usize, 2), emitted);
     try std.testing.expectEqual(@as(usize, 18), stats.active_before);
     try std.testing.expect(stats.batch.ran_inline);
+}
+
+test "threaded multi-worker particle update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const count = particle_range_alignment_items * 8;
+    var particles = try ParticleSystem.init(std.testing.allocator, .{ .capacity = count });
+    defer particles.deinit();
+    fillParticles(&particles, count);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = particle_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const warmup = particles.update(&threads, 0.016, .{
+        .items_per_range = particle_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expect(!warmup.batch.ran_inline);
+
+    const original_particle_allocator = particles.allocator;
+    const original_thread_allocator = threads.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    particles.allocator = failing_allocator.allocator();
+    threads.allocator = failing_allocator.allocator();
+    defer {
+        particles.allocator = original_particle_allocator;
+        threads.allocator = original_thread_allocator;
+    }
+
+    const stats = particles.update(&threads, 0.016, .{
+        .items_per_range = particle_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    });
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(count, stats.active_before);
 }

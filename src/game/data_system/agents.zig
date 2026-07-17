@@ -32,6 +32,7 @@ pub fn validateAiAgent(agent: AiAgent) !void {
         return error.InvalidAiAgent;
     }
     if (!std.math.isFinite(agent.sticky_bonus) or agent.sticky_bonus < 0) return error.InvalidAiAgent;
+    if (agent.commitment_max_steps > types.max_ai_commitment_max_steps) return error.InvalidAiAgent;
 }
 
 pub fn validateSteeringAgent(agent: SteeringAgent) !void {
@@ -300,6 +301,44 @@ pub const SteeringAgentStore = struct {
     }
 };
 
+test "AiAgentStore append is allocation-free after ensureCapacity reserves" {
+    var store: AiAgentStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "SteeringAgentStore append is allocation-free after ensureCapacity reserves" {
+    var store: SteeringAgentStore = .{};
+    defer store.deinit(std.testing.allocator);
+
+    const reserved = 4;
+    try store.ensureCapacity(std.testing.allocator, reserved);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const failing_alloc = failing.allocator();
+
+    var i: u32 = 0;
+    while (i < reserved) : (i += 1) {
+        const entity = try EntityId.init(i, 1);
+        _ = try store.append(failing_alloc, entity, .{});
+    }
+    try std.testing.expectEqual(@as(usize, reserved), store.len());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
 test "validateAiAgent accepts defaults and the max_ai_gain boundary, rejects each gain individually" {
     try validateAiAgent(.{});
     try validateAiAgent(.{
@@ -323,6 +362,8 @@ test "validateAiAgent rejects out-of-range wander_amplitude and sticky_bonus" {
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .wander_amplitude = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = -0.01 }));
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps + 1 }));
+    try validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps });
 }
 
 test "AiAgentStore.set retunes only cold personality fields, preserving hot arbitration state" {

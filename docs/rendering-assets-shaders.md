@@ -303,16 +303,31 @@ gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 
-The retained combined tile-data storage buffer is **not** ring-buffered. Partial
-dig uploads must never pass `cycle=true` to `SDL_UploadToGPUBuffer` or map the
-tile-edit transfer buffer with `cycle=true` — doing so ping-pongs GPU storage and
-flips visible tiles while CPU state stays correct.
+`cycle` is a per-buffer decision made independently on the destination
+`SDL_UploadToGPUBuffer` and on the source `SDL_MapGPUTransferBuffer`, and it
+follows one rule on each axis: **a buffer whose full contents are re-staged every
+frame and reused across frames cycles; a retained buffer written partially does
+not.** The fixed loop does not fence between frames, so any buffer touched on
+frame N+1 while frame N's copy is still in flight must cycle to rotate to fresh
+backing, or the new write lands on memory the in-flight copy is still reading.
+
+- The combined tile-data storage buffer is retained and written partially (one
+  cell per dig edit), so its destination upload passes `cycle=false`. Cycling it
+  would ping-pong GPU storage and flip visible tiles while CPU state stays
+  correct.
+- The renderer's pooled tile-edit transfer buffer is reused across frames and
+  fully re-staged each frame, so its source map passes `cycle=true`, exactly like
+  the vertex-stream staging in `stageVertices`.
+- A one-shot transfer buffer allocated for a single upload
+  (`uploadStorageRegions`) is never reused, so its source map passes
+  `cycle=false`.
 
 | Resource | `cycle` on upload / map |
 | --- | --- |
 | Dynamic/static **vertex** streams (per-frame ring) | `true` on the last **vertex** upload in the copy pass |
-| **Tile-data storage** buffer (combined, retained) | **always `false`** |
-| Tile-edit transfer buffer (`stageStorageRegions`) | **`false`** |
+| **Tile-data storage** buffer (combined, retained) | destination upload **always `false`** |
+| Tile-edit transfer buffer, pooled (`stageStorageRegions`) | source map **`true`** |
+| Tile-edit transfer buffer, one-shot (`uploadStorageRegions`) | source map `false` |
 
 Tile edits are excluded from the vertex upload `cycle` counter; they are batched
 in the post-acquire copy pass via `recordStorageRegionsInPass`.

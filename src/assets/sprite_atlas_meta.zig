@@ -158,17 +158,6 @@ fn jsonSpriteToEntry(sprite: JsonSpriteEntry) SpriteEntry {
     };
 }
 
-pub fn sourceRectForIndex(index: u16, columns: u32, frame_w: f32, frame_h: f32) manifest.SourceRect {
-    const col = @as(f32, @floatFromInt(index % columns));
-    const row = @as(f32, @floatFromInt(index / columns));
-    return .{
-        .x = col * frame_w,
-        .y = row * frame_h,
-        .w = frame_w,
-        .h = frame_h,
-    };
-}
-
 pub fn load(
     allocator: std.mem.Allocator,
     asset_store: @import("assets.zig").AssetStore,

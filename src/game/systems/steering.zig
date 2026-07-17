@@ -8,8 +8,9 @@
 //! jobs read immutable slices and write range-owned movement intents.
 
 const std = @import("std");
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -17,21 +18,34 @@ const WorkerId = @import("../../app/thread_system.zig").WorkerId;
 const alignItemCount = @import("../../app/thread_system.zig").alignItemCount;
 const rangeCount = @import("../../app/thread_system.zig").rangeCount;
 const math = @import("../../core/math.zig");
+const simd = @import("../../core/simd.zig");
+const runtime_perf_log = @import("../../app/runtime_perf_log.zig");
 const ConstCollisionBoundsSlice = @import("../data_system.zig").ConstCollisionBoundsSlice;
 const ConstCollisionResponseSlice = @import("../data_system.zig").ConstCollisionResponseSlice;
 const ConstMovementBodySlice = @import("../data_system.zig").ConstMovementBodySlice;
+const ConstScopeColumnsSlice = @import("../data_system.zig").ConstScopeColumnsSlice;
 const ConstSteeringAgentSlice = @import("../data_system.zig").ConstSteeringAgentSlice;
+const Component = @import("../data_system.zig").Component;
 const DataSystem = @import("../data_system.zig").DataSystem;
 const EntityId = @import("../data_system.zig").EntityId;
+const StageTimer = runtime_perf_log.StageTimer;
 const MovementIntent = @import("../simulation.zig").MovementIntent;
 const NavigationIntent = @import("../simulation.zig").NavigationIntent;
 const PathRequest = @import("../simulation.zig").PathRequest;
+const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationIntent = @import("../simulation.zig").SimulationIntent;
 const RangeOutputStream = @import("../simulation.zig").RangeOutputStream;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const PathfindingSystem = @import("pathfinding.zig").PathfindingSystem;
 
 pub const steering_range_alignment_items: usize = @import("../data_system.zig").movement_range_alignment_items;
+
+// Range alignment only; batch time gate comes from AdaptiveWorkTunerConfig defaults.
+const steering_adaptive_tuner_config = AdaptiveWorkTunerConfig{
+    .initial_range_items = steering_range_alignment_items,
+    .smallest_range_items = steering_range_alignment_items,
+};
+
 pub const HotF32Slice = []f32;
 pub const ConstHotF32Slice = []const f32;
 
@@ -39,8 +53,11 @@ fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, steering_range_alignment_items);
 }
 
-fn entityWorldLevel(data: *const DataSystem, entity: EntityId) u16 {
-    return data.worldLevelConst(entity) orelse 0;
+/// Prefer the dense movement scope level (kept in sync with world_level) when the
+/// caller already has a movement row index — avoids a second entity slot resolve.
+fn movementScopeLevel(scope: ConstScopeColumnsSlice, movement_index: usize) u16 {
+    if (movement_index >= scope.level.len) return 0;
+    return scope.level[movement_index];
 }
 
 const invalid_index = std.math.maxInt(usize);
@@ -83,6 +100,10 @@ pub const SteeringStats = struct {
     agent_candidate_checks: usize = 0,
     obstacle_candidate_checks: usize = 0,
     batch: BatchStats = .{},
+    // Main-thread prepareUpdate phases (ns); zero when perf logging is disabled.
+    select_ns: u64 = 0,
+    snapshot_ns: u64 = 0,
+    directions_ns: u64 = 0,
 };
 
 pub const SteeringSystem = struct {
@@ -107,20 +128,24 @@ pub const SteeringSystem = struct {
     agent_snapshot_rows: std.MultiArrayList(AgentSnapshotRow) = .{},
     agent_cell_entries: std.ArrayList(SpatialCellEntry) = .empty,
     agent_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
+    // Parallel to steering dense order: movement body dense index per steering row.
+    // Rebuilt only when invalidated (structural create/destroy/component renumber),
+    // not every cognition step — avoids per-agent slot resolve in the hot snapshot.
+    steering_movement_index: std.ArrayList(usize) = .empty,
+    steering_movement_index_valid: bool = false,
     obstacle_snapshot_rows: std.MultiArrayList(ObstacleSnapshotRow) = .{},
     obstacle_cell_entries: std.ArrayList(SpatialCellEntry) = .empty,
     obstacle_cell_ranges: std.ArrayList(SpatialCellRange) = .empty,
     spatial_cell_size: f32 = 64.0,
     spatial_obstacle_query_extra: f32 = 0,
-    // Signature of the static-obstacle set + spatial cell size that produced the
-    // obstacle spatial index. Static obstacles never move, so the obstacle cell
-    // entries + sorted ranges are rebuilt only when this changes, not every step.
-    obstacle_index_signature: u64 = 0,
+    // Static-obstacle snapshot + spatial bins are rebuilt only when invalid.
+    // Invalidation is event-driven (reactToPostCommitSteeringEvents), same shape
+    // as pathfinding/perception post-commit reactions — not a per-step poll.
+    // Also rebuilt when the agent-radius-derived cell size changes (bins wrong).
     obstacle_index_valid: bool = false,
-    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{
-        .initial_range_items = steering_range_alignment_items,
-        .smallest_range_items = steering_range_alignment_items,
-    }),
+    /// `spatial_cell_size` used when the obstacle index was last built.
+    obstacle_spatial_cell_size: f32 = 0,
+    adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
         return .{ .allocator = allocator };
@@ -133,6 +158,7 @@ pub const SteeringSystem = struct {
         self.agent_cell_ranges.deinit(self.allocator);
         self.agent_cell_entries.deinit(self.allocator);
         self.agent_snapshot_rows.deinit(self.allocator);
+        self.steering_movement_index.deinit(self.allocator);
         self.selected_work_rows.deinit(self.allocator);
         self.obstacle_candidate_counts.deinit(self.allocator);
         self.agent_candidate_counts.deinit(self.allocator);
@@ -149,6 +175,37 @@ pub const SteeringSystem = struct {
         try self.reserveForCapacity(max_agents, max_agents);
     }
 
+    /// Marks the retained static-obstacle snapshot/spatial index dirty so the next
+    /// `prepareUpdate` rebuilds it. Called from the post-commit structural reaction
+    /// (and tests that mutate obstacles outside the event stream).
+    pub fn invalidateStaticObstacleSpatial(self: *SteeringSystem) void {
+        self.obstacle_index_valid = false;
+        self.obstacle_spatial_cell_size = 0;
+    }
+
+    pub fn invalidateSteeringMovementIndexCache(self: *SteeringSystem) void {
+        self.steering_movement_index_valid = false;
+    }
+
+    /// Post-commit reaction: structural_commit events that change static obstacles
+    /// and/or renumber steering↔movement dense indices. Allocation-free.
+    pub fn reactToPostCommitSteeringEvents(self: *SteeringSystem, frame: *const SimulationFrame) void {
+        var hit_obstacle = false;
+        var hit_movement_index = false;
+        for (frame.events.mergedItems()) |event| {
+            if (event.stage != .structural_commit) continue;
+            if (!hit_obstacle and eventInvalidatesStaticObstacleSpatial(event)) {
+                self.invalidateStaticObstacleSpatial();
+                hit_obstacle = true;
+            }
+            if (!hit_movement_index and eventInvalidatesSteeringMovementIndexCache(event)) {
+                self.invalidateSteeringMovementIndexCache();
+                hit_movement_index = true;
+            }
+            if (hit_obstacle and hit_movement_index) return;
+        }
+    }
+
     pub fn reserveForCapacity(self: *SteeringSystem, max_agents: usize, max_obstacles: usize) !void {
         // Reserve separates agent and obstacle budgets because dense static
         // obstacle scenes can be larger than the steering-agent population.
@@ -162,6 +219,7 @@ pub const SteeringSystem = struct {
         try self.obstacle_candidate_counts.ensureTotalCapacity(self.allocator, max_agents);
         try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_agents));
         try self.agent_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_agents));
+        try self.steering_movement_index.ensureTotalCapacity(self.allocator, max_agents);
         try self.agent_cell_entries.ensureTotalCapacity(self.allocator, max_agents);
         try self.agent_cell_ranges.ensureTotalCapacity(self.allocator, max_agents);
         try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(max_obstacles));
@@ -182,6 +240,7 @@ pub const SteeringSystem = struct {
             .selected_avoidance_radii = s.items(.selected_avoidance_radii),
             .selected_avoidance_weights = s.items(.selected_avoidance_weights),
             .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+            .selected_world_level = s.items(.selected_world_level),
         };
     }
 
@@ -198,6 +257,7 @@ pub const SteeringSystem = struct {
             .selected_avoidance_radii = s.items(.selected_avoidance_radii),
             .selected_avoidance_weights = s.items(.selected_avoidance_weights),
             .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+            .selected_world_level = s.items(.selected_world_level),
         };
     }
 
@@ -208,6 +268,7 @@ pub const SteeringSystem = struct {
             .x = s.items(.x),
             .y = s.items(.y),
             .radius = s.items(.radius),
+            .world_level = s.items(.world_level),
         };
     }
 
@@ -265,19 +326,27 @@ pub const SteeringSystem = struct {
         const navigation_intents = frame.navigation_intents.mergedItems();
         // Multiple systems may target the same entity. Selection keeps one
         // intent per steering row by priority, then source order for ties.
+        var select_timer = StageTimer.start();
         try self.selectIntents(data, steering, navigation_intents, config);
+        const select_ns = select_timer.lap();
 
         const movement = data.movementBodySliceConst();
         // Snapshot all avoidance inputs before dispatch so worker jobs never
         // touch DataSystem or pathfinding mutable state.
+        var snapshot_timer = StageTimer.start();
         try self.gatherWorldSnapshot(data, movement, steering, data.collisionBoundsSliceConst(), data.collisionResponseSliceConst());
+        const snapshot_ns = snapshot_timer.lap();
 
         var stats = SteeringStats{
             .navigation_intent_count = navigation_intents.len,
             .selected_intent_count = self.selected.items.len,
+            .select_ns = select_ns,
+            .snapshot_ns = snapshot_ns,
         };
 
+        var directions_timer = StageTimer.start();
         try self.prepareSelectedDirections(data, movement, steering, pathfinding, &stats);
+        stats.directions_ns = directions_timer.lap();
         return stats;
     }
 
@@ -320,8 +389,10 @@ pub const SteeringSystem = struct {
         try resetIndexScratch(&self.selected_index_by_steering, self.allocator, steering.entities.len);
 
         for (intents, 0..) |intent, source_order| {
-            const movement_index = data.movementBodyDenseIndex(intent.entity) orelse continue;
-            const steering_index = data.steeringAgentDenseIndex(intent.entity) orelse continue;
+            // One slot resolve for both dense indices (not movement + steering separately).
+            const indices = data.movementSteeringDenseIndices(intent.entity) orelse continue;
+            const movement_index = indices.movement;
+            const steering_index = indices.steering;
             const existing_index = self.selected_index_by_steering.items[steering_index];
             if (existing_index != invalid_index) {
                 if (intentIsBetter(intent.priority, source_order, self.selected.items[existing_index])) {
@@ -383,32 +454,128 @@ pub const SteeringSystem = struct {
     ) !void {
         // The snapshot uses previous fixed-step positions. Steering output for
         // this step should not depend on partially updated movement columns.
+        const cell_size = spatialCellSize(steering);
+        self.spatial_cell_size = cell_size;
+
+        try self.ensureSteeringMovementIndexCache(data, steering);
+
+        // Agents move every step: pack previous positions into SoA, then dense
+        // SIMD cell assignment + sort (no per-agent slot resolve on the hot path).
         self.agent_snapshot_rows.clearRetainingCapacity();
         self.agent_cell_entries.clearRetainingCapacity();
         self.agent_cell_ranges.clearRetainingCapacity();
-        self.obstacle_snapshot_rows.clearRetainingCapacity();
-        self.spatial_cell_size = spatialCellSize(steering);
-        self.spatial_obstacle_query_extra = 0;
-
         try self.agent_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(steering.entities.len));
         try self.agent_cell_entries.ensureTotalCapacity(self.allocator, steering.entities.len);
         try self.agent_cell_ranges.ensureTotalCapacity(self.allocator, steering.entities.len);
         var agent_row_slice = self.agent_snapshot_rows.slice();
-        for (steering.entities, 0..) |entity, steering_index| {
-            const movement_index = data.movementBodyDenseIndex(entity) orelse continue;
+        const movement_indices = self.steering_movement_index.items;
+        const scope = data.scopeColumnsSliceConst();
+        std.debug.assert(movement_indices.len == steering.entities.len);
+        for (steering.entities, movement_indices, 0..) |entity, movement_index, steering_index| {
+            if (movement_index == invalid_index) continue;
+            if (movement_index >= movement.previous_x.len) continue;
             appendMalRow(AgentSnapshotRow, &self.agent_snapshot_rows, &agent_row_slice, .{
                 .entity = entity,
                 .x = movement.previous_x[movement_index],
                 .y = movement.previous_y[movement_index],
                 .radius = steering.agent_radii[steering_index],
+                // Same-level gate as collision: scope.level is kept in sync with
+                // world_level (setWorldLevel / setMovementBody).
+                .world_level = movementScopeLevel(scope, movement_index),
             });
         }
+        try self.fillAgentCellEntriesDense(cell_size);
+        try buildCellRanges(self.agent_cell_entries.items, &self.agent_cell_ranges, self.allocator);
 
+        // Static obstacles never move between structural commits. Rebuild only when
+        // post-commit events invalidated the cache, or the agent-radius-derived cell
+        // size changed (bins would be wrong under a different grid).
+        const cell_size_changed = self.obstacle_index_valid and self.obstacle_spatial_cell_size != cell_size;
+        if (!self.obstacle_index_valid or cell_size_changed) {
+            try self.rebuildStaticObstacleSnapshot(
+                data,
+                movement,
+                collision_bounds,
+                collision_responses,
+                cell_size,
+            );
+            self.obstacle_index_valid = true;
+            self.obstacle_spatial_cell_size = cell_size;
+        }
+    }
+
+    fn ensureSteeringMovementIndexCache(
+        self: *SteeringSystem,
+        data: *const DataSystem,
+        steering: ConstSteeringAgentSlice,
+    ) !void {
+        const count = steering.entities.len;
+        if (self.steering_movement_index_valid and self.steering_movement_index.items.len == count) return;
+
+        try self.steering_movement_index.ensureTotalCapacity(self.allocator, count);
+        self.steering_movement_index.items.len = count;
+        for (steering.entities, 0..) |entity, steering_index| {
+            self.steering_movement_index.items[steering_index] =
+                data.movementBodyDenseIndex(entity) orelse invalid_index;
+        }
+        self.steering_movement_index_valid = true;
+    }
+
+    /// After agent snapshot rows are packed, assign spatial cells over the contiguous
+    /// x/y columns (SIMD 4-wide + scalar tail), bit-identical to `spatialCell`.
+    fn fillAgentCellEntriesDense(self: *SteeringSystem, cell_size: f32) !void {
+        const agents = self.agentSnapshotSliceConst();
+        const n = agents.len();
+        if (n == 0) return;
+        try self.agent_cell_entries.ensureTotalCapacity(self.allocator, n);
+        self.agent_cell_entries.items.len = n;
+
+        const safe_cell = @max(cell_size, min_spatial_cell_size);
+        const cell_size_vec = simd.splatFloat4(safe_cell);
+        const xs = agents.x;
+        const ys = agents.y;
+        var i: usize = 0;
+        const vend = simd.vectorizedEnd(n);
+        while (i < vend) : (i += simd.lane_count) {
+            const px = simd.loadFloat4(xs[i..]);
+            const py = simd.loadFloat4(ys[i..]);
+            const cx = simd.toIntArray(simd.floorToI4(simd.divFloat4(px, cell_size_vec)));
+            const cy = simd.toIntArray(simd.floorToI4(simd.divFloat4(py, cell_size_vec)));
+            inline for (0..simd.lane_count) |lane| {
+                self.agent_cell_entries.items[i + lane] = .{
+                    .cell_x = cx[lane],
+                    .cell_y = cy[lane],
+                    .index = i + lane,
+                };
+            }
+        }
+        while (i < n) : (i += 1) {
+            self.agent_cell_entries.items[i] = .{
+                .cell_x = spatialCell(xs[i], cell_size),
+                .cell_y = spatialCell(ys[i], cell_size),
+                .index = i,
+            };
+        }
+    }
+
+    fn rebuildStaticObstacleSnapshot(
+        self: *SteeringSystem,
+        data: *const DataSystem,
+        movement: ConstMovementBodySlice,
+        collision_bounds: ConstCollisionBoundsSlice,
+        collision_responses: ConstCollisionResponseSlice,
+        cell_size: f32,
+    ) !void {
+        self.obstacle_snapshot_rows.clearRetainingCapacity();
+        self.obstacle_cell_entries.clearRetainingCapacity();
+        self.obstacle_cell_ranges.clearRetainingCapacity();
         try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(collision_responses.entities.len));
         try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
         try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
+
         var obstacle_row_slice = self.obstacle_snapshot_rows.slice();
-        var signature: u64 = 1469598103934665603; // FNV offset basis
+        self.spatial_obstacle_query_extra = 0;
+        var obstacle_index: usize = 0;
         for (collision_responses.entities, 0..) |obstacle_entity, response_index| {
             if (collision_responses.mobilities[response_index] != .static) continue;
             const bounds_index = data.collisionBoundsDenseIndex(obstacle_entity) orelse continue;
@@ -418,67 +585,22 @@ pub const SteeringSystem = struct {
             const size_x = collision_bounds.size_x[bounds_index];
             const size_y = collision_bounds.size_y[bounds_index];
             self.spatial_obstacle_query_extra = @max(self.spatial_obstacle_query_extra, @max(size_x, size_y) * 0.5);
+            const max_x = min_x + size_x;
+            const max_y = min_y + size_y;
             appendMalRow(ObstacleSnapshotRow, &self.obstacle_snapshot_rows, &obstacle_row_slice, .{
                 .min_x = min_x,
                 .min_y = min_y,
-                .max_x = min_x + size_x,
-                .max_y = min_y + size_y,
+                .max_x = max_x,
+                .max_y = max_y,
             });
-            // Fold identity + geometry so the obstacle index rebuilds whenever the
-            // static set, an obstacle's position/size, or the iteration order changes.
-            signature = foldSignature(signature, obstacle_entity.index);
-            signature = foldSignature(signature, obstacle_entity.generation);
-            signature = foldSignature(signature, @bitCast(min_x));
-            signature = foldSignature(signature, @bitCast(min_y));
-            signature = foldSignature(signature, @bitCast(size_x));
-            signature = foldSignature(signature, @bitCast(size_y));
-        }
-        // The binning depends on the spatial cell size too.
-        signature = foldSignature(signature, @bitCast(self.spatial_cell_size));
-
-        // Static obstacles never move, so rebuild the (binned + sorted) obstacle
-        // index only when the signature changes; reuse it across steps otherwise.
-        const rebuild_obstacles = !self.obstacle_index_valid or signature != self.obstacle_index_signature;
-        try self.buildSpatialIndexes(rebuild_obstacles);
-        self.obstacle_index_signature = signature;
-        self.obstacle_index_valid = true;
-    }
-
-    fn buildSpatialIndexes(self: *SteeringSystem, rebuild_obstacles: bool) !void {
-        // Entries are sorted into compact cell ranges so worker queries do a
-        // binary search per neighboring cell instead of scanning every actor. The
-        // agent index rebuilds every step (agents move); the obstacle index is
-        // rebuilt only when its signature changed (static obstacles do not move).
-        const agents = self.agentSnapshotSliceConst();
-        for (0..agents.len()) |index| {
-            const cell_x = spatialCell(agents.x[index], self.spatial_cell_size);
-            const cell_y = spatialCell(agents.y[index], self.spatial_cell_size);
-            self.agent_cell_entries.appendAssumeCapacity(.{
-                .cell_x = cell_x,
-                .cell_y = cell_y,
-                .index = index,
-            });
-        }
-        try buildCellRanges(self.agent_cell_entries.items, &self.agent_cell_ranges, self.allocator);
-
-        if (!rebuild_obstacles) return;
-        self.obstacle_cell_entries.clearRetainingCapacity();
-        self.obstacle_cell_ranges.clearRetainingCapacity();
-        const obstacles = self.obstacleSnapshotSliceConst();
-        for (0..obstacles.len()) |index| {
-            const min_x = obstacles.min_x[index];
-            const min_y = obstacles.min_y[index];
-            const max_x = obstacles.max_x[index];
-            const max_y = obstacles.max_y[index];
             const center_x = (min_x + max_x) * 0.5;
             const center_y = (min_y + max_y) * 0.5;
-            const cell_x = spatialCell(center_x, self.spatial_cell_size);
-            const cell_y = spatialCell(center_y, self.spatial_cell_size);
             self.obstacle_cell_entries.appendAssumeCapacity(.{
-                .cell_x = cell_x,
-                .cell_y = cell_y,
-                .index = index,
+                .cell_x = spatialCell(center_x, cell_size),
+                .cell_y = spatialCell(center_y, cell_size),
+                .index = obstacle_index,
             });
+            obstacle_index += 1;
         }
         try buildCellRanges(self.obstacle_cell_entries.items, &self.obstacle_cell_ranges, self.allocator);
     }
@@ -495,15 +617,24 @@ pub const SteeringSystem = struct {
         // path requests that should be appended before movement intents.
         const count = self.selected.items.len;
         try self.selected_work_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(count));
-        // At most one new runtime row is created per selected intent, so reserve
-        // the worst case once, upfront, instead of growing inside the loop below.
-        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + count);
+        // Map existing runtime rows first, then reserve only for selected intents
+        // that still lack a row. `items.len + count` overshoots a warm population
+        // (requests 2N when N rows already exist) and forces a one-shot realloc
+        // after the first full step — breaking the reserve/warmup contract.
         try resetIndexScratch(&self.runtime_index_by_steering, self.allocator, steering.entities.len);
         for (self.runtime_rows.items, 0..) |row, runtime_index| {
             const steering_index = data.steeringAgentDenseIndex(row.entity) orelse continue;
             self.runtime_index_by_steering.items[steering_index] = runtime_index;
         }
+        var missing_runtime_rows: usize = 0;
+        for (self.selected.items) |selected| {
+            if (self.runtime_index_by_steering.items[selected.steering_index] == invalid_index) {
+                missing_runtime_rows += 1;
+            }
+        }
+        try self.runtime_rows.ensureTotalCapacity(self.allocator, self.runtime_rows.items.len + missing_runtime_rows);
 
+        const scope = data.scopeColumnsSliceConst();
         var request_count: usize = 0;
         var work_row_slice = self.selected_work_rows.slice();
         for (self.selected.items) |*selected| {
@@ -513,7 +644,8 @@ pub const SteeringSystem = struct {
                 .y = movement.previous_y[selected.movement_index],
             };
             const runtime = self.runtimeRowForSelected(selected);
-            const path_dir = self.directionFromPathStatus(data, pathfinding, selected, start, steering_agent, runtime, stats, &request_count);
+            const start_level = movementScopeLevel(scope, selected.movement_index);
+            const path_dir = self.directionFromPathStatus(pathfinding, selected, start, start_level, steering_agent, runtime, stats, &request_count);
             const direct_dir = math.normalizeOrZeroFinite(selected.intent.direct_direction_x, selected.intent.direct_direction_y, 0.0001);
             const target_dir = if (path_dir.has_direction) path_dir.direction else direct_dir;
             const base_dir = smoothBaseDirection(runtime, target_dir);
@@ -530,6 +662,7 @@ pub const SteeringSystem = struct {
                 .selected_avoidance_radii = steering_agent.avoidance_radius,
                 .selected_avoidance_weights = steering_agent.avoidance_weight,
                 .selected_max_neighbor_samples = steering_agent.max_neighbor_samples,
+                .selected_world_level = start_level,
             });
         }
         stats.path_request_count = request_count;
@@ -543,14 +676,14 @@ pub const SteeringSystem = struct {
         // Path requests are appended as their own range so steering can coexist
         // with future producers without rebuilding earlier stream offsets.
         const work = self.selectedWorkSliceConst();
+        const scope = data.scopeColumnsSliceConst();
         for (self.selected.items, 0..) |selected, index| {
             if (!selected.emit_path_request) continue;
-            const start_level = entityWorldLevel(data, selected.entity);
             request_writer.write(PathRequest{
                 .entity = selected.entity,
                 .agent_class = selected.intent.agent_class,
                 .kind = selected.intent.kind,
-                .start_level = start_level,
+                .start_level = movementScopeLevel(scope, selected.movement_index),
                 .goal_level = selected.intent.goal_level,
                 .start = .{ .x = work.start_x[index], .y = work.start_y[index] },
                 .goal = selected.intent.goal,
@@ -579,7 +712,7 @@ pub const SteeringSystem = struct {
         }
         try frame.intents.prefixAppendedRanges(range_base);
 
-        var context = self.jobContext(frame, range_base);
+        var context = self.jobContext(frame, range_base, work.range_count);
         const batch = thread_system.parallelForWithOptions(count, &context, writeSteeringMovementJob, .{
             .items_per_range = work.items_per_range,
             .max_worker_threads = work.worker_threads,
@@ -597,7 +730,7 @@ pub const SteeringSystem = struct {
         const range_base = try frame.intents.appendRangeCounts(1);
         frame.intents.addCount(range_base, count);
         try frame.intents.prefixAppendedRanges(range_base);
-        var context = self.jobContext(frame, range_base);
+        var context = self.jobContext(frame, range_base, 1);
         writeSteeringMovementJob(&context, .{ .index = 0, .start = 0, .end = count }, WorkerId.main);
         frame.intents.finishWrite();
         return serialBatch(count);
@@ -628,10 +761,10 @@ pub const SteeringSystem = struct {
 
     fn directionFromPathStatus(
         self: *SteeringSystem,
-        data: *const DataSystem,
         pathfinding: *const PathfindingSystem,
         selected: *SelectedIntent,
         start: math.Vec2,
+        start_level: u16,
         steering_agent: SteeringAgentView,
         runtime: *RuntimeRow,
         stats: *SteeringStats,
@@ -640,7 +773,6 @@ pub const SteeringSystem = struct {
         _ = self;
         // Missing paths request work, pending paths hold direction, unavailable
         // paths enter backoff, and available paths steer toward the next waypoint.
-        const start_level = entityWorldLevel(data, selected.entity);
         const goal_distance = distance(start, selected.intent.goal);
         const view = pathfinding.statusForWorld(start_level, start, selected.intent.goal_level, selected.intent.goal, selected.intent.agent_class, &runtime.waypoint_hint);
         switch (view.status) {
@@ -745,7 +877,7 @@ pub const SteeringSystem = struct {
         }
     }
 
-    fn jobContext(self: *SteeringSystem, frame: *SimulationFrame, range_base: usize) SteeringJobContext {
+    fn jobContext(self: *SteeringSystem, frame: *SimulationFrame, range_base: usize, range_count: usize) SteeringJobContext {
         return .{
             .selected = self.selected.items,
             .work = self.selectedWorkSlice(),
@@ -763,6 +895,7 @@ pub const SteeringSystem = struct {
             .obstacle_candidate_counts = self.obstacle_candidate_counts.items,
             .intents = &frame.intents,
             .range_base = range_base,
+            .range_count = range_count,
         };
     }
 };
@@ -778,6 +911,8 @@ const SelectedWorkRow = struct {
     selected_avoidance_radii: f32,
     selected_avoidance_weights: f32,
     selected_max_neighbor_samples: u16,
+    /// Movement-scope world level for same-level local avoidance gating.
+    selected_world_level: u16,
 };
 
 const AgentSnapshotRow = struct {
@@ -785,6 +920,7 @@ const AgentSnapshotRow = struct {
     x: f32,
     y: f32,
     radius: f32,
+    world_level: u16,
 };
 
 const ObstacleSnapshotRow = struct {
@@ -811,6 +947,7 @@ pub const SelectedWorkSlice = struct {
     selected_avoidance_radii: HotF32Slice,
     selected_avoidance_weights: HotF32Slice,
     selected_max_neighbor_samples: []u16,
+    selected_world_level: []u16,
 
     pub fn len(self: SelectedWorkSlice) usize {
         return self.start_x.len;
@@ -828,6 +965,7 @@ pub const ConstSelectedWorkSlice = struct {
     selected_avoidance_radii: ConstHotF32Slice,
     selected_avoidance_weights: ConstHotF32Slice,
     selected_max_neighbor_samples: []const u16,
+    selected_world_level: []const u16,
 
     pub fn len(self: ConstSelectedWorkSlice) usize {
         return self.start_x.len;
@@ -839,6 +977,7 @@ pub const ConstAgentSnapshotSlice = struct {
     x: ConstHotF32Slice,
     y: ConstHotF32Slice,
     radius: ConstHotF32Slice,
+    world_level: []const u16,
 
     pub fn len(self: ConstAgentSnapshotSlice) usize {
         return self.entity.len;
@@ -909,13 +1048,7 @@ const PathDirection = struct {
     progress_distance: f32 = 0,
 };
 
-const SteeringWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
+const SteeringWorkSelection = BatchSelection;
 
 const SteeringJobContext = struct {
     // Worker context is immutable input plus range-indexed output columns and a
@@ -936,6 +1069,8 @@ const SteeringJobContext = struct {
     obstacle_candidate_counts: []u16,
     intents: *RangeOutputStream(SimulationIntent),
     range_base: usize,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 const AvoidanceResult = struct {
@@ -963,6 +1098,10 @@ fn writeSteeringMovementJob(context: *anyopaque, range: ParallelRange, _: Worker
     // Jobs never append outside their assigned output range, which keeps the
     // transient intent stream deterministic across serial and threaded runs.
     const job: *SteeringJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig).
+    std.debug.assert(range.index < job.range_count);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.selected.len);
     var writer = job.intents.rangeWriter(job.range_base + range.index);
     for (range.start..range.end) |index| {
         const result = computeAvoidance(job, index);
@@ -1093,7 +1232,10 @@ fn accumulateAgentAvoidanceBounded(
                 if (sample_count.* >= max_samples or candidate_count.* >= max_agent_candidate_checks) break;
                 candidate_count.* += 1;
                 const other_index = entry.index;
-                if (entityIdsEqual(job.agents.entity[other_index], self_entity)) continue;
+                if (job.agents.entity[other_index].eql(self_entity)) continue;
+                // Match collision's sameWorldLevel gate: pure-XY overlap across
+                // floors must not produce a lateral push.
+                if (job.agents.world_level[other_index] != job.work.selected_world_level[index]) continue;
                 const dx = start_x - job.agents.x[other_index];
                 const dy = start_y - job.agents.y[other_index];
                 const combined_radius = avoidance_radius + job.agents.radius[other_index];
@@ -1129,48 +1271,16 @@ fn selectSteeringWork(
     system: *SteeringSystem,
 ) SteeringWorkSelection {
     // Steering owns its tuner because avoidance cost differs from movement,
-    // pathfinding, and render-prep work even when item counts are similar.
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(config.max_worker_threads orelse available_workers, available_workers);
-    const requested_items_per_range = config.items_per_range orelse thread_system.config.items_per_range;
-    const active_tuner = if (config.adaptive and config.items_per_range == null and max_worker_threads > 0)
-        config.adaptive_tuner orelse &system.adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = steering_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), steering_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+    // pathfinding, and render-prep work even when item counts are similar. Shape is
+    // resolved through the single tuner-owned entry point so pre-sizing and dispatch
+    // agree exactly.
+    return thread_system.selectBatchProfile(config.adaptive_tuner orelse &system.adaptive_tuner, .{
+        .item_count = item_count,
+        .items_per_range = config.items_per_range,
+        .max_worker_threads = config.max_worker_threads,
+        .range_alignment_items = steering_range_alignment_items,
+        .adaptive = config.adaptive,
+    });
 }
 
 fn steeringAgentAt(slice: ConstSteeringAgentSlice, index: usize) SteeringAgentView {
@@ -1222,7 +1332,9 @@ fn buildCellRanges(entries: []SpatialCellEntry, ranges: *std.ArrayList(SpatialCe
     ranges.clearRetainingCapacity();
     if (entries.len == 0) return;
 
-    std.mem.sort(SpatialCellEntry, entries, {}, spatialCellEntryLessThan);
+    // pdqsort: agents move slowly so order is often nearly sorted; still O(n log n)
+    // worst case, better constant factors than the previous generic sort on large N.
+    std.sort.pdq(SpatialCellEntry, entries, {}, spatialCellEntryLessThan);
     try ranges.ensureTotalCapacity(allocator, entries.len);
 
     var entry_index: usize = 0;
@@ -1282,17 +1394,41 @@ fn spatialCell(value: f32, cell_size: f32) i32 {
     return math.floorToI32(value / @max(cell_size, min_spatial_cell_size));
 }
 
-// FNV-1a fold of one 32-bit word into a running signature.
-fn foldSignature(hash: u64, value: u32) u64 {
-    return (hash ^ value) *% 1099511628211;
+/// Whether a committed structural event changes the set of static entity
+/// obstacles steering uses for local avoidance. Mirrors the entity/static side of
+/// `PathfindingSystem.eventInvalidatesNavigation` (same `isStaticNavigationObstacle`
+/// definition: movement + bounds + response.mobility == .static). World *tile*
+/// events are not consulted — steering's obstacle spatial is entity AABBs only;
+/// pathfinding/perception own tile occupancy.
+pub fn eventInvalidatesStaticObstacleSpatial(event: SimulationEvent) bool {
+    return switch (event.payload) {
+        .entity_destroyed => |destroyed| destroyed.was_static_navigation_obstacle,
+        .component_changed => |changed| switch (changed.component) {
+            .movement_body, .collision_bounds => changed.was_static_navigation_obstacle or changed.is_static_navigation_obstacle,
+            .collision_response => changed.was_static_navigation_obstacle != changed.is_static_navigation_obstacle,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Whether a structural event can renumber or drop steering↔movement dense
+/// index pairs (swap-remove, destroy, add/remove components). Forces a rebuild
+/// of `steering_movement_index` before the next snapshot.
+pub fn eventInvalidatesSteeringMovementIndexCache(event: SimulationEvent) bool {
+    return switch (event.payload) {
+        .entity_destroyed => true,
+        .entity_created => true,
+        .component_changed => |changed| switch (changed.component) {
+            .movement_body, .steering_agent => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn distance(a: math.Vec2, b: math.Vec2) f32 {
     return math.length(.{ .x = a.x - b.x, .y = a.y - b.y });
-}
-
-fn entityIdsEqual(lhs: EntityId, rhs: EntityId) bool {
-    return lhs.index == rhs.index and lhs.generation == rhs.generation;
 }
 
 fn serialBatch(count: usize) BatchStats {
@@ -1319,7 +1455,13 @@ fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapsh
     try std.testing.expectEqual(count, s.items(.x).len);
     try std.testing.expectEqual(count, s.items(.y).len);
     try std.testing.expectEqual(count, s.items(.radius).len);
+    try std.testing.expectEqual(count, s.items(.world_level).len);
 }
+
+// Test-only fixtures for multi-level start_level regression (not production API).
+const WorldSystem = @import("../world_system.zig").WorldSystem;
+const loadTestWorldMeta = @import("pathfinding/test_support.zig").loadTestWorldMeta;
+const requireTestTile = @import("pathfinding/test_support.zig").requireTestTile;
 
 test "steering agent snapshot rows keep MAL columns compact after gather" {
     var data = DataSystem.init(std.testing.allocator);
@@ -1430,44 +1572,72 @@ test "steering smooths a discrete target-direction flip over several steps inste
     try std.testing.expect(converged.direction_y > 0.95);
 }
 
-test "steering sources path request start level from entity world level" {
-    // Default surface NPCs without an explicit world_level component still emit
-    // start_level 0. Underground placement uses setWorldLevel before steering runs.
+test "steering sources path request start level from movement scope level" {
+    // writePathRequests reads movementScopeLevel (scope.level, kept in sync with
+    // world_level via setWorldLevel). Exercised through a full updateSerial so a
+    // future edit cannot quietly hardcode start_level back to 0. Multi-level nav
+    // is required: statusForWorld treats an out-of-range start level as
+    // unavailable and never emits a request (not missing).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const surface = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const underground = try addSteeredEntity(&data, .{ .x = 0, .y = 32 });
+    try data.setWorldLevel(underground, 2);
+
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 160, 160);
+    defer world.deinit();
+    // initDemoFromMeta owns level 0; add two more so start_level 2 has a grid.
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(2, 0, .floor, grass);
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
-    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    try pathfinding.rebuildStaticNavGridWithWorld(&data, &world, 160, 160, 32, null);
+    try std.testing.expect(pathfinding.graph.levelCount() >= 3);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reserveStreams(4, 0, 4, 0, 0, 0);
     try frame.reservePathRequests(2, 4);
     var steering = SteeringSystem.init(std.testing.allocator);
     defer steering.deinit();
     try steering.reserve(4);
 
+    // Fresh entities (no replan cooldown): both missing-path agents emit in one step.
     frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    try appendNavigationIntents(&frame, &.{
+        .{ .entity = surface, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
+        .{ .entity = underground, .goal_level = 2, .goal = .{ .x = 96, .y = 32 }, .direct_direction_x = 1 },
+    });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
 
     const requests = frame.path_requests.mergedItems();
-    try std.testing.expectEqual(@as(usize, 1), requests.len);
-    try std.testing.expectEqual(@as(u16, 0), requests[0].start_level);
-    try std.testing.expectEqual(@as(u16, 0), requests[0].goal_level);
+    try std.testing.expectEqual(@as(usize, 2), requests.len);
 
-    // entityWorldLevel is the sole source of a path request's start_level (see
-    // writePathRequests above); this is the direct regression guard that a
-    // future edit can't quietly hardcode it back to 0. Exercised directly
-    // rather than through another full updateSerial step, since a second step
-    // for the same agent would hit the replan cooldown the first request just
-    // armed and never re-request regardless of level.
-    try std.testing.expectEqual(@as(u16, 0), entityWorldLevel(&data, agent));
-    try data.setWorldLevel(agent, 2);
-    try std.testing.expectEqual(@as(u16, 2), entityWorldLevel(&data, agent));
+    var saw_surface = false;
+    var saw_underground = false;
+    for (requests) |request| {
+        if (request.entity.eql(surface)) {
+            try std.testing.expectEqual(@as(u16, 0), request.start_level);
+            saw_surface = true;
+        } else if (request.entity.eql(underground)) {
+            try std.testing.expectEqual(@as(u16, 2), request.start_level);
+            try std.testing.expectEqual(@as(u16, 2), request.goal_level);
+            saw_underground = true;
+        }
+    }
+    try std.testing.expect(saw_surface);
+    try std.testing.expect(saw_underground);
+    try std.testing.expectEqual(
+        @as(u16, 2),
+        data.scopeColumnsSliceConst().level[data.movementBodyDenseIndex(underground).?],
+    );
 }
 
 test "steering missing path requests respect replan cooldown" {
@@ -1657,11 +1827,16 @@ test "steering applies local agent and static obstacle avoidance" {
     try std.testing.expect(movement.direction_x < 1);
 }
 
-test "steering reuses the static obstacle index until the obstacle set changes" {
+test "steering local agent avoidance ignores XY overlap across different world_levels" {
+    // Two agents fully overlap in XY but sit on different floors. Without a
+    // same-level gate the neighbor would push the steerer; with it, samples
+    // stay zero and the direct direction is unchanged.
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
-    _ = try addStaticObstacle(&data, .{ .x = 24, .y = -24 }, .{ .x = 20, .y = 20 });
+    const other = try addSteeredEntity(&data, .{ .x = 20, .y = 0 });
+    try data.setWorldLevel(agent, 0);
+    try data.setWorldLevel(other, 1);
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
@@ -1674,28 +1849,118 @@ test "steering reuses the static obstacle index until the obstacle set changes" 
     try frame.reservePathRequests(2, 4);
     var steering = SteeringSystem.init(std.testing.allocator);
     defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const movement = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 0), stats.agent_neighbor_samples);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), movement.direction_y, 0.001);
+}
+
+test "steering movement index cache rebuilds only after structural invalidate" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 4, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(8);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expect(steering.steering_movement_index_valid);
+    try std.testing.expectEqual(@as(usize, 1), steering.steering_movement_index.items.len);
+    const cached_mi = steering.steering_movement_index.items[0];
+    try std.testing.expectEqual(data.movementBodyDenseIndex(agent).?, cached_mi);
+
+    // Second step without structural events reuses the cache.
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expect(steering.steering_movement_index_valid);
+    try std.testing.expectEqual(cached_mi, steering.steering_movement_index.items[0]);
+
+    // Structural destroy of a different entity still invalidates (renumber risk).
+    const other = try addSteeredEntity(&data, .{ .x = 40, .y = 0 });
+    frame.beginStep();
+    try frame.events.ensureCanAppend(1);
+    try frame.events.appendRequired(.{
+        .stage = .structural_commit,
+        .payload = .{ .entity_destroyed = .{
+            .entity = other,
+            .component_mask = 0,
+        } },
+    });
+    steering.reactToPostCommitSteeringEvents(&frame);
+    try std.testing.expect(!steering.steering_movement_index_valid);
+}
+
+test "steering reuses the static obstacle index until post-commit events invalidate it" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    _ = try addStaticObstacle(&data, .{ .x = 24, .y = -24 }, .{ .x = 20, .y = 20 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 4, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
     try steering.reserve(8);
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
     try std.testing.expect(steering.obstacle_index_valid);
-    const sig1 = steering.obstacle_index_signature;
     try std.testing.expectEqual(@as(usize, 1), steering.obstacle_cell_entries.items.len);
+    const first_query_extra = steering.spatial_obstacle_query_extra;
 
-    // Same static obstacle set next step: signature unchanged, index reused.
+    // No structural events: retained obstacle spatial is reused (no rebuild).
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
-    try std.testing.expectEqual(sig1, steering.obstacle_index_signature);
+    try std.testing.expect(steering.obstacle_index_valid);
     try std.testing.expectEqual(@as(usize, 1), steering.obstacle_cell_entries.items.len);
+    try std.testing.expectEqual(first_query_extra, steering.spatial_obstacle_query_extra);
 
-    // Add an obstacle: the set changed, so the signature changes and the index rebuilds.
-    _ = try addStaticObstacle(&data, .{ .x = -24, .y = 24 }, .{ .x = 20, .y = 20 });
+    // Structural change: post-commit reaction invalidates; next update rebuilds.
+    const new_obstacle = try addStaticObstacle(&data, .{ .x = -24, .y = 24 }, .{ .x = 20, .y = 20 });
     frame.beginStep();
+    try frame.events.ensureCanAppend(1);
+    try frame.events.appendRequired(.{
+        .stage = .structural_commit,
+        .payload = .{ .component_changed = .{
+            .entity = new_obstacle,
+            .component = .collision_response,
+            .was_static_navigation_obstacle = false,
+            .is_static_navigation_obstacle = true,
+        } },
+    });
+    steering.reactToPostCommitSteeringEvents(&frame);
+    try std.testing.expect(!steering.obstacle_index_valid);
+
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
-    try std.testing.expect(steering.obstacle_index_signature != sig1);
+    try std.testing.expect(steering.obstacle_index_valid);
     try std.testing.expectEqual(@as(usize, 2), steering.obstacle_cell_entries.items.len);
 }
 
@@ -1771,6 +2036,95 @@ test "steering serial and real threaded workers produce identical movement inten
     }
 }
 
+test "steering serial matches threaded intents across multiple range splits and worker counts" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // The single-split parity test above pins one fixed split; the AdaptiveWorkTuner
+    // instead picks range/worker counts dynamically, and its probe-driven choice is not
+    // reproducible in a unit test. This asserts the split-INVARIANCE the tuner relies on:
+    // every explicit partition and worker count must reproduce the serial reference. The
+    // read-only inputs (data, obstacles, nav grid, intents) are shared; only the mutated
+    // output frame and system are rebuilt per split.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var intents = std.ArrayList(NavigationIntent).empty;
+    defer intents.deinit(std.testing.allocator);
+    try intents.ensureTotalCapacity(std.testing.allocator, 128);
+
+    for (0..128) |index| {
+        const x: f32 = @floatFromInt(index % 16);
+        const y: f32 = @floatFromInt(index / 16);
+        const entity = try addSteeredEntity(&data, .{ .x = x * 14.0, .y = y * 14.0 });
+        intents.appendAssumeCapacity(.{
+            .entity = entity,
+            .goal = .{ .x = 420, .y = 220 },
+            .direct_direction_x = if (index % 2 == 0) 1 else -1,
+            .direct_direction_y = if (index % 3 == 0) 0.25 else -0.15,
+            .priority = 1,
+        });
+    }
+    _ = try addStaticObstacle(&data, .{ .x = 72, .y = 32 }, .{ .x = 36, .y = 96 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 128, .max_pending_requests = 128, .max_cached_results = 256, .max_group_fields = 4, .worker_participant_count = 1, .max_solved_requests_per_step = 128 });
+    try pathfinding.rebuildStaticNavGrid(&data, 512, 512, 32);
+
+    var serial_frame = SimulationFrame.init(std.testing.allocator);
+    defer serial_frame.deinit();
+    try serial_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+    try serial_frame.reservePathRequests(16, 128);
+    serial_frame.beginStep();
+    try appendNavigationIntents(&serial_frame, intents.items);
+    var serial_system = SteeringSystem.init(std.testing.allocator);
+    defer serial_system.deinit();
+    try serial_system.reserve(128);
+    _ = try serial_system.updateSerial(&data, &serial_frame, &pathfinding, .{});
+    const serial = serial_frame.intents.mergedItems();
+    try std.testing.expect(serial.len > 0);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 4,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    const splits = [_]struct { items_per_range: usize, workers: usize }{
+        .{ .items_per_range = steering_range_alignment_items, .workers = 2 },
+        .{ .items_per_range = steering_range_alignment_items * 2, .workers = 2 },
+        .{ .items_per_range = steering_range_alignment_items, .workers = 4 },
+        .{ .items_per_range = steering_range_alignment_items * 3, .workers = 3 },
+    };
+    for (splits) |split| {
+        var threaded_frame = SimulationFrame.init(std.testing.allocator);
+        defer threaded_frame.deinit();
+        try threaded_frame.reserveStreams(16, 0, 128, 0, 0, 0);
+        try threaded_frame.reservePathRequests(16, 128);
+        threaded_frame.beginStep();
+        try appendNavigationIntents(&threaded_frame, intents.items);
+        var threaded_system = SteeringSystem.init(std.testing.allocator);
+        defer threaded_system.deinit();
+        try threaded_system.reserve(128);
+        const threaded_stats = try threaded_system.update(&data, &threaded_frame, &threads, &pathfinding, .{
+            .items_per_range = split.items_per_range,
+            .max_worker_threads = split.workers,
+            .adaptive = false,
+        });
+        // Real workers processed the batch, so this split exercised the multi-worker
+        // path it claims to.
+        try std.testing.expect(threaded_stats.batch.active_worker_threads > 0);
+        const threaded = threaded_frame.intents.mergedItems();
+        try std.testing.expectEqual(serial.len, threaded.len);
+        for (serial, threaded) |a, b| {
+            try std.testing.expectEqual(a.movement.entity.index, b.movement.entity.index);
+            try std.testing.expectEqual(a.movement.entity.generation, b.movement.entity.generation);
+            try std.testing.expectEqual(a.movement.direction_x, b.movement.direction_x);
+            try std.testing.expectEqual(a.movement.direction_y, b.movement.direction_y);
+        }
+    }
+}
+
 test "steering update is allocation-free after reserves and warmup" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
@@ -1815,6 +2169,87 @@ test "steering update is allocation-free after reserves and warmup" {
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
     const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+}
+
+test "steering threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var agents: [steering_range_alignment_items * 4]EntityId = undefined;
+    for (&agents, 0..) |*slot, i| {
+        const x: f32 = @floatFromInt(i % 8);
+        const y: f32 = @floatFromInt(i / 8);
+        slot.* = try addSteeredEntity(&data, .{ .x = x * 16.0, .y = y * 16.0 });
+    }
+    _ = try addStaticObstacle(&data, .{ .x = 48, .y = -12 }, .{ .x = 16, .y = 16 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{
+        .max_frame_requests = agents.len,
+        .max_pending_requests = agents.len,
+        .max_cached_results = agents.len * 2,
+        .max_group_fields = 1,
+        .worker_participant_count = 1,
+        .max_solved_requests_per_step = agents.len,
+    });
+    try pathfinding.rebuildStaticNavGrid(&data, 256, 256, 32);
+
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
+        .max_worker_threads = 2,
+        .items_per_range = steering_range_alignment_items,
+    });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(8, 0, agents.len, 0, 0, 0);
+    try frame.reservePathRequests(8, agents.len);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(agents.len);
+
+    const cfg: SteeringConfig = .{
+        .items_per_range = steering_range_alignment_items,
+        .max_worker_threads = 2,
+        .adaptive = false,
+    };
+
+    // One batched append: each appendNavigationIntent prepareRangeCounts-clears
+    // the stream, so a per-agent loop would leave only the last intent and collapse
+    // the batch to a single-range inline path.
+    var warmup_intents: [agents.len]NavigationIntent = undefined;
+    for (&warmup_intents, agents) |*slot, agent| {
+        slot.* = .{ .entity = agent, .goal = .{ .x = 200, .y = 0 }, .direct_direction_x = 1 };
+    }
+    frame.beginStep();
+    try appendNavigationIntents(&frame, &warmup_intents);
+    const warmup = try steering.update(&data, &frame, &threads, &pathfinding, cfg);
+    try std.testing.expect(!warmup.batch.ran_inline);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const original_system_allocator = steering.allocator;
+    const original_navigation_allocator = frame.navigation_intents.allocator;
+    const original_intent_allocator = frame.intents.allocator;
+    const original_path_allocator = frame.path_requests.allocator;
+    steering.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    frame.intents.allocator = failing.allocator();
+    frame.path_requests.allocator = failing.allocator();
+    defer {
+        steering.allocator = original_system_allocator;
+        frame.navigation_intents.allocator = original_navigation_allocator;
+        frame.intents.allocator = original_intent_allocator;
+        frame.path_requests.allocator = original_path_allocator;
+    }
+
+    frame.beginStep();
+    try appendNavigationIntents(&frame, &warmup_intents);
+    const stats = try steering.update(&data, &frame, &threads, &pathfinding, cfg);
+    try std.testing.expect(!stats.batch.ran_inline);
+    try std.testing.expectEqual(agents.len, stats.movement_intent_count);
 }
 
 test "steering obstacle scratch reserve is independent from agent reserve" {
@@ -1962,6 +2397,14 @@ test "steering bounds dense obstacle candidate checks" {
     try std.testing.expect(stats.obstacle_candidate_checks <= max_obstacle_candidate_checks);
     try std.testing.expect(stats.obstacle_candidate_checks > 0);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+}
+
+test "steering production adaptive tuner uses central gate and range alignment" {
+    var system = SteeringSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expectEqual((AdaptiveWorkTunerConfig{}).threaded_batch_ns, system.adaptive_tuner.config.threaded_batch_ns);
+    try std.testing.expectEqual(steering_range_alignment_items, system.adaptive_tuner.config.initial_range_items);
+    try std.testing.expectEqual(steering_range_alignment_items, system.adaptive_tuner.config.smallest_range_items);
 }
 
 fn addSteeredEntity(data: *DataSystem, position: math.Vec2) !EntityId {

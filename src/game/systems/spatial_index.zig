@@ -57,8 +57,8 @@ const std = @import("std");
 const math = @import("../../core/math.zig");
 const simd = @import("../../core/simd.zig");
 const cognition_halo_chunks = @import("../simulation_scope.zig").cognition_halo_chunks;
-const AdaptiveWorkProfile = @import("../../app/thread_system.zig").AdaptiveWorkProfile;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
+const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
 const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
@@ -159,11 +159,25 @@ pub const DenseCellLookup = struct {
 
     fn reserve(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32, population_capacity: usize) !void {
         const total = @as(usize, width) * @as(usize, height);
+        try self.touched.ensureTotalCapacity(allocator, population_capacity);
+
+        // Re-entrant: a second call with the same grid size must not append
+        // another full window of zeros (would desync len from capacity and
+        // inflate O(window) storage). Grow-or-shrink paths re-init to exactly
+        // `total` so starts/ends always match the reserved side lengths.
+        if (self.capacity_cells_x == width and self.capacity_cells_y == height and
+            self.starts.items.len == total and self.ends.items.len == total)
+        {
+            return;
+        }
+
         try self.starts.ensureTotalCapacity(allocator, total);
         try self.ends.ensureTotalCapacity(allocator, total);
+        self.starts.clearRetainingCapacity();
+        self.ends.clearRetainingCapacity();
+        self.touched.clearRetainingCapacity();
         self.starts.appendNTimesAssumeCapacity(0, total);
         self.ends.appendNTimesAssumeCapacity(0, total);
-        try self.touched.ensureTotalCapacity(allocator, population_capacity);
         self.capacity_cells_x = width;
         self.capacity_cells_y = height;
     }
@@ -297,20 +311,39 @@ pub const SpatialIndexView = struct {
         // Row-independent x clip: the scanned x-span never depends on cell_y,
         // so it is computed once against the dense window's bounds rather than
         // once per row.
-        const window_min_x = self.dense_lookup.origin.x;
-        const window_max_x = window_min_x + @as(i32, @intCast(self.dense_lookup.width)) - 1;
-        const clipped_min_x = @max(own_cell.x - cell_scan_radius, window_min_x);
-        const clipped_max_x = @min(own_cell.x + cell_scan_radius, window_max_x);
+        // Widen before narrowing: `own_cell.x +/- cell_scan_radius` on i32 cell
+        // coordinates (from saturating `floorToI32`, so possibly `minInt`/
+        // `maxInt`) can overflow i32, which is UB in ReleaseFast. Compute the
+        // clip in i64; the offsets that feed `@intCast` are provably in range
+        // (`clipped_min_x >= window_min_x`, and the span is `>= 1` past the
+        // early return), so the result is identical for well-formed inputs.
+        const window_min_x: i64 = self.dense_lookup.origin.x;
+        const window_max_x: i64 = window_min_x + @as(i64, self.dense_lookup.width) - 1;
+        const clipped_min_x = @max(@as(i64, own_cell.x) - cell_scan_radius, window_min_x);
+        const clipped_max_x = @min(@as(i64, own_cell.x) + cell_scan_radius, window_max_x);
         if (clipped_min_x > clipped_max_x) return stats;
         const row_x_offset: usize = @intCast(clipped_min_x - window_min_x);
         const n_cells: usize = @intCast(clipped_max_x - clipped_min_x + 1);
         const vectorized_len = simd.vectorizedEnd(n_cells);
 
-        var cell_y = own_cell.y - cell_scan_radius;
-        while (cell_y <= own_cell.y + cell_scan_radius) : (cell_y += 1) {
-            const rel_y = cell_y - self.dense_lookup.origin.y;
-            if (rel_y < 0 or rel_y >= @as(i32, @intCast(self.dense_lookup.height))) continue;
-            const row_base = @as(usize, @intCast(rel_y)) * self.dense_lookup.width + row_x_offset;
+        // Same widen-before-narrow clip for the y-scan bounds: `own_cell.y +/-
+        // cell_scan_radius` on i32 cell coordinates (saturating `floorToI32`, so
+        // possibly `minInt`/`maxInt`) can overflow i32, UB in ReleaseFast.
+        // Clamping the range to the window's y-span while wide makes each row's
+        // `rel_y` in-bounds by construction — it drops the old `rel_y < 0 or
+        // rel_y >= height` `continue` skip while visiting exactly the same rows
+        // in the same order for well-formed inputs, and bounds the loop to the
+        // reserved window instead of the raw (possibly saturated) scan span.
+        const window_min_y: i64 = self.dense_lookup.origin.y;
+        const window_max_y: i64 = window_min_y + @as(i64, self.dense_lookup.height) - 1;
+        const clipped_min_y = @max(@as(i64, own_cell.y) - cell_scan_radius, window_min_y);
+        const clipped_max_y = @min(@as(i64, own_cell.y) + cell_scan_radius, window_max_y);
+        if (clipped_min_y > clipped_max_y) return stats;
+
+        var cell_y: i64 = clipped_min_y;
+        while (cell_y <= clipped_max_y) : (cell_y += 1) {
+            const rel_y: usize = @intCast(cell_y - window_min_y);
+            const row_base = rel_y * self.dense_lookup.width + row_x_offset;
 
             var j: usize = 0;
             while (j < vectorized_len) : (j += simd.lane_count) {
@@ -521,6 +554,7 @@ pub const SpatialIndexSystem = struct {
             .data = data,
             .scope_dense_indices = config.scope_dense_indices,
             .ranges = self.gather_ranges.items[0..selection.range_count],
+            .item_count = n,
         };
         const batch = thread_system.parallelForWithOptions(n, &context, spatialGatherJob, .{
             .max_worker_threads = selection.worker_threads,
@@ -671,10 +705,17 @@ pub const SpatialIndexSystem = struct {
         }
         const min_y = self.entries.items[0].cell.y;
         const max_y = self.entries.items[self.entries.items.len - 1].cell.y;
-        const width_unclamped: u32 = @intCast(max_x - min_x + 1);
-        const height_unclamped: u32 = @intCast(max_y - min_y + 1);
-        const width = @min(width_unclamped, self.dense_lookup.capacity_cells_x);
-        const height = @min(height_unclamped, self.dense_lookup.capacity_cells_y);
+        // Widen before narrowing: `max - min` on i32 cell coordinates (produced
+        // from possibly-inf/huge positions via saturating `floorToI32`) can
+        // overflow i32, and an out-of-range `@intCast` to u32 is UB in
+        // ReleaseFast (safety checks stripped) — and it would run *before* the
+        // capacity clamp meant to contain an oversized window. Compute the span
+        // in i64, clamp against the reserved capacity while still wide, then
+        // narrow the already-bounded value to u32.
+        const width_span = @as(i64, max_x) - @as(i64, min_x) + 1;
+        const height_span = @as(i64, max_y) - @as(i64, min_y) + 1;
+        const width: u32 = @intCast(@min(width_span, @as(i64, self.dense_lookup.capacity_cells_x)));
+        const height: u32 = @intCast(@min(height_span, @as(i64, self.dense_lookup.capacity_cells_y)));
 
         self.dense_lookup.origin = .{ .x = min_x, .y = min_y };
         self.dense_lookup.width = width;
@@ -784,6 +825,9 @@ const SpatialGatherContext = struct {
     data: *const DataSystem,
     scope_dense_indices: ?[]const u32,
     ranges: []RowRangeSlot,
+    /// Candidate count the dispatch was shaped for (scoped subset or full AI
+    /// population); dual-asserted against `range.end` at job entry.
+    item_count: usize,
 };
 
 /// Scattered/branchy per-entity resolution: `movementBodyDenseIndex` is a
@@ -796,8 +840,12 @@ const SpatialGatherContext = struct {
 /// `docs/coding-standards.md`'s SIMD section calls for.
 fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpatialGatherContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / collision.zig): range.index vs
+    // dispatched range count AND range.end vs the candidate buffer this job walks.
     // Guards the reserve-before-dispatch invariant: ranges was sized to this dispatch's range count.
     std.debug.assert(range.index < job.ranges.len);
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= job.item_count);
     const buffer = &job.ranges[range.index].buffer;
     for (range.start..range.end) |k| {
         const i: usize = if (job.scope_dense_indices) |idx| idx[k] else k;
@@ -814,13 +862,7 @@ fn spatialGatherJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void
 
 // ---- Work selection (mirrors ai.zig/simulation_scope.zig's selectStageWork) ---
 
-const StageWorkSelection = struct {
-    profile: AdaptiveWorkProfile,
-    items_per_range: usize,
-    worker_threads: usize,
-    range_count: usize,
-    active_tuner: ?*AdaptiveWorkTuner = null,
-};
+const StageWorkSelection = BatchSelection;
 
 fn selectStageWork(
     thread_system: *const ThreadSystem,
@@ -830,47 +872,15 @@ fn selectStageWork(
     adaptive: bool,
     adaptive_tuner: ?*AdaptiveWorkTuner,
 ) StageWorkSelection {
-    const available_workers = thread_system.workerThreadCount();
-    const max_worker_threads = @min(max_worker_threads_override orelse available_workers, available_workers);
-    const requested_items_per_range = items_per_range_override orelse thread_system.config.items_per_range;
-    const active_tuner = if (adaptive and items_per_range_override == null and max_worker_threads > 0)
-        adaptive_tuner
-    else
-        null;
-    const profile = if (active_tuner) |tuner|
-        tuner.selectProfile(.{
-            .item_count = item_count,
-            .available_worker_threads = available_workers,
-            .max_worker_threads = max_worker_threads,
-            .fallback_items_per_range = requested_items_per_range,
-            .range_alignment_items = spatial_index_range_alignment_items,
-        })
-    else
-        AdaptiveWorkProfile{
-            .worker_threads = max_worker_threads,
-            .items_per_range = requested_items_per_range,
-        };
-    const aligned_items_per_range = alignItemCount(@max(profile.items_per_range, @as(usize, 1)), spatial_index_range_alignment_items);
-    const selected_range_count = rangeCount(item_count, aligned_items_per_range);
-    const selected_worker_threads = if (selected_range_count <= 1)
-        @as(usize, 0)
-    else
-        @min(profile.worker_threads, @min(max_worker_threads, selected_range_count - 1));
-    const items_per_range = if (selected_worker_threads == 0 and active_tuner != null and profile.worker_threads == 0)
-        item_count
-    else
-        aligned_items_per_range;
-
-    return .{
-        .profile = .{
-            .worker_threads = selected_worker_threads,
-            .items_per_range = items_per_range,
-        },
-        .items_per_range = items_per_range,
-        .worker_threads = selected_worker_threads,
-        .range_count = rangeCount(item_count, items_per_range),
-        .active_tuner = active_tuner,
-    };
+    // Shapes work through the single tuner-owned entry point so pre-sizing and
+    // dispatch (parallelForWithOptions) resolve an identical batch shape.
+    return thread_system.selectBatchProfile(adaptive_tuner, .{
+        .item_count = item_count,
+        .items_per_range = items_per_range_override,
+        .max_worker_threads = max_worker_threads_override,
+        .range_alignment_items = spatial_index_range_alignment_items,
+        .adaptive = adaptive,
+    });
 }
 
 fn paddingForCacheLine(comptime T: type) usize {
@@ -1363,13 +1373,18 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     var threads = try ThreadSystem.init(testing.allocator, testing.io, .{ .max_worker_threads = 2, .items_per_range = 6 });
     defer threads.deinit();
+    // Without real workers the threaded build falls back to inline on the main
+    // thread and this proof becomes a silent serial false pass.
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
 
     var sys = SpatialIndexSystem.init(testing.allocator);
     defer sys.deinit();
     try sys.reserve(24, .{});
 
     // Warmup: one threaded build (warms `gather_ranges`) and one serial build.
-    _ = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
+    const warmup_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
+    try testing.expect(!warmup_stats.batch.ran_inline);
+    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
     _ = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
@@ -1379,6 +1394,8 @@ test "SpatialIndexSystem has no steady-state allocation after warmup (FailingAll
 
     const threaded_stats = try sys.build(ai_slice, move_slice, &fixture.data, &threads, .{ .items_per_range = 6, .max_worker_threads = 2, .adaptive = false });
     try testing.expectEqual(@as(usize, 24), threaded_stats.entity_count);
+    try testing.expect(!threaded_stats.batch.ran_inline);
+    try testing.expect(threaded_stats.batch.active_worker_threads > 0);
     const serial_stats = try sys.buildSerial(ai_slice, move_slice, &fixture.data, .{});
     try testing.expectEqual(@as(usize, 24), serial_stats.entity_count);
 
@@ -1443,6 +1460,40 @@ test "reserve sizes the dense window from cognition halo margin plus fixed visib
     const expected_margin_cells: u32 = 128;
     try testing.expectEqual(expected_margin_cells + max_expected_visible_window_cells, sys.dense_lookup.capacity_cells_x);
     try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+}
+
+test "DenseCellLookup reserve twice keeps grid length; query still finds neighbors" {
+    // Re-entrancy proof: a second reserve at the same size must not append
+    // another full starts/ends grid, and a subsequent build+query still works.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(a, .{ .active_behavior = .wander });
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 8, .y = 0 }, .previous_position = .{ .x = 8, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(b, .{ .active_behavior = .wander });
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
+    const cells_after_first = sys.dense_lookup.starts.items.len;
+    try testing.expect(cells_after_first > 0);
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
+
+    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.starts.items.len);
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
+    try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    const stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
+    try testing.expectEqual(@as(usize, 2), stats.entity_count);
+
+    var visitor = RecordingVisitor{};
+    _ = sys.view().queryNeighbors(0, 0, 0, 1, .{ .radius = 32.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
+    try testing.expectEqual(@as(usize, 1), visitor.count);
 }
 
 test "reserve clamps the dense window to the hard ceiling for a pathological world geometry" {
