@@ -146,8 +146,8 @@ Read the owning doc before editing. Do not invent architecture from memory.
 | `docs/simulation-tiers-and-pipeline.md` | Fixed-step simulation contracts |
 | `docs/atlas-asset-workflow.md` | Atlas packing, JSON sidecars, art swaps |
 | `docs/framework-implementation-slices.md` | Live roadmap / open slices |
-| `docs/framework-implementation-slices-archive.md` | Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41) |
-| `docs/changelogs/` | Per-branch feature summaries |
+| `docs/framework-implementation-slices-archive.md` | Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45) |
+| `docs/changelogs/` | Per-branch feature summaries (latest: `docs/changelogs/ai_update2.md`) |
 | `docs/reviews/` | Module deep-dives (pathfinder, GPU, …) |
 
 ---

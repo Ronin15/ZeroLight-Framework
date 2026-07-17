@@ -27,10 +27,10 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
 - `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
   priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
-  18–25E, 26–32, 34, 36, 39–41) are in
+  18–25E, 26–32, 34, 36, 39–41, 45) are in
   `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
-  `docs/changelogs/world.md`).
+  `docs/changelogs/ai_update2.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
 
 ## Module Ownership (`src/`)

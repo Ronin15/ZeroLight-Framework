@@ -233,16 +233,22 @@ baselines (`baseline_fear` / `baseline_curiosity` / `baseline_aggression` /
 / `threshold_*` control how fast a drive relaxes and when it crosses into
 above-threshold behavior. Higher `baseline_fear` biases toward flee, higher
 `baseline_curiosity` toward investigate, and so on — arbitration maps drives to
-behavior through the weight table in `src/game/systems/arbitration.zig`. Give an
-archetype a `perception` block with a longer `vision_range` (keen-eyed sentry)
-or a near-zero `vision_range` with a large `hearing_range` (blind tracker) to
-differentiate senses. After editing, run `zig build test` to re-validate the
-catalog.
+behavior through the weight table in `src/game/systems/arbitration.zig`. Under
+`agent`, non-zero `commitment_max_steps` / `sticky_bonus` keep a chosen behavior
+from flapping every fixed step (shipped timid / aggressive / curious set these).
+Give an archetype a `perception` block with a longer `vision_range` (keen-eyed
+sentry) or a near-zero `vision_range` with a large `hearing_range` (blind
+tracker) to differentiate senses. After editing, run `zig build test` to
+re-validate the catalog.
 
 Press **F2** (or gamepad **BACK**) at runtime to toggle the debug overlay: it
 draws each nearby agent's vision cone, emotion drive bars, memory markers, and
 active behavior label, plus scope/tier counts — read-only, so it never changes
 simulation.
+
+In gameplay, **R** or gamepad **left shoulder** is interact (rising-edge action
+intent); dig and move keep their existing keyboard / stick bindings — see
+[state stack and input](state-stack-and-input.md).
 
 ## Testing
 
@@ -262,7 +268,8 @@ zig build test
 zig build verify
 ```
 
-`verify` runs compile coverage, unit tests, shader compilation, and atlas lint.
+`verify` runs compile coverage, unit tests, shader compilation, atlas lint, and
+idiom lint.
 
 Coding style, performance standards, comment policy, test standards, and
 generated-output rules live in `docs/coding-standards.md`.

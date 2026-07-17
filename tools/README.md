@@ -1,8 +1,8 @@
 # `tools/`
 
-Developer tooling for ZeroLight-Framework: the asset/atlas pipeline and the
-benchmark runner. These are build- and content-side helpers — they are **not**
-part of the game binary.
+Developer tooling for ZeroLight-Framework: the asset/atlas pipeline, idiom
+lint, and the benchmark runner. These are build- and content-side helpers —
+they are **not** part of the game binary.
 
 ## Conventions
 
@@ -10,7 +10,7 @@ part of the game binary.
   resolved relative to it), e.g. `python3 tools/pack_atlas.py …`.
 - **Dependency:** the asset-generation scripts need [Pillow](https://pypi.org/project/Pillow/)
   (`from PIL import Image`). Install with `pip install Pillow`. The benchmark
-  runner and lint script are stdlib-only.
+  runner, asset lint, and idiom lint scripts are stdlib-only.
 - **Shared modules** (`*_common.py`, `tileset_quality.py`) are imported by the
   CLIs, not run directly.
 - The canonical description of the atlas workflow lives in
@@ -28,6 +28,7 @@ part of the game binary.
 | `pack_atlas.py` | Pack loose, filename-driven source sprites into atlas PNG + JSON manifests. |
 | `export_source_sprites.py` | Inverse of packing: export loose source PNGs back out of installed atlas sheets + JSON manifests. |
 | `lint_assets_if_changed.py` | Lint registered runtime atlas PNG/JSON (and optional source sprites). Wired into `zig build verify` via the atlas-lint step. |
+| `lint_idioms.py` | Lint Zig naming, current stdlib spellings, and unsafe `catch`/`orelse unreachable`. Wired into `zig build verify` via `zig build idiom-lint`. |
 
 ## Shared modules (imported, not run)
 

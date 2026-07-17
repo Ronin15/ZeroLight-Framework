@@ -51,8 +51,8 @@ game-specific behavior under `src/game/`.
   not the discovery gate. Queries return nearest-k (dist², then slot index).
 - `src/game/data_system.zig` fronts the `data_system/` subpackage (types,
   movement, visual, collision, agents, faction_level, perception, memory,
-  affect, structural, system) and owns state-local persistent entity data in
-  dense SoA stores for gameplay, collision, and render systems.
+  affect, destructible, structural, system) and owns state-local persistent
+  entity data in dense SoA stores for gameplay, collision, and render systems.
 - `src/game/simulation.zig` owns transient fixed-step streams, deterministic
   range-output collection, and deferred structural command buffers.
 - `src/game/simulation_pipeline.zig` owns state-local fixed-step processor
@@ -67,7 +67,8 @@ game-specific behavior under `src/game/`.
 - `src/game/player.zig` keeps player-specific input and facing behavior while
   storing persistent player data in `DataSystem`.
 - `src/game/systems/movement.zig` integrates movement-body SoA columns through
-  serial or threaded SIMD-aware ranges.
+  serial or threaded SIMD-aware ranges (world x/y only; discrete vertical plane
+  is `position_z` / `world_level`, not continuous z motion).
 - `src/game/systems/spatial_index.zig` owns `SpatialIndexSystem`, the
   pipeline-shared per-step uniform grid built once from the cognition-scoped
   population and read by AI separation and perception.
@@ -78,13 +79,22 @@ game-specific behavior under `src/game/`.
   LOS-blocked cache incrementally patched.
 - `src/game/systems/ai_memory.zig` owns `AiMemorySystem`: decays last-known-
   target position, a fixed-capacity recent-contact ring, and spatial
-  familiarity, and refreshes state from perception's acquisition events.
+  familiarity; refreshes last-known from continuous same-identity visibility
+  and perception acquire/lose events; raises familiarity under sustained track.
 - `src/game/systems/affect.zig` owns `AffectSystem`: appraises perception and
   memory into four independent per-entity mood drives (fear, curiosity,
   aggression, fatigue) and emits threshold-crossing events.
-- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows.
+- `src/game/systems/ai.zig` emits navigation intents for ai_agent rows
+  (arbitration over perception, memory, affect, and world interest markers).
+- `src/game/ai_archetypes.zig` loads data-driven personality bundles from
+  `assets/ai/archetypes.json` at load time into a fixed enum → component table
+  (no hot-path JSON).
+- `src/game/ai_debug_overlay.zig` draws read-only AI introspection (vision,
+  drives, memory, active behavior) under the existing debug toggle; never
+  mutates simulation.
 - `src/game/systems/steering.zig` consumes navigation intents and path status,
-  then emits final NPC movement intents with local avoidance.
+  then emits final NPC movement intents with local avoidance (same-level agent
+  neighbor gating mirrors collision).
 - `src/game/systems/collision.zig` generates deterministic contact streams.
 - `src/game/systems/collision_response.zig` consumes contacts and applies
   response-policy movement corrections.
@@ -92,9 +102,12 @@ game-specific behavior under `src/game/`.
   in a fixed-capacity SoA pool with serial or threaded SIMD-aware updates.
 - `src/game/systems/pathfinding.zig` fronts the `pathfinding/` subpackage
   (types, nav_grid, nav_graph, caches, group_field, scratch, solve, system,
-  nav_memory, test_support) for frame-delayed Z-aware grid navigation.
+  nav_memory, test_support) for frame-delayed multi-level grid navigation.
 - `src/game/dig_controller.zig` is the pipeline-owned controller for player
   digging, authoring world-tile edits and navigation-invalidation signals.
+- `src/game/destructible_controller.zig` is the pipeline-owned controller that
+  consumes `action_intents` (interact/attack) into deferred destructible
+  damage/destroy commands and domain events.
 - `src/game/audio_controller.zig` is the pipeline-owned controller that turns
   per-step input and collision contacts into audio command-buffer intents
   (ambient music, a movement-gated jet loop, and collision SFX with per-pair
@@ -420,6 +433,7 @@ The current gameplay fixed-step pipeline is:
    `bounds_and_tile_gate` (world bounds clamp + solid-tile gate; after
    collision so a contact push into dirt is re-gated) →
    `plane_traversal` (ramp/fall/carve/snap) → `chunk_derive` →
+   `action_react` (destructible / action-intent consumers) →
    `tier_policy` (deferred `set_simulation_tier` commands).
 4. Queue contact audio, emit/update transient particles, and merge outputs.
 5. Update the state-owned follow camera and visible world chunks.
