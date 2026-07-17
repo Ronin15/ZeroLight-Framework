@@ -15,8 +15,8 @@ pub const DebugOverlay = struct {
         return .{ .fps_counter = FpsCounter.init(text_service) };
     }
 
-    pub fn deinit(self: *DebugOverlay) void {
-        self.fps_counter.deinit();
+    pub fn deinit(self: *DebugOverlay, text_service: *TextService, renderer: *Renderer) void {
+        self.fps_counter.deinit(text_service, renderer);
     }
 
     pub fn applyCommands(self: *DebugOverlay, commands: *const FrameCommands) void {

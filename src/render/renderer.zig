@@ -631,8 +631,9 @@ pub const Renderer = struct {
         // gpu/buffer.zig): the map rotates to fresh backing storage rather than
         // overwriting bytes a prior frame's copy pass may still reference. The
         // static buffer uses the same cycle=true upload, only when dirty.
-        // Tile-edit transfer grow (create → WaitForGPUIdle → release-old) also
-        // lives here so a capacity stall never holds an acquired swapchain.
+        // Tile-edit transfer grow (create → WaitForGPUIdle → release-old) and
+        // staging also live here so a capacity stall never holds an acquired
+        // swapchain and post-acquire work is record-only (matches dynamic verts).
         if (self.batch.positions.items.len > 0) {
             try self.stageVertices();
         }
@@ -641,8 +642,7 @@ pub const Renderer = struct {
         }
         const upload_tile_edits = self.tile_edits_pending and self.tile_edit_scratch.items.len > 0;
         if (upload_tile_edits) {
-            const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
-            try self.ensureTileEditTransfer(required_bytes);
+            try self.stageTileEdits();
         }
 
         const frame = try self.acquireSwapchainFrame(false) orelse return .skipped_no_swapchain;
@@ -1295,19 +1295,11 @@ pub const Renderer = struct {
         }
 
         if (work.tile_edits) {
-            // Transfer capacity is ensured pre-acquire; post-acquire only maps
-            // into the already-sized buffer and records the copy. cycle=true
-            // because this transfer is renderer-owned and reused across frames.
+            // Staging (map + write values) already happened pre-acquire; only
+            // record the storage-region uploads into the open copy pass here.
             const transfer = self.tile_edit_transfer.?;
             const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
             std.debug.assert(self.tile_edit_transfer_byte_size >= required_bytes);
-            try gpu_buffer.stageStorageRegions(
-                self.device,
-                transfer,
-                self.tile_edit_transfer_byte_size,
-                self.tile_edit_scratch.items,
-                true,
-            );
             try gpu_buffer.recordStorageRegionsInPass(
                 copy_pass_scope.pass,
                 transfer,
@@ -1317,6 +1309,24 @@ pub const Renderer = struct {
             self.tile_edits_pending = false;
             self.tile_edit_scratch.clearRetainingCapacity();
         }
+    }
+
+    /// Ensures tile-edit transfer capacity and stages edit values into the
+    /// pooled transfer buffer (cycle=true). Call pre-acquire so the post-acquire
+    /// copy pass only records `recordStorageRegionsInPass`.
+    fn stageTileEdits(self: *Renderer) !void {
+        const required_bytes = try gpu_buffer.storageByteSize(self.tile_edit_scratch.items.len);
+        try self.ensureTileEditTransfer(required_bytes);
+        const transfer = self.tile_edit_transfer.?;
+        // cycle=true: transfer is renderer-owned and reused across frames, so
+        // map must rotate to fresh backing rather than overwrite in-flight data.
+        try gpu_buffer.stageStorageRegions(
+            self.device,
+            transfer,
+            self.tile_edit_transfer_byte_size,
+            self.tile_edit_scratch.items,
+            true,
+        );
     }
 
     // Grows the retained static buffer to hold `needed_vertices` (the dense-layer

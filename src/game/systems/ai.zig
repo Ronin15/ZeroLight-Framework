@@ -1155,12 +1155,14 @@ const AiJobContext = struct {
 /// Runs arbitration for one row: builds a transient `arbitration.Signals`
 /// from this row's gathered columns (never stored — discarded immediately
 /// after the three calls below), scores behaviors, sticky-selects one, then
-/// resolves a concrete goal. Persists the raw selection to `ai_agent_hot`
-/// (the agent's actual cognitive pick, independent of goal-resolution
-/// success) and writes the row's steering-facing output column: a selected
+/// resolves a concrete goal. Writes the row's steering-facing output column
+/// and persists the *locomotion* behavior to `ai_agent_hot`: a selected
 /// behavior with no resolvable goal this step (e.g. a one-frame perception
-/// gap) degrades to a pure-wander fallback (zero gain) rather than freezing
-/// or chasing a stale goal.
+/// gap) degrades to pure wander (zero gain) for both steering and the hot
+/// `active_behavior` column so affect fatigue does not treat an unresolvable
+/// pursue/flee as exertion. Sticky commitment still records the selection's
+/// countdown when the goal is valid; on invalid goals commitment is cleared
+/// so sticky does not hold an unresolvable pursue/flee across steps.
 fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const threat = job.threat[i];
     const stimulus = job.stimulus[i];
@@ -1238,9 +1240,6 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
     const goal = arbitration.resolveGoal(selected_behavior, signals);
 
     const agent_index = sticky.agent_dense_index;
-    job.ai_agent_hot.active_behavior[agent_index] = selected_behavior;
-    job.ai_agent_hot.commitment_remaining[agent_index] = selection.new_commitment;
-    job.ai_agent_hot.last_score[agent_index] = scores[selection.index];
 
     if (goal.valid) {
         const resolved_gain: f32 = switch (selected_behavior) {
@@ -1250,6 +1249,9 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
             .investigate => gains_col.investigate,
             .cohere => gains_col.cohere,
         };
+        job.ai_agent_hot.active_behavior[agent_index] = selected_behavior;
+        job.ai_agent_hot.commitment_remaining[agent_index] = selection.new_commitment;
+        job.ai_agent_hot.last_score[agent_index] = scores[selection.index];
         job.resolved[i] = .{
             .behavior = selected_behavior,
             .gain = resolved_gain,
@@ -1259,6 +1261,12 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
             .goal_entity = goal.goal_entity,
         };
     } else {
+        // Locomotion degrades to wander: write that for affect fatigue and sticky
+        // prev_behavior, and clear commitment so an unresolvable pursue/flee is
+        // not held as the active exertion mode.
+        job.ai_agent_hot.active_behavior[agent_index] = .wander;
+        job.ai_agent_hot.commitment_remaining[agent_index] = 0;
+        job.ai_agent_hot.last_score[agent_index] = scores[@intFromEnum(AiBehavior.wander)];
         job.resolved[i] = .{
             .behavior = .wander,
             .gain = 0,
@@ -3228,6 +3236,49 @@ test "arbitration graceful degrade to wander when perception/memory/affect are a
     try std.testing.expectEqual(@as(f32, 10), intents[0].goal.y);
     try std.testing.expectEqual(@as(i16, 0), intents[0].priority);
     try std.testing.expect(data.aiAgentConst(entity).?.active_behavior == .wander);
+}
+
+test "invalid pursue goal writes wander active_behavior so fatigue does not treat it as exertion" {
+    var data = @import("../data_system.zig").DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    // Sticky-held pursue with commitment remaining, but no visible threat, no
+    // fresh memory, no focus_target: resolveGoal is invalid and locomotion
+    // degrades to wander. active_behavior must become wander (not stay pursue)
+    // so affect's fatigue path does not keep accruing exertion.
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(entity, .{
+        .active_behavior = .pursue,
+        .commitment_remaining = 10,
+        .commitment_max_steps = 30,
+        .sticky_bonus = 0.2,
+        .wander_amplitude = 0,
+        .gain_pursue = 1.0,
+        .gain_wander = 0.1,
+    });
+    try data.setAiPerception(entity, .{ .target_visible = false });
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
+
+    var ai_sys = AiSystem.init(std.testing.allocator);
+    defer ai_sys.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 2, 0, 0, 0);
+
+    frame.beginStep();
+    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, .{
+        .intent_seed = 1,
+        .perception_slice = data.aiPerceptionSliceConst(),
+    });
+
+    const agent = data.aiAgentConst(entity).?;
+    try std.testing.expect(agent.active_behavior == .wander);
+    try std.testing.expectEqual(@as(u16, 0), agent.commitment_remaining);
 }
 
 test "arbitration serial and threaded (0 workers) parity across perception + memory + affect signals" {

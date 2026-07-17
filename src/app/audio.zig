@@ -362,10 +362,13 @@ pub const AudioService = struct {
 
     pub fn setPaused(self: *AudioService, paused: bool) void {
         if (!self.enabled or self.paused == paused) return;
+        // Always silence SFX before changing the pause flag / music gain.
+        // On enter: drop one-shots and looping SFX (jet) under the pause duck.
+        // On resume: stop any residual loop *before* unducking music so a
+        // still-playing jet cannot blip at full volume for a frame while the
+        // AudioController deferred stop waits for the next gameplay drain.
+        self.stopAllSfx();
         self.paused = paused;
-        if (paused) {
-            self.stopAllSfx();
-        }
         self.applyMusicGain();
     }
 
@@ -1287,6 +1290,48 @@ test "audio service plays music idempotently and ducks on pause" {
     service.setPaused(true);
     try std.testing.expectEqual(@as(f32, 0.1), fake.tracks.get(service.music_track).?.gain);
     service.setPaused(false);
+    try std.testing.expectEqual(@as(f32, 0.4), fake.tracks.get(service.music_track).?.gain);
+}
+
+test "audio service stops residual looping sfx before unducking on resume" {
+    var fake = FakeBackendContext.init(std.testing.allocator);
+    defer fake.deinit();
+    const asset_store = assets.AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var service = try AudioService.initWithBackend(std.testing.allocator, asset_store, .{
+        .max_sfx_tracks = 1,
+        .music_gain = 0.5,
+        .paused_music_gain = 0.25,
+        .sfx_gain = 1.0,
+    }, FakeBackendContext.backend(), @ptrCast(&fake));
+    defer service.deinit();
+    try std.testing.expect(try service.preloadAudio(.demo_music, "audio/music/theme.wav", .music, false));
+    try std.testing.expect(try service.preloadAudio(.player_jet_sfx, "audio/sfx/jet.wav", .sfx, true));
+    var commands = AudioCommandBuffer.init(std.testing.allocator, 8);
+    defer commands.deinit();
+    const loop_id = try LoopingSfxId.init(3);
+
+    try commands.playMusic(.{ .asset = .demo_music, .gain = 0.8, .fade_in_ms = 0 });
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .gain = 0.5, .frequency_ratio = 1.0 });
+    service.drain(&commands);
+    try std.testing.expect(fake.tracks.get(service.sfx_tracks.items[0].handle).?.playing);
+    try std.testing.expectEqual(@as(f32, 0.4), fake.tracks.get(service.music_track).?.gain);
+
+    service.setPaused(true);
+    try std.testing.expect(!fake.tracks.get(service.sfx_tracks.items[0].handle).?.playing);
+    try std.testing.expect(service.sfx_tracks.items[0].looping_id == null);
+    try std.testing.expectEqual(@as(f32, 0.1), fake.tracks.get(service.music_track).?.gain);
+
+    // Residual loop while still ducked: models a still-playing jet that outlived
+    // pause-enter cleanup. Resume must silence it before unducking music.
+    commands.beginStep();
+    try commands.startLoopingSfx(loop_id, .{ .asset = .player_jet_sfx, .gain = 0.5, .frequency_ratio = 1.0 });
+    service.drain(&commands);
+    try std.testing.expect(fake.tracks.get(service.sfx_tracks.items[0].handle).?.playing);
+    try std.testing.expectEqual(@as(f32, 0.1), fake.tracks.get(service.music_track).?.gain);
+
+    service.setPaused(false);
+    try std.testing.expect(!fake.tracks.get(service.sfx_tracks.items[0].handle).?.playing);
+    try std.testing.expect(service.sfx_tracks.items[0].looping_id == null);
     try std.testing.expectEqual(@as(f32, 0.4), fake.tracks.get(service.music_track).?.gain);
 }
 

@@ -3,9 +3,18 @@
 // Licensed under the MIT License - see LICENSE file for details
 
 //! Backbone simulation system that determines which entities enter each
-//! fixed-step stage. Runs once per step to recompute chunk coordinates from
-//! settled positions, then builds filtered dense-index lists consumed by the
-//! downstream movement, collision, AI, and steering systems.
+//! fixed-step stage.
+//!
+//! Per-step ownership split (chunk columns vs gathers):
+//!   - **Early gathers** (AI / collision dense-index lists) run at the **start**
+//!     of the step and read chunk columns left by the **prior** step's late
+//!     `deriveChunks`. That one-step lag for the cognition halo is intentional
+//!     (same contract as pathfinding's frame delay): this step's halo uses the
+//!     body's pre-move cell, not mid-step pose thrash.
+//!   - **`deriveChunks`** runs **late**, after movement integrate, collision
+//!     response, bounds/tile gate, and plane traversal have settled poses, so
+//!     tier_policy (same step) and next-step gathers see final world positions.
+//!     Movement/collision gate on tier only — no chunk filter.
 //!
 //! Stage participation rules (Slice 24):
 //!   movement   — tier.allowsMovement()  — no chunk filter
@@ -13,10 +22,6 @@
 //!   ai/steering — tier.allowsCognition() AND chunk inside cognition halo
 //!                 AND stagger_phase == step % cognition_stagger_n
 //!                 (always_active entities bypass halo and stagger)
-//!
-//! Index lists are rebuilt each step from the same-step recomputed chunk coords
-//! (which reflect positions settled at the end of the prior step — one step lag,
-//! identical to the pathfinding frame-delay contract).
 //!
 //! Each O(N)-per-step pass threads like the other processors: the gathers are
 //! stream-compactions (per-range index buffers merged in range order); the tier
@@ -600,13 +605,33 @@ fn deriveChunkJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     // Worker ranges own disjoint rows; the chunk columns share the movement-body
     // store length, so a range can never write past them.
     std.debug.assert(range.end <= job.chunk_x.len);
+    std.debug.assert(range.end <= job.chunk_y.len);
     const grid = job.grid;
+    const chunk_size: i32 = @intCast(@max(grid.chunk_size_tiles, 1));
+    const chunk_div = simd.splatInt4(chunk_size);
+
     var i = range.start;
+    const count = range.end - range.start;
+    const vend = range.start + simd.vectorizedEnd(count);
+    while (i < vend) : (i += simd.lane_count) {
+        // Dense contiguous SoA: load four positions, worldPosToCell4 (floor +
+        // clamp, matching math.worldPosToCell), then truncating cell/chunk divide.
+        const px = simd.loadFloat4(job.position_x[i..]);
+        const py = simd.loadFloat4(job.position_y[i..]);
+        const tx = simd.worldPosToCell4(px, grid.tile_size, grid.width);
+        const ty = simd.worldPosToCell4(py, grid.tile_size, grid.height);
+        const cx = simd.toIntArray(simd.divInt4(tx, chunk_div));
+        const cy = simd.toIntArray(simd.divInt4(ty, chunk_div));
+        inline for (0..simd.lane_count) |lane| {
+            job.chunk_x[i + lane] = cx[lane];
+            job.chunk_y[i + lane] = cy[lane];
+        }
+    }
     while (i < range.end) : (i += 1) {
         const tx = math.worldPosToCell(job.position_x[i], grid.tile_size, grid.width);
         const ty = math.worldPosToCell(job.position_y[i], grid.tile_size, grid.height);
-        job.chunk_x[i] = @intCast(tx / grid.chunk_size_tiles);
-        job.chunk_y[i] = @intCast(ty / grid.chunk_size_tiles);
+        job.chunk_x[i] = @intCast(tx / @as(u32, @intCast(chunk_size)));
+        job.chunk_y[i] = @intCast(ty / @as(u32, @intCast(chunk_size)));
     }
 }
 

@@ -71,12 +71,6 @@ const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
 
-// Level entity-driven static-obstacle nav events resolve against: only level 0 sources
-// DataSystem collision bodies (NavGrid.markStaticBodies' own invariant — the demo's
-// entities live on the ground floor). Named once here so a future entity-level feature
-// changes one site instead of a hardcoded 0 re-derived independently at every call.
-const entity_nav_level: u16 = 0;
-
 pub const PathfindingSystem = struct {
     allocator: std.mem.Allocator,
     capacity: PathfindingCapacity = .{},
@@ -637,22 +631,28 @@ pub const PathfindingSystem = struct {
                     changed.max_y_exclusive,
                 ),
                 .entity_destroyed => |destroyed| {
+                    // Stamped from world_level at structural commit (default 0 when missing).
+                    // markStaticBodies is still level-0-only for full body rasterize; this
+                    // path only marks dirty on the event's plane so multi-level is ready.
+                    const level = destroyed.level;
                     if (destroyed.obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                        try self.markNavObstacleRectDirty(level, rect);
                     } else {
-                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                        try self.markNavLevelDirtyWithFallbackWarn(level);
                     }
                 },
                 .component_changed => |changed| {
+                    // Same as destroy: use stamped plane (default 0), not a hardcoded 0.
+                    const level = changed.level;
                     if (changed.old_obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                        try self.markNavObstacleRectDirty(level, rect);
                     } else if (changed.was_static_navigation_obstacle) {
-                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                        try self.markNavLevelDirtyWithFallbackWarn(level);
                     }
                     if (changed.new_obstacle_world_rect) |rect| {
-                        try self.markNavObstacleRectDirty(entity_nav_level, rect);
+                        try self.markNavObstacleRectDirty(level, rect);
                     } else if (changed.is_static_navigation_obstacle) {
-                        try self.markNavLevelDirtyWithFallbackWarn(entity_nav_level);
+                        try self.markNavLevelDirtyWithFallbackWarn(level);
                     }
                 },
                 else => {},

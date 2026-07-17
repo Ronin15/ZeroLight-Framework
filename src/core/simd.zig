@@ -120,6 +120,16 @@ pub fn divInt4(lhs: Int4, rhs: Int4) Int4 {
     };
 }
 
+/// Vectorized counterpart of `math.worldPosToCell`: floor each lane by
+/// `tile_size`, then clamp to `[0, max_cells - 1]`. Returns `i32` lanes (grid
+/// dimensions fit comfortably; callers that need `u32` cast after). When
+/// `max_cells == 0`, every lane is 0 — matching the scalar helper.
+pub fn worldPosToCell4(world_pos: Float4, tile_size: f32, max_cells: u32) Int4 {
+    if (max_cells == 0) return splatInt4(0);
+    const cells = floorToI4(divFloat4(world_pos, splatFloat4(tile_size)));
+    return clampInt4(cells, splatInt4(0), splatInt4(@intCast(max_cells - 1)));
+}
+
 /// Vectorized counterpart of `math.floorToI32`: floors each lane to `i32`,
 /// saturating identically to the scalar form (NaN -> 0; at/below `minInt(i32)`
 /// -> `minInt(i32)`; at/above the f32 rounding of `maxInt(i32)` -> `maxInt(i32)`).
@@ -592,6 +602,34 @@ test "floorToI4 matches math.floorToI32 lane-for-lane, including NaN/inf/boundar
         const simd_result = toIntArray(floorToI4(vector));
         try std.testing.expectEqual(math.floorToI32(cases[i]), simd_result[0]);
     }
+}
+
+test "worldPosToCell4 matches math.worldPosToCell lane-for-lane" {
+    const tile_size: f32 = 32;
+    const max_cells: u32 = 10;
+    const cases = [_]f32{
+        5 * 32 + 7,        3 * 32,             -1.0,              1.0e9,
+        std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 100,
+    };
+    var i: usize = 0;
+    while (i + lane_count <= cases.len) : (i += lane_count) {
+        const vector = loadFloat4(cases[i..]);
+        const simd_result = toIntArray(worldPosToCell4(vector, tile_size, max_cells));
+        for (0..lane_count) |lane| {
+            try std.testing.expectEqual(
+                @as(i32, @intCast(math.worldPosToCell(cases[i + lane], tile_size, max_cells))),
+                simd_result[lane],
+            );
+        }
+    }
+    try std.testing.expectEqual(
+        @as(i32, @intCast(math.worldPosToCell(100, tile_size, 0))),
+        toIntArray(worldPosToCell4(splatFloat4(100), tile_size, 0))[0],
+    );
+    try std.testing.expectEqual(
+        @as(i32, @intCast(math.worldPosToCell(100, tile_size, 1))),
+        toIntArray(worldPosToCell4(splatFloat4(100), tile_size, 1))[0],
+    );
 }
 
 test "sin and cos match scalar builtins per lane" {

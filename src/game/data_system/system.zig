@@ -2748,6 +2748,31 @@ test "destructible round-trips through set/get and clears on destroy" {
     try std.testing.expectEqual(@as(?Destructible, null), data.destructibleConst(first));
 }
 
+test "destructible store is columnar and compact after removal" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+
+    const first = try data.createEntity();
+    const second = try data.createEntity();
+    const third = try data.createEntity();
+    try data.setDestructible(first, .{ .hit_points = 1 });
+    try data.setDestructible(second, .{ .hit_points = 2 });
+    try data.setDestructible(third, .{ .hit_points = 3 });
+
+    try std.testing.expect(data.destroyEntity(second));
+
+    const slice = data.destructibleSliceConst();
+    try std.testing.expectEqual(slice.entities.len, slice.hit_points.len);
+    try std.testing.expectEqual(@as(usize, 2), slice.entities.len);
+
+    // The swap-remove moved `third` into `second`'s old dense slot; resolving
+    // it back through its EntitySlot proves removeDestructibleAt fixed up the
+    // slot's destructible_index rather than just leaving the dense columns paired.
+    try std.testing.expectEqual(@as(u8, 3), data.destructibleConst(third).?.hit_points);
+    try std.testing.expectEqual(@as(?usize, null), data.destructibleDenseIndex(second));
+    try std.testing.expect(data.destructibleDenseIndex(third) != null);
+}
+
 test "ai affect round-trips through set/get, retunes cold-only, and rejects invalid fields" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

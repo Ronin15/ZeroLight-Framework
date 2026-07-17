@@ -106,6 +106,11 @@ pub fn recordVertexUploadInPass(
     c.SDL_UploadToGPUBuffer(copy_pass, &source, &destination, cycle);
 }
 
+/// One-shot vertex upload that opens/ends its own copy pass. Treats
+/// `vertex_buffer_byte_size` as both transfer and destination capacity (paired
+/// streams share that size). Callers that stage separately, share a pass, or
+/// need distinct transfer vs vertex sizes must use `stageVertices` +
+/// `recordVertexUploadInPass` instead.
 pub fn recordVertexUpload(
     command_buffer: *c.SDL_GPUCommandBuffer,
     transfer_buffer: *c.SDL_GPUTransferBuffer,

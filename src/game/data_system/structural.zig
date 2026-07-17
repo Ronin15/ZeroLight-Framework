@@ -361,6 +361,8 @@ fn commitStructuralCommands(
                 const component_mask = self.componentMaskFor(entity);
                 const was_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
                 const obstacle_world_rect = if (was_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null;
+                // Capture plane before destroy: world_level row is removed with the entity.
+                const level = self.worldLevelConst(entity) orelse 0;
                 if (self.destroyEntity(entity)) {
                     stats.destroyed += 1;
                     change_sink.record(.{ .entity_destroyed = .{
@@ -368,6 +370,7 @@ fn commitStructuralCommands(
                         .component_mask = component_mask,
                         .was_static_navigation_obstacle = was_static_navigation_obstacle,
                         .obstacle_world_rect = obstacle_world_rect,
+                        .level = level,
                     } });
                 } else {
                     stats.stale_skipped += 1;
@@ -706,14 +709,18 @@ fn recordTemplateComponentChanges(self: *const DataSystem, change_sink: anytype,
 
 fn recordComponentChange(self: *const DataSystem, change_sink: anytype, entity: EntityId, component: Component, was_static_navigation_obstacle: bool, old_rect: ?ObstacleWorldRect) void {
     const is_static_navigation_obstacle = self.isStaticNavigationObstacle(entity);
-    change_sink.record(.{ .component_changed = .{
-        .entity = entity,
-        .component = component,
-        .was_static_navigation_obstacle = was_static_navigation_obstacle,
-        .is_static_navigation_obstacle = is_static_navigation_obstacle,
-        .old_obstacle_world_rect = old_rect,
-        .new_obstacle_world_rect = if (is_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null,
-    } });
+    change_sink.record(.{
+        .component_changed = .{
+            .entity = entity,
+            .component = component,
+            .was_static_navigation_obstacle = was_static_navigation_obstacle,
+            .is_static_navigation_obstacle = is_static_navigation_obstacle,
+            .old_obstacle_world_rect = old_rect,
+            .new_obstacle_world_rect = if (is_static_navigation_obstacle) self.staticObstacleWorldRect(entity) else null,
+            // Post-set plane (world_level after this command when that component changed).
+            .level = self.worldLevelConst(entity) orelse 0,
+        },
+    });
 }
 
 fn applyTemplateComponents(self: *DataSystem, entity: EntityId, template: EntityTemplate) !usize {
@@ -873,6 +880,8 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     const entity = created_entity orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(expected_rect, create_new_rect orelse return error.TestExpectedEqual);
 
+    // Stamp a non-zero plane so destroy/component-changed carry multi-level readiness.
+    try data.setWorldLevel(entity, 2);
     sink.changes.clearRetainingCapacity();
 
     const moved_position = math.Vec2{ .x = 100, .y = 200 };
@@ -892,6 +901,7 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     const move_change = sink.changes.items[0].component_changed;
     try std.testing.expectEqual(expected_rect, move_change.old_obstacle_world_rect orelse return error.TestExpectedEqual);
     try std.testing.expectEqual(expected_new_rect, move_change.new_obstacle_world_rect orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(@as(u16, 2), move_change.level);
 
     sink.changes.clearRetainingCapacity();
 
@@ -899,4 +909,5 @@ test "commitStructuralCommands emits obstacle world rects across create, move, a
     try std.testing.expectEqual(@as(usize, 1), sink.changes.items.len);
     const destroy_change = sink.changes.items[0].entity_destroyed;
     try std.testing.expectEqual(expected_new_rect, destroy_change.obstacle_world_rect orelse return error.TestExpectedEqual);
+    try std.testing.expectEqual(@as(u16, 2), destroy_change.level);
 }

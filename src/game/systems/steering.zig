@@ -53,10 +53,6 @@ fn hotStoreCapacity(min_len: usize) usize {
     return alignItemCount(min_len, steering_range_alignment_items);
 }
 
-fn entityWorldLevel(data: *const DataSystem, entity: EntityId) u16 {
-    return data.worldLevelConst(entity) orelse 0;
-}
-
 /// Prefer the dense movement scope level (kept in sync with world_level) when the
 /// caller already has a movement row index — avoids a second entity slot resolve.
 fn movementScopeLevel(scope: ConstScopeColumnsSlice, movement_index: usize) u16 {
@@ -244,6 +240,7 @@ pub const SteeringSystem = struct {
             .selected_avoidance_radii = s.items(.selected_avoidance_radii),
             .selected_avoidance_weights = s.items(.selected_avoidance_weights),
             .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+            .selected_world_level = s.items(.selected_world_level),
         };
     }
 
@@ -260,6 +257,7 @@ pub const SteeringSystem = struct {
             .selected_avoidance_radii = s.items(.selected_avoidance_radii),
             .selected_avoidance_weights = s.items(.selected_avoidance_weights),
             .selected_max_neighbor_samples = s.items(.selected_max_neighbor_samples),
+            .selected_world_level = s.items(.selected_world_level),
         };
     }
 
@@ -270,6 +268,7 @@ pub const SteeringSystem = struct {
             .x = s.items(.x),
             .y = s.items(.y),
             .radius = s.items(.radius),
+            .world_level = s.items(.world_level),
         };
     }
 
@@ -470,6 +469,7 @@ pub const SteeringSystem = struct {
         try self.agent_cell_ranges.ensureTotalCapacity(self.allocator, steering.entities.len);
         var agent_row_slice = self.agent_snapshot_rows.slice();
         const movement_indices = self.steering_movement_index.items;
+        const scope = data.scopeColumnsSliceConst();
         std.debug.assert(movement_indices.len == steering.entities.len);
         for (steering.entities, movement_indices, 0..) |entity, movement_index, steering_index| {
             if (movement_index == invalid_index) continue;
@@ -479,6 +479,9 @@ pub const SteeringSystem = struct {
                 .x = movement.previous_x[movement_index],
                 .y = movement.previous_y[movement_index],
                 .radius = steering.agent_radii[steering_index],
+                // Same-level gate as collision: scope.level is kept in sync with
+                // world_level (setWorldLevel / setMovementBody).
+                .world_level = movementScopeLevel(scope, movement_index),
             });
         }
         try self.fillAgentCellEntriesDense(cell_size);
@@ -659,6 +662,7 @@ pub const SteeringSystem = struct {
                 .selected_avoidance_radii = steering_agent.avoidance_radius,
                 .selected_avoidance_weights = steering_agent.avoidance_weight,
                 .selected_max_neighbor_samples = steering_agent.max_neighbor_samples,
+                .selected_world_level = start_level,
             });
         }
         stats.path_request_count = request_count;
@@ -907,6 +911,8 @@ const SelectedWorkRow = struct {
     selected_avoidance_radii: f32,
     selected_avoidance_weights: f32,
     selected_max_neighbor_samples: u16,
+    /// Movement-scope world level for same-level local avoidance gating.
+    selected_world_level: u16,
 };
 
 const AgentSnapshotRow = struct {
@@ -914,6 +920,7 @@ const AgentSnapshotRow = struct {
     x: f32,
     y: f32,
     radius: f32,
+    world_level: u16,
 };
 
 const ObstacleSnapshotRow = struct {
@@ -940,6 +947,7 @@ pub const SelectedWorkSlice = struct {
     selected_avoidance_radii: HotF32Slice,
     selected_avoidance_weights: HotF32Slice,
     selected_max_neighbor_samples: []u16,
+    selected_world_level: []u16,
 
     pub fn len(self: SelectedWorkSlice) usize {
         return self.start_x.len;
@@ -957,6 +965,7 @@ pub const ConstSelectedWorkSlice = struct {
     selected_avoidance_radii: ConstHotF32Slice,
     selected_avoidance_weights: ConstHotF32Slice,
     selected_max_neighbor_samples: []const u16,
+    selected_world_level: []const u16,
 
     pub fn len(self: ConstSelectedWorkSlice) usize {
         return self.start_x.len;
@@ -968,6 +977,7 @@ pub const ConstAgentSnapshotSlice = struct {
     x: ConstHotF32Slice,
     y: ConstHotF32Slice,
     radius: ConstHotF32Slice,
+    world_level: []const u16,
 
     pub fn len(self: ConstAgentSnapshotSlice) usize {
         return self.entity.len;
@@ -1223,6 +1233,9 @@ fn accumulateAgentAvoidanceBounded(
                 candidate_count.* += 1;
                 const other_index = entry.index;
                 if (job.agents.entity[other_index].eql(self_entity)) continue;
+                // Match collision's sameWorldLevel gate: pure-XY overlap across
+                // floors must not produce a lateral push.
+                if (job.agents.world_level[other_index] != job.work.selected_world_level[index]) continue;
                 const dx = start_x - job.agents.x[other_index];
                 const dy = start_y - job.agents.y[other_index];
                 const combined_radius = avoidance_radius + job.agents.radius[other_index];
@@ -1442,7 +1455,13 @@ fn expectAgentSnapshotColumnsAligned(rows: *const std.MultiArrayList(AgentSnapsh
     try std.testing.expectEqual(count, s.items(.x).len);
     try std.testing.expectEqual(count, s.items(.y).len);
     try std.testing.expectEqual(count, s.items(.radius).len);
+    try std.testing.expectEqual(count, s.items(.world_level).len);
 }
+
+// Test-only fixtures for multi-level start_level regression (not production API).
+const WorldSystem = @import("../world_system.zig").WorldSystem;
+const loadTestWorldMeta = @import("pathfinding/test_support.zig").loadTestWorldMeta;
+const requireTestTile = @import("pathfinding/test_support.zig").requireTestTile;
 
 test "steering agent snapshot rows keep MAL columns compact after gather" {
     var data = DataSystem.init(std.testing.allocator);
@@ -1553,44 +1572,72 @@ test "steering smooths a discrete target-direction flip over several steps inste
     try std.testing.expect(converged.direction_y > 0.95);
 }
 
-test "steering sources path request start level from entity world level" {
-    // Default surface NPCs without an explicit world_level component still emit
-    // start_level 0. Underground placement uses setWorldLevel before steering runs.
+test "steering sources path request start level from movement scope level" {
+    // writePathRequests reads movementScopeLevel (scope.level, kept in sync with
+    // world_level via setWorldLevel). Exercised through a full updateSerial so a
+    // future edit cannot quietly hardcode start_level back to 0. Multi-level nav
+    // is required: statusForWorld treats an out-of-range start level as
+    // unavailable and never emits a request (not missing).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
-    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const surface = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const underground = try addSteeredEntity(&data, .{ .x = 0, .y = 32 });
+    try data.setWorldLevel(underground, 2);
+
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    const grass = try requireTestTile(&meta, "grass");
+    var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 160, 160);
+    defer world.deinit();
+    // initDemoFromMeta owns level 0; add two more so start_level 2 has a grid.
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(2, 0, .floor, grass);
 
     var pathfinding = PathfindingSystem.init(std.testing.allocator);
     defer pathfinding.deinit();
     try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 2, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
-    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+    try pathfinding.rebuildStaticNavGridWithWorld(&data, &world, 160, 160, 32, null);
+    try std.testing.expect(pathfinding.graph.levelCount() >= 3);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reserveStreams(4, 0, 4, 0, 0, 0);
     try frame.reservePathRequests(2, 4);
     var steering = SteeringSystem.init(std.testing.allocator);
     defer steering.deinit();
     try steering.reserve(4);
 
+    // Fresh entities (no replan cooldown): both missing-path agents emit in one step.
     frame.beginStep();
-    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    try appendNavigationIntents(&frame, &.{
+        .{ .entity = surface, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 },
+        .{ .entity = underground, .goal_level = 2, .goal = .{ .x = 96, .y = 32 }, .direct_direction_x = 1 },
+    });
     _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
 
     const requests = frame.path_requests.mergedItems();
-    try std.testing.expectEqual(@as(usize, 1), requests.len);
-    try std.testing.expectEqual(@as(u16, 0), requests[0].start_level);
-    try std.testing.expectEqual(@as(u16, 0), requests[0].goal_level);
+    try std.testing.expectEqual(@as(usize, 2), requests.len);
 
-    // entityWorldLevel is the sole source of a path request's start_level (see
-    // writePathRequests above); this is the direct regression guard that a
-    // future edit can't quietly hardcode it back to 0. Exercised directly
-    // rather than through another full updateSerial step, since a second step
-    // for the same agent would hit the replan cooldown the first request just
-    // armed and never re-request regardless of level.
-    try std.testing.expectEqual(@as(u16, 0), entityWorldLevel(&data, agent));
-    try data.setWorldLevel(agent, 2);
-    try std.testing.expectEqual(@as(u16, 2), entityWorldLevel(&data, agent));
+    var saw_surface = false;
+    var saw_underground = false;
+    for (requests) |request| {
+        if (request.entity.eql(surface)) {
+            try std.testing.expectEqual(@as(u16, 0), request.start_level);
+            saw_surface = true;
+        } else if (request.entity.eql(underground)) {
+            try std.testing.expectEqual(@as(u16, 2), request.start_level);
+            try std.testing.expectEqual(@as(u16, 2), request.goal_level);
+            saw_underground = true;
+        }
+    }
+    try std.testing.expect(saw_surface);
+    try std.testing.expect(saw_underground);
+    try std.testing.expectEqual(
+        @as(u16, 2),
+        data.scopeColumnsSliceConst().level[data.movementBodyDenseIndex(underground).?],
+    );
 }
 
 test "steering missing path requests respect replan cooldown" {
@@ -1778,6 +1825,39 @@ test "steering applies local agent and static obstacle avoidance" {
     try std.testing.expect(stats.agent_neighbor_samples > 0);
     try std.testing.expect(stats.obstacle_samples > 0);
     try std.testing.expect(movement.direction_x < 1);
+}
+
+test "steering local agent avoidance ignores XY overlap across different world_levels" {
+    // Two agents fully overlap in XY but sit on different floors. Without a
+    // same-level gate the neighbor would push the steerer; with it, samples
+    // stay zero and the direct direction is unchanged.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    const other = try addSteeredEntity(&data, .{ .x = 20, .y = 0 });
+    try data.setWorldLevel(agent, 0);
+    try data.setWorldLevel(other, 1);
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserve(4);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    const movement = frame.intents.mergedItems()[0].movement;
+    try std.testing.expectEqual(@as(usize, 0), stats.agent_neighbor_samples);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), movement.direction_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), movement.direction_y, 0.001);
 }
 
 test "steering movement index cache rebuilds only after structural invalidate" {

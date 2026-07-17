@@ -38,7 +38,9 @@ HANDLE_CTOR = re.compile(
     r"\b(?:TextureId|FontId|TextTextureId|EntityId|LeaseHandle)\.init\s*\("
 )
 CATCH_UNREACHABLE = re.compile(r"\b(?:catch|orelse)\s+unreachable\b")
-ALLOW_ANNOTATION = "lint:allow catch-unreachable"
+# Require a non-empty reason after the colon. Bare
+# `// lint:allow catch-unreachable` or empty `...: ` do not allow.
+ALLOW_ANNOTATION = re.compile(r"lint:allow catch-unreachable:\s*\S+")
 
 # Scalar NaN self-comparison (`x != x` / `x == x`). std.math.isNan is the
 # canonical spelling (see src/core/math.zig); a hand-rolled self-compare is idiom
@@ -227,7 +229,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                     enum_body_depths.pop()
 
         if CATCH_UNREACHABLE.search(code):
-            allowed = in_test or HANDLE_CTOR.search(code) or ALLOW_ANNOTATION in raw
+            allowed = in_test or HANDLE_CTOR.search(code) or ALLOW_ANNOTATION.search(raw)
             if not allowed:
                 issues.append(
                     (
@@ -235,7 +237,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                         lineno,
                         "`catch/orelse unreachable` can swallow a recoverable failure into ReleaseFast UB; "
                         "use a sanctioned handle constructor, propagate the error, or annotate "
-                        "`// lint:allow catch-unreachable: <reason>`",
+                        "`// lint:allow catch-unreachable: <reason>` with a non-empty reason",
                         raw.strip(),
                     )
                 )

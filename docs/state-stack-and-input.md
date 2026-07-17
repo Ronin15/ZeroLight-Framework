@@ -254,13 +254,16 @@ Lifecycle policy:
   single-active-gamepad ownership end-to-end (device open + state events +
   routing), not only at connect time.
 
-The three adoption/fallback decisions
-(`shouldAdopt`/`isActiveDevice`/`pickFallback`) are pure functions unit-tested
-against synthetic `SDL_JoystickID` values; `shouldDeliverEvent` and the
-router's active-id filter are also unit-tested with synthetic `which` values.
-The `SDL_OpenGamepad`/`SDL_GetGamepads` glue itself is not unit-testable
-without real or virtual hardware (same posture as the display-gated
-`gpu-smoke` probe).
+The adoption/fallback decisions (`shouldAdopt`/`isActiveDevice`/
+`shouldSkipFallback`/`pickFallback`) are pure functions unit-tested against
+synthetic `SDL_JoystickID` values; `shouldDeliverEvent` and the router's
+active-id filter are also unit-tested with synthetic `which` values. On
+disconnect (and cold open), the manager walks every available id, skips a
+just-removed id when still listed, and adopts the first `SDL_OpenGamepad`
+success rather than giving up after the first open failure. The
+`SDL_OpenGamepad`/`SDL_GetGamepads` glue itself is not unit-testable without
+real or virtual hardware (same posture as the display-gated `gpu-smoke`
+probe).
 
 ### Default gamepad bindings
 
@@ -286,6 +289,7 @@ This slice ships default bindings only; there is no rebind UI yet.
 - West (X / Square) -> `digHole`
 - North (Y / Triangle) -> `digRamp`
 - Right Shoulder -> `digDown`
+- Left Shoulder -> `interact`
 - Back -> `toggleDebugOverlay`
 
 ### Analog left-stick movement
@@ -315,7 +319,7 @@ the same axis at once — is capped by the per-axis clamp at the same sqrt(2)
 ceiling keyboard-only input already produced, so nothing regresses.
 `InputState.releaseHeldGameplay()` (pause enter/exit, gameplay-context-loss
 transitions, and the gamepad-disconnect alias `releaseGamepadInput`) clears
-movement, dig actions, and the raw stick fields together, so a paused/blocked
-gameplay context cannot leave stale dig or stick deflection to snap back in on
-resume. `releaseMovement()` alone clears only movement + stick and is not
-sufficient for dig.
+movement, dig actions, interact, and the raw stick fields together, so a
+paused/blocked gameplay context cannot leave stale dig/interact or stick
+deflection to snap back in on resume. `releaseMovement()` alone clears only
+movement + stick and is not sufficient for dig or interact.

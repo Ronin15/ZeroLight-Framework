@@ -424,9 +424,20 @@ pub const SpriteBatch = struct {
                 if (system_config.adaptive and system_config.adaptive_tuner == null and system_config.items_per_range == null) {
                     system_config.adaptive_tuner = &self.adaptive_tuner;
                 }
+                // Pre-select so the job context can dual-assert range.index against
+                // the dispatched range count (mirror affect.zig / particle.zig).
+                // Mirrors parallelForWithOptions' adaptive_tuner fallback.
+                const selection = threads.selectBatchProfile(system_config.adaptive_tuner orelse &threads.adaptive_tuner, .{
+                    .item_count = valid_count,
+                    .items_per_range = system_config.items_per_range,
+                    .max_worker_threads = system_config.max_worker_threads,
+                    .range_alignment_items = 4,
+                    .adaptive = system_config.adaptive,
+                });
                 var context = SpritePrepJobContext{
                     .commands = self.prepared_commands.items,
                     .columns = columns,
+                    .range_count = selection.range_count,
                 };
                 // Align range boundaries to 4 commands (192/192/384 B per column,
                 // all divisible by 64) so no worker range straddles a cache line in
@@ -436,7 +447,8 @@ pub const SpriteBatch = struct {
                     .max_worker_threads = system_config.max_worker_threads,
                     .range_alignment_items = 4,
                     .adaptive = system_config.adaptive,
-                    .adaptive_tuner = system_config.adaptive_tuner,
+                    .adaptive_tuner = selection.active_tuner,
+                    .selected_profile = selection.profile,
                 });
             } else {
                 fillPreparedRange(self.prepared_commands.items, columns, .{
@@ -545,10 +557,15 @@ const PreparedSpriteCommand = struct {
 const SpritePrepJobContext = struct {
     commands: []const PreparedSpriteCommand,
     columns: VertexColumns,
+    /// Dispatched range count; dual-asserted against `range.index` at job entry.
+    range_count: usize,
 };
 
 fn writePreparedSpritesJob(context: *anyopaque, range: ParallelRange, _: WorkerId) void {
     const job: *SpritePrepJobContext = @ptrCast(@alignCast(context));
+    // Dual worker asserts (mirror affect.zig / particle.zig). Write-span bounds
+    // also live in fillPreparedRange (shared with the serial path).
+    std.debug.assert(range.index < job.range_count);
     fillPreparedRange(job.commands, job.columns, range);
 }
 

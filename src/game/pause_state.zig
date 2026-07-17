@@ -30,7 +30,7 @@ pub const PauseState = struct {
     const panel_color = config.Color{ .r = 0.12, .g = 0.15, .b = 0.18, .a = 0.9 };
     const accent_color = config.Color{ .r = 1.0, .g = 0.86, .b = 0.2, .a = 1.0 };
     const prompt_color = config.Color{ .r = 0.92, .g = 0.95, .b = 0.96, .a = 1.0 };
-    const prompt_text = "Enter / Space / P to resume    Esc to quit";
+    const prompt_text = "Enter / Space / P / A / Start to resume    Esc / B to quit";
 
     pub fn init(width: f32, height: f32) PauseState {
         return .{ .width = width, .height = height };

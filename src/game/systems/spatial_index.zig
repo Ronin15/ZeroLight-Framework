@@ -159,11 +159,25 @@ pub const DenseCellLookup = struct {
 
     fn reserve(self: *DenseCellLookup, allocator: std.mem.Allocator, width: u32, height: u32, population_capacity: usize) !void {
         const total = @as(usize, width) * @as(usize, height);
+        try self.touched.ensureTotalCapacity(allocator, population_capacity);
+
+        // Re-entrant: a second call with the same grid size must not append
+        // another full window of zeros (would desync len from capacity and
+        // inflate O(window) storage). Grow-or-shrink paths re-init to exactly
+        // `total` so starts/ends always match the reserved side lengths.
+        if (self.capacity_cells_x == width and self.capacity_cells_y == height and
+            self.starts.items.len == total and self.ends.items.len == total)
+        {
+            return;
+        }
+
         try self.starts.ensureTotalCapacity(allocator, total);
         try self.ends.ensureTotalCapacity(allocator, total);
+        self.starts.clearRetainingCapacity();
+        self.ends.clearRetainingCapacity();
+        self.touched.clearRetainingCapacity();
         self.starts.appendNTimesAssumeCapacity(0, total);
         self.ends.appendNTimesAssumeCapacity(0, total);
-        try self.touched.ensureTotalCapacity(allocator, population_capacity);
         self.capacity_cells_x = width;
         self.capacity_cells_y = height;
     }
@@ -1446,6 +1460,40 @@ test "reserve sizes the dense window from cognition halo margin plus fixed visib
     const expected_margin_cells: u32 = 128;
     try testing.expectEqual(expected_margin_cells + max_expected_visible_window_cells, sys.dense_lookup.capacity_cells_x);
     try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+}
+
+test "DenseCellLookup reserve twice keeps grid length; query still finds neighbors" {
+    // Re-entrancy proof: a second reserve at the same size must not append
+    // another full starts/ends grid, and a subsequent build+query still works.
+    var data = DataSystem.init(testing.allocator);
+    defer data.deinit();
+    const a = try data.createEntity();
+    try data.setMovementBody(a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(a, .{ .active_behavior = .wander });
+    const b = try data.createEntity();
+    try data.setMovementBody(b, .{ .position = .{ .x = 8, .y = 0 }, .previous_position = .{ .x = 8, .y = 0 }, .velocity = .{}, .speed = 20 });
+    try data.setAiAgent(b, .{ .active_behavior = .wander });
+
+    var sys = SpatialIndexSystem.init(testing.allocator);
+    defer sys.deinit();
+    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
+    const cells_after_first = sys.dense_lookup.starts.items.len;
+    try testing.expect(cells_after_first > 0);
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
+
+    try sys.reserve(4, .{ .cell_size = 32.0, .chunk_size_tiles = 8, .tile_size = 4.0 });
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.starts.items.len);
+    try testing.expectEqual(cells_after_first, sys.dense_lookup.ends.items.len);
+    try testing.expectEqual(sys.dense_lookup.capacity_cells_x, sys.dense_lookup.capacity_cells_y);
+
+    const ai_slice = data.aiAgentSliceConst();
+    const move_slice = data.movementBodySliceConst();
+    const stats = try sys.buildSerial(ai_slice, move_slice, &data, .{});
+    try testing.expectEqual(@as(usize, 2), stats.entity_count);
+
+    var visitor = RecordingVisitor{};
+    _ = sys.view().queryNeighbors(0, 0, 0, 1, .{ .radius = 32.0, .max_candidate_checks = 8 }, &visitor, RecordingVisitor.record);
+    try testing.expectEqual(@as(usize, 1), visitor.count);
 }
 
 test "reserve clamps the dense window to the hard ceiling for a pathological world geometry" {

@@ -55,8 +55,11 @@ pub const GamepadManager = struct {
             },
             c.SDL_EVENT_GAMEPAD_REMOVED => {
                 if (!isActiveDevice(self.activeId(), event.gdevice.which)) return .none;
+                const removed_id = event.gdevice.which;
                 self.closeActive();
-                self.openFirstAvailable();
+                // Skip the just-removed id if SDL still lists it briefly after the
+                // REMOVED event so we do not re-open a dead handle as "fallback".
+                self.openFirstAvailableSkipping(removed_id);
                 return .disconnected;
             },
             else => .none,
@@ -88,13 +91,22 @@ pub const GamepadManager = struct {
     }
 
     fn openFirstAvailable(self: *GamepadManager) void {
+        self.openFirstAvailableSkipping(null);
+    }
+
+    /// Enumerates connected gamepad ids and adopts the first `SDL_OpenGamepad`
+    /// success. Failed opens are skipped so a single bad id cannot block every
+    /// other connected pad. When `skip_id` is set (just-removed), that id is
+    /// not attempted even if SDL still lists it.
+    fn openFirstAvailableSkipping(self: *GamepadManager, skip_id: ?c.SDL_JoystickID) void {
         var count: c_int = 0;
         const ids = c.SDL_GetGamepads(&count) orelse return;
         defer c.SDL_free(ids);
         if (count <= 0) return;
         const available = ids[0..@intCast(count)];
-        if (pickFallback(available)) |id| {
-            _ = self.openDevice(id);
+        for (available) |id| {
+            if (shouldSkipFallback(id, skip_id)) continue;
+            if (self.openDevice(id)) return;
         }
     }
 };
@@ -109,10 +121,21 @@ fn isActiveDevice(current_id: ?c.SDL_JoystickID, candidate_id: c.SDL_JoystickID)
     return current_id != null and current_id.? == candidate_id;
 }
 
-/// First-available-wins fallback pick after a disconnect.
-fn pickFallback(available: []const c.SDL_JoystickID) ?c.SDL_JoystickID {
-    if (available.len == 0) return null;
-    return available[0];
+/// True when `id` is the just-removed pad that fallback should not re-open.
+fn shouldSkipFallback(id: c.SDL_JoystickID, skip_id: ?c.SDL_JoystickID) bool {
+    return if (skip_id) |skip| id == skip else false;
+}
+
+/// First-available-wins fallback pick after a disconnect, optionally skipping
+/// a just-removed id that may still appear in SDL's enumeration. Pure helper
+/// for the open-order decision; the live path also retries later ids when
+/// `SDL_OpenGamepad` fails.
+fn pickFallback(available: []const c.SDL_JoystickID, skip_id: ?c.SDL_JoystickID) ?c.SDL_JoystickID {
+    for (available) |id| {
+        if (shouldSkipFallback(id, skip_id)) continue;
+        return id;
+    }
+    return null;
 }
 
 // SDL_OpenGamepad/SDL_GetGamepads themselves are not unit-testable: there is
@@ -129,10 +152,19 @@ test "isActiveDevice matches only the currently active id" {
     try std.testing.expect(!isActiveDevice(@as(c.SDL_JoystickID, 1), 2));
 }
 
-test "pickFallback selects the first available device or null" {
-    try std.testing.expectEqual(@as(?c.SDL_JoystickID, null), pickFallback(&.{}));
+test "shouldSkipFallback matches only the optional skip id" {
+    try std.testing.expect(!shouldSkipFallback(3, null));
+    try std.testing.expect(shouldSkipFallback(3, 3));
+    try std.testing.expect(!shouldSkipFallback(3, 9));
+}
+
+test "pickFallback selects the first non-skipped device or null" {
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, null), pickFallback(&.{}, null));
     const single = [_]c.SDL_JoystickID{5};
-    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 5), pickFallback(&single));
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 5), pickFallback(&single, null));
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, null), pickFallback(&single, 5));
     const multiple = [_]c.SDL_JoystickID{ 3, 9, 12 };
-    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 3), pickFallback(&multiple));
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 3), pickFallback(&multiple, null));
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 9), pickFallback(&multiple, 3));
+    try std.testing.expectEqual(@as(?c.SDL_JoystickID, 3), pickFallback(&multiple, 99));
 }

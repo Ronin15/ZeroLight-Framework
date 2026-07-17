@@ -84,10 +84,11 @@ collision response, bounds clamp + world-tile gating, and plane traversal — AI
 movement, and collision run scope-gated through a `scope_dense_indices` option.
 Collision broadphase keeps its own sweep-and-prune structure rather than
 consuming the spatial index (see `docs/architecture.md`). It closes with
-`chunk_derive` then the **simulation-LOD tier policy**, which assigns each
-entity a cognition/locomotion/kinematic/dormant tier by cube distance and emits
-deferred `set_simulation_tier` commands at the commit seam. See
-`docs/architecture.md` for scope/tier ownership and the gating rules per stage.
+`chunk_derive`, then `action_react` (destructible / action-intent consumer),
+then the **simulation-LOD tier policy**, which assigns each entity a
+cognition/locomotion/kinematic/dormant tier by cube distance and emits deferred
+`set_simulation_tier` commands at the commit seam. See `docs/architecture.md`
+for scope/tier ownership and the gating rules per stage.
 
 Late-stage pose order (after movement integrate):
 
@@ -95,7 +96,7 @@ Late-stage pose order (after movement integrate):
 2. `bounds_and_tile_gate` (world bounds clamp + solid-tile gate)
 3. `plane_traversal` (ramp follow / one-level fall; batches landing-cell tile
    events into one `finishWrite`)
-4. `chunk_derive` → `tier_policy`
+4. `chunk_derive` → `action_react` → `tier_policy`
 
 The tile gate runs **after** collision response so a contact push into solid
 underground dirt is re-gated before plane traversal and chunk derive observe the

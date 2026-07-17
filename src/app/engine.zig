@@ -117,7 +117,7 @@ pub const Engine = struct {
         // a *TextService: Engine is returned by value below, so the address of this
         // local would dangle. Per-frame use takes &self.text_service explicitly.
         var debug_overlay = DebugOverlay.init(&text_service);
-        errdefer debug_overlay.deinit();
+        errdefer debug_overlay.deinit(&text_service, &renderer);
 
         var states = StateStack.init(allocator);
         errdefer states.deinit();
@@ -179,7 +179,7 @@ pub const Engine = struct {
         self.transitions.deinit();
         self.states.deinit();
         self.thread_system.deinit();
-        self.debug_overlay.deinit();
+        self.debug_overlay.deinit(&self.text_service, &self.renderer);
         self.text_service.deinit(&self.renderer);
         self.runtime_assets.deinit(&self.asset_cache, &self.renderer);
         self.asset_cache.deinit(&self.renderer);

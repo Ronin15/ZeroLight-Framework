@@ -511,6 +511,46 @@ test "warmed response update does not allocate" {
     try std.testing.expectEqual(@as(usize, 1), frame.collision_triggers.mergedItems().len);
 }
 
+test "warmed solid response update does not allocate" {
+    // FA proof for the physical-intent path: reserveForContacts then a solid
+    // dynamic-vs-static contact must emit one intent with zero allocations.
+    // The trigger-only FA test above never exercises intent_rows growth.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const dynamic = try addEntity(&data, 10, 20, 50, 7, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    const static = try addEntity(&data, 40, 20, 0, 0, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(1, 0, 0, 1, 0, 0);
+    const contacts = [_]CollisionContact{makeContact(
+        dynamic,
+        static,
+        data.movementBodyDenseIndex(dynamic).?,
+        data.movementBodyDenseIndex(static).?,
+        -1,
+        0,
+        3,
+    )};
+    try writeContacts(&frame, &contacts);
+
+    var system = CollisionResponseSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserveForContacts(1);
+
+    const original_system_allocator = system.allocator;
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing_allocator.allocator();
+    defer system.allocator = original_system_allocator;
+
+    const stats = try system.update(&data, &frame);
+
+    try std.testing.expectEqual(@as(usize, 1), stats.intent_count);
+    try std.testing.expectEqual(@as(usize, 0), stats.trigger_count);
+    const body = data.movementBodyConst(dynamic).?;
+    try std.testing.expectEqual(@as(f32, 0), body.velocity.x);
+    try std.testing.expectApproxEqAbs(@as(f32, 7), body.position.x, 0.001);
+}
+
 test "serial response math uses simd chunks and scalar tails" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();

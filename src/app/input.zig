@@ -90,9 +90,9 @@ pub const InputState = struct {
         self.gamepad_stick_y_raw = 0;
     }
 
-    /// Clears every held gameplay action (movement + dig) and stick deflection.
-    /// Used when gameplay context is lost (pause enter/exit, modal stack
-    /// transitions) so dig cannot stick across a blocked update interval.
+    /// Clears every held gameplay action (movement + dig + interact) and stick
+    /// deflection. Used when gameplay context is lost (pause enter/exit, modal
+    /// stack transitions) so dig/interact cannot stick across a blocked interval.
     pub fn releaseHeldGameplay(self: *InputState) void {
         self.releaseMovement();
         self.held_actions.set(.dig_hole, false);
@@ -408,12 +408,13 @@ test "input can release held movement when gameplay is paused" {
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
 }
 
-test "releaseHeldGameplay clears movement, dig, and stick state together" {
+test "releaseHeldGameplay clears movement, dig, interact, and stick state together" {
     var input = InputState{};
     input.setHeld(.move_right, true);
     input.setHeld(.dig_hole, true);
     input.setHeld(.dig_ramp, true);
     input.setHeld(.dig_down, true);
+    input.setHeld(.interact, true);
     input.handleGamepadAxis(20000, 20000);
 
     input.releaseHeldGameplay();
@@ -422,6 +423,7 @@ test "releaseHeldGameplay clears movement, dig, and stick state together" {
     try std.testing.expect(!input.isHeld(.dig_hole));
     try std.testing.expect(!input.isHeld(.dig_ramp));
     try std.testing.expect(!input.isHeld(.dig_down));
+    try std.testing.expect(!input.isHeld(.interact));
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
 }
@@ -429,21 +431,24 @@ test "releaseHeldGameplay clears movement, dig, and stick state together" {
 test "releaseGamepadInput is the disconnect alias of releaseHeldGameplay" {
     var input = InputState{};
     input.setHeld(.dig_hole, true);
+    input.setHeld(.interact, true);
     input.handleGamepadAxis(10000, -10000);
 
     input.releaseGamepadInput();
 
     try std.testing.expect(!input.isHeld(.dig_hole));
+    try std.testing.expect(!input.isHeld(.interact));
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_x_raw);
     try std.testing.expectEqual(@as(i16, 0), input.gamepad_stick_y_raw);
 }
 
-test "releaseMovement leaves dig held so releaseHeldGameplay is required for dig clear" {
+test "releaseMovement leaves dig and interact held so releaseHeldGameplay is required for full clear" {
     var input = InputState{};
     input.setHeld(.move_left, true);
     input.setHeld(.dig_hole, true);
     input.setHeld(.dig_ramp, true);
     input.setHeld(.dig_down, true);
+    input.setHeld(.interact, true);
 
     input.releaseMovement();
 
@@ -451,11 +456,13 @@ test "releaseMovement leaves dig held so releaseHeldGameplay is required for dig
     try std.testing.expect(input.isHeld(.dig_hole));
     try std.testing.expect(input.isHeld(.dig_ramp));
     try std.testing.expect(input.isHeld(.dig_down));
+    try std.testing.expect(input.isHeld(.interact));
 
     input.releaseHeldGameplay();
     try std.testing.expect(!input.isHeld(.dig_hole));
     try std.testing.expect(!input.isHeld(.dig_ramp));
     try std.testing.expect(!input.isHeld(.dig_down));
+    try std.testing.expect(!input.isHeld(.interact));
 }
 
 test "actionForGamepadButton resolves every default binding and rejects unmapped buttons" {

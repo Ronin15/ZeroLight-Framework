@@ -529,6 +529,12 @@ pub const ai_memory_ring_capacity: usize = 4;
 pub const max_ai_memory_staleness: f32 = 3600.0;
 pub const max_ai_memory_familiarity: f32 = 1.0;
 pub const ai_memory_familiarity_decay_rate: f32 = 0.02;
+/// Per-step familiarity rise while the remembered target stays visible (same
+/// identity). Applied after decay so sustained LOS nets a climb; must exceed
+/// the decay's proportional drop at high familiarity for novelty to fall.
+pub const ai_memory_familiarity_gain_rate: f32 = 0.05;
+/// Upper bound for sticky-commitment authoring (10 s at 60 Hz).
+pub const max_ai_commitment_max_steps: u16 = 600;
 
 /// One remembered contact: who, where, and how long ago. Ring slots are
 /// overwritten oldest-first via ring_next_slot; there is no per-entity growth.
@@ -831,6 +837,9 @@ pub const StructuralEntityDestroyedChange = struct {
     component_mask: ComponentMask,
     was_static_navigation_obstacle: bool,
     obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at destroy time (`world_level` component, else 0).
+    /// Lets post-commit nav invalidation mark the correct multi-level grid.
+    level: u16 = 0,
 };
 
 pub const StructuralComponentChangedChange = struct {
@@ -840,6 +849,9 @@ pub const StructuralComponentChangedChange = struct {
     is_static_navigation_obstacle: bool,
     old_obstacle_world_rect: ?ObstacleWorldRect = null,
     new_obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at change time (`world_level` component, else 0).
+    /// Lets post-commit nav invalidation mark the correct multi-level grid.
+    level: u16 = 0,
 };
 
 pub const StructuralChange = union(enum) {

@@ -78,6 +78,9 @@ pub const ComponentChangedEvent = struct {
     // covered nav cells instead of the whole level.
     old_obstacle_world_rect: ?ObstacleWorldRect = null,
     new_obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at change time (`world_level`, else 0). Multi-level nav readiness;
+    /// defaults 0 when missing so level-0 demos stay correct.
+    level: u16 = 0,
 };
 
 pub const EntityDestroyedEvent = struct {
@@ -87,6 +90,9 @@ pub const EntityDestroyedEvent = struct {
     // World-space obstacle rect at destroy time, when the entity was a static navigation
     // obstacle. Lets the post-commit nav reaction localize invalidation to the vacated cells.
     obstacle_world_rect: ?ObstacleWorldRect = null,
+    /// World/level plane at destroy time (`world_level`, else 0). Multi-level nav readiness;
+    /// defaults 0 when missing so level-0 demos stay correct.
+    level: u16 = 0,
 };
 
 pub const EntityPerceivedEvent = struct {
@@ -835,6 +841,7 @@ pub const SimulationFrame = struct {
                         .component_mask = destroyed.component_mask,
                         .was_static_navigation_obstacle = destroyed.was_static_navigation_obstacle,
                         .obstacle_world_rect = destroyed.obstacle_world_rect,
+                        .level = destroyed.level,
                     } },
                 },
                 .component_changed => |changed| .{
@@ -846,6 +853,7 @@ pub const SimulationFrame = struct {
                         .is_static_navigation_obstacle = changed.is_static_navigation_obstacle,
                         .old_obstacle_world_rect = changed.old_obstacle_world_rect,
                         .new_obstacle_world_rect = changed.new_obstacle_world_rect,
+                        .level = changed.level,
                     } },
                 },
             });

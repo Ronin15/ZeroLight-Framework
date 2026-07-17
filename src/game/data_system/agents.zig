@@ -32,6 +32,7 @@ pub fn validateAiAgent(agent: AiAgent) !void {
         return error.InvalidAiAgent;
     }
     if (!std.math.isFinite(agent.sticky_bonus) or agent.sticky_bonus < 0) return error.InvalidAiAgent;
+    if (agent.commitment_max_steps > types.max_ai_commitment_max_steps) return error.InvalidAiAgent;
 }
 
 pub fn validateSteeringAgent(agent: SteeringAgent) !void {
@@ -361,6 +362,8 @@ test "validateAiAgent rejects out-of-range wander_amplitude and sticky_bonus" {
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .wander_amplitude = std.math.nan(f32) }));
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = -0.01 }));
     try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .sticky_bonus = std.math.inf(f32) }));
+    try std.testing.expectError(error.InvalidAiAgent, validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps + 1 }));
+    try validateAiAgent(.{ .commitment_max_steps = types.max_ai_commitment_max_steps });
 }
 
 test "AiAgentStore.set retunes only cold personality fields, preserving hot arbitration state" {

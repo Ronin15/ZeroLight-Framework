@@ -28,6 +28,17 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 /// Fixed damage applied per accepted interact/attack intent (demo one-shot with hp=1).
 const damage_per_hit: u8 = 1;
 
+/// Max dense destructible rows examined per cell resolve. Fixed constant, independent of
+/// world/map size and destructible population. Intent count is already capped at
+/// `action_intent_live_capacity`; without this, each intent would scan every destructible
+/// (O(intents × rows)). When the store is larger, later dense rows are not considered —
+/// deterministic prefix drop: no hit among unscanned rows rather than unbounded work.
+const destructible_cell_scan_budget: usize = 256;
+
+/// Cell stamp when body→cell resolution fails for a target-only intent. Prefer this over
+/// (0,0): tile (0,0) is a real world cell and would falsely attribute the destroy event.
+const invalid_intent_cell: u16 = std.math.maxInt(u16);
+
 /// Small soft-drop particle burst at body center on destroy.
 const destroy_burst_count: usize = 6;
 const destroy_burst_lifetime: f32 = 0.35;
@@ -229,8 +240,9 @@ fn intentCell(intent: ActionIntent, data: *const DataSystem, target: EntityId, w
             return .{ .level = level, .x = cell.x, .y = cell.y };
         }
     }
+    // No resolvable body cell: invalid sentinel, not intent defaults (0,0) or a fake tile.
     const level = data.worldLevelConst(target) orelse intent.level;
-    return .{ .level = level, .x = intent.cell_x, .y = intent.cell_y };
+    return .{ .level = level, .x = invalid_intent_cell, .y = invalid_intent_cell };
 }
 
 fn findPending(pending: *const [action_intent_live_capacity]PendingDamage, count: usize, entity: EntityId) ?usize {
@@ -261,6 +273,7 @@ fn resolveTarget(data: *const DataSystem, world: *const WorldSystem, intent: Act
 
 /// Lowest entity.index, then generation, among destructibles whose collision
 /// AABB contains the cell center on the intent level (missing world_level → 0).
+/// Scans at most `destructible_cell_scan_budget` dense rows (fixed, not map-scaled).
 fn findDestructibleAtCell(
     data: *const DataSystem,
     world: *const WorldSystem,
@@ -276,8 +289,11 @@ fn findDestructibleAtCell(
     const cell_max_y = cell_min_y + world.tile_size;
 
     const slice = data.destructibleSliceConst();
+    const scan_limit = @min(slice.entities.len, destructible_cell_scan_budget);
     var best: ?EntityId = null;
-    for (slice.entities) |entity| {
+    var i: usize = 0;
+    while (i < scan_limit) : (i += 1) {
+        const entity = slice.entities[i];
         if (!data.isAlive(entity)) continue;
         const entity_level = data.worldLevelConst(entity) orelse 0;
         if (entity_level != level) continue;
@@ -450,6 +466,73 @@ test "DestructibleController multi-hit same step nets one destroy" {
     try std.testing.expectEqual(@as(usize, 1), stats.destroyed);
     try std.testing.expectEqual(@as(usize, 0), stats.hits);
     try std.testing.expectEqual(@as(usize, 1), frame.structural_commands.mergedItems().len);
+}
+
+test "DestructibleController target-only destroy stamps body cell not (0,0)" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = makeMinimalWorld();
+    defer world.deinit();
+    // Body at (32,32) → cell (1,1) with tile_size 32.
+    const crate = try spawnCrate(&data, 32, 32, 32, 1);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(4, 4, 0, 0, 0, 4);
+    frame.beginStep();
+    try frame.appendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .attack,
+        .target = crate,
+        // has_cell false: cell_x/y default 0 — must not stamp (0,0).
+    });
+
+    const controller = DestructibleController.init();
+    _ = try controller.process(&frame, &data, &world, null);
+
+    var saw = false;
+    for (frame.events.mergedItems()) |event| {
+        if (event.payload != .destructible_destroyed) continue;
+        const destroyed = event.payload.destructible_destroyed;
+        try std.testing.expectEqual(@as(u16, 1), destroyed.cell_x);
+        try std.testing.expectEqual(@as(u16, 1), destroyed.cell_y);
+        saw = true;
+    }
+    try std.testing.expect(saw);
+}
+
+test "DestructibleController off-world target stamps invalid cell sentinel" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var world = makeMinimalWorld();
+    defer world.deinit();
+    // Far outside the 8×8 / tile_size 32 world so cellContaining fails.
+    const crate = try spawnCrate(&data, -1000, -1000, 32, 1);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try frame.reserveStreams(4, 4, 0, 0, 0, 4);
+    frame.beginStep();
+    try frame.appendActionIntent(.{
+        .entity = EntityId.invalid,
+        .kind = .attack,
+        .target = crate,
+    });
+
+    const controller = DestructibleController.init();
+    _ = try controller.process(&frame, &data, &world, null);
+
+    var saw = false;
+    for (frame.events.mergedItems()) |event| {
+        if (event.payload != .destructible_destroyed) continue;
+        const destroyed = event.payload.destructible_destroyed;
+        try std.testing.expectEqual(invalid_intent_cell, destroyed.cell_x);
+        try std.testing.expectEqual(invalid_intent_cell, destroyed.cell_y);
+        saw = true;
+    }
+    try std.testing.expect(saw);
 }
 
 test "DestructibleController multi-hit partial set_destructible when hp remains" {
@@ -687,6 +770,7 @@ test "DestructibleController destroy emits static-nav entity_destroyed with obst
     defer world.deinit();
     // spawnCrate attaches static solid collision → isStaticNavigationObstacle.
     const crate = try spawnCrate(&data, 32, 32, 32, 1);
+    try data.setWorldLevel(crate, 0);
     try std.testing.expect(data.isStaticNavigationObstacle(crate));
 
     var frame = SimulationFrame.init(std.testing.allocator);
@@ -720,6 +804,7 @@ test "DestructibleController destroy emits static-nav entity_destroyed with obst
         const rect = destroyed.obstacle_world_rect.?;
         try std.testing.expect(rect.max_x > rect.min_x);
         try std.testing.expect(rect.max_y > rect.min_y);
+        try std.testing.expectEqual(@as(u16, 0), destroyed.level);
         saw_nav_destroy = true;
     }
     try std.testing.expect(saw_nav_destroy);

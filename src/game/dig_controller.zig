@@ -41,9 +41,9 @@ const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 pub const DigConfig = struct {
     // Default to the invalid sentinel, not tile 0: TileId 0 is a real,
     // movement-blocking tile, so a 0 default would silently carve it. Leaving
-    // these unresolved trips the carve-path guard in `DigController.process`
-    // rather than digging a wrong tile. `fromMeta`/`fromRuntimeAssets` resolve
-    // them to valid ids.
+    // these unresolved returns `error.UnresolvedDigTiles` from `process` before
+    // any world mutate (ReleaseFast-safe; not a Debug-only assert).
+    // `fromMeta`/`fromRuntimeAssets` resolve them to valid ids.
     ramp_tile: TileId = invalid_tile_id,
     tunnel_tile: TileId = invalid_tile_id,
 
@@ -116,8 +116,11 @@ pub const DigController = struct {
         // controller's dig tiles must have been resolved to valid ids (via
         // `DigConfig.fromMeta`/`fromRuntimeAssets`). The sentinel defaults exist so
         // a controller that is never asked to dig need not resolve them.
-        std.debug.assert(self.ramp_tile != invalid_tile_id);
-        std.debug.assert(self.tunnel_tile != invalid_tile_id);
+        // Runtime check (not Debug-only assert): ReleaseFast strips std.debug.assert,
+        // so an unresolved controller must return before any world mutate.
+        if (self.ramp_tile == invalid_tile_id or self.tunnel_tile == invalid_tile_id) {
+            return error.UnresolvedDigTiles;
+        }
 
         const cell = facedCellForEntity(world, data, player.entity) orelse return;
 
@@ -237,8 +240,10 @@ pub const DigController = struct {
     ///
     /// Attaches `world_level` (at the current plane) before any tile mutate so
     /// `setEntityLevel` cannot OOM after `carveLandingCell` has already written.
+    /// The pipeline plane stage also preflights and attaches `world_level` for
+    /// every cell-entry candidate before the first carve (multi-entity safety).
     /// Player.spawn pre-attaches level 0; NPCs should carry the component before
-    /// the plane stage. Missing-component attach is the safety net.
+    /// the plane stage. Missing-component attach here is the direct-call safety net.
     pub fn applyEntityPlaneTraversal(
         self: *const DigController,
         world: *WorldSystem,
@@ -394,6 +399,24 @@ fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").
     frame.dig_intent = intent;
     try dig.process(&tw.world, &tw.data, tw.player, &frame);
     return frame;
+}
+
+test "dig process returns UnresolvedDigTiles without mutating world" {
+    var tw = try TestWorld.init(.right, 0);
+    defer tw.deinit();
+    // Default DigConfig leaves ramp/tunnel as invalid_tile_id — must fail before carve.
+    const dig = DigController.init(.{});
+    const floor = tw.world.denseFloorLayerForLevel(0).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    frame.beginStep();
+    frame.dig_intent = .hole;
+    try std.testing.expectError(error.UnresolvedDigTiles, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
 }
 
 test "dig controller punches a see-through hole in the faced cell" {

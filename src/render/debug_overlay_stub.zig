@@ -16,8 +16,10 @@ pub const DebugOverlay = struct {
         return .{};
     }
 
-    pub fn deinit(self: *DebugOverlay) void {
+    pub fn deinit(self: *DebugOverlay, text_service: *TextService, renderer: *Renderer) void {
         _ = self;
+        _ = text_service;
+        _ = renderer;
     }
 
     pub fn applyCommands(self: *DebugOverlay, commands: *const FrameCommands) void {

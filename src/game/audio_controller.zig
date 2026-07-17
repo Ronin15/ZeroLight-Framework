@@ -56,8 +56,12 @@ pub const AudioController = struct {
             self.music_started = true;
         }
 
+        // Mirror the start-edge latch: only clear the deferred-stop flag when
+        // the stop command is accepted. A failed enqueue (full buffer) must
+        // leave the pending bit set so the next step retries instead of
+        // leaving a stale engine-side loop playing through resume.
         if (self.jet_loop_stop_pending) {
-            audio.stopLoopingSfx(player_jet_loop_id) catch {};
+            audio.stopLoopingSfx(player_jet_loop_id) catch return;
             self.jet_loop_stop_pending = false;
         }
 
@@ -359,6 +363,49 @@ test "queueAmbient edge-latches the jet loop across movement and pause/resume" {
     try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .stop_looping_sfx));
     try std.testing.expect(!controller.jet_loop_stop_pending);
     try std.testing.expect(!controller.jet_loop_active);
+}
+
+test "queueAmbient keeps jet_loop_stop_pending when deferred stop is dropped" {
+    const allocator = std.testing.allocator;
+    var data = DataSystem.init(allocator);
+    defer data.deinit();
+    const player_entity = try data.createEntity();
+    try data.setMovementBody(player_entity, .{ .position = .{ .x = 0, .y = 0 } });
+    const player = Player{ .entity = player_entity };
+
+    var moving = InputState{};
+    moving.setHeld(.move_right, true);
+    const idle = InputState{};
+
+    var commands = AudioCommandBuffer.init(allocator, 8);
+    defer commands.deinit();
+    var controller = AudioController.init();
+
+    commands.beginStep();
+    controller.queueAmbient(&commands, &moving, &data, player);
+    try std.testing.expect(controller.jet_loop_active);
+
+    controller.onPause();
+    try std.testing.expect(controller.jet_loop_stop_pending);
+    try std.testing.expect(!controller.jet_loop_active);
+
+    // Full buffer: deferred stop cannot enqueue. Pending must stay set so the
+    // next step retries (mirror of the start-edge latch). Capacity is at least
+    // 1, so pre-fill with a listener command to leave no room for stop.
+    var full = AudioCommandBuffer.init(allocator, 1);
+    defer full.deinit();
+    full.beginStep();
+    try full.setListener(.{ .x = 0, .y = 0 });
+    controller.queueAmbient(&full, &idle, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), full.len());
+    try std.testing.expectEqual(@as(usize, 0), countKind(&full, .stop_looping_sfx));
+    try std.testing.expect(controller.jet_loop_stop_pending);
+
+    // Room again: stop is accepted and the pending flag clears.
+    commands.beginStep();
+    controller.queueAmbient(&commands, &idle, &data, player);
+    try std.testing.expectEqual(@as(usize, 1), countKind(&commands, .stop_looping_sfx));
+    try std.testing.expect(!controller.jet_loop_stop_pending);
 }
 
 test "queueAmbient does not latch the jet loop when the start command is dropped" {
