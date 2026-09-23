@@ -42,6 +42,33 @@ pub const SimulationEventStage = enum {
     domain_reaction,
 };
 
+/// Stages that append to `frame.events` during `update`. The switch in
+/// `maxEventsPerStep` is exhaustive, so a new producer does not compile until
+/// it has a fixed budget.
+pub const EventProducerId = enum {
+    dig_world_edit,
+    perception_update,
+    affect_update,
+    plane_traversal,
+    action_react,
+};
+
+pub const EventBudgetInputs = struct {
+    perception_max_events_per_step: usize = 0,
+    affect_max_events_per_step: usize = 0,
+    movement_body_capacity: usize = 0,
+};
+
+pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
+    return switch (producer) {
+        .dig_world_edit => 1,
+        .perception_update => budgets.perception_max_events_per_step,
+        .affect_update => budgets.affect_max_events_per_step,
+        .plane_traversal => budgets.movement_body_capacity + 1,
+        .action_react => action_intent_live_capacity,
+    };
+}
+
 pub const NavInvalidationReason = enum {
     static_obstacle_changed,
 };

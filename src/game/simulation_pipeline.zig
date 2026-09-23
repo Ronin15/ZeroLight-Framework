@@ -55,6 +55,9 @@ const SteeringStats = @import("systems/steering.zig").SteeringStats;
 const SteeringSystem = @import("systems/steering.zig").SteeringSystem;
 const CollisionContact = @import("simulation.zig").CollisionContact;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
+const EventProducerId = @import("simulation.zig").EventProducerId;
+const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const WorldStimulus = @import("simulation.zig").WorldStimulus;
@@ -569,6 +572,14 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
+fn eventBudgetInputs(config: SimulationPipelineConfig) EventBudgetInputs {
+    return .{
+        .perception_max_events_per_step = config.perception_max_events_per_step,
+        .affect_max_events_per_step = config.affect_max_events_per_step,
+        .movement_body_capacity = config.movement_body_capacity,
+    };
+}
+
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global
 /// scheduler, registry, or callback-driven dependency graph.
@@ -607,6 +618,7 @@ pub const SimulationPipeline = struct {
     destructible: DestructibleController,
     audio_controller: AudioController,
     nav_cell_size: f32,
+    movement_body_capacity: usize,
     /// See `SimulationPipelineConfig.perception_max_events_per_step`.
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
@@ -673,7 +685,12 @@ pub const SimulationPipeline = struct {
         errdefer affect.deinit();
         var dig = DigController.init(config.dig);
         errdefer dig.deinit();
-        try dig.reservePlaneScratch(allocator, config.movement_body_capacity + 1);
+        const event_budgets = eventBudgetInputs(config);
+        try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, event_budgets));
+        try ai.reserve(config.movement_body_capacity);
+        try perception.reserve(config.movement_body_capacity);
+        try ai_memory.reserve(config.movement_body_capacity);
+        try affect.reserve(config.movement_body_capacity);
 
         return .{
             .movement = MovementSystem.init(),
@@ -691,6 +708,7 @@ pub const SimulationPipeline = struct {
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
+            .movement_body_capacity = config.movement_body_capacity,
             .perception_max_events_per_step = config.perception_max_events_per_step,
             .affect_max_events_per_step = config.affect_max_events_per_step,
             .sensory = SensoryBus.init(config.stimuli),
@@ -699,6 +717,35 @@ pub const SimulationPipeline = struct {
 
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
+    /// Tops up frame events to the sum of producer budgets and reserves cognition
+    /// gather scratch for `pop`. Does not lower an existing higher event limit.
+    pub fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
+        try self.ai.reserve(pop);
+        try self.perception.reserve(pop);
+        try self.ai_memory.reserve(pop);
+        try self.affect.reserve(pop);
+        const budgets = self.eventBudgets();
+        var sum: usize = 0;
+        inline for (std.meta.fields(EventProducerId)) |field| {
+            const producer: EventProducerId = @enumFromInt(field.value);
+            sum += maxEventsPerStep(producer, budgets);
+        }
+        try frame.events.reserve(sum, sum);
+        if (frame.events.capacity_limit) |limit| {
+            if (limit < sum) frame.events.setCapacityLimit(sum);
+        } else {
+            frame.events.setCapacityLimit(sum);
+        }
+    }
+
+    fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
+        return eventBudgetInputs(.{
+            .perception_max_events_per_step = self.perception_max_events_per_step,
+            .affect_max_events_per_step = self.affect_max_events_per_step,
+            .movement_body_capacity = self.movement_body_capacity,
+        });
+    }
+
     pub fn deinit(self: *SimulationPipeline) void {
         self.dig.deinit();
         self.affect.deinit();
@@ -1067,7 +1114,7 @@ pub const SimulationPipeline = struct {
                 .candidate_dense_indices = step.ai_halo_indices,
                 .player_candidate = perception_player_candidate,
                 .stimuli = hearing_stimuli,
-                .max_events_per_step = self.perception_max_events_per_step,
+                .max_events_per_step = maxEventsPerStep(.perception_update, self.eventBudgets()),
             },
         );
         perception_timer.stop(context.perf, .pipeline_perception);
@@ -1092,7 +1139,7 @@ pub const SimulationPipeline = struct {
         var affect_timer = StageTimer.start();
         step.affect = try self.affect.update(context.data.aiAgentSliceConst(), context.data, &context.frame.events, context.thread_system, .{
             .scope_dense_indices = step.ai_cognition_indices,
-            .max_events_per_step = self.affect_max_events_per_step,
+            .max_events_per_step = maxEventsPerStep(.affect_update, self.eventBudgets()),
         });
         affect_timer.stop(context.perf, .pipeline_ai_affect);
     }
@@ -1793,6 +1840,232 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     const affect_after = data.aiAffectConst(observer).?;
     try std.testing.expect(affect_after.fear > 0);
     try std.testing.expect(affect_after.aggression > 0);
+}
+
+test "pipeline fear selects flee before movement, not only a positive drive" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 40 });
+    try data.setAiAgent(observer, .{
+        .active_behavior = .wander,
+        .wander_amplitude = 0,
+        .gain_flee = 1,
+        .gain_pursue = 0,
+        .gain_wander = 0,
+    });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiAffect(observer, .{});
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .perception_max_events_per_step = 4,
+        .affect_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+    try pipeline.reserve(&frame, 4);
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    try std.testing.expectEqual(@import("data_system.zig").AiBehavior.flee, data.aiAgentConst(observer).?.active_behavior);
+}
+
+test "pipeline perception acquire refreshes memory last_known the same step" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+
+    const observer = try data.createEntity();
+    try data.setMovementBody(observer, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(observer, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(observer, .player);
+    try data.setAiPerception(observer, .{});
+    try data.setAiMemory(observer, .{
+        .last_known_target = player.entity,
+        .last_known_x = 0,
+        .last_known_y = 100,
+        .staleness = 10,
+    });
+
+    const hostile = try data.createEntity();
+    try data.setMovementBody(hostile, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(hostile, .{ .active_behavior = .wander });
+    try data.setFaction(hostile, .hostile);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .perception_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    const memory = data.aiMemoryConst(observer).?;
+    try std.testing.expect(memory.last_known_target.eql(hostile));
+    try std.testing.expectApproxEqAbs(@as(f32, 10), memory.last_known_x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), memory.last_known_y, 0.01);
+}
+
+test "chunk_derive matches the pose after a contact push crosses a chunk boundary" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    const body = data.movementBodyPtr(player.entity).?;
+    body.previous_x.* = 20;
+    body.previous_y.* = 0;
+    body.position_x.* = 20;
+    body.position_y.* = 0;
+    body.velocity_x.* = 0;
+    body.velocity_y.* = 0;
+    try data.setCollisionBounds(player.entity, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(player.entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    try data.setWorldLevel(player.entity, 0);
+
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(wall, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    try data.setWorldLevel(wall, 0);
+    try data.setSimulationTier(wall, .locomotion);
+
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 128,
+        .height = 64,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+    };
+    defer world.deinit();
+    _ = try world.addLevel(0);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    try frame.reservePathRequests(2, 2);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 128, 64, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+
+    frame.beginStep();
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 128,
+        .bounds_height = 64,
+    });
+
+    const settled = data.movementBodyConst(player.entity).?;
+    const mi = data.movementBodyDenseIndex(player.entity).?;
+    const chunk = data.scopeColumnsSliceConst().chunk_x[mi];
+    const expected: i32 = @intFromFloat(@floor(settled.position.x / 32.0));
+    try std.testing.expectEqual(expected, chunk);
+    try std.testing.expect(settled.position.x >= 32);
 }
 
 test "pipeline resolves an aggressive non-player entity's pursue goal to another non-player entity, not the player" {

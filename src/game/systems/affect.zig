@@ -206,6 +206,18 @@ pub const AffectSystem = struct {
     merge_scratch: std.ArrayList(SimulationEvent) = .empty,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
+    /// Sizes gather rows and per-range event scratch for `pop` agents, including
+    /// a single serial range that covers the whole population and enough ranges
+    /// for an alignment-sized split.
+    pub fn reserve(self: *AffectSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+        const ranges = std.math.divCeil(usize, cap, affect_range_alignment_items) catch 1;
+        try self.prepareEventRangeBuffers(ranges, affect_range_alignment_items, cap);
+        try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * 4);
+    }
+
     pub fn init(allocator: std.mem.Allocator) AffectSystem {
         return .{
             .allocator = allocator,
@@ -1253,7 +1265,7 @@ test "serial has no steady-state allocation after warmup (FailingAllocator)" {
     var events = SimulationEvents.init(testing.allocator);
     defer events.deinit();
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{});
+    try sys.reserve(1);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;
@@ -1289,8 +1301,7 @@ test "threaded update has no steady-state allocation after warmup (FailingAlloca
         .adaptive = false,
     };
 
-    const warmup_stats = try sys.update(data.aiAgentSliceConst(), &data, &events, &threads, config);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
+    try sys.reserve(64);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;

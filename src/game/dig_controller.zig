@@ -32,6 +32,7 @@ const WorldTileChangedEvent = @import("simulation.zig").WorldTileChangedEvent;
 const StimulusKind = @import("simulation.zig").StimulusKind;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const DigIntent = @import("simulation.zig").DigIntent;
+const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 
@@ -138,7 +139,7 @@ pub const DigController = struct {
         // Reserve event + stimulus slots before any world mutate so a capacity miss
         // cannot leave the tile changed without matching outputs. digRamp also
         // preflights level_links capacity before its tile write.
-        try frame.events.ensureEventAppendCapacity(1);
+        try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
         const changed = switch (intent) {
             // Surface: punch a see-through hole to fall through. Underground: mine a
@@ -331,7 +332,7 @@ pub const DigController = struct {
                 if (data.worldLevelConst(entity) == null) missing_world_level += 1;
             }
         }
-        std.debug.assert(scratch.capacity >= pending_carves);
+        std.debug.assert(pending_carves <= scratch.capacity);
         try frame.events.ensureEventAppendCapacity(pending_carves);
         try world.ensureDenseTileEditCapacity(pending_carves);
 

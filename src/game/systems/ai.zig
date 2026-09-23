@@ -403,6 +403,13 @@ pub const AiSystem = struct {
     snapped_goal: AiDir = .{ .x = 0, .y = 0 },
     snapped_goal_initialized: bool = false,
 
+    pub fn reserve(self: *AiSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.candidates.ensureTotalCapacity(self.allocator, cap);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+    }
+
     pub fn init(allocator: std.mem.Allocator) AiSystem {
         return .{
             .allocator = allocator,
@@ -2041,12 +2048,7 @@ test "ai threaded multi-worker update has no steady-state allocation after warmu
         .focus_target = .{ .x = 100, .y = 100 },
     };
 
-    // Warm multi-worker path (must not be the inline fallback).
-    frame.beginStep();
-    const warmup = try ai_sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, &threads, 0.016, cfg);
-    try std.testing.expect(!warmup.intent_batch.ran_inline);
-    try std.testing.expect(warmup.intent_batch.active_worker_threads > 0);
-    frame.phase = .finished;
+    try ai_sys.reserve(64);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai = ai_sys.allocator;
@@ -2101,9 +2103,7 @@ test "ai dual-list gather has no steady-state allocation after warmup (FailingAl
         .intent_seed = 1,
     };
 
-    frame.beginStep();
-    _ = try ai_sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &data, &frame, 0.016, cfg);
-    frame.phase = .finished;
+    try ai_sys.reserve(4);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai = ai_sys.allocator;
@@ -2213,11 +2213,7 @@ test "ai memory-retargeted seek has no steady-state allocation after warmup (Fai
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
 
-    // Warm-up run sizes rows/navigation_intents to steady state and exercises
-    // arbitration's populated (perception + fresh memory) pursue branch.
-    frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
-    frame.phase = .finished;
+    try ai_sys.reserve(ai_slice.entities.len);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai_allocator = ai_sys.allocator;
@@ -3686,12 +3682,7 @@ test "arbitration call path has no steady-state allocation after warmup (Failing
         .affect_slice = data.aiAffectSliceConst(),
     };
 
-    // Warm-up run sizes rows/navigation_intents to steady state and exercises
-    // every arbitration input branch (perception, memory, affect, cohere
-    // neighbor query, focus_target fallback).
-    frame.beginStep();
-    _ = try ai_sys.updateSerial(ai_slice, move_slice, spatial_sys.view(), &data, &frame, 0.016, cfg);
-    frame.phase = .finished;
+    try ai_sys.reserve(ai_slice.entities.len);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const original_ai_allocator = ai_sys.allocator;

@@ -98,6 +98,11 @@ pub const AiMemorySystem = struct {
     memory_dense_indices: std.ArrayList(u32) = .empty,
     decay_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
+    pub fn reserve(self: *AiMemorySystem, pop: usize) !void {
+        if (pop == 0) return;
+        try self.memory_dense_indices.ensureTotalCapacity(self.allocator, hotStoreCapacity(pop));
+    }
+
     pub fn init(allocator: std.mem.Allocator) AiMemorySystem {
         return .{
             .allocator = allocator,
@@ -823,9 +828,7 @@ test "AiMemorySystem serial has no steady-state allocation after warmup (Failing
     defer frame.deinit();
     try frame.reserveStreams(1, 4, 0, 0, 0, 0);
 
-    // Warm-up run sizes memory_dense_indices to steady state.
-    frame.beginStep();
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &frame, .{});
+    try sys.reserve(1);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;
@@ -864,11 +867,7 @@ test "AiMemorySystem threaded update has no steady-state allocation after warmup
         .adaptive = false,
     };
 
-    // Warm-up: sizes memory_dense_indices to steady state.
-    frame.beginStep();
-    const warmup_stats = try sys.update(data.aiAgentSliceConst(), &data, &frame, &threads, config);
-    try testing.expect(!warmup_stats.batch.ran_inline);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
+    try sys.reserve(64);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_allocator = sys.allocator;

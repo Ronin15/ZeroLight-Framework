@@ -130,6 +130,8 @@ pub const DestructibleController = struct {
         // Preflight event + structural capacity before queuing so a full budget
         // cannot leave partial outputs (dig pattern).
         if (event_count > 0) {
+            const event_budget = @import("simulation.zig").maxEventsPerStep(.action_react, .{});
+            std.debug.assert(event_count <= event_budget);
             try frame.events.ensureEventAppendCapacity(event_count);
         }
         if (command_count > 0) {

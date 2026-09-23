@@ -547,6 +547,23 @@ pub const PerceptionSystem = struct {
     /// step's observer set could span at once. Safe to call with zero
     /// levels (no-op) or to call again later (subsequent per-level calls are
     /// the normal cheap "nothing changed" reuse path, not a second rebuild).
+    /// Sizes candidate/observer rows and event scratch for `pop` agents. LOS
+    /// bitmaps stay on `prebuildLevelCaches` because they follow world dimensions,
+    /// not the agent count.
+    pub fn reserve(self: *PerceptionSystem, pop: usize) !void {
+        if (pop == 0) return;
+        const cap = hotStoreCapacity(pop);
+        try self.candidates.ensureTotalCapacity(self.allocator, cap);
+        try self.rows.ensureTotalCapacity(self.allocator, cap);
+        const ranges = std.math.divCeil(usize, cap, perception_range_alignment_items) catch 1;
+        try self.prepareEventRangeBuffers(ranges, perception_range_alignment_items, cap);
+        try self.prepareRangeStats(ranges);
+        try self.range_take_counts.ensureTotalCapacity(self.allocator, ranges);
+        if (self.event_ranges.items.len > 0) {
+            try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * 2);
+        }
+    }
+
     pub fn prebuildLevelCaches(self: *PerceptionSystem, world: *const WorldSystem) !void {
         var level: usize = 0;
         while (level < world.levelCount()) : (level += 1) {
@@ -3282,10 +3299,9 @@ test "PerceptionSystem has no steady-state allocation after warmup (FailingAlloc
 
     const stimuli = [_]WorldStimulus{.{ .position = .{ .x = 20, .y = 0 }, .intensity = 1, .kind = .dig, .level = 0 }};
 
-    // Warm up: one full serial run sizes every scratch buffer (candidates,
-    // rows, event range scratch, range_take_counts, and the per-level
-    // LOS-blocked bitmap cache) to steady state.
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{ .stimuli = &stimuli });
+    try sys.reserve(2);
+    try sys.prebuildLevelCaches(&world);
+    try events.reserve(8, 8);
     try testing.expect(sys.level_blocked.items.len > 0);
     try testing.expect(sys.level_blocked.items[0].valid);
 
@@ -3337,7 +3353,9 @@ test "PerceptionSystem dual-list gather has no steady-state allocation after war
         .candidate_dense_indices = &halo,
     };
 
-    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, cfg);
+    try sys.reserve(4);
+    try sys.prebuildLevelCaches(&world);
+    try events.reserve(8, 8);
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const original_system_allocator = sys.allocator;
@@ -3397,14 +3415,9 @@ test "PerceptionSystem threaded update has no steady-state allocation after warm
         .stimuli = &stimuli,
     };
 
-    // Warm up: one full threaded run sizes every scratch buffer (candidates,
-    // rows, per-range event buffers, per-range stats, range_take_counts, and
-    // the per-level LOS-blocked bitmap cache) to steady state at range_count
-    // > 1.
-    const warmup_stats = try sys.update(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, &threads, config);
-    try testing.expect(warmup_stats.batch.range_count > 1);
-    try testing.expect(!warmup_stats.batch.ran_inline);
-    try testing.expect(warmup_stats.batch.active_worker_threads > 0);
+    try sys.reserve(data.aiAgentSliceConst().entities.len);
+    try sys.prebuildLevelCaches(&world);
+    try events.reserve(64, 64);
     try testing.expect(sys.level_blocked.items.len > 0);
     try testing.expect(sys.level_blocked.items[0].valid);
 
