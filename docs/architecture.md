@@ -594,10 +594,10 @@ and `hasLineOfSight` itself walks every grid cell a ray's segment actually
 crosses (an Amanatides-Woo DDA), not fixed-distance samples. Hearing folds
 into the same per-agent pass as a same-level squared-distance check against
 `SimulationFrame.stimuli`, a transient per-step positional buffer that
-`SimulationPipeline` sensory producers feed (Slice 39): deferred-promoted
-`.impact`, same-step `.dig` from `DigController`, and same-step `.footstep`
-from player velocity — all before `PerceptionSystem` hearing. Cognition does
-not read `AudioCommandBuffer`; audio may play in parallel for presentation
+`SensoryBus` feeds (Slice 39, placed by Slice 48): deferred-promoted
+`.impact`, a required same-step `.dig` from `DigController`, and an optional
+same-step `.footstep` from player velocity — all before `PerceptionSystem` hearing.
+Cognition does not read `AudioCommandBuffer`; audio may play in parallel for presentation
 only. Dense per-step results (visibility,
 last-seen position, nearest threat, heard stimulus) write to `PerceptionStore`
 hot columns; only acquisition/loss transitions emit low-volume
@@ -631,9 +631,9 @@ nonzero and no better signal exists; investigate resolves goals in priority
 order **heard stimulus → nearest in-range world interest marker → freshest
 `AiMemory` ring contact** (stimulus still wins short-term over markers;
 `investigate_interest_marker_bonus` sits between ring and stimulus scoring).
-`AiSystem` gathers markers read-only from `WorldSystem.interest_markers` via a
-bounded nearest-marker query (fixed radius constant, not world-sized), only for
-rows with `gain_investigate > 0`; cohere reads a friendly-neighbor mean
+The separation job queries `WorldSystem.interest_markers` read-only (fixed
+radius, not world-sized) only for rows with `gain_investigate > 0`. Gather
+stores the row's level and does not scan. Cohere reads a friendly-neighbor mean
 gathered from the same shared spatial index. This utility arbitration decides
 *what* an agent wants (a behavior and a goal); it is a distinct mechanism from
 `SteeringSystem`'s stream-priority arbitration below, which decides *which*

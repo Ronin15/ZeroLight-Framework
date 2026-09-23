@@ -247,22 +247,23 @@ part of the contract: count and write phases must stay consistent.
 - `stimuli`: transient per-step positional sensory bus AI hearing can sense,
   read by `PerceptionSystem`. Cleared every `beginStep` and never promoted to
   an event, since a stimulus carries no stable entity identity to transition
-  against. **Producer phase (before `perception_update`):** the pipeline
-  promotes deferred impacts from the prior step, then `DigController.process`
-  may append `.dig`, then the pipeline may append at most one `.footstep`
-  when the player's movement body carries non-trivial velocity. **Deferred
-  producer:** player-involving collision contacts with non-trivial relative
-  motion (or penetration plus relative velocity above fixed thresholds) enqueue
-  `.impact` into a pipeline-owned fixed buffer after `collision_respond`; they
-  are promoted onto the live bus at the start of the *next* step so perception
-  never reads same-step impacts. **Sticky one-shots:** after `perception_update`,
-  the pipeline captures live `.dig` and `.impact` into a fixed sticky buffer for
-  `cognition_stagger_n - 1` additional steps (feeds a hearing scratch merged
-  with the live bus before perception). Footsteps are live-only. Capacities are
-  fixed constants (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
+  against. **Producer phase (before `perception_update`):** `SensoryBus`
+  promotes deferred impacts, `DigController.process` emits a required `.dig`
+  (a full live bus returns `StimulusCapacityExceeded` and leaves the tile
+  unchanged), then `SensoryBus.appendFootstep` may emit one optional
+  `.footstep`. **Deferred producer:** `SensoryBus.enqueuePlayerImpacts` after
+  `collision_respond` writes `.impact` into the bus's fixed deferred buffer;
+  promote runs on the next step's `dig_world_edit`, so perception never reads
+  same-step impacts. **Sticky one-shots:** `advanceSticky` after perception
+  captures live `.dig` and `.impact` for `cognition_stagger_n - 1` further
+  steps (hearing scratch is live bus plus still-lingering sticky). Footsteps
+  are live-only. Live writes go through `SensoryBus.emit`. Required fails;
+  optional increments the drop counter and returns false. `writeLiveStimulus`
+  is the unchecked frame append under that cap. Sticky and deferred overflow
+  is a counted drop, not a bigger buffer. Capacities are fixed constants
+  (`stimulus_live_capacity`, `stimulus_sticky_capacity`,
   `stimulus_deferred_capacity`, `stimulus_max_impacts_per_step` in
-  `simulation.zig`); overflow drops newest optional/live entries
-  deterministically. Callers warm `stimuli` to `stimulus_live_capacity` during
+  `simulation.zig`). Callers warm `stimuli` to `stimulus_live_capacity` during
   state init (demo/pipeline), not scene-scale-derived counts.
 
 High-volume data should stay in its specialized stream. Do not collapse

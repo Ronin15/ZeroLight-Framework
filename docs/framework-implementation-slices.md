@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45, 47) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45, 47, 48) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only. Landed slices that still need
@@ -88,9 +88,8 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
-| **48** | Partial | SimulationPipeline thin-composer restoration — contract vocabulary, `runStage`, and `SensoryBus` landed; domain eviction, budgets, causal tests, and follow-ups still open |
 
-**Recently settled (archive only):** 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -102,14 +101,14 @@ Use this index to choose the next slice; **implement from that slice's section**
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice section.
 
-**Locomotion emergence is closed** (archive 26–32, 39, 41, 47; frontier residual 33
+**Locomotion emergence is closed** (archive 26–32, 39, 41, 47, 48; frontier residual 33
 visual only). Multi-source investigate (stimuli + world markers + memory) and
 table-driven affect→behavior are in place. Open work grows *beside* that loop.
 
 | Track | Slices | Notes |
 | --- | --- | --- |
 | **Primary — action/interaction** | archive **40** + **45** | Action-intent substrate + first domain controller (destructibles) landed; future combat/rules consumers reuse the same bus. |
-| **Pipeline composer** | **48** | Thin-composer restoration after 47's two-population split. Independent landable steps. |
+| **Pipeline composer** | archive **48** | Thin-composer restoration landed. `world_gate` SIMD is a Scaling Gap. |
 | **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
 | **World / render verticality** | **37 → 38** | Cap raise + shader sync, then elevation-above-surface semantics. Independent of AI. |
 | **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
@@ -150,6 +149,9 @@ world depth, or cognition-track scope.
 
 **Simulation scale**
 
+- [ ] **World-gate SIMD.** `world_gate.apply` stays scalar (Slice 48 kept the
+      structural move off the perf change). Thread and SIMD it only as its own
+      benched follow-up.
 - [ ] **Interest marker consumers beyond investigate.** Slice 41 stores
       `cover` / `resource` / `patrol` kinds and nearest-k query, but only
       `investigate` is wired into AI. Promote when ready: cover-aware flee/pursue
@@ -422,9 +424,10 @@ footstep / deferred impact) and world interest markers (41: investigate wired;
 - **Slices 39, 41** — richer senses + world-authored investigate POIs (landed).
 - **Open post-loop expandability:** **42** (more/coupled feelings, only with a
   real appraisal signal). Action intents (**40**) and first consumer (**45**)
-  are landed. Sensing substrate (**47**) is landed. Each remaining item is a
-  full slice — do not half-wire into 32 or overload `NavigationIntent`.
-  Next on this track's structural work is **48** (thin-composer restoration).
+  are landed. Sensing substrate (**47**) and thin-composer restoration (**48**)
+  are landed. Each remaining item is a full slice — do not half-wire into 32
+  or overload `NavigationIntent`. Next open on this track is **42**, and only
+  once a real appraisal signal exists. **35** is the unblocked perf follow-up.
 
 Shared design contracts for the whole track:
 
@@ -1224,113 +1227,6 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 - [ ] Serialized form contains no handles or filesystem paths (payload-purity
       inspection/test); `zig build verify` passes.
 
-## Slice 48: SimulationPipeline Thin-Composer Restoration
-
-**Status: partial.** Contract vocabulary, `runStage`, and `SensoryBus` are landed.
-Structural refactor surfaced by the architecture
-review. Land as independently-shippable steps in the listed order, never as one
-change; each step is separately bisectable.
-
-Goal: restore [architecture.md](architecture.md)'s thin-composer contract by
-binding `stage_order` to execution, extracting the sensory bus into a controller,
-evicting movement/world domain logic to its owning systems, and moving event and
-allocation budgets to their producers — so the comptime stage graph governs what
-actually runs and the composer stops owning cross-step state and policy.
-
-### Problem (verified against live code)
-
-- `update()` is ~270 straight-line lines mixing four altitudes. The pipeline
-  owns cross-step sensory state (`deferred_stimuli`, `sticky_*`,
-  `interact_held_last`, hearing scratch) plus policy (lifetime rules, the impact
-  penetration curve, an eligibility gate, the interact latch).
-- Four sensory mutations run as untagged wall-clock statements the comptime
-  reads-before-writes check cannot see; `.action_intent_capture` is a declared
-  stage whose real work happens before `update()`. `stage_order` binds to no
-  executor (`runStage`/dispatch), so it governs nothing: the review panel
-  reordered load-bearing stage pairs and the whole suite still passed.
-- ~230 lines of movement/world domain logic and four serial, scalar,
-  random-access full-AI-population scans sit in the composer — precisely because
-  they live here instead of a system that would inherit the threading/SIMD/scope
-  conventions (`simulation_pipeline.zig` has zero `@Vector` uses).
-
-### Checklist (each step independently landable)
-
-- [x] **Contract vocabulary** (declaration-only): add a `carried` field to
-      `StageContract` (checked disjoint from `reads`, required to be written by
-      some stage) so `.reads = .empty` regains its meaning; split `.events` into
-      `perception_events`/`affect_events`/`world_events`/`structural_events` (a
-      stage-0-written tag must not vacuously satisfy every downstream read); add
-      `.stimuli`/`.interest_markers`/`.ai_behavior` tags and `ai_decide`'s
-      missing write; add a `stage_order` permutation comptime check.
-- [x] **Bind the graph**: add `StepState`, one private `stage<Name>` method per
-      stage (carrying its own `StageTimer`), `runStage(comptime id)` with an
-      exhaustive switch, and `inline for (stage_order) |id| try runStage(...)`;
-      `update()` drops to ~6 lines. Delete `.action_intent_capture` (no body) →
-      `carried = {action_intents}` on `.action_react`. Watch `zig build check`
-      eval-branch quota; if it bites, split the switch by stage-half — never a
-      runtime dispatch table on the frame path.
-- [x] **Extract `SensoryBus`** (`src/game/sensory_bus.zig`, in the
-      DigController/AudioController mold): move the sensory state fields + the
-      free functions (already written with `pipeline: *SimulationPipeline`
-      first) + thresholds; add `StimulusConfig` mirroring `DigConfig`; split
-      `footstep_velocity_sq_threshold` into `footstep_min_speed_sq` +
-      `impact_min_approach_speed_sq`. Extract `contact_query.zig` as a shared
-      leaf both `sensory_bus` and `audio_controller` import (including the
-      duplicated `clamp(penetration/18, 0.25, 1)` curve). Decide sticky sizing:
-      either fixed `(stimulus_max_impacts_per_step + 1) * (cognition_stagger_n -
-      1)` with a comptime assert, or priority-aware capture (dig before impact).
-      *(Bounded-drop + a counted `stimuli_sticky_dropped` metric already landed;
-      this step chooses the permanent capacity, never a bigger number for one
-      map.)*
-- [ ] **Evict domain logic**: plane traversal (`applyPlaneTraversalStage` +
-      helpers) → `DigController`, replacing the live-population
-      `ensureTotalCapacity` carve scratch with a fixed init-sized buffer
-      (`config.movement_body_capacity + 1`); the gate/clamp/`rectOverlap` family
-      → a new `src/game/systems/world_gate.zig` (thread/SIMD it in a **separate
-      benched** follow-up, so a perf change never rides inside a structural one);
-      `applyAiMovementIntents` → `MovementSystem.applyIntents`.
-- [ ] **Own the budgets**: add `SimulationPipeline.reserve(frame, pop)`; add
-      `reserve` to `ai`/`perception`/`affect`/`ai_memory` called from `init`
-      (they have no reserve seam today — allocation-freedom is "after warmup at a
-      fixed population," not "after init"), and convert their `FailingAllocator`
-      tests from warm-then-run to reserve-then-run; add an exhaustive
-      `EventProducerId` + `maxEventsPerStep` so an unbudgeted producer will not
-      compile; add the first composite `FailingAllocator` test over
-      `pipeline.update()` on a minimal 1x1 fixture with dig + falls + contacts live.
-- [ ] **Ordering-backstop tests** (belt-and-braces once the graph is bound):
-      the affect-before-ai test must assert an AI-visible consequence of drives,
-      not `fear > 0`; add a `chunk_derive` causal test (a body pushed across a
-      chunk boundary by collision response, asserting the chunk column matches
-      the settled position after `update()`); add a perception→ai_memory causal
-      test where perception actually acquires so `ai_memory` refreshes
-      `last_known` from this step's `last_seen`; fold the `RowInterest` column
-      into the `ai` serial/threaded parity test.
-- [ ] **Follow-ups** (independently landable, none blocking): route every
-      producer through `SensoryBus.emit` and delete
-      `SimulationFrame.appendStimulus`/`tryAppendStimulus`, making `live <= 32` a
-      type invariant (ships with its own dig-behavior-change test); extend the AI
-      bench to the full production config (memory/affect/populated
-      `interest_markers`) and correct the roadmap AI-stage band; move
-      `findBestInvestigateMarker`'s scan out of the serial gather into
-      `writeAiSeparationJob`.
-- [ ] Update [architecture.md](architecture.md) and
-      [simulation-tiers-and-pipeline.md](simulation-tiers-and-pipeline.md): the
-      contributor checklist gains the `carried` rule and the "a tag written by
-      stage 0 cannot constrain anything downstream" rule; record the SensoryBus
-      controller's stage placement.
-
-### Acceptance checks
-
-- [ ] `update()` is a short `runStage` loop; no untagged sensory mutation
-      remains; reordering `stage_order` either fails to compile or fails a causal
-      test.
-- [ ] The sensory bus, `world_gate`, and movement-intent apply live in their
-      owning modules; the pipeline composes them like `DigController`.
-- [ ] Every per-step budget stays fixed/world-size-independent; the composite
-      `update()` path is proven allocation-free-after-reserve by `FailingAllocator`.
-- [ ] No bench regression from the moves (the `world_gate` SIMD pass is a
-      separate benched follow-up); `zig build verify` passes.
-
 ## Suggested Order
 
 0. Runtime diagnostics policy.
@@ -1394,9 +1290,7 @@ actually runs and the composer stops owning cross-step state and policy.
     persistence).
 47. Un-stagger the shared sensing substrate (live perception defect; before 48).
     — landed (archive).
-48. SimulationPipeline thin-composer restoration (after 47; independent landable
-    steps — contract vocab → bind graph → extract SensoryBus → evict domain
-    logic → own budgets).
+48. SimulationPipeline thin-composer restoration (after 47). — landed (archive).
 
 Dependency index for slice ordering. **Open Frontier Slice Index** is the entry
 point; each slice's **Checklist** and **Acceptance checks** are what agents
