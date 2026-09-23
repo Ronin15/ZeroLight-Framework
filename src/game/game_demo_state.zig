@@ -436,9 +436,6 @@ pub const GameDemoState = struct {
         // events (`pop_cap.event_reserve`), not a flat constant unrelated to that budget.
         try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
-        // Plane-traversal batches fall-landing tile events into this scratch (player +
-        // every AI agent can fall in one step).
-        try simulation_frame.reserveWorldTileChangesScratch(pop_cap.mover_count + 1);
         // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
         // fixed live ceiling so optional emitters stay allocation-free after init.
         try simulation_frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);

@@ -585,9 +585,6 @@ pub const SimulationFrame = struct {
     // Reused across commits so a structural-mutating frame stays allocation-free
     // after warmup; cleared (capacity retained) at the start of each commit.
     structural_changes_scratch: std.ArrayList(StructuralChange) = .empty,
-    // Reused by plane-traversal to batch fall-landing tile events into one
-    // finishWrite (see publishWorldTileChanges); cleared each beginStep.
-    world_tile_changes_scratch: std.ArrayList(WorldTileChangedEvent) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) SimulationFrame {
         return .{
@@ -606,7 +603,6 @@ pub const SimulationFrame = struct {
     }
 
     pub fn deinit(self: *SimulationFrame) void {
-        self.world_tile_changes_scratch.deinit(self.allocator);
         self.structural_changes_scratch.deinit(self.allocator);
         self.structural_plan_scratch.deinit();
         self.stimuli.deinit();
@@ -639,7 +635,6 @@ pub const SimulationFrame = struct {
         self.stimuli.clearRetainingCapacity();
         self.structural_plan_scratch.clearRetainingCapacity();
         self.structural_changes_scratch.clearRetainingCapacity();
-        self.world_tile_changes_scratch.clearRetainingCapacity();
     }
 
     pub fn reserveStreams(
@@ -680,12 +675,6 @@ pub const SimulationFrame = struct {
             break :blk pending + value_count;
         };
         try self.stimuli.values.ensureTotalCapacity(alloc, new_value_count);
-    }
-
-    /// Warms the plane-traversal tile-change batch buffer. Sized for the worst
-    /// case of player + every AI agent falling in one step (`mover_count + 1`).
-    pub fn reserveWorldTileChangesScratch(self: *SimulationFrame, capacity: usize) !void {
-        try self.world_tile_changes_scratch.ensureTotalCapacity(self.allocator, capacity);
     }
 
     /// Live stimulus count already written this step (after any `prefix`/finish).
@@ -1742,31 +1731,6 @@ test "tryAppendStimulus returns false at live capacity without allocating (Faili
         .kind = .footstep,
         .level = 0,
     }, stimulus_live_capacity));
-}
-
-test "SimulationFrame.world_tile_changes_scratch reserved-then-push is allocation-free (FailingAllocator)" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-
-    try frame.reserveWorldTileChangesScratch(2);
-
-    const original = frame.allocator;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    frame.allocator = failing.allocator();
-    defer frame.allocator = original;
-
-    const change = WorldTileChangedEvent{
-        .level = 1,
-        .x = 2,
-        .y = 3,
-        .old_tile_id = 1,
-        .new_tile_id = 2,
-        .old_blocks_movement = true,
-        .new_blocks_movement = false,
-    };
-    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
-    frame.world_tile_changes_scratch.appendAssumeCapacity(change);
-    try std.testing.expectEqual(@as(usize, 2), frame.world_tile_changes_scratch.items.len);
 }
 
 test "ActionIntent fields are scalar or enum only" {

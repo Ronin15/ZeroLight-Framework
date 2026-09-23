@@ -19,6 +19,7 @@ const std = @import("std");
 const math = @import("../core/math.zig");
 const InputState = @import("../app/input.zig").InputState;
 const DataSystem = @import("data_system.zig").DataSystem;
+const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice;
 const EntityId = @import("data_system.zig").EntityId;
 const Facing = @import("data_system.zig").Facing;
 const Player = @import("player.zig").Player;
@@ -73,6 +74,10 @@ pub const DigController = struct {
     // Last grid cell the player occupied, so plane traversal (fall/ramp) fires only
     // on cell entry — anti-oscillation and the one-level-per-fall guard.
     player_last_cell: ?CellCoord = null,
+    /// Fall-landing tile changes for one step. Reserved once; the step path
+    /// only clears and `appendAssumeCapacity`s.
+    plane_tile_changes: std.ArrayList(WorldTileChangedEvent) = .empty,
+    scratch_allocator: ?std.mem.Allocator = null,
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
@@ -285,7 +290,122 @@ pub const DigController = struct {
         const floor_layer = world.denseFloorLayerForLevel(level) orelse return null;
         return try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile);
     }
+
+    pub fn reservePlaneScratch(self: *DigController, allocator: std.mem.Allocator, capacity: usize) !void {
+        self.scratch_allocator = allocator;
+        try self.plane_tile_changes.ensureTotalCapacity(allocator, capacity);
+    }
+
+    pub fn deinit(self: *DigController) void {
+        if (self.scratch_allocator) |allocator| self.plane_tile_changes.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Player + NPC plane traversal for one step. Event capacity, dense GPU edit
+    /// capacity, and missing `world_level` rows are reserved before any carve.
+    /// Landing tile changes go into `plane_tile_changes`, which must already be
+    /// reserved to at least the movement-body ceiling.
+    pub fn applyPlaneTraversalStage(
+        self: *DigController,
+        world: *WorldSystem,
+        data: *DataSystem,
+        player: *Player,
+        frame: *SimulationFrame,
+    ) !void {
+        const scratch = &self.plane_tile_changes;
+        scratch.clearRetainingCapacity();
+
+        const ai_slice = data.aiAgentSliceConst();
+        const scope_columns = data.scopeColumnsSliceConst();
+
+        var pending_carves: usize = 0;
+        var missing_world_level: usize = 0;
+        const player_entry = playerCellEntry(self, world, data, player.*);
+        if (player_entry) |entry| {
+            if (self.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
+            if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
+        }
+        for (ai_slice.entities) |entity| {
+            if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
+                if (self.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
+                if (data.worldLevelConst(entity) == null) missing_world_level += 1;
+            }
+        }
+        std.debug.assert(scratch.capacity >= pending_carves);
+        try frame.events.ensureEventAppendCapacity(pending_carves);
+        try world.ensureDenseTileEditCapacity(pending_carves);
+
+        if (missing_world_level > 0) {
+            try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
+            if (player_entry) |entry| {
+                if (data.worldLevelConst(player.entity) == null) {
+                    try data.setWorldLevel(player.entity, entry.level);
+                }
+            }
+            for (ai_slice.entities) |entity| {
+                if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
+                    if (data.worldLevelConst(entity) == null) {
+                        try data.setWorldLevel(entity, entry.level);
+                    }
+                }
+            }
+        }
+
+        if (try self.applyPlaneTraversal(world, data, player)) |change| {
+            scratch.appendAssumeCapacity(change);
+        }
+        for (ai_slice.entities) |entity| {
+            const entry = npcCellEntry(world, data, scope_columns, entity) orelse continue;
+            const result = try self.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell);
+            if (result.tile_change) |change| scratch.appendAssumeCapacity(change);
+        }
+        try frame.publishWorldTileChanges(scratch.items);
+    }
 };
+
+const PlaneCellEntry = struct {
+    level: u16,
+    cell: CellCoord,
+};
+
+fn playerCellEntry(
+    dig: *const DigController,
+    world: *const WorldSystem,
+    data: *const DataSystem,
+    player: Player,
+) ?PlaneCellEntry {
+    const body = data.movementBodyConst(player.entity) orelse return null;
+    const visual = data.primitiveVisualConst(player.entity) orelse return null;
+    const center_x = body.position.x + visual.size.x * 0.5;
+    const center_y = body.position.y + visual.size.y * 0.5;
+    const target = world.cellContaining(center_x, center_y) orelse return null;
+    const cell = CellCoord{ .x = target.x, .y = target.y };
+    if (dig.player_last_cell) |last| {
+        if (last.x == cell.x and last.y == cell.y) return null;
+    }
+    return .{ .level = player.current_level, .cell = cell };
+}
+
+fn npcCellEntry(
+    world: *const WorldSystem,
+    data: *const DataSystem,
+    scope_columns: ConstScopeColumnsSlice,
+    entity: EntityId,
+) ?PlaneCellEntry {
+    const dense_index = data.movementBodyDenseIndex(entity) orelse return null;
+    if (!scope_columns.tier[dense_index].allowsMovement()) return null;
+    const level = data.worldLevelConst(entity) orelse scope_columns.level[dense_index];
+    const body = data.movementBodyConst(entity) orelse return null;
+    const visual = data.primitiveVisualConst(entity) orelse return null;
+    const prev_center_x = body.previous_position.x + visual.size.x * 0.5;
+    const prev_center_y = body.previous_position.y + visual.size.y * 0.5;
+    const center_x = body.position.x + visual.size.x * 0.5;
+    const center_y = body.position.y + visual.size.y * 0.5;
+    const prev_cell = world.cellContaining(prev_center_x, prev_center_y) orelse return null;
+    const cell = world.cellContaining(center_x, center_y) orelse return null;
+    if (prev_cell.x == cell.x and prev_cell.y == cell.y) return null;
+    return .{ .level = level, .cell = CellCoord{ .x = cell.x, .y = cell.y } };
+}
 
 fn cellCenterWorldPos(world: *const WorldSystem, cell: CellCoord) math.Vec2 {
     return .{
@@ -390,6 +510,31 @@ const TestWorld = struct {
         self.meta.deinit();
     }
 };
+
+test "DigController plane scratch reserved-then-push is allocation-free (FailingAllocator)" {
+    var dig = DigController.init(.{});
+    defer dig.deinit();
+    try dig.reservePlaneScratch(std.testing.allocator, 2);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved = dig.scratch_allocator.?;
+    dig.scratch_allocator = failing.allocator();
+    defer dig.scratch_allocator = saved;
+
+    const change = WorldTileChangedEvent{
+        .level = 1,
+        .x = 2,
+        .y = 3,
+        .old_tile_id = 1,
+        .new_tile_id = 2,
+        .old_blocks_movement = true,
+        .new_blocks_movement = false,
+    };
+    dig.plane_tile_changes.appendAssumeCapacity(change);
+    dig.plane_tile_changes.appendAssumeCapacity(change);
+    try std.testing.expectEqual(@as(usize, 2), dig.plane_tile_changes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
 
 fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").DigIntent) !SimulationFrame {
     var frame = SimulationFrame.init(std.testing.allocator);

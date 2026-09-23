@@ -11,6 +11,9 @@ const BatchStats = @import("../../app/thread_system.zig").BatchStats;
 const ParallelRange = @import("../../app/thread_system.zig").ParallelRange;
 const ThreadSystem = @import("../../app/thread_system.zig").ThreadSystem;
 const WorkerId = @import("../../app/thread_system.zig").WorkerId;
+const SimulationFrame = @import("../simulation.zig").SimulationFrame;
+
+const default_intent_speed: f32 = 40.0;
 
 pub const MovementConfig = struct {
     items_per_range: ?usize = null,
@@ -49,6 +52,22 @@ pub const MovementSystem = struct {
 
     pub fn syncPreviousPositions(_: *MovementSystem, slice: *data.MovementBodySlice) void {
         syncPreviousPositionsImpl(slice);
+    }
+
+    /// Writes AI movement intents into velocity. Rows without an AI agent or a
+    /// living movement body are skipped. A non-positive speed uses `40`.
+    pub fn applyIntents(_: *MovementSystem, bodies: *data.DataSystem, frame: *const SimulationFrame) void {
+        for (frame.intents.mergedItems()) |item| {
+            if (item != .movement) continue;
+            const movement_intent = item.movement;
+            if (!bodies.isAlive(movement_intent.entity)) continue;
+            if (bodies.aiAgentConst(movement_intent.entity) == null) continue;
+            if (bodies.movementBodyPtr(movement_intent.entity)) |body| {
+                const speed = if (body.speed.* > 0) body.speed.* else default_intent_speed;
+                body.velocity_x.* = movement_intent.direction_x * speed;
+                body.velocity_y.* = movement_intent.direction_y * speed;
+            }
+        }
     }
 };
 

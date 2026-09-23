@@ -74,6 +74,7 @@ const SpatialIndexSystem = @import("systems/spatial_index.zig").SpatialIndexSyst
 const SpatialIndexDenseWindowGeometry = @import("systems/spatial_index.zig").DenseWindowGeometry;
 const CellCoord = @import("world_system.zig").CellCoord;
 const WorldSystem = @import("world_system.zig").WorldSystem;
+const world_gate = @import("systems/world_gate.zig");
 
 /// Coarse per-step data resources stages read/write, for the stage-ordering
 /// contract below. Some tags bundle several SoA columns owned by one system
@@ -670,6 +671,9 @@ pub const SimulationPipeline = struct {
         // gather buffer on first use, same as AiMemorySystem/PerceptionSystem.
         var affect = AffectSystem.init(allocator);
         errdefer affect.deinit();
+        var dig = DigController.init(config.dig);
+        errdefer dig.deinit();
+        try dig.reservePlaneScratch(allocator, config.movement_body_capacity + 1);
 
         return .{
             .movement = MovementSystem.init(),
@@ -683,7 +687,7 @@ pub const SimulationPipeline = struct {
             .perception = perception,
             .ai_memory = ai_memory,
             .affect = affect,
-            .dig = DigController.init(config.dig),
+            .dig = dig,
             .destructible = DestructibleController.init(),
             .audio_controller = AudioController.init(),
             .nav_cell_size = config.nav_cell_size,
@@ -696,6 +700,7 @@ pub const SimulationPipeline = struct {
     /// Releases owned processor/controller state. Borrowed gameplay data and
     /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
+        self.dig.deinit();
         self.affect.deinit();
         self.ai_memory.deinit();
         self.perception.deinit();
@@ -908,6 +913,17 @@ pub const SimulationPipeline = struct {
         collision_response: CollisionResponseStats = .{},
         destructible: DestructibleProcessStats = .{},
 
+        fn init(pipeline: *SimulationPipeline, context: SimulationPipelineUpdateContext) StepState {
+            const dropped = pipeline.action_intents_dropped_step;
+            pipeline.action_intents_dropped_step = 0;
+            var step = StepState{
+                .context = context,
+                .action_intents_dropped = dropped,
+            };
+            step.context.frame.phase = .processors;
+            return step;
+        }
+
         fn finish(self: StepState, pipeline: *const SimulationPipeline) SimulationPipelineStats {
             const scope = pipeline.buildScopeStats(
                 self.context.data,
@@ -946,15 +962,8 @@ pub const SimulationPipeline = struct {
     /// columns are derived in their own late stage after positions settle.
     /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
-        var step = StepState{
-            .context = context,
-            .action_intents_dropped = self.action_intents_dropped_step,
-        };
-        self.action_intents_dropped_step = 0;
-        step.context.frame.phase = .processors;
-        inline for (stage_order) |id| {
-            try self.runStage(id, &step);
-        }
+        var step = StepState.init(self, context);
+        inline for (stage_order) |id| try self.runStage(id, &step);
         return step.finish(self);
     }
 
@@ -1149,9 +1158,9 @@ pub const SimulationPipeline = struct {
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
     }
 
-    fn stageApplyAiMovementIntents(_: *SimulationPipeline, step: *StepState) void {
+    fn stageApplyAiMovementIntents(self: *SimulationPipeline, step: *StepState) void {
         var apply_intents_timer = StageTimer.start();
-        applyAiMovementIntents(step.context.data, step.context.frame);
+        self.movement.applyIntents(step.context.data, step.context.frame);
         apply_intents_timer.stop(step.context.perf, .pipeline_apply_intents);
     }
 
@@ -1199,13 +1208,7 @@ pub const SimulationPipeline = struct {
     fn stageBoundsAndTileGate(_: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         var clamp_timer = StageTimer.start();
-        clampAiEntitiesToBounds(context.data, context.bounds_width, context.bounds_height);
-        try context.player.clampToBounds(context.data, context.bounds_width, context.bounds_height);
-        // Gate against solid world tiles on the current plane. After collision
-        // response so a contact push into solid dirt is corrected before plane
-        // traversal and chunk derive. NPCs skip dormant tier.
-        gatePlayerToWalkableTiles(context.world, context.data, context.player.*);
-        gateNpcEntitiesToWalkableTiles(context.world, context.data);
+        try world_gate.apply(context.world, context.data, context.player, context.bounds_width, context.bounds_height);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
     }
 
@@ -1213,7 +1216,7 @@ pub const SimulationPipeline = struct {
     /// standing over a hole. Landing carves are one event range.
     fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
-        try applyPlaneTraversalStage(&self.dig, context.world, context.data, context.player, context.frame);
+        try self.dig.applyPlaneTraversalStage(context.world, context.data, context.player, context.frame);
     }
 
     /// Recompute each body's chunk from its settled position. Consumers are tier
@@ -1276,269 +1279,6 @@ pub const SimulationPipeline = struct {
 };
 
 const StageTimer = runtime_perf_log.StageTimer;
-
-fn applyAiMovementIntents(data: *DataSystem, frame: *const SimulationFrame) void {
-    for (frame.intents.mergedItems()) |item| {
-        if (item != .movement) continue;
-        const movement_intent = item.movement;
-        if (!data.isAlive(movement_intent.entity)) continue;
-        if (data.aiAgentConst(movement_intent.entity) == null) continue;
-        if (data.movementBodyPtr(movement_intent.entity)) |body| {
-            const speed = if (body.speed.* > 0) body.speed.* else 40.0;
-            body.velocity_x.* = movement_intent.direction_x * speed;
-            body.velocity_y.* = movement_intent.direction_y * speed;
-        }
-    }
-}
-
-/// Stops one dense movement row from moving into solid world tiles on `level`.
-/// No-op on level 0 (the surface is fully walkable and pre-existing decos/water
-/// are intentionally pass-through there). Resolves X then Y independently against
-/// the pre-move position so a diagonal push into a wall slides along it. The body
-/// is one tile wide; sampling the four AABB corners (with an epsilon so a flush
-/// right/bottom edge stays in the covered cell) is exact for the sub-tile motion
-/// this produces. Allocation-free, scalar. Shared by the player and NPC gates.
-fn gateBodyColumnsToWalkableTiles(
-    world: *const WorldSystem,
-    level: u16,
-    movement: *MovementBodySlice,
-    movement_index: usize,
-    size_x: f32,
-    size_y: f32,
-) void {
-    if (level == 0) return;
-    const pre_x = movement.previous_x[movement_index];
-    const pre_y = movement.previous_y[movement_index];
-    const post_x = movement.position_x[movement_index];
-    const post_y = movement.position_y[movement_index];
-
-    var resolved_x = post_x;
-    if (rectOverlapsSolidTile(world, level, post_x, pre_y, size_x, size_y)) resolved_x = pre_x;
-    var resolved_y = post_y;
-    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, size_x, size_y)) resolved_y = pre_y;
-
-    if (resolved_x != post_x) movement.velocity_x[movement_index] = 0;
-    if (resolved_y != post_y) movement.velocity_y[movement_index] = 0;
-    movement.position_x[movement_index] = resolved_x;
-    movement.position_y[movement_index] = resolved_y;
-}
-
-/// Pointer wrapper for the single-entity player gate (same math as the dense path).
-fn gateBodyToWalkableTiles(world: *const WorldSystem, level: u16, body: MovementBodyPtr, visual: PrimitiveVisual) void {
-    if (level == 0) return;
-    const w = visual.size.x;
-    const h = visual.size.y;
-    const pre_x = body.previous_x.*;
-    const pre_y = body.previous_y.*;
-    const post_x = body.position_x.*;
-    const post_y = body.position_y.*;
-
-    var resolved_x = post_x;
-    if (rectOverlapsSolidTile(world, level, post_x, pre_y, w, h)) resolved_x = pre_x;
-    var resolved_y = post_y;
-    if (rectOverlapsSolidTile(world, level, resolved_x, post_y, w, h)) resolved_y = pre_y;
-
-    if (resolved_x != post_x) body.velocity_x.* = 0;
-    if (resolved_y != post_y) body.velocity_y.* = 0;
-    body.position_x.* = resolved_x;
-    body.position_y.* = resolved_y;
-}
-
-fn gateNpcEntitiesToWalkableTiles(world: *const WorldSystem, data: *DataSystem) void {
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    const visuals = data.primitiveVisualSliceConst();
-    var movement = data.movementBodySlice();
-    // One slot resolve per AI → dense columns. Tier/level come from the movement
-    // scope row (kept in sync with world_level), not extra entity lookups.
-    for (ai_slice.entities) |entity| {
-        const indices = data.movementVisualDenseIndices(entity) orelse continue;
-        const mi = indices.movement;
-        // Dormant NPCs never move this step (movement itself skips writing their
-        // position), so gating them against world tiles is dead work — skip.
-        if (!scope_columns.tier[mi].allowsMovement()) continue;
-        gateBodyColumnsToWalkableTiles(
-            world,
-            scope_columns.level[mi],
-            &movement,
-            mi,
-            visuals.size_x[indices.visual],
-            visuals.size_y[indices.visual],
-        );
-    }
-}
-
-/// Player + NPC plane traversal for one step. Preflights event capacity, dense
-/// GPU edit capacity, and `world_level` attaches for every cell-entry candidate
-/// **before** any world mutate, then applies transitions (collecting tile
-/// changes) and publishes all carves in a single event range with one
-/// finishWrite — O(N) rather than per-fall appendRequired O(N²). Mid-loop
-/// attach OOM cannot leave earlier landings carved without events.
-fn applyPlaneTraversalStage(
-    dig: *DigController,
-    world: *WorldSystem,
-    data: *DataSystem,
-    player: *Player,
-    frame: *SimulationFrame,
-) !void {
-    const scratch = &frame.world_tile_changes_scratch;
-    scratch.clearRetainingCapacity();
-
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    try scratch.ensureTotalCapacity(frame.allocator, 1 + ai_slice.entities.len);
-
-    // Read-only preflight: count landing carves and missing world_level attaches
-    // so capacity is reserved before any world mutate.
-    var pending_carves: usize = 0;
-    var missing_world_level: usize = 0;
-    const player_entry = playerCellEntry(dig, world, data, player.*);
-    if (player_entry) |entry| {
-        if (dig.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
-        if (data.worldLevelConst(player.entity) == null) missing_world_level += 1;
-    }
-    for (ai_slice.entities) |entity| {
-        if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-            if (dig.wouldCarveLandingCell(world, entry.level, entry.cell)) pending_carves += 1;
-            if (data.worldLevelConst(entity) == null) missing_world_level += 1;
-        }
-    }
-    // Event capacity + dense GPU edit queue (when live) reserved before any
-    // carve so a mid-stage OOM cannot leave earlier falls published to world
-    // without world_tile_changed / GPU edits (multi-fall atomicity).
-    try frame.events.ensureEventAppendCapacity(pending_carves);
-    try world.ensureDenseTileEditCapacity(pending_carves);
-
-    // Attach world_level for every cell-entry candidate that lacks it before the
-    // first carve. Capacity for all missing rows is reserved first so a partial
-    // attach loop cannot leave some entities leveled and others mid-growth, then
-    // carves still safe: applyEntityPlaneTraversal's attach becomes a no-op.
-    if (missing_world_level > 0) {
-        try data.world_levels.ensureCapacity(data.allocator, data.world_levels.len() + missing_world_level);
-        if (player_entry) |entry| {
-            if (data.worldLevelConst(player.entity) == null) {
-                try data.setWorldLevel(player.entity, entry.level);
-            }
-        }
-        for (ai_slice.entities) |entity| {
-            if (npcCellEntry(world, data, scope_columns, entity)) |entry| {
-                if (data.worldLevelConst(entity) == null) {
-                    try data.setWorldLevel(entity, entry.level);
-                }
-            }
-        }
-    }
-
-    if (try dig.applyPlaneTraversal(world, data, player)) |change| {
-        scratch.appendAssumeCapacity(change);
-    }
-    for (ai_slice.entities) |entity| {
-        const entry = npcCellEntry(world, data, scope_columns, entity) orelse continue;
-        const result = try dig.applyEntityPlaneTraversal(world, data, entity, entry.level, entry.cell);
-        if (result.tile_change) |change| {
-            scratch.appendAssumeCapacity(change);
-        }
-    }
-    try frame.publishWorldTileChanges(scratch.items);
-}
-
-const NpcCellEntry = struct {
-    level: u16,
-    cell: CellCoord,
-};
-
-/// Player cell-entry probe for preflight: new cell this step (vs `player_last_cell`).
-fn playerCellEntry(
-    dig: *const DigController,
-    world: *const WorldSystem,
-    data: *const DataSystem,
-    player: Player,
-) ?NpcCellEntry {
-    const body = data.movementBodyConst(player.entity) orelse return null;
-    const visual = data.primitiveVisualConst(player.entity) orelse return null;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
-    const target = world.cellContaining(center_x, center_y) orelse return null;
-    const cell = CellCoord{ .x = target.x, .y = target.y };
-    if (dig.player_last_cell) |last| {
-        if (last.x == cell.x and last.y == cell.y) return null;
-    }
-    return .{ .level = player.current_level, .cell = cell };
-}
-
-/// NPC cell-entry probe: previous vs current body centers, skipping dormant tiers.
-/// Returns null when the NPC did not enter a new cell this step. Prefers the
-/// `world_level` component; falls back to the movement-scope level so a missing
-/// component can still be pre-attached before any carve (multi-entity safety).
-fn npcCellEntry(
-    world: *const WorldSystem,
-    data: *const DataSystem,
-    scope_columns: ConstScopeColumnsSlice,
-    entity: EntityId,
-) ?NpcCellEntry {
-    const dense_index = data.movementBodyDenseIndex(entity) orelse return null;
-    if (!scope_columns.tier[dense_index].allowsMovement()) return null;
-    const level = data.worldLevelConst(entity) orelse scope_columns.level[dense_index];
-    const body = data.movementBodyConst(entity) orelse return null;
-    const visual = data.primitiveVisualConst(entity) orelse return null;
-    const prev_center_x = body.previous_position.x + visual.size.x * 0.5;
-    const prev_center_y = body.previous_position.y + visual.size.y * 0.5;
-    const center_x = body.position.x + visual.size.x * 0.5;
-    const center_y = body.position.y + visual.size.y * 0.5;
-    const prev_cell = world.cellContaining(prev_center_x, prev_center_y) orelse return null;
-    const cell = world.cellContaining(center_x, center_y) orelse return null;
-    if (prev_cell.x == cell.x and prev_cell.y == cell.y) return null;
-    return .{ .level = level, .cell = CellCoord{ .x = cell.x, .y = cell.y } };
-}
-
-fn gatePlayerToWalkableTiles(world: *const WorldSystem, data: *DataSystem, player: Player) void {
-    const body = data.movementBodyPtr(player.entity) orelse return;
-    const visual = data.primitiveVisualConst(player.entity) orelse return;
-    gateBodyToWalkableTiles(world, player.current_level, body, visual);
-}
-
-/// Whether an axis-aligned body rect overlaps any movement-blocking tile on `level`.
-/// Off-world corners read as blocked (fail-closed), matching `levelBlocksMovement`.
-fn rectOverlapsSolidTile(world: *const WorldSystem, level: u16, x: f32, y: f32, w: f32, h: f32) bool {
-    const edge_epsilon: f32 = 0.5;
-    const sample_xs = [_]f32{ x, x + w - edge_epsilon };
-    const sample_ys = [_]f32{ y, y + h - edge_epsilon };
-    for (sample_ys) |sy| {
-        for (sample_xs) |sx| {
-            const cell = world.cellContaining(sx, sy) orelse return true;
-            if (world.levelBlocksMovement(level, cell.x, cell.y)) return true;
-        }
-    }
-    return false;
-}
-
-fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: f32) void {
-    const ai_slice = data.aiAgentSliceConst();
-    const scope_columns = data.scopeColumnsSliceConst();
-    // Size columns only — no PrimitiveVisual struct rebuild per entity.
-    const visuals = data.primitiveVisualSliceConst();
-    var movement = data.movementBodySlice();
-    // One slot resolve per AI → dense movement/visual indices, then pure SoA
-    // column writes. Matches the tile-gate path so bounds + gate share the same
-    // index resolve shape (not dual movementBodyPtr + visual index lookups).
-    for (ai_slice.entities) |entity| {
-        const indices = data.movementVisualDenseIndices(entity) orelse continue;
-        const mi = indices.movement;
-        // Dormant rows did not integrate this step; re-clamping settled poses is
-        // dead work (same skip policy as gateNpcEntitiesToWalkableTiles).
-        if (!scope_columns.tier[mi].allowsMovement()) continue;
-
-        const max_x = bounds_width - visuals.size_x[indices.visual];
-        const new_x = math.clamp(movement.position_x[mi], 0, max_x);
-        if (new_x != movement.position_x[mi]) movement.velocity_x[mi] = 0;
-        movement.position_x[mi] = new_x;
-
-        const max_y = bounds_height - visuals.size_y[indices.visual];
-        const new_y = math.clamp(movement.position_y[mi], 0, max_y);
-        if (new_y != movement.position_y[mi]) movement.velocity_y[mi] = 0;
-        movement.position_y[mi] = new_y;
-    }
-}
 
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
@@ -1676,12 +1416,12 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     defer frame.deinit();
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
-    try frame.reserveWorldTileChangesScratch(4);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -2200,7 +1940,7 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     body.velocity_x.* = 100;
     body.velocity_y.* = 100;
 
-    gatePlayerToWalkableTiles(&world, &data, player);
+    world_gate.gatePlayerToWalkableTiles(&world, &data, player);
 
     // X reverted (wall), velocity_x zeroed; Y allowed (open pocket), velocity_y kept.
     try std.testing.expectEqual(@as(f32, 3 * 32), body.position_x.*);
@@ -2213,7 +1953,7 @@ test "player tile gate slides along solid dirt and is a no-op on the surface" {
     placePlayerFlush(&data, player, .{ 3, 3 });
     body.position_x.* = 3 * 32 + 6;
     body.position_y.* = 3 * 32 + 6;
-    gatePlayerToWalkableTiles(&world, &data, player);
+    world_gate.gatePlayerToWalkableTiles(&world, &data, player);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_x.*);
     try std.testing.expectEqual(@as(f32, 3 * 32 + 6), body.position_y.*);
 }
@@ -2242,6 +1982,7 @@ test "pipeline skips NPC plane traversal for dormant tier but still falls active
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -2661,6 +2402,7 @@ test "pipeline commits the dig stage's world edit before the tile gate reads wal
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -2787,7 +2529,7 @@ test "pipeline tile gate after collision response rejects contact push into soli
 
     const body = data.movementBodyConst(player.entity).?;
     // End-of-step pose must not overlap solid tiles on level 1.
-    try std.testing.expect(!rectOverlapsSolidTile(&world, 1, body.position.x, body.position.y, 32, 32));
+    try std.testing.expect(!world_gate.rectOverlapsSolidTile(&world, 1, body.position.x, body.position.y, 32, 32));
     // And should remain in/near the carved pocket rather than deep in solid dirt.
     const cell = world.cellContaining(body.position.x + 16, body.position.y + 16).?;
     try std.testing.expectEqual(@as(u16, 3), cell.x);
@@ -2940,12 +2682,12 @@ test "pipeline plane traversal batches fall landing tile events into one range" 
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
     try frame.reservePathRequests(2, 2);
-    try frame.reserveWorldTileChangesScratch(4);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -3033,14 +2775,15 @@ test "plane traversal event capacity miss leaves landing tiles unchanged" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 0, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
     frame.beginStep();
     frame.events.setCapacityLimit(0);
 
     var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
     try std.testing.expectError(
         error.EventCapacityExceeded,
-        applyPlaneTraversalStage(&dig, &world, &data, &player, &frame),
+        dig.applyPlaneTraversalStage(&world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_before, world.denseTile(floor1, 4, 3));
     try std.testing.expect(world.denseTileBlocksMovement(floor1, 4, 3));
@@ -3080,6 +2823,8 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
     // Seed last_cell so the parked player is not a cell-entry candidate.
     const dig_config = try DigConfig.fromMeta(&meta);
     var dig = DigController.init(dig_config);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
     dig.player_last_cell = .{ .x = 1, .y = 1 };
 
     try std.testing.expectEqual(@as(usize, 0), data.world_levels.len());
@@ -3105,7 +2850,6 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
     frame.beginStep();
 
     // Fail the first data allocation (world_levels ensureCapacity / attach).
@@ -3116,7 +2860,7 @@ test "plane traversal multi-entity world_level attach OOM leaves landings uncarv
 
     try std.testing.expectError(
         error.OutOfMemory,
-        applyPlaneTraversalStage(&dig, &world, &data, &player, &frame),
+        dig.applyPlaneTraversalStage(&world, &data, &player, &frame),
     );
     try std.testing.expectEqual(landing_a, world.denseTile(floor1, 4, 3));
     try std.testing.expectEqual(landing_b, world.denseTile(floor1, 6, 3));
@@ -3163,7 +2907,6 @@ test "plane traversal multi-fall after scratch reserve is allocation-free (Faili
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
     try frame.reserveStreams(4, 16, 8, 8, 8, 8);
-    try frame.reserveWorldTileChangesScratch(4);
     // Warm the exact event append path the stage preflights + publishes through.
     try frame.events.ensureEventAppendCapacity(2);
     frame.beginStep();
@@ -3186,7 +2929,9 @@ test "plane traversal multi-fall after scratch reserve is allocation-free (Faili
     }
 
     var dig = DigController.init(dig_config);
-    try applyPlaneTraversalStage(&dig, &world, &data, &player, &frame);
+    try dig.reservePlaneScratch(std.testing.allocator, 4);
+    defer dig.deinit();
+    try dig.applyPlaneTraversalStage(&world, &data, &player, &frame);
 
     try std.testing.expectEqual(@as(usize, 2), frame.events.stats.world_tile_changed);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
@@ -3241,6 +2986,7 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4293,6 +4039,7 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .dig = dig_config,
+        .movement_body_capacity = 4,
         .perception_max_events_per_step = 8,
         .pathfinding = .{
             .max_frame_requests = 2,
