@@ -50,7 +50,9 @@ comptime {
     _ = @import("game/settings_menu_state.zig");
     _ = @import("game/player.zig");
     _ = @import("game/render_depth.zig");
+    _ = @import("game/contact_query.zig");
     _ = @import("game/render_prep.zig");
+    _ = @import("game/sensory_bus.zig");
     _ = @import("game/simulation.zig");
     _ = @import("game/simulation_pipeline.zig");
     _ = @import("game/simulation_scope.zig");

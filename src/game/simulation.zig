@@ -546,9 +546,12 @@ pub const stimulus_deferred_capacity: usize = 16;
 pub const stimulus_max_impacts_per_step: usize = 8;
 
 /// Pipeline-owned sticky one-shot dig/impact linger slots (world-size independent).
-/// One-shots linger `cognition_stagger_n` hearing windows so each stagger cohort
-/// gets a chance; footsteps stay live-bus only.
-pub const stimulus_sticky_capacity: usize = 16;
+/// One dig plus the per-step impact cap, held for `cognition_stagger_n - 1`
+/// hearing windows so each other stagger cohort gets a chance. Footsteps stay
+/// live-bus only. A full deferred-buffer drain in one step can still drop;
+/// that drop is counted (`stimuli_sticky_dropped`).
+pub const stimulus_sticky_capacity: usize = (stimulus_max_impacts_per_step + 1) *
+    (@as(usize, @import("simulation_scope.zig").cognition_stagger_n) - 1);
 
 /// A transient per-step positional stimulus AI hearing can sense. Cleared
 /// every step on the live bus, so it carries no entity identity and is not a

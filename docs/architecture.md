@@ -530,7 +530,8 @@ hot/reusable loops.
 Landed pipeline-owned domain controllers (beside processors):
 
 - `DigController` — dig intents → world-tile edits + stimuli/events
-- `AudioController` — ambient + collision SFX queues (no SDL in the controller)
+- `SensoryBus` — deferred impacts, sticky dig/impact linger, and the hearing scratch. Promote and footstep run in `dig_world_edit`; perception reads `hearingSlice` then `advanceSticky`; collision response enqueues the next step's impacts
+- `AudioController` — ambient + collision SFX queues (no SDL in the controller). Impact gain uses the same penetration scale as `SensoryBus`
 - `DestructibleController` (Slice 45) — first `action_intents` consumer:
   interact/attack → deferred `destroy_entity`/`set_destructible` +
   `destructible_destroyed` domain event; optional soft-drop particle burst

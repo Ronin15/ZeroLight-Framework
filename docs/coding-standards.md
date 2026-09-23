@@ -187,19 +187,32 @@ resources (navigation intents, movement intents, path requests, contacts, and
 similar), where a later stage's correctness depends on an earlier stage having
 already produced what it reads. This dependency is enforced at comptime, not
 by convention: `simulation_pipeline.zig`'s `stageContract()` declares each
-stage's resource reads/writes, `stage_order` is the concrete order `update()`
-runs them in, and a `comptime` block walks `stage_order` failing the build if
-any stage reads a resource no earlier stage writes.
+stage's resource reads, writes, and carried inputs, `stage_order` is a
+permutation of `StageId`, and a `comptime` block walks `stage_order` failing
+the build if any stage reads a resource no earlier stage writes.
+
+`carried` is for a value this stage consumes that no earlier stage writes:
+input captured before `update` (`action_intents`), world authoring
+(`interest_markers`), or a column a later stage writes for the next step
+(`ai_behavior` carried by `affect_update`). It is disjoint from that stage's
+reads and writes. A resource an earlier stage already writes is a read.
+
+Event payloads are four tags, not one `events` tag. A write of `world_events`
+does not satisfy a read of `perception_events`, `affect_events`, or
+`structural_events`. `structural_events` are the commit-seam payloads
+(`entity_created`, `entity_destroyed`, `component_changed`) and are external
+to the stage graph.
 
 Every new or reordered `SimulationPipeline` stage must add, in the same
 change:
 
-1. The `PipelineResource` tag(s) it reads or writes (reuse an existing tag
+1. The `PipelineResource` tag(s) it reads, writes, or carries (reuse an existing tag
    when it is the same coarse resource; do not add a redundant one-off tag).
 2. Its `StageId` slotted into `stage_order` at the position its real
    dependencies require.
-3. Its `stageContract()` arm declaring those reads/writes.
-4. The real call in `update()` at the position `stage_order` requires.
+3. Its `stageContract()` arm declaring those reads/writes/carried inputs.
+4. The stage method invoked from `runStage` (the `inline for` over
+   `stage_order` inside `update()`).
 
 `zig build check` catches a stage reading a resource before any earlier stage
 produces it. Not every real ordering dependency is expressible as a

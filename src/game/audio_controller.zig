@@ -21,6 +21,7 @@ const EntityId = @import("data_system.zig").EntityId;
 const Player = @import("player.zig").Player;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const CollisionContact = @import("simulation.zig").CollisionContact;
+const contact_query = @import("contact_query.zig");
 
 const cooldown_capacity = 32;
 const cooldown_seconds: f32 = 0.14;
@@ -96,10 +97,10 @@ pub const AudioController = struct {
     pub fn queueCollision(self: *AudioController, audio: *AudioCommandBuffer, frame: *const SimulationFrame, data: *const DataSystem, player_entity: EntityId, delta_seconds: f32) void {
         self.tickCooldowns(delta_seconds);
         for (frame.contacts.mergedItems()) |contact| {
-            if (!involvesEntity(contact, player_entity)) continue;
+            if (!contact_query.involvesEntity(contact, player_entity)) continue;
             if (self.pairOnCooldown(contact.a, contact.b)) continue;
-            const position = contactAudioPosition(data, contact) orelse continue;
-            const gain = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
+            const position = contact_query.midpoint(data, contact) orelse continue;
+            const gain = contact_query.penetrationScale(contact.penetration);
             const frequency_ratio = collisionSfxFrequencyRatio(contact);
             audio.playSfx(.{
                 .asset = collision_sfx,
@@ -172,19 +173,6 @@ pub const AudioController = struct {
 };
 
 /// Whether `entity` is either side of `contact`.
-fn involvesEntity(contact: CollisionContact, entity: EntityId) bool {
-    return contact.a.eql(entity) or contact.b.eql(entity);
-}
-
-fn contactAudioPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
-    const a = data.movementBodyConst(contact.a) orelse return null;
-    const b = data.movementBodyConst(contact.b) orelse return null;
-    return .{
-        .x = (a.position.x + b.position.x) * 0.5,
-        .y = (a.position.y + b.position.y) * 0.5,
-    };
-}
-
 fn collisionSfxFrequencyRatio(contact: CollisionContact) f32 {
     var hash = CollisionSfxCooldown.keyFor(contact.a, contact.b);
     hash ^= hashBitsFromFloat(@abs(contact.normal_x) * 31.0);

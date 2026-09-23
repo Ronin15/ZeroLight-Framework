@@ -88,7 +88,7 @@ Use this index to choose the next slice; **implement from that slice's section**
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
-| **48** | Not started | SimulationPipeline thin-composer restoration — bind `stage_order` to execution, extract `SensoryBus`, evict movement/world domain logic, own event/allocation budgets. Land as independent steps |
+| **48** | Partial | SimulationPipeline thin-composer restoration — contract vocabulary, `runStage`, and `SensoryBus` landed; domain eviction, budgets, causal tests, and follow-ups still open |
 
 **Recently settled (archive only):** 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
@@ -1226,7 +1226,8 @@ only stable IDs and enum/scalar columns, never paths or live handles.
 
 ## Slice 48: SimulationPipeline Thin-Composer Restoration
 
-**Status: not started.** Structural refactor surfaced by the architecture
+**Status: partial.** Contract vocabulary, `runStage`, and `SensoryBus` are landed.
+Structural refactor surfaced by the architecture
 review. Land as independently-shippable steps in the listed order, never as one
 change; each step is separately bisectable.
 
@@ -1254,21 +1255,21 @@ actually runs and the composer stops owning cross-step state and policy.
 
 ### Checklist (each step independently landable)
 
-- [ ] **Contract vocabulary** (declaration-only): add a `carried` field to
+- [x] **Contract vocabulary** (declaration-only): add a `carried` field to
       `StageContract` (checked disjoint from `reads`, required to be written by
       some stage) so `.reads = .empty` regains its meaning; split `.events` into
       `perception_events`/`affect_events`/`world_events`/`structural_events` (a
       stage-0-written tag must not vacuously satisfy every downstream read); add
       `.stimuli`/`.interest_markers`/`.ai_behavior` tags and `ai_decide`'s
       missing write; add a `stage_order` permutation comptime check.
-- [ ] **Bind the graph**: add `StepState`, one private `stage<Name>` method per
+- [x] **Bind the graph**: add `StepState`, one private `stage<Name>` method per
       stage (carrying its own `StageTimer`), `runStage(comptime id)` with an
       exhaustive switch, and `inline for (stage_order) |id| try runStage(...)`;
       `update()` drops to ~6 lines. Delete `.action_intent_capture` (no body) →
       `carried = {action_intents}` on `.action_react`. Watch `zig build check`
       eval-branch quota; if it bites, split the switch by stage-half — never a
       runtime dispatch table on the frame path.
-- [ ] **Extract `SensoryBus`** (`src/game/sensory_bus.zig`, in the
+- [x] **Extract `SensoryBus`** (`src/game/sensory_bus.zig`, in the
       DigController/AudioController mold): move the sensory state fields + the
       free functions (already written with `pipeline: *SimulationPipeline`
       first) + thresholds; add `StimulusConfig` mirroring `DigConfig`; split

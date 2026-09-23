@@ -23,7 +23,10 @@ const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const DestructibleController = @import("destructible_controller.zig").DestructibleController;
+const DestructibleProcessStats = @import("destructible_controller.zig").DestructibleProcessStats;
 const AudioController = @import("audio_controller.zig").AudioController;
+const SensoryBus = @import("sensory_bus.zig").SensoryBus;
+const StimulusConfig = @import("sensory_bus.zig").StimulusConfig;
 const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const AudioCommandBuffer = @import("../app/audio.zig").AudioCommandBuffer;
 const InputState = @import("../app/input.zig").InputState;
@@ -78,7 +81,21 @@ const WorldSystem = @import("world_system.zig").WorldSystem;
 /// columns together) rather than tracking every field individually.
 const PipelineResource = enum {
     world_tiles,
-    events,
+    /// `entity_perceived` / `entity_lost`. A dig write of `world_events` does not satisfy this.
+    perception_events,
+    /// `affect_threshold_crossed`.
+    affect_events,
+    /// World-domain payloads: tile/obstacle/nav changes and `destructible_destroyed`.
+    world_events,
+    /// `entity_created` / `entity_destroyed` / `component_changed`, emitted at structural commit
+    /// after `update`. External to the stage graph.
+    structural_events,
+    /// Live `frame.stimuli` bus (promote, dig, footstep) read by perception the same step.
+    stimuli,
+    /// `AiAgent.active_behavior`. Written by `ai_decide`; `affect_update` carries the previous step.
+    ai_behavior,
+    /// `WorldSystem` interest markers. Authored outside the step; `ai_decide` carries them.
+    interest_markers,
     ai_halo_indices,
     ai_cognition_indices,
     spatial_index,
@@ -106,7 +123,6 @@ fn resources(comptime items: []const PipelineResource) ResourceSet {
 
 const StageId = enum {
     dig_world_edit,
-    action_intent_capture,
     scope_advance_and_ai_gather,
     spatial_index_build,
     perception_update,
@@ -127,35 +143,52 @@ const StageId = enum {
     tier_policy,
 };
 
-const StageContract = struct { reads: ResourceSet, writes: ResourceSet };
+const StageContract = struct {
+    reads: ResourceSet = .empty,
+    writes: ResourceSet = .empty,
+    /// Consumed this step, but not written by an earlier stage. Either produced
+    /// outside `update` (`external_resources`) or written by a later stage for
+    /// the next step's reader. Disjoint from `reads` and `writes`.
+    carried: ResourceSet = .empty,
+};
+
+/// Resources produced outside `stage_order`: input capture, world authoring, or
+/// the post-`update` structural commit.
+const external_resources = resources(&.{ .action_intents, .interest_markers, .structural_events });
 
 /// Declares each stage's resource reads/writes against `stage_order` below.
 /// Checked at comptime: a stage cannot read a resource no earlier stage in
-/// `stage_order` writes.
+/// `stage_order` writes. `carried` is the exception for values that arrive from
+/// outside this step's graph.
 fn stageContract(stage: StageId) StageContract {
     return switch (stage) {
-        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .events }) },
-        // Contract-only resource handoff — NOT a wall-clock stage body.
-        // Wall-clock emit: `main_thread_inputs` → `captureActionIntent` before
-        // `update()` (before dig). `stage_order` may list this tag after dig for
-        // graph bookkeeping only; do not schedule dig-dependent action logic
-        // as if capture runs after dig process.
-        .action_intent_capture => .{ .reads = .empty, .writes = resources(&.{.action_intents}) },
+        // Stimulus writes (promote, dig append, footstep) run inside this stage,
+        // before perception reads the live bus.
+        .dig_world_edit => .{ .reads = .empty, .writes = resources(&.{ .world_tiles, .world_events, .stimuli }) },
         .scope_advance_and_ai_gather => .{ .reads = .empty, .writes = resources(&.{ .ai_halo_indices, .ai_cognition_indices }) },
         .spatial_index_build => .{ .reads = resources(&.{.ai_halo_indices}), .writes = resources(&.{.spatial_index}) },
         // Queries the spatial index for hostile candidates (halo) and writes sensed
         // state for this step's observers (think set); also emits acquisition/loss
         // transition events (Slice 29). Reads world_tiles for line-of-sight /
         // occlusion against the dig-authored floor state from dig_world_edit.
-        .perception_update => .{ .reads = resources(&.{ .ai_halo_indices, .ai_cognition_indices, .spatial_index, .world_tiles }), .writes = resources(&.{ .perception_sensed, .events }) },
+        // Reads `stimuli` authored at dig_world_edit (live bus + hearing scratch).
+        .perception_update => .{ .reads = resources(&.{ .ai_halo_indices, .ai_cognition_indices, .spatial_index, .world_tiles, .stimuli }), .writes = resources(&.{ .perception_sensed, .perception_events }) },
         // Refreshes from this step's perception transition events (Slice 30),
         // reading the acquired target's last-seen position from perception_sensed.
-        .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
+        .ai_memory_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_events, .perception_sensed }), .writes = resources(&.{.ai_memory}) },
         // Appraises this step's just-written perception + memory columns into drives
-        // (Slice 31); arbitration (Slice 32), wired into ai_decide below, is the
-        // first affect_drives reader.
-        .affect_update => .{ .reads = resources(&.{ .ai_cognition_indices, .perception_sensed, .ai_memory }), .writes = resources(&.{ .affect_drives, .events }) },
-        .ai_decide => .{ .reads = resources(&.{ .ai_cognition_indices, .ai_halo_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }), .writes = resources(&.{.navigation_intents}) },
+        // (Slice 31). Carries `ai_behavior` from the previous step; `ai_decide`
+        // writes the new mode later in this step.
+        .affect_update => .{
+            .reads = resources(&.{ .ai_cognition_indices, .perception_sensed, .ai_memory }),
+            .writes = resources(&.{ .affect_drives, .affect_events }),
+            .carried = resources(&.{.ai_behavior}),
+        },
+        .ai_decide => .{
+            .reads = resources(&.{ .ai_cognition_indices, .ai_halo_indices, .spatial_index, .perception_sensed, .ai_memory, .affect_drives }),
+            .writes = resources(&.{ .navigation_intents, .ai_behavior }),
+            .carried = resources(&.{.interest_markers}),
+        },
         .steering_update => .{ .reads = resources(&.{.navigation_intents}), .writes = resources(&.{ .movement_intents, .path_requests }) },
         .pathfinding_update => .{ .reads = resources(&.{.path_requests}), .writes = .empty },
         .apply_ai_movement_intents => .{ .reads = resources(&.{.movement_intents}), .writes = resources(&.{.movement_positions}) },
@@ -177,16 +210,18 @@ fn stageContract(stage: StageId) StageContract {
         .collision_detect => .{ .reads = resources(&.{ .movement_positions, .collision_scope_indices }), .writes = resources(&.{.contacts}) },
         .collision_respond => .{ .reads = resources(&.{.contacts}), .writes = resources(&.{ .movement_positions, .collision_triggers }) },
         // Reads hole/ramp walkability from world_tiles; may carve landing cells
-        // (writes world_tiles + events) and snaps body x/y/z on fall
+        // (writes world_tiles + world_events) and snaps body x/y/z on fall
         // (writes movement_positions + world_level).
-        .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .events, .movement_positions }) },
-        // DestructibleController consumes merged action intents and queues
-        // structural commands + domain events. Target resolve reads settled poses
+        .plane_traversal => .{ .reads = resources(&.{ .movement_positions, .world_tiles }), .writes = resources(&.{ .world_tiles, .world_level, .world_events, .movement_positions }) },
+        // DestructibleController consumes action intents captured before `update`
+        // (`carried`, not written by a stage) and queues structural commands plus
+        // `destructible_destroyed` world events. Target resolve reads settled poses
         // and world_level columns. tier_policy also writes structural_commands
         // afterward via RangeOutputStream multi-producer append.
         .action_react => .{
-            .reads = resources(&.{ .action_intents, .movement_positions, .world_level }),
-            .writes = resources(&.{ .structural_commands, .events }),
+            .reads = resources(&.{ .movement_positions, .world_level }),
+            .writes = resources(&.{ .structural_commands, .world_events }),
+            .carried = resources(&.{.action_intents}),
         },
         .tier_policy => .{ .reads = resources(&.{ .movement_positions, .chunk_columns }), .writes = resources(&.{.structural_commands}) },
     };
@@ -222,7 +257,6 @@ fn stageDerivations(stage: StageId) []const Derivation {
 /// walkable for movement + gate. Bounds clamp shares the gate stage.
 const stage_order = [_]StageId{
     .dig_world_edit,
-    .action_intent_capture,
     .scope_advance_and_ai_gather,
     .spatial_index_build,
     .perception_update,
@@ -244,13 +278,66 @@ const stage_order = [_]StageId{
 };
 
 comptime {
-    var produced: ResourceSet = .empty;
+    // EnumSet insert/union/intersect each walk the resource bits. One cached
+    // contract per stage plus the carried checks exceed the default 1000.
+    @setEvalBranchQuota(4000);
+    if (stage_order.len != @typeInfo(StageId).@"enum".fields.len) {
+        @compileError("SimulationPipeline stage_order must list every StageId exactly once");
+    }
+    var seen = [_]bool{false} ** stage_order.len;
     for (stage_order) |stage| {
-        const contract = stageContract(stage);
+        const index = @intFromEnum(stage);
+        if (seen[index]) {
+            @compileError("SimulationPipeline stage_order lists '" ++ @tagName(stage) ++ "' more than once");
+        }
+        seen[index] = true;
+    }
+
+    // One `stageContract` evaluation per stage. Repeating it inside the
+    // freshness walk rebuilds EnumSets and blows the comptime branch quota.
+    var contracts: [stage_order.len]StageContract = undefined;
+    for (stage_order, 0..) |stage, index| contracts[index] = stageContract(stage);
+
+    // Writes of every stage after index i, so a carried input can be checked
+    // against "a later stage writes this" without a resource×stage scan.
+    var later_writes = [_]ResourceSet{.empty} ** stage_order.len;
+    {
+        var later: ResourceSet = .empty;
+        var index = stage_order.len;
+        while (index > 0) {
+            index -= 1;
+            later_writes[index] = later;
+            later.setUnion(contracts[index].writes);
+        }
+    }
+
+    var produced: ResourceSet = .empty;
+    for (stage_order, 0..) |stage, stage_index| {
+        const contract = contracts[stage_index];
+        if (contract.carried.intersectWith(contract.reads).count() != 0 or
+            contract.carried.intersectWith(contract.writes).count() != 0)
+        {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' carries a resource it also reads or writes — carried is disjoint from both");
+        }
         const unmet = contract.reads.differenceWith(produced);
         if (unmet.count() != 0) {
             @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
                 "' reads a resource no earlier stage writes — fix stage_order or stageContract()");
+        }
+        if (contract.carried.intersectWith(produced).count() != 0) {
+            @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                "' carries a resource an earlier stage writes — declare it as a read");
+        }
+        const unjustified = contract.carried.differenceWith(external_resources).differenceWith(later_writes[stage_index]);
+        if (unjustified.count() != 0) {
+            for (std.meta.fields(PipelineResource)) |field| {
+                const resource: PipelineResource = @enumFromInt(field.value);
+                if (!unjustified.contains(resource)) continue;
+                @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
+                    "' carries '" ++ field.name ++
+                    "', which is neither external nor written by a later stage");
+            }
         }
         produced.setUnion(contract.writes);
     }
@@ -261,13 +348,13 @@ comptime {
     // consumer reads a value computed from superseded inputs.
     for (stage_order, 0..) |producer_stage, producer_i| {
         for (stageDerivations(producer_stage)) |derivation| {
-            for (stage_order[producer_i + 1 ..], producer_i + 1..) |consumer_stage, consumer_i| {
-                if (!stageContract(consumer_stage).reads.contains(derivation.output)) continue;
-                for (stage_order[producer_i + 1 .. consumer_i]) |between_stage| {
-                    if (stageContract(between_stage).writes.intersectWith(derivation.inputs).count() != 0) {
+            for (producer_i + 1..stage_order.len) |consumer_i| {
+                if (!contracts[consumer_i].reads.contains(derivation.output)) continue;
+                for (producer_i + 1..consumer_i) |between_i| {
+                    if (contracts[between_i].writes.intersectWith(derivation.inputs).count() != 0) {
                         @compileError("SimulationPipeline: derived resource '" ++ @tagName(derivation.output) ++
                             "' from '" ++ @tagName(producer_stage) ++ "' is stale before consumer '" ++
-                            @tagName(consumer_stage) ++ "': stage '" ++ @tagName(between_stage) ++
+                            @tagName(stage_order[consumer_i]) ++ "': stage '" ++ @tagName(stage_order[between_i]) ++
                             "' overwrites an input in between — move the deriving stage after the last input writer that precedes the consumer");
                     }
                 }
@@ -302,6 +389,7 @@ pub const SimulationPipelineConfig = struct {
     /// caller against its own event-capacity budget, same as
     /// `perception_max_events_per_step`; defaults to 0.
     affect_max_events_per_step: usize = 0,
+    stimuli: StimulusConfig = .{},
 };
 
 /// Borrowed per-step inputs for pipeline update.
@@ -480,170 +568,6 @@ fn metric(value: usize) u64 {
     return @intCast(value);
 }
 
-/// Squared speed threshold for emitting one player footstep per step.
-const footstep_velocity_sq_threshold: f32 = 1.0;
-
-/// Minimum penetration before a zero-velocity contact may still enqueue impact
-/// (only when relative velocity is also non-trivial).
-const impact_min_penetration: f32 = 1.0;
-
-const hearing_stimuli_scratch_capacity: usize = stimulus_live_capacity + stimulus_sticky_capacity;
-
-comptime {
-    // sticky_remaining stores the per-entry linger count in a u8.
-    std.debug.assert(cognition_stagger_n - 1 <= std.math.maxInt(u8));
-}
-
-fn contactInvolvesEntity(contact: CollisionContact, entity: EntityId) bool {
-    return contact.a.eql(entity) or contact.b.eql(entity);
-}
-
-fn contactStimulusPosition(data: *const DataSystem, contact: CollisionContact) ?math.Vec2 {
-    const a = data.movementBodyConst(contact.a) orelse return null;
-    const b = data.movementBodyConst(contact.b) orelse return null;
-    return .{
-        .x = (a.position.x + b.position.x) * 0.5,
-        .y = (a.position.y + b.position.y) * 0.5,
-    };
-}
-
-fn impactStimulusIntensity(contact: CollisionContact) f32 {
-    const scale = std.math.clamp(contact.penetration / 18.0, 0.25, 1.0);
-    return defaultStimulusIntensity(.impact) * scale;
-}
-
-fn contactEligibleForImpactStimulus(contact: CollisionContact) bool {
-    // Velocity comes from the contact's pre-response snapshot; reading the live
-    // movement columns here would see the approach axis already zeroed by
-    // collision response, silencing head-on hits.
-    if (contact.pre_response_max_speed_sq >= footstep_velocity_sq_threshold) return true;
-    if (contact.penetration < impact_min_penetration) return false;
-    return contact.pre_response_relative_speed_sq >= footstep_velocity_sq_threshold;
-}
-
-/// Moves pipeline-deferred impacts onto the live per-step bus before perception.
-fn promoteDeferredStimuli(
-    pipeline: *SimulationPipeline,
-    frame: *SimulationFrame,
-    live_dropped: *usize,
-) usize {
-    const pending = pipeline.deferred_stimulus_count;
-    var promoted: usize = 0;
-    var retained: usize = 0;
-    for (pipeline.deferred_stimuli[0..pending]) |stimulus| {
-        if (frame.tryAppendStimulus(stimulus, stimulus_live_capacity)) {
-            promoted += 1;
-        } else {
-            pipeline.deferred_stimuli[retained] = stimulus;
-            retained += 1;
-            live_dropped.* += 1;
-        }
-    }
-    pipeline.deferred_stimulus_count = retained;
-    return promoted;
-}
-
-fn rebuildHearingStimuliScratch(pipeline: *SimulationPipeline, frame: *const SimulationFrame) []const WorldStimulus {
-    const live = frame.stimuli.mergedItems();
-    var len: usize = 0;
-    for (live) |stimulus| {
-        std.debug.assert(len < hearing_stimuli_scratch_capacity);
-        pipeline.hearing_stimuli_scratch[len] = stimulus;
-        len += 1;
-    }
-    for (0..pipeline.sticky_count) |i| {
-        if (pipeline.sticky_remaining[i] == 0) continue;
-        std.debug.assert(len < hearing_stimuli_scratch_capacity);
-        pipeline.hearing_stimuli_scratch[len] = pipeline.sticky_stimuli[i];
-        len += 1;
-    }
-    return pipeline.hearing_stimuli_scratch[0..len];
-}
-
-/// Ages one-shot sticky stimuli one stagger step, then captures this step's
-/// dig/impact stimuli into freed slots. The age-before-capture order is internal
-/// so it cannot be reordered by a caller; captures past the fixed sticky
-/// capacity are dropped and counted rather than silently discarded.
-fn advanceStickyStimuli(pipeline: *SimulationPipeline, frame: *const SimulationFrame, sticky_dropped: *usize) void {
-    var write: usize = 0;
-    for (0..pipeline.sticky_count) |i| {
-        const remaining = pipeline.sticky_remaining[i];
-        if (remaining <= 1) continue;
-        pipeline.sticky_stimuli[write] = pipeline.sticky_stimuli[i];
-        pipeline.sticky_remaining[write] = remaining - 1;
-        write += 1;
-    }
-    pipeline.sticky_count = write;
-
-    const linger = cognition_stagger_n - 1;
-    if (linger == 0) return;
-    for (frame.stimuli.mergedItems()) |stimulus| {
-        switch (stimulus.kind) {
-            .dig, .impact => {},
-            .footstep => continue,
-        }
-        if (pipeline.sticky_count >= stimulus_sticky_capacity) {
-            sticky_dropped.* += 1;
-            continue;
-        }
-        pipeline.sticky_stimuli[pipeline.sticky_count] = stimulus;
-        pipeline.sticky_remaining[pipeline.sticky_count] = linger;
-        pipeline.sticky_count += 1;
-    }
-}
-
-/// At most one footstep when the player's movement body carries non-trivial velocity.
-fn tryAppendPlayerFootstepStimulus(
-    frame: *SimulationFrame,
-    data: *const DataSystem,
-    player: Player,
-    live_dropped: *usize,
-) void {
-    const body = data.movementBodyConst(player.entity) orelse return;
-    const vel_sq = body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y;
-    if (vel_sq < footstep_velocity_sq_threshold) return;
-    const appended = frame.tryAppendStimulus(.{
-        .position = body.position,
-        .intensity = defaultStimulusIntensity(.footstep),
-        .kind = .footstep,
-        .level = player.current_level,
-    }, stimulus_live_capacity);
-    if (!appended) live_dropped.* += 1;
-}
-
-/// Enqueues player-involving collision contacts as next-step impact stimuli.
-fn enqueuePlayerCollisionImpactsToDeferred(
-    pipeline: *SimulationPipeline,
-    frame: *const SimulationFrame,
-    data: *const DataSystem,
-    player_entity: EntityId,
-    player_level: u16,
-    deferred_dropped: *usize,
-) void {
-    var enqueued: usize = 0;
-    for (frame.contacts.mergedItems()) |contact| {
-        if (!contactInvolvesEntity(contact, player_entity)) continue;
-        if (!contactEligibleForImpactStimulus(contact)) continue;
-        if (enqueued >= stimulus_max_impacts_per_step) {
-            deferred_dropped.* += 1;
-            continue;
-        }
-        const position = contactStimulusPosition(data, contact) orelse continue;
-        if (pipeline.deferred_stimulus_count >= stimulus_deferred_capacity) {
-            deferred_dropped.* += 1;
-            continue;
-        }
-        pipeline.deferred_stimuli[pipeline.deferred_stimulus_count] = .{
-            .position = position,
-            .intensity = impactStimulusIntensity(contact),
-            .kind = .impact,
-            .level = player_level,
-        };
-        pipeline.deferred_stimulus_count += 1;
-        enqueued += 1;
-    }
-}
-
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global
 /// scheduler, registry, or callback-driven dependency graph.
@@ -686,15 +610,8 @@ pub const SimulationPipeline = struct {
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
     affect_max_events_per_step: usize,
-    /// Pipeline-owned deferred impact buffer (Slice 39): survives `beginStep`
-    /// until promoted before perception on the next `update`.
-    deferred_stimuli: [stimulus_deferred_capacity]WorldStimulus = undefined,
-    deferred_stimulus_count: usize = 0,
-    /// One-shot dig/impact linger for cognition stagger (not cleared on `beginStep`).
-    sticky_stimuli: [stimulus_sticky_capacity]WorldStimulus = undefined,
-    sticky_remaining: [stimulus_sticky_capacity]u8 = undefined,
-    sticky_count: usize = 0,
-    hearing_stimuli_scratch: [hearing_stimuli_scratch_capacity]WorldStimulus = undefined,
+    /// Deferred impacts, sticky linger, and the hearing scratch. Survives `beginStep`.
+    sensory: SensoryBus,
     /// Rising-edge latch for `Action.interact` (one press per fixed step).
     /// Advanced only after a successful append so a soft-dropped press can retry.
     interact_held_last: bool = false,
@@ -772,6 +689,7 @@ pub const SimulationPipeline = struct {
             .nav_cell_size = config.nav_cell_size,
             .perception_max_events_per_step = config.perception_max_events_per_step,
             .affect_max_events_per_step = config.affect_max_events_per_step,
+            .sensory = SensoryBus.init(config.stimuli),
         };
     }
 
@@ -964,63 +882,156 @@ pub const SimulationPipeline = struct {
         self.movement.syncPreviousPositions(&movement_slice);
     }
 
-    /// Runs the current full-active fixed-step stage order and returns stage
-    /// stats. Scope selection uses the live camera cognition halo (index/
-    /// candidates) plus stagger (think set); chunk columns are derived in their
-    /// own late stage after positions settle.
+    /// Per-step values produced by one stage and read by a later stage or by
+    /// `finish`. Not persistent. Indices alias scope scratch owned by the pipeline.
+    const StepState = struct {
+        context: SimulationPipelineUpdateContext,
+        stimuli_live_dropped: usize = 0,
+        stimuli_deferred_dropped: usize = 0,
+        stimuli_sticky_dropped: usize = 0,
+        stimuli_promoted: usize = 0,
+        action_intents_dropped: usize = 0,
+        cognition_region: ?ActiveRegion = null,
+        ai_halo_indices: []const u32 = &[_]u32{},
+        ai_cognition_indices: []const u32 = &[_]u32{},
+        collision_scope_indices: ?[]const u32 = null,
+        spatial_index: SpatialIndexStats = .{},
+        perception: PerceptionStats = .{},
+        ai_memory: AiMemoryStats = .{},
+        affect: AffectStats = .{},
+        ai: AiStats = .{},
+        steering: SteeringStats = .{},
+        pathfinding: PathfindingStats = .{},
+        movement: MovementStats = .{},
+        chunk_derive: BatchStats = .{},
+        collision: CollisionStats = .{},
+        collision_response: CollisionResponseStats = .{},
+        destructible: DestructibleProcessStats = .{},
+
+        fn finish(self: StepState, pipeline: *const SimulationPipeline) SimulationPipelineStats {
+            const scope = pipeline.buildScopeStats(
+                self.context.data,
+                self.cognition_region,
+                self.ai_cognition_indices,
+                self.collision_scope_indices,
+                self.steering,
+            );
+            return .{
+                .scope = scope,
+                .spatial_index = self.spatial_index,
+                .perception = self.perception,
+                .ai_memory = self.ai_memory,
+                .affect = self.affect,
+                .ai = self.ai,
+                .steering = self.steering,
+                .pathfinding = self.pathfinding,
+                .movement = self.movement,
+                .chunk_derive = self.chunk_derive,
+                .collision = self.collision,
+                .collision_response = self.collision_response,
+                .stimuli_live_dropped = self.stimuli_live_dropped,
+                .stimuli_deferred_dropped = self.stimuli_deferred_dropped,
+                .stimuli_sticky_dropped = self.stimuli_sticky_dropped,
+                .stimuli_promoted = self.stimuli_promoted,
+                .action_intents_consumed = self.destructible.intents_consumed,
+                .action_intents_dropped = self.action_intents_dropped,
+                .destructibles_destroyed = self.destructible.destroyed,
+                .destructibles_hit = self.destructible.hits,
+            };
+        }
+    };
+
+    /// Runs `stage_order` and returns stage stats. Scope selection uses the live
+    /// camera cognition halo (index/candidates) plus stagger (think set); chunk
+    /// columns are derived in their own late stage after positions settle.
+    /// Action intents are already on the frame from `captureActionIntent`.
     pub fn update(self: *SimulationPipeline, context: SimulationPipelineUpdateContext) !SimulationPipelineStats {
-        const data = context.data;
-        const frame = context.frame;
-
-        frame.phase = .processors;
-        var stimuli_live_dropped: usize = 0;
-        var stimuli_deferred_dropped: usize = 0;
-        var stimuli_sticky_dropped: usize = 0;
-        // Capture-phase soft-drops accumulate on the pipeline field before update;
-        // fold into this step's stats and clear for the next input phase.
-        const action_intents_dropped = self.action_intents_dropped_step;
+        var step = StepState{
+            .context = context,
+            .action_intents_dropped = self.action_intents_dropped_step,
+        };
         self.action_intents_dropped_step = 0;
-        const stimuli_promoted = promoteDeferredStimuli(self, frame, &stimuli_live_dropped);
-        // Player-authored world edit. Runs after deferred promote; its
-        // world_tile_changed event is deferred and re-masks navigation in
-        // merge_outputs regardless of order.
-        try self.dig.process(context.world, data, context.player.*, frame);
-        tryAppendPlayerFootstepStimulus(frame, data, context.player.*, &stimuli_live_dropped);
-        // `action_intent_capture` is a contract-only stage: intents were already
-        // appended in `main_thread_inputs` (before this function).
+        step.context.frame.phase = .processors;
+        inline for (stage_order) |id| {
+            try self.runStage(id, &step);
+        }
+        return step.finish(self);
+    }
 
-        // Backbone scope pass. Advance the stagger clock, derive the camera
-        // cognition halo, and select the two cognition populations for this step:
-        // unstaggered halo (spatial index + perception candidates) and the
-        // stagger-filtered think set (observers, memory, affect, AI decide).
-        // Chunk columns are derived later in `chunk_derive` from each body's
-        // final settled position (after integrate, collision, tile gate, and plane
-        // traversal) — not in-pass during movement. The AI gather reads the chunk
-        // written last step (the body's current pre-move cell). Movement/collision
-        // gate on tier only (no chunk filter), so they keep running off-screen.
+    fn runStage(self: *SimulationPipeline, comptime id: StageId, step: *StepState) !void {
+        switch (id) {
+            .dig_world_edit => try self.stageDigWorldEdit(step),
+            .scope_advance_and_ai_gather => try self.stageScopeAdvanceAndAiGather(step),
+            .spatial_index_build => try self.stageSpatialIndexBuild(step),
+            .perception_update => try self.stagePerceptionUpdate(step),
+            .ai_memory_update => try self.stageAiMemoryUpdate(step),
+            .affect_update => try self.stageAffectUpdate(step),
+            .ai_decide => try self.stageAiDecide(step),
+            .steering_update => try self.stageSteeringUpdate(step),
+            .pathfinding_update => try self.stagePathfindingUpdate(step),
+            .apply_ai_movement_intents => self.stageApplyAiMovementIntents(step),
+            .movement_integrate => self.stageMovementIntegrate(step),
+            .collision_scope_gather => try self.stageCollisionScopeGather(step),
+            .collision_detect => try self.stageCollisionDetect(step),
+            .collision_respond => try self.stageCollisionRespond(step),
+            .bounds_and_tile_gate => try self.stageBoundsAndTileGate(step),
+            .plane_traversal => try self.stagePlaneTraversal(step),
+            .chunk_derive => self.stageChunkDerive(step),
+            .action_react => try self.stageActionReact(step),
+            .tier_policy => try self.stageTierPolicy(step),
+        }
+    }
+
+    fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        // Promote, then dig, then at most one footstep, before perception reads stimuli.
+        step.stimuli_promoted = self.sensory.promote(context.frame, &step.stimuli_live_dropped);
+        // Player-authored world edit. Its world_tile_changed event is deferred and
+        // re-masks navigation in merge_outputs regardless of order.
+        try self.dig.process(context.world, context.data, context.player.*, context.frame);
+        self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+    }
+
+    /// Advance the stagger clock, derive the camera cognition halo, and select the
+    /// two cognition populations for this step: unstaggered halo (spatial index +
+    /// perception candidates) and the stagger-filtered think set. Chunk columns are
+    /// derived later in `chunk_derive`. The AI gather reads the chunk written last
+    /// step. Movement/collision gate on tier only, so they keep running off-screen.
+    fn stageScopeAdvanceAndAiGather(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         self.scope.advanceStep();
-        const cognition_region: ?ActiveRegion = context.world.cognitionActiveRegion(cognition_halo_chunks);
+        step.cognition_region = context.world.cognitionActiveRegion(cognition_halo_chunks);
         const stagger_step = self.scope.staggerStep();
-        const ai_pops = try self.scope.gatherAiPopulations(data, cognition_region, stagger_step, context.thread_system, .{});
-        const ai_halo_indices = ai_pops.halo;
-        const ai_cognition_indices = ai_pops.cognition;
+        const ai_pops = try self.scope.gatherAiPopulations(context.data, step.cognition_region, stagger_step, context.thread_system, .{});
+        step.ai_halo_indices = ai_pops.halo;
+        step.ai_cognition_indices = ai_pops.cognition;
+    }
 
-        const ai_slice = data.aiAgentSliceConst();
-        const move_slice = data.movementBodySliceConst();
-
-        // Shared spatial index (Slice 28): built once from the unstaggered halo,
-        // from the same prior positions the candidate walks read. Index row `i`
-        // matches PerceptionSystem/AiSystem candidate row `i`; think rows map via
-        // `spatial_self_index` (see spatial_index.zig, perception.zig, ai.zig).
+    /// Shared spatial index (Slice 28): built once from the unstaggered halo, from
+    /// the same prior positions the candidate walks read. Index row `i` matches
+    /// PerceptionSystem/AiSystem candidate row `i`; think rows map via
+    /// `spatial_self_index`.
+    fn stageSpatialIndexBuild(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
         var spatial_index_timer = StageTimer.start();
-        const spatial_index_stats = try self.spatial_index.build(ai_slice, move_slice, data, context.thread_system, .{ .scope_dense_indices = ai_halo_indices });
+        step.spatial_index = try self.spatial_index.build(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            data,
+            context.thread_system,
+            .{ .scope_dense_indices = step.ai_halo_indices },
+        );
         spatial_index_timer.stop(context.perf, .pipeline_spatial_index);
+    }
 
-        // Perception substrate (Slice 29): queries the just-built spatial index
-        // for hostile candidates within vision/FOV/line-of-sight over the halo
-        // candidate set, writing sensed state only for this step's think-set
-        // observers. The player is folded in as an extra hostile candidate
-        // alongside spatial-index neighbors.
+    /// Perception (Slice 29): hostile candidates within vision/FOV/line-of-sight
+    /// over the halo, writing sensed state only for this step's think-set observers.
+    /// The player is folded in as an extra hostile candidate. Sticky dig/impact
+    /// stimuli advance after this step's hearing read.
+    fn stagePerceptionUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
         const perception_player_candidate: ?PlayerPerceptionCandidate = if (data.movementBodyConst(context.player.entity)) |pbody|
             .{
                 .entity = context.player.entity,
@@ -1032,235 +1043,215 @@ pub const SimulationPipeline = struct {
         else
             null;
 
-        const hearing_stimuli = rebuildHearingStimuliScratch(self, frame);
+        const hearing_stimuli = self.sensory.hearingSlice(context.frame);
         var perception_timer = StageTimer.start();
-        const perception_stats = try self.perception.update(ai_slice, move_slice, self.spatial_index.view(), context.world, data, &frame.events, context.thread_system, .{
-            .scope_dense_indices = ai_cognition_indices,
-            .candidate_dense_indices = ai_halo_indices,
-            .player_candidate = perception_player_candidate,
-            .stimuli = hearing_stimuli,
-            .max_events_per_step = self.perception_max_events_per_step,
-        });
+        step.perception = try self.perception.update(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            self.spatial_index.view(),
+            context.world,
+            data,
+            &context.frame.events,
+            context.thread_system,
+            .{
+                .scope_dense_indices = step.ai_cognition_indices,
+                .candidate_dense_indices = step.ai_halo_indices,
+                .player_candidate = perception_player_candidate,
+                .stimuli = hearing_stimuli,
+                .max_events_per_step = self.perception_max_events_per_step,
+            },
+        );
         perception_timer.stop(context.perf, .pipeline_perception);
-        advanceStickyStimuli(self, frame, &stimuli_sticky_dropped);
+        self.sensory.advanceSticky(context.frame, &step.stimuli_sticky_dropped);
+    }
 
-        // Decays staleness/familiarity/ring contacts and refreshes from this
-        // step's perception acquisition events, over the think-set
-        // `ai_cognition_indices` population, before AI reads it for the cold-pursue
-        // retarget below.
+    /// Decays staleness/familiarity/ring contacts and refreshes from this step's
+    /// perception acquisition events, over the think set, before AI reads memory.
+    fn stageAiMemoryUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var ai_memory_timer = StageTimer.start();
-        const ai_memory_stats = try self.ai_memory.update(ai_slice, data, frame, context.thread_system, .{
-            .scope_dense_indices = ai_cognition_indices,
+        step.ai_memory = try self.ai_memory.update(context.data.aiAgentSliceConst(), context.data, context.frame, context.thread_system, .{
+            .scope_dense_indices = step.ai_cognition_indices,
         });
         ai_memory_timer.stop(context.perf, .pipeline_ai_memory);
+    }
 
-        // Appraises this step's just-written perception + memory state into
-        // fear/curiosity/aggression/fatigue, over the think-set
-        // `ai_cognition_indices` population. Must run after both perception and
-        // ai_memory (it reads their this-step hot columns) and before
-        // arbitration (Slice 32), wired below via `AiConfig.affect_slice`,
-        // reads the resulting drives.
+    /// Appraises this step's perception + memory into drives over the think set.
+    /// Must run after both producers and before `ai_decide` reads the drives.
+    fn stageAffectUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var affect_timer = StageTimer.start();
-        const affect_stats = try self.affect.update(ai_slice, data, &frame.events, context.thread_system, .{
-            .scope_dense_indices = ai_cognition_indices,
+        step.affect = try self.affect.update(context.data.aiAgentSliceConst(), context.data, &context.frame.events, context.thread_system, .{
+            .scope_dense_indices = step.ai_cognition_indices,
             .max_events_per_step = self.affect_max_events_per_step,
         });
         affect_timer.stop(context.perf, .pipeline_ai_affect);
+    }
 
-        // The player's plane is deliberately NOT propagated into the AI goal level:
-        // NPCs stay on the surface (goal_level 0) until autonomous descent lands.
-        // Seeding the player's underground plane here would make them request
-        // cross-level paths they cannot walk (start_level is pinned to 0), piling
-        // them at the ramp mouth. `player_target` only ever feeds the opt-in
-        // pursue fallback below, never a goal level, so this stays a flat (x,y).
+    fn stageAiDecide(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        const data = context.data;
+        // The player's plane is deliberately not propagated into the AI goal level:
+        // NPCs stay on the surface until autonomous descent lands. Seeding the
+        // player's underground plane here would make them request cross-level paths
+        // they cannot walk, piling them at the ramp mouth. `player_target` only
+        // feeds the opt-in pursue fallback, never a goal level.
         const player_target = if (data.movementBodyConst(context.player.entity)) |pbody|
             pbody.previous_position
         else
             math.Vec2{ .x = 400, .y = 225 };
 
         var ai_timer = StageTimer.start();
-        const ai_stats = try self.ai.update(ai_slice, move_slice, self.spatial_index.view(), data, frame, context.thread_system, context.delta_seconds, .{
-            .intent_seed = 0xfeedf00d,
-            .step = self.scope.currentStep(),
-            // Last-resort fallback (see AiConfig.focus_target's doc comment):
-            // arbitration only reaches for this when a row's own perception/
-            // memory produced no goal and its gain_pursue > 0. Most rows
-            // resolve their goal from their own sensed/remembered/felt state
-            // instead and never touch this pair.
-            .focus_target = player_target,
-            // Ties the pursue fallback's identity to the actual entity
-            // `player_target` represents, so a row falling back to this
-            // signal only ever targets this same entity.
-            .focus_entity = context.player.entity,
-            // Throttles how often the fallback target re-keys as the player
-            // moves continuously, since local separation/steering closes the
-            // small gap between path updates. Without this, the goal re-keys
-            // (and triggers one bounded escalated solve) roughly every nav
-            // cell the player crosses.
-            .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
-            // Ceiling only: arbitration currently resolves every behavior's
-            // goal to `.individual` (each row's goal is agent-specific), so
-            // this has no observable effect today. `.individual` is still the
-            // correct default going forward -- a future group-goal upgrade
-            // (e.g. cohere's shared quantized cell) would otherwise silently
-            // turn back on the moment it lands.
-            .nav_request_kind = .individual,
-            .navigation_intents = &frame.navigation_intents,
-            // Think-set gather; halo is the spatial/candidate population.
-            // Steering inherits this scope transitively: it only acts on the
-            // navigation intents AI emits here.
-            .scope_dense_indices = ai_cognition_indices,
-            .spatial_population_indices = ai_halo_indices,
-            // Cold-perception agents with fresh memory retarget seek toward
-            // their last-known position instead of losing the goal.
-            .perception_slice = data.aiPerceptionSliceConst(),
-            .memory_slice = data.aiMemorySliceConst(),
-            // Emotion drives (Slice 31/32): arbitration scores each row's
-            // behaviors partly off these, so feelings can change which
-            // behavior wins independent of what's perceived/remembered.
-            .affect_slice = data.aiAffectSliceConst(),
-            .interest_markers = &context.world.interest_markers,
-        });
+        step.ai = try self.ai.update(
+            data.aiAgentSliceConst(),
+            data.movementBodySliceConst(),
+            self.spatial_index.view(),
+            data,
+            context.frame,
+            context.thread_system,
+            context.delta_seconds,
+            .{
+                .intent_seed = 0xfeedf00d,
+                .step = self.scope.currentStep(),
+                // Last-resort fallback: arbitration reaches for this only when a
+                // row's own perception/memory produced no goal and its gain_pursue > 0.
+                .focus_target = player_target,
+                .focus_entity = context.player.entity,
+                .goal_requantization_hysteresis_distance = default_goal_requantization_hysteresis_distance,
+                // Ceiling only: arbitration resolves every behavior's goal to
+                // `.individual`, so this has no observable effect today.
+                .nav_request_kind = .individual,
+                .navigation_intents = &context.frame.navigation_intents,
+                .scope_dense_indices = step.ai_cognition_indices,
+                .spatial_population_indices = step.ai_halo_indices,
+                .perception_slice = data.aiPerceptionSliceConst(),
+                .memory_slice = data.aiMemorySliceConst(),
+                .affect_slice = data.aiAffectSliceConst(),
+                .interest_markers = &context.world.interest_markers,
+            },
+        );
         ai_timer.stop(context.perf, .pipeline_ai);
+    }
 
+    fn stageSteeringUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var steering_timer = StageTimer.start();
-        const steering_stats = try self.steering.update(data, frame, context.thread_system, &self.pathfinding, .{});
+        step.steering = try self.steering.update(context.data, context.frame, context.thread_system, &self.pathfinding, .{});
         steering_timer.stop(context.perf, .pipeline_steering);
+    }
 
+    fn stagePathfindingUpdate(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var pathfinding_timer = StageTimer.start();
-        // Drive elastic pathfinding capacity off the live steering-agent crowd (the
-        // entities that consume paths), so pools grow for battles and shrink after.
-        const path_agent_count = data.steeringAgentSliceConst().entities.len;
-        const pathfinding_stats = try self.pathfinding.update(&frame.path_requests, path_agent_count, context.thread_system, .{});
+        // Elastic pathfinding capacity tracks the live steering-agent crowd.
+        const path_agent_count = context.data.steeringAgentSliceConst().entities.len;
+        step.pathfinding = try self.pathfinding.update(&context.frame.path_requests, path_agent_count, context.thread_system, .{});
         pathfinding_timer.stop(context.perf, .pipeline_pathfinding);
+    }
 
+    fn stageApplyAiMovementIntents(_: *SimulationPipeline, step: *StepState) void {
         var apply_intents_timer = StageTimer.start();
-        applyAiMovementIntents(data, frame);
-        apply_intents_timer.stop(context.perf, .pipeline_apply_intents);
+        applyAiMovementIntents(step.context.data, step.context.frame);
+        apply_intents_timer.stop(step.context.perf, .pipeline_apply_intents);
+    }
 
-        // Movement is a pure position integrator over the full contiguous SoA range:
-        // non-moving rows carry zero velocity (DataSystem zeros it on entry to a
-        // non-moving tier) so they integrate as no-ops — no scattered skip-path.
-        // Chunk maintenance is deliberately NOT here: chunk columns are consumed by
-        // tier policy (LOD) and render prep, not by movement, and must reflect the
-        // final settled position after collision response, bounds/tile gating, and
-        // plane traversal — so it runs as its own late pass (action_react may sit
-        // between chunk_derive and tier_policy; neither rewrites chunk columns).
-        var movement_slice = data.movementBodySlice();
+    /// Movement integrates the full contiguous range. Non-moving rows carry zero
+    /// velocity, so they integrate as no-ops. Chunk maintenance is `chunk_derive`,
+    /// after collision, the tile gate, and plane traversal have settled positions.
+    fn stageMovementIntegrate(self: *SimulationPipeline, step: *StepState) void {
+        const context = step.context;
+        var movement_slice = context.data.movementBodySlice();
         var movement_timer = StageTimer.start();
-        const movement_stats = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
+        step.movement = self.movement.update(&movement_slice, context.thread_system, context.delta_seconds, .{});
         movement_timer.stop(context.perf, .pipeline_movement);
+    }
 
-        // Collision also gates on tier only (no chunk filter): off-screen entities
-        // keep colliding with geometry. Null = full-active. Runs before the tile
-        // gate so a contact push into solid underground dirt is corrected by the
-        // gate before plane_traversal / chunk_derive observe the pose.
-        const collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(data, context.thread_system, .{})).indices;
+    /// Collision gates on tier only (no chunk filter): off-screen entities keep
+    /// colliding. Null indices mean full-active.
+    fn stageCollisionScopeGather(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        step.collision_scope_indices = (try self.scope.gatherCollisionBoundsIndices(context.data, context.thread_system, .{})).indices;
+    }
+
+    fn stageCollisionDetect(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var collision_timer = StageTimer.start();
-        const collision_stats = try self.collision.update(data, &frame.contacts, context.thread_system, .{
-            .scope_dense_indices = collision_scope_indices,
+        step.collision = try self.collision.update(context.data, &context.frame.contacts, context.thread_system, .{
+            .scope_dense_indices = step.collision_scope_indices,
         });
         collision_timer.stop(context.perf, .pipeline_collision);
+    }
 
+    fn stageCollisionRespond(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var collision_response_timer = StageTimer.start();
-        const collision_response_stats = try self.collision_response.update(data, frame);
+        step.collision_response = try self.collision_response.update(context.data, context.frame);
         collision_response_timer.stop(context.perf, .pipeline_collision_response);
-        enqueuePlayerCollisionImpactsToDeferred(
-            self,
-            frame,
-            data,
+        self.sensory.enqueuePlayerImpacts(
+            context.frame,
+            context.data,
             context.player.entity,
             context.player.current_level,
-            &stimuli_deferred_dropped,
+            &step.stimuli_deferred_dropped,
         );
+    }
 
+    fn stageBoundsAndTileGate(_: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
         var clamp_timer = StageTimer.start();
-        clampAiEntitiesToBounds(data, context.bounds_width, context.bounds_height);
-        try context.player.clampToBounds(data, context.bounds_width, context.bounds_height);
-        // Gate against solid world tiles on the current plane (mining: underground
-        // dirt is solid until dug). After collision response so contact corrections
-        // cannot leave a body embedded in solid tiles. NPCs skip dormant-tier
-        // (they don't move this step, so gating them would be dead work).
-        gatePlayerToWalkableTiles(context.world, data, context.player.*);
-        gateNpcEntitiesToWalkableTiles(context.world, data);
+        clampAiEntitiesToBounds(context.data, context.bounds_width, context.bounds_height);
+        try context.player.clampToBounds(context.data, context.bounds_width, context.bounds_height);
+        // Gate against solid world tiles on the current plane. After collision
+        // response so a contact push into solid dirt is corrected before plane
+        // traversal and chunk derive. NPCs skip dormant tier.
+        gatePlayerToWalkableTiles(context.world, context.data, context.player.*);
+        gateNpcEntitiesToWalkableTiles(context.world, context.data);
         clamp_timer.stop(context.perf, .pipeline_clamp_bounds);
+    }
 
-        // After movement/collision/gate settle positions, update planes: follow a
-        // ramp on cell entry, fall one level per step when standing over a hole.
-        // Player + NPCs route through `DigController.applyEntityPlaneTraversal`;
-        // fall landing carves are batched into one event range (single finishWrite).
-        try applyPlaneTraversalStage(&self.dig, context.world, data, context.player, frame);
+    /// After positions settle: follow a ramp on cell entry, or fall one level when
+    /// standing over a hole. Landing carves are one event range.
+    fn stagePlaneTraversal(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        try applyPlaneTraversalStage(&self.dig, context.world, context.data, context.player, context.frame);
+    }
 
-        // Chunk maintenance: recompute each body's (chunk_x, chunk_y) from its now
-        // settled position. Positions are final here — all of movement, collision
-        // response, bounds/tile gating, and plane traversal have run. Consumers are
-        // tier_policy (LOD banding; action_react may run between this pass and it)
-        // and render prep; movement never reads it. Own timer keeps this scope
-        // work out of the movement stage.
+    /// Recompute each body's chunk from its settled position. Consumers are tier
+    /// policy and render prep. `action_react` may sit between this and tier policy;
+    /// neither rewrites chunk columns.
+    fn stageChunkDerive(self: *SimulationPipeline, step: *StepState) void {
+        const context = step.context;
         var chunk_derive_timer = StageTimer.start();
-        const chunk_derive_stats = self.scope.deriveChunks(data, context.thread_system, .{
+        step.chunk_derive = self.scope.deriveChunks(context.data, context.thread_system, .{
             .tile_size = context.world.tile_size,
             .chunk_size_tiles = context.world.chunk_size_tiles,
             .width = context.world.width,
             .height = context.world.height,
         }, .{});
         chunk_derive_timer.stop(context.perf, .pipeline_chunk_derive);
+    }
 
-        // action_react: first domain consumer of merged action intents (destructibles).
-        // Queues structural_commands + domain events; tier_policy may append more
-        // structural_commands afterward (RangeOutputStream multi-producer).
-        const destructible_stats = try self.destructible.process(
-            frame,
-            data,
+    /// First domain consumer of action intents carried from input capture.
+    fn stageActionReact(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        step.destructible = try self.destructible.process(
+            context.frame,
+            context.data,
             context.world,
             context.particles,
         );
-
-        // Simulation-LOD tier policy: each entity is assigned cognition/locomotion/
-        // kinematic/dormant by its cube distance from the visible region, applied
-        // via deferred structural commands on the frame stream for the commit seam.
-        // Uses the raw visible region (not the cognition halo) so all four bands
-        // are measured from the same origin, anchored at the camera/player level so
-        // off-level entities demote. Queues nothing when no tier changed.
-        var visible_region = context.world.visibleChunkRegion();
-        if (visible_region) |*region| region.level = context.player.current_level;
-        _ = try self.scope.queueTierChanges(data, visible_region, &frame.structural_commands, context.thread_system, .{});
-
-        const scope = self.buildScopeStats(
-            data,
-            cognition_region,
-            ai_cognition_indices,
-            collision_scope_indices,
-            steering_stats,
-        );
-
-        return .{
-            .scope = scope,
-            .spatial_index = spatial_index_stats,
-            .perception = perception_stats,
-            .ai_memory = ai_memory_stats,
-            .affect = affect_stats,
-            .ai = ai_stats,
-            .steering = steering_stats,
-            .pathfinding = pathfinding_stats,
-            .movement = movement_stats,
-            .chunk_derive = chunk_derive_stats,
-            .collision = collision_stats,
-            .collision_response = collision_response_stats,
-            .stimuli_live_dropped = stimuli_live_dropped,
-            .stimuli_deferred_dropped = stimuli_deferred_dropped,
-            .stimuli_sticky_dropped = stimuli_sticky_dropped,
-            .stimuli_promoted = stimuli_promoted,
-            .action_intents_consumed = destructible_stats.intents_consumed,
-            .action_intents_dropped = action_intents_dropped,
-            .destructibles_destroyed = destructible_stats.destroyed,
-            .destructibles_hit = destructible_stats.hits,
-        };
     }
 
-    /// Builds the per-step scope stats: tier histograms and full-active baselines
-    /// from `DataSystem`, with stage entity counts overridden to the actually-scoped
-    /// participation and the stagger/chunk-filter counters from this step.
+    /// Assign cognition/locomotion/kinematic/dormant by cube distance from the
+    /// visible region. Commands are deferred. The anchor level is the player's,
+    /// so off-level entities demote. Queues nothing when no tier changed.
+    fn stageTierPolicy(self: *SimulationPipeline, step: *StepState) !void {
+        const context = step.context;
+        var visible_region = context.world.visibleChunkRegion();
+        if (visible_region) |*region| region.level = context.player.current_level;
+        _ = try self.scope.queueTierChanges(context.data, visible_region, &context.frame.structural_commands, context.thread_system, .{});
+    }
+
     fn buildScopeStats(
         self: *const SimulationPipeline,
         data: *const DataSystem,
@@ -1552,6 +1543,33 @@ fn clampAiEntitiesToBounds(data: *DataSystem, bounds_width: f32, bounds_height: 
 test "stageContract(.ai_decide) reads affect_drives, written by affect_update one stage earlier" {
     const contract = stageContract(.ai_decide);
     try std.testing.expect(contract.reads.contains(.affect_drives));
+}
+
+test "stage contracts split event families and carry out-of-graph inputs" {
+    const memory = stageContract(.ai_memory_update);
+    try std.testing.expect(memory.reads.contains(.perception_events));
+    try std.testing.expect(!memory.reads.contains(.world_events));
+    try std.testing.expect(!memory.reads.contains(.affect_events));
+    try std.testing.expect(!memory.reads.contains(.structural_events));
+
+    const affect = stageContract(.affect_update);
+    try std.testing.expect(affect.writes.contains(.affect_events));
+    try std.testing.expect(affect.carried.contains(.ai_behavior));
+    try std.testing.expect(!affect.reads.contains(.ai_behavior));
+
+    const decide = stageContract(.ai_decide);
+    try std.testing.expect(decide.writes.contains(.ai_behavior));
+    try std.testing.expect(decide.writes.contains(.navigation_intents));
+    try std.testing.expect(decide.carried.contains(.interest_markers));
+
+    const react = stageContract(.action_react);
+    try std.testing.expect(react.carried.contains(.action_intents));
+    try std.testing.expect(!react.reads.contains(.action_intents));
+    try std.testing.expect(react.writes.contains(.world_events));
+
+    try std.testing.expect(stageContract(.dig_world_edit).writes.contains(.stimuli));
+    try std.testing.expect(stageContract(.perception_update).reads.contains(.stimuli));
+    try std.testing.expect(external_resources.contains(.structural_events));
 }
 
 test "pipeline updates full active player-only state through serial path" {
@@ -3308,13 +3326,13 @@ test "pipeline promotes deferred impacts before perception on the following step
     defer pipeline.deinit();
 
     // Simulate a collision impact deferred at the end of the prior step.
-    pipeline.deferred_stimuli[0] = .{
+    pipeline.sensory.deferred_stimuli[0] = .{
         .position = .{ .x = impact_x, .y = impact_y },
         .intensity = defaultStimulusIntensity(.impact),
         .kind = .impact,
         .level = 0,
     };
-    pipeline.deferred_stimulus_count = 1;
+    pipeline.sensory.deferred_stimulus_count = 1;
 
     frame.beginStep();
     _ = try pipeline.update(.{
@@ -3332,7 +3350,7 @@ test "pipeline promotes deferred impacts before perception on the following step
     try std.testing.expect(perception.heard_stimulus);
     try std.testing.expectApproxEqAbs(impact_x, perception.heard_stimulus_x, 0.01);
     try std.testing.expectApproxEqAbs(impact_y, perception.heard_stimulus_y, 0.01);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
 }
 
 test "pipeline defers player collision impacts until the next step" {
@@ -3416,8 +3434,8 @@ test "pipeline defers player collision impacts until the next step" {
         .bounds_height = 450,
     });
     try std.testing.expect(stats.collision.contact_count > 0);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
     try std.testing.expect(!data.aiPerceptionConst(observer).?.heard_stimulus);
 
     frame.beginStep();
@@ -3514,8 +3532,8 @@ test "head-on player impact enqueues even after collision response zeroes approa
     // Response ran and zeroed the approach axis; the old post-response read would
     // see this and drop the impact. The snapshot-based gate must not.
     try std.testing.expectEqual(@as(f32, 0), data.movementBodyConst(player.entity).?.velocity.x);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
 }
 
 test "pipeline emits player footstep stimulus before perception in the same step" {
@@ -3645,11 +3663,10 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
         },
     });
     defer pipeline.deinit();
-    pipeline.deferred_stimulus_count = stimulus_deferred_capacity;
+    pipeline.sensory.deferred_stimulus_count = stimulus_deferred_capacity;
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(
-        &pipeline,
+    pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
         player.entity,
@@ -3657,7 +3674,7 @@ test "deferred impact enqueue drops newest when deferred buffer is full" {
         &deferred_dropped,
     );
     try std.testing.expectEqual(@as(usize, 1), deferred_dropped);
-    try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(stimulus_deferred_capacity, pipeline.sensory.deferred_stimulus_count);
 }
 
 test "promote drops deferred impacts when live bus is already full" {
@@ -3688,19 +3705,19 @@ test "promote drops deferred impacts when live bus is already full" {
         },
     });
     defer pipeline.deinit();
-    pipeline.deferred_stimuli[0] = .{
+    pipeline.sensory.deferred_stimuli[0] = .{
         .position = .{ .x = 200, .y = 0 },
         .intensity = defaultStimulusIntensity(.impact),
         .kind = .impact,
         .level = 0,
     };
-    pipeline.deferred_stimulus_count = 1;
+    pipeline.sensory.deferred_stimulus_count = 1;
 
     var live_dropped: usize = 0;
-    const promoted = promoteDeferredStimuli(&pipeline, &frame, &live_dropped);
+    const promoted = pipeline.sensory.promote(&frame, &live_dropped);
     try std.testing.expectEqual(@as(usize, 0), promoted);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
-    try std.testing.expectEqual(@as(usize, 1), pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
 
@@ -3725,7 +3742,8 @@ test "player footstep drops when live bus is full" {
     }
 
     var live_dropped: usize = 0;
-    tryAppendPlayerFootstepStimulus(&frame, &data, player, &live_dropped);
+    const bus = SensoryBus.init(.{});
+    bus.appendFootstep(&frame, &data, player, &live_dropped);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
@@ -3791,19 +3809,18 @@ test "player collision impacts enqueue at most stimulus_max_impacts_per_step per
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(
-        &pipeline,
+    pipeline.sensory.enqueuePlayerImpacts(
         &frame,
         &data,
         player.entity,
         0,
         &deferred_dropped,
     );
-    try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.deferred_stimulus_count);
+    try std.testing.expectEqual(stimulus_max_impacts_per_step, pipeline.sensory.deferred_stimulus_count);
     try std.testing.expectEqual(@as(usize, 4), deferred_dropped);
-    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.deferred_stimuli[0].kind);
+    try std.testing.expectEqual(@import("simulation.zig").StimulusKind.impact, pipeline.sensory.deferred_stimuli[0].kind);
     // First contact in merged order wins the first deferred slot (midpoint x = 10).
-    try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.deferred_stimuli[0].position.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), pipeline.sensory.deferred_stimuli[0].position.x, 0.01);
 }
 
 test "action_react consumer reports zero intents when no action producers ran" {
@@ -4201,8 +4218,8 @@ test "standing player collision does not enqueue deferred impact without motion"
     defer pipeline.deinit();
 
     var deferred_dropped: usize = 0;
-    enqueuePlayerCollisionImpactsToDeferred(&pipeline, &frame, &data, player.entity, 0, &deferred_dropped);
-    try std.testing.expectEqual(@as(usize, 0), pipeline.deferred_stimulus_count);
+    pipeline.sensory.enqueuePlayerImpacts(&frame, &data, player.entity, 0, &deferred_dropped);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.sensory.deferred_stimulus_count);
 }
 
 test "sticky dig linger reaches every stagger phase within the linger window" {

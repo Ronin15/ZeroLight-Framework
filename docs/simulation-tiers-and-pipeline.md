@@ -127,29 +127,40 @@ before it is written fails the build instead of silently corrupting behavior.
   movement body state, and similar). Some tags bundle several SoA columns one
   system owns together rather than tracking every field.
 - `StageId` names each concrete stage in `update()`.
-- `stageContract(stage)` declares each stage's reads and writes over
-  `PipelineResource`.
-- `stage_order` is the concrete order `update()` runs stages in.
+- `stageContract(stage)` declares each stage's reads, writes, and carried
+  inputs over `PipelineResource`.
+- `stage_order` is a permutation of `StageId`: every tag once, in the order
+  `update()` runs.
 - A `comptime` block walks `stage_order`, accumulating the resources written
   so far, and fails the build (`@compileError`) if any stage's declared reads
   are not a subset of what an earlier stage already wrote.
+- `carried` lists inputs no earlier stage writes. It is disjoint from that
+  stage's reads and writes. Allowed sources are `external_resources`
+  (`action_intents` from input capture, `interest_markers` from world
+  authoring, `structural_events` from the post-step commit) or a later stage's
+  write consumed as previous-step state (`affect_update` carries `ai_behavior`,
+  which `ai_decide` writes later in the same step). A carried resource that an
+  earlier stage writes is a compile error; declare it as a read.
+- Event payloads are four tags. `perception_events` (`entity_perceived`,
+  `entity_lost`) is written by `perception_update` and read by
+  `ai_memory_update`. `affect_events` is `affect_threshold_crossed`.
+  `world_events` covers tile, obstacle, nav, and `destructible_destroyed`
+  payloads. `structural_events` covers `entity_created`, `entity_destroyed`,
+  and `component_changed`. A stage-0 write of `world_events` does not satisfy
+  a later read of a different event tag. The `SimulationEvents` stream is
+  still one buffer; the tags are the ordering contract.
+- `stimuli` is written by `dig_world_edit` (promote, dig append, footstep) and
+  read by `perception_update`. `interest_markers` is carried by `ai_decide`.
 - A stage's `stageContract` lists **every** live resource it touches, including
   this-step values an earlier stage authored: `bounds_and_tile_gate`,
   `plane_traversal`, and `perception_update` all read the dig-authored
   `world_tiles`, and `plane_traversal` also writes `movement_positions` via the
   fall snap. An under-declared read or write leaves a real dependency invisible
   to the comptime check, so a reorder compiles clean.
-- Not every real ordering dependency is expressible as a `PipelineResource`
-  read/write — two stages can depend on call order while sharing no tracked
-  resource, and a transient stream with no `PipelineResource` tag at all (e.g.
-  the `WorldStimulus` values producers write into `frame.stimuli` and
-  `perception_update` reads the same step) carries a producer→consumer
-  dependency the comptime check cannot see. Durable world interest markers
-  (Slice 41) are read-only inputs on `ai_decide` via `WorldSystem.interest_markers`
-  — not frame streams and not `PipelineResource`-tagged. Every such untagged same-step
-  dependency is pinned by a causal-effect test co-located in
-  `simulation_pipeline.zig`: each sets up a scenario where the wrong order
-  produces an observably different result and asserts the correct one. See
+- Ordering the resource tags cannot see is pinned by a causal-effect test
+  co-located in `simulation_pipeline.zig`: each sets up a scenario where the
+  wrong order produces an observably different result and asserts the correct
+  one. See
   "pipeline commits the dig stage's world edit before the tile gate reads
   walkability in the same step", "pipeline commits the dig stage's stimulus
   before perception reads it in the same step", "pipeline emits player footstep
@@ -166,10 +177,12 @@ Checklist for adding or reordering a stage:
    tags already cover them.
 2. Insert its `StageId` into `stage_order` at the position its real
    dependencies require.
-3. Add its `stageContract()` arm.
-4. Add the real call in `update()` at the position `stage_order` requires. If
-   the dependency isn't expressible via `PipelineResource`, add a
-   causal-effect test proving the real call order.
+3. Add its `stageContract()` arm, including `carried` when the input is
+   external or previous-step state.
+4. Add the stage method `runStage` dispatches to. `update()` is an `inline for`
+   over `stage_order` and does not call systems itself. If the dependency
+   isn't expressible via `PipelineResource`, add a causal-effect test proving
+   the real call order.
 5. `zig build check` fails at comptime if a `PipelineResource` dependency is
    missing; a causal-effect test fails if the stages run out of order for a
    dependency the comptime check can't see.
@@ -217,9 +230,9 @@ part of the contract: count and write phases must stay consistent.
   `.use`/`.signal`. Structural + event capacity is preflighted before queuing
   (dig pattern). `tier_policy` may append more `structural_commands` afterward
   via `RangeOutputStream` multi-producer append — action_react does not own the
-  stream exclusively. The `action_intent_capture` stage is a **contract-only**
-  resource handoff (writes declared so `action_react` can read); wall-clock
-  appends happen in `main_thread_inputs` before `update`. Capacity is the fixed
+  stream exclusively. Action intents are **carried** into `action_react`:
+  wall-clock appends happen in `main_thread_inputs` via `captureActionIntent`
+  before `update`, and no stage writes the stream. Capacity is the fixed
   constant `action_intent_live_capacity` in `simulation.zig` (64), not
   map-scaled. Callers warm with
   `reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity)`
