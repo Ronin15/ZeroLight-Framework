@@ -55,18 +55,38 @@ pub const SensoryBus = struct {
         return .{ .config = config };
     }
 
+    /// Writes one live stimulus. `required` fails when the live bus is already at
+    /// `stimulus_live_capacity`. Optional emitters increment `dropped` and return false.
+    pub fn emit(frame: *SimulationFrame, stimulus: WorldStimulus, required: bool, dropped: *usize) !bool {
+        if (frame.stimulusLiveCount() >= stimulus_live_capacity) {
+            if (!required) {
+                dropped.* += 1;
+                return false;
+            }
+            return error.StimulusCapacityExceeded;
+        }
+        frame.ensureStimulusAppendCapacity(1) catch |err| {
+            if (!required) {
+                dropped.* += 1;
+                return false;
+            }
+            return err;
+        };
+        try frame.writeLiveStimulus(stimulus);
+        return true;
+    }
+
     /// Moves deferred impacts onto the live bus. Returns how many were promoted.
-    pub fn promote(self: *SensoryBus, frame: *SimulationFrame, live_dropped: *usize) usize {
+    pub fn promote(self: *SensoryBus, frame: *SimulationFrame, live_dropped: *usize) !usize {
         const pending = self.deferred_stimulus_count;
         var promoted: usize = 0;
         var retained: usize = 0;
         for (self.deferred_stimuli[0..pending]) |stimulus| {
-            if (frame.tryAppendStimulus(stimulus, stimulus_live_capacity)) {
+            if (try emit(frame, stimulus, false, live_dropped)) {
                 promoted += 1;
             } else {
                 self.deferred_stimuli[retained] = stimulus;
                 retained += 1;
-                live_dropped.* += 1;
             }
         }
         self.deferred_stimulus_count = retained;
@@ -80,17 +100,16 @@ pub const SensoryBus = struct {
         data: *const DataSystem,
         player: Player,
         live_dropped: *usize,
-    ) void {
+    ) !void {
         const body = data.movementBodyConst(player.entity) orelse return;
         const vel_sq = body.velocity.x * body.velocity.x + body.velocity.y * body.velocity.y;
         if (vel_sq < self.config.footstep_min_speed_sq) return;
-        const appended = frame.tryAppendStimulus(.{
+        _ = try emit(frame, .{
             .position = body.position,
             .intensity = defaultStimulusIntensity(.footstep),
             .kind = .footstep,
             .level = player.current_level,
-        }, stimulus_live_capacity);
-        if (!appended) live_dropped.* += 1;
+        }, false, live_dropped);
     }
 
     /// Live bus plus still-lingering sticky stimuli, in that order.
@@ -183,3 +202,39 @@ pub const SensoryBus = struct {
         return contact.pre_response_relative_speed_sq >= self.config.impact_min_approach_speed_sq;
     }
 };
+
+test "optional emit drops once the live bus is full and required emit fails" {
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+
+    var dropped: usize = 0;
+    for (0..stimulus_live_capacity) |i| {
+        const wrote = try SensoryBus.emit(&frame, .{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .footstep,
+            .level = 0,
+        }, false, &dropped);
+        try std.testing.expect(wrote);
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved = frame.stimuli.allocator;
+    frame.stimuli.allocator = failing.allocator();
+    defer frame.stimuli.allocator = saved;
+    const wrote = try SensoryBus.emit(&frame, .{
+        .position = .{ .x = 99, .y = 0 },
+        .intensity = 1,
+        .kind = .footstep,
+        .level = 0,
+    }, false, &dropped);
+    try std.testing.expect(!wrote);
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectError(error.StimulusCapacityExceeded, SensoryBus.emit(&frame, .{
+        .position = .{ .x = 1, .y = 1 },
+        .intensity = 1,
+        .kind = .dig,
+        .level = 0,
+    }, true, &dropped));
+}

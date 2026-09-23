@@ -159,6 +159,8 @@ const RowInterest = struct {
     present: bool = false,
     x: f32 = 0,
     y: f32 = 0,
+    /// World level sampled at gather. The separation job reads it when it scans markers.
+    level: u16 = 0,
 };
 
 /// Explicit opt-in fallback target (see `AiConfig.focus_target`'s doc
@@ -464,7 +466,7 @@ pub const AiSystem = struct {
             system_config.adaptive,
             system_config.separation_adaptive_tuner,
         );
-        var separation_context = buildAiSeparationContext(self, gathered, spatial, separation_selection.range_count);
+        var separation_context = buildAiSeparationContext(self, gathered, spatial, separation_selection.range_count, config.interest_markers);
         const separation_batch = thread_system.parallelForWithOptions(entity_count, &separation_context, writeAiSeparationJob, .{
             .max_worker_threads = separation_selection.worker_threads,
             .range_alignment_items = ai_range_alignment_items,
@@ -542,7 +544,7 @@ pub const AiSystem = struct {
         }
         std.debug.assert(self.candidates.len == spatial.pos_x.len);
         self.resetSeparationScratch();
-        self.computeAiSeparationsSerial(spatial);
+        self.computeAiSeparationsSerial(spatial, config.interest_markers);
         const gathered = self.rows.slice();
         const rcount: usize = 1;
         const system_config = normalizedConfig(config, self);
@@ -597,7 +599,7 @@ pub const AiSystem = struct {
         perception_slice: ?ConstPerceptionSlice,
         memory_slice: ?ConstAiMemorySlice,
         affect_slice: ?ConstAiAffectSlice,
-        interest_markers: ?*const InterestMarkerStore,
+        _: ?*const InterestMarkerStore,
     ) !void {
         self.clearWork();
         const spatial_indices = spatial_population_indices orelse scope_dense_indices;
@@ -754,17 +756,7 @@ pub const AiSystem = struct {
                 }
             }
 
-            // Mirror focus gating: investigate score is multiplied by gain, so a
-            // zero-gain row can never win investigate — skip the marker scan.
-            if (interest_markers) |markers| {
-                if (row.gains.investigate > 0) {
-                    const level = data.worldLevelConst(ent) orelse 0;
-                    const agent_faction = data.factionConst(ent);
-                    if (markers.findBestInvestigateMarker(level, row.pos_x, row.pos_y, interest_marker_query_radius, agent_faction)) |hit| {
-                        row.interest = .{ .present = true, .x = hit.x, .y = hit.y };
-                    }
-                }
-            }
+            row.interest = .{ .level = data.worldLevelConst(ent) orelse 0 };
 
             appendAiGatherRow(&self.rows, &row_slice, row);
             spatial_row_index += 1;
@@ -804,12 +796,12 @@ pub const AiSystem = struct {
         @memset(gathered.items(.cohere), RowCohere{});
     }
 
-    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView) void {
+    fn computeAiSeparationsSerial(self: *AiSystem, spatial: SpatialIndexView, markers: ?*const InterestMarkerStore) void {
         // Population-domain contract with spatial_index.zig: candidates (halo walk)
         // must match the shared index row count. Think rows may be a subset.
         std.debug.assert(self.candidates.len == spatial.pos_x.len);
         const gathered = self.rows.slice();
-        var context = buildAiSeparationContext(self, gathered, spatial, 1);
+        var context = buildAiSeparationContext(self, gathered, spatial, 1, markers);
         writeAiSeparationJob(&context, .{ .index = 0, .start = 0, .end = self.rows.len }, WorkerId.main);
     }
 };
@@ -857,6 +849,7 @@ fn buildAiSeparationContext(
     gathered: std.MultiArrayList(AiGatherRow).Slice,
     spatial: SpatialIndexView,
     range_count: usize,
+    markers: ?*const InterestMarkerStore,
 ) AiSeparationContext {
     const candidate_slice = system.candidates.slice();
     return .{
@@ -871,6 +864,8 @@ fn buildAiSeparationContext(
         .neighbor_counts = gathered.items(.separation_neighbor_count),
         .candidate_counts = gathered.items(.separation_candidate_count),
         .cohere = gathered.items(.cohere),
+        .interest = gathered.items(.interest),
+        .markers = markers,
         .spatial_index = spatial,
         .range_count = range_count,
     };
@@ -1056,6 +1051,8 @@ const AiSeparationContext = struct {
     /// by the same job, same shared spatial index, as local separation. Not
     /// a second grid.
     cohere: []RowCohere,
+    interest: []RowInterest,
+    markers: ?*const InterestMarkerStore,
     spatial_index: SpatialIndexView,
     /// Dispatched range count; dual-asserted against `range.index` at job entry.
     range_count: usize,
@@ -1084,6 +1081,17 @@ fn writeAiSeparationJob(context: *anyopaque, range: ParallelRange, _: WorkerId) 
             computeCohereNeighbors(job, index)
         else
             .{};
+
+        if (job.markers) |markers| {
+            if (job.gains[index].investigate > 0) {
+                const interest = &job.interest[index];
+                if (markers.findBestInvestigateMarker(interest.level, job.pos_x[index], job.pos_y[index], interest_marker_query_radius, job.faction[index])) |hit| {
+                    interest.present = true;
+                    interest.x = hit.x;
+                    interest.y = hit.y;
+                }
+            }
+        }
     }
 }
 
@@ -1435,6 +1443,7 @@ fn expectAiGatherColumnsAligned(rows: *const std.MultiArrayList(AiGatherRow)) !v
     try std.testing.expectEqual(count, s.items(.memory_ring).len);
     try std.testing.expectEqual(count, s.items(.drives).len);
     try std.testing.expectEqual(count, s.items(.focus).len);
+    try std.testing.expectEqual(count, s.items(.interest).len);
     try std.testing.expectEqual(count, s.items(.sep_x).len);
     try std.testing.expectEqual(count, s.items(.sep_y).len);
     try std.testing.expectEqual(count, s.items(.separation_neighbor_count).len);
@@ -2326,9 +2335,12 @@ test "ai interest gate skips the marker scan for a zero-investigate-gain row" {
     const ai_slice = data.aiAgentSliceConst();
     const move_slice = data.movementBodySliceConst();
 
+    var spatial_sys = try testSpatialIndex(ai_slice, move_slice, &data);
+    defer spatial_sys.deinit();
     var ai_sys = AiSystem.init(std.testing.allocator);
     defer ai_sys.deinit();
     try ai_sys.gatherAiData(ai_slice, move_slice, &data, null, null, null, null, null, null, null, &markers);
+    ai_sys.computeAiSeparationsSerial(spatial_sys.view(), &markers);
 
     const rows = ai_sys.rows.slice();
     const entities = rows.items(.entity);
@@ -2951,7 +2963,7 @@ test "ai computeBoundedSeparation matches an O(n^2) brute-force reference bit-fo
     const pos_x = gathered.items(.pos_x);
     const pos_y = gathered.items(.pos_y);
 
-    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1);
+    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1, null);
 
     for (0..count) |i| {
         const ported = computeBoundedSeparation(&context, i);
@@ -3061,7 +3073,7 @@ test "ai computeBoundedSeparation matches a cell-scan-ordered oracle across mult
     try std.testing.expect(max_cell_x - min_cell_x >= 3);
     try std.testing.expect(max_cell_y - min_cell_y >= 3);
 
-    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1);
+    const context = buildAiSeparationContext(&ai_sys, gathered, spatial_sys.view(), 1, null);
 
     // Fail loud if no agent ever accumulates >= 2 neighbors: with fewer than
     // two summed `dir` terms, float-summation order can't actually differ,
@@ -3522,10 +3534,11 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
             try data.setAiAgent(entity, .{
                 .active_behavior = .wander,
                 .wander_amplitude = @floatFromInt(i % 5),
-                .gain_wander = 1.0,
-                .gain_pursue = if (i % 3 == 0) 1.0 else 0,
-                .gain_flee = if (i % 3 == 1) 1.0 else 0,
-                .gain_cohere = if (i % 3 == 2) 1.0 else 0,
+                .gain_wander = if (i == 0) 0 else 1.0,
+                .gain_pursue = if (i == 0) 0 else if (i % 3 == 0) 1.0 else 0,
+                .gain_flee = if (i == 0) 0 else if (i % 3 == 1) 1.0 else 0,
+                .gain_cohere = if (i == 0) 0 else if (i % 3 == 2) 1.0 else 0,
+                .gain_investigate = if (i == 0) 1.0 else 0,
             });
             try data.setAiPerception(entity, .{
                 .target_visible = i % 4 == 0,
@@ -3545,6 +3558,16 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
     var threaded_spatial = try testSpatialIndex(threaded_data.aiAgentSliceConst(), threaded_data.movementBodySliceConst(), &threaded_data);
     defer threaded_spatial.deinit();
 
+    var markers = InterestMarkerStore.init(std.testing.allocator);
+    defer markers.deinit(std.testing.allocator);
+    _ = try markers.addMarker(.{
+        .kind = .investigate,
+        .level = 0,
+        .x = 100,
+        .y = 0,
+        .radius = 8,
+    });
+
     var serial_ai = AiSystem.init(std.testing.allocator);
     defer serial_ai.deinit();
     var serial_frame = SimulationFrame.init(std.testing.allocator);
@@ -3557,6 +3580,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         .perception_slice = serial_data.aiPerceptionSliceConst(),
         .memory_slice = serial_data.aiMemorySliceConst(),
         .affect_slice = serial_data.aiAffectSliceConst(),
+        .interest_markers = &markers,
     });
     const serial = serial_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(@as(usize, 12), serial.len);
@@ -3575,6 +3599,7 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         .perception_slice = threaded_data.aiPerceptionSliceConst(),
         .memory_slice = threaded_data.aiMemorySliceConst(),
         .affect_slice = threaded_data.aiAffectSliceConst(),
+        .interest_markers = &markers,
     });
     const threaded = threaded_frame.navigation_intents.mergedItems();
     try std.testing.expectEqual(serial.len, threaded.len);
@@ -3588,6 +3613,11 @@ test "arbitration serial and threaded (0 workers) parity across perception + mem
         try std.testing.expectEqual(a.direct_direction_y, b.direct_direction_y);
         try std.testing.expectEqual(a.priority, b.priority);
     }
+    var saw_marker = false;
+    for (serial) |intent| {
+        if (intent.goal.x == 100 and intent.goal.y == 0) saw_marker = true;
+    }
+    try std.testing.expect(saw_marker);
 }
 
 test "arbitration cohere goal is the mean of friendly spatial neighbors" {

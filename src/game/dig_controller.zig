@@ -33,6 +33,8 @@ const StimulusKind = @import("simulation.zig").StimulusKind;
 const defaultStimulusIntensity = @import("simulation.zig").defaultStimulusIntensity;
 const DigIntent = @import("simulation.zig").DigIntent;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
+const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
+const SensoryBus = @import("sensory_bus.zig").SensoryBus;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
 
@@ -139,6 +141,7 @@ pub const DigController = struct {
         // Reserve event + stimulus slots before any world mutate so a capacity miss
         // cannot leave the tile changed without matching outputs. digRamp also
         // preflights level_links capacity before its tile write.
+        if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
         const changed = switch (intent) {
@@ -159,12 +162,13 @@ pub const DigController = struct {
             .stage = .structural_commit,
             .payload = .{ .world_tile_changed = changed },
         });
-        try frame.appendStimulus(.{
+        var stimulus_dropped: usize = 0;
+        _ = try SensoryBus.emit(frame, .{
             .position = cellCenterWorldPos(world, cell),
             .intensity = defaultStimulusIntensity(.dig),
             .kind = .dig,
             .level = player.current_level,
-        });
+        }, true, &stimulus_dropped);
     }
 
     /// Carves a walkable ramp tile and adds a bidirectional ramp `LevelLink` to the
@@ -941,6 +945,36 @@ test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
     );
     try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
     try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
+}
+
+test "dig process on a full live bus leaves the tile unchanged" {
+    var tw = try TestWorld.init(.right, 0);
+    defer tw.deinit();
+    const dig = try testDigController(&tw.meta);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.events.reserve(4, 8);
+    frame.events.setCapacityLimit(8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    frame.beginStep();
+    for (0..stimulus_live_capacity) |i| {
+        try frame.writeLiveStimulus(.{
+            .position = .{ .x = @floatFromInt(i), .y = 0 },
+            .intensity = 1,
+            .kind = .footstep,
+            .level = 0,
+        });
+    }
+    frame.dig_intent = .hole;
+
+    const floor = tw.world.denseFloorLayerForLevel(0).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+
+    try std.testing.expectError(error.StimulusCapacityExceeded, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }
 
 test "dig process stimulus capacity miss leaves tile unchanged" {

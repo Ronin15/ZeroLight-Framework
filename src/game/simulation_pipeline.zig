@@ -434,7 +434,7 @@ pub const SimulationPipelineStats = struct {
     collision_response: CollisionResponseStats = .{},
     /// Live-bus stimuli dropped this step (promote and footstep optional
     /// appends when `stimulus_live_capacity` is full). Dig uses required
-    /// `appendStimulus`, not soft drop.
+    /// `writeLiveStimulus`, not soft drop.
     stimuli_live_dropped: usize = 0,
     /// Deferred impact stimuli dropped this step when the pipeline buffer is full.
     stimuli_deferred_dropped: usize = 0,
@@ -1041,11 +1041,11 @@ pub const SimulationPipeline = struct {
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
-        step.stimuli_promoted = self.sensory.promote(context.frame, &step.stimuli_live_dropped);
+        step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
         // re-masks navigation in merge_outputs regardless of order.
         try self.dig.process(context.world, context.data, context.player.*, context.frame);
-        self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+        try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
     }
 
     /// Advance the stagger clock, derive the camera cognition halo, and select the
@@ -1502,6 +1502,151 @@ test "pipeline commits the dig stage's world edit before plane traversal reads i
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
     const floor1 = world.denseFloorLayerForLevel(1).?;
     try std.testing.expect(!world.denseTileBlocksMovement(floor1, 6, 3));
+}
+
+test "pipeline update after reserve allocates nothing on frame streams with dig, fall, and contact" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    // Same dig-then-fall fixture as the causal order test, plus an overlapping
+    // pair at the origin so collision writes a contact. The pair sits off the
+    // dug cell, so the fall still lands. Frame streams are reserved, then
+    // swapped to a failing allocator; world and data allocators stay real
+    // because the dig and the landing carve mutate tiles.
+    const asset_store = AssetStore.init(std.testing.allocator, std.testing.io, "assets");
+    var meta = try world_tileset_meta.load(std.testing.allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
+    defer meta.deinit();
+    var world = try testMinimalMultiLevelWorld(&meta);
+    defer world.deinit();
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    player.current_level = 0;
+    placePlayerFlush(&data, player, .{ 5, 3 });
+    data.facingPtr(player.entity).?.* = .right;
+
+    const npc = try data.createEntity();
+    try data.setMovementBody(npc, .{});
+    try data.setPrimitiveVisual(npc, .{
+        .size = .{ .x = 32, .y = 32 },
+        .color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+        .marker_color = .{ .r = 1, .g = 1, .b = 1, .a = 1 },
+    });
+    try data.setAiAgent(npc, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setWorldLevel(npc, 0);
+    try data.setSimulationTier(npc, .locomotion);
+    {
+        const body = data.movementBodyPtr(npc).?;
+        body.previous_x.* = 5 * 32;
+        body.previous_y.* = 3 * 32;
+        body.position_x.* = 5 * 32;
+        body.position_y.* = 3 * 32;
+        body.velocity_x.* = 2000;
+        body.velocity_y.* = 0;
+    }
+
+    const bumper = try data.createEntity();
+    try data.setMovementBody(bumper, .{
+        .position = .{ .x = 0, .y = 0 },
+        .previous_position = .{ .x = 0, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(bumper, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(bumper, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    try data.setWorldLevel(bumper, 0);
+    try data.setSimulationTier(bumper, .locomotion);
+
+    const wall = try data.createEntity();
+    try data.setMovementBody(wall, .{
+        .position = .{ .x = 16, .y = 0 },
+        .previous_position = .{ .x = 16, .y = 0 },
+        .velocity = .{},
+        .speed = 0,
+    });
+    try data.setCollisionBounds(wall, .{ .size = .{ .x = 32, .y = 32 } });
+    try data.setCollisionResponse(wall, .{ .mode = .solid, .mobility = .static, .restitution = 0 });
+    try data.setWorldLevel(wall, 0);
+    try data.setSimulationTier(wall, .locomotion);
+
+    const dig_config = try DigConfig.fromMeta(&meta);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(16, 128, 32, 32, 16, 16);
+    try frame.reservePathRequests(4, 8);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(4, 4);
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 8,
+        .dig = dig_config,
+        .movement_body_capacity = 8,
+        .perception_max_events_per_step = 4,
+        .affect_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+    try pipeline.reserve(&frame, 8);
+
+    frame.beginStep();
+    frame.dig_intent = .hole;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const fail_alloc = failing.allocator();
+    const saved_events = frame.events.stream.allocator;
+    const saved_stimuli = frame.stimuli.allocator;
+    const saved_contacts = frame.contacts.allocator;
+    const saved_structural = frame.structural_commands.allocator;
+    const saved_intents = frame.intents.allocator;
+    const saved_nav = frame.navigation_intents.allocator;
+    const saved_paths = frame.path_requests.allocator;
+    const saved_triggers = frame.collision_triggers.allocator;
+    const saved_actions = frame.action_intents.allocator;
+    frame.events.stream.allocator = fail_alloc;
+    frame.stimuli.allocator = fail_alloc;
+    frame.contacts.allocator = fail_alloc;
+    frame.structural_commands.allocator = fail_alloc;
+    frame.intents.allocator = fail_alloc;
+    frame.navigation_intents.allocator = fail_alloc;
+    frame.path_requests.allocator = fail_alloc;
+    frame.collision_triggers.allocator = fail_alloc;
+    frame.action_intents.allocator = fail_alloc;
+    defer {
+        frame.events.stream.allocator = saved_events;
+        frame.stimuli.allocator = saved_stimuli;
+        frame.contacts.allocator = saved_contacts;
+        frame.structural_commands.allocator = saved_structural;
+        frame.intents.allocator = saved_intents;
+        frame.navigation_intents.allocator = saved_nav;
+        frame.path_requests.allocator = saved_paths;
+        frame.collision_triggers.allocator = saved_triggers;
+        frame.action_intents.allocator = saved_actions;
+    }
+
+    _ = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
+    try std.testing.expect(frame.contacts.mergedItems().len > 0);
+    try std.testing.expect(frame.stimuli.mergedItems().len > 0);
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {
@@ -3704,7 +3849,7 @@ test "promote drops deferred impacts when live bus is already full" {
     try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
 
     for (0..stimulus_live_capacity) |i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = .dig,
@@ -3733,7 +3878,7 @@ test "promote drops deferred impacts when live bus is already full" {
     pipeline.sensory.deferred_stimulus_count = 1;
 
     var live_dropped: usize = 0;
-    const promoted = pipeline.sensory.promote(&frame, &live_dropped);
+    const promoted = try pipeline.sensory.promote(&frame, &live_dropped);
     try std.testing.expectEqual(@as(usize, 0), promoted);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
     try std.testing.expectEqual(@as(usize, 1), pipeline.sensory.deferred_stimulus_count);
@@ -3752,7 +3897,7 @@ test "player footstep drops when live bus is full" {
     defer frame.deinit();
     try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
     for (0..stimulus_live_capacity) |i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = .dig,
@@ -3762,7 +3907,7 @@ test "player footstep drops when live bus is full" {
 
     var live_dropped: usize = 0;
     const bus = SensoryBus.init(.{});
-    bus.appendFootstep(&frame, &data, player, &live_dropped);
+    try bus.appendFootstep(&frame, &data, player, &live_dropped);
     try std.testing.expectEqual(@as(usize, 1), live_dropped);
     try std.testing.expectEqual(stimulus_live_capacity, frame.stimuli.mergedItems().len);
 }

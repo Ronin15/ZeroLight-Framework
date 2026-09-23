@@ -16,6 +16,7 @@ const ai_range_alignment_items = @import("../game/systems/ai.zig").ai_range_alig
 const SpatialIndexSystem = @import("../game/systems/spatial_index.zig").SpatialIndexSystem;
 const SpatialIndexView = @import("../game/systems/spatial_index.zig").SpatialIndexView;
 const SimulationFrame = @import("../game/simulation.zig").SimulationFrame;
+const InterestMarkerStore = @import("../game/world_interest.zig").InterestMarkerStore;
 const suite = @import("suite.zig");
 
 const delta_seconds: f32 = 1.0 / 60.0;
@@ -45,8 +46,10 @@ const Fixture = struct {
     // config with only `.focus_target` set and no `.focus_entity` never
     // resolves the fallback tier at all.
     focus_entity: EntityId,
+    markers: InterestMarkerStore,
 
     fn deinit(self: *Fixture) void {
+        self.markers.deinit(self.frame.allocator);
         self.frame.deinit();
         self.data.deinit();
         self.* = undefined;
@@ -115,9 +118,16 @@ pub fn createFixture(allocator: std.mem.Allocator, count: usize) !Fixture {
             },
             else => try data.setAiAgent(entity, .{ .active_behavior = .wander, .wander_amplitude = wander_amplitude, .gain_cohere = 1.5 }),
         }
+        try data.setAiMemory(entity, .{ .staleness = @floatFromInt(index % 5), .familiarity = 0.25 });
+        try data.setAiAffect(entity, .{ .fear = 0.2, .curiosity = 0.15, .aggression = 0.1 });
     }
 
-    return .{ .data = data, .frame = frame, .focus_entity = focus_entity };
+    var markers = InterestMarkerStore.init(allocator);
+    errdefer markers.deinit(allocator);
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 64, .y = 64, .radius = 16 });
+    _ = try markers.addMarker(.{ .kind = .investigate, .level = 0, .x = 400, .y = 200, .radius = 16 });
+
+    return .{ .data = data, .frame = frame, .focus_entity = focus_entity, .markers = markers };
 }
 
 fn behaviorHistogram(behaviors: []const AiBehavior) suite.AiBehaviorHistogramSummary {
@@ -212,6 +222,9 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
             .focus_target = benchmarkSeekTarget(),
             .focus_entity = fixture.focus_entity,
             .perception_slice = fixture.data.aiPerceptionSliceConst(),
+            .memory_slice = fixture.data.aiMemorySliceConst(),
+            .affect_slice = fixture.data.aiAffectSliceConst(),
+            .interest_markers = &fixture.markers,
         });
     }
 
@@ -223,6 +236,9 @@ fn runOnce(system: *AiSystem, fixture: *Fixture, spatial_view: SpatialIndexView,
         .focus_target = benchmarkSeekTarget(),
         .focus_entity = fixture.focus_entity,
         .perception_slice = fixture.data.aiPerceptionSliceConst(),
+        .memory_slice = fixture.data.aiMemorySliceConst(),
+        .affect_slice = fixture.data.aiAffectSliceConst(),
+        .interest_markers = &fixture.markers,
     });
 }
 

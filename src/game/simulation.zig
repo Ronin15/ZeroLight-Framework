@@ -682,7 +682,7 @@ pub const SimulationFrame = struct {
         try self.structural_commands.reserve(range_count, structural_command_capacity);
     }
 
-    /// Preflights buffer growth for one `appendStimulus` (one range, `value_count`
+    /// Preflights buffer growth for one `writeLiveStimulus` (one range, `value_count`
     /// values) so a capacity miss cannot leave a dig tile changed without a
     /// matching stimulus. Call before any world mutate that must emit one.
     pub fn ensureStimulusAppendCapacity(self: *SimulationFrame, value_count: usize) !void {
@@ -712,14 +712,12 @@ pub const SimulationFrame = struct {
         return pending;
     }
 
-    /// Single-value append for main-thread producers (dig is not threaded).
-    /// Multi-producer bus (Slice 39): dig, footstep, and promoted deferred
-    /// impacts share this path. Dig preflights via `ensureStimulusAppendCapacity`
-    /// before world mutate; optional emitters use `tryAppendStimulus` so a full
-    /// bus drops sensory noise without failing the step. Demo/pipeline warm
+    /// Unchecked single-value append. The live-bus cap lives in `SensoryBus.emit`:
+    /// a required emit fails before the caller mutates the world, an optional
+    /// emit increments the drop counter and returns false. Demo/pipeline warm
     /// with `stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity)`
     /// (one range per append).
-    pub fn appendStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
+    pub fn writeLiveStimulus(self: *SimulationFrame, stimulus: WorldStimulus) !void {
         const first_range = try self.stimuli.appendRangeCounts(1);
         self.stimuli.addCount(first_range, 1);
         try self.stimuli.prefixAppendedRanges(first_range);
@@ -727,16 +725,6 @@ pub const SimulationFrame = struct {
         writer.write(stimulus);
         writer.finish();
         self.stimuli.finishWrite();
-    }
-
-    /// Capacity-aware optional append: drops when live count is already at
-    /// `capacity` (fixed budget, not map-scaled). Returns false when dropped
-    /// or when buffer growth fails after warmup (should not happen if reserved).
-    pub fn tryAppendStimulus(self: *SimulationFrame, stimulus: WorldStimulus, capacity: usize) bool {
-        if (capacity == 0 or self.stimulusLiveCount() >= capacity) return false;
-        self.ensureStimulusAppendCapacity(1) catch return false;
-        self.appendStimulus(stimulus) catch return false;
-        return true;
     }
 
     pub fn reservePathRequests(self: *SimulationFrame, range_count: usize, request_capacity: usize) !void {
@@ -1603,12 +1591,12 @@ test "simulation frame reserves stream capacity for warmed fixed-step output" {
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.appendStimulus writes into frame.stimuli, mergedItems reflects it immediately" {
+test "SimulationFrame.writeLiveStimulus writes into frame.stimuli, mergedItems reflects it immediately" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
-    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 1 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 1 });
 
     const merged = frame.stimuli.mergedItems();
     try std.testing.expectEqual(@as(usize, 2), merged.len);
@@ -1624,27 +1612,6 @@ test "stimulusHearingScore prefers nearer equal intensities and louder equal dis
     try std.testing.expect(stimulusHearingScore(1.0, 20 * 20) > stimulusHearingScore(1.0, 40 * 40));
     try std.testing.expect(stimulusHearingScore(1.0, 30 * 30) > stimulusHearingScore(0.35, 30 * 30));
     try std.testing.expect(stimulusHearingScore(0, 0) < 0);
-}
-
-test "tryAppendStimulus drops when live capacity is full" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-    try frame.stimuli.reserve(1, 4);
-
-    try std.testing.expect(frame.tryAppendStimulus(.{
-        .position = .{ .x = 0, .y = 0 },
-        .intensity = 1,
-        .kind = .dig,
-        .level = 0,
-    }, 1));
-    try std.testing.expect(!frame.tryAppendStimulus(.{
-        .position = .{ .x = 1, .y = 0 },
-        .intensity = 1,
-        .kind = .footstep,
-        .level = 0,
-    }, 1));
-    try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
-    try std.testing.expectEqual(StimulusKind.dig, frame.stimuli.mergedItems()[0].kind);
 }
 
 test "SimulationFrame.publishWorldTileChanges writes N events in a single range" {
@@ -1668,14 +1635,14 @@ test "SimulationFrame.clearRetainingCapacity clears stimuli" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 
     frame.clearRetainingCapacity();
     try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.appendStimulus has no steady-state allocation after warmup (FailingAllocator)" {
+test "SimulationFrame.writeLiveStimulus has no steady-state allocation after warmup (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1687,11 +1654,11 @@ test "SimulationFrame.appendStimulus has no steady-state allocation after warmup
     frame.stimuli.allocator = failing_allocator.allocator();
     defer frame.stimuli.allocator = original_allocator;
 
-    try frame.appendStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 3, .y = 4 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is allocation-free (FailingAllocator)" {
+test "SimulationFrame.ensureStimulusAppendCapacity then writeLiveStimulus is allocation-free (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1702,11 +1669,11 @@ test "SimulationFrame.ensureStimulusAppendCapacity then appendStimulus is alloca
     frame.stimuli.allocator = failing.allocator();
     defer frame.stimuli.allocator = original_stimuli;
 
-    try frame.appendStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
+    try frame.writeLiveStimulus(.{ .position = .{ .x = 1, .y = 2 }, .intensity = 1, .kind = .dig, .level = 0 });
     try std.testing.expectEqual(@as(usize, 1), frame.stimuli.mergedItems().len);
 }
 
-test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
+test "SimulationFrame multi-writeLiveStimulus after live-bus reserve is allocation-free (FailingAllocator)" {
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
 
@@ -1721,7 +1688,7 @@ test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-
     // Representative multi-producer step: promoted impact + dig + footstep.
     const kinds = [_]StimulusKind{ .impact, .dig, .footstep };
     for (kinds, 0..) |kind, i| {
-        try frame.appendStimulus(.{
+        try frame.writeLiveStimulus(.{
             .position = .{ .x = @floatFromInt(i), .y = 0 },
             .intensity = 1,
             .kind = kind,
@@ -1729,35 +1696,6 @@ test "SimulationFrame multi-appendStimulus after live-bus reserve is allocation-
         });
     }
     try std.testing.expectEqual(@as(usize, 3), frame.stimuli.mergedItems().len);
-}
-
-test "tryAppendStimulus returns false at live capacity without allocating (FailingAllocator)" {
-    var frame = SimulationFrame.init(std.testing.allocator);
-    defer frame.deinit();
-
-    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
-    frame.clearRetainingCapacity();
-
-    const original_stimuli = frame.stimuli.allocator;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
-    frame.stimuli.allocator = failing.allocator();
-    defer frame.stimuli.allocator = original_stimuli;
-
-    for (0..stimulus_live_capacity) |i| {
-        try std.testing.expect(frame.tryAppendStimulus(.{
-            .position = .{ .x = @floatFromInt(i), .y = 0 },
-            .intensity = 1,
-            .kind = .footstep,
-            .level = 0,
-        }, stimulus_live_capacity));
-    }
-    try std.testing.expectEqual(@as(usize, stimulus_live_capacity), frame.stimuli.mergedItems().len);
-    try std.testing.expect(!frame.tryAppendStimulus(.{
-        .position = .{ .x = 99, .y = 0 },
-        .intensity = 1,
-        .kind = .footstep,
-        .level = 0,
-    }, stimulus_live_capacity));
 }
 
 test "ActionIntent fields are scalar or enum only" {
