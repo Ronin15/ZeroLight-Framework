@@ -189,6 +189,15 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
   via `agentType`; keep them stable. All run `opus`; design at `xhigh`
   effort, review/implementation/debug at `high` (review fans out across many
   workflow agents).
+  **Required, not optional:** all non-trivial Zig design, implementation,
+  review, and debugging goes through these agents, chained as one pipeline —
+  `zig-design-specialist` plans → `zig-specialist` implements →
+  `zig-review-specialist` reviews (findings go back to `zig-specialist`) →
+  `zig-debug-specialist` for build/test/runtime failures. Do not implement
+  non-trivial changes inline, and do not substitute or add generic skills or
+  agents (`/code-review`, `/simplify`, generic Explore/Plan) for this repo's
+  Zig work — not even alongside these agents. The main session orchestrates,
+  verifies agent claims against the live code, and reports.
 - `workflows/` — multi-agent passes, invoked as `/pathfinder-review`,
   `/architecture-assessment`, `/zig-best-practices-review`,
   `/zig-deep-correctness-review-pass`. Each produces a report; none edits code.
