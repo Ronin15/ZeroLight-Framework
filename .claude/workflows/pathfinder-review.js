@@ -1,6 +1,7 @@
 export const meta = {
   name: 'pathfinder-review',
   description: 'Multi-agent Zig review of the pathfinder module for coherency, cohesion, and standards adherence',
+  whenToUse: 'Module-wide review of src/game/systems/pathfinding/ after substantive pathfinder changes; review-only, produces one severity-ordered report',
   phases: [
     { title: 'Review', detail: 'one zig-review-specialist per file cluster' },
     { title: 'Cross-cut', detail: 'module-wide coherency & cohesion lenses' },

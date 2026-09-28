@@ -2,12 +2,15 @@
 name: zig-design-specialist
 description: >-
   Data-oriented (DOD) game-systems design specialist for this Zig 0.16 + SDL3/SDL_GPU
-  engine. Use PROACTIVELY before implementing any non-trivial change: gameplay systems,
+  engine. Use proactively before implementing any non-trivial change: gameplay systems,
   ECS/DataSystem changes, processor ordering, deferred structural changes, save/load
   boundaries, emergent gameplay (AI, collision, steering, pathfinding, particles),
   parallel render-prep, simulation pipeline/controller placement, threading/SIMD policy,
   or a roadmap slice. Produces a decision-complete plan; it does NOT edit code.
 tools: Read, Grep, Glob, Bash
+model: opus
+effort: xhigh
+color: purple
 ---
 
 # Zig Design Specialist

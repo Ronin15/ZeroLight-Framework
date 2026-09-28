@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(zig build)",
+      "Bash(zig build check)",
+      "Bash(zig build check *)",
+      "Bash(zig build test)",
+      "Bash(zig build test *)",
+      "Bash(zig build verify)",
+      "Bash(zig build verify *)",
+      "Bash(zig build fmt)",
+      "Bash(zig build idiom-lint)",
+      "Bash(zig build assets-lint)",
+      "Bash(zig build shaders)",
+      "Bash(zig build bench -- *)",
+      "Bash(zig fmt *)",
+      "Bash(zig version)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "deny": [
+      "Edit(/zig-out/**)",
+      "Edit(/.zig-cache/**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/zig-fmt.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

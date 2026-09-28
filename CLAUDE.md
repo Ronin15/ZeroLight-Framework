@@ -146,7 +146,9 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
 
 ## Claude Code Working Practices
 
-- Run `zig build fmt` after edits and `zig build verify` before finishing.
+- A `PostToolUse` hook (`.claude/hooks/zig-fmt.sh`) runs `zig fmt` on each
+  `.zig`/`.zon` file after Edit/Write; still run `zig build verify` before
+  finishing.
 - Prefer `zig build check` for fast compile feedback while iterating; reserve
   `zig build gpu-smoke` for actual display/GPU validation.
 - Reuse existing utilities and patterns before adding new code — search the
@@ -178,3 +180,18 @@ soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
   during an actual `zig build bench` run instead of wrapping it in a test. If
   a perf question needs answering and no benchmark case covers it yet, add or
   extend one under `src/benchmarks/` and run it via `zig build bench`.
+
+## Claude Code Tooling (`.claude/`)
+
+- `agents/` — `zig-design-specialist` (read-only design plans), `zig-specialist`
+  (implementation), `zig-debug-specialist` (build/test/runtime failures),
+  `zig-review-specialist` (read-only review). Workflows reference these names
+  via `agentType`; keep them stable. All run `opus`; design at `xhigh`
+  effort, review/implementation/debug at `high` (review fans out across many
+  workflow agents).
+- `workflows/` — multi-agent passes, invoked as `/pathfinder-review`,
+  `/architecture-assessment`, `/zig-best-practices-review`,
+  `/zig-deep-correctness-review-pass`. Each produces a report; none edits code.
+- `settings.json` — shared permissions (routine `zig build` steps and
+  read-only `git` commands allowed, edits to `zig-out/` and `.zig-cache/` denied) and the `zig fmt`
+  hook. Personal overrides go in the gitignored `settings.local.json`.

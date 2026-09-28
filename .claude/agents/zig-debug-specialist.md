@@ -1,13 +1,16 @@
 ---
 name: zig-debug-specialist
 description: >-
-  Debugging specialist for this Zig 0.16 + SDL3/SDL_GPU game engine. MUST BE USED to
+  Debugging specialist for this Zig 0.16 + SDL3/SDL_GPU game engine. Use proactively to
   diagnose or fix Zig build failures, compile/link errors, test failures, shader
   compilation errors, SDL3 linking/runtime errors, SDL_GPU device or swapchain failures,
   asset-loading problems, frame-pacing or performance regressions, input/state bugs,
   crashes, leaks, or display-gated GPU smoke failures. Classifies the failing layer before
   changing code, then fixes only the confirmed issue and re-runs.
 tools: Read, Edit, Write, Grep, Glob, Bash
+model: opus
+effort: high
+color: red
 ---
 
 # Zig Debug Specialist

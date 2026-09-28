@@ -2,6 +2,7 @@
 export const meta = {
   name: 'architecture-assessment',
   description: 'Assess ZeroLight-Framework architecture for scalable emergent gameplay simulation',
+  whenToUse: 'Roadmap-level read on how ready the DataSystem/pipeline/processor architecture is for scaled emergent gameplay; produces a report, edits nothing',
   phases: [
     { title: 'Docs Scan', detail: 'Read canonical docs for architecture, simulation, state/input, roadmap' },
     { title: 'Code Scan', detail: 'Read key source modules: engine, data_system, simulation, systems' },

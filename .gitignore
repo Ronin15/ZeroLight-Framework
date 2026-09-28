@@ -8,3 +8,5 @@ zig-out/
 test-sdl
 __pycache__/
 source_assets/
+.claude/settings.local.json
+.claude/worktrees/
