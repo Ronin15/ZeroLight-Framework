@@ -43,11 +43,13 @@ const shader_programs = [_]ShaderProgram{
                 .stage = .vertex,
                 .source_path = "assets/shaders/sprite.vert.glsl",
                 .output_stem = "sprite.vert",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant FrameUniform& u [[buffer(0)]])",
             },
             .{
                 .stage = .fragment,
                 .source_path = "assets/shaders/sprite.frag.glsl",
                 .output_stem = "sprite.frag",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], texture2d<float> sprite_texture [[texture(0)]], sampler sprite_textureSmplr [[sampler(0)]])",
             },
         },
     },
@@ -58,11 +60,13 @@ const shader_programs = [_]ShaderProgram{
                 .stage = .vertex,
                 .source_path = "assets/shaders/tilemap.vert.glsl",
                 .output_stem = "tilemap.vert",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant FrameUniform& u [[buffer(0)]])",
             },
             .{
                 .stage = .fragment,
                 .source_path = "assets/shaders/tilemap.frag.glsl",
                 .output_stem = "tilemap.frag",
+                .msl_entry_signature = "main0(main0_in in [[stage_in]], constant TilemapUniform& tm [[buffer(0)]], const device TileData& tiles [[buffer(1)]], texture2d<float> atlas_texture [[texture(0)]], sampler atlas_textureSmplr [[sampler(0)]])",
             },
         },
     },
@@ -613,6 +617,11 @@ const ShaderStageSource = struct {
     stage: ShaderStage,
     source_path: []const u8,
     output_stem: []const u8,
+    /// Exact generated MSL entry-point parameter list, `main0(` through `)`. Pins
+    /// SDL_GPU's Metal slot layout (uniform buffers, then storage buffers, in
+    /// [[buffer]]; textures/samplers from 0): Metal binds a mismatched slot silently
+    /// and only rejects duplicate indices at shader creation.
+    msl_entry_signature: []const u8,
 };
 
 const ShaderStage = enum {
@@ -659,6 +668,15 @@ comptime {
         const built = shaderFormatsForTarget(os_tag);
         if ((built & runtime_accepted) == 0)
             @compileError("shaderFormatsForTarget produces a format the runtime cannot select");
+    }
+}
+
+comptime {
+    for (shader_programs) |program| {
+        for (program.stages) |stage_source| {
+            if (!std.mem.startsWith(u8, stage_source.msl_entry_signature, "main0("))
+                @compileError("msl_entry_signature must be the generated MSL entry-point parameter list starting with main0(: " ++ stage_source.output_stem);
+        }
     }
 }
 
@@ -749,9 +767,12 @@ fn addMslShaderSteps(
 
             const msl_cmd = b.addSystemCommand(&.{shader_cross_compiler});
             msl_cmd.addFileArg(spv);
-            msl_cmd.addArgs(&.{ "--msl", "--stage", stage_source.stage.spirvCrossArg(), "--output" });
+            // Decoration binding pins MSL indices to the SPIR-V bindings. Without it
+            // spirv-cross numbers [[buffer(n)]] by SPIR-V id order, which drifts with
+            // shader code shape and can put a storage buffer in SDL's uniform slot.
+            msl_cmd.addArgs(&.{ "--msl", "--msl-decoration-binding", "--stage", stage_source.stage.spirvCrossArg(), "--output" });
             const msl = msl_cmd.addOutputFileArg(b.fmt("{s}.msl", .{stage_source.output_stem}));
-            const check = b.addCheckFile(msl, .{});
+            const check = b.addCheckFile(msl, .{ .expected_matches = &.{stage_source.msl_entry_signature} });
             const install = b.addInstallBinFile(msl, b.fmt("{s}/shaders/{s}.msl", .{ asset_root, stage_source.output_stem }));
             install.step.dependOn(&check.step);
             install_steps[install_index] = &install.step;
