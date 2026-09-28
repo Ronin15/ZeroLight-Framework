@@ -195,19 +195,13 @@ comptime {
     const submit_layers = @as(usize, 1 + procedural_render_window_levels_below) * procedural_max_dense_bands_per_level;
     std.debug.assert(submit_layers <= world_system.k_max_dense_submit_stack_cap);
 }
-/// `estimateDenseTileGpuBytes` ceiling: dense_layer_count * width * height * @sizeOf(u32).
-const procedural_max_dense_tile_gpu_bytes: usize =
-    procedural_dense_layer_count *
-    @as(usize, procedural_world_width_tiles) *
-    @as(usize, procedural_world_height_tiles) *
-    @sizeOf(u32);
 pub const default_world_build_config = world_system.WorldBuildConfig{
     .width_tiles = procedural_world_width_tiles,
     .height_tiles = procedural_world_height_tiles,
     .chunk_size_tiles = 16,
     .underground_level_count = procedural_underground_count,
     .max_dense_bands_per_level = procedural_max_dense_bands_per_level,
-    .max_dense_tile_gpu_bytes = procedural_max_dense_tile_gpu_bytes,
+    .max_dense_tile_gpu_bytes = world_system.k_max_dense_tile_gpu_bytes,
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 

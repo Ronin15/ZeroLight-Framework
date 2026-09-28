@@ -153,11 +153,12 @@ pub const Renderer = struct {
         std.debug.assert(k_stacked_state_ui_headroom >= 2 * k_overlay_command_headroom);
     }
 
-    /// Upper bound on composited layers in one tilemap draw's window. Tied to
-    /// `world_system.zig`'s `k_max_dense_submit_stack_cap` by a comptime assert in
-    /// that file (which already imports this module, so the assert lives there
-    /// to avoid an import cycle).
-    pub const k_max_tilemap_window_layers: usize = 32;
+    /// Upper bound on composited layers in one tilemap draw's window; owned by
+    /// `sprite_batch.zig` beside the `TilemapParams.layer_offsets` array it sizes.
+    /// Tied to `world_system.zig`'s `k_max_dense_submit_stack_cap` by a comptime
+    /// assert in that file (which already imports this module, so the assert
+    /// lives there to avoid an import cycle).
+    pub const k_max_tilemap_window_layers = sprite_batch.k_max_tilemap_window_layers;
 
     /// Cap on separate tilemap composite draw calls in one frame. In the
     /// shipped default config this always resolves to 1 (only the active

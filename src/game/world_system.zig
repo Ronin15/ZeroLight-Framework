@@ -54,6 +54,10 @@ pub const level_z_step: i32 = 16;
 /// (8 level indices × 2 bands). Build-time validation keeps real worlds inside
 /// `maxDenseSubmitLayerCount`; overflow here is a defensive submit-time guard.
 pub const k_max_dense_submit_stack_cap: usize = 32;
+/// Fixed GPU tile-data budget for `WorldBuildConfig.max_dense_tile_gpu_bytes`.
+/// A world whose `estimateDenseTileGpuBytes` exceeds it is refused with
+/// `DenseTileGpuBudgetExceeded`; never derive it from a world's own size.
+pub const k_max_dense_tile_gpu_bytes: usize = 64 * 1024 * 1024;
 
 // The renderer's per-draw composited layer window must be able to hold every
 // layer this stack can ever submit in one frame; tied here (this file already
@@ -3773,6 +3777,24 @@ test "validateDenseRenderBudget rejects oversized render window stack cap" {
         .max_dense_bands_per_level = 2,
     };
     defer world.deinit();
+    try std.testing.expectError(error.DenseLayerWindowExceeded, world.validateDenseRenderBudget());
+}
+
+test "validateDenseRenderBudget accepts a window at the submit stack cap and refuses one past it" {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 1,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 1,
+        .render_window = .{ .levels_below = @intCast(k_max_dense_submit_stack_cap - 1) },
+        .max_dense_bands_per_level = 1,
+    };
+    defer world.deinit();
+    try std.testing.expectEqual(k_max_dense_submit_stack_cap, world.maxDenseSubmitLayerCount());
+    try world.validateDenseRenderBudget();
+
+    world.render_window.levels_below += 1;
     try std.testing.expectError(error.DenseLayerWindowExceeded, world.validateDenseRenderBudget());
 }
 

@@ -150,6 +150,11 @@ pub fn build(b: *std.Build) void {
     });
 
     const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl);
+    // GLSL cannot read Zig constants; sprite_batch.zig's layer_offsets sync test
+    // embeds the shader source to check its array size.
+    unitTestsModule.addAnonymousImport("tilemap_frag_glsl", .{
+        .root_source_file = b.path("assets/shaders/tilemap.frag.glsl"),
+    });
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
         .use_llvm = force_llvm_lld,

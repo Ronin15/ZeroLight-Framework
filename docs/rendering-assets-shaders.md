@@ -166,7 +166,15 @@ Each bucket becomes one retained world-space quad (`Renderer.beginStaticGeometry
 `Renderer.TilemapWindowLayers` — up to `Renderer.k_max_tilemap_window_layers`
 topmost-first element offsets into the combined buffer
 (`WorldSystem.buildWindowLayers` reverses `collectDenseSubmitLayers`'s
-deepest-first bucket slice, since the shader composites top-down). The tilemap
+deepest-first bucket slice, since the shader composites top-down). The constant
+is owned by `sprite_batch.zig`, where it also sizes `TilemapParams.layer_offsets`,
+and is comptime-tied to `k_max_dense_submit_stack_cap` (32). GLSL cannot read a
+Zig constant, so `tilemap.frag.glsl`'s `uvec4 layer_offsets[N]` is held to
+`N == k_max_tilemap_window_layers / 4` by the `sprite_batch.zig` test
+"tilemap.frag.glsl layer_offsets matches k_max_tilemap_window_layers", which
+embeds the shader source (build.zig's `tilemap_frag_glsl` test import). Change
+the constant and the shader literal together; ReleaseFast strips the bounds
+check that would otherwise catch an overrun. The tilemap
 fragment shader maps each screen pixel to a world cell, then loops its window
 topmost-first — `tile_ids[layer_offsets[i] + cell_index]` — stopping at the first
 non-`invalid_tile_id` hit (or discarding if every composited layer is empty at
@@ -242,9 +250,14 @@ for every authored layer regardless of window depth.
 before append — this contract is unchanged by composite-draw bucketing.
 `maxDenseSubmitLayerCount` derives the **layer** cap from the window and
 `max_dense_bands_per_level`; `validateDenseRenderBudget` fails at world build if
-the window exceeds `k_max_dense_submit_stack_cap` or optional
-`WorldBuildConfig.max_dense_tile_gpu_bytes` — this bounds GPU tile-data memory
-and the depth-ascending collection buffer, not draw count. The separate
+the window exceeds `k_max_dense_submit_stack_cap` (`DenseLayerWindowExceeded`)
+or `estimateDenseTileGpuBytes` exceeds `WorldBuildConfig.max_dense_tile_gpu_bytes`
+(`DenseTileGpuBudgetExceeded`) — this bounds GPU tile-data memory and the
+depth-ascending collection buffer, not draw count. Both caps are fixed: a world
+that does not fit is refused, never accommodated by a larger number. The demo
+assigns the fixed literal `world_system.k_max_dense_tile_gpu_bytes` (64 MiB);
+the byte budget is never computed from the world's own level or cell count, and
+`0` disables the gate, so it is not a budget. The separate
 **draw**-count cap is `WorldSystem.maxDenseSubmitDrawCount()`
 (`Renderer.k_max_dense_composite_draws`): the actual bucket count is
 data-dependent per frame (how many interleave points exist), so this is the

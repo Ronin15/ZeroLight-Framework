@@ -6,7 +6,7 @@ feature chunk with a **Goal**, **Checklist**, and **Acceptance checks**. Agents
 implement by opening a slice section, checking items off only when integrated,
 and running `zig build verify` before marking the slice complete.
 
-Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45, 47, 48) live in
+Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48) live in
 [framework-implementation-slices-archive.md](framework-implementation-slices-archive.md).
 This file is the **open frontier**: agent workflow, priorities, Scaling Gaps,
 track overviews, and open slice sections only. Landed slices that still need
@@ -94,14 +94,13 @@ Use this index to choose the next slice; **implement from that slice's section**
 | --- | --- | --- |
 | **33** | Landed (visual/GPU-smoke verification pending) | Data-driven AI archetypes (JSON→enum bundle table) + debug introspection overlay — implemented and unit-tested; on-screen viz (F2) confirmed only via `gpu-smoke`/manual run |
 | **35** | Not started | AI/steering hot-loop SIMD restructure — unblocked (Slice 32 landed); measure at battle scale |
-| **37** | Partial | Fixed dense-submit cap (windows that do not fit are refused) + shader/host layer sync + fixed GPU-byte budget — stale-doc checklist item landed; rest open |
-| **38** | Not started | Elevation above the surface (depends on Slice 37) |
+| **38** | Not started | Elevation above the surface (prerequisite Slice 37 landed) |
 | **42** | Not started | Affect expansion — more emotion drives, coupling, appraisal gains, optional mood (needs real appraisal signals) |
 | **43** | Landed (manual HW verification pending) | SDL3 gamepad/controller support — single active device, analog movement, default button bindings (app/input layer; independent of AI/render tracks) |
 | **44** | Not started | Input rebinding UI + extended gamepad controls (right stick / triggers) — completes controls deferred by Slice 43 |
 | **46** | Not started | Save/load persistence — serialize `DataSystem`/`WorldSystem` by stable IDs; completes archive Slice 10's designed boundary |
 
-**Recently settled (archive only):** 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
+**Recently settled (archive only):** 37, 48, 47, 45, 40, 39, 41, 32, 8, 18–25E, 26–31, 34, 36 (plus 0–7, 9–17).
 **Residual non-slice backlog:** optional render micro-opts (e.g. an O(n) linear
 `mergeDrawList`) — see **Scaling Gaps**, not a live slice body. (The 23A
 `expand2`→`world` merge is settled: `expand2`/`world` are merged into `main`.)
@@ -122,7 +121,7 @@ table-driven affect→behavior are in place. Open work grows *beside* that loop.
 | **Primary — action/interaction** | archive **40** + **45** | Action-intent substrate + first domain controller (destructibles) landed; future combat/rules consumers reuse the same bus. |
 | **Pipeline composer** | archive **48** | Thin-composer restoration landed. `world_gate` SIMD is a Scaling Gap. |
 | **Feelings growth** | **42** | More drives / coupling / gains only when a real appraisal signal exists (often from 40/45 combat or other producers) — no dead enum tags. |
-| **World / render verticality** | **37 → 38** | Shader/host sync and a fixed byte budget, then elevation semantics inside the existing submit cap. Independent of AI. |
+| **World / render verticality** | archive **37** → **38** | Fixed submit cap, shader/host sync, and fixed byte budget landed; next is elevation semantics inside the existing submit cap. Independent of AI. |
 | **Input polish** | **44** (after 43 residual) | Rebind UI + right stick/triggers; binding persistence optional in **46**. |
 | **Perf** | **35** + Scaling Gaps | SIMD restructure of existing AI/steering loops when battle soak says math dominates — do not reshape arbitration contracts. |
 | **Persistence** | **46** | Save/load by stable IDs; largely independent. |
@@ -638,138 +637,6 @@ Acceptance checks:
       Scaling Gap.
 - [ ] `zig build verify` passes.
 
-## Slice 37: Dense Render-Window Fixed Cap And Shader/Host Sync Hardening
-
-Goal: keep one fixed dense-submit cap, close the shader/host layer-offset
-drift, and point the demo at a fixed GPU-byte budget. A world whose submit
-window or byte estimate does not fit is refused. This slice does not raise
-`k_max_dense_submit_stack_cap`, and it does not add a compositing window whose
-size is computed from level count or dense-band count.
-
-Why now: the GLSL layer-offset array and its Zig mirror are still separate
-literals, so a later edit can overrun the array in a ReleaseFast build. The
-demo's GPU-byte ceiling is computed from the same formula
-`estimateDenseTileGpuBytes` checks, so that gate cannot fail for the
-procedural world. The procedural window already fills today's cap of 32; that
-is the refusal case, not a reason to pick a larger constant for this map or
-for Slice 38's above/below shape.
-
-Problem (current envelope):
-
-- `world_system.k_max_dense_submit_stack_cap = 32` bounds
-  `DenseLayerRenderWindow.maxSubmitLayers()`; `Renderer.k_max_tilemap_window_layers`
-  and `Renderer.k_max_dense_composite_draws` are comptime-tied to it via
-  cross-module asserts (`world_system.zig`). All three stay on that one
-  literal. `validateDenseRenderBudget` returns `DenseLayerWindowExceeded` when
-  `maxDenseSubmitLayerCount()` or a level's band count exceeds the cap.
-- `assets/shaders/tilemap.frag.glsl`'s `uvec4 layer_offsets[8]` (32 `u32`
-  slots) and `sprite_batch.zig`'s `TilemapParams.layer_offsets: [32]u32` both
-  hardcode that literal independently of `Renderer.k_max_tilemap_window_layers`.
-  Nothing currently fails to compile or asserts at runtime if these three
-  values drift apart. `Renderer.applyWindowLayers`'s existing assert only
-  checks the caller's `window.count` against the Zig constant, not the
-  physical array size — so bumping the Zig constant alone would pass that
-  assert and then write past the end of the fixed 32-slot array. In Debug/
-  ReleaseSafe that's a bounds-check panic; in **ReleaseFast, what this project
-  ships, bounds checks are stripped — silent memory corruption**, not a crash.
-- `docs/rendering-assets-shaders.md` and the archive Slice 36 section said
-  `Renderer.k_max_dense_composite_draws = 8` — stale relative to the current
-  cap of 32. That doc correction is already landed; this slice does not raise
-  the value again.
-- `game_demo_state.zig`'s `procedural_max_dense_tile_gpu_bytes` computes its
-  budget ceiling from the exact same formula `estimateDenseTileGpuBytes`
-  checks it against, so `validateDenseRenderBudget`'s GPU-byte gate can never
-  actually fail for that world. The mechanism itself
-  (`WorldBuildConfig.max_dense_tile_gpu_bytes` + `validateDenseRenderBudget`)
-  is otherwise correct and already tested — only this one caller defeats it.
-  Leaving the field at `0` disables the check (`max_dense_tile_gpu_bytes > 0`
-  guards it) and is not a budget.
-
-Current foundation (landed, do not rebuild):
-
-- Slice 36's single-pass compositing (`partitionDenseCompositeBuckets`,
-  `buildWindowLayers`, `TilemapWindowLayers`, the per-pixel shader walk)
-  already makes draw-call count track interleave points rather than window
-  depth. This slice binds that path to the existing fixed cap. It does not
-  change how compositing works and it does not widen the cap.
-- `WorldBuildConfig.max_dense_tile_gpu_bytes` / `validateDenseRenderBudget`
-  (`world_system.zig`) is a real, already-tested budget gate. Keep the
-  function. Replace the demo's computed ceiling with a literal constant the
-  demo assigns by name.
-
-Architecture notes:
-
-- `k_max_dense_submit_stack_cap` stays `32`, and the two renderer constants
-  comptime-tied to it stay with it. A world that needs more submit layers, or
-  more dense bands on a level, is refused with `DenseLayerWindowExceeded`.
-  There is no follow-up dynamic window sized by
-  `(levels_above + levels_below + 1) * max_dense_bands_per_level`.
-- Move `k_max_tilemap_window_layers` ownership (and `TilemapParams.layer_offsets`'s
-  array size) into `sprite_batch.zig`, defined directly off the shared
-  constant instead of a hardcoded literal, so the Zig-side half of the gap is
-  structurally closed rather than merely asserted against. `Renderer`
-  re-exports the constant so `world_system.zig`'s existing cross-module
-  comptime asserts keep compiling unchanged. The array length stays
-  `k_max_dense_submit_stack_cap` (32 `u32` slots).
-- GLSL cannot read a Zig constant, so the shader-side literal needs its own
-  enforcement: add a headless `zig build test` test (co-located with
-  `sprite_batch.zig`'s existing `TilemapParams` layout tests) that
-  `@embedFile`s `tilemap.frag.glsl`, parses its `layer_offsets[N]`
-  declaration, and asserts `N == k_max_tilemap_window_layers / 4` (8 while the
-  cap is 32). This turns a doc-comment convention into a CI-enforced contract;
-  document the exact literal pattern the test expects so an unrelated shader
-  edit doesn't break it confusingly.
-- Add `k_max_dense_tile_gpu_bytes` as a literal next to the stack cap in
-  `world_system.zig`. The demo sets `max_dense_tile_gpu_bytes` to that
-  constant. The literal is not computed from `estimateDenseTileGpuBytes`,
-  `denseLayerCount`, `cellCount`, `procedural_underground_count`, or a
-  RAM/VRAM query. `validateDenseRenderBudget` still returns
-  `DenseTileGpuBudgetExceeded` when the estimate exceeds the literal. The demo
-  must not pass `0`.
-- No gameplay, dig, or nav contract changes in this slice — the fixed cap,
-  the shader/host binding, and the byte literal only.
-
-Checklist:
-
-- [ ] Keep `k_max_dense_submit_stack_cap` (`world_system.zig`),
-      `Renderer.k_max_tilemap_window_layers`, and
-      `Renderer.k_max_dense_composite_draws` at 32, still comptime-tied.
-      Confirm `validateDenseRenderBudget` refuses a window over that cap with
-      `DenseLayerWindowExceeded`.
-- [ ] Move `k_max_tilemap_window_layers` and `TilemapParams.layer_offsets`'s
-      array-size ownership into `sprite_batch.zig`, defined off the shared
-      constant; `Renderer` re-exports it. Array length stays 32 `u32` slots.
-- [ ] Keep `assets/shaders/tilemap.frag.glsl`'s `uvec4 layer_offsets[8]`
-      matched to `k_max_tilemap_window_layers / 4` and recompile shaders
-      (`zig build shaders`) if the literal's surrounding declaration changes.
-- [ ] Add an `@embedFile`-based headless test asserting the GLSL
-      `layer_offsets[N]` literal matches `k_max_tilemap_window_layers / 4`;
-      cross-reference the test by name in both the Zig doc comment and the
-      GLSL comment so neither side can drift silently again.
-- [ ] Add literal `k_max_dense_tile_gpu_bytes` in `world_system.zig`. Point
-      `game_demo_state.zig` at it and delete the
-      `procedural_max_dense_tile_gpu_bytes` computation. The demo field is
-      that constant, not `0` and not the world's own byte estimate.
-- [x] Correct the stale `Renderer.k_max_dense_composite_draws = 8` references
-      in `docs/rendering-assets-shaders.md` and the archive Slice 36 section
-      to the current cap (32).
-
-Acceptance checks:
-
-- [ ] `zig build verify` passes (check + test + shader compile + atlas lint)
-      with the cap still 32 and the GLSL `layer_offsets[8]` declaration
-      matched to it.
-- [ ] The new GLSL-sync test fails if either the Zig constant or the shader
-      literal changes without the other (spot-checked by temporarily editing
-      one in a scratch branch, not shipped).
-- [ ] `partitionDenseCompositeBuckets`'s existing worst-case test (proving no
-      fold/error at the cap) passes at the existing cap of 32.
-- [ ] `validateDenseRenderBudget`'s existing GPU-byte-budget test still
-      passes. The demo assigns `k_max_dense_tile_gpu_bytes`. That constant's
-      definition does not call `estimateDenseTileGpuBytes` and does not
-      multiply by level count or cell count. A world whose estimate exceeds
-      the literal still returns `DenseTileGpuBudgetExceeded`.
-
 ## Slice 38: Elevation Above The Surface
 
 Goal: let a world represent levels above the surface (not just underground
@@ -777,7 +644,7 @@ depth below it) as an explicit, stable per-level fact, and generalize the
 dense render window to a symmetric above/below policy — so elevation, not
 append order or storage index, determines what "surface" means.
 
-Depends on: Slice 37 (shader/host sync and the fixed GPU-byte literal).
+Depends on: Slice 37 (landed, archive: shader/host sync and the fixed GPU-byte literal).
 Elevation uses the existing `k_max_dense_submit_stack_cap`. A world whose
 submit window does not fit that cap is refused with `DenseLayerWindowExceeded`.
 This slice does not raise the cap.
@@ -814,7 +681,7 @@ Problem (current envelope):
 
 Current foundation (landed, do not rebuild):
 
-- After Slice 37: `k_max_dense_submit_stack_cap` is still 32, shader/host layer
+- Slice 37 (archive): `k_max_dense_submit_stack_cap` is 32, shader/host layer
   offsets are tied to that cap, and the demo's byte budget is the literal
   `k_max_dense_tile_gpu_bytes`. This slice uses that cap. It does not redesign
   compositing and it does not widen the cap.
@@ -1336,7 +1203,7 @@ only stable IDs and enum/scalar columns, never paths or live handles.
     scale — do not reshape arbitration contracts).
 36. Single-pass dense-layer depth compositing. — landed (archive).
 37. Dense render-window fixed cap + shader/host sync hardening (no cap raise,
-    no runtime-sized window).
+    no runtime-sized window). — landed (archive).
 38. Elevation above the surface (after 37).
 43. SDL3 gamepad/controller support (landed; HW residual on frontier).
 44. Input rebinding UI + extended gamepad controls (after 43).

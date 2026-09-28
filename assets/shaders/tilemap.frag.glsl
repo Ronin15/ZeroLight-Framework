@@ -25,8 +25,12 @@ layout(set = 3, binding = 0) uniform TilemapUniform {
     ivec4 layer_meta;
     // layer_offsets: element offsets into the combined tile-data buffer, one per
     // composited layer (layer_meta.x of them valid), topmost layer first. Packed
-    // 4-per-uvec4 so this matches a flat Zig [32]u32 byte-for-byte under std140
-    // (uvec4 array elements have no interior padding).
+    // 4-per-uvec4 so this matches the flat Zig
+    // [k_max_tilemap_window_layers]u32 (sprite_batch.zig) byte-for-byte under
+    // std140 (uvec4 array elements have no interior padding). The array size
+    // must equal k_max_tilemap_window_layers / 4; the Zig test
+    // "tilemap.frag.glsl layer_offsets matches k_max_tilemap_window_layers"
+    // parses this declaration, so keep it a single-line decimal literal.
     uvec4 layer_offsets[8];
 } tm;
 
