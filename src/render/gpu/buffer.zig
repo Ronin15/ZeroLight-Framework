@@ -131,13 +131,13 @@ pub fn recordVertexUpload(
     );
 }
 
-/// One tile-data storage element. `u32` (not the world's `u16`) keeps the
-/// storage layout portable — no 16-bit storage extension — and leaves room to
-/// pack variant/light/AO bits later without changing the buffer type.
+/// One tile-data storage element: two packed `u16` tile ids (see
+/// `renderer.zig` `packTileData`). A `u32` element keeps the storage layout portable
+/// — no 16-bit storage extension — without spending 4 bytes per cell.
 pub const StorageElement = u32;
 
-/// Creates a graphics-storage-read buffer holding `data` (one element per cell,
-/// row-major) and uploads it once via a transient command buffer. The returned
+/// Creates a graphics-storage-read buffer holding `data` (packed tile-id
+/// elements) and uploads it once via a transient command buffer. The returned
 /// buffer is read by the tilemap fragment shader; the caller owns its release.
 pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement) !*c.SDL_GPUBuffer {
     if (data.len == 0) return error.EmptyStorageBuffer;
@@ -196,7 +196,7 @@ pub fn uploadStorageData(device: *c.SDL_GPUDevice, data: []const StorageElement)
     return buffer;
 }
 
-/// One storage-buffer cell edit: write `value` at `element_index` of `buffer`.
+/// One storage-buffer element edit: write `value` at `element_index` of `buffer`.
 pub const StorageRegion = struct {
     buffer: *c.SDL_GPUBuffer,
     element_index: usize,
@@ -282,7 +282,7 @@ pub fn recordStorageRegions(
     try recordStorageRegionsInPass(copy_pass_scope.pass, transfer_buffer, transfer_byte_size, edits);
 }
 
-/// Uploads a batch of single-cell edits (the dig path) in one transfer buffer +
+/// Uploads a batch of single-element edits (the dig path) in one transfer buffer +
 /// one copy pass + one submit. Prefer `stageStorageRegions` + `recordStorageRegions`
 /// with a renderer-pooled transfer buffer for per-frame dig work.
 pub fn uploadStorageRegions(device: *c.SDL_GPUDevice, edits: []const StorageRegion) !void {

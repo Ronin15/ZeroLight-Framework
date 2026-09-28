@@ -138,8 +138,18 @@ ordered-command, prepared-command, vertex, and draw-group capacity.
 Dense world tiles are not emitted as per-tile vertices. Every dense layer's tile ids
 are concatenated into one flat array (`WorldSystem.dense_tile_ids`) and uploaded
 once, in one pass, to a single combined GPU **storage buffer**
-(`GRAPHICS_STORAGE_READ`, one `u32` per cell, row-major — via
+(`GRAPHICS_STORAGE_READ`, row-major — via
 `WorldSystem.uploadDenseTileDataBuffer` / `Renderer.createTileDataBuffer`).
+
+The buffer packs two 16-bit tile ids per `u32` element (`renderer.zig`
+`packTileData`): flat cell `i` lives in element `i >> 1`, in the low half when
+`i` is even, and an odd tail pads its high half. That is 2 bytes per cell, the
+same as the CPU `TileId`, while `u32` elements keep the layout free of any
+16-bit storage extension so it runs on modern desktop and mobile GPUs alike.
+The shader unpacks through `tilemap.frag.glsl`'s `tileAt`. Layer offsets
+(`TilemapWindowLayers.offsets`, `TilemapUniform.layer_offsets`) stay in cell
+units, so a layer may start mid-element. `WorldSystem` owns the
+`@bitSizeOf(TileId) == 16` assert this packing depends on.
 
 The world draws its dense render window as a small, bounded number of **composite**
 draws, not one draw per dense layer. `WorldSystem.submitStaticDenseGeometry` takes
@@ -176,7 +186,7 @@ embeds the shader source (build.zig's `tilemap_frag_glsl` test import). Change
 the constant and the shader literal together; ReleaseFast strips the bounds
 check that would otherwise catch an overrun. The tilemap
 fragment shader maps each screen pixel to a world cell, then loops its window
-topmost-first — `tile_ids[layer_offsets[i] + cell_index]` — stopping at the first
+topmost-first — `tileAt(layer_offsets[i] + cell_index)` — stopping at the first
 non-`invalid_tile_id` hit (or discarding if every composited layer is empty at
 that pixel), derives the atlas cell from the tight grid (`col = id % columns`,
 `row = id / columns`; enforced for every tile at meta load by
@@ -186,8 +196,9 @@ that pixel), derives the atlas cell from the tight grid (`col = id % columns`,
 toolchain risk. Draw count scales with how many interleave points exist this
 frame (`Renderer.k_max_dense_composite_draws = 32` is the defensive cap; the
 shipped default config always resolves to 1), never with window depth — cost
-still scales with the **screen**, not the world: ~0.5 MB/layer of tile data and a
-handful of draw calls regardless of world size or render-window depth.
+still scales with the **screen**, not the world: a handful of draw calls
+regardless of world size or render-window depth. Resident tile data is 2 bytes
+per cell (512 KiB per 512×512 layer), uploaded once.
 
 The fragment shader also applies a fixed-margin rim-darkening (contact-shadow)
 pass on the surface tile's rim where it overhangs a hole: it reads neighboring
@@ -203,10 +214,13 @@ an interleave-depth-set change (a newly relevant sandwich point) — never on a 
 alone.
 
 A **dig/build** (`setDenseTile`) writes the CPU tile field — the source of truth for
-collision and gameplay — and queues a single-cell GPU edit. `flushDenseTileEdits`
-applies all of a frame's queued edits in one batched copy pass
-(`Renderer.uploadTileDataEdits`) at the render boundary: a dig is one storage-buffer
-element write, no full re-upload and no vertex work.
+collision and gameplay — and queues an edit for the packed element holding that
+cell. `flushDenseTileEdits` first coalesces the queue to one edit per element,
+valued from `dense_tile_ids` (neighboring digs share an element, and overlapping
+writes in one copy pass have no defined order), then applies all of the frame's
+edits in one batched copy pass (`Renderer.uploadTileDataEdits`) at the render
+boundary: a dig is one storage-buffer element write, no full re-upload and no
+vertex work.
 
 Two pipelines share the ordered draw list. The renderer binds the **sprite** or
 **tilemap** pipeline on a `DrawGroup.material` change; tilemap groups additionally

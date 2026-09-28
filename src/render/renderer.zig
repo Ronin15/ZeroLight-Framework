@@ -63,9 +63,67 @@ pub const FrameResult = enum {
 
 pub const TileDataId = resources.TileDataId;
 
-/// One queued tile-data cell edit: write `value` at `element_index` of the layer
-/// buffer `buffer`. Game code accumulates these on tile changes and flushes them
-/// to the GPU once per frame at the render boundary.
+/// Tile-data storage packs two 16-bit tile ids per `u32` element: flat cell `i`
+/// lives in element `i >> 1`, in the low half when `i` is even. `u32` elements
+/// avoid a 16-bit storage extension; `tilemap.frag.glsl`'s `tileAt` is the
+/// matching unpack. Layer offsets (`TilemapWindowLayers.offsets`) stay in cells.
+pub const tile_data_cells_per_element: usize = 2;
+/// Fills the unread high half of a trailing element when the cell count is odd.
+pub const tile_data_pad_cell: u16 = std.math.maxInt(u16);
+
+pub fn tileDataElementCount(cell_count: usize) usize {
+    return (cell_count + tile_data_cells_per_element - 1) / tile_data_cells_per_element;
+}
+
+pub fn tileDataElementIndex(cell_index: usize) usize {
+    return cell_index / tile_data_cells_per_element;
+}
+
+pub fn packTileDataElement(low_cell: u16, high_cell: u16) u32 {
+    return @as(u32, low_cell) | (@as(u32, high_cell) << 16);
+}
+
+/// Packs `cells` into `out` (`tileDataElementCount(cells.len)` elements).
+pub fn packTileData(cells: []const u16, out: []u32) void {
+    std.debug.assert(out.len == tileDataElementCount(cells.len));
+    const pair_count = cells.len / tile_data_cells_per_element;
+    for (out[0..pair_count], 0..) |*element, pair| {
+        element.* = packTileDataElement(cells[pair * 2], cells[pair * 2 + 1]);
+    }
+    if (pair_count < out.len) {
+        out[pair_count] = packTileDataElement(cells[cells.len - 1], tile_data_pad_cell);
+    }
+}
+
+/// Overwrites the value of a `pending` region targeting the same buffer element
+/// as `region`; returns false when none does.
+fn replacePendingStorageRegion(pending: []gpu_buffer.StorageRegion, region: gpu_buffer.StorageRegion) bool {
+    for (pending) |*slot| {
+        if (slot.buffer == region.buffer and slot.element_index == region.element_index) {
+            slot.value = region.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Debug-checks the one-write-per-element batch contract: edits are strictly
+/// increasing by (`buffer`, `element_index`), so no element repeats.
+fn assertTileDataEditsSortedUnique(edits: []const TileDataEdit) void {
+    if (edits.len < 2) return;
+    for (edits[0 .. edits.len - 1], edits[1..]) |prev, next| {
+        const prev_buffer = @intFromEnum(prev.buffer);
+        const next_buffer = @intFromEnum(next.buffer);
+        std.debug.assert(prev_buffer < next_buffer or
+            (prev_buffer == next_buffer and prev.element_index < next.element_index));
+    }
+}
+
+/// One queued tile-data element edit: write the packed `value` at
+/// `element_index` of `buffer`. Game code accumulates these on tile changes and
+/// flushes them to the GPU once per frame at the render boundary. One batch must
+/// be sorted with at most one edit per element (`uploadTileDataEdits`):
+/// overlapping writes in one copy pass have no defined order.
 pub const TileDataEdit = struct {
     buffer: TileDataId,
     element_index: usize,
@@ -174,7 +232,7 @@ pub const Renderer = struct {
     pub const k_max_dense_composite_draws: usize = 32;
 
     /// One tilemap draw's composited layer window: up to
-    /// `k_max_tilemap_window_layers` element offsets into a combined tile-data
+    /// `k_max_tilemap_window_layers` cell offsets into a combined tile-data
     /// buffer, topmost layer first. The fragment shader walks these in order and
     /// stops at the first opaque cell. `is_shallowest_bucket` is true only for
     /// the composite draw holding the frame's overall shallowest submitted dense
@@ -209,15 +267,15 @@ pub const Renderer = struct {
     vertex_streams: VertexStreams,
     batch_capacity_vertices: usize,
     texture_slots: std.ArrayList(TextureSlot) = .empty,
-    // GPU-driven tilemap tile-data: one graphics-storage-read buffer per dense
-    // layer (a row-major copy of the world's dense_tile_ids). Renderer-owned so
-    // world keeps only opaque handles and never crosses the render/gpu boundary.
+    // GPU-driven tilemap tile-data: graphics-storage-read buffers of packed
+    // tile-id elements (see `packTileData`). Renderer-owned so world keeps only
+    // opaque handles and never crosses the render/gpu boundary.
     tile_data_buffers: std.ArrayList(*c.SDL_GPUBuffer) = .empty,
     // World-constant grid/atlas uniform per tile-data buffer (parallel to
     // tile_data_buffers). Kept here rather than on each DrawGroup so the per-frame
     // draw-group sort/coalesce/merge stays small.
     tile_data_params: std.ArrayList(TilemapParams) = .empty,
-    // Cell count per tile-data buffer (parallel to tile_data_buffers) so the
+    // Element count per tile-data buffer (parallel to tile_data_buffers) so the
     // dig-edit upload boundary can reject an out-of-range element_index before it
     // becomes an out-of-bounds GPU buffer write.
     tile_data_counts: std.ArrayList(u32) = .empty,
@@ -931,16 +989,16 @@ pub const Renderer = struct {
         return ids;
     }
 
-    /// Creates a renderer-owned tile-data storage buffer from a row-major tile
-    /// array (one `u32` per cell) and returns its handle. `params` is the
+    /// Creates a renderer-owned tile-data storage buffer from row-major cells
+    /// already packed by `packTileData` and returns its handle. `params` is the
     /// world-constant grid/atlas uniform, stored alongside so draw groups carry only
     /// the handle. A generic multi-buffer registry: `WorldSystem` registers one
     /// entry holding every dense layer's cells concatenated, built once at world
     /// load; draw groups distinguish layers via a per-draw cell offset instead of
     /// a distinct buffer per layer.
-    pub fn createTileDataBuffer(self: *Renderer, tiles: []const u32, params: TilemapParams) !TileDataId {
-        const cell_count = std.math.cast(u32, tiles.len) orelse return error.TileDataBufferTooLarge;
-        const buffer = try gpu_buffer.uploadStorageData(self.device, tiles);
+    pub fn createTileDataBuffer(self: *Renderer, packed_cells: []const u32, params: TilemapParams) !TileDataId {
+        const element_count = std.math.cast(u32, packed_cells.len) orelse return error.TileDataBufferTooLarge;
+        const buffer = try gpu_buffer.uploadStorageData(self.device, packed_cells);
         errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
         const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
         if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
@@ -948,35 +1006,43 @@ pub const Renderer = struct {
         errdefer _ = self.tile_data_buffers.pop();
         try self.tile_data_params.append(self.allocator, params);
         errdefer _ = self.tile_data_params.pop();
-        try self.tile_data_counts.append(self.allocator, cell_count);
-        log.debug("created tilemap tile-data buffer {d}: {d} cells", .{ index, tiles.len });
+        try self.tile_data_counts.append(self.allocator, element_count);
+        log.debug("created tilemap tile-data buffer {d}: {d} packed elements", .{ index, packed_cells.len });
         return @enumFromInt(index);
     }
 
-    /// Queues a batch of single-cell tile edits (the dig path) for upload during
-    /// the next `endFrame` copy pass. Edits whose handle no longer resolves are
-    /// skipped. The scratch list resolves handles to buffers and is grow-only.
+    /// Queues a batch of packed-element tile edits (the dig path) for upload during
+    /// the next `endFrame` copy pass. The batch must be sorted by strictly
+    /// increasing (`buffer`, `element_index`): one edit per element. Edits whose
+    /// handle no longer resolves are skipped. The scratch list resolves handles to
+    /// buffers and is grow-only.
     pub fn uploadTileDataEdits(self: *Renderer, edits: []const TileDataEdit) !void {
         if (edits.len == 0) return;
+        assertTileDataEditsSortedUnique(edits);
         // Grow-only append: pending edits are held until the post-acquire copy pass
         // runs so a skipped swapchain frame does not drop dig updates.
         try self.tile_edit_scratch.ensureTotalCapacity(self.allocator, self.tile_edit_scratch.items.len + edits.len);
+        // Edits still pending from a skipped frame may share an element with this
+        // batch; those are overwritten so the copy pass holds one write per element.
+        const carried = self.tile_edit_scratch.items.len;
         for (edits) |edit| {
             const buffer = self.tileDataBuffer(edit.buffer) orelse continue;
             const element_count = self.tileDataCount(edit.buffer);
             if (edit.element_index >= element_count) {
-                log.warn("dropped tile-data edit: cell {d} out of range for buffer {d}", .{
+                log.warn("dropped tile-data edit: element {d} out of range for buffer {d}", .{
                     edit.element_index,
                     @intFromEnum(edit.buffer),
                 });
                 continue;
             }
-            self.tile_edit_scratch.appendAssumeCapacity(.{
+            const region = gpu_buffer.StorageRegion{
                 .buffer = buffer,
                 .element_index = edit.element_index,
                 .element_count = element_count,
                 .value = edit.value,
-            });
+            };
+            if (replacePendingStorageRegion(self.tile_edit_scratch.items[0..carried], region)) continue;
+            self.tile_edit_scratch.appendAssumeCapacity(region);
         }
         self.tile_edits_pending = self.tile_edit_scratch.items.len > 0;
     }
@@ -1962,6 +2028,47 @@ test "contiguous tilemap groups never coalesce" {
 
     try mergeDrawList(&list, allocator, &static_groups, &.{});
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "packTileData packs two cells per element low half first and pads an odd tail" {
+    const cells = [_]u16{ 0x0001, 0x0002, 0xABCD, 0xFFFF, 0x0007 };
+    var elements: [tileDataElementCount(cells.len)]u32 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), elements.len);
+    packTileData(&cells, &elements);
+
+    try std.testing.expectEqual(@as(u32, 0x0002_0001), elements[0]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_ABCD), elements[1]);
+    try std.testing.expectEqual(@as(u32, 0x0007) | (@as(u32, tile_data_pad_cell) << 16), elements[2]);
+
+    // Every cell unpacks from its element exactly as tilemap.frag.glsl's tileAt does.
+    for (cells, 0..) |cell, flat| {
+        const element = elements[tileDataElementIndex(flat)];
+        const shift: u5 = @intCast((flat & 1) * 16);
+        try std.testing.expectEqual(cell, @as(u16, @truncate(element >> shift)));
+    }
+}
+
+test "replacePendingStorageRegion overwrites a carried edit to the same element only" {
+    const buffer_a: *c.SDL_GPUBuffer = @ptrFromInt(0x1000);
+    const buffer_b: *c.SDL_GPUBuffer = @ptrFromInt(0x2000);
+    var pending = [_]gpu_buffer.StorageRegion{
+        .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 1 },
+        .{ .buffer = buffer_b, .element_index = 3, .element_count = 8, .value = 2 },
+    };
+
+    try std.testing.expect(replacePendingStorageRegion(&pending, .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 9 }));
+    try std.testing.expectEqual(@as(u32, 9), pending[0].value);
+    try std.testing.expectEqual(@as(u32, 2), pending[1].value);
+
+    try std.testing.expect(!replacePendingStorageRegion(&pending, .{ .buffer = buffer_a, .element_index = 4, .element_count = 8, .value = 7 }));
+    try std.testing.expect(!replacePendingStorageRegion(pending[0..0], .{ .buffer = buffer_a, .element_index = 3, .element_count = 8, .value = 7 }));
+}
+
+test "tileDataElementCount halves cell counts rounding up" {
+    try std.testing.expectEqual(@as(usize, 0), tileDataElementCount(0));
+    try std.testing.expectEqual(@as(usize, 1), tileDataElementCount(1));
+    try std.testing.expectEqual(@as(usize, 1), tileDataElementCount(2));
+    try std.testing.expectEqual(@as(usize, 2), tileDataElementCount(3));
 }
 
 test "applyWindowLayers fills layer count and topmost-first offsets" {

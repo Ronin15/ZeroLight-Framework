@@ -10,6 +10,8 @@ const log = @import("../core/logging.zig").platform;
 const RenderOrder = @import("../render/renderer.zig").RenderOrder;
 const Renderer = @import("../render/renderer.zig").Renderer;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
+const packTileData = @import("../render/renderer.zig").packTileData;
+const tileDataElementCount = @import("../render/renderer.zig").tileDataElementCount;
 const TilemapWindowLayers = Renderer.TilemapWindowLayers;
 const Position = @import("../render/renderer.zig").Position;
 const Uv = @import("../render/renderer.zig").Uv;
@@ -47,21 +49,26 @@ pub fn main(init: std.process.Init) !void {
     var renderer = try Renderer.init(init.gpa, window.handle, assets, app_config);
     defer renderer.deinit();
 
-    // Two 2x2 layers concatenated in one combined buffer: a topmost layer with
+    // Two 3x1 layers concatenated in one combined buffer: a topmost layer with
     // one dug hole (invalid_tile_id) and a fully solid layer beneath it. This
     // exercises the fragment shader's multi-layer compositing loop (a real
     // GPU read at layer_offsets[1] beyond the first uvec4 lane, not just the
     // single-layer pass-through) end to end, not just the trivial 1-layer case.
-    const invalid_tile_id: u32 = 65535;
-    const tiles = [_]u32{
-        1, 1, invalid_tile_id, 1, // topmost layer, offset 0: one hole
-        1, 1, 1, 1, // bottom layer, offset 4: solid, revealed through the hole
+    // The odd per-layer cell count starts the bottom layer mid-element, so the
+    // hole's fall-through reads flat cell 0 (element 0 low half) and then flat
+    // cell 3 (element 1 high half), crossing an element boundary.
+    const invalid_tile_id: u16 = 65535;
+    const tiles = [_]u16{
+        invalid_tile_id, 1, 1, // topmost layer, offset 0: one hole
+        1, 1, 1, // bottom layer, offset 3: solid, revealed through the hole
     };
+    var packed_tiles: [tileDataElementCount(tiles.len)]u32 = undefined;
+    packTileData(&tiles, &packed_tiles);
     const tile_params = TilemapParams{
-        .grid = .{ 16.0, 2.0, 2.0, @floatFromInt(invalid_tile_id) },
+        .grid = .{ 16.0, 3.0, 1.0, @floatFromInt(invalid_tile_id) },
         .atlas = .{ 1.0, 1.0, 1.0, 16.0 },
     };
-    const tile_data = try renderer.createTileDataBuffer(&tiles, tile_params);
+    const tile_data = try renderer.createTileDataBuffer(&packed_tiles, tile_params);
 
     // Sprite submit is reserve-first for allocation-free frames (see
     // Renderer.reserveSpriteCommands). Without this, the first rect still
@@ -77,17 +84,17 @@ pub fn main(init: std.process.Init) !void {
     writeWorldSpriteQuad(.{
         .texture = renderer.white_texture,
         .source = .{ .x = 0, .y = 0, .w = 16, .h = 16 },
-        .dest = .{ .x = 0, .y = 0, .w = 32, .h = 32 },
+        .dest = .{ .x = 0, .y = 0, .w = 48, .h = 16 },
     }, TextureDesc{ .width = 1, .height = 1 }, .{
         .positions = &tile_positions,
         .uvs = &tile_uvs,
         .colors = &tile_colors,
     });
-    // Topmost-first: the holed layer at offset 0, the solid layer at offset 4.
+    // Topmost-first: the holed layer at offset 0, the solid layer at offset 3.
     var window_layers = TilemapWindowLayers{};
     window_layers.count = 2;
     window_layers.offsets[0] = 0;
-    window_layers.offsets[1] = 4;
+    window_layers.offsets[1] = 3;
     try renderer.appendStaticTilemapSpan(
         renderer.white_texture,
         RenderOrder.world(@intFromEnum(SmokeDepth.test_tilemap)),

@@ -24,6 +24,12 @@ const Renderer = @import("../render/renderer.zig").Renderer;
 const TileDataId = @import("../render/renderer.zig").TileDataId;
 const TilemapParams = @import("../render/renderer.zig").TilemapParams;
 const TileDataEdit = @import("../render/renderer.zig").TileDataEdit;
+const packTileData = @import("../render/renderer.zig").packTileData;
+const packTileDataElement = @import("../render/renderer.zig").packTileDataElement;
+const tile_data_cells_per_element = @import("../render/renderer.zig").tile_data_cells_per_element;
+const tile_data_pad_cell = @import("../render/renderer.zig").tile_data_pad_cell;
+const tileDataElementCount = @import("../render/renderer.zig").tileDataElementCount;
+const tileDataElementIndex = @import("../render/renderer.zig").tileDataElementIndex;
 const Sprite = @import("../render/renderer.zig").Sprite;
 const sprite_batch = @import("../render/sprite_batch.zig");
 const Position = @import("../render/renderer.zig").Position;
@@ -72,6 +78,11 @@ comptime {
 // the bucket-count invariant it relies on breaks.
 comptime {
     std.debug.assert(Renderer.k_max_dense_composite_draws >= k_max_dense_submit_stack_cap);
+}
+
+// The GPU tile-data buffer packs two tile ids per u32 element (`renderer.zig` `packTileData`).
+comptime {
+    std.debug.assert(@bitSizeOf(TileId) == 16);
 }
 
 pub const TileFlags = packed struct(u8) {
@@ -294,14 +305,16 @@ pub const WorldSystem = struct {
     dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
     dense_tile_ids: std.ArrayList(TileId) = .empty,
     // Single renderer-owned tile-data storage buffer holding every dense layer's
-    // cells concatenated, mirroring dense_tile_ids's flat layout. Built once from
+    // cells concatenated, mirroring dense_tile_ids's flat layout packed two
+    // cells per u32 element (`renderer.zig` `packTileData`). Built once from
     // the whole array at load. World holds only the opaque handle; the renderer
     // owns and releases the GPU buffer. Each layer's draw reads only its own
     // slice via denseLayerOffset, so no per-tile vertex geometry is built for
     // dense layers.
     dense_tile_data_buffer: TileDataId = .invalid,
-    // Per-cell tile-data edits queued by setDenseTile once a layer's storage buffer
-    // exists, flushed in one batched copy pass at the render boundary. Empty (and
+    // Packed-element tile-data edits queued by setDenseTile once the storage buffer
+    // exists, coalesced per element and flushed in one batched copy pass at the
+    // render boundary. Empty (and
     // allocation-free) on frames with no tile changes. Invariant: drained every frame
     // gameplay advances — the pause policy blocks gameplay updates whenever render is
     // skipped, so the queue stays bounded without an explicit cap.
@@ -645,7 +658,7 @@ pub const WorldSystem = struct {
     }
 
     pub fn estimateDenseTileGpuBytes(self: *const WorldSystem) usize {
-        return self.denseLayerCount() * self.cellCount() * @sizeOf(u32);
+        return tileDataElementCount(self.denseLayerCount() * self.cellCount()) * @sizeOf(u32);
     }
 
     pub fn validateDenseRenderBudget(self: *const WorldSystem) error{ DenseLayerWindowExceeded, DenseTileGpuBudgetExceeded }!void {
@@ -1050,13 +1063,45 @@ pub const WorldSystem = struct {
         return submit_count;
     }
 
-    /// Flushes queued per-cell tile edits (digs/builds) to the GPU in one batched
-    /// copy pass, then clears the queue. A no-op on frames with no tile changes.
+    /// Flushes queued tile edits (digs/builds) to the GPU in one batched copy
+    /// pass, then clears the queue. A no-op on frames with no tile changes.
     /// Call once per frame at the render boundary, after the layer buffers exist.
     pub fn flushDenseTileEdits(self: *WorldSystem, renderer: *Renderer) !void {
         if (self.dense_tile_edits.items.len == 0) return;
+        self.coalesceDenseTileEdits();
         try renderer.uploadTileDataEdits(self.dense_tile_edits.items);
         self.dense_tile_edits.clearRetainingCapacity();
+    }
+
+    /// Two cells share one packed GPU element, so neighboring digs in one frame
+    /// queue the same element twice. Collapses the queue in place to one edit per
+    /// element, valued from `dense_tile_ids` (the source of truth), so the copy
+    /// pass never carries overlapping writes. Allocation-free.
+    fn coalesceDenseTileEdits(self: *WorldSystem) void {
+        const edits = self.dense_tile_edits.items;
+        std.mem.sortUnstable(TileDataEdit, edits, {}, tileDataEditLessThan);
+        var kept: usize = 0;
+        for (edits) |edit| {
+            std.debug.assert(edit.buffer == self.dense_tile_data_buffer);
+            if (kept > 0 and edits[kept - 1].element_index == edit.element_index) continue;
+            edits[kept] = edit;
+            edits[kept].value = self.packedDenseTileElement(edit.element_index);
+            kept += 1;
+        }
+        self.dense_tile_edits.items.len = kept;
+    }
+
+    fn tileDataEditLessThan(_: void, lhs: TileDataEdit, rhs: TileDataEdit) bool {
+        return lhs.element_index < rhs.element_index;
+    }
+
+    /// The packed GPU element holding flat cells `2 * element_index` and the one
+    /// after it (padded past the last cell).
+    fn packedDenseTileElement(self: *const WorldSystem, element_index: usize) u32 {
+        const cells = self.dense_tile_ids.items;
+        const low = element_index * tile_data_cells_per_element;
+        const high_cell = if (low + 1 < cells.len) cells[low + 1] else tile_data_pad_cell;
+        return packTileDataElement(cells[low], high_cell);
     }
 
     /// Submits the visible sparse tiles at `depth` through the dynamic ordered
@@ -1165,7 +1210,7 @@ pub const WorldSystem = struct {
     }
 
     /// Shared dense-cell write: bounds-checks, updates the CPU tile field (the
-    /// source of truth), queues one GPU cell edit once the combined buffer exists,
+    /// source of truth), queues one GPU element edit once the combined buffer exists,
     /// and returns the compact change event. Tile-id validity is the caller's
     /// concern, so an empty (`invalid_tile_id`) write is allowed here.
     ///
@@ -1180,10 +1225,10 @@ pub const WorldSystem = struct {
         if (old_tile_id == tile_id) return null;
         const old_blocks_movement = self.flagsFor(old_tile_id).blocks_movement;
         const new_blocks_movement = self.flagsFor(tile_id).blocks_movement;
-        // Queue the GPU cell update once the combined buffer exists. Before it is
-        // built, the initial full upload captures the tile, so no edit is needed.
-        // element_index is the global flat offset (matches this buffer's layout),
-        // not a per-layer-local index.
+        // Queue the GPU element update once the combined buffer exists. Before it
+        // is built, the initial full upload captures the tile, so no edit is
+        // needed. element_index is the packed element holding the global flat
+        // cell (not a per-layer-local index); flush coalesces shared elements.
         const buffer = self.denseTileDataBuffer();
         if (buffer != .invalid) {
             try self.dense_tile_edits.ensureTotalCapacity(self.allocator, self.dense_tile_edits.items.len + 1);
@@ -1193,8 +1238,9 @@ pub const WorldSystem = struct {
         if (buffer != .invalid) {
             self.dense_tile_edits.appendAssumeCapacity(.{
                 .buffer = buffer,
-                .element_index = tile_index,
-                .value = tile_id,
+                .element_index = tileDataElementIndex(tile_index),
+                // coalesceDenseTileEdits packs the value from dense_tile_ids at flush.
+                .value = 0,
             });
         }
         return .{
@@ -1212,16 +1258,15 @@ pub const WorldSystem = struct {
         return self.dense_layers.len;
     }
 
-    /// Widens the whole flat dense tile-id array (every dense layer's cells
-    /// concatenated, in layer order) into `out` (one `u32` per cell) for
-    /// storage-buffer upload. `out.len` must equal `dense_tile_ids.items.len`.
-    /// The row-major order within each layer is exactly the tilemap shader's
-    /// `cell.y * width + cell.x` read (offset by that layer's own
-    /// `denseLayerOffset`), so the GPU lookup matches `cellIndex`. Load-time
-    /// only (not a frame path).
-    fn widenDenseTileData(self: *const WorldSystem, out: []u32) void {
-        std.debug.assert(out.len == self.dense_tile_ids.items.len);
-        for (self.dense_tile_ids.items, out) |tile, *dst| dst.* = tile;
+    /// Packs the whole flat dense tile-id array (every dense layer's cells
+    /// concatenated, in layer order) into `out` for storage-buffer upload, two
+    /// cells per element (`renderer.zig` `packTileData`). `out.len` must equal
+    /// `tileDataElementCount(dense_tile_ids.items.len)`. The flat cell
+    /// index is exactly the tilemap shader's `layer_offset + cell.y * width +
+    /// cell.x`, so the GPU lookup matches `denseLayerOffset + cellIndex`.
+    /// Load-time only (not a frame path).
+    fn packDenseTileData(self: *const WorldSystem, out: []u32) void {
+        packTileData(self.dense_tile_ids.items, out);
     }
 
     /// Builds the single renderer-owned tile-data storage buffer from the whole
@@ -1231,20 +1276,22 @@ pub const WorldSystem = struct {
     pub fn uploadDenseTileDataBuffer(self: *WorldSystem, renderer: *Renderer) !void {
         if (self.dense_tile_data_buffer != .invalid) return;
 
-        const scratch = try self.allocator.alloc(u32, self.dense_tile_ids.items.len);
+        const scratch = try self.allocator.alloc(u32, tileDataElementCount(self.dense_tile_ids.items.len));
         defer self.allocator.free(scratch);
-        self.widenDenseTileData(scratch);
+        self.packDenseTileData(scratch);
         self.dense_tile_data_buffer = try renderer.createTileDataBuffer(scratch, self.tilemap_params);
     }
 
-    /// Releases the renderer-owned tile-data buffer this world created and drops
-    /// the local handle, keeping the world's handle and the renderer in sync.
-    /// The symmetric teardown for `uploadDenseTileDataBuffer`: call before
-    /// rebuilding the dense tilemap when the renderer outlives the world. App
-    /// shutdown instead frees this through `Renderer.deinit`.
+    /// Releases the renderer-owned tile-data buffer this world created, drops
+    /// the local handle, and discards queued edits that target it, keeping the
+    /// world's handle and the renderer in sync. The symmetric teardown for
+    /// `uploadDenseTileDataBuffer`: call before rebuilding the dense tilemap
+    /// when the renderer outlives the world. App shutdown instead frees this
+    /// through `Renderer.deinit`.
     pub fn releaseDenseTileDataBuffer(self: *WorldSystem, renderer: *Renderer) void {
         renderer.releaseTileDataBuffers();
         self.dense_tile_data_buffer = .invalid;
+        self.dense_tile_edits.clearRetainingCapacity();
     }
 
     /// The combined tile-data storage buffer handle (`.invalid` until
@@ -2375,26 +2422,29 @@ test "dense tile-data staging matches denseTile by row-major cell index" {
     const grass = try world.requireTileByName(&meta, "grass");
     _ = try world.setDenseTile(0, 2, 1, grass);
 
-    const staging = try std.testing.allocator.alloc(u32, world.dense_tile_ids.items.len);
+    const staging = try std.testing.allocator.alloc(u32, tileDataElementCount(world.dense_tile_ids.items.len));
     defer std.testing.allocator.free(staging);
-    world.widenDenseTileData(staging);
+    world.packDenseTileData(staging);
+    try std.testing.expectEqual(world.estimateDenseTileGpuBytes(), staging.len * @sizeOf(u32));
 
     for (0..world.height) |y| {
         for (0..world.width) |x| {
             const xi: u16 = @intCast(x);
             const yi: u16 = @intCast(y);
-            // The shader reads tile_ids[cell.y*width + cell.x] from layer 0's own
-            // base offset within the combined buffer; denseLayerOffset(0) +
-            // cellIndex is that same index, so staging[..] must equal the tile.
+            // The shader reads tileAt(layer_offset + cell.y*width + cell.x);
+            // denseLayerOffset(0) + cellIndex is that same flat cell, so its
+            // packed half must equal the tile.
+            const flat = world.denseLayerOffset(0) + world.cellIndex(xi, yi);
+            const shift: u5 = @intCast((flat & 1) * 16);
             try std.testing.expectEqual(
-                @as(u32, world.denseTile(0, xi, yi)),
-                staging[world.denseLayerOffset(0) + world.cellIndex(xi, yi)],
+                world.denseTile(0, xi, yi),
+                @as(TileId, @truncate(staging[tileDataElementIndex(flat)] >> shift)),
             );
         }
     }
 }
 
-test "setDenseTile queues a GPU cell edit only once the combined buffer exists" {
+test "setDenseTile queues a GPU element edit only once the combined buffer exists" {
     var meta = try testWorldMeta();
     defer meta.deinit();
     var world = try WorldSystem.initDemoFromMeta(std.testing.allocator, &meta, 96, 64);
@@ -2415,8 +2465,15 @@ test "setDenseTile queues a GPU cell edit only once the combined buffer exists" 
     _ = try world.setDenseTile(0, 1, 0, grass);
     try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
     const edit = world.dense_tile_edits.items[0];
-    try std.testing.expectEqual(world.denseLayerOffset(0) + @as(usize, world.cellIndex(1, 0)), edit.element_index);
-    try std.testing.expectEqual(@as(u32, grass), edit.value);
+    const flat = world.denseLayerOffset(0) + @as(usize, world.cellIndex(1, 0));
+    try std.testing.expectEqual(tileDataElementIndex(flat), edit.element_index);
+    // Flat cell 1 is the high half of element 0; the low half keeps cell 0.
+    try std.testing.expectEqual(@as(usize, 1), flat);
+    world.coalesceDenseTileEdits();
+    try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
+    const packed_value = world.dense_tile_edits.items[0].value;
+    try std.testing.expectEqual(grass, @as(TileId, @truncate(packed_value >> 16)));
+    try std.testing.expectEqual(world.denseTile(0, 0, 0), @as(TileId, @truncate(packed_value)));
 
     // A flushed queue is cleared; an unchanged tile records nothing.
     world.dense_tile_edits.clearRetainingCapacity();
@@ -2463,6 +2520,86 @@ test "ensureDenseTileEditCapacity reserves multi-edit budget before batch carves
     try world.ensureDenseTileEditCapacity(8);
     try std.testing.expectEqual(cap_before, world.dense_tile_edits.capacity);
     try std.testing.expectEqual(@as(usize, 0), world.dense_tile_edits.items.len);
+}
+
+test "coalesceDenseTileEdits keeps one edit per packed element valued from CPU tiles" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 4,
+        .height = 4,
+        .tile_size = meta.tileSize(),
+        .chunk_size_tiles = 4,
+    };
+    defer world.deinit();
+    try world.buildCatalog(&meta);
+    const level = try world.addLevel(0);
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer = try world.addDenseLayer(level, 0, .floor, grass);
+    world.dense_tile_data_buffer = @enumFromInt(0);
+
+    // (2,0) then (0,0),(1,0) share element 0 with a rewrite of (0,0) in between;
+    // (2,0) is element 1. Out-of-order queueing exercises the sort.
+    _ = try world.setDenseTile(layer, 2, 0, water);
+    _ = try world.setDenseTile(layer, 0, 0, water);
+    _ = try world.setDenseTile(layer, 1, 0, water);
+    _ = try world.clearDenseTile(layer, 0, 0);
+    try std.testing.expectEqual(@as(usize, 4), world.dense_tile_edits.items.len);
+
+    world.coalesceDenseTileEdits();
+
+    const edits = world.dense_tile_edits.items;
+    try std.testing.expectEqual(@as(usize, 2), edits.len);
+    try std.testing.expectEqual(@as(usize, 0), edits[0].element_index);
+    try std.testing.expectEqual(packTileDataElement(invalid_tile_id, water), edits[0].value);
+    try std.testing.expectEqual(@as(usize, 1), edits[1].element_index);
+    try std.testing.expectEqual(packTileDataElement(water, grass), edits[1].value);
+}
+
+test "dense layer starting mid-element packs and coalesces across the shared element" {
+    var meta = try testWorldMeta();
+    defer meta.deinit();
+    // 3 cells per layer: layer 1 starts at flat cell 3, the high half of element 1.
+    var world = try testMinimalSurfaceWorld(&meta, 3, 1);
+    defer world.deinit();
+    const grass = try world.requireTileByName(&meta, "grass");
+    const water = try world.requireTileByName(&meta, "water_1");
+    const layer1 = try world.addDenseLayer(0, 0, .obstacle, water);
+    try std.testing.expectEqual(@as(usize, 3), world.denseLayerOffset(layer1));
+    _ = try world.setDenseTile(0, 2, 0, water);
+    _ = try world.setDenseTile(layer1, 0, 0, grass);
+
+    var staging: [3]u32 = undefined;
+    try std.testing.expectEqual(staging.len, tileDataElementCount(world.dense_tile_ids.items.len));
+    world.packDenseTileData(&staging);
+    // Layer 0's last cell is the low half of element 1; layer 1's first cell the high half.
+    try std.testing.expectEqual(water, @as(TileId, @truncate(staging[1])));
+    try std.testing.expectEqual(grass, @as(TileId, @truncate(staging[1] >> 16)));
+    for ([_]usize{ 0, layer1 }) |layer| {
+        for (0..world.width) |x| {
+            const xi: u16 = @intCast(x);
+            const flat = world.denseLayerOffset(layer) + world.cellIndex(xi, 0);
+            const shift: u5 = @intCast((flat & 1) * 16);
+            try std.testing.expectEqual(
+                world.denseTile(layer, xi, 0),
+                @as(TileId, @truncate(staging[tileDataElementIndex(flat)] >> shift)),
+            );
+        }
+    }
+
+    // Edits in both layers in one frame land on the shared element and coalesce.
+    world.dense_tile_data_buffer = @enumFromInt(0);
+    _ = try world.clearDenseTile(0, 2, 0);
+    _ = try world.setDenseTile(layer1, 0, 0, water);
+    try std.testing.expectEqual(@as(usize, 2), world.dense_tile_edits.items.len);
+    world.coalesceDenseTileEdits();
+    try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
+    const edit = world.dense_tile_edits.items[0];
+    try std.testing.expectEqual(@as(usize, 1), edit.element_index);
+    try std.testing.expectEqual(packTileDataElement(world.denseTile(0, 2, 0), world.denseTile(layer1, 0, 0)), edit.value);
+    try std.testing.expectEqual(packTileDataElement(invalid_tile_id, water), edit.value);
 }
 
 test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingAllocator)" {

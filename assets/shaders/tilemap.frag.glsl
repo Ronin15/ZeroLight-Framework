@@ -10,10 +10,11 @@ layout(location = 0) in vec2 in_world_pos;
 layout(location = 0) out vec4 out_color;
 
 // Fragment resource set: sampler at binding 0, tile-data storage buffer at
-// binding 1 (a direct copy of the world's row-major dense_tile_ids).
+// binding 1 (the world's row-major dense_tile_ids, two 16-bit ids per uint;
+// see renderer.zig packTileData).
 layout(set = 2, binding = 0) uniform sampler2D atlas_texture;
 layout(set = 2, binding = 1) readonly buffer TileData {
-    uint tile_ids[];
+    uint packed_tile_ids[];
 } tiles;
 
 layout(set = 3, binding = 0) uniform TilemapUniform {
@@ -23,9 +24,9 @@ layout(set = 3, binding = 0) uniform TilemapUniform {
     vec4 atlas;
     // layer_meta: x=this draw's composited layer count (topmost-first), y/z/w unused
     ivec4 layer_meta;
-    // layer_offsets: element offsets into the combined tile-data buffer, one per
-    // composited layer (layer_meta.x of them valid), topmost layer first. Packed
-    // 4-per-uvec4 so this matches the flat Zig
+    // layer_offsets: cell offsets (not packed element offsets) into the combined
+    // tile-data buffer, one per composited layer (layer_meta.x of them valid),
+    // topmost layer first. Packed 4-per-uvec4 so this matches the flat Zig
     // [k_max_tilemap_window_layers]u32 (sprite_batch.zig) byte-for-byte under
     // std140 (uvec4 array elements have no interior padding). The array size
     // must equal k_max_tilemap_window_layers / 4; the Zig test
@@ -33,6 +34,12 @@ layout(set = 3, binding = 0) uniform TilemapUniform {
     // parses this declaration, so keep it a single-line decimal literal.
     uvec4 layer_offsets[8];
 } tm;
+
+// Flat cell i lives in element i >> 1, low 16 bits when i is even.
+uint tileAt(uint flat_cell) {
+    uint element = tiles.packed_tile_ids[flat_cell >> 1];
+    return (element >> ((flat_cell & 1u) * 16u)) & 0xFFFFu;
+}
 
 void main() {
     float tile_size = tm.grid.x;
@@ -57,7 +64,7 @@ void main() {
     // through to whichever composited layer beneath it is actually opaque.
     for (int i = 0; i < layer_count; i++) {
         uint layer_offset = tm.layer_offsets[i / 4][i % 4];
-        uint candidate = tiles.tile_ids[layer_offset + cell_index];
+        uint candidate = tileAt(layer_offset + cell_index);
         if (candidate != invalid_id) {
             tile_id = candidate;
             resolved_depth = i;
@@ -120,25 +127,25 @@ void main() {
 
         if (in_tile.x < rim_margin && cx > 0) {
             uint left_index = uint(cy * grid_w + (cx - 1));
-            if (tiles.tile_ids[top_layer_offset + left_index] == invalid_id) {
+            if (tileAt(top_layer_offset + left_index) == invalid_id) {
                 rim = max(rim, 1.0 - in_tile.x / rim_margin);
             }
         }
         if (in_tile.x > 1.0 - rim_margin && cx + 1 < grid_w) {
             uint right_index = uint(cy * grid_w + (cx + 1));
-            if (tiles.tile_ids[top_layer_offset + right_index] == invalid_id) {
+            if (tileAt(top_layer_offset + right_index) == invalid_id) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.x) / rim_margin);
             }
         }
         if (in_tile.y < rim_margin && cy > 0) {
             uint up_index = uint((cy - 1) * grid_w + cx);
-            if (tiles.tile_ids[top_layer_offset + up_index] == invalid_id) {
+            if (tileAt(top_layer_offset + up_index) == invalid_id) {
                 rim = max(rim, 1.0 - in_tile.y / rim_margin);
             }
         }
         if (in_tile.y > 1.0 - rim_margin && cy + 1 < grid_h) {
             uint down_index = uint((cy + 1) * grid_w + cx);
-            if (tiles.tile_ids[top_layer_offset + down_index] == invalid_id) {
+            if (tileAt(top_layer_offset + down_index) == invalid_id) {
                 rim = max(rim, 1.0 - (1.0 - in_tile.y) / rim_margin);
             }
         }

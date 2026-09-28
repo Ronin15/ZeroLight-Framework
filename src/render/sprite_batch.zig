@@ -190,11 +190,12 @@ pub const TilemapParams = extern struct {
     // createTileDataBuffer's per-buffer params, since several draws can
     // composite different layer subsets from one combined buffer.
     layer_meta: [4]i32 = .{ 0, 0, 0, 0 },
-    // Topmost-first element offsets into the tile-data buffer named by
-    // DrawGroup.tile_data, one per composited layer (layer_meta[0] of them
-    // valid; the rest are stale). Packed as a flat u32 array to byte-match the
-    // GLSL uvec4 array under std140 (uvec4 array elements have no interior
-    // padding, so this is contiguous with no guessed compiler padding).
+    // Topmost-first cell offsets (not packed element offsets) into the
+    // tile-data buffer named by DrawGroup.tile_data, one per composited layer
+    // (layer_meta[0] of them valid; the rest are stale). A flat u32 array to
+    // byte-match the GLSL uvec4 array under std140 (uvec4 array elements have
+    // no interior padding, so this is contiguous with no guessed compiler
+    // padding).
     layer_offsets: [k_max_tilemap_window_layers]u32 = @splat(0),
 };
 
