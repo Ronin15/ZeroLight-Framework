@@ -309,7 +309,17 @@ fn createSdlTranslateC(
                 translate_c.addIncludePath(windowsSdlPackagePath(package, "include"));
             }
         },
-        .system, .pending => {},
+        .system => {
+            // System SDL headers may only be reachable through pkg-config `--cflags`
+            // (custom prefix + PKG_CONFIG_PATH, MacPorts, Homebrew). TranslateC applies
+            // pkg-config only for libraries linked on the step itself. Limited to `.system`:
+            // pkg-config has no cross-target guard, so the Windows `.local`/`.packages` arms
+            // would leak host include paths into a cross translation.
+            translate_c.linkSystemLibrary("SDL3", .{});
+            translate_c.linkSystemLibrary("SDL3_ttf", .{});
+            translate_c.linkSystemLibrary("SDL3_mixer", .{});
+        },
+        .pending => {},
     }
     return translate_c;
 }
