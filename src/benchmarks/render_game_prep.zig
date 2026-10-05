@@ -540,8 +540,8 @@ fn initFixture(
     // point), so `stage` starts past all three.
     var stage: InitStage = .scene_prep;
     errdefer {
-        if (@intFromEnum(stage) >= @intFromEnum(InitStage.world)) fixture.world.deinit();
-        if (@intFromEnum(stage) >= @intFromEnum(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
+        if (@backingInt(stage) >= @backingInt(InitStage.world)) fixture.world.deinit();
+        if (@backingInt(stage) >= @backingInt(InitStage.tileset_meta)) fixture.tileset_meta.deinit();
         fixture.scene_prep.deinit();
         fixture.particles.deinit();
         fixture.data.deinit();
@@ -648,7 +648,7 @@ fn benchStaticGroups(
         .order = sprite_batch.RenderOrder.world(benchDenseFloorDepth(start_level)),
         .first_vertex = 0,
         .vertex_count = 6,
-        .tile_data = @enumFromInt(0),
+        .tile_data = @fromBackingInt(0),
     };
     const sprite_index = tilemap_group_count;
     out[sprite_index] = .{

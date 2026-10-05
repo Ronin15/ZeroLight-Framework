@@ -51,7 +51,7 @@ pub const SettingsMenuState = struct {
     selected: usize = 0,
     pending_adjust: i32 = 0,
     title_text: PreparedText = .invalid,
-    item_texts: [item_count]PreparedText = [_]PreparedText{PreparedText.invalid} ** item_count,
+    item_texts: [item_count]PreparedText = @splat(PreparedText.invalid),
     text_dirty: bool = true,
 
     const item_count = 4;
@@ -162,6 +162,10 @@ pub const SettingsMenuState = struct {
     }
 
     pub fn onPause(self: *SettingsMenuState) void {
+        _ = self;
+    }
+
+    pub fn onResume(self: *SettingsMenuState) void {
         _ = self;
     }
 

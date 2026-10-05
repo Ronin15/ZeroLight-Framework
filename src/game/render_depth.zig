@@ -13,7 +13,7 @@ pub const WorldDepth = enum(i32) {
 };
 
 pub fn worldZ(depth: WorldDepth) i32 {
-    return @intFromEnum(depth);
+    return @backingInt(depth);
 }
 
 pub fn worldZWithOffset(base_z: i32, depth: WorldDepth) i32 {

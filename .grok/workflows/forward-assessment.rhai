@@ -23,7 +23,7 @@ fn preamble() {
     let s = "";
     s += "Assess whether ZeroLight-Framework is moving forward in a performant and expandable way. ";
     s += "Workspace root: /mnt/storage/projects/zig_projects/ZeroLight-Framework. ";
-    s += "Stack: Zig 0.16, SDL3/SDL_GPU, fixed-step 60Hz simulation, dense SoA DataSystem, state-owned SimulationPipeline. ";
+    s += "Stack: Zig 0.17, SDL3/SDL_GPU, fixed-step 60Hz simulation, dense SoA DataSystem, state-owned SimulationPipeline. ";
     s += "Use read_file and grep. Do not answer from memory. Do not edit files. Do not propose an implementation plan. ";
     s += "A finding is valid only if you opened the file it cites during this run. ";
     s += "Return at most 5 findings. Each claim is one sentence a skeptic can check against a file. ";

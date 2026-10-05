@@ -26,7 +26,7 @@ const GroupField = @import("group_field.zig").GroupField;
 // cost — no import cycle (scratch.zig does not import this module).
 fn multiArrayRowBytes(comptime Row: type) usize {
     var total: usize = 0;
-    for (std.meta.fields(Row)) |field| total += @sizeOf(field.type);
+    for (@typeInfo(Row).@"struct".field_types) |field_type| total += @sizeOf(field_type);
     return total;
 }
 

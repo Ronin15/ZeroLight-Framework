@@ -55,7 +55,7 @@ pub const UiDepth = enum(i32) {
     text,
 };
 
-const ui_depth_stride: i32 = @intCast(std.meta.fields(UiDepth).len);
+const ui_depth_stride: i32 = @intCast(@typeInfo(UiDepth).@"enum".field_names.len);
 
 pub const UiStackOrder = struct {
     index: u16 = 0,
@@ -88,16 +88,16 @@ pub const RenderOrder = struct {
     }
 
     pub fn uiInStack(stack_order: UiStackOrder, depth: UiDepth) RenderOrder {
-        return .{ .domain = .ui, .depth = stack_order.depthOffset() + @intFromEnum(depth) };
+        return .{ .domain = .ui, .depth = stack_order.depthOffset() + @backingInt(depth) };
     }
 
     pub fn debug(depth: DebugDepth) RenderOrder {
-        return .{ .domain = .debug, .depth = @intFromEnum(depth) };
+        return .{ .domain = .debug, .depth = @backingInt(depth) };
     }
 
     pub fn lessOrEqual(lhs: RenderOrder, rhs: RenderOrder) bool {
-        const lhs_domain = @intFromEnum(lhs.domain);
-        const rhs_domain = @intFromEnum(rhs.domain);
+        const lhs_domain = @backingInt(lhs.domain);
+        const rhs_domain = @backingInt(rhs.domain);
         if (lhs_domain != rhs_domain) return lhs_domain < rhs_domain;
         return lhs.depth <= rhs.depth;
     }
@@ -908,17 +908,17 @@ test "batch builder preserves ordered submission stream" {
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 10, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.near)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.near)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 20, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 30, .y = 0, .w = 1, .h = 1 },
-        .order = RenderOrder.world(@intFromEnum(OrderedStreamDepth.far)),
+        .order = RenderOrder.world(@backingInt(OrderedStreamDepth.far)),
     });
 
     try batch.buildSerial(table.resolver());
@@ -1196,12 +1196,12 @@ test "render order compares domain before depth" {
         ground = 0,
         above_ground = 1,
     };
-    const high_world = RenderOrder.world(@intFromEnum(ComparisonDepth.above_ground));
+    const high_world = RenderOrder.world(@backingInt(ComparisonDepth.above_ground));
     const ui_background = RenderOrder.ui(.background);
     const ui_text = RenderOrder.ui(.text);
     const debug_overlay = RenderOrder.debug(.overlay);
-    const below_ground = RenderOrder.world(@intFromEnum(ComparisonDepth.below_ground));
-    const ground = RenderOrder.world(@intFromEnum(ComparisonDepth.ground));
+    const below_ground = RenderOrder.world(@backingInt(ComparisonDepth.below_ground));
+    const ground = RenderOrder.world(@backingInt(ComparisonDepth.ground));
 
     try std.testing.expect(high_world.lessOrEqual(ui_background));
     try std.testing.expect(ui_text.lessOrEqual(debug_overlay));
@@ -1400,7 +1400,7 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
     try batch.drawSprite(.{
         .texture = testTextureId(2, 1),
         .dest = .{ .x = -10, .y = 0, .w = 12, .h = 12 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.invalid_background)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.invalid_background)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
@@ -1409,32 +1409,32 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
         .origin = .{ .x = 8, .y = 9 },
         .rotation = 0.25,
         .tint = .{ .r = 0.2, .g = 0.5, .b = 0.8, .a = 0.9 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.world_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.world_sprite)),
         .coordinate_space = .world,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(1, 1),
         .dest = .{ .x = 12, .y = 14, .w = 8, .h = 8 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.logical_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.logical_sprite)),
         .coordinate_space = .logical,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(0, 1),
         .dest = .{ .x = 60, .y = 12, .w = 10, .h = 10 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.logical_sprite)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.logical_sprite)),
         .coordinate_space = .drawable,
     });
     try batch.drawSprite(.{
         .texture = testTextureId(99, 1),
         .dest = .{ .x = 0, .y = 0, .w = 4, .h = 4 },
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
     });
     try batch.drawSprite(.{
         .texture = testTextureId(1, 1),
         .dest = .{ .x = 2, .y = 6, .w = 7, .h = 9 },
         .origin = .{ .x = 3, .y = 4 },
         .rotation = -0.5,
-        .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+        .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
         .coordinate_space = .world,
     });
     // Extra valid sprites so the 4-command range alignment yields more than one
@@ -1452,7 +1452,7 @@ fn addParallelParityCommands(batch: *SpriteBatch) !void {
             .origin = .{ .x = 1, .y = 2 },
             .rotation = @as(f32, @floatFromInt(index)) * 0.1,
             .tint = .{ .r = 0.3, .g = 0.4, .b = 0.5, .a = 1 },
-            .order = RenderOrder.world(@intFromEnum(ParityDepth.foreground)),
+            .order = RenderOrder.world(@backingInt(ParityDepth.foreground)),
             .coordinate_space = .world,
         });
     }

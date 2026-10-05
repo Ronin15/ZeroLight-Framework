@@ -296,15 +296,15 @@ const PreloadOptions = struct {
 };
 
 fn initSpriteSlots() [manifest.sprite_asset_count]SpriteSlot {
-    return [_]SpriteSlot{.{}} ** manifest.sprite_asset_count;
+    return @splat(.{});
 }
 
 fn initAudioStatus() [manifest.audio_asset_count]AssetStatus {
-    return [_]AssetStatus{.not_loaded} ** manifest.audio_asset_count;
+    return @splat(.not_loaded);
 }
 
 fn initAtlasMetaSlots() [manifest.sprite_asset_count]?AtlasMetaSlot {
-    return .{null} ** manifest.sprite_asset_count;
+    return @splat(null);
 }
 
 fn isRequiredStartupSprite(id: SpriteAssetId) bool {

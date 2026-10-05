@@ -143,7 +143,7 @@ fn preparePrimitiveVisualSoA(
         .w = visuals.size_x[visual_index],
         .h = visuals.size_y[visual_index],
     };
-    const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
+    const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
     const order = worldOrder(movement.position_z[movement_index], depth_band);
     const color = Color{
         .r = visuals.color_r[visual_index],
@@ -450,7 +450,7 @@ pub fn collectDynamicRecords(
             );
             prep.appendAssumeCapacity(.{ .depth = prepared.depth(), .draw = prepared });
         } else {
-            const depth_band: WorldDepth = @enumFromInt(visuals.depth_values[visual_index]);
+            const depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.depth_values[visual_index]));
             const record_depth = render_depth.worldZWithOffset(movement.position_z[movement_index], depth_band);
             prep.appendAssumeCapacity(.{
                 .depth = record_depth,
@@ -586,7 +586,7 @@ fn collectDenseInterleaveDepths(
 ) error{TooManyDenseLayers}![]const i32 {
     const span = (try scene.world.denseWindowDepthSpan(scene.player_level)) orelse return scratch[0..0];
     const layer_depths = scene.world.denseWindowLayerDepths();
-    var gap_filled: [k_max_dense_interleave_gaps]bool = [_]bool{false} ** k_max_dense_interleave_gaps;
+    var gap_filled: [k_max_dense_interleave_gaps]bool = @splat(false);
     var count: usize = 0;
 
     appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.activeLevelActorDepth(scene.player_level), span);
@@ -675,7 +675,7 @@ fn preparePlayerMarkerSoA(
     render_x: f32,
     render_y: f32,
 ) ?PreparedDraw {
-    const marker_depth_band: WorldDepth = @enumFromInt(visuals.marker_depth_values[visual_index]);
+    const marker_depth_band: WorldDepth = @fromBackingInt(@intCast(visuals.marker_depth_values[visual_index]));
     const marker_order = worldOrder(movement.position_z[movement_index], marker_depth_band);
     return .{ .rect = .{
         .rect = markerRectAt(
@@ -1429,7 +1429,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     // Fake the combined GPU tile-data buffer so submitStaticDenseGeometry skips
     // the real GPU upload (unavailable headless), mirroring world_system.zig's
     // "setDenseTile queues a GPU cell edit only once the combined buffer exists".
-    world.dense_tile_data_buffer = @enumFromInt(0);
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1526,7 +1526,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
         _ = try world.addSparseTile(0, 0, 0, grass, gap_start_depth + 13, .effect);
     }
     world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0);
-    world.dense_tile_data_buffer = @enumFromInt(0);
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));

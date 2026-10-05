@@ -1320,7 +1320,7 @@ test "batch stats stay lean scalar telemetry" {
 }
 
 test "inline parallel for covers every item exactly once" {
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 8;
+    var hits: [8]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 0,
@@ -1338,8 +1338,8 @@ test "inline parallel for covers every item exactly once" {
 }
 
 test "inline parallel ranges expose stable range indices" {
-    var starts = [_]usize{std.math.maxInt(usize)} ** 4;
-    var ends = [_]usize{0} ** 4;
+    var starts: [4]usize = @splat(std.math.maxInt(usize));
+    var ends: [4]usize = @splat(0);
     var context = RangeIndexContext{
         .starts = starts[0..],
         .ends = ends[0..],
@@ -1362,7 +1362,7 @@ test "inline parallel ranges expose stable range indices" {
 test "adaptive inline runs as one direct main-thread range" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1391,8 +1391,8 @@ test "adaptive inline runs as one direct main-thread range" {
 test "threaded parallel ranges expose stable range indices" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var starts = [_]usize{std.math.maxInt(usize)} ** 16;
-    var ends = [_]usize{0} ** 16;
+    var starts: [16]usize = @splat(std.math.maxInt(usize));
+    var ends: [16]usize = @splat(0);
     var context = RangeIndexContext{
         .starts = starts[0..],
         .ends = ends[0..],
@@ -1419,7 +1419,7 @@ test "threaded parallel ranges expose stable range indices" {
 test "worker thread parallel for covers every item exactly once" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1443,7 +1443,7 @@ test "worker thread parallel for covers every item exactly once" {
 test "parallel for options use provided adaptive work tuner" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1477,7 +1477,7 @@ test "parallel for options use provided adaptive work tuner" {
 test "parallel for options record selected adaptive profile" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1510,7 +1510,7 @@ test "parallel for options record selected adaptive profile" {
 test "parallel for options record selected inline adaptive profile" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 2,
@@ -1545,7 +1545,7 @@ test "parallel for options record selected inline adaptive profile" {
 test "single selected range runs inline even when worker threads exist" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 8;
+    var hits: [8]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 1,
@@ -1567,7 +1567,7 @@ test "single selected range runs inline even when worker threads exist" {
 test "small measured-expensive batch can activate worker threads" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 8;
+    var hits: [8]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 1,
@@ -1601,7 +1601,7 @@ test "small measured-expensive batch can activate worker threads" {
 test "parallel for options cap active workers and align ranges" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 256;
+    var hits: [256]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{
         .max_worker_threads = 3,
@@ -2279,7 +2279,7 @@ test "batch submission does not allocate after init" {
     threads.allocator = failing_allocator.allocator();
     defer threads.allocator = original_allocator;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 4;
+    var hits: [4]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     const stats = threads.parallelFor(hits.len, &context, markCoverage);
 
@@ -2303,7 +2303,7 @@ test "threaded batch submission does not allocate after init" {
     threads.allocator = failing_allocator.allocator();
     defer threads.allocator = original_allocator;
 
-    var hits = [_]std.atomic.Value(u32){.{ .raw = 0 }} ** 128;
+    var hits: [128]std.atomic.Value(u32) = @splat(.{ .raw = 0 });
     var context = CoverageContext{ .hits = hits[0..] };
     const stats = threads.parallelForWithOptions(hits.len, &context, markCoverage, .{
         .adaptive = false,

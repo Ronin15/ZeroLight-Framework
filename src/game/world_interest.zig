@@ -62,16 +62,16 @@ pub const InterestMarker = struct {
 
 pub const InterestMarkerStore = struct {
     /// Non-zero while a marker occupies the slot (id generation for that slot).
-    generations: [interest_marker_capacity]u16 = [_]u16{0} ** interest_marker_capacity,
+    generations: [interest_marker_capacity]u16 = @splat(0),
     /// Monotonic per-slot epoch; bumped on every new allocation at the slot so
     /// removed ids stay invalid after reuse.
-    retired_generations: [interest_marker_capacity]u16 = [_]u16{0} ** interest_marker_capacity,
+    retired_generations: [interest_marker_capacity]u16 = @splat(0),
     kinds: [interest_marker_capacity]InterestMarkerKind = undefined,
     levels: [interest_marker_capacity]u16 = undefined,
     xs: [interest_marker_capacity]f32 = undefined,
     ys: [interest_marker_capacity]f32 = undefined,
     radii: [interest_marker_capacity]f32 = undefined,
-    faction_filter_present: [interest_marker_capacity]bool = [_]bool{false} ** interest_marker_capacity,
+    faction_filter_present: [interest_marker_capacity]bool = @splat(false),
     faction_filters: [interest_marker_capacity]Faction = undefined,
     live_count: usize = 0,
 
@@ -357,8 +357,8 @@ test "InterestMarkerStore is allocation-free by fixed inline storage" {
     defer store.deinit(testing.allocator);
 
     inline for (.{ InterestMarkerStore.addMarker, InterestMarkerStore.findBestInvestigateMarker }) |func| {
-        inline for (@typeInfo(@TypeOf(func)).@"fn".params) |param| {
-            try testing.expect(param.type != std.mem.Allocator);
+        inline for (@typeInfo(@TypeOf(func)).@"fn".param_types) |param_type| {
+            try testing.expect(param_type != std.mem.Allocator);
         }
     }
 

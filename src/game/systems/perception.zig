@@ -337,7 +337,7 @@ const PerceptionEventRangeSlot = struct {
     // Each worker writes only its assigned slot. Padding keeps hot append
     // state off shared cache lines across concurrently written range records.
     buffer: PerceptionEventRangeBuffer = .{},
-    padding: [paddingForCacheLine(PerceptionEventRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(PerceptionEventRangeBuffer),
+    padding: [paddingForCacheLine(PerceptionEventRangeBuffer)]u8 = @splat(0),
 };
 
 const PerceptionEventRangeSlotList = std.ArrayListAligned(PerceptionEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));
@@ -347,7 +347,7 @@ const PerceptionRangeStatsSlot = struct {
     // range (see `PerceptionRangeStats`'s doc comment). Padding keeps that
     // write off shared cache lines across concurrently running ranges.
     stats: PerceptionRangeStats = .{},
-    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = [_]u8{0} ** paddingForCacheLine(PerceptionRangeStats),
+    padding: [paddingForCacheLine(PerceptionRangeStats)]u8 = @splat(0),
 };
 
 const PerceptionRangeStatsSlotList = std.ArrayListAligned(PerceptionRangeStatsSlot, .fromByteUnits(thread_shared_record_alignment));

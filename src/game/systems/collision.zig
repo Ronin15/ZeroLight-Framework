@@ -177,14 +177,14 @@ const BroadphaseRangeSlot = struct {
     // Each worker writes only its assigned slot. Padding keeps hot append state
     // from sharing cache lines across concurrently written range records.
     buffer: BroadphaseRangeBuffer = .{},
-    padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(BroadphaseRangeBuffer),
+    padding: [paddingForCacheLine(BroadphaseRangeBuffer)]u8 = @splat(0),
 };
 
 const NarrowphaseRangeSlot = struct {
     // Narrowphase has the same ownership contract as broadphase: one range, one
     // slot, merged serially after all workers finish.
     buffer: NarrowphaseRangeBuffer = .{},
-    padding: [paddingForCacheLine(NarrowphaseRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(NarrowphaseRangeBuffer),
+    padding: [paddingForCacheLine(NarrowphaseRangeBuffer)]u8 = @splat(0),
 };
 
 const BroadphaseRangeSlotList = std.ArrayListAligned(BroadphaseRangeSlot, .fromByteUnits(thread_shared_record_alignment));

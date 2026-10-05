@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
     window_layers.offsets[1] = 3;
     try renderer.appendStaticTilemapSpan(
         renderer.white_texture,
-        RenderOrder.world(@intFromEnum(SmokeDepth.test_tilemap)),
+        RenderOrder.world(@backingInt(SmokeDepth.test_tilemap)),
         .{ .positions = &tile_positions, .uvs = &tile_uvs, .colors = &tile_colors },
         tile_data,
         window_layers,
@@ -107,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
     try renderer.submitOrderedRectInSpace(
         .{ .x = 96, .y = 32, .w = 64, .h = 64 },
         .{ .r = 1, .g = 1, .b = 1, .a = 1 },
-        RenderOrder.world(@intFromEnum(SmokeDepth.test_rect)),
+        RenderOrder.world(@backingInt(SmokeDepth.test_rect)),
         .world,
     );
     switch (try renderer.endFrame(null)) {

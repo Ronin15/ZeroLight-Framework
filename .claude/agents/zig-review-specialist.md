@@ -1,7 +1,7 @@
 ---
 name: zig-review-specialist
 description: >-
-  Code-review specialist for this Zig 0.16 + SDL3/SDL_GPU game engine. Use proactively to
+  Code-review specialist for this Zig 0.17 + SDL3/SDL_GPU game engine. Use proactively to
   review Zig changes, pull requests, diffs, refactors, and tests touching app flow, state
   stacks, input routing, rendering, SDL3/SDL_GPU integration, fixed-step game loops, asset
   handling, resource lifetimes, ECS/DataSystem processors, and performance-sensitive paths.

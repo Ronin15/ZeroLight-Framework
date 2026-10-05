@@ -96,7 +96,7 @@ pub const component_masks = struct {
 };
 
 pub fn componentMask(component: Component) ComponentMask {
-    return @as(ComponentMask, 1) << @intFromEnum(component);
+    return @as(ComponentMask, 1) << @backingInt(component);
 }
 
 pub const Facing = enum {
@@ -555,7 +555,7 @@ pub const AiMemory = struct {
     last_known_y: f32 = 0,
     staleness: f32 = max_ai_memory_staleness,
     familiarity: f32 = 0,
-    ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity,
+    ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{}),
     ring_next_slot: u8 = 0,
 };
 
@@ -623,7 +623,7 @@ pub const ai_affect_threshold_hysteresis: f32 = 0.05;
 /// `AffectSystem`'s live per-step appraisal output: the four drive values are
 /// each clamped to `[0, 1]`; `above_threshold_mask` is the persisted Schmitt-
 /// trigger state that makes threshold-crossing detection stateful across
-/// steps (see `ai_affect_threshold_hysteresis`) — bit `@intFromEnum(drive)`
+/// steps (see `ai_affect_threshold_hysteresis`) — bit `@backingInt(drive)`
 /// is set while that drive is above its rising threshold. Not user-facing
 /// validated: any combination of the low 4 bits is valid internal state, and
 /// the upper 4 bits are unused.

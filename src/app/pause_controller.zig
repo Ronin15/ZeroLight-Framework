@@ -244,6 +244,10 @@ test "pause enter clears held dig so dig cannot stick across pause" {
             _ = self;
         }
 
+        pub fn onResume(self: *@This()) void {
+            _ = self;
+        }
+
         pub fn deinit(self: *@This()) void {
             _ = self;
         }
@@ -287,6 +291,10 @@ test "pause controller applies forced pause policy once" {
         }
 
         pub fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn onResume(self: *@This()) void {
             _ = self;
         }
 
@@ -408,6 +416,10 @@ test "pause controller clears stale handle after stack replacement" {
         }
 
         pub fn onPause(self: *@This()) void {
+            _ = self;
+        }
+
+        pub fn onResume(self: *@This()) void {
             _ = self;
         }
 

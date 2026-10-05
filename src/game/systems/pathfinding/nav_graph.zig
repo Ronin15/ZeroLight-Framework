@@ -132,24 +132,30 @@ pub const NavLevelGraph = struct {
         return count;
     }
 };
+// Cache-line separation for per-worker scratch slots, same policy as collision.zig,
+// simulation_scope.zig and spatial_index.zig.
+const thread_shared_record_alignment: usize = 64;
+
 // Per-worker scratch for one chunk patch: the chunk's transient edge list (filled by
 // discover/intra, drained into the chunk's fixed edge window) and the compaction cursor.
 // One slot per threaded participant so chunk patches run in parallel without sharing
 // writable state; the serial path uses slot 0. Both buffers are per-chunk transient,
 // cleared at the start of each patch. Distinct from NavLevelGraph.edge_scratch, which the
 // init full build reuses to accumulate a whole level's edges.
-// align(64) on `edges` forces @alignOf(ChunkPatchScratch)==64 and @sizeOf==64 (Zig rounds
-// struct size up to its alignment), so adjacent worker slots occupy separate cache lines
-// and workers patching chunks in parallel see no false sharing.
+// align(thread_shared_record_alignment) on `edges` forces @alignOf(ChunkPatchScratch)==64 and
+// rounds @sizeOf up to a multiple of 64, so adjacent worker slots never share a cache line and
+// workers patching chunks in parallel see no false sharing. The slot is 64 B in
+// ReleaseFast/ReleaseSmall and 128 B in Debug/ReleaseSafe: since Zig 0.17 each std.ArrayList
+// carries a runtime-safety lock field that is zero-sized only when runtime safety is off.
 const ChunkPatchScratch = struct {
-    edges: std.ArrayList(NavLevelGraph.EdgeScratch) align(64) = .empty,
+    edges: std.ArrayList(NavLevelGraph.EdgeScratch) align(thread_shared_record_alignment) = .empty,
     cursor: std.ArrayList(u32) = .empty,
     // Set when this chunk's edges overflowed its fixed window during compaction.
     overflow: bool = false,
 
     comptime {
-        std.debug.assert(@sizeOf(ChunkPatchScratch) == 64);
-        std.debug.assert(@alignOf(ChunkPatchScratch) == 64);
+        std.debug.assert(@alignOf(ChunkPatchScratch) == thread_shared_record_alignment);
+        std.debug.assert(@sizeOf(ChunkPatchScratch) % thread_shared_record_alignment == 0);
     }
 
     fn deinit(self: *ChunkPatchScratch, allocator: std.mem.Allocator) void {
@@ -162,16 +168,18 @@ const ChunkPatchScratch = struct {
 // chunk-local component flood and a private blocked-count delta. One slot per participant so
 // chunks re-flood in parallel without sharing the queue or racing the shared blocked counter;
 // the serial path uses slot 0 and the deltas are summed once after the barrier.
-// align(64) on `queue` forces @alignOf(ChunkRemaskScratch)==64 and @sizeOf==64 (Zig rounds
-// struct size up to its alignment), so adjacent worker slots occupy separate cache lines
-// and workers accumulating blocked_delta in parallel see no false sharing.
+// align(thread_shared_record_alignment) on `queue` forces @alignOf(ChunkRemaskScratch)==64 and
+// rounds @sizeOf up to a multiple of 64, so adjacent worker slots never share a cache line and
+// workers accumulating blocked_delta in parallel see no false sharing. The slot is 64 B in
+// every mode today (the 0.17 ArrayList runtime-safety lock still fits in one line here); the
+// assert pins the multiple-of-64 invariant rather than one exact size.
 const ChunkRemaskScratch = struct {
-    queue: std.ArrayList(usize) align(64) = .empty,
+    queue: std.ArrayList(usize) align(thread_shared_record_alignment) = .empty,
     blocked_delta: isize = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(ChunkRemaskScratch) == 64);
-        std.debug.assert(@alignOf(ChunkRemaskScratch) == 64);
+        std.debug.assert(@alignOf(ChunkRemaskScratch) == thread_shared_record_alignment);
+        std.debug.assert(@sizeOf(ChunkRemaskScratch) % thread_shared_record_alignment == 0);
     }
 
     fn deinit(self: *ChunkRemaskScratch, allocator: std.mem.Allocator) void {

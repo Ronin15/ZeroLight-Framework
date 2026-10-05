@@ -18,7 +18,7 @@ pub const InputContext = enum(usize) {
     debug,
 };
 
-const context_count = @typeInfo(InputContext).@"enum".fields.len;
+const context_count = @typeInfo(InputContext).@"enum".field_names.len;
 
 pub const InputRoutingPolicy = struct {
     contexts: ContextFlags = ContextFlags.defaultGameplay(),
@@ -170,7 +170,7 @@ pub fn contextForAction(action: Action) InputContext {
 }
 
 pub const ContextFlags = struct {
-    values: [context_count]bool = [_]bool{false} ** context_count,
+    values: [context_count]bool = @splat(false),
 
     pub fn defaultGameplay() ContextFlags {
         var flags = ContextFlags{};
@@ -181,11 +181,11 @@ pub const ContextFlags = struct {
     }
 
     pub fn get(self: *const ContextFlags, context: InputContext) bool {
-        return self.values[@intFromEnum(context)];
+        return self.values[@backingInt(context)];
     }
 
     pub fn set(self: *ContextFlags, context: InputContext, value: bool) void {
-        self.values[@intFromEnum(context)] = value;
+        self.values[@backingInt(context)] = value;
     }
 };
 

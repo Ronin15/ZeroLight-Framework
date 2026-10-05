@@ -7,7 +7,7 @@ native target and do not require an external MinGW or Visual Studio toolchain.
 
 ## Required Tools
 
-- Zig 0.16.0 or a compatible 0.16.x build
+- Zig 0.17.0 or a compatible 0.17.x build
 - SDL3 development files (system packages on Linux/macOS, Zig-fetched packages on Windows)
 - SDL3_ttf development files (system packages on Linux/macOS, Zig-fetched packages on Windows)
 - SDL3_mixer development files (system packages on Linux/macOS, Zig-fetched packages on Windows)
@@ -46,14 +46,24 @@ Fetch or validate those packages with:
 zig build fetch-sdl
 ```
 
-Zig fetches only packages missing from its package cache, verifies the pinned
-package hashes, and reuses the same cache for debug and release builds. The
+Zig fetches only packages missing from the project-local `zig-pkg/` directory
+(Zig 0.17's package location; gitignored, overridable with `ZIG_LOCAL_PKG_DIR`),
+verifies the pinned package hashes, and reuses the same packages for debug and
+release builds. `fetch-sdl` then runs one named check step per required header,
+import library, and DLL; a missing file fails on a `check Windows ...` step whose
+name says how to fix it. The
 `-VC.zip` archive names are SDL's published binary package names, not a
 requirement to install Visual Studio. Normal Windows builds use the fetched
 package paths automatically. If you already have SDL installed globally, pass
 `-Dsystem-sdl=true`. If you have custom extracted SDL archives, pass
 `-Dsdl-root=<path>` where that directory contains the
 `SDL3-3.4.10`, `SDL3_ttf-3.2.2`, and `SDL3_mixer-3.2.4` directories.
+
+On a Windows host, `zig build run`, `test`, `bench`, and `gpu-smoke` prepend the
+SDL DLL directories to `PATH` for the launched process. Because that reads the
+host environment at configure time, `build.zig` poisons Zig 0.17's configure
+cache on Windows hosts, so `build.zig` re-runs on every `zig build` there. Linux
+and macOS hosts (including Windows cross-builds) keep the configure cache.
 
 Windows shader builds require `glslc`, `spirv-cross`, and `dxc` on `PATH` or
 passed with `-Dshader-compiler`, `-Dshader-cross-compiler`, and

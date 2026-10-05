@@ -8,7 +8,7 @@ pub const Faction = enum { neutral, player, ally, hostile };
 
 pub const Stance = enum { hostile, neutral, friendly };
 
-const faction_count = @typeInfo(Faction).@"enum".fields.len;
+const faction_count = @typeInfo(Faction).@"enum".field_names.len;
 
 // Indexed [a][b]; kept explicit and symmetric so authoring the relationship is
 // a direct table edit rather than a derived/computed rule.
@@ -24,7 +24,7 @@ const relationship_matrix: [faction_count][faction_count]Stance = .{
 };
 
 pub fn stance(a: Faction, b: Faction) Stance {
-    return relationship_matrix[@intFromEnum(a)][@intFromEnum(b)];
+    return relationship_matrix[@backingInt(a)][@backingInt(b)];
 }
 
 test "stance is symmetric for defined faction pairs" {

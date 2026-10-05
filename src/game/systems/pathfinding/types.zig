@@ -822,7 +822,7 @@ const fnv_prime: u64 = 1099511628211;
 
 pub fn hashPathKey(key: PathQueryKey) usize {
     var h: u64 = fnv_offset_basis;
-    inline for (.{ key.nav_version, @intFromEnum(key.agent_class), @as(u32, key.goal_level), @as(u32, @bitCast(key.goal.x)), @as(u32, @bitCast(key.goal.y)) }) |part| {
+    inline for (.{ key.nav_version, @backingInt(key.agent_class), @as(u32, key.goal_level), @as(u32, @bitCast(key.goal.x)), @as(u32, @bitCast(key.goal.y)) }) |part| {
         h ^= @as(u64, part);
         h *%= fnv_prime;
     }

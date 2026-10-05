@@ -65,7 +65,7 @@ zig build --release=small
 zig build -Doptimize=ReleaseFast
 ```
 
-Release builds use the same pinned Zig package cache as Debug builds. They do
+Release builds use the same pinned packages in `zig-pkg/` as Debug builds. They do
 not download SDL again unless a required package is missing and Zig fetching is
 enabled by the current `--fetch` mode.
 
@@ -77,8 +77,8 @@ before hot-path code can rely on it safely. On non-Mach-O targets
 (Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
 for the shipped **app executable only** in `ReleaseFast` and forces the LLVM
 backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
-binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.16 because
-LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
+binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.17 because
+LTO requires LLD and LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
 local iteration and size-focused builds stay predictable. Before cutting a
 ReleaseFast release candidate, run an extended soak session in
 `--release=safe` (not just `zig build test`) across realistic-to-extreme
@@ -141,11 +141,28 @@ Use this once on a Windows machine, or any time you want to validate the cache:
 zig build fetch-sdl
 ```
 
-The default `--fetch=needed` behavior fetches only missing lazy packages, then
-re-runs the build with package paths available. After that, normal builds are
-offline and deterministic unless the package cache is removed. Pass
+The default `--fetch=needed` behavior fetches only missing lazy packages into the
+project-local `zig-pkg/` directory (Zig 0.17's package location, gitignored),
+then re-runs the build with package paths available. After that, normal builds
+are offline and deterministic unless `zig-pkg/` is removed. Pass
 `-Dsystem-sdl=true` to use globally installed SDL libraries instead, or
 `-Dsdl-root=<path>` for custom extracted SDL archives.
+
+Each required SDL header, import library, and DLL is validated by its own
+`CheckFile` step named `check Windows <file> (<fix-it hint>)`; compile steps, the
+shared SDL translate-c step, the DLL installs, and `fetch-sdl` all depend on
+them, so a missing or wrong `-Dsdl-root` fails on that step line instead of on a
+later translate-c or link error. SDL headers are translated once per build from
+`src/platform/sdl_c.h` (Zig 0.17 removed `@cImport`) and imported as the
+`sdl_c` module.
+
+On a Windows host, the `run`, `test`, `bench`, and `gpu-smoke` steps prepend the
+absolute SDL DLL directories to the launched process's `PATH` (Zig 0.17 removed
+`Run.addPathDir`). That value is computed from the configure-time environment,
+which Zig 0.17's configure cache does not key on, so `build.zig` poisons the
+configure cache on Windows hosts and the configure phase re-runs on every
+`zig build` there. Non-Windows hosts, including Windows cross-builds, are
+unaffected.
 
 SDL_GPU debug validation is enabled by default in Debug builds. Override it with:
 

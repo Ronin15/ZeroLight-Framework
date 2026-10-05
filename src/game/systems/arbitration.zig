@@ -24,7 +24,7 @@ const PathRequestKind = @import("../simulation.zig").PathRequestKind;
 pub const behavior_count: usize = 5;
 pub const Scores = [behavior_count]f32;
 
-const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".fields.len;
+const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".field_names.len;
 
 /// Flat per-agent signal snapshot: drive values, perception, memory, a
 /// caller-gathered cohere neighbor mean, and an explicit opt-in fallback
@@ -63,10 +63,10 @@ pub const Signals = struct {
     memory_last_known_y: f32 = 0,
     memory_staleness: f32 = 0,
     memory_max_staleness: f32 = 0,
-    memory_ring_entity: [ai_memory_ring_capacity]EntityId = [_]EntityId{EntityId.invalid} ** ai_memory_ring_capacity,
-    memory_ring_x: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_y: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_age: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
+    memory_ring_entity: [ai_memory_ring_capacity]EntityId = @splat(EntityId.invalid),
+    memory_ring_x: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_y: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_age: [ai_memory_ring_capacity]f32 = @splat(0),
 
     // Cohere neighbor mean, gathered by the caller via the shared spatial
     // index (see ai.zig's separationNeighborVisit-style visitor) — this
@@ -229,7 +229,7 @@ pub fn scoreBehaviors(signals: Signals, gains: PersonalityGains) Scores {
     // this behavior at all," which the bonus terms don't get to bypass.
     var scores: Scores = undefined;
     for (0..behavior_count) |b| {
-        const behavior: AiBehavior = @enumFromInt(b);
+        const behavior: AiBehavior = @fromBackingInt(@intCast(b));
         scores[b] = gainFor(behavior, gains) * (weighted[b] + perceptionTerm(behavior, signals) + memoryTerm(behavior, signals));
     }
     return scores;
@@ -265,7 +265,7 @@ pub fn selectSticky(
     sticky_bonus: f32,
     min_delta: f32,
 ) StickySelection {
-    const previous_index = @intFromEnum(previous);
+    const previous_index = @backingInt(previous);
     if (commitment_remaining > 0) {
         const hold_threshold = scores[previous_index] + sticky_bonus + min_delta;
         var challenged = false;
@@ -434,8 +434,8 @@ test "scoreBehaviors is a pure zero-allocation function (provable by signature a
     // No allocator parameter exists on this function at all -- the type of
     // scoreBehaviors itself is the proof, not a FailingAllocator run.
     const info = @typeInfo(@TypeOf(scoreBehaviors)).@"fn";
-    inline for (info.params) |param| {
-        try testing.expect(param.type != std.mem.Allocator);
+    inline for (info.param_types) |param_type| {
+        try testing.expect(param_type != std.mem.Allocator);
     }
 }
 
@@ -453,8 +453,8 @@ test "scoreBehaviors is table-driven: identical perception/memory with only driv
     aggressive.aggression = 1.0;
     const aggression_scores = scoreBehaviors(aggressive, unitGains());
 
-    const fear_winner: AiBehavior = @enumFromInt(argmax(fear_scores));
-    const aggression_winner: AiBehavior = @enumFromInt(argmax(aggression_scores));
+    const fear_winner: AiBehavior = @fromBackingInt(@intCast(argmax(fear_scores)));
+    const aggression_winner: AiBehavior = @fromBackingInt(@intCast(argmax(aggression_scores)));
 
     try testing.expectEqual(AiBehavior.flee, fear_winner);
     try testing.expectEqual(AiBehavior.pursue, aggression_winner);
@@ -605,7 +605,7 @@ test "scoreBehaviors investigate interest marker bonus is 0.35 with unit gains" 
         .interest_y = 0,
     };
     const scores = scoreBehaviors(signals, unitGains());
-    const investigate_idx = @intFromEnum(AiBehavior.investigate);
+    const investigate_idx = @backingInt(AiBehavior.investigate);
     try testing.expectApproxEqAbs(investigate_interest_marker_bonus, scores[investigate_idx], 0.001);
 }
 
@@ -708,6 +708,6 @@ test "scoreBehaviors gives a pursue-gained agent with only an opt-in focus_targe
     };
     const gains = PersonalityGains{ .wander = 1.0, .pursue = 1.0, .flee = 0, .investigate = 0, .cohere = 0 };
     const scores = scoreBehaviors(signals, gains);
-    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @enumFromInt(argmax(scores))));
-    try testing.expect(scores[@intFromEnum(AiBehavior.pursue)] > scores[@intFromEnum(AiBehavior.wander)]);
+    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @fromBackingInt(@intCast(argmax(scores)))));
+    try testing.expect(scores[@backingInt(AiBehavior.pursue)] > scores[@backingInt(AiBehavior.wander)]);
 }

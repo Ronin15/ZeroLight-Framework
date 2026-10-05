@@ -281,8 +281,7 @@ fn structuralEntityKey(entity: EntityId) u64 {
 }
 
 fn removeProjectedComponents(component_mask: ComponentMask, projection: *StructuralCapacityProjection) void {
-    inline for (std.meta.fields(Component)) |field| {
-        const component: Component = @enumFromInt(field.value);
+    inline for (comptime std.meta.tags(Component)) |component| {
         if ((component_mask & componentMask(component)) != 0) {
             projection.removeComponent(component);
         }

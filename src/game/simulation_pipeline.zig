@@ -285,12 +285,12 @@ comptime {
     // EnumSet insert/union/intersect each walk the resource bits. One cached
     // contract per stage plus the carried checks exceed the default 1000.
     @setEvalBranchQuota(4000);
-    if (stage_order.len != @typeInfo(StageId).@"enum".fields.len) {
+    if (stage_order.len != @typeInfo(StageId).@"enum".field_names.len) {
         @compileError("SimulationPipeline stage_order must list every StageId exactly once");
     }
-    var seen = [_]bool{false} ** stage_order.len;
+    var seen: [stage_order.len]bool = @splat(false);
     for (stage_order) |stage| {
-        const index = @intFromEnum(stage);
+        const index = @backingInt(stage);
         if (seen[index]) {
             @compileError("SimulationPipeline stage_order lists '" ++ @tagName(stage) ++ "' more than once");
         }
@@ -304,7 +304,7 @@ comptime {
 
     // Writes of every stage after index i, so a carried input can be checked
     // against "a later stage writes this" without a resource×stage scan.
-    var later_writes = [_]ResourceSet{.empty} ** stage_order.len;
+    var later_writes: [stage_order.len]ResourceSet = @splat(.empty);
     {
         var later: ResourceSet = .empty;
         var index = stage_order.len;
@@ -335,11 +335,10 @@ comptime {
         }
         const unjustified = contract.carried.differenceWith(external_resources).differenceWith(later_writes[stage_index]);
         if (unjustified.count() != 0) {
-            for (std.meta.fields(PipelineResource)) |field| {
-                const resource: PipelineResource = @enumFromInt(field.value);
+            for (std.meta.tags(PipelineResource)) |resource| {
                 if (!unjustified.contains(resource)) continue;
                 @compileError("SimulationPipeline stage '" ++ @tagName(stage) ++
-                    "' carries '" ++ field.name ++
+                    "' carries '" ++ @tagName(resource) ++
                     "', which is neither external nor written by a later stage");
             }
         }
@@ -726,8 +725,7 @@ pub const SimulationPipeline = struct {
         try self.affect.reserve(pop);
         const budgets = self.eventBudgets();
         var sum: usize = 0;
-        inline for (std.meta.fields(EventProducerId)) |field| {
-            const producer: EventProducerId = @enumFromInt(field.value);
+        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
             sum += maxEventsPerStep(producer, budgets);
         }
         try frame.events.reserve(sum, sum);

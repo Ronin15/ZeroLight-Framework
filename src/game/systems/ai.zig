@@ -689,7 +689,7 @@ pub const AiSystem = struct {
                     .staleness = 0,
                     .max_staleness = 0,
                 },
-                .memory_ring = [_]RowMemoryRingSlot{.{}} ** ai_memory_ring_capacity,
+                .memory_ring = @splat(.{}),
                 .drives = .{ .fear = 0, .curiosity = 0, .aggression = 0, .fatigue = 0 },
                 .focus = .{
                     .entity = if (has_focus) focus_entity else null,
@@ -1322,7 +1322,7 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
         sticky.sticky_bonus,
         arbitration_sticky_min_delta,
     );
-    const selected_behavior: AiBehavior = @enumFromInt(selection.index);
+    const selected_behavior: AiBehavior = @fromBackingInt(@intCast(selection.index));
     const goal = arbitration.resolveGoal(selected_behavior, signals);
 
     const agent_index = sticky.agent_dense_index;
@@ -1352,7 +1352,7 @@ fn resolveRowArbitration(job: *AiJobContext, i: usize) void {
         // not held as the active exertion mode.
         job.ai_agent_hot.active_behavior[agent_index] = .wander;
         job.ai_agent_hot.commitment_remaining[agent_index] = 0;
-        job.ai_agent_hot.last_score[agent_index] = scores[@intFromEnum(AiBehavior.wander)];
+        job.ai_agent_hot.last_score[agent_index] = scores[@backingInt(AiBehavior.wander)];
         job.resolved[i] = .{
             .behavior = .wander,
             .gain = 0,

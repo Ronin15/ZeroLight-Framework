@@ -115,7 +115,7 @@ pub const DataSystem = struct {
     free_slot_count: usize = 0,
     // Live entity count per simulation tier, maintained incrementally on
     // create/destroy/metadata-change so the per-fixed-step scope stats are O(1)
-    // instead of scanning every slot. Indexed by @intFromEnum(SimulationTier).
+    // instead of scanning every slot. Indexed by @backingInt(SimulationTier).
     tier_counts: [4]usize = .{ 0, 0, 0, 0 },
     movement_bodies: MovementBodyStore = .{},
     facings: FacingStore = .{},
@@ -253,8 +253,8 @@ pub const DataSystem = struct {
         try metadata.validate();
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(di))] -= 1;
-        self.tier_counts[@intFromEnum(metadata.tier)] += 1;
+        self.tier_counts[@backingInt(self.movement_bodies.tierAt(di))] -= 1;
+        self.tier_counts[@backingInt(metadata.tier)] += 1;
         self.movement_bodies.setScopeMetadata(di, metadata);
         self.snapInterpolationIfStill(di, metadata.tier);
     }
@@ -265,8 +265,8 @@ pub const DataSystem = struct {
     pub fn setSimulationTier(self: *DataSystem, id: EntityId, tier: SimulationTier) !void {
         const slot = self.resolveSlot(id) orelse return error.InvalidEntity;
         const di: usize = slot.movement_body_index orelse return error.InvalidEntity;
-        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(di))] -= 1;
-        self.tier_counts[@intFromEnum(tier)] += 1;
+        self.tier_counts[@backingInt(self.movement_bodies.tierAt(di))] -= 1;
+        self.tier_counts[@backingInt(tier)] += 1;
         self.movement_bodies.setTier(di, tier);
         // chunk, stagger_phase, and always_active are intentionally preserved.
         self.snapInterpolationIfStill(di, tier);
@@ -298,7 +298,7 @@ pub const DataSystem = struct {
     /// The scope system uses this for fast-path gather decisions: when no entity
     /// is below a stage's required tier, the stage runs full-active with no scan.
     pub fn tierCount(self: *const DataSystem, tier: SimulationTier) usize {
-        return self.tier_counts[@intFromEnum(tier)];
+        return self.tier_counts[@backingInt(tier)];
     }
 
     /// Current full-active scope counters. Tier histograms come from the
@@ -310,10 +310,10 @@ pub const DataSystem = struct {
     pub fn simulationScopeStatsFullActive(self: *const DataSystem) SimulationScopeStats {
         return .{
             .total_entities = self.tier_counts[0] + self.tier_counts[1] + self.tier_counts[2] + self.tier_counts[3],
-            .dormant_entities = self.tier_counts[@intFromEnum(SimulationTier.dormant)],
-            .kinematic_entities = self.tier_counts[@intFromEnum(SimulationTier.kinematic)],
-            .locomotion_entities = self.tier_counts[@intFromEnum(SimulationTier.locomotion)],
-            .cognition_entities = self.tier_counts[@intFromEnum(SimulationTier.cognition)],
+            .dormant_entities = self.tier_counts[@backingInt(SimulationTier.dormant)],
+            .kinematic_entities = self.tier_counts[@backingInt(SimulationTier.kinematic)],
+            .locomotion_entities = self.tier_counts[@backingInt(SimulationTier.locomotion)],
+            .cognition_entities = self.tier_counts[@backingInt(SimulationTier.cognition)],
             .movement_stage_entities = self.movement_bodies.len(),
             .collision_stage_entities = self.collision_bounds.len(),
             .collision_response_stage_entities = self.collision_responses.len(),
@@ -328,7 +328,7 @@ pub const DataSystem = struct {
     fn scanLiveTierCounts(self: *const DataSystem) [4]usize {
         var counts = [4]usize{ 0, 0, 0, 0 };
         for (self.movement_bodies.scopeSliceConst().tier) |tier| {
-            counts[@intFromEnum(tier)] += 1;
+            counts[@backingInt(tier)] += 1;
         }
         return counts;
     }
@@ -413,7 +413,7 @@ pub const DataSystem = struct {
         slot.movement_body_index = dense_index;
         slot.addComponent(.movement_body);
         // The new scope row defaults to .cognition (see MovementBodyStore.append).
-        self.tier_counts[@intFromEnum(SimulationTier.cognition)] += 1;
+        self.tier_counts[@backingInt(SimulationTier.cognition)] += 1;
         // A primitive-visual row may already exist for this entity (e.g. movement
         // body re-added after being destroyed while the visual persisted) — sync
         // the new row's flag so render collect doesn't skip it.
@@ -992,7 +992,7 @@ pub const DataSystem = struct {
     fn removeMovementBodyAt(self: *DataSystem, index: usize) void {
         // The scope tier row leaves with the movement body, so drop its tier count
         // before the swap overwrites it. The moved tail row keeps its own tier.
-        self.tier_counts[@intFromEnum(self.movement_bodies.tierAt(index))] -= 1;
+        self.tier_counts[@backingInt(self.movement_bodies.tierAt(index))] -= 1;
         // Store removals swap the tail row into the removed row. If a row moved,
         // the moved entity's slot must be patched immediately.
         const moved = self.movement_bodies.removeAt(index);
@@ -2337,10 +2337,10 @@ test "incremental tier counts track create, destroy, metadata change, and reset"
     try std.testing.expectEqual(data.scanLiveTierCounts(), data.tier_counts);
     const stats = data.simulationScopeStatsFullActive();
     const scan = data.scanLiveTierCounts();
-    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.dormant)], stats.dormant_entities);
-    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.kinematic)], stats.kinematic_entities);
-    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.locomotion)], stats.locomotion_entities);
-    try std.testing.expectEqual(scan[@intFromEnum(SimulationTier.cognition)], stats.cognition_entities);
+    try std.testing.expectEqual(scan[@backingInt(SimulationTier.dormant)], stats.dormant_entities);
+    try std.testing.expectEqual(scan[@backingInt(SimulationTier.kinematic)], stats.kinematic_entities);
+    try std.testing.expectEqual(scan[@backingInt(SimulationTier.locomotion)], stats.locomotion_entities);
+    try std.testing.expectEqual(scan[@backingInt(SimulationTier.cognition)], stats.cognition_entities);
     try std.testing.expectEqual(@as(usize, 3), stats.total_entities);
 
     data.clearRetainingCapacity();

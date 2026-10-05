@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## Project Snapshot
 
-ZeroLight-Framework is a 2D game framework built on **Zig 0.16** and
+ZeroLight-Framework is a 2D game framework built on **Zig 0.17** and
 **SDL3 / SDL_GPU**. It runs a thin executable timing layer over a fixed-step
 **60Hz** simulation, a state stack with policy-driven input routing, and
 atlas-backed runtime assets addressed by stable IDs. Gameplay is data-oriented:
@@ -30,7 +30,7 @@ Read the doc that owns the area before editing — these are canonical, not note
   18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48) are in
   `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
-  `docs/changelogs/ai_update2.md`).
+  `docs/changelogs/zig_0_17_upgrade.md`).
 - `docs/reviews/` — module deep-dive reviews (pathfinder, GPU, and similar).
 
 ## Module Ownership (`src/`)
@@ -136,13 +136,13 @@ zig build gpu-smoke  # display-gated renderer pipeline smoke (needs a display)
 zig build package    # install selected-mode binaries and runtime assets
 zig build assets-lint # lint runtime atlases and source sprite consistency
 zig build idiom-lint # lint Zig naming, stdlib currency, unsafe catch unreachable
-zig build fetch-sdl  # fetch pinned Windows SDL packages into Zig's package cache
+zig build fetch-sdl  # fetch pinned Windows SDL packages into zig-pkg/ and validate them
 ```
 
 Default optimize mode is `Debug`. Use `--release=safe|fast|small` only for
 release candidates. **Packaged builds ship `ReleaseFast`** — see
 `docs/development-workflow.md` for the required pre-release ReleaseSafe
-soak-test gate this implies. Minimum toolchain is **Zig 0.16.0**.
+soak-test gate this implies. Minimum toolchain is **Zig 0.17.0**.
 
 ## Claude Code Working Practices
 

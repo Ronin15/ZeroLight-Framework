@@ -231,7 +231,7 @@ pub const TextService = struct {
         };
         defer self.allocator.free(path);
 
-        const path_z = try self.allocator.dupeZ(u8, path);
+        const path_z = try self.allocator.dupeSentinel(u8, path, 0);
         defer self.allocator.free(path_z);
 
         const font = c.TTF_OpenFont(path_z.ptr, desc.point_size) orelse {

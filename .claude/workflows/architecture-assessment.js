@@ -123,7 +123,7 @@ const allFindings = {
 const report = await agent(
   `You are a senior game engine architect. Synthesize the following architectural analysis findings into a comprehensive assessment report for the ZeroLight-Framework.
 
-CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.16 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events.
+CONTEXT: ZeroLight-Framework is a 2D game engine built on Zig 0.17 + SDL3/SDL_GPU. The goal is to assess how well the architecture supports a scalable, emergent gameplay simulation framework — meaning: multiple interacting simulation layers, complex AI behaviors, dynamic world state, and gameplay that arises from system interactions rather than scripted events.
 
 DOC ANALYSIS FINDINGS:
 ${JSON.stringify(allFindings.docs, null, 2)}

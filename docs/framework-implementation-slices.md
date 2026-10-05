@@ -393,7 +393,7 @@ by Slice 24.
 
 **How to add a new feeling later (contract for Slice 42 / implementers):**
 
-1. Append a tag to `AiAffectDrive` (preserve existing `@intFromEnum` order —
+1. Append a tag to `AiAffectDrive` (preserve existing `@backingInt` order —
    append only).
 2. Add cold baseline/decay/threshold + hot value columns on `AiAffect` /
    store / slices / template / validation (same pattern as existing drives).
@@ -579,7 +579,7 @@ or string behavior names on the hot path.
       intent streams. (Read-only const-slice gather; determinism test proves the
       AI columns are byte-identical before/after gather.)
 - [x] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
-      passes. (Spawn resolves `@intFromEnum` → prevalidated bundle; strict
+      passes. (Spawn resolves `@backingInt` → prevalidated bundle; strict
       load-time parse only.)
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 
@@ -932,9 +932,9 @@ keyboard — no rebind UI (defaults only, a later slice).
 - `src/app/input_router.zig`'s `InputRoutingPolicy` (gameplay/modalUi/
   passThroughOverlay/opaqueScreen) and `routeEvent` already gated keyboard
   events through per-state action contexts.
-- `src/platform/sdl.zig`'s `@cImport` already exposed the full SDL3 gamepad
-  API; `init_flag_names` already listed gamepad/joystick flag names for
-  debug logging.
+- The `sdl_c` TranslateC module (`src/platform/sdl_c.h`) already exposed
+  the full SDL3 gamepad API; `init_flag_names` already listed
+  gamepad/joystick flag names for debug logging.
 
 ### Architecture notes
 
@@ -985,7 +985,8 @@ keyboard — no rebind UI (defaults only, a later slice).
   `SDL_GAMEPAD_AXIS_INVALID` are `-1`, so translate-c falls back to an integer
   alias with comptime constants. The correct cast at every call/construction
   site is therefore a plain `@intCast` between the `u8` event field and the
-  `c_int` binding/comparison type — never `@enumFromInt`.
+  `c_int` binding/comparison type — never `@fromBackingInt` (formerly
+  `@enumFromInt`).
 
 ### Checklist
 

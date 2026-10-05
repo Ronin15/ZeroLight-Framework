@@ -162,7 +162,7 @@ const Fixture = struct {
 // OWNERSHIP: this module-global owns heap fixtures across the whole run; any entry point that
 // drives these cases (runner.main, or a test/harness calling runCase directly) MUST call
 // deinitCaches afterward or the fixtures leak.
-var shared_fixtures: [@typeInfo(Variant).@"enum".fields.len]?Fixture = .{ null, null };
+var shared_fixtures: [@typeInfo(Variant).@"enum".field_names.len]?Fixture = .{ null, null };
 
 pub fn deinitCaches() void {
     for (&shared_fixtures) |*slot| {
@@ -176,7 +176,7 @@ pub fn deinitCaches() void {
 // Returns the variant's reusable fixture, building it once (world + nav sized for the maximum
 // threaded participant count, so every case fits) on first use.
 fn sharedFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant) !*Fixture {
-    const slot = &shared_fixtures[@intFromEnum(variant)];
+    const slot = &shared_fixtures[@backingInt(variant)];
     if (slot.* == null) {
         var probe = try ThreadSystem.init(allocator, io, .{});
         const max_participants = probe.participantSlotCount();

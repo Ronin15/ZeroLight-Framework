@@ -798,7 +798,7 @@ const RowRangeSlot = struct {
     // Padding keeps hot append state off shared cache lines across concurrently
     // written range records.
     buffer: RowRangeBuffer = .{},
-    padding: [paddingForCacheLine(RowRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(RowRangeBuffer),
+    padding: [paddingForCacheLine(RowRangeBuffer)]u8 = @splat(0),
 };
 
 const RowRangeSlotList = std.ArrayListAligned(RowRangeSlot, .fromByteUnits(thread_shared_record_alignment));

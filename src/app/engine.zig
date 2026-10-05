@@ -71,7 +71,7 @@ pub const Engine = struct {
         };
 
         const allocator = process_init.gpa;
-        const window_title = try allocator.dupeZ(u8, app_config.window_title);
+        const window_title = try allocator.dupeSentinel(u8, app_config.window_title, 0);
         defer allocator.free(window_title);
 
         const sdl_flags = c.SDL_INIT_VIDEO | c.SDL_INIT_GAMEPAD | if (app_config.audio.enabled) c.SDL_INIT_AUDIO else 0;
