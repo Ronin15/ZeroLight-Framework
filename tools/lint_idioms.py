@@ -5,7 +5,11 @@ Enforces a small set of high-signal, low-false-positive rules so the properties
 that make this codebase idiomatic stay guaranteed by the build rather than by
 reviewer diligence:
 
-1. Current standard-library spellings (no deprecated/removed aliases).
+1. Current standard-library and builtin spellings (no deprecated/removed
+   aliases), including the Zig 0.17 removals (`**` array repeat, `@cImport`,
+   `std.meta.fields`, `Allocator.dupeZ`) and deprecated builtins/aliases
+   (`@intFromEnum`, `@enumFromInt`, `std.builtin.OptimizeMode`), plus no
+   `@hasDecl` gating in src (0.17 `@hasDecl` sees only `pub` declarations).
 2. snake_case struct fields and function parameters (Zig names non-callables
    snake_case); no C++-style camelCase `kFoo` constants.
 3. `catch unreachable` / `orelse unreachable` only where it cannot swallow a
@@ -104,7 +108,43 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(r"\busingnamespace\b"),
-        "usingnamespace is removed in Zig 0.16; use explicit declaration imports",
+        "usingnamespace was removed from the language; use explicit declaration imports",
+    ),
+    (
+        re.compile(r"@intFromEnum\s*\("),
+        "@intFromEnum is deprecated in Zig 0.17; use @backingInt (`zig fmt` rewrites it)",
+    ),
+    (
+        re.compile(r"@enumFromInt\s*\("),
+        "@enumFromInt is deprecated in Zig 0.17; use @fromBackingInt(@intCast(x)) (`zig fmt` rewrites it)",
+    ),
+    (
+        re.compile(r"\bstd\.meta\.fields\s*\("),
+        "std.meta.fields is a compile error in Zig 0.17; use @typeInfo(T).<kind>.field_names/field_types "
+        "or std.meta.tags(E) for enum iteration",
+    ),
+    (
+        re.compile(r"\.dupeZ\s*\("),
+        "Allocator.dupeZ is removed in Zig 0.17; use allocator.dupeSentinel(u8, bytes, 0)",
+    ),
+    (
+        re.compile(r"\bOptimizeMode\b"),
+        "std.builtin.OptimizeMode is the deprecated alias in Zig 0.17; use std.builtin.Optimize "
+        "(tags .debug/.safe/.fast/.small)",
+    ),
+    (
+        re.compile(r"@cImport\b"),
+        "@cImport is removed in Zig 0.17; C headers go through build.zig's shared TranslateC step "
+        "(src/platform/sdl_c.h, imported as `sdl_c`)",
+    ),
+    (
+        re.compile(r"\s\*\*\s"),
+        "the `**` array-repeat operator is removed in Zig 0.17; use @splat (prefer `var a: [N]T = @splat(x);`)",
+    ),
+    (
+        re.compile(r"@hasDecl\s*\("),
+        "@hasDecl sees only pub declarations in Zig 0.17, so a hook gated on it is silently skipped "
+        "when the decl is private; make the hook part of the required contract instead",
     ),
     (
         re.compile(r"\bstd\.mem\.(?:copy|set)\s*\("),
