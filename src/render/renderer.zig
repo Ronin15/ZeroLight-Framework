@@ -2134,7 +2134,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
         var window = Renderer.TilemapWindowLayers{};
         window.count = 1;
         window.offsets[0] = @intCast(i);
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(@intCast(0)), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(0), window);
     }
 
     try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
@@ -2151,7 +2151,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
     var window = Renderer.TilemapWindowLayers{};
     window.count = 1;
     window.offsets[0] = 99;
-    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @fromBackingInt(@intCast(0)), window);
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @fromBackingInt(0), window);
     try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
     try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
 }
@@ -2170,13 +2170,13 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
 
     renderer.beginStaticGeometry();
     for (0..Renderer.k_max_dense_composite_draws) |i| {
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(@intCast(0)), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(0), window);
     }
     try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
 
     try std.testing.expectError(
         error.TooManyTilemapWindowDraws,
-        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @fromBackingInt(@intCast(0)), window),
+        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @fromBackingInt(0), window),
     );
     // The fixed-size table stayed exactly at the cap; the failed call past it
     // neither corrupted it nor grew past bounds.
@@ -2212,7 +2212,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
             texture,
             RenderOrder.world(@intCast(i)),
             vertices,
-            @fromBackingInt(@intCast(0)),
+            @fromBackingInt(0),
             window,
         );
     }

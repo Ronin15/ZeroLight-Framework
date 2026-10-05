@@ -1429,7 +1429,7 @@ test "a visible sparse tile at a deeper in-window level produces a second dense 
     // Fake the combined GPU tile-data buffer so submitStaticDenseGeometry skips
     // the real GPU upload (unavailable headless), mirroring world_system.zig's
     // "setDenseTile queues a GPU cell edit only once the combined buffer exists".
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -1526,7 +1526,7 @@ test "dense composite bucketing keeps every needed cut regardless of how many re
         _ = try world.addSparseTile(0, 0, 0, grass, gap_start_depth + 13, .effect);
     }
     world.setVisibleChunksForWorldRect(.{ .x = 0, .y = 0, .w = 64, .h = 64 }, 0);
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));

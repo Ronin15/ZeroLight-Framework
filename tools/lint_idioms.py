@@ -9,7 +9,7 @@ reviewer diligence:
    aliases), including the Zig 0.17 removals (`**` array repeat, `@cImport`,
    `std.meta.fields`, `Allocator.dupeZ`) and deprecated builtins/aliases
    (`@intFromEnum`, `@enumFromInt`, `std.builtin.OptimizeMode`), plus no
-   `@hasDecl` gating in src (0.17 `@hasDecl` sees only `pub` declarations).
+   `@hasDecl` in src (0.17 `@hasDecl` sees only `pub` declarations).
 2. snake_case struct fields and function parameters (Zig names non-callables
    snake_case); no C++-style camelCase `kFoo` constants.
 3. `catch unreachable` / `orelse unreachable` only where it cannot swallow a
@@ -22,6 +22,10 @@ reviewer diligence:
 6. No no-op `catch |e| return e` (or `{ return e; }`); it is just `try`.
 7. No camelCase enum tags (Zig enum members are snake_case).
 
+Scans every `src/**/*.zig` file plus `build.zig`. Rules in SRC_ONLY_PATTERNS
+apply to `src/` only. All rules match code with string/char-literal contents
+blanked and `//` comments removed, so text inside literals never trips a rule.
+
 Run via `zig build idiom-lint` (also part of `zig build verify`).
 """
 
@@ -33,6 +37,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
+BUILD_FILE = REPO_ROOT / "build.zig"
 
 # Fallible constructors that fail only on inputs already guarded at every call
 # site (index == maxInt / generation == 0), so `X.init(...) catch unreachable`
@@ -75,23 +80,25 @@ RETURN_ONLY = re.compile(r"^\s*return\s+(\w+)\s*;\s*$")
 # `enum` sits inside `(...)`, and members carry payload types) and `error {}`
 # sets (no `enum` keyword) — both avoid false positives. A method nested in an
 # enum is skipped (its body sits below the tag depth). Single-line enum bodies
-# are a tolerated false-negative. Braces inside string/char literals are stripped
-# before counting so format strings like "{s}" cannot skew the depth.
+# are a tolerated false-negative. Literal contents are blanked before counting
+# (see blank_literals) so format strings like "{s}" cannot skew the depth.
 ENUM_BODY_OPEN = re.compile(r"\benum\b\s*(?:\([^)]*\))?\s*\{")
 ENUM_TAG_CAMEL = re.compile(r"^\s*([a-z][a-z0-9]*[A-Z][A-Za-z0-9]*)\s*(?:,|=[^=]|$)")
-_STR_LIT = re.compile(r'"(?:\\.|[^"\\])*"')
-_CHR_LIT = re.compile(r"'(?:\\.|[^'\\])*'")
+# One left-to-right alternation so whichever literal opens first wins: a char
+# literal `'"'` is not misread as the start of a string, and vice versa.
+_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 
 
-def strip_literals_for_braces(code: str) -> str:
-    """Blank string/char-literal (and Zig multiline-string) contents so braces
-    inside them do not skew brace-depth tracking."""
-    code = _STR_LIT.sub('""', code)
-    code = _CHR_LIT.sub("''", code)
-    stripped = code.lstrip()
+def blank_literals(line: str) -> str:
+    """Blank string/char-literal (and Zig multiline-string) contents so text
+    inside them cannot trip a rule or skew brace-depth tracking. Run this
+    before strip_line_comment so a `//` inside a literal (`"http://..."`) does
+    not cut the rest of the line off as a comment."""
+    line = _LITERAL.sub(lambda m: m.group(0)[0] * 2, line)
+    stripped = line.lstrip()
     if stripped.startswith("\\\\"):  # Zig multiline-string line: remainder is text
-        return code[: len(code) - len(stripped)]
-    return code
+        return line[: len(line) - len(stripped)]
+    return line
 
 # A free function performing EntityId equality (`fn *Equal(... : EntityId ...)`).
 # EntityId owns `eql` (src/game/data_system/types.zig); a standalone helper is a
@@ -100,7 +107,8 @@ def strip_literals_for_braces(code: str) -> str:
 # are caught; the promoted method is named `eql`, so it never self-triggers.
 ENTITY_EQL_FN = re.compile(r"\bfn\s+\w*[Ee]qual\s*\([^)]*:\s*EntityId\b")
 
-# (pattern, message). Matched against comment-stripped code only.
+# (pattern, message). Matched against literal-blanked, comment-stripped code in
+# every scanned file (src/ and build.zig).
 FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"\bstd\.ArrayListUnmanaged\b"),
@@ -142,11 +150,6 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "the `**` array-repeat operator is removed in Zig 0.17; use @splat (prefer `var a: [N]T = @splat(x);`)",
     ),
     (
-        re.compile(r"@hasDecl\s*\("),
-        "@hasDecl sees only pub declarations in Zig 0.17, so a hook gated on it is silently skipped "
-        "when the decl is private; make the hook part of the required contract instead",
-    ),
-    (
         re.compile(r"\bstd\.mem\.(?:copy|set)\s*\("),
         "std.mem.copy/set are removed; use @memcpy/@memset",
     ),
@@ -157,6 +160,16 @@ FORBIDDEN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"\b(?:pub\s+)?const\s+k[A-Z][A-Za-z0-9]*\b"),
         "C++-style camelCase `k` constant; use k_snake_case to match the codebase convention",
+    ),
+]
+
+# (pattern, message). Like FORBIDDEN_PATTERNS, but applied to src/ only. The
+# `@hasDecl(` prefix survives literal blanking, so `@hasDecl(T, "x")` is caught.
+SRC_ONLY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"@hasDecl\s*\("),
+        "@hasDecl is banned in src/: Zig 0.17 only sees pub declarations, so gating behavior on it "
+        "silently skips private hooks; make the hook required instead",
     ),
 ]
 
@@ -180,13 +193,15 @@ def strip_line_comment(line: str) -> str:
 def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
     issues: list[tuple[str, int, str, str]] = []
     rel = str(path.relative_to(REPO_ROOT))
+    patterns = FORBIDDEN_PATTERNS + SRC_ONLY_PATTERNS if path.is_relative_to(SRC_DIR) else FORBIDDEN_PATTERNS
     nan_exempt = rel in NAN_SELF_COMPARE_EXEMPT
     in_test = False
     brace_depth = 0
     enum_body_depths: list[int] = []
     lines = path.read_text(encoding="utf-8").splitlines()
     for lineno, raw in enumerate(lines, start=1):
-        code = strip_line_comment(raw)
+        # Blank literals first: stripping `//` first would cut `"http://..."` short.
+        code = strip_line_comment(blank_literals(raw))
 
         # Track top-level `test` blocks. `zig fmt` closes top-level decls with a
         # `}` in column 0, so this state machine is exact for formatted sources.
@@ -195,7 +210,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
         elif raw.startswith("}"):
             in_test = False
 
-        for pattern, message in FORBIDDEN_PATTERNS:
+        for pattern, message in patterns:
             if pattern.search(code):
                 issues.append((rel, lineno, message, raw.strip()))
 
@@ -237,7 +252,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
         if not noop_hit:
             open_catch = NOOP_CATCH_OPEN.search(code)
             if open_catch and lineno < len(lines):
-                nxt = RETURN_ONLY.match(strip_line_comment(lines[lineno]))
+                nxt = RETURN_ONLY.match(strip_line_comment(blank_literals(lines[lineno])))
                 noop_hit = bool(nxt) and nxt.group(1) == open_catch.group(1)
         if noop_hit:
             issues.append(
@@ -260,7 +275,7 @@ def lint_file(path: Path) -> list[tuple[str, int, str, str]]:
                 issues.append(
                     (rel, lineno, f"camelCase enum tag `{tag.group(1)}`; Zig enum members use snake_case", raw.strip())
                 )
-        for ch in strip_literals_for_braces(code):
+        for ch in code:
             if ch == "{":
                 brace_depth += 1
             elif ch == "}":
@@ -289,7 +304,7 @@ def main() -> None:
         print(f"idiom-lint: source directory not found: {SRC_DIR}", file=sys.stderr)
         raise SystemExit(1)
 
-    files = sorted(SRC_DIR.rglob("*.zig"))
+    files = sorted(SRC_DIR.rglob("*.zig")) + [BUILD_FILE]
     issues: list[tuple[str, int, str, str]] = []
     for path in files:
         issues.extend(lint_file(path))

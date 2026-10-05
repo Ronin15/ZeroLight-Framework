@@ -2460,7 +2460,7 @@ test "setDenseTile queues a GPU element edit only once the combined buffer exist
 
     // Simulate the combined storage buffer having been built (uploadDenseTileDataBuffer
     // needs a renderer, unavailable headless).
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     _ = try world.setDenseTile(0, 1, 0, grass);
     try std.testing.expectEqual(@as(usize, 1), world.dense_tile_edits.items.len);
@@ -2497,7 +2497,7 @@ test "ensureDenseTileEditCapacity reserves multi-edit budget before batch carves
     const grass = try world.requireTileByName(&meta, "grass");
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     // Preflight N edits, then N setDenseTile calls must stay allocation-free.
     try world.ensureDenseTileEditCapacity(3);
@@ -2538,7 +2538,7 @@ test "coalesceDenseTileEdits keeps one edit per packed element valued from CPU t
     const grass = try world.requireTileByName(&meta, "grass");
     const water = try world.requireTileByName(&meta, "water_1");
     const layer = try world.addDenseLayer(level, 0, .floor, grass);
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     // (2,0) then (0,0),(1,0) share element 0 with a rewrite of (0,0) in between;
     // (2,0) is element 1. Out-of-order queueing exercises the sort.
@@ -2590,7 +2590,7 @@ test "dense layer starting mid-element packs and coalesces across the shared ele
     }
 
     // Edits in both layers in one frame land on the shared element and coalesce.
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
     _ = try world.clearDenseTile(0, 2, 0);
     _ = try world.setDenseTile(layer1, 0, 0, water);
     try std.testing.expectEqual(@as(usize, 2), world.dense_tile_edits.items.len);
@@ -2621,7 +2621,7 @@ test "writeDenseTileCell reserves edit queue before mutating CPU tiles (FailingA
 
     // Simulate the combined storage buffer having been built so the edit-queue
     // path is armed (uploadDenseTileDataBuffer needs a renderer, unavailable headless).
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     const tile_index = world.denseLayerOffset(layer) + world.cellIndex(1, 1);
     const old_tile = world.dense_tile_ids.items[tile_index];
@@ -3744,7 +3744,7 @@ test "submitStaticDenseGeometry marks only the bucket holding the shallowest sub
     const grass = try world.requireTileByName(&meta, "grass");
     const level1 = try world.addLevel(-level_z_step);
     _ = try world.addDenseLayer(level1, 0, .floor, grass);
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     var runtime_assets = RuntimeAssets.init(allocator);
     setSpriteAvailableForTest(&runtime_assets, .world_tileset, try TextureId.init(1, 1));
@@ -3898,7 +3898,7 @@ test "addDenseLayer fails loud once the combined tile-data buffer already exists
     // needs a renderer, unavailable headless): a layer added after this point would
     // compute a valid-looking denseLayerOffset whose cells the GPU buffer never
     // actually contains, so the call must fail loud instead of silently dropping it.
-    world.dense_tile_data_buffer = @fromBackingInt(@intCast(0));
+    world.dense_tile_data_buffer = @fromBackingInt(0);
 
     try std.testing.expectError(error.DenseLayerAddedAfterUpload, world.addDenseLayer(level, 0, .floor, grass));
 }

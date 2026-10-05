@@ -579,7 +579,7 @@ or string behavior names on the hot path.
       intent streams. (Read-only const-slice gather; determinism test proves the
       AI columns are byte-identical before/after gather.)
 - [x] No hot-path JSON or string behavior/emotion lookup; `zig build verify`
-      passes. (Spawn resolves `@intFromEnum` → prevalidated bundle; strict
+      passes. (Spawn resolves `@backingInt` → prevalidated bundle; strict
       load-time parse only.)
 ## Slice 35: AI And Steering Hot-Loop SIMD Restructure
 
@@ -932,9 +932,9 @@ keyboard — no rebind UI (defaults only, a later slice).
 - `src/app/input_router.zig`'s `InputRoutingPolicy` (gameplay/modalUi/
   passThroughOverlay/opaqueScreen) and `routeEvent` already gated keyboard
   events through per-state action contexts.
-- `src/platform/sdl.zig`'s `@cImport` already exposed the full SDL3 gamepad
-  API; `init_flag_names` already listed gamepad/joystick flag names for
-  debug logging.
+- The `sdl_c` TranslateC module (`src/platform/sdl_c.h`) already exposed
+  the full SDL3 gamepad API; `init_flag_names` already listed
+  gamepad/joystick flag names for debug logging.
 
 ### Architecture notes
 
