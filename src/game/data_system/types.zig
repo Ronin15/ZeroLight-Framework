@@ -555,7 +555,7 @@ pub const AiMemory = struct {
     last_known_y: f32 = 0,
     staleness: f32 = max_ai_memory_staleness,
     familiarity: f32 = 0,
-    ring: [ai_memory_ring_capacity]AiMemoryContact = [_]AiMemoryContact{.{}} ** ai_memory_ring_capacity,
+    ring: [ai_memory_ring_capacity]AiMemoryContact = @splat(.{}),
     ring_next_slot: u8 = 0,
 };
 

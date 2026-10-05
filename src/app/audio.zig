@@ -648,7 +648,7 @@ pub const AudioService = struct {
             try self.allocator.dupe(u8, relative_path);
         defer self.allocator.free(load_path);
 
-        const load_path_z = try self.allocator.dupeZ(u8, load_path);
+        const load_path_z = try self.allocator.dupeSentinel(u8, load_path, 0);
         defer self.allocator.free(load_path_z);
         const handle = self.backend.load_audio(self.backend_context, load_path_z, predecode) catch |err| {
             // Failed paths are memoized so missing optional audio does not retry
@@ -688,7 +688,7 @@ const AudioAssetStatus = enum {
 };
 
 fn initAudioAssetSlots() [manifest.audio_asset_count]AudioAssetSlot {
-    return [_]AudioAssetSlot{.{}} ** manifest.audio_asset_count;
+    return @splat(.{});
 }
 
 const AudioEntry = struct {

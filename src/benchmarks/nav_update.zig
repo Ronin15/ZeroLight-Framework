@@ -162,7 +162,7 @@ const Fixture = struct {
 // OWNERSHIP: this module-global owns heap fixtures across the whole run; any entry point that
 // drives these cases (runner.main, or a test/harness calling runCase directly) MUST call
 // deinitCaches afterward or the fixtures leak.
-var shared_fixtures: [@typeInfo(Variant).@"enum".fields.len]?Fixture = .{ null, null };
+var shared_fixtures: [@typeInfo(Variant).@"enum".field_names.len]?Fixture = .{ null, null };
 
 pub fn deinitCaches() void {
     for (&shared_fixtures) |*slot| {

@@ -632,11 +632,11 @@ test "destructible_destroyed event payload is scalar-only" {
     // Payload purity: every field is a scalar or enum (no pointers/handles/slices).
     comptime {
         const Payload = simulation.DestructibleDestroyedEvent;
-        for (@typeInfo(Payload).@"struct".fields) |field| {
-            const T = field.type;
+        const info = @typeInfo(Payload).@"struct";
+        for (info.field_names, info.field_types) |field_name, T| {
             switch (@typeInfo(T)) {
                 .int, .float, .bool, .@"enum", .@"struct" => {},
-                else => @compileError("destructible_destroyed field not scalar/enum: " ++ field.name),
+                else => @compileError("destructible_destroyed field not scalar/enum: " ++ field_name),
             }
         }
     }

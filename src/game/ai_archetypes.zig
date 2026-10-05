@@ -58,7 +58,7 @@ pub const AiArchetypeId = enum(u16) {
     pursuer_strong,
 };
 
-pub const archetype_count: usize = @typeInfo(AiArchetypeId).@"enum".fields.len;
+pub const archetype_count: usize = @typeInfo(AiArchetypeId).@"enum".field_names.len;
 
 const archetypes_path = "ai/archetypes.json";
 const max_archetypes_bytes: usize = 64 * 1024;
@@ -170,7 +170,7 @@ fn buildFromSlice(allocator: std.mem.Allocator, json_bytes: []const u8) LoadErro
 }
 
 fn buildCatalog(root: JsonRoot) BuildError!AiArchetypeCatalog {
-    var seen = [_]bool{false} ** archetype_count;
+    var seen: [archetype_count]bool = @splat(false);
     var bundles: [archetype_count]DemoArchetype = undefined;
     for (root.archetypes) |entry| {
         const id = std.meta.stringToEnum(AiArchetypeId, entry.id) orelse return error.UnknownArchetypeId;

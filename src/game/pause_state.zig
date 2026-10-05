@@ -83,6 +83,10 @@ pub const PauseState = struct {
     pub fn onPause(self: *PauseState) void {
         _ = self;
     }
+
+    pub fn onResume(self: *PauseState) void {
+        _ = self;
+    }
 };
 
 fn drawScreenRect(renderer: *Renderer, rect: @import("../render/renderer.zig").Rect, color: config.Color, ui_stack_order: UiStackOrder, depth: UiDepth) !void {

@@ -179,7 +179,7 @@ const AffectEventRangeSlot = struct {
     // Each worker writes only its assigned slot. Padding keeps hot append
     // state off shared cache lines across concurrently written range records.
     buffer: AffectEventRangeBuffer = .{},
-    padding: [paddingForCacheLine(AffectEventRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(AffectEventRangeBuffer),
+    padding: [paddingForCacheLine(AffectEventRangeBuffer)]u8 = @splat(0),
 };
 
 const AffectEventRangeSlotList = std.ArrayListAligned(AffectEventRangeSlot, .fromByteUnits(thread_shared_record_alignment));

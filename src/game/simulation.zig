@@ -1700,16 +1700,15 @@ test "SimulationFrame multi-writeLiveStimulus after live-bus reserve is allocati
 
 test "ActionIntent fields are scalar or enum only" {
     comptime {
-        const fields = @typeInfo(ActionIntent).@"struct".fields;
-        for (fields) |field| {
-            const info = @typeInfo(field.type);
-            const allowed: bool = switch (info) {
+        const struct_info = @typeInfo(ActionIntent).@"struct";
+        for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+            const allowed: bool = switch (@typeInfo(field_type)) {
                 .int, .float, .bool => true,
                 .@"enum" => true,
-                .@"struct" => field.type == EntityId,
+                .@"struct" => field_type == EntityId,
                 else => false,
             };
-            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field.name);
+            if (!allowed) @compileError("ActionIntent field has non-scalar type: " ++ field_name);
         }
     }
 }

@@ -8,7 +8,7 @@ pub const Faction = enum { neutral, player, ally, hostile };
 
 pub const Stance = enum { hostile, neutral, friendly };
 
-const faction_count = @typeInfo(Faction).@"enum".fields.len;
+const faction_count = @typeInfo(Faction).@"enum".field_names.len;
 
 // Indexed [a][b]; kept explicit and symmetric so authoring the relationship is
 // a direct table edit rather than a derived/computed rule.

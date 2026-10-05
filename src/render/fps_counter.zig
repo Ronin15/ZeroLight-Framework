@@ -21,7 +21,7 @@ const font_size_epsilon: f32 = 0.1;
 pub const FpsCounter = struct {
     font: FontId = FontId.invalid,
     prefix: PreparedText = .invalid,
-    digits: [10]PreparedText = [_]PreparedText{PreparedText.invalid} ** 10,
+    digits: [10]PreparedText = @splat(PreparedText.invalid),
     accumulated_ns: u64 = 0,
     sampled_frames: u32 = 0,
     displayed_fps: u32 = 0,
@@ -56,7 +56,7 @@ pub const FpsCounter = struct {
         @memcpy(glyphs[1..], self.digits[0..]);
         text_service.destroyPreparedTexts(renderer, &glyphs);
         self.prefix = .invalid;
-        self.digits = [_]PreparedText{PreparedText.invalid} ** 10;
+        self.digits = @splat(PreparedText.invalid);
         self.texture_dirty = true;
     }
 
@@ -66,7 +66,7 @@ pub const FpsCounter = struct {
         @memcpy(glyphs[1..], self.digits[0..]);
         text_service.destroyPreparedTextsWithContext(backend_context, &glyphs);
         self.prefix = .invalid;
-        self.digits = [_]PreparedText{PreparedText.invalid} ** 10;
+        self.digits = @splat(PreparedText.invalid);
         self.texture_dirty = true;
     }
 
@@ -161,7 +161,7 @@ pub const FpsCounter = struct {
             }
         }
 
-        var new_digits = [_]PreparedText{PreparedText.invalid} ** 10;
+        var new_digits: [10]PreparedText = @splat(PreparedText.invalid);
         var prepared_digits: usize = 0;
         errdefer {
             for (new_digits[0..prepared_digits], 0..) |digit_text, index| {

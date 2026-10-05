@@ -158,6 +158,10 @@ pub const LoadingState = struct {
         _ = self;
     }
 
+    pub fn onResume(self: *LoadingState) void {
+        _ = self;
+    }
+
     fn returnToMainMenu(self: *LoadingState, transitions: *StateTransitions) !void {
         // Local import keeps the top-level cycle with main_menu_state (which
         // creates LoadingState on Start) from binding both modules' type graphs.

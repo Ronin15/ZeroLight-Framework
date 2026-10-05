@@ -20,8 +20,8 @@ const log = logging.perf;
 // compile — not every edit). Emit uses `log.debug`; both modes' `auto` log
 // level includes debug.
 pub const enabled = switch (builtin.mode) {
-    .Debug, .ReleaseSafe => true,
-    .ReleaseFast, .ReleaseSmall => false,
+    .debug, .safe => true,
+    .fast, .small => false,
 };
 pub const interval_ns: u64 = 60 * std.time.ns_per_s;
 
@@ -234,9 +234,9 @@ pub const FrameSample = struct {
     sprite_prep: SpritePrepStats = .{},
 };
 
-const metric_count = std.meta.fields(Metric).len;
-const timing_count = std.meta.fields(Timing).len;
-const batch_stage_count = std.meta.fields(BatchStage).len;
+const metric_count = @typeInfo(Metric).@"enum".field_names.len;
+const timing_count = @typeInfo(Timing).@"enum".field_names.len;
+const batch_stage_count = @typeInfo(BatchStage).@"enum".field_names.len;
 
 pub const RuntimePerfLog = if (enabled) EnabledRuntimePerfLog else DisabledRuntimePerfLog;
 
@@ -333,9 +333,9 @@ const DisabledRuntimePerfLog = struct {
 const EnabledRuntimePerfLog = struct {
     interval_start_ns: u64,
     frames: u64 = 0,
-    metrics: [metric_count]u64 = [_]u64{0} ** metric_count,
-    timings: [timing_count]TimingAggregate = [_]TimingAggregate{.{}} ** timing_count,
-    batches: [batch_stage_count]BatchAggregate = [_]BatchAggregate{.{}} ** batch_stage_count,
+    metrics: [metric_count]u64 = @splat(0),
+    timings: [timing_count]TimingAggregate = @splat(.{}),
+    batches: [batch_stage_count]BatchAggregate = @splat(.{}),
 
     pub fn init(now_ns: u64) EnabledRuntimePerfLog {
         return .{ .interval_start_ns = now_ns };
@@ -389,9 +389,9 @@ const EnabledRuntimePerfLog = struct {
     fn reset(self: *EnabledRuntimePerfLog, now_ns: u64) void {
         self.interval_start_ns = now_ns;
         self.frames = 0;
-        self.metrics = [_]u64{0} ** metric_count;
-        self.timings = [_]TimingAggregate{.{}} ** timing_count;
-        self.batches = [_]BatchAggregate{.{}} ** batch_stage_count;
+        self.metrics = @splat(0);
+        self.timings = @splat(.{});
+        self.batches = @splat(.{});
     }
 
     fn emit(self: *const EnabledRuntimePerfLog, elapsed_ns: u64) void {
@@ -744,15 +744,14 @@ const EnabledRuntimePerfLog = struct {
             },
         );
 
-        inline for (std.meta.fields(BatchStage)) |field| {
-            const stage: BatchStage = @enumFromInt(field.value);
+        inline for (comptime std.meta.tags(BatchStage)) |stage| {
             const batch_stats = self.batchValue(stage);
             if (batch_stats.calls != 0) {
                 log.debug(
                     "perf {d:.1}s batch {s} calls={} items={} ranges={} inline={} threaded={} max_workers={} avg_ms={d:.3} max_ms={d:.3} wait_avg_ms={d:.3} wait_on_max_ms={d:.3} worker_util_avg={d:.1}%",
                     .{
                         elapsed_s,
-                        field.name,
+                        @tagName(stage),
                         batch_stats.calls,
                         batch_stats.items,
                         batch_stats.ranges,

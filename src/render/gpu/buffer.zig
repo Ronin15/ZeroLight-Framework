@@ -382,7 +382,7 @@ test "storage region in-pass validation rejects oversized transfer staging" {
 }
 
 test "vertex upload in-pass validation rejects oversized transfer staging" {
-    const bytes = [_]u8{0} ** 16;
+    const bytes: [16]u8 = @splat(0);
     try std.testing.expectError(
         error.GpuUploadOutOfBounds,
         recordVertexUploadInPass(@ptrFromInt(1), @ptrFromInt(2), 8, @ptrFromInt(3), 16, &bytes, false),

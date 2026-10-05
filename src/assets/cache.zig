@@ -481,7 +481,7 @@ const FakeBackend = struct {
     }
 };
 
-var test_startup_pixels = [_]u8{255} ** 4;
+var test_startup_pixels: [4]u8 = @splat(255);
 
 fn testStartupImage() image.LoadedImage {
     return .{

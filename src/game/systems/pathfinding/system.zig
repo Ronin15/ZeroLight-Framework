@@ -931,7 +931,7 @@ pub const PathfindingSystem = struct {
             // it sat on the per-fixed-step path and would spam every step under a
             // misconfiguration whose inputs are step-invariant. Scratch is never grown past
             // the memory-budgeted count, and the solve loop stays allocation-free.
-            if (builtin.mode == .Debug) std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
+            if (builtin.mode == .debug) std.debug.assert(thread_system.participantSlotCount() <= self.scratch_slots.items.len);
             const max_workers_for_scratch = self.scratch_slots.items.len -| 1;
             const scratch_clamped_workers = if (system_config.max_worker_threads) |requested|
                 @min(requested, max_workers_for_scratch)
@@ -976,7 +976,7 @@ pub const PathfindingSystem = struct {
             // Debug-gated assert catches it loudly in development; a release build
             // degrades gracefully (every fallback entry stays .deferred and is retried
             // once initialized) instead of an OOB scratch read or a one-off named error.
-            if (builtin.mode == .Debug) std.debug.assert(self.scratch_slots.items.len != 0);
+            if (builtin.mode == .debug) std.debug.assert(self.scratch_slots.items.len != 0);
             if (self.scratch_slots.items.len != 0) {
                 self.resetSolvedPaths();
                 const scratch = &self.scratch_slots.items[0];
@@ -1330,7 +1330,7 @@ pub const PathfindingSystem = struct {
     fn prepareSolvePhase(self: *PathfindingSystem, solve_count: usize, fallback_limit: usize, stats: *PathfindingStats) void {
         self.prepareSolveBuffers(solve_count);
         self.prepareFallbackIndices(solve_count, fallback_limit, stats);
-        if (builtin.mode == .Debug and self.fallback_indices.items.len > 1) {
+        if (builtin.mode == .debug and self.fallback_indices.items.len > 1) {
             for (self.fallback_indices.items[1..], 0..) |idx, i| {
                 std.debug.assert(self.fallback_indices.items[i] < idx);
             }

@@ -689,7 +689,7 @@ pub const AiSystem = struct {
                     .staleness = 0,
                     .max_staleness = 0,
                 },
-                .memory_ring = [_]RowMemoryRingSlot{.{}} ** ai_memory_ring_capacity,
+                .memory_ring = @splat(.{}),
                 .drives = .{ .fear = 0, .curiosity = 0, .aggression = 0, .fatigue = 0 },
                 .focus = .{
                     .entity = if (has_focus) focus_entity else null,

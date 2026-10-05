@@ -2093,7 +2093,7 @@ test "applyWindowLayers fills layer count and topmost-first offsets" {
 // A minimal 6-vertex quad; `appendStaticTilemapSpan` only counts and stores
 // vertices, so their contents do not matter for these tests.
 fn testStaticQuad() [6]Position {
-    return [_]Position{.{ 0, 0 }} ** 6;
+    return @splat(.{ 0, 0 });
 }
 
 fn testRenderer(allocator: std.mem.Allocator) Renderer {
@@ -2124,8 +2124,8 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
     defer deinitStaticGeometryTestRenderer(&renderer, allocator);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
 
@@ -2162,8 +2162,8 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
     defer deinitStaticGeometryTestRenderer(&renderer, allocator);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
     const window = Renderer.TilemapWindowLayers{ .count = 1 };
@@ -2194,8 +2194,8 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
     try renderer.reserveStaticGeometry(vertex_capacity, span_count);
 
     const positions = testStaticQuad();
-    const uvs = [_]Uv{.{ 0, 0 }} ** 6;
-    const colors = [_]VertexColor{.{ 1, 1, 1, 1 }} ** 6;
+    const uvs: [6]Uv = @splat(.{ 0, 0 });
+    const colors: [6]VertexColor = @splat(.{ 1, 1, 1, 1 });
     const vertices = VertexColumnsConst{ .positions = &positions, .uvs = &uvs, .colors = &colors };
     const texture = testTextureId(0, 1);
     const window = Renderer.TilemapWindowLayers{ .count = 1 };

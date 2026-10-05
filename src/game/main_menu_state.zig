@@ -30,7 +30,7 @@ pub const MainMenuState = struct {
     audio_settings: RuntimeAudioSettings,
     selected: usize = 0,
     title_text: PreparedText = .invalid,
-    item_texts: [item_count]PreparedText = [_]PreparedText{PreparedText.invalid} ** item_count,
+    item_texts: [item_count]PreparedText = @splat(PreparedText.invalid),
     text_dirty: bool = true,
 
     const item_count = 3;
@@ -130,6 +130,10 @@ pub const MainMenuState = struct {
     }
 
     pub fn onPause(self: *MainMenuState) void {
+        _ = self;
+    }
+
+    pub fn onResume(self: *MainMenuState) void {
         _ = self;
     }
 

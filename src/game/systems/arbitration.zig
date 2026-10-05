@@ -24,7 +24,7 @@ const PathRequestKind = @import("../simulation.zig").PathRequestKind;
 pub const behavior_count: usize = 5;
 pub const Scores = [behavior_count]f32;
 
-const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".fields.len;
+const drive_count: usize = @typeInfo(AiAffectDrive).@"enum".field_names.len;
 
 /// Flat per-agent signal snapshot: drive values, perception, memory, a
 /// caller-gathered cohere neighbor mean, and an explicit opt-in fallback
@@ -63,10 +63,10 @@ pub const Signals = struct {
     memory_last_known_y: f32 = 0,
     memory_staleness: f32 = 0,
     memory_max_staleness: f32 = 0,
-    memory_ring_entity: [ai_memory_ring_capacity]EntityId = [_]EntityId{EntityId.invalid} ** ai_memory_ring_capacity,
-    memory_ring_x: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_y: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
-    memory_ring_age: [ai_memory_ring_capacity]f32 = [_]f32{0} ** ai_memory_ring_capacity,
+    memory_ring_entity: [ai_memory_ring_capacity]EntityId = @splat(EntityId.invalid),
+    memory_ring_x: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_y: [ai_memory_ring_capacity]f32 = @splat(0),
+    memory_ring_age: [ai_memory_ring_capacity]f32 = @splat(0),
 
     // Cohere neighbor mean, gathered by the caller via the shared spatial
     // index (see ai.zig's separationNeighborVisit-style visitor) — this
@@ -434,8 +434,8 @@ test "scoreBehaviors is a pure zero-allocation function (provable by signature a
     // No allocator parameter exists on this function at all -- the type of
     // scoreBehaviors itself is the proof, not a FailingAllocator run.
     const info = @typeInfo(@TypeOf(scoreBehaviors)).@"fn";
-    inline for (info.params) |param| {
-        try testing.expect(param.type != std.mem.Allocator);
+    inline for (info.param_types) |param_type| {
+        try testing.expect(param_type != std.mem.Allocator);
     }
 }
 

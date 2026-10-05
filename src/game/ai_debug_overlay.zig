@@ -43,8 +43,8 @@ pub const k_max_annotated_agents: usize = 16;
 /// Segments approximating each vision ring arc. Fixed regardless of world size.
 const ring_segments: usize = 24;
 
-const drive_count = @typeInfo(AiAffectDrive).@"enum".fields.len;
-const behavior_count = @typeInfo(AiBehavior).@"enum".fields.len;
+const drive_count = @typeInfo(AiAffectDrive).@"enum".field_names.len;
+const behavior_count = @typeInfo(AiBehavior).@"enum".field_names.len;
 
 // All overlay draws share the debug/overlay order so they sort above world and
 // UI; equal orders are legal in the ordered stream (stream order layers them).
@@ -95,10 +95,10 @@ pub const AgentAnnotation = struct {
     vision_range: f32 = 0,
     fov_half_angle: f32 = 0,
     has_affect: bool = false,
-    drives: [drive_count]f32 = [_]f32{0} ** drive_count,
+    drives: [drive_count]f32 = @splat(0),
     above_threshold_mask: u8 = 0,
     memory_contact_count: usize = 0,
-    contacts: [ai_memory_ring_capacity]ContactMarker = [_]ContactMarker{.{}} ** ai_memory_ring_capacity,
+    contacts: [ai_memory_ring_capacity]ContactMarker = @splat(.{}),
 };
 
 fn rectContains(rect: Rect, p: Vec2) bool {
@@ -186,9 +186,9 @@ const hud_commands = (hud_lines + behavior_count) * (1 + max_hud_digits);
 /// string→texture work happens. `draw` is render-only and allocation-free after
 /// the caches warm.
 pub const AiDebugOverlay = struct {
-    behavior_labels: [behavior_count]PreparedText = [_]PreparedText{PreparedText.invalid} ** behavior_count,
-    tier_labels: [hud_lines]PreparedText = [_]PreparedText{PreparedText.invalid} ** hud_lines,
-    digits: [10]PreparedText = [_]PreparedText{PreparedText.invalid} ** 10,
+    behavior_labels: [behavior_count]PreparedText = @splat(PreparedText.invalid),
+    tier_labels: [hud_lines]PreparedText = @splat(PreparedText.invalid),
+    digits: [10]PreparedText = @splat(PreparedText.invalid),
     labels_ready: bool = false,
 
     const hud_color = Color{ .r = 1, .g = 0.902, .b = 0.157, .a = 1 };
@@ -303,7 +303,7 @@ pub const AiDebugOverlay = struct {
 // the annotated set), so the HUD shows the true global distribution regardless
 // of which agents are on-camera. A single read-only O(agents) pass, no alloc.
 fn tallyBehaviorsByCognition(data: *const DataSystem) [behavior_count]usize {
-    var counts = [_]usize{0} ** behavior_count;
+    var counts: [behavior_count]usize = @splat(0);
     const agents = data.aiAgentSliceConst();
     const scope = data.scopeColumnsSliceConst();
     for (agents.entities, agents.behaviors) |entity, behavior| {
@@ -636,9 +636,9 @@ test "draw never exceeds commandCapacity for a worst-case frame (FailingAllocato
     // GPU). `labels_ready` short-circuits `ensureLabels`, so the dummy
     // `text_service` pointer passed to `draw` below is never dereferenced.
     const dummy_label = PreparedText{ .texture = try TextureId.init(1, 1), .width = 8, .height = 8 };
-    overlay.behavior_labels = [_]PreparedText{dummy_label} ** behavior_count;
-    overlay.tier_labels = [_]PreparedText{dummy_label} ** hud_lines;
-    overlay.digits = [_]PreparedText{dummy_label} ** 10;
+    overlay.behavior_labels = @splat(dummy_label);
+    overlay.tier_labels = @splat(dummy_label);
+    overlay.digits = @splat(dummy_label);
     overlay.labels_ready = true;
 
     renderer.beginFrame(.{ .r = 0, .g = 0, .b = 0, .a = 1 });

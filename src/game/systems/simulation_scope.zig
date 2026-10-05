@@ -584,7 +584,7 @@ const IndexRangeSlot = struct {
     // Padding keeps hot append state off shared cache lines across concurrently
     // written range records.
     buffer: IndexRangeBuffer = .{},
-    padding: [paddingForCacheLine(IndexRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(IndexRangeBuffer),
+    padding: [paddingForCacheLine(IndexRangeBuffer)]u8 = @splat(0),
 };
 
 const CommandRangeBuffer = struct {
@@ -602,7 +602,7 @@ const CommandRangeBuffer = struct {
 
 const CommandRangeSlot = struct {
     buffer: CommandRangeBuffer = .{},
-    padding: [paddingForCacheLine(CommandRangeBuffer)]u8 = [_]u8{0} ** paddingForCacheLine(CommandRangeBuffer),
+    padding: [paddingForCacheLine(CommandRangeBuffer)]u8 = @splat(0),
 };
 
 const IndexRangeSlotList = std.ArrayListAligned(IndexRangeSlot, .fromByteUnits(thread_shared_record_alignment));

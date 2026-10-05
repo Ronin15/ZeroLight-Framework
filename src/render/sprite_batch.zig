@@ -55,7 +55,7 @@ pub const UiDepth = enum(i32) {
     text,
 };
 
-const ui_depth_stride: i32 = @intCast(std.meta.fields(UiDepth).len);
+const ui_depth_stride: i32 = @intCast(@typeInfo(UiDepth).@"enum".field_names.len);
 
 pub const UiStackOrder = struct {
     index: u16 = 0,

@@ -586,7 +586,7 @@ fn collectDenseInterleaveDepths(
 ) error{TooManyDenseLayers}![]const i32 {
     const span = (try scene.world.denseWindowDepthSpan(scene.player_level)) orelse return scratch[0..0];
     const layer_depths = scene.world.denseWindowLayerDepths();
-    var gap_filled: [k_max_dense_interleave_gaps]bool = [_]bool{false} ** k_max_dense_interleave_gaps;
+    var gap_filled: [k_max_dense_interleave_gaps]bool = @splat(false);
     var count: usize = 0;
 
     appendInterleaveDepth(scratch, &count, &gap_filled, layer_depths, scene.world.activeLevelActorDepth(scene.player_level), span);
