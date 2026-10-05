@@ -43,6 +43,10 @@ Checked against 0.17 and still accurate: Mach-O targets skip LTO. In 0.17,
 `-flto` still requires LLD ("LTO requires using LLD"), and LLD still rejects
 Mach-O ("using LLD to link macho files is unsupported").
 
+The native-Linux GNU "force LLVM + LLD" Debug workaround (`forceLlvmLldForTarget`)
+is removed; all artifacts use Zig's default backend/linker selection, and only
+the ReleaseFast LTO app executable sets LLVM + LLD explicitly.
+
 ## Language and stdlib (`src/`)
 
 - **`**` array repeat removed (83 sites).** Converted to `@splat`. When the

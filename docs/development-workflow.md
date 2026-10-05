@@ -75,10 +75,11 @@ bounds/overflow safety checks — see `docs/coding-standards.md`'s allocator
 discipline rules for the `FailingAllocator` proof-test coverage this requires
 before hot-path code can rely on it safely. On non-Mach-O targets
 (Linux/Windows), `build.zig` enables full link-time optimization (`-flto=full`)
-for the shipped **app executable only** in `ReleaseFast` and forces the LLVM
-backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
-binaries do not get LTO. Mach-O targets (macOS) skip LTO in Zig 0.17 because
-LTO requires LLD and LLD cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
+for the shipped **app executable only** in `ReleaseFast` and explicitly sets the
+LLVM backend plus LLD, which LTO requires. `gpu-smoke`, benchmarks, and unit-test
+binaries do not get LTO and use Zig's default backend and linker selection.
+Mach-O targets (macOS) skip LTO in Zig 0.17 because LTO requires LLD and LLD
+cannot link Mach-O. Debug / ReleaseSafe / ReleaseSmall leave LTO off so
 local iteration and size-focused builds stay predictable. Before cutting a
 ReleaseFast release candidate, run an extended soak session in
 `--release=safe` (not just `zig build test`) across realistic-to-extreme
@@ -118,9 +119,11 @@ On Windows, the shader pipeline is GLSL to SPIR-V with `glslc`, SPIR-V to HLSL
 with `spirv-cross --hlsl --shader-model 60`, and HLSL to DXIL with `dxc` using
 `vs_6_0` or `ps_6_0` targets. Installed Windows shader files end in `.dxil`.
 
-On native **Linux GNU** targets, `build.zig` forces LLVM and LLD for the game,
-benchmark, test, and GPU-smoke executables. This is a temporary Debug-build
-workaround; other targets use Zig's default backend selection.
+`build.zig` uses Zig's default backend and linker selection for every target.
+On x86_64 Linux, Debug builds use Zig's self-hosted backend and linker, which
+compile much faster; release builds use LLVM and LLD. The one explicit override is the app
+executable in `ReleaseFast` with LTO, which always sets LLVM and LLD because
+LTO requires them.
 
 ## Windows SDL Packages
 

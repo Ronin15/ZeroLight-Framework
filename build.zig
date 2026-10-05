@@ -96,8 +96,8 @@ pub fn build(b: *std.Build) void {
     const gpu_shader_formats = shaderFormatsForTarget(target.result.os.tag);
     // Full LTO needs LLVM+LLD. Zig 0.17 rejects LLD for Mach-O, so Darwin
     // ReleaseFast stays without LTO; Linux/Windows ship with `-flto=full`.
+    // Every other artifact and mode uses Zig's default backend/linker selection.
     const release_lto = optimize == .fast and ltoSupportedForTarget(target.result);
-    const force_llvm_lld: ?bool = if (release_lto) true else forceLlvmLldForTarget(target);
     const windows_sdl = configureWindowsSdl(b, target.result, system_sdl, sdl_root);
     const windows_sdl_checks = windowsSdlValidateSteps(windows_sdl);
 
@@ -139,24 +139,22 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = app_name,
         .root_module = exeModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
+        // LTO requires LLVM+LLD; force them explicitly rather than relying on
+        // the ReleaseFast default. Otherwise use Zig's default selection.
+        .use_llvm = if (release_lto) true else null,
+        .use_lld = if (release_lto) true else null,
     });
 
     const gpuSmokeModule = createSdlModule(b, target, optimize, buildOptions, "src/gpu_smoke.zig", windows_sdl, sdl_c_module);
     const gpu_smoke_exe = b.addExecutable(.{
         .name = "gpu-smoke",
         .root_module = gpuSmokeModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
     });
 
     const benchModule = createSdlModule(b, target, optimize, benchBuildOptions, "src/benchmark_runner.zig", windows_sdl, sdl_c_module);
     const bench_exe = b.addExecutable(.{
         .name = "benchmarks",
         .root_module = benchModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
     });
 
     const unitTestsModule = createSdlModule(b, target, optimize, buildOptions, "src/tests.zig", windows_sdl, sdl_c_module);
@@ -167,8 +165,6 @@ pub fn build(b: *std.Build) void {
     });
     const unit_tests = b.addTest(.{
         .root_module = unitTestsModule,
-        .use_llvm = force_llvm_lld,
-        .use_lld = force_llvm_lld,
     });
 
     // Ship/package mode: full LTO (`-flto=full`) for cross-module inlining and
@@ -738,14 +734,6 @@ comptime {
                 @compileError("msl_entry_signature must be the generated MSL entry-point parameter list starting with main0(: " ++ stage_source.output_stem);
         }
     }
-}
-
-fn forceLlvmLldForTarget(target: std.Build.ResolvedTarget) ?bool {
-    if (target.query.isNative() and target.result.os.tag == .linux and target.result.abi.isGnu()) {
-        return true;
-    }
-
-    return null;
 }
 
 /// Zig 0.17 LTO requires LLD; LLD cannot link Mach-O object files.
