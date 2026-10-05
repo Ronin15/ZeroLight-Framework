@@ -181,11 +181,11 @@ pub const ContextFlags = struct {
     }
 
     pub fn get(self: *const ContextFlags, context: InputContext) bool {
-        return self.values[@intFromEnum(context)];
+        return self.values[@backingInt(context)];
     }
 
     pub fn set(self: *ContextFlags, context: InputContext, value: bool) void {
-        self.values[@intFromEnum(context)] = value;
+        self.values[@backingInt(context)] = value;
     }
 };
 

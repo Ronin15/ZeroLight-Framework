@@ -138,11 +138,11 @@ pub const sprite_asset_count = @typeInfo(SpriteAssetId).@"enum".field_names.len;
 pub const audio_asset_count = @typeInfo(AudioAssetId).@"enum".field_names.len;
 
 pub fn spriteIndex(id: SpriteAssetId) usize {
-    return @intFromEnum(id);
+    return @backingInt(id);
 }
 
 pub fn audioIndex(id: AudioAssetId) usize {
-    return @intFromEnum(id);
+    return @backingInt(id);
 }
 
 test "metadata manifest entries declare loader kind and sidecar together" {

@@ -24,7 +24,7 @@ const relationship_matrix: [faction_count][faction_count]Stance = .{
 };
 
 pub fn stance(a: Faction, b: Faction) Stance {
-    return relationship_matrix[@intFromEnum(a)][@intFromEnum(b)];
+    return relationship_matrix[@backingInt(a)][@backingInt(b)];
 }
 
 test "stance is symmetric for defined faction pairs" {

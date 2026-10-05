@@ -107,7 +107,7 @@ pub fn build(b: *std.Build) void {
     buildOptions.addOption([]const u8, "asset_root", asset_root);
     buildOptions.addOption(bool, "gpu_debug", gpu_debug);
     buildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    buildOptions.addOption(u8, "log_level", @intFromEnum(log_level));
+    buildOptions.addOption(u8, "log_level", @backingInt(log_level));
     buildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const benchBuildOptions = b.addOptions();
@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
     benchBuildOptions.addOption([]const u8, "asset_root", asset_root);
     benchBuildOptions.addOption(bool, "gpu_debug", gpu_debug);
     benchBuildOptions.addOption(bool, "debug_overlay", debug_overlay);
-    benchBuildOptions.addOption(u8, "log_level", @intFromEnum(bench_log_level));
+    benchBuildOptions.addOption(u8, "log_level", @backingInt(bench_log_level));
     benchBuildOptions.addOption(u32, "gpu_shader_formats", gpu_shader_formats);
 
     const fetch_sdl_step = b.step("fetch-sdl", "Fetch pinned Windows SDL packages into zig-pkg/ and validate them");

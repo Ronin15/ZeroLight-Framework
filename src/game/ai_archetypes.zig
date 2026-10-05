@@ -5,7 +5,7 @@
 //! Data-driven AI archetype catalog: personalities are authored in
 //! `assets/ai/archetypes.json` and loaded once at load-time into a dense
 //! enum-indexed table of prevalidated component bundles. Spawn resolves a slot
-//! to a bundle by `@intFromEnum` — no strings, no hashmap, no JSON on the hot
+//! to a bundle by `@backingInt` — no strings, no hashmap, no JSON on the hot
 //! path. Lives in the game layer because bundles hold game-layer component
 //! types; it merely borrows `AssetStore`'s path-safe reader (direction stays
 //! game -> assets).
@@ -100,7 +100,7 @@ pub const AiArchetypeCatalog = struct {
     bundles: [archetype_count]DemoArchetype,
 
     pub fn bundleForId(self: *const AiArchetypeCatalog, id: AiArchetypeId) DemoArchetype {
-        return self.bundles[@intFromEnum(id)];
+        return self.bundles[@backingInt(id)];
     }
 };
 
@@ -174,7 +174,7 @@ fn buildCatalog(root: JsonRoot) BuildError!AiArchetypeCatalog {
     var bundles: [archetype_count]DemoArchetype = undefined;
     for (root.archetypes) |entry| {
         const id = std.meta.stringToEnum(AiArchetypeId, entry.id) orelse return error.UnknownArchetypeId;
-        const slot = @intFromEnum(id);
+        const slot = @backingInt(id);
         if (seen[slot]) return error.DuplicateArchetype;
         seen[slot] = true;
         bundles[slot] = try buildBundle(entry);
@@ -301,7 +301,7 @@ test "installed archetypes.json loads to the full parity table" {
 
     const expected = expectedBundles();
     inline for (std.meta.tags(AiArchetypeId)) |id| {
-        try std.testing.expectEqual(expected[@intFromEnum(id)], catalog.bundleForId(id));
+        try std.testing.expectEqual(expected[@backingInt(id)], catalog.bundleForId(id));
     }
 }
 
@@ -316,7 +316,7 @@ test "every AiArchetypeId tag round-trips name<->enum and the catalog fills all 
     // Missing/duplicate rejection means a successful load populates all 8 slots;
     // inert (slot 2) is the only one with a null behavior.
     for (catalog.bundles, 0..) |bundle, slot| {
-        if (slot == @intFromEnum(AiArchetypeId.inert)) {
+        if (slot == @backingInt(AiArchetypeId.inert)) {
             try std.testing.expect(bundle.behavior == null);
         } else {
             try std.testing.expect(bundle.behavior != null);

@@ -342,21 +342,21 @@ const EnabledRuntimePerfLog = struct {
     }
 
     pub fn recordMetric(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
-        self.metrics[@intFromEnum(metric_id)] += value;
+        self.metrics[@backingInt(metric_id)] += value;
     }
 
     pub fn recordMetricMax(self: *EnabledRuntimePerfLog, metric_id: Metric, value: u64) void {
-        const slot = &self.metrics[@intFromEnum(metric_id)];
+        const slot = &self.metrics[@backingInt(metric_id)];
         slot.* = @max(slot.*, value);
     }
 
     pub fn recordTiming(self: *EnabledRuntimePerfLog, timing_id: Timing, duration_ns: u64) void {
-        self.timings[@intFromEnum(timing_id)].record(duration_ns);
+        self.timings[@backingInt(timing_id)].record(duration_ns);
     }
 
     pub fn recordBatch(self: *EnabledRuntimePerfLog, stage: BatchStage, stats: BatchStats) void {
         if (stats.item_count == 0 and stats.range_count == 0 and stats.batch_duration_ns == 0) return;
-        self.batches[@intFromEnum(stage)].record(stats);
+        self.batches[@backingInt(stage)].record(stats);
     }
 
     pub fn recordFrame(self: *EnabledRuntimePerfLog, now_ns: u64, sample: FrameSample) void {
@@ -770,15 +770,15 @@ const EnabledRuntimePerfLog = struct {
     }
 
     fn metricValue(self: *const EnabledRuntimePerfLog, value: Metric) u64 {
-        return self.metrics[@intFromEnum(value)];
+        return self.metrics[@backingInt(value)];
     }
 
     fn timingValue(self: *const EnabledRuntimePerfLog, value: Timing) TimingAggregate {
-        return self.timings[@intFromEnum(value)];
+        return self.timings[@backingInt(value)];
     }
 
     fn batchValue(self: *const EnabledRuntimePerfLog, value: BatchStage) BatchAggregate {
-        return self.batches[@intFromEnum(value)];
+        return self.batches[@backingInt(value)];
     }
 };
 

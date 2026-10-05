@@ -249,11 +249,11 @@ const ActionFlags = struct {
     }
 
     fn get(self: *const ActionFlags, action: Action) bool {
-        return self.values[@intFromEnum(action)];
+        return self.values[@backingInt(action)];
     }
 
     fn set(self: *ActionFlags, action: Action, value: bool) void {
-        self.values[@intFromEnum(action)] = value;
+        self.values[@backingInt(action)] = value;
     }
 };
 

@@ -442,7 +442,7 @@ fn lessThanCrossing(_: void, a: SimulationEvent, b: SimulationEvent) bool {
     const cb = b.payload.affect_threshold_crossed;
     if (ca.entity.index != cb.entity.index) return ca.entity.index < cb.entity.index;
     if (ca.entity.generation != cb.entity.generation) return ca.entity.generation < cb.entity.generation;
-    return @intFromEnum(ca.drive) < @intFromEnum(cb.drive);
+    return @backingInt(ca.drive) < @backingInt(cb.drive);
 }
 
 const AffectJobContext = struct {
@@ -495,7 +495,7 @@ fn combineDriveScalar(prev: f32, delta: f32, baseline: f32, decay_rate: f32) f32
 /// One bit per AiAffectDrive tag, keyed by its declaration order (fear = bit
 /// 0, curiosity = bit 1, aggression = bit 2, fatigue = bit 3).
 fn driveBit(drive: AiAffectDrive) u8 {
-    return @as(u8, 1) << @intCast(@intFromEnum(drive));
+    return @as(u8, 1) << @intCast(@backingInt(drive));
 }
 
 /// True Schmitt trigger over `above_threshold.*`'s persisted per-drive bit

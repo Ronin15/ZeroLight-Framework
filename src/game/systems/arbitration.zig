@@ -229,7 +229,7 @@ pub fn scoreBehaviors(signals: Signals, gains: PersonalityGains) Scores {
     // this behavior at all," which the bonus terms don't get to bypass.
     var scores: Scores = undefined;
     for (0..behavior_count) |b| {
-        const behavior: AiBehavior = @enumFromInt(b);
+        const behavior: AiBehavior = @fromBackingInt(@intCast(b));
         scores[b] = gainFor(behavior, gains) * (weighted[b] + perceptionTerm(behavior, signals) + memoryTerm(behavior, signals));
     }
     return scores;
@@ -265,7 +265,7 @@ pub fn selectSticky(
     sticky_bonus: f32,
     min_delta: f32,
 ) StickySelection {
-    const previous_index = @intFromEnum(previous);
+    const previous_index = @backingInt(previous);
     if (commitment_remaining > 0) {
         const hold_threshold = scores[previous_index] + sticky_bonus + min_delta;
         var challenged = false;
@@ -453,8 +453,8 @@ test "scoreBehaviors is table-driven: identical perception/memory with only driv
     aggressive.aggression = 1.0;
     const aggression_scores = scoreBehaviors(aggressive, unitGains());
 
-    const fear_winner: AiBehavior = @enumFromInt(argmax(fear_scores));
-    const aggression_winner: AiBehavior = @enumFromInt(argmax(aggression_scores));
+    const fear_winner: AiBehavior = @fromBackingInt(@intCast(argmax(fear_scores)));
+    const aggression_winner: AiBehavior = @fromBackingInt(@intCast(argmax(aggression_scores)));
 
     try testing.expectEqual(AiBehavior.flee, fear_winner);
     try testing.expectEqual(AiBehavior.pursue, aggression_winner);
@@ -605,7 +605,7 @@ test "scoreBehaviors investigate interest marker bonus is 0.35 with unit gains" 
         .interest_y = 0,
     };
     const scores = scoreBehaviors(signals, unitGains());
-    const investigate_idx = @intFromEnum(AiBehavior.investigate);
+    const investigate_idx = @backingInt(AiBehavior.investigate);
     try testing.expectApproxEqAbs(investigate_interest_marker_bonus, scores[investigate_idx], 0.001);
 }
 
@@ -708,6 +708,6 @@ test "scoreBehaviors gives a pursue-gained agent with only an opt-in focus_targe
     };
     const gains = PersonalityGains{ .wander = 1.0, .pursue = 1.0, .flee = 0, .investigate = 0, .cohere = 0 };
     const scores = scoreBehaviors(signals, gains);
-    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @enumFromInt(argmax(scores))));
-    try testing.expect(scores[@intFromEnum(AiBehavior.pursue)] > scores[@intFromEnum(AiBehavior.wander)]);
+    try testing.expectEqual(AiBehavior.pursue, @as(AiBehavior, @fromBackingInt(@intCast(argmax(scores)))));
+    try testing.expect(scores[@backingInt(AiBehavior.pursue)] > scores[@backingInt(AiBehavior.wander)]);
 }

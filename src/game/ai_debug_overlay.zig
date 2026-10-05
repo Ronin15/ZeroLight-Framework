@@ -57,7 +57,7 @@ const ring_thickness: f32 = 2;
 const cone_alpha: f32 = 0.28;
 const ring_alpha: f32 = 0.5;
 
-// Distinct, well-separated hue per `AiBehavior` (indexed by `@intFromEnum`), so
+// Distinct, well-separated hue per `AiBehavior` (indexed by `@backingInt`), so
 // an agent's active behavior reads from its cone/ring tint and colored label
 // alone. Order matches the enum: wander, pursue, flee, investigate, cohere.
 const behavior_colors = [behavior_count]Color{
@@ -145,10 +145,10 @@ pub fn gatherAnnotations(data: *const DataSystem, camera_rect: Rect, out: []Agen
 
         if (data.aiAffectDenseIndex(entity)) |ai| {
             ann.has_affect = true;
-            ann.drives[@intFromEnum(AiAffectDrive.fear)] = affect.fear[ai];
-            ann.drives[@intFromEnum(AiAffectDrive.curiosity)] = affect.curiosity[ai];
-            ann.drives[@intFromEnum(AiAffectDrive.aggression)] = affect.aggression[ai];
-            ann.drives[@intFromEnum(AiAffectDrive.fatigue)] = affect.fatigue[ai];
+            ann.drives[@backingInt(AiAffectDrive.fear)] = affect.fear[ai];
+            ann.drives[@backingInt(AiAffectDrive.curiosity)] = affect.curiosity[ai];
+            ann.drives[@backingInt(AiAffectDrive.aggression)] = affect.aggression[ai];
+            ann.drives[@backingInt(AiAffectDrive.fatigue)] = affect.fatigue[ai];
             ann.above_threshold_mask = affect.above_threshold_mask[ai];
         }
 
@@ -236,8 +236,8 @@ pub const AiDebugOverlay = struct {
         // Each behavior label is prepared in its own behavior color, so both the
         // per-agent world-space label and the HUD tally line read as that hue.
         inline for (std.meta.tags(AiBehavior)) |behavior| {
-            self.behavior_labels[@intFromEnum(behavior)] =
-                try text_service.prepareDefaultText(renderer, @tagName(behavior), behavior_colors[@intFromEnum(behavior)]);
+            self.behavior_labels[@backingInt(behavior)] =
+                try text_service.prepareDefaultText(renderer, @tagName(behavior), behavior_colors[@backingInt(behavior)]);
         }
         for (&self.tier_labels, tier_names) |*slot, name| {
             slot.* = try text_service.prepareDefaultText(renderer, name, hud_color);
@@ -309,7 +309,7 @@ fn tallyBehaviorsByCognition(data: *const DataSystem) [behavior_count]usize {
     for (agents.entities, agents.behaviors) |entity, behavior| {
         const mdi = data.movementBodyDenseIndex(entity) orelse continue;
         if (scope.tier[mdi] != .cognition) continue;
-        counts[@intFromEnum(behavior)] += 1;
+        counts[@backingInt(behavior)] += 1;
     }
     return counts;
 }
@@ -324,7 +324,7 @@ fn drawHudText(renderer: *Renderer, prepared: PreparedText, x: f32, y: f32) !voi
 }
 
 fn drawAgent(renderer: *Renderer, ann: AgentAnnotation, labels: [behavior_count]PreparedText) !void {
-    const behavior_color = behavior_colors[@intFromEnum(ann.behavior)];
+    const behavior_color = behavior_colors[@backingInt(ann.behavior)];
     if (ann.has_perception and ann.vision_range > 0) {
         try drawVisionCone(renderer, ann.position, ann.facing, ann.vision_range, ann.fov_half_angle, behavior_color);
     }
@@ -334,7 +334,7 @@ fn drawAgent(renderer: *Renderer, ann: AgentAnnotation, labels: [behavior_count]
     for (ann.contacts[0..ann.memory_contact_count]) |contact| {
         try drawMemoryMarker(renderer, contact);
     }
-    try drawBehaviorLabel(renderer, ann.position, labels[@intFromEnum(ann.behavior)]);
+    try drawBehaviorLabel(renderer, ann.position, labels[@backingInt(ann.behavior)]);
 }
 
 fn drawVisionCone(renderer: *Renderer, origin: Vec2, facing: Vec2, range: f32, fov_half_angle: f32, color: Color) !void {
@@ -465,11 +465,11 @@ test "tallyBehaviorsByCognition counts the whole cognition set independent of ca
     try data.setSimulationTier(demoted, .locomotion);
 
     const counts = tallyBehaviorsByCognition(&data);
-    try testing.expectEqual(@as(usize, 1), counts[@intFromEnum(AiBehavior.wander)]);
-    try testing.expectEqual(@as(usize, 2), counts[@intFromEnum(AiBehavior.pursue)]);
-    try testing.expectEqual(@as(usize, 1), counts[@intFromEnum(AiBehavior.flee)]);
-    try testing.expectEqual(@as(usize, 0), counts[@intFromEnum(AiBehavior.investigate)]);
-    try testing.expectEqual(@as(usize, 0), counts[@intFromEnum(AiBehavior.cohere)]);
+    try testing.expectEqual(@as(usize, 1), counts[@backingInt(AiBehavior.wander)]);
+    try testing.expectEqual(@as(usize, 2), counts[@backingInt(AiBehavior.pursue)]);
+    try testing.expectEqual(@as(usize, 1), counts[@backingInt(AiBehavior.flee)]);
+    try testing.expectEqual(@as(usize, 0), counts[@backingInt(AiBehavior.investigate)]);
+    try testing.expectEqual(@as(usize, 0), counts[@backingInt(AiBehavior.cohere)]);
 }
 
 test "gatherAnnotations caps at k_max_annotated_agents regardless of agent count or camera size" {
@@ -533,8 +533,8 @@ test "gatherAnnotations populates sub-component viz and skips missing components
     try testing.expectEqual(@as(f32, 150), equipped.vision_range);
     try testing.expectEqual(@as(f32, 0.6), equipped.fov_half_angle);
     try testing.expect(equipped.has_affect);
-    try testing.expectEqual(@as(f32, 0.4), equipped.drives[@intFromEnum(AiAffectDrive.fear)]);
-    try testing.expectEqual(@as(f32, 0.7), equipped.drives[@intFromEnum(AiAffectDrive.curiosity)]);
+    try testing.expectEqual(@as(f32, 0.4), equipped.drives[@backingInt(AiAffectDrive.fear)]);
+    try testing.expectEqual(@as(f32, 0.7), equipped.drives[@backingInt(AiAffectDrive.curiosity)]);
     try testing.expectEqual(@as(usize, 2), equipped.memory_contact_count);
     try testing.expectEqual(@as(f32, 12), equipped.contacts[0].position.x);
     try testing.expectEqual(@as(f32, 56), equipped.contacts[1].position.x);

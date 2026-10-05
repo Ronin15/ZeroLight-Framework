@@ -1503,7 +1503,7 @@ test "real worker threads match serial across every scope pass" {
         try data.setMovementBody(e, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
         try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
-        try data.setSimulationMetadata(e, .{ .tier = @enumFromInt(index % 4), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = @intCast(index % cognition_stagger_n) });
+        try data.setSimulationMetadata(e, .{ .tier = @fromBackingInt(@intCast(index % 4)), .chunk = .{ .x = @intCast(index % 20), .y = 0 }, .level = @intCast(index % 5), .stagger_phase = @intCast(index % cognition_stagger_n) });
     }
 
     var threads = try ThreadSystem.init(allocator, std.testing.io, .{ .max_worker_threads = 2, .items_per_range = scope_range_alignment_items });
@@ -1573,7 +1573,7 @@ test "warmed scope threaded gathers and tier policy do not allocate (FailingAllo
         try data.setCollisionBounds(e, .{ .size = .{ .x = 8, .y = 8 } });
         try data.setAiAgent(e, .{ .active_behavior = if (index % 2 == 0) .pursue else .wander });
         try data.setSimulationMetadata(e, .{
-            .tier = @enumFromInt(index % 4),
+            .tier = @fromBackingInt(@intCast(index % 4)),
             .chunk = .{ .x = @intCast(index % 20), .y = 0 },
             .level = @intCast(index % 5),
             // Fixed at 0 (not `index % cognition_stagger_n`): that modulus shares a

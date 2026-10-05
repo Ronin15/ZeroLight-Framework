@@ -719,7 +719,7 @@ fn queryJob(context: *anyopaque, range: ParallelRange, worker_id: WorkerId) void
     const ctx: *QueryContext = @ptrCast(@alignCast(context));
     for (range.start..range.end) |i| {
         const view = ctx.system.statusForWorld(0, ctx.starts[i], 0, ctx.goals[i], .default, &ctx.hints[i]);
-        ctx.sink[i] = @intFromEnum(view.status);
+        ctx.sink[i] = @backingInt(view.status);
     }
 }
 

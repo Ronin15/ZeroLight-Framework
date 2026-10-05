@@ -290,7 +290,7 @@ comptime {
     }
     var seen: [stage_order.len]bool = @splat(false);
     for (stage_order) |stage| {
-        const index = @intFromEnum(stage);
+        const index = @backingInt(stage);
         if (seen[index]) {
             @compileError("SimulationPipeline stage_order lists '" ++ @tagName(stage) ++ "' more than once");
         }

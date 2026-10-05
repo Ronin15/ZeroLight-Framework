@@ -112,8 +112,8 @@ fn replacePendingStorageRegion(pending: []gpu_buffer.StorageRegion, region: gpu_
 fn assertTileDataEditsSortedUnique(edits: []const TileDataEdit) void {
     if (edits.len < 2) return;
     for (edits[0 .. edits.len - 1], edits[1..]) |prev, next| {
-        const prev_buffer = @intFromEnum(prev.buffer);
-        const next_buffer = @intFromEnum(next.buffer);
+        const prev_buffer = @backingInt(prev.buffer);
+        const next_buffer = @backingInt(next.buffer);
         std.debug.assert(prev_buffer < next_buffer or
             (prev_buffer == next_buffer and prev.element_index < next.element_index));
     }
@@ -1001,14 +1001,14 @@ pub const Renderer = struct {
         const buffer = try gpu_buffer.uploadStorageData(self.device, packed_cells);
         errdefer c.SDL_ReleaseGPUBuffer(self.device, buffer);
         const index = std.math.cast(u32, self.tile_data_buffers.items.len) orelse return error.TooManyTileDataBuffers;
-        if (index == @intFromEnum(TileDataId.invalid)) return error.TooManyTileDataBuffers;
+        if (index == @backingInt(TileDataId.invalid)) return error.TooManyTileDataBuffers;
         try self.tile_data_buffers.append(self.allocator, buffer);
         errdefer _ = self.tile_data_buffers.pop();
         try self.tile_data_params.append(self.allocator, params);
         errdefer _ = self.tile_data_params.pop();
         try self.tile_data_counts.append(self.allocator, element_count);
         log.debug("created tilemap tile-data buffer {d}: {d} packed elements", .{ index, packed_cells.len });
-        return @enumFromInt(index);
+        return @fromBackingInt(@intCast(index));
     }
 
     /// Queues a batch of packed-element tile edits (the dig path) for upload during
@@ -1031,7 +1031,7 @@ pub const Renderer = struct {
             if (edit.element_index >= element_count) {
                 log.warn("dropped tile-data edit: element {d} out of range for buffer {d}", .{
                     edit.element_index,
-                    @intFromEnum(edit.buffer),
+                    @backingInt(edit.buffer),
                 });
                 continue;
             }
@@ -1096,14 +1096,14 @@ pub const Renderer = struct {
 
     fn tileDataBuffer(self: *const Renderer, id: TileDataId) ?*c.SDL_GPUBuffer {
         if (id == .invalid) return null;
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index >= self.tile_data_buffers.items.len) return null;
         return self.tile_data_buffers.items[index];
     }
 
     fn tileDataCount(self: *const Renderer, id: TileDataId) u32 {
         if (id == .invalid) return 0;
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (index >= self.tile_data_counts.items.len) return 0;
         return self.tile_data_counts.items[index];
     }
@@ -1111,7 +1111,7 @@ pub const Renderer = struct {
     // Direct load: only called for a tilemap group whose `tile_data` already
     // resolved to a buffer this frame, so the parallel params entry is present.
     fn tileDataParams(self: *const Renderer, id: TileDataId) TilemapParams {
-        return self.tile_data_params.items[@intFromEnum(id)];
+        return self.tile_data_params.items[@backingInt(id)];
     }
 
     fn createInternalTextureFromPixels(
@@ -1441,8 +1441,8 @@ pub const Renderer = struct {
 // orders keep append order (static spans are appended before dynamic groups,
 // preserving the prior world-before-dynamic tie-break at the same depth).
 fn drawGroupOrderLessThan(_: void, a: DrawGroup, b: DrawGroup) bool {
-    const a_domain = @intFromEnum(a.order.domain);
-    const b_domain = @intFromEnum(b.order.domain);
+    const a_domain = @backingInt(a.order.domain);
+    const b_domain = @backingInt(b.order.domain);
     if (a_domain != b_domain) return a_domain < b_domain;
     return a.order.depth < b.order.depth;
 }
@@ -2134,7 +2134,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
         var window = Renderer.TilemapWindowLayers{};
         window.count = 1;
         window.offsets[0] = @intCast(i);
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(@intCast(0)), window);
     }
 
     try std.testing.expectEqual(@as(usize, 3), renderer.tilemap_window_layer_count);
@@ -2151,7 +2151,7 @@ test "appendStaticTilemapSpan assigns sequential window slots per static-geometr
     var window = Renderer.TilemapWindowLayers{};
     window.count = 1;
     window.offsets[0] = 99;
-    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @enumFromInt(0), window);
+    try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(0), vertices, @fromBackingInt(@intCast(0)), window);
     try std.testing.expectEqual(@as(usize, 1), renderer.tilemap_window_layer_count);
     try std.testing.expectEqual(@as(u8, 0), renderer.static_groups.items[0].window_slot);
 }
@@ -2170,13 +2170,13 @@ test "appendStaticTilemapSpan returns TooManyTilemapWindowDraws past the composi
 
     renderer.beginStaticGeometry();
     for (0..Renderer.k_max_dense_composite_draws) |i| {
-        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @enumFromInt(0), window);
+        try renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(i)), vertices, @fromBackingInt(@intCast(0)), window);
     }
     try std.testing.expectEqual(Renderer.k_max_dense_composite_draws, renderer.tilemap_window_layer_count);
 
     try std.testing.expectError(
         error.TooManyTilemapWindowDraws,
-        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @enumFromInt(0), window),
+        renderer.appendStaticTilemapSpan(texture, RenderOrder.world(@intCast(Renderer.k_max_dense_composite_draws)), vertices, @fromBackingInt(@intCast(0)), window),
     );
     // The fixed-size table stayed exactly at the cap; the failed call past it
     // neither corrupted it nor grew past bounds.
@@ -2212,7 +2212,7 @@ test "reserved static geometry append and mergeDrawList stay allocation-free" {
             texture,
             RenderOrder.world(@intCast(i)),
             vertices,
-            @enumFromInt(0),
+            @fromBackingInt(@intCast(0)),
             window,
         );
     }

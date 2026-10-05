@@ -176,7 +176,7 @@ pub fn deinitCaches() void {
 // Returns the variant's reusable fixture, building it once (world + nav sized for the maximum
 // threaded participant count, so every case fits) on first use.
 fn sharedFixture(allocator: std.mem.Allocator, io: std.Io, variant: Variant) !*Fixture {
-    const slot = &shared_fixtures[@intFromEnum(variant)];
+    const slot = &shared_fixtures[@backingInt(variant)];
     if (slot.* == null) {
         var probe = try ThreadSystem.init(allocator, io, .{});
         const max_participants = probe.participantSlotCount();
