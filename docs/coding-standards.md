@@ -30,10 +30,25 @@ such as `thread.ThreadSystem`. Do not rewrite SDL/C symbols, generated
 build-option names, or `std.Build` field names.
 
 Use current standard-library spellings. `std.ArrayList` is the unmanaged list in
-Zig 0.16 (it takes an explicit allocator per operation and initializes as
+Zig 0.17 (it takes an explicit allocator per operation and initializes as
 `.empty`); do not use the deprecated `std.ArrayListUnmanaged` alias for new or
 edited code. Prefer the modern initializer forms (`= .empty`, `.{}`) over
 removed managed-container constructors.
+
+Use the Zig 0.17 builtin spellings: `@backingInt` / `@fromBackingInt` (not the
+deprecated `@intFromEnum` / `@enumFromInt`), `@splat` instead of the removed `**`
+array-repeat operator (prefer `var a: [N]T = @splat(x);` when the declaration
+can carry the type), `@typeInfo(T).<kind>.field_names` / `field_types` or
+`std.meta.tags(E)` instead of the removed `std.meta.fields`,
+`allocator.dupeSentinel(u8, bytes, 0)` instead of the removed `dupeZ`, and
+`std.builtin.Optimize` (`.debug`/`.safe`/`.fast`/`.small`) instead of the
+`OptimizeMode` alias. C headers go through `build.zig`'s shared TranslateC step,
+never `@cImport`.
+
+Do not gate behavior hooks on `@hasDecl`. Since Zig 0.17, `@hasDecl` only sees
+`pub` declarations, so a private hook is silently skipped instead of failing to
+compile. Make a hook part of the required contract and call it unconditionally
+(the state stack does this for `onPause` and `onResume`).
 
 Keep `Renderer` as the render facade for app/game code. Do not import
 `src/render/gpu/*` outside the render/platform boundary.
@@ -90,8 +105,10 @@ the annotation to silence the lint on a genuinely recoverable failure — propag
 the error instead (the reference case is `SpriteBatch.buildSerial`, which returns
 `!void` rather than folding `ensureFrameStorage`'s allocation error into UB). The
 same lint gate enforces snake_case struct fields/parameters, `k_snake_case`
-constants, and current stdlib spellings (no `std.ArrayListUnmanaged`,
-`usingnamespace`, `std.mem.copy`/`set`, `std.BoundedArray`); its rules live in
+constants, and current stdlib/builtin spellings (no `std.ArrayListUnmanaged`,
+`usingnamespace`, `std.mem.copy`/`set`, `std.BoundedArray`, `@intFromEnum`,
+`@enumFromInt`, `std.meta.fields`, `dupeZ`, `OptimizeMode`, `@cImport`, `**`
+array repeat, or `@hasDecl` in `src/`); its rules live in
 `tools/lint_idioms.py`.
 
 When a collection is written from more than one thread, both of these must

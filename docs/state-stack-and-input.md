@@ -59,10 +59,12 @@ pub const MyState = struct {
 
 Return `true` from `handleEvent` when the state consumes an event.
 
-`onPause` is required; `onResume` is optional (`src/app/state.zig`'s adapter
-calls it only when `@hasDecl(T, "onResume")`). Only gameplay-owning states
-like `GameDemoState` implement `onResume`; pure UI states typically implement
-`onPause` alone.
+`onPause` and `onResume` are both required: `src/app/state.zig`'s adapter
+calls both unconditionally, so a state missing either fails to compile. Pure
+UI states implement them as no-ops; gameplay-owning states like
+`GameDemoState` put real pause/resume behavior there. Do not reintroduce an
+optional hook gated on `@hasDecl`: since Zig 0.17 it only sees `pub`
+declarations, so a private hook would be silently skipped.
 
 `UpdateContext` carries `asset_store` (an `assets.AssetStore` handle) so a state
 can load content catalogs at init from the traversal-safe asset root —

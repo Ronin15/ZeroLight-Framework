@@ -1,7 +1,7 @@
 ---
 name: zig-workflows
 description: >-
-  ZeroLight-Framework (Zig 0.16, SDL3, SDL_GPU) specialist routing: design, implement,
+  ZeroLight-Framework (Zig 0.17, SDL3, SDL_GPU) specialist routing: design, implement,
   debug, PR/diff review, and multi-phase review passes. Use when the user asks for
   zig-design-specialist, zig-specialist, zig-debug-specialist, or zig-review-specialist;
   when zig build, zig test, or shader compile fails; when reviewing a PR or branch diff;

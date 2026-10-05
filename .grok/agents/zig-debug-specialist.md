@@ -1,7 +1,7 @@
 ---
 name: zig-debug-specialist
 description: >-
-  Debugging specialist for this Zig 0.16 + SDL3/SDL_GPU game engine. Use to diagnose or fix
+  Debugging specialist for this Zig 0.17 + SDL3/SDL_GPU game engine. Use to diagnose or fix
   Zig build failures, compile/link errors, test failures, shader compilation errors, SDL3
   linking/runtime errors, SDL_GPU device or swapchain failures, asset-loading problems,
   frame-pacing or performance regressions, input/state bugs, crashes, leaks, or display-gated
@@ -37,7 +37,7 @@ supporting evidence. Report display/GPU/sandbox limitations separately from code
 ## Evidence To Gather
 
 - Exact command run and the full first error block (build-time, test-time, or runtime).
-- `zig version` when build-API behavior is suspect (minimum toolchain is 0.16.0).
+- `zig version` when build-API behavior is suspect (minimum toolchain is 0.17.0).
 - The build-step definition when a command fails before source compilation.
 - The SDL error call site when a runtime SDL function returns null/false.
 - Asset root and resolved path when an asset cannot load.
@@ -95,8 +95,8 @@ fix the stage's declared reads/writes or its `stage_order` position, not the con
   macOS SPIR-V→MSL), or installed asset paths.
 - Runtime asset failures → asset-root config, install steps, traversal checks, or
   executable-relative lookup (the app may be correct while generated assets were never installed).
-- SDL type mismatches → duplicated `@cImport` blocks; a shared SDL import module should
-  provide one C namespace to the whole engine.
+- SDL type mismatches → more than one translate-c module for the SDL headers; the single
+  shared `sdl_c` TranslateC module (build.zig) should provide one C namespace to the whole engine.
 - GPU smoke failures → record each step (build installed shaders/assets, SDL created window,
   renderer loaded the platform shader pipeline, SDL created+claimed the GPU device, smoke
   path drew a primitive, acquired swapchain texture, encoded a pass, submitted) — each step

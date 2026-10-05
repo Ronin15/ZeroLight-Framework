@@ -14,7 +14,7 @@ tree to load the other.
 **Do not invent architecture** — read the owning `docs/` file and live `src/`
 before editing.
 
-**Stack:** Zig **0.16**, **SDL3 / SDL_GPU**, fixed-step **60Hz** sim, state stack
+**Stack:** Zig **0.17**, **SDL3 / SDL_GPU**, fixed-step **60Hz** sim, state stack
 with policy-driven input, atlas assets by stable IDs, data-oriented SoA
 (`DataSystem`, `WorldSystem`), state-owned `SimulationPipeline`, threaded/SIMD
 processors (movement, AI, steering, collision, pathfinding, particles).
@@ -120,7 +120,7 @@ Read the owning doc before editing. Do not invent architecture from memory.
 | `docs/atlas-asset-workflow.md` | Atlas packing, JSON sidecars, art swaps |
 | `docs/framework-implementation-slices.md` | Live roadmap / open slices |
 | `docs/framework-implementation-slices-archive.md` | Settled slices (0–8, 9–17, 18–25E, 26–32, 34, 36, 39–41, 45) |
-| `docs/changelogs/` | Per-branch feature summaries (latest: `docs/changelogs/ai_update2.md`) |
+| `docs/changelogs/` | Per-branch feature summaries (latest: `docs/changelogs/zig_0_17_upgrade.md`) |
 | `docs/reviews/` | Module deep-dives (pathfinder, GPU, …) |
 
 ---
@@ -190,12 +190,12 @@ zig build gpu-smoke  # display-gated GPU smoke
 zig build package    # release-mode install
 zig build assets-lint
 zig build idiom-lint
-zig build fetch-sdl  # Windows SDL package cache
+zig build fetch-sdl  # fetch + validate Windows SDL packages (zig-pkg/)
 ```
 
 Default optimize: `Debug`. Use `--release=safe|fast|small` for release candidates
 only. Packaged builds ship **ReleaseFast** — ReleaseSafe soak first (see
-`docs/development-workflow.md`). Minimum toolchain: **Zig 0.16.0**.
+`docs/development-workflow.md`). Minimum toolchain: **Zig 0.17.0**.
 
 ### Agent working practices
 

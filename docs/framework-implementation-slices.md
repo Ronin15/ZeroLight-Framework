@@ -393,7 +393,7 @@ by Slice 24.
 
 **How to add a new feeling later (contract for Slice 42 / implementers):**
 
-1. Append a tag to `AiAffectDrive` (preserve existing `@intFromEnum` order —
+1. Append a tag to `AiAffectDrive` (preserve existing `@backingInt` order —
    append only).
 2. Add cold baseline/decay/threshold + hot value columns on `AiAffect` /
    store / slices / template / validation (same pattern as existing drives).
@@ -985,7 +985,8 @@ keyboard — no rebind UI (defaults only, a later slice).
   `SDL_GAMEPAD_AXIS_INVALID` are `-1`, so translate-c falls back to an integer
   alias with comptime constants. The correct cast at every call/construction
   site is therefore a plain `@intCast` between the `u8` event field and the
-  `c_int` binding/comparison type — never `@enumFromInt`.
+  `c_int` binding/comparison type — never `@fromBackingInt` (formerly
+  `@enumFromInt`).
 
 ### Checklist
 

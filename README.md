@@ -1,6 +1,6 @@
 # ZeroLight Framework
 
-A lean 2D game framework built with **Zig 0.16**, **SDL3**, and **SDL_GPU**.
+A lean 2D game framework built with **Zig 0.17**, **SDL3**, and **SDL_GPU**.
 It targets predictable runtime flow, data-oriented gameplay, and a clear split
 between app coordination, rendering, assets, and simulation.
 
@@ -47,7 +47,7 @@ For design detail and ownership boundaries, start with
 
 ## Requirements
 
-- Zig 0.16.0 or a compatible 0.16.x build
+- Zig 0.17.0 or a compatible 0.17.x build
 - SDL3, SDL3_ttf, and SDL3_mixer
 - Shader toolchain: `glslc`; `spirv-cross` on macOS; `spirv-cross` and `dxc`
   on Windows

@@ -141,7 +141,7 @@ const SYNTHESIS_SCHEMA = {
 
 function reviewPrompt(u) {
   return [
-    `Review these files for **Zig 0.16 best practices and this codebase's coding standards** (read them fully first):`,
+    `Review these files for **Zig 0.17 best practices and this codebase's coding standards** (read them fully first):`,
     u.files.map((f) => `  - ${f}`).join('\n'),
     ``,
     `You are the zig-review-specialist — apply your full checklist, but weight this pass toward mechanizable / generalizable best-practice issues, NOT one-off gameplay logic bugs. Concretely hunt for:`,

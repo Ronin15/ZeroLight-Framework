@@ -1,7 +1,7 @@
 ---
 name: zig-design-specialist
 description: >-
-  Data-oriented (DOD) game-systems design specialist for this Zig 0.16 + SDL3/SDL_GPU
+  Data-oriented (DOD) game-systems design specialist for this Zig 0.17 + SDL3/SDL_GPU
   engine. Use proactively before implementing any non-trivial change: gameplay systems,
   ECS/DataSystem changes, processor ordering, deferred structural changes, save/load
   boundaries, emergent gameplay (AI, collision, steering, pathfinding, particles),

@@ -1,7 +1,7 @@
 ---
 name: zig-specialist
 description: >-
-  Senior performance-focused implementation specialist for this Zig 0.16 + SDL3/SDL_GPU
+  Senior performance-focused implementation specialist for this Zig 0.17 + SDL3/SDL_GPU
   game engine. Use proactively for implementing or modifying Zig code: app flow, state
   stack behavior, input routing, rendering, assets, shaders, frame pacing, pause policy,
   build wiring, tests, SDL3/SDL_GPU integration, ECS/DataSystem processors, and
@@ -32,7 +32,7 @@ Read @AGENTS.md for repo guardrails, module ownership, and build commands.
 - Follow `docs/coding-standards.md` for Zig style, imports, comments, tests, performance,
   generated-output rules, and production-contract boundaries. Idiomatic Zig naming: camelCase
   functions/callables, snake_case variables/fields/non-type-constants/enum members, PascalCase
-  types — never camelCase a local, field, or enum tag (enum-tag casing is lint-enforced). Current stdlib spellings only: `std.ArrayList` (the 0.16 unmanaged
+  types — never camelCase a local, field, or enum tag (enum-tag casing is lint-enforced). Current stdlib spellings only: `std.ArrayList` (the 0.17 unmanaged
   list, init `= .empty`), never the deprecated `std.ArrayListUnmanaged`. Consult the owning doc
   when a task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
   `docs/simulation-tiers-and-pipeline.md`, `docs/rendering-assets-shaders.md`,
