@@ -41,6 +41,7 @@ const ParticleSystem = @import("systems/particle.zig").ParticleSystem;
 const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
+const nav_interior_link_slots_per_chunk = @import("systems/pathfinding.zig").nav_interior_link_slots_per_chunk;
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -206,6 +207,16 @@ pub const default_world_build_config = world_system.WorldBuildConfig{
     .render_window = .{ .levels_below = procedural_render_window_levels_below },
 };
 
+/// Level-link capacity reserved at load, sized from the loaded world: its authored links
+/// plus one nav chunk's worth of interior link slots (`nav_interior_link_slots_per_chunk`)
+/// per world chunk for runtime ramps. Interior ramps can never exceed that density anyway
+/// (the dig refuses a ninth distinct interior ramp per nav chunk); perimeter ramps share the
+/// same pool, and a dig past the limit is refused rather than growing storage on the hot path.
+fn demoLevelLinkLimit(world: *const WorldSystem) usize {
+    const world_chunks = @as(usize, world.chunksX()) * @as(usize, world.chunksY());
+    return world.levelLinks().len + world_chunks * nav_interior_link_slots_per_chunk;
+}
+
 fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_count: usize) PathfindingCapacity {
     var cap: PathfindingCapacity = .{
         .max_group_fields = 4,
@@ -354,7 +365,9 @@ pub const GameDemoState = struct {
             // The configured threaded participant count is fixed at this point; the
             // pathfinding A* scratch is sized for it during the nav build.
             thread_system.participantSlotCount(),
-            proceduralPathfindingCapacity(thread_system.participantSlotCount(), world.levelLinks().len),
+            // The nav memory gate admits the world's reserved link limit (initWithWorld
+            // reserves exactly this before the nav build).
+            proceduralPathfindingCapacity(thread_system.participantSlotCount(), demoLevelLinkLimit(&world)),
             thread_system,
             battle_scale_demo_mover_count,
             asset_store,
@@ -388,6 +401,9 @@ pub const GameDemoState = struct {
         // does not fire, so there is no double-deinit.
         var world = world_value;
         errdefer world.deinit();
+        // Reserve the world's level-link capacity up front (before the nav build sizes its
+        // link edges and memory gate from it) so runtime ramps never grow link storage.
+        try world.reserveLevelLinks(demoLevelLinkLimit(&world));
         const pop_cap = deriveDemoPopulationCapacity(mover_count);
         // Cold path: load the data-driven AI archetype catalog once before spawn.
         // A malformed/missing catalog surfaces as an init error rather than a
@@ -1619,6 +1635,61 @@ test "demo ramp dig drives the real post-commit nav re-mask without panicking on
     placePlayerInCell(&demo, 5, 3);
     _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
     try std.testing.expectEqual(@as(u16, 0), demo.player.current_level);
+}
+
+test "demo reserves the nav invalidation event for a pending ramp link that flipped no blocking state" {
+    // A ramp dug on an already-walkable cell (tunnel -> ramp) emits a world_tile_changed that
+    // does NOT invalidate navigation, and the batch's structural command does not either, yet
+    // the post-commit reaction folds the new link in and appends nav_region_invalidated. Only
+    // the hasPendingNavLinks term reserves that slot: with it, a tight capacity_limit fails the
+    // preflight BEFORE the structural mutation; without it, the entity would be created and
+    // only the later nav append would fail.
+    var demo = try initDemoForTest(std.testing.allocator);
+    defer demo.deinit();
+
+    demo.data.facingPtr(demo.player.entity).?.* = .right;
+    placePlayerInCell(&demo, 3, 3);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try digFacedForTest(&demo, .hole);
+    placePlayerInCell(&demo, 4, 3);
+    _ = try demo.pipeline.dig.applyPlaneTraversal(&demo.world, &demo.data, &demo.player);
+    try std.testing.expectEqual(@as(u16, 1), demo.player.current_level);
+    // Mine (5,3) walkable on the dirt plane, and settle the nav graph for it.
+    try digFacedForTest(&demo, .hole);
+    _ = try demo.pipeline.reactToPostCommitNavEvents(&demo.simulation_frame, &demo.data, &demo.world, null);
+
+    // Ramp on the already-walkable (5,3): no blocking flip.
+    try digFacedForTest(&demo, .ramp);
+    try std.testing.expectEqual(@as(usize, 1), demo.world.levelLinks().len);
+    const dig_events = demo.simulation_frame.events.mergedItems();
+    try std.testing.expectEqual(@as(usize, 1), dig_events.len);
+    const changed = dig_events[0].payload.world_tile_changed;
+    try std.testing.expect(!changed.old_blocks_movement and !changed.new_blocks_movement);
+    try std.testing.expect(!SimulationPipeline.pendingEventsMayInvalidateNavigation(&demo.simulation_frame));
+    try std.testing.expect(demo.pipeline.hasPendingNavLinks(&demo.world));
+
+    // One non-navigation structural command (a dynamic entity create: entity_created plus one
+    // component event per template component = 4 events) with room for exactly its events.
+    const entity_count_before = demo.data.movementBodySliceConst().entities.len;
+    const create_event_count: usize = 4;
+    demo.simulation_frame.events.setCapacityLimit(dig_events.len + create_event_count);
+    try demo.simulation_frame.structural_commands.prepareRangeCounts(1);
+    demo.simulation_frame.structural_commands.addCount(0, 1);
+    try demo.simulation_frame.structural_commands.prefix();
+    var writer = demo.simulation_frame.structural_commands.rangeWriter(0);
+    writer.write(.{ .create_entity = .{
+        .movement_body = .{ .position = .{ .x = 360, .y = 180 }, .previous_position = .{ .x = 360, .y = 180 }, .velocity = .{}, .speed = 0 },
+        .collision_bounds = .{ .size = .{ .x = 32, .y = 32 } },
+        .collision_response = .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 },
+    } });
+    writer.finish();
+    demo.simulation_frame.structural_commands.finishWrite();
+    try std.testing.expect(!SimulationPipeline.structuralCommandsMayInvalidateNavigation(&demo.data, &demo.simulation_frame));
+
+    try std.testing.expectError(error.EventCapacityExceeded, demo.applyStructuralCommandsAndPostCommitEvents(null));
+    // Preflighted: nothing was mutated and no event was written.
+    try std.testing.expectEqual(entity_count_before, demo.data.movementBodySliceConst().entities.len);
+    try std.testing.expectEqual(dig_events.len, demo.simulation_frame.events.mergedItems().len);
 }
 
 test "demo dig down drops the player through the dirt plane to the void plane" {

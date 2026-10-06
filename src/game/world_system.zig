@@ -301,6 +301,11 @@ pub const WorldSystem = struct {
 
     level_base_z: std.ArrayList(i32) = .empty,
     level_links: std.ArrayList(LevelLink) = .empty,
+    // Logical level-link capacity reserved at init/load by `reserveLevelLinks`. Null =
+    // unreserved (authoring and small fixtures): `addLevelLink` grows storage. Once set,
+    // `level_links` holds exactly this many reserved entries, runtime links never grow it,
+    // and a link past the limit is refused (`error.LevelLinkLimitReached`).
+    level_link_limit: ?usize = null,
 
     dense_layers: std.MultiArrayList(DenseLayerRow) = .{},
     dense_tile_ids: std.ArrayList(TileId) = .empty,
@@ -1551,7 +1556,34 @@ pub const WorldSystem = struct {
     /// cannot leave a ramp tile without its link.
     pub fn ensureLevelLinkCapacity(self: *WorldSystem, additional: usize) !void {
         if (additional == 0) return;
+        if (self.level_link_limit) |limit| {
+            // Reserved world: storage already holds `limit`; never grow past it.
+            if (additional > limit - self.level_links.items.len) return error.LevelLinkLimitReached;
+            return;
+        }
         try self.level_links.ensureTotalCapacity(self.allocator, self.level_links.items.len + additional);
+    }
+
+    /// Reserves the world's level-link capacity up front (init/load), sized by the caller
+    /// from the loaded world and content (authored links plus a runtime allowance). After
+    /// this, links added within the limit never allocate, and derived per-link stores (the
+    /// nav graph's link edges, the nav memory gate) size from `levelLinkLimit`.
+    pub fn reserveLevelLinks(self: *WorldSystem, limit: usize) error{ LevelLinkLimitBelowAuthored, OutOfMemory }!void {
+        if (limit < self.level_links.items.len) return error.LevelLinkLimitBelowAuthored;
+        try self.level_links.ensureTotalCapacityPrecise(self.allocator, limit);
+        self.level_link_limit = limit;
+    }
+
+    /// Link count derived per-link stores must hold: the reserved limit, or the current
+    /// count for an unreserved (authoring) world.
+    pub fn levelLinkLimit(self: *const WorldSystem) usize {
+        return self.level_link_limit orelse self.level_links.items.len;
+    }
+
+    /// Whether one more level link fits (always true for an unreserved world).
+    pub fn hasLevelLinkRoom(self: *const WorldSystem) bool {
+        const limit = self.level_link_limit orelse return true;
+        return self.level_links.items.len < limit;
     }
 
     /// Reserves room for `additional` GPU dense-tile edits when the combined
@@ -1572,23 +1604,22 @@ pub const WorldSystem = struct {
     // that both cells lie inside the tile grid before storing. Explicit error
     // set; allocation is bounded to the single append. Prefer
     // `ensureLevelLinkCapacity` before any paired tile mutate.
-    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, OutOfMemory }!void {
+    pub fn addLevelLink(self: *WorldSystem, link: LevelLink) error{ InvalidWorldLevel, InvalidWorldCell, LevelLinkLimitReached, OutOfMemory }!void {
         try self.validateLevelIndex(link.level_a);
         try self.validateLevelIndex(link.level_b);
         if (link.cell_a.x >= self.width or link.cell_a.y >= self.height) return error.InvalidWorldCell;
         if (link.cell_b.x >= self.width or link.cell_b.y >= self.height) return error.InvalidWorldCell;
+        if (self.level_link_limit) |limit| {
+            if (self.level_links.items.len >= limit) return error.LevelLinkLimitReached;
+            // Reserved by reserveLevelLinks (ensureTotalCapacityPrecise(limit)).
+            self.level_links.appendAssumeCapacity(link);
+            return;
+        }
         try self.level_links.append(self.allocator, link);
     }
 
     pub fn levelLinks(self: *const WorldSystem) []const LevelLink {
         return self.level_links.items;
-    }
-
-    /// Reserved link storage (>= `levelLinks().len`). Derived per-link stores (the nav
-    /// graph's link edges) reserve to this so they grow only when the world's own link
-    /// storage grew, never on a link added within this reservation.
-    pub fn levelLinkCapacity(self: *const WorldSystem) usize {
-        return self.level_links.capacity;
     }
 
     pub fn sparseTileCount(self: *const WorldSystem) usize {
