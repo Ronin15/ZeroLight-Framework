@@ -2,7 +2,7 @@
 
 ## Slice 72: Live Capacity Sizing Pass
 
-**Status: in progress — Batches A (A1–A4), B (B1) and C (C1–C5; Batch C complete) landed, plus the Batch A review follow-ups and the Batch B/C final-review follow-ups (recorded below); K6 landed with its owners' items (64E, 71B.1, 68A note); Batch F is unblocked (64E's nav dirty-buffer item landed 2026-10-06); Batches M, D–J and K1–K5 not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+**Status: in progress — Batches A (A1–A4), B (B1) and C (C1–C5) landed, plus the Batch A review follow-ups, the Batch B/C final-review follow-ups and the C5 review follow-up (recorded below); C6 (contact streams to the pair bound, found by the C5 review follow-up) is open; K6 landed with its owners' items (64E, 71B.1, 68A note); Batch F is unblocked (64E's nav dirty-buffer item landed 2026-10-06); Batches M, D–J and K1–K5 not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
 
 **Batch B + C bench record (2026-10-06).** `zig build -Doptimize=ReleaseFast bench -- --group <name>`, 5 interleaved before/after repetitions (odd reps before first, even reps after first). Before = `0e6a74e` (the commit preceding B1), after = B1–C4 together, both built from exported trees. Medians of each case's mean; run spread = the larger of the before/after (max − min) / median. Groups: the union of the B and C gates (`perception`, `ai-affect`, `collision`, `collision-sparse`, `steering`, `scope`, `spatial_index`, `ai`, `ai-memory`, `movement`), every case at every item count (240 cases) gated against max(3%, spread). The table lists the serial baseline and the production `thread-adaptive-tuned-range` row, all within the gate. **Two forced-scheduler control rows breached formally:** `perception` 4096 `thread-fixed-2` (130.07 us → 198.48 us, +52.6% vs 35.8% spread) and `steering` 512 `thread-fixed-auto` (55.55 us → 72.03 us, +29.7% vs 26.1% spread). Six extra interleaved diagnostic pairs of each show scheduler bimodality on both sides, not a regression: perception before {129, 194, 134, 206, 190, 131} us vs after {194, 130, 132, 131, 130, 138} us; steering before median 66.1 us vs after 64.4 us. Neither code path changes on those benches (perception: one constant of equal value plus a once-only drop-warn branch in the merge; steering: the statics pre-pass runs only on invalidation steps). The `perception` and `ai-affect` fixtures run the systems standalone at their default 512-event cap, so they now print C4's once-per-system drop warn; their workload columns are unchanged. Memory: C1 moves ≈0.28 MiB of first-step collision growth to init at 2053 bodies; C2 drops ≈0.12 MiB of idle obstacle scratch; C3's tier-command slot 0 costs population × 472 B (≈0.92 MiB at 2053, 17 KiB for the shipped 37-body demo; no demo init change otherwise); C4 leaves the shipped `capacity_limit` at 293. The seam's fast path (8 store-length loads, a `deriveCapacity` copy, 5 compares per step) has no isolating bench group; no gated group drives `SimulationPipeline`.
 
@@ -111,6 +111,25 @@
 | `spatial_index` | thread-adaptive-tuned-range | 4096 | 52.50 us | 51.84 us | -1.3% | 19.6% | ok |
 | `spatial_index` | serial-direct | 10000 | 153.47 us | 153.80 us | +0.2% | 6.9% | ok |
 | `spatial_index` | thread-adaptive-tuned-range | 10000 | 165.39 us | 163.88 us | -0.9% | 23.6% | ok |
+
+**C5 review follow-up M1: bench and memory record (2026-10-06).** `78ed7e5` reserves the merged candidates, the narrowphase staging and its tallies to `broadphasePairBound(cap)` (4 pairs per body, the per-range slot density) instead of `estimateBroadphasePairCapacity(cap, cap)` (clamped to 1 pair per body). The hot loops are unchanged; only `reserve` sizes differ. `zig build -Doptimize=ReleaseFast bench -- --group <name>`, 3 runs at `78ed7e5`, medians of each case's mean (run spread = (max − min) / median of the 3 runs), against the C5 "after" column above:
+
+| group | case | items | C5 after | M1 (3-run median) | delta | run spread | ok |
+|---|---|---|---|---|---|---|---|
+| `collision` | serial-direct | 1024 | 18.25 us | 25.18 us | +38.0% | 85.8% | ok |
+| `collision` | thread-adaptive-tuned-range | 1024 | 19.76 us | 24.42 us | +23.6% | 20.0% | noise (interleaved below) |
+| `collision` | serial-direct | 4096 | 116.62 us | 127.53 us | +9.4% | 18.4% | ok |
+| `collision` | thread-adaptive-tuned-range | 4096 | 122.95 us | 125.94 us | +2.4% | 0.5% | ok |
+| `collision` | serial-direct | 10000 | 745.56 us | 771.42 us | +3.5% | 1.0% | noise (interleaved below) |
+| `collision` | thread-adaptive-tuned-range | 10000 | 379.46 us | 336.18 us | -11.4% | 20.7% | ok |
+| `collision-sparse` | serial-direct | 1024 | 10.12 us | 9.54 us | -5.7% | 80.6% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 1024 | 7.26 us | 7.24 us | -0.3% | 4.0% | ok |
+| `collision-sparse` | serial-direct | 4096 | 35.41 us | 33.25 us | -6.1% | 4.4% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 4096 | 35.20 us | 34.60 us | -1.7% | 16.5% | ok |
+| `collision-sparse` | serial-direct | 10000 | 183.02 us | 183.79 us | +0.4% | 10.9% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 10000 | 209.79 us | 195.66 us | -6.7% | 5.5% | ok |
+
+The two rows past max(3%, spread) against the cross-session record were re-measured interleaved against `c9496b8` (exported tree, 3 reps): `collision` 1024 tuned 22.56 → 19.52 us (after faster), 10000 serial 768.37 → 773.26 us (+0.6%), 10000 tuned 382.15 → 390.19 us (+2.1%), 4096 serial 125.83 → 116.54 us. The interleaved 4096 tuned row read 126.29 → 143.45 us, so six isolated interleaved pairs of that case alone were run: before median 134.74 us, after 135.84 us (+0.8%). All noise. The `collision` fixture runs 2.5 / 3.6 / 3.8 candidate pairs per body at 1024 / 4096 / 10000, the density M1 covers; before M1 its warmup grew `candidate_pairs` and the staging in-stage. Memory at 2053 bodies, from the reserved capacities: `candidate_pairs` 3,087 pairs (49,392 B) → 12,326 pairs (197,216 B), +147,824 B; staging 2,053 contacts (114,968 B) → 8,212 (459,872 B), +344,904 B; tallies 129 (8,256 B) → 514 (32,896 B), +24,640 B. Net +517,368 B (≈0.49 MiB, ≈252 B per body capacity).
 
 **Batch A review follow-ups (2026-10-06).**
 
@@ -247,7 +266,7 @@ Out of scope (each item has a named owner):
 | M | M1 | enabling | — | new `footprint-*` (baseline recorded before D2/F/G) |
 | A | A1 A2 A3 A4 | high (A4 medium) | — (independent) | `render-prep`, `render-game-prep`, `pathfinding`, `pathfinding-hard-fallback`, `pathfinding-hard-fallback-budget`, `pathfinding-escalated-detour` |
 | B | B1 | high | — | `perception`, `ai-affect` (no-change check) |
-| C | C1 C2 C3 C4 | high (C1, C2 low prerequisites) | B | `collision`, `steering`, `spatial_index`, `scope`, `ai`, `ai-memory`, `ai-affect`, `perception`, `movement` |
+| C | C1 C2 C3 C4 C5 C6 | high (C1, C2 low prerequisites; C5, C6 found by C3/C5 proofs) | B | `collision`, `collision-sparse`, `collision-response-mixed` (C6), `steering`, `spatial_index`, `scope`, `ai`, `ai-memory`, `ai-affect`, `perception`, `movement` |
 | D | D1 D2 D3 D4 | high (D3 medium, D4 low) | M (D2 memory) | new `destructible-resolve`, `spatial_index`, `ai`, `perception`, `perception-los-dense`, `footprint-spatial` |
 | E | E1–E8 | high (E3, E4, E6 medium; E5, E7, E8 low) | — (E2 before E3) | `pathfinding`, `pathfinding-shared-goal`, `pathfinding-drain`, `pathfinding-cache-open`, `pathfinding-cache-detour`, `pathfinding-cache-unreachable`, `pathfinding-group-field-detour*`, `nav-update-scattered`, `nav-update-multichunk`, `nav-update-links`, new `pathfinding-elastic-ramp` |
 | F | F1 F2 F3 | high (F2, F3 medium); memory | M; F1 after 64E nav-dirty item; F2 after F1 | `nav-update-*`, `pathfinding`, `footprint-world`, `footprint-nav` |
@@ -383,7 +402,7 @@ Out of scope (each item has a named owner):
 - **Change:** add `reserve(body_capacity)`:
   - `rows` gets `hotStoreCapacity(body_capacity)`;
   - `order` gets `body_capacity`;
-  - `candidate_pairs` and narrowphase slot 0 get `estimateBroadphasePairCapacity(body_capacity, body_capacity)`.
+  - `candidate_pairs` and narrowphase slot 0 get `estimateBroadphasePairCapacity(body_capacity, body_capacity)` (since the C5 review follow-up: `candidate_pairs`, the narrowphase staging and its tallies get `broadphasePairBound(body_capacity)`).
 
   `SimulationPipeline.init` calls it next to `reserveForContacts`, and C3 re-runs it. (Landed C1 left threaded per-range slots warming on their first threaded step; C5 removed that: the narrowphase writes per-range windows of one staging list and the broadphase slots are reserved to a per-range bound at `reserve`.)
 - **Benefit:** the first collision step does not allocate, and an after-reserve proof becomes possible.
@@ -942,6 +961,13 @@ Out of scope (each item has a named owner):
   - Original change (superseded by the as-landed design above): `syncPopulationCapacity` also reserves each system's per-range slots for the maximum range count the tuner can choose at the new capacity (ranges = ceil(capacity / min items per range), bounded by the worker count), so a partition retune never allocates in-stage. Sizes stay pure functions of capacity and worker count.
   - Original tests (replaced as above): the `runPopulationGrowthScenario` 2-worker variant (tuners pinned to a 2-worker split) asserts zero allocations on the first threaded step after growth, under `FailingAllocator` with the world allocator swapped; plus a retune test that moves from 16- to 64-item ranges with zero allocations.
   - Bench: `collision`, `collision-sparse`, `scope`, `spatial_index` (no-regression gate; recorded above, 0 breaches).
+  - **Review follow-up M1 (`78ed7e5`).** `reserve` sized `candidate_pairs`, the narrowphase staging and its tallies to `estimateBroadphasePairCapacity(cap, cap)`, which clamps to 1 pair per body, while the broadphase slots hold up to 4 pairs per range item. A scene with 1–4 pairs per body therefore grew them in-stage (`mergeBroadphaseRangeBuffers`, `prepareNarrowphaseStaging`), uncounted. They are now reserved to `broadphasePairBound(cap) = broadphase_pairs_per_item (4) × cap` (tallies to `maxRangeCount` of it), so every scene with total candidate pairs ≤ 4 × capacity is allocation-free under every partition; denser scenes take the kept grow paths (broadphase replay included). Test: `collision.zig` "after reserve, ~2 pairs per body on the multi-worker path allocate nothing" (64-body chain, 125 pairs, real 2-worker pool at 32- then 16-item ranges, contacts compared with serial); it fails on the old reserve in `mergeBroadphaseRangeBuffers`. Bench and memory record above (+0.49 MiB at 2053 bodies, no time change).
+- [ ] **C6 · Contact-dependent streams reserved to the pair bound** (found by the C5 review follow-up M1, 2026-10-06; open).
+  - Now: `CollisionSystem.estimateContactCapacity(body)` is still `estimateBroadphasePairCapacity(body, body)` (1 contact per body). The seam (`growPopulationCapacity`) and `SimulationPipeline.init` size `frame.contacts`, `frame.collision_triggers` (`estimateTriggerCapacity`) and `CollisionResponseSystem.reserveForContacts` (intents 2×, triggers 1×) from it, so a scene with more than one contact per body grows `frame.contacts.values` in `collision_detect` (`RangeOutputStream.prefix`) and the response intents in `collision_respond`, even though the collision system's own stores now cover 4 pairs per body.
+  - Change: `estimateContactCapacity(body)` returns `broadphasePairBound(body)` (contacts ⊆ candidate pairs), so the contact stream, the trigger stream and the response reserves match the collision stores' bound; the docs' "warm target" wording becomes "the pair bound, past which the streams grow". No other caller changes.
+  - Cost: the contact stream, trigger stream and response intent/trigger reserves each grow ×4 in records (contacts are 56 B: +344,904 B for the contact values at 2053 bodies; record the rest from the reserved capacities).
+  - Test: a pipeline step with ~2 contacts per body after the population seam allocates nothing on the multi-worker path (`FailingAllocator` on the frame streams and the response system), failing on the 1-per-body estimate.
+  - Bench: `collision`, `collision-sparse`, `collision-response-mixed`.
 - [ ] **D1 · Inverted destructible resolve** (§D1).
   - Tests in `destructible_controller.zig`:
     - 300 crates (minimal world, one per cell): a cell interact hits the crate at dense index 299, which fails today;
