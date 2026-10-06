@@ -445,8 +445,9 @@ pub const GameDemoState = struct {
             // resolution.
             .nav_cell_size = 32,
             // Elastic pathfinding capacity tracks the live steering-agent crowd:
-            // the per-step request/cache caps and the group-field threshold derive
-            // from the agent count automatically. Only the hard ceiling is fixed, so
+            // the per-step request/cache caps derive from the agent count
+            // automatically, and the group-field threshold is the fixed default
+            // (never derived from world size). Only the hard ceiling is fixed, so
             // a battle grows and quiets shrinks without bumping knobs. At this demo's
             // small scale capacity settles low and the group path stays dormant.
             .pathfinding = pathfinding_override orelse .{

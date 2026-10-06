@@ -66,8 +66,6 @@ const min_capacity_floor = types.min_capacity_floor;
 const cached_results_per_agent = types.cached_results_per_agent;
 const default_max_solves_per_frame = types.default_max_solves_per_frame;
 const deriveCapacity = types.deriveCapacity;
-const default_cells_per_group_agent = types.default_cells_per_group_agent;
-const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
 const nav_new_links_per_step_max = types.nav_new_links_per_step_max;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
@@ -220,15 +218,14 @@ pub const PathfindingSystem = struct {
         self.* = undefined;
     }
 
-    // See default_cells_per_group_agent for the model. Capped by max_agent_budget (the
-    // hard ceiling), NOT live max_pending_requests, or the small live crowd would pull
-    // the threshold to demo scale. A sub-floor budget can cap below the floor; cellCount
-    // 0 (no graph yet) yields the floor.
+    // The fixed per-query group-field threshold (see default_min_group_field_agents), never
+    // derived from world size. Clamped to [1, population ceiling]: the ceiling is
+    // max_agent_budget (the hard cap), NOT live max_pending_requests, so a small live crowd
+    // never pulls the threshold down, and the threshold never demands more sharers than can
+    // ever exist. A pin of 0 clamps to 1.
     pub fn groupFieldThreshold(self: *const PathfindingSystem) usize {
-        if (self.capacity.min_group_field_agents != 0) return self.capacity.min_group_field_agents;
-        const derived = self.graph.cellCount() / default_cells_per_group_agent;
         const ceiling = @max(min_capacity_floor, self.capacity.max_agent_budget);
-        return @min(@max(derived, group_field_threshold_floor), ceiling);
+        return std.math.clamp(self.capacity.min_group_field_agents, 1, ceiling);
     }
 
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) !void {
@@ -4508,27 +4505,31 @@ test "pathfinding capacity shrink preserves surviving pending keys/tiers and cou
     }
 }
 
-test "pathfinding group-field threshold derives from grid size, not population" {
+test "group-field threshold is independent of world size" {
+    // CLAUDE.md fixed-budget rule: the default threshold is the fixed 1024 on a 1024-cell
+    // grid AND on a 262,144-cell grid (the retired derivation gave 64 and 1024 here).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
     const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
 
+    var large = PathfindingSystem.init(std.testing.allocator);
+    defer large.deinit();
+    try large.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
+    try large.rebuildStaticNavGrid(&data, 16384, 16384, 32);
+    try std.testing.expectEqual(@as(usize, 512 * 512), large.graph.cellCount());
+
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    // No explicit min_group_field_agents (derive from grid). Budget large enough that
-    // the grid-derived threshold, not the population cap, governs on the demo grid.
     try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
-    // 512x512 px / 32 px cell = 16x16 = 256 cells... use the demo's nav resolution:
-    // a 512x512-cell grid (512x512 world at 1px cells) gives 262144 cells.
-    try system.rebuildStaticNavGrid(&data, 16384, 16384, 32);
-    try std.testing.expectEqual(@as(usize, 512 * 512), system.graph.cellCount());
+    try system.rebuildStaticNavGrid(&data, 1024, 1024, 32);
+    try std.testing.expectEqual(@as(usize, 32 * 32), system.graph.cellCount());
 
-    // 262144 / 256 = 1024 same-goal sharers required before the field builds.
-    try std.testing.expectEqual(@as(usize, 1024), system.groupFieldThreshold());
+    try std.testing.expectEqual(@as(usize, 1024), large.groupFieldThreshold());
+    try std.testing.expectEqual(large.groupFieldThreshold(), system.groupFieldThreshold());
 
-    // A small same-goal group at this grid size never reaches the threshold, so no
-    // O(cells) flow field is built (the demo's 8 agents stay on individual A*).
+    // A small same-goal group never reaches the threshold, so no O(cells) flow field is
+    // built (the demo's few agents stay on individual A*).
     const goal = math.Vec2{ .x = 400, .y = 400 };
     var built: usize = 0;
     for (0..8) |_| {
@@ -4543,27 +4544,28 @@ test "pathfinding group-field threshold derives from grid size, not population" 
     try std.testing.expectEqual(@as(usize, 0), built);
 }
 
-test "pathfinding group-field threshold floors on a tiny grid and caps by population" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
-    // A 32x32-cell grid (1024 cells) would derive 1024/256 = 4, below the floor (64),
-    // so the floor governs.
-    try system.rebuildStaticNavGrid(&data, 1024, 1024, 32);
-    try std.testing.expectEqual(@as(usize, 32 * 32), system.graph.cellCount());
-    try std.testing.expectEqual(group_field_threshold_floor, system.groupFieldThreshold());
-
-    // With a tiny budget (max possible population 8) below the floor, the budget cap
-    // wins so the threshold never demands more sharers than can ever exist.
+test "group-field threshold is capped by the population ceiling" {
+    // With max_agent_budget = 8 the default 1024 clamps to 8, so the threshold never
+    // demands more sharers than can ever exist. No graph is needed: the threshold no
+    // longer reads the grid.
     var capped = PathfindingSystem.init(std.testing.allocator);
     defer capped.deinit();
     try capped.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
-    try capped.rebuildStaticNavGrid(&data, 1024, 1024, 32);
     try std.testing.expectEqual(@as(usize, 8), capped.groupFieldThreshold());
+}
+
+test "group-field threshold pin is clamped" {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096, .min_group_field_agents = 0 });
+    // A pin of 0 (formerly "derive from the grid") clamps to 1.
+    try std.testing.expectEqual(@as(usize, 1), system.groupFieldThreshold());
+    // A pin above the population ceiling clamps to the ceiling.
+    system.capacity.min_group_field_agents = 5000;
+    try std.testing.expectEqual(@as(usize, 4096), system.groupFieldThreshold());
+    // An in-range pin is returned unchanged.
+    system.capacity.min_group_field_agents = 2000;
+    try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
 }
 
 // A full-height wall with a single far gap forces the longest possible detour — the

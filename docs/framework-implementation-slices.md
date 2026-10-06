@@ -199,7 +199,7 @@ Use this index to choose the next slice; **implement from that slice's file**
 | [**70B**](roadmap/slices/slice-70b.md) | Not started | Runtime scene resolution (settings v5), pad zoom/trigger defaults, fade-out hold, sharp-bilinear, zoom tween — after 60, 54, 44 |
 | [**71**](roadmap/slices/slice-71.md) | Not started (umbrella) | AI behavior parity and navigation/collision static fast paths: 71A, 71B, 71C, 71D |
 | [**71A**](roadmap/slices/slice-71a.md) | Not started | Patrol/follow/guard (`ai_post` tag → 25 of 32), `guard_alarm` stage, post goals carry the row level — after 55, 56, 61, 62, 63 |
-| [**71B**](roadmap/slices/slice-71b.md) | Not started (71B.1 ungated; 71B.2 bench-gated; 71B.3 after 62 + 71A) | Fixed group-field threshold (live rule fix, first), `StaticColliderIndex` (cache class; steering level-gate fix), collision static split, group-field prewarm (normalized class) |
+| [**71B**](roadmap/slices/slice-71b.md) | In progress: fixed group-field threshold landed 2026-10-05 (rest of 71B.1 ungated; 71B.2 bench-gated; 71B.3 after 62 + 71A) | Fixed group-field threshold (live rule fix, first), `StaticColliderIndex` (cache class; steering level-gate fix), collision static split, group-field prewarm (normalized class) |
 | [**71C**](roadmap/slices/slice-71c.md) | Not started | Cover-aware flee and ranged pursue (`cover` markers) — after 56B |
 | [**71D**](roadmap/slices/slice-71d.md) | Not started | AI merchant selling (`trade` behavior + `.sell` arm; closes forage → sell) — after 63, 61, 71A |
 
