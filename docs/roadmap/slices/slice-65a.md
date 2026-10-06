@@ -10,9 +10,11 @@ lane-thread loop. The checklist item that consolidates
 its own commit.
 
 Goal:
-- The 64-byte thread-shared record rule has one owner, used by six modules.
+- The 64-byte thread-shared record rule has one owner, used by seven modules.
   Every padded slot type is checked at comptime against it.
 - Each worker's wake semaphore sits on its own line.
+- Per-range `SimulationEvents` stats and `RangeOutputStream` cursors sit on
+  their own lines (Checklist (e), (f)).
 - The lane thread lowers its own OS priority on Linux, Windows, and Darwin.
   Fork-join workers then win any core they share with a running lane job.
 - The worker-pool size stays a fixed function of CPU count, with no core
@@ -21,7 +23,10 @@ Goal:
 
 ### Current foundation (do not rebuild)
 
-- **Six private copies** of `const thread_shared_record_alignment: usize = 64;`:
+- **Seven private copies** of `const thread_shared_record_alignment: usize = 64;`:
+  - `systems/pathfinding/scratch.zig` (added by the Slice 72 Batch A review
+    follow-up, which moved `SearchScratch` from `std.atomic.cache_line` to the
+    64 B rule by measurement; see the slice-72 Status)
   - `systems/affect.zig:154`
   - `systems/simulation_scope.zig:66`
   - `systems/spatial_index.zig:76`
@@ -44,6 +49,9 @@ Goal:
   - `ChunkPatchScratch` / `ChunkRemaskScratch` (`nav_graph.zig:150-183`).
     These use a field `align(...)` and already carry comptime asserts at
     `:156-159` and `:180-183`.
+  - `SearchScratch` (`pathfinding/scratch.zig`, the per-participant
+    `PathfindingSystem.scratch_slots` entries): field `align(...)` on
+    `generation` plus comptime `@alignOf`/`@sizeOf` asserts, like nav_graph.
 - **Out of scope by contract** (different concepts, not thread-shared
   records):
   - `hot_soa_column_alignment` (`data_system/types.zig:21`) and
@@ -129,7 +137,7 @@ pub fn assertThreadSharedRecord(comptime T: type) void {
 }
 ```
 
-- **Each of the six sites** replaces its private literal with a
+- **Each of the seven sites** replaces its private literal with a
   direct-declaration import:
   - `const thread_shared_record_alignment = @import("../../app/thread_system.zig").thread_shared_record_alignment;`
     (`nav_graph.zig` uses `../../../`, and already imports `thread_system.zig`
@@ -143,9 +151,11 @@ pub fn assertThreadSharedRecord(comptime T: type) void {
   - spatial_index: `RowRangeSlot`;
   - collision: `BroadphaseRangeSlot`, `NarrowphaseRangeSlot`;
   - perception: `PerceptionEventRangeSlot`, `PerceptionRangeStatsSlot`;
-  - nav_graph: `ChunkPatchScratch`, `ChunkRemaskScratch`.
+  - nav_graph: `ChunkPatchScratch`, `ChunkRemaskScratch`;
+  - pathfinding/scratch: `SearchScratch` (imports
+    `../../../app/thread_system.zig`).
 
-  The nav_graph types keep their `@alignOf == thread_shared_record_alignment`
+  The nav_graph types and `SearchScratch` keep their `@alignOf == thread_shared_record_alignment`
   asserts. Field-level alignment is how those two types get their line, while
   the `ArrayListAligned` lists supply alignment for the others. The existing
   runtime size/alignment tests stay.
@@ -332,7 +342,7 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
 - [ ] (a) Shared rule in `src/app/thread_system.zig`:
   `thread_shared_record_alignment`, `threadSharedRecordPadding`,
   `assertThreadSharedRecord`.
-  - All six sites switch to the import, and the five helper copies are
+  - All seven sites switch to the import, and the five helper copies are
     deleted.
   - Each site gets a comptime block with `assertThreadSharedRecord` over
     every slot type listed above.
@@ -355,6 +365,9 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
   - Expect `@intFromPtr(&workers[1]) - @intFromPtr(&workers[0]) == thread_shared_record_alignment`.
   - One threaded batch still covers every item: reuse `markCoverage`
     (`:1295`).
+  - Confirmed by the Slice 72 Batch A review (2026-10-06): `WorkerRecord`
+    (`thread_system.zig:1059`, allocated as one slice at `:722`, held at
+    `:713`) is still unpadded; this item owns it.
 - [ ] (c) `src/platform/thread_priority.zig` with the per-OS table above.
   Test `test "lowering the calling thread leaves other threads unchanged"`
   spawns a `std.Thread` that calls `lowerCurrentThreadPriority()` and reads
@@ -382,6 +395,53 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
     (`thread_enabled = false`).
 - [ ] (d) `resolveWorkerThreadCount` doc comment states the fixed rule.
   Review check: `Engine.init` passes `app_config.threading` unmodified.
+- [ ] (e) `SimulationEvents.range_stats` padded per range (Slice 72 Batch A
+  review follow-up).
+  - What: `range_stats: std.ArrayList(SimulationEventStats)`
+    (`simulation.zig:265`) holds one stats record per range, and each
+    `RangeWriter.write` bumps its range's record (`rangeWriter` at `:338-344`,
+    `SimulationEventStats.record`). The record is 8-byte aligned and not a
+    whole number of lines, so adjacent ranges share a line at every boundary.
+  - Why: today every production producer writes its event ranges from the main
+    thread (perception and affect stage into their own padded slots and merge
+    serially), so this is latent. The first producer that calls
+    `events.rangeWriter` from workers false-shares on every event. No slice
+    currently plans a threaded event producer, so this slice owns the fix.
+  - Fix shape: a padded slot
+    `SimulationEventRangeStats { stats: SimulationEventStats, _pad: [threadSharedRecordPadding(SimulationEventStats)]u8 = undefined }`
+    in an `ArrayListAligned(…, .fromByteUnits(thread_shared_record_alignment))`,
+    with `assertThreadSharedRecord` in a comptime block. `RangeWriter.stats`
+    points at the slot's `stats`; the main-thread `finishWrite` stats rebuild
+    reads `.stats`.
+  - Tests: comptime assert; slot stride is a multiple of 64; a real
+    multi-worker `ThreadSystem` batch writing one event range per worker gives
+    the same merged events and `stats` as the serial path; the existing
+    `simulation.zig` range-stats tests (`:1209-1210`) stay green.
+  - Bench: `perception`, `ai-affect` (main-thread event merge) for
+    non-regression in ReleaseFast.
+- [ ] (f) `RangeOutputStream` per-range `counts` / `write_offsets` padded
+  (Slice 72 Batch A review follow-up).
+  - What: `counts` and `write_offsets` (`simulation.zig:915-917`) are dense
+    `usize` arrays, eight ranges per line. A threaded count pass writes
+    `counts[range]` (`addCount`), and each worker's `RangeWriter.finish`
+    writes `write_offsets[range_index]` (`:1036`).
+  - Why: false sharing between neighbouring ranges' workers. It is limited to
+    one write per range at finish, plus the count pass, but the
+    `RangeOutputStream` is the generic deterministic-emit primitive (Slice 56
+    plans a threaded `RangeOutputStream(ActionCandidate)` emit), so the layout
+    should be right before the first threaded user lands.
+  - Fix shape: one padded per-range cursor record
+    `RangeCursor { count: usize, write_offset: usize, _pad: [threadSharedRecordPadding(...)]u8 }`
+    in an aligned list replacing the two arrays (or two padded slot lists).
+    `offsets` stays dense (main-thread prefix output, read-only during the
+    write). Prefix and merge walk the cursor list at a 64 B stride; range
+    counts are small, so this is not a hot cost.
+  - Tests: comptime assert; a real multi-worker `ThreadSystem` count + write
+    over N ranges merges in range order identically to serial; the existing
+    `simulation.zig` stream tests (`:1106-1150`) stay green; the
+    reserve-then-write FailingAllocator proof allocates nothing.
+  - Bench: `perception`, `ai-affect`, `scope` (ReleaseFast) for
+    non-regression; once Slice 56 lands, its candidate-emit group too.
 - [ ] Bench: register `background-lane-inherit` in `src/benchmarks/runner.zig`.
   Both lane groups print `os_priority` under `--details`.
 - [ ] Roadmap cross-edits (same change):
@@ -403,7 +463,7 @@ pub fn lowerCurrentThreadPriority() ThreadPriorityResult;
 
 ### Acceptance checks
 
-- [ ] `zig build check` passes with the comptime asserts at all six sites and
+- [ ] `zig build check` passes with the comptime asserts at all seven sites and
   on `WorkerRecord`. `grep -rn "thread_shared_record_alignment: usize" src`
   returns only `src/app/thread_system.zig`.
 - [ ] `zig build test` passes, and so does `zig build test -Dsanitize-thread=true`
