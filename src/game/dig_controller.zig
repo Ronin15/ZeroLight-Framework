@@ -71,6 +71,16 @@ pub const DigConfig = struct {
     }
 };
 
+/// A dig `DigController.admit` let through for this step: the intent, the player's plane
+/// and its floor layer, and the faced cell. Consumed by `DigController.commit` in the same
+/// step; never persisted.
+pub const AdmittedDig = struct {
+    intent: DigIntent,
+    level: u16,
+    floor_layer: usize,
+    cell: CellCoord,
+};
+
 pub const DigController = struct {
     ramp_tile: TileId,
     tunnel_tile: TileId,
@@ -136,9 +146,10 @@ pub const DigController = struct {
     }
 
     /// Applies this step's dig intent to the cell the player faces on their current
-    /// plane. No-op when there is no intent, the player lacks a body/facing, the
-    /// plane has no floor layer, or the faced cell is off-world. Emits one
-    /// `world_tile_changed` event on an actual change.
+    /// plane: `admit`, then `commit`. No-op when there is no intent, the player lacks a
+    /// body/facing, the plane has no floor layer, or the faced cell is off-world. Emits one
+    /// `world_tile_changed` event on an actual change. The pipeline's `dig_world_edit`
+    /// stage calls the two halves itself so the level-link growth seam runs between them.
     pub fn process(
         self: *DigController,
         world: *WorldSystem,
@@ -146,8 +157,25 @@ pub const DigController = struct {
         player: Player,
         frame: *SimulationFrame,
     ) !void {
+        const plan = try self.admit(world, data, player, frame) orelse return;
+        try self.commit(plan, world, frame);
+    }
+
+    /// Admission half of a dig: every intentional no-op and every refusal that does not
+    /// depend on the level-link pool's room (surface/existing-link ramp no-ops, the K
+    /// interior-stride refusal, counted in `ramp_refused_link_slots`). Reads the world; never
+    /// mutates it or the frame. Returns the admitted dig, or null when this press digs
+    /// nothing. The dig commit seam grows a full link pool only for an admitted ramp, so a
+    /// refused press never changes the pool and press history cannot affect later refusals.
+    pub fn admit(
+        self: *DigController,
+        world: *const WorldSystem,
+        data: *const DataSystem,
+        player: Player,
+        frame: *const SimulationFrame,
+    ) !?AdmittedDig {
         const intent = frame.dig_intent;
-        if (intent == .none) return;
+        if (intent == .none) return null;
 
         // Fail loudly on an unresolved config rather than silently carving the
         // invalid sentinel into the world: reaching the carve path means the
@@ -160,32 +188,39 @@ pub const DigController = struct {
             return error.UnresolvedDigTiles;
         }
 
-        const cell = facedCellForEntity(world, data, player.entity) orelse return;
+        const cell = facedCellForEntity(world, data, player.entity) orelse return null;
 
-        const floor_layer = world.denseFloorLayerForLevel(player.current_level) orelse return;
+        const floor_layer = world.denseFloorLayerForLevel(player.current_level) orelse return null;
         // Intentional no-ops that never mutate return before the event preflight
         // so a full event budget cannot fail a dig that would have done nothing.
-        if (intent == .down and @as(usize, player.current_level) + 1 >= world.levelCount()) return;
+        if (intent == .down and @as(usize, player.current_level) + 1 >= world.levelCount()) return null;
         if (intent == .ramp) {
-            if (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null) return;
+            if (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null) return null;
             // Runtime check (not a Debug-only assert), matching UnresolvedDigTiles above.
             if (!self.nav_link_geometry.isResolved()) return error.UnresolvedNavLinkGeometry;
-            // Refuse a ramp when the world's level-link pool is still full: the dig commit seam
-            // (`SimulationPipeline.ensureLevelLinkRoom`) grows it before this runs, so a full
-            // pool here means the nav-memory ceiling refused the growth (the link would have
-            // to grow storage on the hot path). Same no-mutate early return as the
-            // existing-link no-op.
-            if (!world.hasLevelLinkRoom()) {
-                self.ramp_refused_link_capacity += 1;
-                return;
-            }
             // Refuse a ramp whose new interior endpoint would find its nav chunk's fixed link
             // slots full (the link would be inert to NPC pathing): the K stride, a layout
             // bound. The player re-presses to dig elsewhere.
             if (!interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry)) {
                 self.ramp_refused_link_slots += 1;
-                return;
+                return null;
             }
+        }
+        return .{ .intent = intent, .level = player.current_level, .floor_layer = floor_layer, .cell = cell };
+    }
+
+    /// Commit half of a dig admitted by `admit` this step. Refuses an admitted ramp when the
+    /// world's level-link pool is still full (the dig commit seam,
+    /// `SimulationPipeline.ensureLevelLinkRoom`, grows it between admit and commit, so a full
+    /// pool here means the nav-memory ceiling refused the growth; counted in
+    /// `ramp_refused_link_capacity`). Then preflights event + stimulus capacity and mutates.
+    pub fn commit(self: *DigController, plan: AdmittedDig, world: *WorldSystem, frame: *SimulationFrame) !void {
+        std.debug.assert(plan.intent != .none);
+        // Refusing here (not growing) keeps the link append off the allocator: the same
+        // no-mutate early return as the admission no-ops.
+        if (plan.intent == .ramp and !world.hasLevelLinkRoom()) {
+            self.ramp_refused_link_capacity += 1;
+            return;
         }
 
         // Reserve event + stimulus slots before any world mutate so a capacity miss
@@ -194,18 +229,20 @@ pub const DigController = struct {
         if (frame.stimulusLiveCount() >= stimulus_live_capacity) return error.StimulusCapacityExceeded;
         try frame.events.ensureEventAppendCapacity(maxEventsPerStep(.dig_world_edit, .{}));
         try frame.ensureStimulusAppendCapacity(1);
-        const changed = switch (intent) {
+        const cell = plan.cell;
+        const changed = switch (plan.intent) {
             // Surface: punch a see-through hole to fall through. Underground: mine a
             // walkable tunnel floor through the solid dirt of this plane.
-            .hole => if (player.current_level == 0)
-                try world.clearDenseTile(floor_layer, cell.x, cell.y)
+            .hole => if (plan.level == 0)
+                try world.clearDenseTile(plan.floor_layer, cell.x, cell.y)
             else
-                try world.setDenseTile(floor_layer, cell.x, cell.y, self.tunnel_tile),
+                try world.setDenseTile(plan.floor_layer, cell.x, cell.y, self.tunnel_tile),
             // Dig down: punch a see-through hole in the faced cell on any plane to
-            // drop to the level below. Bottom-plane no-op is handled above.
-            .down => try world.clearDenseTile(floor_layer, cell.x, cell.y),
-            .ramp => try self.digRamp(world, player.current_level, floor_layer, cell),
-            .none => unreachable,
+            // drop to the level below. Bottom-plane no-op is handled in `admit`.
+            .down => try world.clearDenseTile(plan.floor_layer, cell.x, cell.y),
+            .ramp => try self.digRamp(world, plan.level, plan.floor_layer, cell),
+            // `admit` never yields `.none` (asserted above).
+            .none => return,
         } orelse return;
 
         try frame.events.appendRequired(.{
@@ -217,7 +254,7 @@ pub const DigController = struct {
             .position = cellCenterWorldPos(world, cell),
             .intensity = defaultStimulusIntensity(.dig),
             .kind = .dig,
-            .level = player.current_level,
+            .level = plan.level,
         }, true, &stimulus_dropped);
     }
 

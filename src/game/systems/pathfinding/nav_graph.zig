@@ -2660,7 +2660,7 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     // and one more interior and one more perimeter link are added and folded through the REAL
     // 3-worker threaded chunk patch (forced multi-range), then again through the serial path.
     // Every step allocates zero times (world link storage, link edges, dirty buffers, patch
-    // scratch) and matches a full rebuild. A link past the reservation grows world storage.
+    // scratch) and matches a full rebuild. A link past the reservation is refused.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2721,17 +2721,21 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     try std.testing.expect(system.graph.last_patch_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
-    // The reservation is the initial size, not a refusal bound: a seventh link must grow
-    // world storage, so under the failing world allocator it returns OutOfMemory and leaves
-    // the links and the logical limit unchanged.
-    try std.testing.expectError(error.OutOfMemory, world.addLevelLink(rampLink(10, 10)));
+    // A seventh direct link past the reservation is refused without growing anything: only
+    // the dig commit seam's admitted growth raises the limit, so the link edges can never be
+    // outgrown in-step.
+    try std.testing.expectError(error.LevelLinkRoomUnreserved, world.addLevelLink(rampLink(10, 10)));
     try std.testing.expectEqual(@as(usize, 6), world.levelLinks().len);
     try std.testing.expectEqual(@as(usize, 6), world.levelLinkLimit());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
     world.allocator = world_original;
     system.graph.allocator = original;
     system.allocator = original;
-    // With real allocators the seventh link lands (the limit grows by one) and folds in.
+    // The seam's order with real allocators: the nav link stores, then the world's limit;
+    // the seventh link then lands and folds in.
+    try system.reserveLinkCapacity(7);
+    try world.reserveLevelLinks(7);
     try world.addLevelLink(rampLink(10, 10));
     try std.testing.expectEqual(@as(usize, 7), world.levelLinkLimit());
     _ = try reactOneStep(&system, &frame, &data, &world, null);

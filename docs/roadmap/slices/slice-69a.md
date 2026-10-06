@@ -68,9 +68,12 @@ new features.
   - A fall carves its landing cell to the tunnel tile (`:294-297`).
   - Level links: `WorldSystem.ensureLevelLinkCapacity` / `addLevelLink` /
     `rampLinkOtherLevel` (`src/game/world_system.zig:1485-1514,1447-1454`).
-    Since Slice 64E's link-growth follow-up, `ensureLevelLinkCapacity` grows
-    a reserved world's limit (error set `error{OutOfMemory}`;
-    `LevelLinkLimitReached` is gone).
+    Since Slice 64E's link-growth review follow-up, `ensureLevelLinkCapacity`
+    and `addLevelLink` grow only an unreserved world; on a reserved world they
+    return `error.LevelLinkRoomUnreserved` past the limit (only the dig commit
+    seam's admitted growth, `reserveLevelLinks`, raises it).
+    `LevelLinkLimitReached` is gone. Generation runs on the unreserved world,
+    before `GameDemoState.init`'s `reserveLevelLinks`.
 - **Nav memory gate is structural.**
   - `NavMemoryBudget.requiredBytes` sizes per-level static arrays ×
     `level_count`, and abstract slots as `levels × chunks × (4·ct +
@@ -306,8 +309,8 @@ installed beside `worldgen.json`:
       `rng.mix64(entrance_seed, cell_index, 0, entrance_rank_salt)`, ties
       broken by `cell_index`;
     - sort by (y, x);
-    - call `ensureLevelLinkCapacity(n)` once (it grows past a reserved
-      limit; the only error is `OutOfMemory`).
+    - call `ensureLevelLinkCapacity(n)` once (the world is still unreserved
+      at generation, so it grows; the only error there is `OutOfMemory`).
   - For each entrance:
     - write the surface cell to `surface_tile`. This is a direct slice write.
       A `.blocking` surface layer flips to `.mixed`; `.open` and `.mixed`

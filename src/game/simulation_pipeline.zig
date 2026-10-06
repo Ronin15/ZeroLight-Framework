@@ -30,6 +30,7 @@ const ConstScopeColumnsSlice = @import("data_system.zig").ConstScopeColumnsSlice
 const PrimitiveVisual = @import("data_system.zig").PrimitiveVisual;
 const DigConfig = @import("dig_controller.zig").DigConfig;
 const DigController = @import("dig_controller.zig").DigController;
+const AdmittedDig = @import("dig_controller.zig").AdmittedDig;
 const facedCellForEntity = @import("dig_controller.zig").facedCellForEntity;
 const DestructibleController = @import("destructible_controller.zig").DestructibleController;
 const DestructibleProcessStats = @import("destructible_controller.zig").DestructibleProcessStats;
@@ -999,9 +1000,10 @@ pub const SimulationPipeline = struct {
     /// nav-memory gate (`PathfindingSystem.admitsLinkLimit`) admits first. The pathfinding
     /// link stores grow FIRST, then the world's limit, so an OOM leaves the world untouched
     /// and the next press retries. If neither rung is admitted the pool stays full (warn
-    /// once) and the dig refuses the ramp (`dig_ramp_refused_link_capacity`). The trigger
-    /// and target are pure functions of the committed link count, the ramp intent, and the
-    /// gate. Returns whether the pool grew.
+    /// once) and the dig refuses the ramp (`dig_ramp_refused_link_capacity`). Runs only for
+    /// a ramp `DigController.admit` let through (`admitDigAndGrowLinks`), so the trigger and
+    /// target are pure functions of the committed link count, an admitted ramp, and the
+    /// gate; refused presses never grow the pool. Returns whether the pool grew.
     fn ensureLevelLinkRoom(self: *SimulationPipeline, world: *WorldSystem) !bool {
         if (world.hasLevelLinkRoom()) return false;
         const links = world.levelLinks().len;
@@ -1020,7 +1022,7 @@ pub const SimulationPipeline = struct {
             }
         }
         try self.pathfinding.reserveLinkCapacity(target);
-        try world.ensureLevelLinkCapacity(target - links);
+        try world.reserveLevelLinks(target);
         self.level_link_capacity_grows += 1;
         if (!self.level_link_growth_logged) {
             self.level_link_growth_logged = true;
@@ -1346,23 +1348,38 @@ pub const SimulationPipeline = struct {
 
     fn stageDigWorldEdit(self: *SimulationPipeline, step: *StepState) !void {
         const context = step.context;
+        const refused_before = self.dig.ramp_refused_link_slots;
+        const refused_capacity_before = self.dig.ramp_refused_link_capacity;
+        // Admission and the level-link growth seam run first, before the promote below
+        // consumes the deferred stimuli, so a growth OOM leaves this step's state untouched
+        // and the next press retries from the same state.
+        const admitted = try self.admitDigAndGrowLinks(context.world, context.data, context.player.*, context.frame);
+        step.nav_link_capacity_grows = @intFromBool(admitted.link_pool_grew);
         // Promote, then dig, then at most one footstep, before perception reads stimuli.
         step.stimuli_promoted = try self.sensory.promote(context.frame, &step.stimuli_live_dropped);
         // Player-authored world edit. Its world_tile_changed event is deferred and
         // re-masks navigation in merge_outputs regardless of order.
-        // Level-link growth seam: a ramp press that finds the pool full grows it here, on
-        // the main thread before the dig mutates the world, so the dig's link append never
-        // allocates and a dig below the nav-memory ceiling behaves as if the pool were
-        // unbounded.
-        if (context.frame.dig_intent == .ramp) {
-            step.nav_link_capacity_grows = @intFromBool(try self.ensureLevelLinkRoom(context.world));
-        }
-        const refused_before = self.dig.ramp_refused_link_slots;
-        const refused_capacity_before = self.dig.ramp_refused_link_capacity;
-        try self.dig.process(context.world, context.data, context.player.*, context.frame);
+        if (admitted.dig) |dig| try self.dig.commit(dig, context.world, context.frame);
         step.dig_ramp_refused_link_slots = @intCast(self.dig.ramp_refused_link_slots - refused_before);
         step.dig_ramp_refused_link_capacity = @intCast(self.dig.ramp_refused_link_capacity - refused_capacity_before);
         try self.sensory.appendFootstep(context.frame, context.data, context.player.*, &step.stimuli_live_dropped);
+    }
+
+    const AdmittedDigStep = struct {
+        dig: ?AdmittedDig,
+        link_pool_grew: bool,
+    };
+
+    /// The dig's admission plus the level-link growth seam: `DigController.admit`, then,
+    /// only for an admitted ramp, `ensureLevelLinkRoom` (main thread, before the dig
+    /// mutates the world, so the dig's link append never allocates and a dig below the
+    /// nav-memory ceiling behaves as if the pool were unbounded). A refused or no-op press
+    /// never grows the pool. Mutates nothing but the pool growth and the K-stride refusal
+    /// counter, so the stage runs it before any other step-state change.
+    fn admitDigAndGrowLinks(self: *SimulationPipeline, world: *WorldSystem, data: *const DataSystem, player: Player, frame: *const SimulationFrame) !AdmittedDigStep {
+        const dig = try self.dig.admit(world, data, player, frame) orelse return .{ .dig = null, .link_pool_grew = false };
+        const grew = dig.intent == .ramp and try self.ensureLevelLinkRoom(world);
+        return .{ .dig = dig, .link_pool_grew = grew };
     }
 
     /// Advance the stagger clock, derive the cognition halo from the fixed-step
@@ -5408,12 +5425,27 @@ const LinkGrowthFixture = struct {
         self.frame.dig_intent = .ramp;
     }
 
-    /// One ramp press through the dig stage's seam + dig, then the post-commit reaction.
+    /// One ramp press through the dig stage's admission + seam + commit, then the
+    /// post-commit reaction.
     fn dig(self: *LinkGrowthFixture, cell: [2]u16) !void {
         self.aim(cell);
-        _ = try self.pipeline.ensureLevelLinkRoom(&self.world);
-        try self.pipeline.dig.process(&self.world, &self.data, self.player, &self.frame);
+        const admitted = try self.pipeline.admitDigAndGrowLinks(&self.world, &self.data, self.player, &self.frame);
+        if (admitted.dig) |dig_plan| try self.pipeline.dig.commit(dig_plan, &self.world, &self.frame);
         _ = try self.pipeline.reactToPostCommitNavEvents(&self.frame, &self.data, &self.world, null);
+    }
+
+    /// One full pipeline step (the real `dig_world_edit` stage) for the armed press.
+    fn step(self: *LinkGrowthFixture, threads: *ThreadSystem) !SimulationPipelineStats {
+        return self.pipeline.update(.{
+            .data = &self.data,
+            .frame = &self.frame,
+            .world = &self.world,
+            .player = &self.player,
+            .thread_system = threads,
+            .delta_seconds = 0.016,
+            .bounds_width = 256,
+            .bounds_height = 256,
+        });
     }
 
     fn rampAt(self: *const LinkGrowthFixture, cell: [2]u16) bool {
@@ -5490,6 +5522,81 @@ test "link growth happens only at the dig seam" {
     try std.testing.expectEqual(@as(usize, 0), failing_after.allocations);
     try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.dig.ramp_refused_link_capacity);
     try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.dig.ramp_refused_link_slots);
+}
+
+test "a ramp press the dig does not admit never grows the full link pool" {
+    var fixture: LinkGrowthFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    try std.testing.expect(!fixture.world.hasLevelLinkRoom());
+
+    // A surface press (ramps only climb out of a pit) and a press facing off-world are
+    // no-ops: the full pool must stay exactly as it was.
+    fixture.player.current_level = 0;
+    try fixture.data.setWorldLevel(fixture.player.entity, 0);
+    fixture.aim(.{ 1, 0 });
+    const surface = try fixture.step(&threads);
+    fixture.player.current_level = 1;
+    try fixture.data.setWorldLevel(fixture.player.entity, 1);
+    fixture.aim(.{ 8, 0 });
+    const off_world = try fixture.step(&threads);
+    for ([_]SimulationPipelineStats{ surface, off_world }) |stats| {
+        try std.testing.expectEqual(@as(usize, 0), stats.nav_link_capacity_grows);
+        try std.testing.expectEqual(@as(usize, 0), stats.dig_ramp_refused_link_capacity);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
+    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.pathfinding.graph.link_edges.capacity);
+
+    // The first admitted ramp grows the pool and lands.
+    fixture.aim(.{ 1, 0 });
+    const admitted = try fixture.step(&threads);
+    try std.testing.expectEqual(@as(usize, 1), admitted.nav_link_capacity_grows);
+    try std.testing.expect(fixture.rampAt(.{ 1, 0 }));
+    try std.testing.expectEqual(grownLevelLinkLimit(0), fixture.world.levelLinkLimit());
+}
+
+test "a link-growth OOM leaves the step's stimuli and the pool for the retry press" {
+    var fixture: LinkGrowthFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+
+    // An impact deferred from the prior step, waiting for this step's promote.
+    fixture.pipeline.sensory.deferred_stimuli[0] = .{
+        .position = .{ .x = 48, .y = 16 },
+        .intensity = defaultStimulusIntensity(.impact),
+        .kind = .impact,
+        .level = 1,
+    };
+    fixture.pipeline.sensory.deferred_stimulus_count = 1;
+
+    // The press needs the full pool to grow; the growth's allocation fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const saved = LinkGrowthAllocators.install(&fixture, failing.allocator());
+    fixture.aim(.{ 1, 0 });
+    const failed = fixture.step(&threads);
+    saved.restore(&fixture);
+    try std.testing.expectError(error.OutOfMemory, failed);
+    // Nothing irreversible happened before the growth: the impact is still deferred, not
+    // promoted into a live bus the next `beginStep` clears.
+    try std.testing.expectEqual(@as(usize, 1), fixture.pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expectEqual(@as(usize, 0), fixture.frame.stimulusLiveCount());
+    try std.testing.expectEqual(@as(usize, 0), fixture.world.levelLinkLimit());
+    try std.testing.expectEqual(@as(u64, 0), fixture.pipeline.level_link_capacity_grows);
+    try std.testing.expect(!fixture.rampAt(.{ 1, 0 }));
+
+    // The retry press with memory available grows, digs, and promotes the same impact.
+    fixture.aim(.{ 1, 0 });
+    const retried = try fixture.step(&threads);
+    try std.testing.expectEqual(@as(usize, 1), retried.nav_link_capacity_grows);
+    try std.testing.expectEqual(@as(usize, 1), retried.stimuli_promoted);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pipeline.sensory.deferred_stimulus_count);
+    try std.testing.expect(fixture.rampAt(.{ 1, 0 }));
+    try std.testing.expectEqual(grownLevelLinkLimit(0), fixture.world.levelLinkLimit());
 }
 
 test "a link growth the nav memory gate refuses keeps the pool and refuses the ramp loudly" {

@@ -425,7 +425,8 @@ The current gameplay fixed-step pipeline is:
 3. `SimulationPipeline` runs its comptime-checked `stage_order` (see
    "Simulation pipeline stage ordering" in `docs/coding-standards.md` and
    `docs/simulation-tiers-and-pipeline.md` for the full contract):
-   at step open: promote prior-step deferred impacts onto the live bus, then
+   at step open: dig admission and the level-link growth seam (before any other
+   step-state change), promote prior-step deferred impacts onto the live bus, then
    `dig_world_edit` (author world-tile edits from player digging), then at most
    one player footstep when velocity is non-trivial — all before
    `perception_update` reads `frame.stimuli` → `scope_advance_and_ai_gather` →
@@ -886,7 +887,11 @@ and the full nav build reserves `link_edges`/`link_edge_refs` to that same `leve
 ramp press that finds the pool full grows it at the dig commit seam
 (`SimulationPipeline.ensureLevelLinkRoom`, main thread, before the dig mutates the world): a
 bounded ladder (`grownLevelLinkLimit`, else `len + 1`) admitted by the same nav-memory gate,
-nav link edges first, then the world's limit. Only the 8-per-chunk interior stride (a layout
+nav link edges first, then the world's limit (`reserveLevelLinks`). The seam runs only for a
+ramp `DigController.admit` let through (a no-op or refused press never grows the pool) and
+before the step's stimulus promote, so a growth OOM leaves the step's state for the retry. On
+a reserved world `addLevelLink` / `ensureLevelLinkCapacity` never grow: past the limit they
+return `error.LevelLinkRoomUnreserved`, so the nav link edges never grow in-step. Only the 8-per-chunk interior stride (a layout
 bound, `dig_ramp_refused_link_slots`) and a refused memory ceiling
 (`dig_ramp_refused_link_capacity`, warn once) refuse a ramp; links within the grown pool never
 allocate (FailingAllocator-proven over world, graph, and system). The

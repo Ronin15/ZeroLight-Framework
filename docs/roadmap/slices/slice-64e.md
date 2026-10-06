@@ -499,6 +499,50 @@ multi-worker patch path and the serial one.
       link, and a routable path all land, and `dig_ramp_refused_link_slots`
       stays 0 for a perimeter cell). `docs/architecture.md`'s level-link
       paragraph is updated in the same change.
+  - [x] **Review follow-ups (2026-10-06)** to the link-growth item, each with
+        a test confirmed to fail with its fix reverted. Supersedes the as-landed
+        text above where they differ.
+    - **L3 · growth only for an admitted dig.** The seam used to run for any
+      ramp intent, so a press the dig then refused or no-oped (surface,
+      existing link, off-world, K stride) still grew the pool, and press
+      history could change later refusals. `DigController.process` is now
+      `admit` (every no-op and refusal except pool room; reads the world,
+      mutates only the K-stride counter) + `commit` (the capacity refusal,
+      the event/stimulus preflight, the mutate). The stage runs
+      `SimulationPipeline.admitDigAndGrowLinks` (admit, then
+      `ensureLevelLinkRoom` only for an admitted ramp), then commit. A
+      K-stride refusal now wins over a full pool (it used to count as a
+      capacity refusal when both held). Test: `simulation_pipeline.zig` "a
+      ramp press the dig does not admit never grows the full link pool"
+      (surface and off-world presses through `pipeline.update` leave the
+      limit, link edges, and grow counters at 0; the next admitted ramp
+      grows).
+    - **L4 · no in-step growth past a reserved limit.** `addLevelLink` /
+      `ensureLevelLinkCapacity` on a reserved world used to grow the limit by
+      one without the nav-memory gate or `reserveLinkCapacity`, leaving the
+      nav link edges to grow in-step through `rebuildLinkEdges`' authoring
+      safety net. Past the limit they now return
+      `error.LevelLinkRoomUnreserved` without growing; the seam raises the
+      limit with `reserveLevelLinks(target)` after `reserveLinkCapacity`.
+      Unreserved (authoring) worlds still grow. Tests: `world_system.zig`
+      "addLevelLink past the reserved limit fails loudly; only
+      reserveLevelLinks raises it" (replaces "…grows the logical limit
+      instead of refusing"); `nav_graph.zig`'s runtime-link proof now
+      expects the seventh direct link refused with zero allocations, then
+      lands it through the seam's order (`reserveLinkCapacity`,
+      `reserveLevelLinks`).
+    - **L5 · a growth OOM leaves the step retryable.** The seam ran after
+      `sensory.promote`, so an OOM had already moved the deferred impacts
+      onto a live bus the next `beginStep` clears. Admission and growth now
+      run first in `dig_world_edit`, before the promote. Test:
+      `simulation_pipeline.zig` "a link-growth OOM leaves the step's stimuli
+      and the pool for the retry press" (FailingAllocator on the world,
+      pathfinding, and graph allocators: the step returns `OutOfMemory` with
+      the impact still deferred, the live bus empty, and the pool, counters,
+      and tile unchanged; the retry press grows, digs, and promotes the
+      impact).
+    - No bench: the dig stage has no isolating group, and the change only
+      reorders cold per-press calls.
 - [x] Docs:
   - `docs/architecture.md` / pathfinding docs: runtime links patch both
     levels, the fixed interior link slots, the per-step link budget, and
