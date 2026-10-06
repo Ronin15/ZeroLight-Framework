@@ -371,7 +371,6 @@ comptime {
 /// Capacities are reserved up front so the fixed-step hot path can stay warm.
 pub const SimulationPipelineConfig = struct {
     steering_agent_capacity: usize = 0,
-    static_obstacle_capacity: usize = 0,
     contact_capacity: usize = 0,
     /// Movement-body count the scope system pre-sizes its gather/tier scratch to,
     /// so the per-step scope passes are allocation-free after init.
@@ -385,8 +384,8 @@ pub const SimulationPipelineConfig = struct {
     /// This state's reserved share of `frame.events`'s `capacity_limit` (see
     /// `SimulationFrame.reserveStreams`), passed through as
     /// `PerceptionConfig.max_events_per_step`. Sized by the caller against its
-    /// own event-capacity budget, same as `contact_capacity`/
-    /// `static_obstacle_capacity`; defaults to 0.
+    /// own event-capacity budget, same as `contact_capacity`;
+    /// defaults to 0.
     perception_max_events_per_step: usize = 0,
     /// This state's reserved share of `frame.events`'s `capacity_limit`,
     /// passed through as `AffectConfig.max_events_per_step`. Sized by the
@@ -540,6 +539,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.steering_obstacle_samples, metric(steering_stats.obstacle_samples));
         perf.recordMetric(.steering_agent_candidate_checks, metric(steering_stats.agent_candidate_checks));
         perf.recordMetric(.steering_obstacle_candidate_checks, metric(steering_stats.obstacle_candidate_checks));
+        perf.recordMetric(.steering_static_snapshot_grown, metric(steering_stats.static_snapshot_grown));
         perf.recordBatch(.steering, steering_stats.batch);
         perf.recordTiming(.steering_select, steering_stats.select_ns);
         perf.recordTiming(.steering_snapshot, steering_stats.snapshot_ns);
@@ -682,7 +682,7 @@ pub const SimulationPipeline = struct {
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        try steering.reserveForCapacity(config.steering_agent_capacity, config.static_obstacle_capacity);
+        try steering.reserveForCapacity(config.steering_agent_capacity, SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
@@ -1448,7 +1448,6 @@ test "pipeline updates full active player-only state through serial path" {
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1772,7 +1771,6 @@ test "pipeline resamples AI wander direction across fixed steps" {
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1883,7 +1881,6 @@ test "pipeline runs ai_memory after perception and before ai, feeding memory int
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -1966,7 +1963,6 @@ test "pipeline does not retarget a cold agent toward memory of an entity other t
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2044,7 +2040,6 @@ test "pipeline runs affect after perception and ai_memory, before ai" {
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2359,7 +2354,6 @@ test "pipeline resolves an aggressive non-player entity's pursue goal to another
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2631,7 +2625,6 @@ test "pipeline runs the perception stage scoped to cognition-tier ai agents with
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2747,7 +2740,6 @@ fn runScopeRenderWindowScenario(render_cadence: bool) !ScopeRenderTrace {
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 512, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 8,
         .pathfinding = .{
             .max_frame_requests = 4,
@@ -2900,7 +2892,6 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -2995,7 +2986,6 @@ test "pipeline perception events truncate instead of throwing when the shared ev
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4464,7 +4454,6 @@ test "captureActionIntent then pipeline.update reports action_intents_consumed" 
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
@@ -4564,7 +4553,6 @@ test "pipeline.update reports action_intents_dropped after capture soft-drop" {
     defer threads.deinit();
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .steering_agent_capacity = 0,
-        .static_obstacle_capacity = 0,
         .contact_capacity = 4,
         .pathfinding = .{
             .max_frame_requests = 2,

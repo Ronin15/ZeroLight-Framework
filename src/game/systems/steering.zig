@@ -8,6 +8,8 @@
 //! jobs read immutable slices and write range-owned movement intents.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const logging = @import("../../core/logging.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const AdaptiveWorkTunerConfig = @import("../../app/thread_system.zig").AdaptiveWorkTunerConfig;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
@@ -99,6 +101,9 @@ pub const SteeringStats = struct {
     obstacle_samples: usize = 0,
     agent_candidate_checks: usize = 0,
     obstacle_candidate_checks: usize = 0,
+    /// 1 when this step's static-obstacle rebuild outgrew the reserved snapshot
+    /// (see `SteeringSystem.static_snapshot_grown_total`).
+    static_snapshot_grown: usize = 0,
     batch: BatchStats = .{},
     // Main-thread prepareUpdate phases (ns); zero when perf logging is disabled.
     select_ns: u64 = 0,
@@ -145,6 +150,13 @@ pub const SteeringSystem = struct {
     obstacle_index_valid: bool = false,
     /// `spatial_cell_size` used when the obstacle index was last built.
     obstacle_spatial_cell_size: f32 = 0,
+    /// Telemetry: static-obstacle rebuilds whose static count exceeded the reserved
+    /// snapshot, so the rebuild grew in-stage (diagnostics only; never gates behavior).
+    /// The pipeline reserves to the counted statics at init and at the population seam,
+    /// so the only remaining cause is a dynamic->static mobility flip on an existing row.
+    static_snapshot_grown_total: u64 = 0,
+    /// Once-only flag for the in-stage growth warn.
+    static_snapshot_grow_warned: bool = false,
     adaptive_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(steering_adaptive_tuner_config),
 
     pub fn init(allocator: std.mem.Allocator) SteeringSystem {
@@ -204,6 +216,16 @@ pub const SteeringSystem = struct {
             }
             if (hit_obstacle and hit_movement_index) return;
         }
+    }
+
+    /// Upper bound on static-obstacle snapshot rows: collision-response rows with
+    /// `.static` mobility (the rebuild skips statics without bounds or a body).
+    pub fn countStaticObstacles(collision_responses: ConstCollisionResponseSlice) usize {
+        var count: usize = 0;
+        for (collision_responses.mobilities) |mobility| {
+            if (mobility == .static) count += 1;
+        }
+        return count;
     }
 
     pub fn reserveForCapacity(self: *SteeringSystem, max_agents: usize, max_obstacles: usize) !void {
@@ -327,6 +349,7 @@ pub const SteeringSystem = struct {
         const navigation_intents = frame.navigation_intents.mergedItems();
         // Multiple systems may target the same entity. Selection keeps one
         // intent per steering row by priority, then source order for ties.
+        const static_grown_before = self.static_snapshot_grown_total;
         var select_timer = StageTimer.start();
         try self.selectIntents(data, steering, navigation_intents, config);
         const select_ns = select_timer.lap();
@@ -341,6 +364,7 @@ pub const SteeringSystem = struct {
         var stats = SteeringStats{
             .navigation_intent_count = navigation_intents.len,
             .selected_intent_count = self.selected.items.len,
+            .static_snapshot_grown = @intFromBool(self.static_snapshot_grown_total != static_grown_before),
             .select_ns = select_ns,
             .snapshot_ns = snapshot_ns,
         };
@@ -570,9 +594,24 @@ pub const SteeringSystem = struct {
         self.obstacle_snapshot_rows.clearRetainingCapacity();
         self.obstacle_cell_entries.clearRetainingCapacity();
         self.obstacle_cell_ranges.clearRetainingCapacity();
-        try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(collision_responses.entities.len));
-        try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
-        try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, collision_responses.entities.len);
+        // Runs only on invalidation steps: size all three buffers to the static count,
+        // not every collision-response row.
+        const static_count = countStaticObstacles(collision_responses);
+        if (static_count > self.obstacle_cell_entries.capacity or
+            hotStoreCapacity(static_count) > self.obstacle_snapshot_rows.capacity)
+        {
+            self.static_snapshot_grown_total += 1;
+            if (!self.static_snapshot_grow_warned) {
+                self.static_snapshot_grow_warned = true;
+                if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+                    "steering: {d} static obstacles exceeded the reserved snapshot; growing in-stage (reservation short of the live statics)",
+                    .{static_count},
+                );
+            }
+        }
+        try self.obstacle_snapshot_rows.ensureTotalCapacity(self.allocator, hotStoreCapacity(static_count));
+        try self.obstacle_cell_entries.ensureTotalCapacity(self.allocator, static_count);
+        try self.obstacle_cell_ranges.ensureTotalCapacity(self.allocator, static_count);
 
         var obstacle_row_slice = self.obstacle_snapshot_rows.slice();
         const scope = data.scopeColumnsSliceConst();
@@ -2316,7 +2355,7 @@ test "steering serial matches threaded intents across multiple range splits and 
     }
 }
 
-test "steering update is allocation-free after reserves and warmup" {
+test "steering update is allocation-free after reserves from the first step" {
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
@@ -2338,9 +2377,9 @@ test "steering update is allocation-free after reserves and warmup" {
 
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
-    _ = try steering.updateSerial(&data, &frame, &pathfinding, .{});
 
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    // No warm-up step: a first-step allocation means `reserveForCapacity` misses a term.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     const original_system_allocator = steering.allocator;
     const original_navigation_allocator = frame.navigation_intents.allocator;
     const original_intent_allocator = frame.intents.allocator;
@@ -2356,10 +2395,105 @@ test "steering update is allocation-free after reserves and warmup" {
         frame.path_requests.allocator = original_path_allocator;
     }
 
+    const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+}
+
+test "steering static snapshot reserve covers the first rebuild among many dynamic responders" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    _ = try addStaticObstacle(&data, .{ .x = 32, .y = -12 }, .{ .x = 16, .y = 16 });
+    // 24 dynamic responders (no steering): 25 response rows exceed the std growth
+    // slack of a 1-entry reserve, so sizing the snapshot by response rows allocates.
+    for (0..24) |index| {
+        const entity = try data.createEntity();
+        const x: f32 = @floatFromInt(200 + index * 40);
+        try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 200 }, .previous_position = .{ .x = x, .y = 200 }, .velocity = .{}, .speed = 0 });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 8, .y = 8 } });
+        try data.setCollisionResponse(entity, .{ .mode = .solid, .mobility = .dynamic, .restitution = 0 });
+    }
+    try std.testing.expectEqual(@as(usize, 1), SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+    var steering = SteeringSystem.init(std.testing.allocator);
+    defer steering.deinit();
+    try steering.reserveForCapacity(1, 1);
+
     frame.beginStep();
     try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    const original_system_allocator = steering.allocator;
+    const original_navigation_allocator = frame.navigation_intents.allocator;
+    const original_intent_allocator = frame.intents.allocator;
+    const original_path_allocator = frame.path_requests.allocator;
+    steering.allocator = failing.allocator();
+    frame.navigation_intents.allocator = failing.allocator();
+    frame.intents.allocator = failing.allocator();
+    frame.path_requests.allocator = failing.allocator();
+    defer {
+        steering.allocator = original_system_allocator;
+        frame.navigation_intents.allocator = original_navigation_allocator;
+        frame.intents.allocator = original_intent_allocator;
+        frame.path_requests.allocator = original_path_allocator;
+    }
+
     const stats = try steering.updateSerial(&data, &frame, &pathfinding, .{});
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
     try std.testing.expectEqual(@as(usize, 1), stats.movement_intent_count);
+    try std.testing.expectEqual(@as(u64, 0), steering.static_snapshot_grown_total);
+    try std.testing.expectEqual(@as(usize, 0), stats.static_snapshot_grown);
+}
+
+test "steering under-reserved static rebuild grows, counts, and builds the same snapshot" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const agent = try addSteeredEntity(&data, .{ .x = 0, .y = 0 });
+    _ = try addStaticObstacle(&data, .{ .x = 24, .y = -12 }, .{ .x = 12, .y = 12 });
+    _ = try addStaticObstacle(&data, .{ .x = 48, .y = -12 }, .{ .x = 12, .y = 12 });
+
+    var pathfinding = PathfindingSystem.init(std.testing.allocator);
+    defer pathfinding.deinit();
+    try pathfinding.reserve(.{ .max_frame_requests = 4, .max_pending_requests = 4, .max_cached_results = 8, .max_group_fields = 1, .worker_participant_count = 1, .max_solved_requests_per_step = 4 });
+    try pathfinding.rebuildStaticNavGrid(&data, 160, 160, 32);
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(2, 0, 4, 0, 0, 0);
+    try frame.reservePathRequests(2, 4);
+
+    var short = SteeringSystem.init(std.testing.allocator);
+    defer short.deinit();
+    try short.reserveForCapacity(1, 0);
+    var reserved = SteeringSystem.init(std.testing.allocator);
+    defer reserved.deinit();
+    try reserved.reserveForCapacity(1, 2);
+
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const short_stats = try short.updateSerial(&data, &frame, &pathfinding, .{});
+    frame.beginStep();
+    try appendNavigationIntent(&frame, .{ .entity = agent, .goal = .{ .x = 96, .y = 0 }, .direct_direction_x = 1 });
+    const reserved_stats = try reserved.updateSerial(&data, &frame, &pathfinding, .{});
+
+    try std.testing.expectEqual(@as(u64, 1), short.static_snapshot_grown_total);
+    try std.testing.expect(short.static_snapshot_grow_warned);
+    try std.testing.expectEqual(@as(usize, 1), short_stats.static_snapshot_grown);
+    try std.testing.expectEqual(@as(u64, 0), reserved.static_snapshot_grown_total);
+    try std.testing.expectEqual(reserved.obstacle_snapshot_rows.len, short.obstacle_snapshot_rows.len);
+    try std.testing.expectEqual(@as(usize, 2), short.obstacle_snapshot_rows.len);
+    try std.testing.expect(short_stats.obstacle_candidate_checks > 0);
+    try std.testing.expectEqual(reserved_stats.obstacle_candidate_checks, short_stats.obstacle_candidate_checks);
 }
 
 test "steering threaded multi-worker update has no steady-state allocation after warmup (FailingAllocator)" {
