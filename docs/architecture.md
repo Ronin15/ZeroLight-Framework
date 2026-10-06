@@ -238,8 +238,8 @@ camera-chunk culled). NPC per-level cull (Slice 25E) uses the `world_level` comp
 as the gameplay/nav/render authority; `setWorldLevel` syncs `scope.level` for
 cube LOD. Player floor policy stays on `Player.current_level` for digging.
 See `docs/rendering-assets-shaders.md`'s GPU-Driven Tilemap section (source
-of truth for the composite-draw/shader-loop detail) and slice 36 in
-`docs/framework-implementation-slices.md`.
+of truth for the composite-draw/shader-loop detail) and archive
+[Slice 36](roadmap/archive/slice-36.md).
 
 Simulation LOD and render visibility are separate policies: tier, halos, and scope
 gathers control fixed-step processor participation; camera chunk window, pixel
@@ -248,7 +248,7 @@ may keep an entity in a higher sim band off-camera; it must not bypass render
 visibility. Open scaling gaps (collect scan cost, dense-floor layer quads,
 movement contiguous-path vs dormant rows, per-entity depth alignment, component
 mask headroom) are consolidated under **Scaling Gaps And Hardening Frontier** in
-`docs/framework-implementation-slices.md`.
+[`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
 
 Game code submits sprites and rectangles through `Renderer` using prepared
 resource handles. Asset paths and PNG decode stay in `src/assets`; renderer
@@ -514,9 +514,10 @@ agent's own `AiAgent.gain_*` personality gains. `AiConfig.affect_slice`
 threads `DataSystem.aiAffectSliceConst()` into `AiSystem`, and
 `stageContract(.ai_decide)` reads `affect_drives` (written one stage earlier
 by `affect_update`, per `stage_order`). New feelings append to
-`AiAffectDrive` and a new weight-table row (roadmap Slice 42); they do not get
-a second parallel emotion subsystem. See
-`docs/framework-implementation-slices.md` Emergent AI Track Overview.
+`AiAffectDrive` and a new weight-table row (roadmap
+[Slice 42](roadmap/slices/slice-42.md)); they do not get a second parallel
+emotion subsystem. See the
+[Emergent AI Track Overview](roadmap/tracks/emergent-ai.md).
 
 The pipeline is also the right place to compose light domain controllers for
 features such as combat, spawning, rules, encounters, or other gameplay

@@ -3,16 +3,21 @@
 This document describes the implemented fixed-step simulation support in
 `src/game/simulation.zig`. It is a current-code contract for
 `SimulationFrame`, typed transient streams, structural command publication, and
-domain events. Future pipeline/tier roadmap status belongs in
-`docs/framework-implementation-slices.md`; durable ownership guidance belongs in
+domain events. Future pipeline/tier roadmap status belongs in the roadmap
+(index `docs/framework-implementation-slices.md`, one file per slice under
+`docs/roadmap/slices/`; the planned merged `stage_order` is Table T4 in
+`docs/roadmap/tracks/voidlight-port.md`); durable ownership guidance belongs in
 `docs/architecture.md`.
 
 Related docs:
 
 - [architecture.md](architecture.md) for durable frame flow, ownership, and
   future pipeline/tier direction.
-- [framework-implementation-slices.md](framework-implementation-slices.md) for
-  roadmap status and acceptance checklists.
+- [framework-implementation-slices.md](framework-implementation-slices.md) (roadmap
+  index) and the per-slice files under [roadmap/slices/](roadmap/slices/) for
+  roadmap status and acceptance checklists; cross-slice stage order, replay,
+  save, and checksum version tables are in
+  [roadmap/tracks/voidlight-port.md](roadmap/tracks/voidlight-port.md).
 
 ## Module Role
 
@@ -113,8 +118,8 @@ skip dormant-tier entities, since movement never moves them. Steering and
 pathfinding read each entity's `world_level` for `start_level`; level transitions
 at link crossings are committed by plane traversal against physical-cell world
 geometry, not by a path-view field (a `PathView.next_cell_level` field was tried
-and removed as an unused duplicate — see archive Slice 25E in
-`docs/framework-implementation-slices-archive.md`).
+and removed as an unused duplicate — see archive
+[Slice 25E](roadmap/archive/slice-25e.md)).
 
 ## Stage Ordering Contract
 

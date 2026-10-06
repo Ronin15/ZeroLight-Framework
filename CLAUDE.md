@@ -25,9 +25,17 @@ Read the doc that owns the area before editing — these are canonical, not note
 - `docs/rendering-assets-shaders.md` — SDL_GPU rendering, resources, shaders.
 - `docs/simulation-tiers-and-pipeline.md` — fixed-step simulation contracts.
 - `docs/atlas-asset-workflow.md` — atlas packing, JSON sidecars, art swaps.
-- `docs/framework-implementation-slices.md` — live frontier roadmap (open slices,
-  priorities, Scaling Gaps, suggested order); settled slices (0–8, 9–17,
-  18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48) are in
+- `docs/framework-implementation-slices.md` — roadmap **index** (ground rules,
+  agent workflow, open slice table, priorities, suggested order). Each open
+  slice/sub-slice is one file in `docs/roadmap/slices/slice-<id>.md`; shared
+  contracts and the authoritative cross-slice tables (replay/settings/save/
+  checksum versions, stage order, component tags) are in
+  `docs/roadmap/tracks/` (`voidlight-port.md`, `emergent-ai.md`,
+  `gameplay-direction.md`); measured pressure points are in
+  `docs/roadmap/scaling-gaps.md`. To work a slice, read the index, that one
+  slice file, and only the track/contract files it links. Settled slices
+  (0–8, 9–17, 18–25E, 26–32, 34, 36, 37, 39–41, 45, 47, 48) are one file each
+  in `docs/roadmap/archive/`, indexed by
   `docs/framework-implementation-slices-archive.md`.
 - `docs/changelogs/` — per-branch feature changelog summaries (latest:
   `docs/changelogs/zig_0_17_upgrade.md`).
@@ -107,6 +115,14 @@ boundaries just to make a local change easier.
   payloads.
 - Treat implementation slices as full features: runtime behavior, docs, tests,
   and acceptance checks all integrated before marking complete.
+- **No backlog dumping.** Design and review work never parks discovered
+  follow-ups as bare Scaling Gaps/backlog lines. Each one becomes a Checklist
+  item in its owning slice or a decision-complete new slice (Status may be
+  "gated on <trigger>"). Scaling Gaps holds only measured pressure points
+  awaiting a benchmark. When briefing agents, never ask them to "propose
+  Scaling Gaps lines". Exception: work the owner explicitly defers goes in
+  the roadmap index's **Deferred By Owner** list with its trigger; agents
+  never add entries there on their own.
 - Never edit generated output: `zig-out/` and `.zig-cache/`.
 - **Tests only: keep `WorldSystem`/`DataSystem` test fixtures at the smallest
   size that still exercises the behavior under test** — do not build out a

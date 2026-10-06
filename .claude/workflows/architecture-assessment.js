@@ -54,8 +54,8 @@ const docResults = await parallel([
     { label: 'docs:state+standards', phase: 'Docs Scan', schema: DOCS_SCHEMA }
   ),
   () => agent(
-    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/framework-implementation-slices.md.
-    Focus on: what slices are complete (settled), what is the current frontier (Slice 8 hardening), what future slices are planned (18+), what emergent gameplay capabilities are explicitly planned vs gaps, and the priority/ordering rationale.
+    `Read and analyze /Users/roninxv/projects/zig_projects/ZeroLight-Framework/docs/framework-implementation-slices.md (the roadmap index), then the open slice files it links under docs/roadmap/slices/ that matter for emergent gameplay, the track overviews in docs/roadmap/tracks/, and docs/roadmap/scaling-gaps.md. Use docs/framework-implementation-slices-archive.md (index of docs/roadmap/archive/) only to confirm what is settled.
+    Focus on: what slices are complete (settled), what is the current open frontier (see the Open Frontier Slice Index), what future slices are planned, what emergent gameplay capabilities are explicitly planned vs gaps, and the priority/ordering rationale.
     Return a structured analysis.`,
     { label: 'docs:roadmap', phase: 'Docs Scan', schema: DOCS_SCHEMA }
   ),

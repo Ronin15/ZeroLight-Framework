@@ -28,7 +28,9 @@ ownership, data flow, or performance policy. **You do not edit code** — return
    range-output streams, events, structural commands), `docs/state-stack-and-input.md`,
    `docs/rendering-assets-shaders.md`, `docs/atlas-asset-workflow.md`,
    `docs/coding-standards.md` (enforced style/performance/test/contract rules), and
-   `docs/framework-implementation-slices.md` (roadmap status).
+   `docs/framework-implementation-slices.md` (roadmap index; each slice is one file under
+   `docs/roadmap/slices/`, shared contracts and cross-slice version/stage/tag tables in
+   `docs/roadmap/tracks/voidlight-port.md`).
 2. Keep designs scoped to the repo's actual direction: normal 2D game, fixed-step sim,
    state-owned `DataSystem`, dense SoA stores, mostly stateless processors, explicit
    main-thread/deferred boundaries, hardware-aware hot paths. No package/library framing,
@@ -119,6 +121,22 @@ behavior — say exactly what is scaffolded, where future behavior hooks in, and
 checklist remains deferred. Do not rename deferred behavior as complete. For roadmap
 patches use compact sections: Goal / Current foundation / Architecture notes / Checklist /
 Acceptance checks.
+
+**No backlog dumping.** Every follow-up, gap, or deferred item your design discovers must
+land in a planned home, never as a bare Scaling Gaps / backlog line:
+
+- a Checklist item (with its tests) in the slice you are designing,
+- exact checklist bullets for the existing slice that owns it (name the slice and section), or
+- a new, decision-complete slice file under `docs/roadmap/slices/` (Goal / Current foundation / Architecture notes /
+  Checklist / Acceptance checks), even if its Status is "Not started — gated on <concrete
+  trigger>".
+
+"Out of scope" is allowed only when it names the slice that now owns the work. Scaling Gaps
+is for measured pressure points awaiting a benchmark, not for unplanned work. If you cannot
+plan an item fully, say so in your handoff as an open design question for the main thread;
+do not park it in the backlog. The only exception is the roadmap index's **Deferred By
+Owner** list, which holds work the owner explicitly deferred; never add entries to it
+yourself — you may reference an existing entry as the owner of out-of-scope work.
 
 ## Coordination
 

@@ -326,7 +326,7 @@ is a future optimization if profiling requires it.
 
 A pre-built visible movement dense-index list (parallel to scoped simulation
 gathers) is tracked under **Scaling Gaps And Hardening Frontier** in
-`docs/framework-implementation-slices.md`.
+[`docs/roadmap/scaling-gaps.md`](roadmap/scaling-gaps.md).
 
 ### Tile storage upload `cycle` policy (Slice 23A)
 

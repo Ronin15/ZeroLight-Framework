@@ -37,7 +37,8 @@ init/reserve/warmup, and treat performance-sensitive runtime behavior as correct
   when a task touches that area: `docs/architecture.md`, `docs/state-stack-and-input.md`,
   `docs/simulation-tiers-and-pipeline.md`, `docs/rendering-assets-shaders.md`,
   `docs/atlas-asset-workflow.md`, `docs/development-workflow.md`,
-  `docs/framework-implementation-slices.md`.
+  `docs/framework-implementation-slices.md` (index) plus the one slice file under
+  `docs/roadmap/slices/` you are implementing and the track files it links.
 
 ## Ownership Boundaries (put code in the layer that owns the behavior)
 

@@ -1,7 +1,7 @@
 # Coding Standards
 
 This document is the canonical source for code style, performance, comments,
-tests, and generated-output rules. `AGENTS.md` points here so future agents
+tests, and generated-output rules. `CLAUDE.md` points here so future agents
 treat these as repo standards, not optional style notes.
 
 ## Zig Style

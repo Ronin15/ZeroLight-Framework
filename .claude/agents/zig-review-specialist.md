@@ -205,6 +205,11 @@ zero-sized no-op, not runtime-skipped, per `runtime_perf_log.zig`); non-trivial 
 behind `logging.enabled(level)`. `warn`/`err` stay rare and actionable; pure helpers/validation
 stay log-free.
 
+**Roadmap / design docs** — when reviewing slice files (`docs/roadmap/slices/`) or design plans, flag as Medium any
+follow-up, gap, or deferred item parked as a bare Scaling Gaps/backlog line instead of a
+Checklist item in its owning slice or a decision-complete new slice; flag "out of scope" text
+that does not name the slice that now owns the work; flag leftover "decide"/"TBD".
+
 ## Output Format
 
 1. Findings first, highest severity first. For each: the broken behavior, why it matters, the
