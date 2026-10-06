@@ -15,6 +15,11 @@ const no_ref = types.no_ref;
 const no_cell = types.no_cell;
 const openHeapLimit = types.openHeapLimit;
 
+// Cache-line separation for per-worker scratch slots, same policy as nav_graph.zig,
+// collision.zig, simulation_scope.zig and spatial_index.zig (Slice 65A consolidates the
+// copies into one owner).
+const thread_shared_record_alignment: usize = 64;
+
 pub const AbstractSlotRow = struct {
     node: usize = 0,
     g: u32 = 0,
@@ -177,12 +182,15 @@ pub const SearchScratch = struct {
     // node BUDGET: an explicit expansion counter caps how many distinct cells one
     // solve may stamp, spilling the request to a later frame when exceeded (storage
     // is per-cell but the budget is unchanged).
-    // Cache-line aligned (and so padded to whole lines): the per-participant slots sit
-    // contiguously in `PathfindingSystem.scratch_slots` and each worker writes its own slot's
-    // counters (generation, explored, open/path lengths, abstract counters) on every node.
-    // Unaligned, adjacent slots' hot fields share a line and false-share across workers, so
-    // threaded solve throughput swung with this struct's size (Slice 72 A4 bench).
-    generation: u32 align(std.atomic.cache_line) = 1,
+    // Aligned to `thread_shared_record_alignment` (and so padded to whole 64 B lines): the
+    // per-participant slots sit contiguously in `PathfindingSystem.scratch_slots` and each
+    // worker writes its own slot's counters (generation, explored, open/path lengths,
+    // abstract counters) on every node. Unaligned, adjacent slots' hot fields share a line
+    // and false-share across workers, so threaded solve throughput swung with this struct's
+    // size (Slice 72 A4 bench). 64, not `std.atomic.cache_line` (128 on x86_64): the
+    // ReleaseFast `pathfinding --items 512` bench measured no gain from 128 (Slice 72
+    // follow-up record), matching the engine-wide per-slot rule.
+    generation: u32 align(thread_shared_record_alignment) = 1,
     cell_count: usize = 0,
     // Per-solve count of distinct cells stamped this generation, bounded by the
     // node budget so a long-range solve spills instead of fully exploring the grid.
@@ -215,6 +223,11 @@ pub const SearchScratch = struct {
     // PathfindingSystem aggregates and clears it once per step in finishUpdate, so
     // it reflects one step's true worst case rather than a single solve's.
     max_stitch_segments_used: usize = 0,
+
+    comptime {
+        std.debug.assert(@alignOf(SearchScratch) == thread_shared_record_alignment);
+        std.debug.assert(@sizeOf(SearchScratch) % thread_shared_record_alignment == 0);
+    }
 
     pub fn deinit(self: *SearchScratch, allocator: std.mem.Allocator) void {
         self.abstract.deinit(allocator);
@@ -378,7 +391,10 @@ test "re-reserving a smaller budget lowers the logical limits while physical cap
 }
 
 test "SearchScratch participant slots never share a cache line" {
-    // Contiguous scratch_slots entries are written concurrently by different workers.
-    try std.testing.expect(@alignOf(SearchScratch) >= std.atomic.cache_line);
-    try std.testing.expectEqual(@as(usize, 0), @sizeOf(SearchScratch) % std.atomic.cache_line);
+    // Contiguous scratch_slots entries are written concurrently by different workers; the
+    // layout itself is a comptime assert on the type, this pins the slot stride.
+    var slots: [2]SearchScratch = .{ .{}, .{} };
+    const stride = @intFromPtr(&slots[1]) - @intFromPtr(&slots[0]);
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&slots[0]) % thread_shared_record_alignment);
+    try std.testing.expectEqual(@as(usize, 0), stride % thread_shared_record_alignment);
 }
