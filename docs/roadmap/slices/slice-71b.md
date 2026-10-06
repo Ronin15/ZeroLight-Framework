@@ -2,7 +2,9 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 62](slice-62.md), [Slice 71A](slice-71a.md) (71B.3 only; 71B.1 ungated, 71B.2 bench-gated) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: in progress** (71B.1 steering level gate landed 2026-10-05; everything else not started). It has three parts with different gates:
+**Status: in progress.** Landed 2026-10-05: 71B.1's first item (the fixed
+group-field threshold) and the 71B.1 steering level gate. The rest of 71B.1,
+71B.2, and 71B.3 are not started. It has three parts with different gates:
 
 - **71B.1, fixed group-field threshold + shared static-collider rows +
   steering migration + steering level gate.** No gate. It needs only live
@@ -483,7 +485,7 @@ Narrowphase, contact merge, and response are unchanged.
 
 ### Checklist
 
-- [ ] **71B.1, first and ungated: fixed group-field threshold.**
+- [x] **71B.1, first and ungated: fixed group-field threshold.**
       `default_min_group_field_agents = 1024`; delete
       `default_cells_per_group_agent`, `group_field_threshold_floor`, and the
       `cellCount` branch; `groupFieldThreshold` clamps the pin to
@@ -502,6 +504,28 @@ Narrowphase, contact merge, and response are unchanged.
       the `pathfinding*` bench groups whose fixtures were unpinned, and pin a
       literal where a case relies on group fields building. This item lands
       even if nothing else in 71B does.
+
+      (2026-10-05: landed. `types.zig` `default_min_group_field_agents = 1024`;
+      `default_cells_per_group_agent` and `group_field_threshold_floor` are
+      deleted. `PathfindingSystem.groupFieldThreshold` is now
+      `std.math.clamp(min_group_field_agents, 1, @max(min_capacity_floor,
+      max_agent_budget))` with no `cellCount` read. Tests: `"group-field
+      threshold is independent of world size"` (1024-cell and 262,144-cell
+      grids both give 1024, and a 2-agent same-goal group builds no field),
+      `"group-field threshold is capped by the population ceiling"`, and
+      `"group-field threshold pin is clamped"` (0 gives 1, 5000 gives 4096,
+      2000 is unchanged). Every pinned test passes unchanged.
+      No pin was needed: the unpinned fixtures (`pathfinding.zig` near
+      `:406/:509/:617/:767/:902`) submit only `.individual` requests, and
+      `recordGroupRequest` runs only for `.group`, so the threshold is never
+      consulted there. Before/after record (ReleaseFast, `serial-direct`, 3
+      interleaved repetitions of adjacent builds, medians):
+      `pathfinding` 512: 3.21 ms → 3.19 ms;
+      `pathfinding-shared-goal` 128/512/1024: 10.73/19.18/22.83 us →
+      10.51/15.51/22.46 us; `pathfinding-drain` 1024: 3.16 ms → 3.14 ms;
+      `pathfinding-query` 256/1024: 5.28/20.91 us → 5.04/21.27 us;
+      `pathfinding-escalated-detour` 1: 14.91 us → 14.52 us. All are within
+      noise, as expected for an unchanged code path.)
 - [ ] **71B.1** `static_colliders.zig` rows + `version`/`dirty` +
       `ensureBuilt`; `eventInvalidatesStaticColliders` (moved + extended)
       with a table test over every listed event/component and a negative
@@ -652,7 +676,7 @@ Narrowphase, contact merge, and response are unchanged.
 - [ ] `zig build bench -- --group pathfinding-prewarm` is recorded, and the
   `pathfinding-group-field-detour*` groups stay within noise (the
   `samples_total > 0` guard holds).
-- [ ] 71B.1 (fixed threshold, checked on its own landing): no budget
+- [x] 71B.1 (fixed threshold, checked on its own landing): no budget
   derives from world size. Grep shows no `cellCount()` in threshold or
   budget code paths, `default_cells_per_group_agent` and
   `group_field_threshold_floor` no longer exist, and the "independent of

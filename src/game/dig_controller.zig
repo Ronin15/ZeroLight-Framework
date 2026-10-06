@@ -37,6 +37,8 @@ const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const SensoryBus = @import("sensory_bus.zig").SensoryBus;
 const WorldTilesetMeta = @import("../assets/world_tileset_meta.zig").WorldTilesetMeta;
 const RuntimeAssets = @import("../assets/runtime_assets.zig").RuntimeAssets;
+const NavLinkSlotGeometry = @import("systems/pathfinding.zig").NavLinkSlotGeometry;
+const interiorLinkSlotsAvailable = @import("systems/pathfinding.zig").interiorLinkSlotsAvailable;
 
 /// Walkable tiles the dig carves, resolved by the gameplay state from the tileset
 /// meta and passed in at pipeline init, so the controller stays free of asset
@@ -81,6 +83,15 @@ pub const DigController = struct {
     /// only clears and `appendAssumeCapacity`s.
     plane_tile_changes: std.ArrayList(WorldTileChangedEvent) = .empty,
     scratch_allocator: ?std.mem.Allocator = null,
+    /// Nav slot geometry the ramp dig checks before adding a `LevelLink`, so a ramp that
+    /// would exceed its nav chunk's fixed interior link slots is refused before it changes
+    /// the world (never silently inert). Set by `SimulationPipeline` from the nav graph at
+    /// init and after every full nav build. Defaults to the unresolved sentinel: a ramp dig
+    /// with it unresolved returns `error.UnresolvedNavLinkGeometry` before any mutate.
+    nav_link_geometry: NavLinkSlotGeometry = .unresolved,
+    /// Telemetry: ramp digs refused because the faced cell's nav chunk had no free interior
+    /// link slot (perf metric `dig_ramp_refused_link_slots`).
+    ramp_refused_link_slots: u64 = 0,
 
     pub fn init(config: DigConfig) DigController {
         return .{ .ramp_tile = config.ramp_tile, .tunnel_tile = config.tunnel_tile };
@@ -110,7 +121,7 @@ pub const DigController = struct {
     /// plane has no floor layer, or the faced cell is off-world. Emits one
     /// `world_tile_changed` event on an actual change.
     pub fn process(
-        self: *const DigController,
+        self: *DigController,
         world: *WorldSystem,
         data: *const DataSystem,
         player: Player,
@@ -136,7 +147,18 @@ pub const DigController = struct {
         // Intentional no-ops that never mutate return before the event preflight
         // so a full event budget cannot fail a dig that would have done nothing.
         if (intent == .down and @as(usize, player.current_level) + 1 >= world.levelCount()) return;
-        if (intent == .ramp and (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null)) return;
+        if (intent == .ramp) {
+            if (player.current_level == 0 or world.rampLinkOtherLevel(player.current_level, cell) != null) return;
+            // Runtime check (not a Debug-only assert), matching UnresolvedDigTiles above.
+            if (!self.nav_link_geometry.isResolved()) return error.UnresolvedNavLinkGeometry;
+            // Refuse a ramp whose new interior endpoint would find its nav chunk's fixed link
+            // slots full: the link would be inert to NPC pathing. Same no-mutate early return
+            // as the existing-link no-op; the player re-presses to dig elsewhere.
+            if (!interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry)) {
+                self.ramp_refused_link_slots += 1;
+                return;
+            }
+        }
 
         // Reserve event + stimulus slots before any world mutate so a capacity miss
         // cannot leave the tile changed without matching outputs. digRamp also
@@ -471,10 +493,13 @@ const manifest = @import("../assets/manifest.zig");
 const world_tileset_meta = @import("../assets/world_tileset_meta.zig");
 
 fn testDigController(meta: anytype) !DigController {
-    return DigController.init(.{
+    var dig = DigController.init(.{
         .ramp_tile = (meta.tileByName("cobblestone") orelse return error.TestUnexpectedResult).id,
         .tunnel_tile = (meta.tileByName("cave_0") orelse return error.TestUnexpectedResult).id,
     });
+    // The 8x8-tile fixture world as one default 16-tile nav chunk (nav cell == tile).
+    dig.nav_link_geometry = .{ .chunk_tiles = 16, .width = 8, .height = 8 };
+    return dig;
 }
 
 /// Minimal multi-level grass/dirt world for dig/plane tests (not full 320 demo).
@@ -547,7 +572,8 @@ fn runDig(tw: *TestWorld, dig: DigController, intent: @import("simulation.zig").
     try frame.reserveStreams(4, 8, 8, 8, 8, 8);
     frame.beginStep();
     frame.dig_intent = intent;
-    try dig.process(&tw.world, &tw.data, tw.player, &frame);
+    var controller = dig;
+    try controller.process(&tw.world, &tw.data, tw.player, &frame);
     return frame;
 }
 
@@ -555,7 +581,7 @@ test "dig process returns UnresolvedDigTiles without mutating world" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
     // Default DigConfig leaves ramp/tunnel as invalid_tile_id — must fail before carve.
-    const dig = DigController.init(.{});
+    var dig = DigController.init(.{});
     const floor = tw.world.denseFloorLayerForLevel(0).?;
     const before = tw.world.denseTile(floor, 4, 3);
 
@@ -716,6 +742,69 @@ test "dig controller ramp is a no-op on the surface" {
     try std.testing.expectEqual(@as(usize, 0), frame.stimuli.mergedItems().len);
 }
 
+test "a ninth interior ramp in one nav chunk is refused" {
+    // 8x8-tile world as ONE 8-tile nav chunk: 36 interior cells (x,y in 1..6), enough to
+    // reach K = nav_interior_link_slots_per_chunk distinct interior endpoints (a 4-tile chunk
+    // has only 4 interior cells and never could).
+    const k = @import("systems/pathfinding.zig").nav_interior_link_slots_per_chunk;
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    var dig = try testDigController(&tw.meta);
+    dig.nav_link_geometry = .{ .chunk_tiles = 8, .width = 8, .height = 8 };
+
+    // Pre-author K distinct interior endpoint cells in chunk (0,0), none at the faced (4,3).
+    const authored = [_]CellCoord{
+        .{ .x = 1, .y = 1 }, .{ .x = 2, .y = 1 }, .{ .x = 3, .y = 1 }, .{ .x = 4, .y = 1 },
+        .{ .x = 5, .y = 1 }, .{ .x = 6, .y = 1 }, .{ .x = 1, .y = 2 }, .{ .x = 2, .y = 2 },
+    };
+    comptime std.debug.assert(authored.len == k);
+    for (authored) |cell| {
+        try tw.world.addLevelLink(.{ .kind = .stair, .level_a = 1, .cell_a = cell, .level_b = 0, .cell_b = cell, .traversal_cost = 1, .bidirectional = true });
+    }
+
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    try dig.process(&tw.world, &tw.data, tw.player, &frame);
+
+    // Refused before any mutate: no tile change, no event, no new link, counted once.
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, k), tw.world.levelLinks().len);
+    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
+
+    // A perimeter cell of the same chunk needs no interior slot: face (7,3) from (6,3).
+    const body = tw.data.movementBodyPtr(tw.player.entity).?;
+    body.position_x.* = 6 * 32;
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    try dig.process(&tw.world, &tw.data, tw.player, &frame);
+    try std.testing.expectEqual(dig.ramp_tile, tw.world.denseTile(floor, 7, 3));
+    try std.testing.expectEqual(@as(usize, k + 1), tw.world.levelLinks().len);
+    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
+}
+
+test "a ramp dig with unresolved nav link geometry fails before mutating the world" {
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    var dig = try testDigController(&tw.meta);
+    dig.nav_link_geometry = .unresolved;
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    try std.testing.expectError(error.UnresolvedNavLinkGeometry, dig.process(&tw.world, &tw.data, tw.player, &frame));
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
+}
+
 test "dig controller is a no-op for none intent or an off-world target" {
     var tw = try TestWorld.init(.left, 0);
     defer tw.deinit();
@@ -776,7 +865,7 @@ test "dig controller applyEntityPlaneTraversal carves an NPC's landing cell befo
 test "dig process reserves event capacity before world mutate (capacity miss leaves tile unchanged)" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
-    const dig = try testDigController(&tw.meta);
+    var dig = try testDigController(&tw.meta);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -950,7 +1039,7 @@ test "digRamp OOM on level_links growth leaves ramp tile unchanged" {
 test "dig process on a full live bus leaves the tile unchanged" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
-    const dig = try testDigController(&tw.meta);
+    var dig = try testDigController(&tw.meta);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -980,7 +1069,7 @@ test "dig process on a full live bus leaves the tile unchanged" {
 test "dig process stimulus capacity miss leaves tile unchanged" {
     var tw = try TestWorld.init(.right, 0);
     defer tw.deinit();
-    const dig = try testDigController(&tw.meta);
+    var dig = try testDigController(&tw.meta);
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();

@@ -821,22 +821,33 @@ field keyed on the old version re-solves. The dirty
 buffer GROWS rather than dropping, so any number of simultaneous diggers or
 obstacle edits in one step all reach the graph — a dropped cell would leave the
 graph stale. Unaffected chunks are never touched, and the whole-world build runs
-only at init. The abstract SLOT GEOMETRY — the per-chunk perimeter slots plus the
-per-chunk interior link-endpoint runs that index portal nodes — is a pure function of the
-dimensions and the INIT-TIME link set, computed once by `computePortalGeometry`; the
-incremental patch never renumbers it. A `LevelLink` ADDED at runtime (e.g.
-`dig_controller.digRamp` carving a ramp) is therefore handled by endpoint: a PERIMETER
-endpoint keeps its positional slot and is admitted as a portal incrementally, while an
-INTERIOR endpoint has no reserved slot and is DEFERRED — `tryLinkPortal` skips it, leaving
-it non-live in the abstract graph (no portal node), exactly as a blocked endpoint would,
-rather than resolving against an absent run. The walkability-keyed `link_edges` entry still
-forms but is inert: the abstract solver only relaxes a link whose partner endpoint resolves
-to a live portal (`cell_to_portal != no_cell`), so a deferred endpoint is never traversed.
-A deferred interior endpoint is reserved by the next full rebuild. This is correct while
-cross-level NPC pathing is inactive — NPC `goal_level` is pinned to the surface, and the
-PLAYER climbs ramps through the `WorldSystem` link tier (`rampLinkOtherLevel`), not the
-abstract graph; making a runtime interior ramp NPC-pathable would require per-chunk
-interior-link slot headroom reserved at init. The reaction is recorded
+only at init. The abstract SLOT GEOMETRY — `4*ct` perimeter slots plus a FIXED
+`nav_interior_link_slots_per_chunk` (8) interior link-endpoint slots per chunk — is a pure
+function of the grid dimensions, never of the link set, so the incremental patch never
+renumbers a slot and the incremental and full builds share one layout. The interior slot
+table is shared by every level and deduped by cell (a ramp's two endpoints share one
+slot), so the cap bounds DISTINCT interior link-endpoint cells per nav chunk across all
+levels. One assignment rule (`NavGraph.assignLinkEndpointSlots`, link order) fills it:
+a full build assigns the whole link set from index 0, and the post-commit reaction's LINK
+CURSOR (`PathfindingSystem.nav_links_processed`, reset to `levelLinks().len` by every full
+build) assigns each NEW `LevelLink` — e.g. `DigController.digRamp` carving a ramp — before
+marking BOTH endpoint cells dirty on their own levels, so the link joins the abstract tier
+on both levels in the same step. Links are append-only, so the cursor's table equals a full
+build's. The cursor is a world-derived trigger separate from the event filter (a ramp on an
+already-walkable cell flips no blocking state, so `eventInvalidatesNavigation` stays false,
+yet the link still patches); `SimulationPipeline.hasPendingNavLinks` lets the state reserve
+the `nav_region_invalidated` slot. Per step the cursor folds at most
+`nav_new_links_per_step_max` (8) links — a fixed constant independent of world size; extra
+links DEFER in link order to the next step (`pathfinding_links_deferred`). An endpoint that
+finds its chunk's 8 interior slots full stays UNSLOTTED: `tryLinkPortal` skips it (no portal
+node), exactly as a blocked endpoint, so the inert `link_edges` entry is never relaxed (the
+abstract solver only relaxes a link whose partner resolves to a live portal); it is counted
+(`pathfinding_link_endpoints_unslotted`) and warned once when the cursor first visits it. The
+runtime producer never reaches that state: the ramp dig asks the pure
+`interiorLinkSlotsAvailable` helper first (geometry set by `SimulationPipeline` after every
+full nav build) and refuses a ramp that would exceed the cap before mutating the world
+(`dig_ramp_refused_link_slots`). Underground NPCs path cross-level to the surface, so a
+player-dug ramp is routable by them the step it is dug. The reaction is recorded
 through the `nav_dirty_chunks` / `nav_incremental_rebuilds` / `nav_full_relabel` /
 `nav_version_bumps` metrics (the per-affected-level relabel degenerates to a
 counted full relabel only past a configured level threshold), and a
@@ -859,11 +870,15 @@ the build to the largest chunk's caps. The system-owned dirty buffer is likewise
 reserved to a steady-path high-water and does one bounded amortized grow only for an
 unusually large structural step. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
-acceptable on this cold, event-triggered path. The `max_nav_memory_bytes` gate
+acceptable on this cold, event-triggered path. The link edges reserve to the world's own
+link capacity, so a runtime link allocates there only on the step the world's link storage
+itself grew. The `max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border
 cells, CSR edges by portal count times a small abstract degree), not a per-chunk
 pairwise worst case, so large sparse worlds build instead of being falsely
-rejected.
+rejected. Its slot term is `levels * chunk_count * (4*ct + nav_interior_link_slots_per_chunk)`
+— independent of the link set — and the link count sizes only the global
+`link_edges`/`link_edge_refs` term.
 
 The cross-cutting ownership rules apply here too: event reactions may have
 main-thread commit points, but scalable reaction work still needs a named owner,

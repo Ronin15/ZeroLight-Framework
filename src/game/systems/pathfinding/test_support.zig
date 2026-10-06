@@ -41,8 +41,8 @@ pub fn baselineCapacity() PathfindingCapacity {
     // Per-step request/cache caps are derived elastically from the agent count
     // (floored at min_capacity_floor = 8), so only the non-derived knobs are set
     // here. An explicit min_group_field_agents pins the group-field threshold so
-    // these tests exercise the field mechanics with a handful of agents, bypassing
-    // the grid-derived threshold (which would otherwise require hundreds of sharers).
+    // these tests exercise the field mechanics with a handful of agents instead of the
+    // fixed default threshold (which would otherwise require hundreds of sharers).
     return .{
         .max_group_fields = 2,
         .worker_participant_count = 1,

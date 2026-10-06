@@ -66,9 +66,8 @@ const min_capacity_floor = types.min_capacity_floor;
 const cached_results_per_agent = types.cached_results_per_agent;
 const default_max_solves_per_frame = types.default_max_solves_per_frame;
 const deriveCapacity = types.deriveCapacity;
-const default_cells_per_group_agent = types.default_cells_per_group_agent;
-const group_field_threshold_floor = types.group_field_threshold_floor;
 const default_goal_projection_radius = types.default_goal_projection_radius;
+const nav_new_links_per_step_max = types.nav_new_links_per_step_max;
 const pathfinding_range_alignment_items = types.pathfinding_range_alignment_items;
 
 pub const PathfindingSystem = struct {
@@ -126,6 +125,12 @@ pub const PathfindingSystem = struct {
     // localized to a cell — e.g. a destroyed/toggled static obstacle whose nav cell is no
     // longer resolvable from the entity — so the whole level is re-derived from the world.
     nav_dirty_levels: std.ArrayList(u16) = .empty,
+    // Cursor into the world's append-only `levelLinks()`: links before it are folded into the
+    // nav graph's interior slot table and patched on both endpoint levels. Set to
+    // `levelLinks().len` by every full build (which assigns the whole link set); advanced by
+    // the post-commit reaction (markNewNavLinksDirty) by at most nav_new_links_per_step_max per
+    // step. World-derived, so a non-blocking-flip ramp dig still patches the graph.
+    nav_links_processed: usize = 0,
     // Heap A* is the only worker-driven solver tier, so a single tuner owns its
     // adaptive batch profile.
     fallback_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
@@ -213,15 +218,14 @@ pub const PathfindingSystem = struct {
         self.* = undefined;
     }
 
-    // See default_cells_per_group_agent for the model. Capped by max_agent_budget (the
-    // hard ceiling), NOT live max_pending_requests, or the small live crowd would pull
-    // the threshold to demo scale. A sub-floor budget can cap below the floor; cellCount
-    // 0 (no graph yet) yields the floor.
+    // The fixed per-query group-field threshold (see default_min_group_field_agents), never
+    // derived from world size. Clamped to [1, population ceiling]: the ceiling is
+    // max_agent_budget (the hard cap), NOT live max_pending_requests, so a small live crowd
+    // never pulls the threshold down, and the threshold never demands more sharers than can
+    // ever exist. A pin of 0 clamps to 1.
     pub fn groupFieldThreshold(self: *const PathfindingSystem) usize {
-        if (self.capacity.min_group_field_agents != 0) return self.capacity.min_group_field_agents;
-        const derived = self.graph.cellCount() / default_cells_per_group_agent;
         const ceiling = @max(min_capacity_floor, self.capacity.max_agent_budget);
-        return @min(@max(derived, group_field_threshold_floor), ceiling);
+        return std.math.clamp(self.capacity.min_group_field_agents, 1, ceiling);
     }
 
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) !void {
@@ -415,6 +419,8 @@ pub const PathfindingSystem = struct {
         // Pre-reserve the per-level affected-flag scratch so a steady-path
         // applyNavUpdates allocates nothing per edit.
         try setLen(&self.affected_levels, self.allocator, self.graph.levelCount());
+        // The full build assigned every current link's endpoint slots and patched every chunk.
+        self.nav_links_processed = link_count;
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
@@ -587,6 +593,49 @@ pub const PathfindingSystem = struct {
         return self.nav_dirty_edits.items.len != 0 or self.nav_dirty_cell_spans.items.len != 0 or self.nav_dirty_levels.items.len != 0;
     }
 
+    // Whether `world` holds LevelLinks the nav graph has not folded in yet. The post-commit
+    // reaction processes them (and appends nav_region_invalidated), so callers that reserve
+    // that event slot before mutation must consult this alongside the event filter.
+    pub fn hasPendingNavLinks(self: *const PathfindingSystem, world: *const WorldSystem) bool {
+        return self.nav_links_processed < world.levelLinks().len;
+    }
+
+    pub const NavLinkCursorStats = struct {
+        // New links folded in this call (<= nav_new_links_per_step_max).
+        processed: usize = 0,
+        // New links left for a later call (deterministic, link order).
+        deferred: usize = 0,
+        // Endpoint cells of the processed links left unslotted by the K cap (inert).
+        unslotted: usize = 0,
+    };
+
+    // Folds up to nav_new_links_per_step_max new LevelLinks (in link order, from the
+    // nav_links_processed cursor) into the nav graph: assigns their interior endpoint slots with
+    // the same rule a full build uses, then marks BOTH endpoint cells dirty on their own levels
+    // so the next buffered apply patches each endpoint's chunk (plus border neighbors) and
+    // rebuilds the link edges. Links past the budget defer to the next call. Per-call work is
+    // bounded by the fixed budget: 2 dirty cells per link, independent of world size.
+    //
+    // The cursor advances only after every mark succeeded (a failed mark leaves it, so the next
+    // call re-marks; slot assignment is idempotent and a duplicate dirty cell is harmless). Main
+    // thread only, before the patch dispatch. Allocation-free while the dirty buffers stay within
+    // their reserved capacity (they grow rather than drop, like every other markNavDirty).
+    pub fn markNewNavLinksDirty(self: *PathfindingSystem, world: *const WorldSystem) !NavLinkCursorStats {
+        if (!self.graph.valid()) return .{};
+        const links = world.levelLinks();
+        // Links are append-only; clamp anyway so a stale cursor can never slice out of bounds.
+        const first = @min(self.nav_links_processed, links.len);
+        const end = @min(links.len, first + nav_new_links_per_step_max);
+        if (first == end) return .{};
+        const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
+        for (links[first..end]) |link| {
+            try self.markNavDirty(link.level_a, link.cell_a.x, link.cell_a.y);
+            try self.markNavDirty(link.level_b, link.cell_b.x, link.cell_b.y);
+        }
+        self.nav_links_processed = end;
+        return .{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
+    }
+
     // Applies the buffered dirty nav cells, obstacle rects, and whole-level requests as one
     // incremental update, then clears the buffers. Returns zero stats when nothing is
     // buffered. A non-null thread_system lets the chunk patch thread (tuner-gated); null keeps
@@ -604,7 +653,9 @@ pub const PathfindingSystem = struct {
     // only), and emits one nav_region_invalidated domain-reaction event when the graph actually
     // changed. Cell-localizable tile/obstacle edits forward one dirty cell each; entity-driven
     // changes resolve their carried world-space rect to a nav-cell span and patch only the
-    // affected chunks, same as tile edits. Returns the batch stats (zero when nothing was pending).
+    // affected chunks, same as tile edits. New world LevelLinks are folded in through the link
+    // cursor (markNewNavLinksDirty: fixed interior slot, both endpoint levels dirtied, at most
+    // nav_new_links_per_step_max per step). Returns the batch stats (zero when nothing was pending).
     //
     // Deliberately does NOT clear the dirty buffers at entry: applyBufferedNavUpdates only
     // clears them after a successful apply (see its doc comment), so an error here (e.g. this
@@ -658,10 +709,21 @@ pub const PathfindingSystem = struct {
                 else => {},
             }
         }
+        // New world links (e.g. a ramp dug this step) are a separate, world-derived trigger: a
+        // ramp on an already-walkable cell flips no blocking state and so emits no
+        // nav-invalidating event, yet its link must still join the graph on both levels.
+        const link_stats = try self.markNewNavLinksDirty(world);
 
         if (!self.hasPendingNavUpdates()) return .{};
         try frame.events.ensureCanAppend(1);
-        const stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        var stats = try self.applyBufferedNavUpdates(data, world, thread_system);
+        stats.links_deferred = link_stats.deferred;
+        stats.link_endpoints_unslotted = link_stats.unslotted;
+        // A full relabel / edge-cap fallback rebuilds the abstract graph from the whole link set
+        // (computePortalGeometry assigns from index 0) but deliberately leaves the cursor alone:
+        // deferred links are still visited by later steps' cursor (idempotent assignment plus
+        // a redundant bounded patch), so per-step link accounting and the warn-once rule do not
+        // depend on whether a fallback happened to fire.
         // Only signal invalidation when the batch actually changed the graph: an incremental dig
         // keeps nav_version stable, so gate on real work too, not just a full-rebuild version bump.
         if (stats.version_bumps == 0 and stats.incremental_rebuilds == 0) return stats;
@@ -4443,27 +4505,31 @@ test "pathfinding capacity shrink preserves surviving pending keys/tiers and cou
     }
 }
 
-test "pathfinding group-field threshold derives from grid size, not population" {
+test "group-field threshold is independent of world size" {
+    // CLAUDE.md fixed-budget rule: the default threshold is the fixed 1024 on a 1024-cell
+    // grid AND on a 262,144-cell grid (the retired derivation gave 64 and 1024 here).
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     const a = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
     const b = try addNavBody(&data, .{ .x = 32, .y = 0 }, .{ .x = 8, .y = 8 }, false);
 
+    var large = PathfindingSystem.init(std.testing.allocator);
+    defer large.deinit();
+    try large.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
+    try large.rebuildStaticNavGrid(&data, 16384, 16384, 32);
+    try std.testing.expectEqual(@as(usize, 512 * 512), large.graph.cellCount());
+
     var system = PathfindingSystem.init(std.testing.allocator);
     defer system.deinit();
-    // No explicit min_group_field_agents (derive from grid). Budget large enough that
-    // the grid-derived threshold, not the population cap, governs on the demo grid.
     try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
-    // 512x512 px / 32 px cell = 16x16 = 256 cells... use the demo's nav resolution:
-    // a 512x512-cell grid (512x512 world at 1px cells) gives 262144 cells.
-    try system.rebuildStaticNavGrid(&data, 16384, 16384, 32);
-    try std.testing.expectEqual(@as(usize, 512 * 512), system.graph.cellCount());
+    try system.rebuildStaticNavGrid(&data, 1024, 1024, 32);
+    try std.testing.expectEqual(@as(usize, 32 * 32), system.graph.cellCount());
 
-    // 262144 / 256 = 1024 same-goal sharers required before the field builds.
-    try std.testing.expectEqual(@as(usize, 1024), system.groupFieldThreshold());
+    try std.testing.expectEqual(@as(usize, 1024), large.groupFieldThreshold());
+    try std.testing.expectEqual(large.groupFieldThreshold(), system.groupFieldThreshold());
 
-    // A small same-goal group at this grid size never reaches the threshold, so no
-    // O(cells) flow field is built (the demo's 8 agents stay on individual A*).
+    // A small same-goal group never reaches the threshold, so no O(cells) flow field is
+    // built (the demo's few agents stay on individual A*).
     const goal = math.Vec2{ .x = 400, .y = 400 };
     var built: usize = 0;
     for (0..8) |_| {
@@ -4478,27 +4544,28 @@ test "pathfinding group-field threshold derives from grid size, not population" 
     try std.testing.expectEqual(@as(usize, 0), built);
 }
 
-test "pathfinding group-field threshold floors on a tiny grid and caps by population" {
-    var data = DataSystem.init(std.testing.allocator);
-    defer data.deinit();
-    _ = try addNavBody(&data, .{ .x = 0, .y = 0 }, .{ .x = 8, .y = 8 }, false);
-
-    var system = PathfindingSystem.init(std.testing.allocator);
-    defer system.deinit();
-    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096 });
-    // A 32x32-cell grid (1024 cells) would derive 1024/256 = 4, below the floor (64),
-    // so the floor governs.
-    try system.rebuildStaticNavGrid(&data, 1024, 1024, 32);
-    try std.testing.expectEqual(@as(usize, 32 * 32), system.graph.cellCount());
-    try std.testing.expectEqual(group_field_threshold_floor, system.groupFieldThreshold());
-
-    // With a tiny budget (max possible population 8) below the floor, the budget cap
-    // wins so the threshold never demands more sharers than can ever exist.
+test "group-field threshold is capped by the population ceiling" {
+    // With max_agent_budget = 8 the default 1024 clamps to 8, so the threshold never
+    // demands more sharers than can ever exist. No graph is needed: the threshold no
+    // longer reads the grid.
     var capped = PathfindingSystem.init(std.testing.allocator);
     defer capped.deinit();
     try capped.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
-    try capped.rebuildStaticNavGrid(&data, 1024, 1024, 32);
     try std.testing.expectEqual(@as(usize, 8), capped.groupFieldThreshold());
+}
+
+test "group-field threshold pin is clamped" {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 4096, .min_group_field_agents = 0 });
+    // A pin of 0 (formerly "derive from the grid") clamps to 1.
+    try std.testing.expectEqual(@as(usize, 1), system.groupFieldThreshold());
+    // A pin above the population ceiling clamps to the ceiling.
+    system.capacity.min_group_field_agents = 5000;
+    try std.testing.expectEqual(@as(usize, 4096), system.groupFieldThreshold());
+    // An in-range pin is returned unchanged.
+    system.capacity.min_group_field_agents = 2000;
+    try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
 }
 
 // A full-height wall with a single far gap forces the longest possible detour — the

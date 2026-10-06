@@ -16,6 +16,11 @@ at each step. Test count grew from the pre-change baseline to 584 passing.
 - **Not changed by design:** N6 (sanctioned elastic resize); N1 (unnecessary — rebuild is
   already alloc-free after the first high-water build); N3 (essay comments left intact rather
   than risk removing the non-obvious perf/algorithm rationale this module deliberately documents).
+- **Follow-up (Slice 64E, 2026-10-05):** runtime `LevelLink`s are no longer deferred until a
+  full rebuild. Every nav chunk now carries a fixed `nav_interior_link_slots_per_chunk` (8)
+  interior link slots, and the post-commit link cursor folds new links in on both endpoint
+  levels under a fixed per-step budget (`nav_new_links_per_step_max`, deterministic deferral).
+  N1 is also resolved: `link_edges`/`link_edge_refs` reserve to the world's link capacity.
 
 The findings below are the original review, retained for reference.
 

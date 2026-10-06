@@ -453,8 +453,9 @@ pub const GameDemoState = struct {
             // resolution.
             .nav_cell_size = 32,
             // Elastic pathfinding capacity tracks the live steering-agent crowd:
-            // the per-step request/cache caps and the group-field threshold derive
-            // from the agent count automatically. Only the hard ceiling is fixed, so
+            // the per-step request/cache caps derive from the agent count
+            // automatically, and the group-field threshold is the fixed default
+            // (never derived from world size). Only the hard ceiling is fixed, so
             // a battle grows and quiets shrinks without bumping knobs. At this demo's
             // small scale capacity settles low and the group path stays dormant.
             .pathfinding = pathfinding_override orelse .{
@@ -679,11 +680,14 @@ pub const GameDemoState = struct {
         // The post-commit nav reaction appends at most one nav_region_invalidated
         // event, driven by EITHER structural commands applied this frame OR
         // invalidating world events already queued in the stream (e.g. a dig's
-        // world_tile_changed that did not originate from a structural command).
-        // Reserve the slot for both sources so the append never trips a tight
+        // world_tile_changed that did not originate from a structural command), OR
+        // new world LevelLinks the nav graph has not folded in yet (a ramp dug on an
+        // already-walkable cell flips no blocking state, so no event announces it).
+        // Reserve the slot for every source so the append never trips a tight
         // capacity_limit.
         const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(&self.data, &self.simulation_frame) or
-            SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame);
+            SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame) or
+            self.pipeline.hasPendingNavLinks(&self.world);
         const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);

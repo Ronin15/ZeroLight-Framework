@@ -31,6 +31,9 @@ pub const default_max_fallback_requests_per_step = @import("pathfinding/types.zi
 pub const default_max_solves_per_frame = @import("pathfinding/types.zig").default_max_solves_per_frame;
 pub const default_nav_chunk_tiles = @import("pathfinding/types.zig").default_nav_chunk_tiles;
 pub const autoSizedMaxNavMemoryBytes = @import("pathfinding/nav_memory.zig").autoSizedMaxNavMemoryBytes;
+pub const NavLinkSlotGeometry = @import("pathfinding/nav_graph.zig").NavLinkSlotGeometry;
+pub const interiorLinkSlotsAvailable = @import("pathfinding/nav_graph.zig").interiorLinkSlotsAvailable;
+pub const nav_interior_link_slots_per_chunk = @import("pathfinding/types.zig").nav_interior_link_slots_per_chunk;
 
 test {
     _ = @import("pathfinding/types.zig");

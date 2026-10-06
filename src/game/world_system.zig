@@ -1584,6 +1584,13 @@ pub const WorldSystem = struct {
         return self.level_links.items;
     }
 
+    /// Reserved link storage (>= `levelLinks().len`). Derived per-link stores (the nav
+    /// graph's link edges) reserve to this so they grow only when the world's own link
+    /// storage grew, never on a link added within this reservation.
+    pub fn levelLinkCapacity(self: *const WorldSystem) usize {
+        return self.level_links.capacity;
+    }
+
     pub fn sparseTileCount(self: *const WorldSystem) usize {
         return self.sparse_tiles.len;
     }
