@@ -420,7 +420,8 @@ pub const SimulationPipelineUpdateContext = struct {
     /// Never the render visibility window, which follows the interpolated
     /// render camera and so depends on frame pacing. `null` keeps the
     /// full-active fallback (no stagger filter, no tier demotion) for bare-world
-    /// pipeline tests.
+    /// pipeline tests. Production callers must always set this: a missing view
+    /// silently disables scope gating and runs every entity at full cost.
     sim_view: ?Rect = null,
 };
 
