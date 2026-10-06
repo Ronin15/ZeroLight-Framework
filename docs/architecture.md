@@ -870,14 +870,19 @@ the build to the largest chunk's caps. The system-owned dirty buffer is likewise
 reserved to a steady-path high-water and does one bounded amortized grow only for an
 unusually large structural step. A genuine topology expansion past it (an unblock opening
 more portals than any prior build) does one bounded amortized growth, which is
-acceptable on this cold, event-triggered path. The link edges reserve to the world's own
-link capacity, so a runtime link allocates there only on the step the world's link storage
-itself grew. The `max_nav_memory_bytes` gate
+acceptable on this cold, event-triggered path. Level-link storage is a load-time
+CAPACITY: the state reserves it with `WorldSystem.reserveLevelLinks` (the demo sizes it from
+the loaded world as authored links + world chunks × `nav_interior_link_slots_per_chunk`), the
+full nav build reserves `link_edges`/`link_edge_refs` to that same `levelLinkLimit`, and a
+ramp dig past the limit is refused (`dig_ramp_refused_link_slots`) instead of growing storage,
+so runtime links never allocate (FailingAllocator-proven over world, graph, and system). The
+`max_nav_memory_bytes` gate
 estimates nav memory from realistic structure (portals bounded by chunk-border
 cells, CSR edges by portal count times a small abstract degree), not a per-chunk
 pairwise worst case, so large sparse worlds build instead of being falsely
 rejected. Its slot term is `levels * chunk_count * (4*ct + nav_interior_link_slots_per_chunk)`
-— independent of the link set — and the link count sizes only the global
+— independent of the link set — and the world's reserved link limit (the same
+`levelLinkLimit` the build reserves, not just today's link count) sizes only the global
 `link_edges`/`link_edge_refs` term.
 
 The cross-cutting ownership rules apply here too: event reactions may have

@@ -393,7 +393,9 @@ pub const PathfindingSystem = struct {
             try self.reserve(self.capacity);
         }
         const level_count: usize = if (world) |world_system| @max(@as(usize, 1), world_system.levelCount()) else 1;
-        const link_count: usize = if (world) |world_system| world_system.levelLinks().len else 0;
+        // The world's RESERVED link limit (not just today's count): the graph reserves its link
+        // edges to the same number, so the gate admits exactly what the build reserves.
+        const link_count: usize = if (world) |world_system| world_system.levelLinkLimit() else 0;
         // Gates against the elastic-CEILING caps (see budgetForCapacity), so a later
         // adjustCapacityForAgentCount growth can never reserve past the admitted budget.
         const budget = nav_memory.budgetForCapacity(self.capacity, level_count, link_count);
@@ -420,7 +422,7 @@ pub const PathfindingSystem = struct {
         // applyNavUpdates allocates nothing per edit.
         try setLen(&self.affected_levels, self.allocator, self.graph.levelCount());
         // The full build assigned every current link's endpoint slots and patched every chunk.
-        self.nav_links_processed = link_count;
+        self.nav_links_processed = if (world) |world_system| world_system.levelLinks().len else 0;
         // Grid versions are part of query keys. A rebuild invalidates pending
         // work and caches instead of trying to remap old requests onto new cells.
         self.clearRuntimeState();
@@ -610,16 +612,18 @@ pub const PathfindingSystem = struct {
     };
 
     // Folds up to nav_new_links_per_step_max new LevelLinks (in link order, from the
-    // nav_links_processed cursor) into the nav graph: assigns their interior endpoint slots with
-    // the same rule a full build uses, then marks BOTH endpoint cells dirty on their own levels
-    // so the next buffered apply patches each endpoint's chunk (plus border neighbors) and
-    // rebuilds the link edges. Links past the budget defer to the next call. Per-call work is
-    // bounded by the fixed budget: 2 dirty cells per link, independent of world size.
+    // nav_links_processed cursor) into the nav graph: marks BOTH endpoint cells dirty on their
+    // own levels so the next buffered apply patches each endpoint's chunk (plus border
+    // neighbors) and rebuilds the link edges, then assigns their interior endpoint slots with
+    // the same rule a full build uses. Links past the budget defer to the next call. Per-call
+    // work is bounded by the fixed budget: 2 dirty cells per link, independent of world size.
     //
-    // The cursor advances only after every mark succeeded (a failed mark leaves it, so the next
-    // call re-marks; slot assignment is idempotent and a duplicate dirty cell is harmless). Main
-    // thread only, before the patch dispatch. Allocation-free while the dirty buffers stay within
-    // their reserved capacity (they grow rather than drop, like every other markNavDirty).
+    // Success-path-only side effects: the fallible marks run FIRST. A failed mark returns before
+    // any slot is assigned, any unslotted endpoint is counted or warned, or the cursor moves, so
+    // the retry assigns, counts, and warns exactly once (a re-marked dirty cell is harmless). The
+    // assignment is infallible and completes before the apply that reads it. Main thread only,
+    // before the patch dispatch. Allocation-free while the dirty buffers stay within their
+    // reserved capacity (they grow rather than drop, like every other markNavDirty).
     pub fn markNewNavLinksDirty(self: *PathfindingSystem, world: *const WorldSystem) !NavLinkCursorStats {
         if (!self.graph.valid()) return .{};
         const links = world.levelLinks();
@@ -627,11 +631,11 @@ pub const PathfindingSystem = struct {
         const first = @min(self.nav_links_processed, links.len);
         const end = @min(links.len, first + nav_new_links_per_step_max);
         if (first == end) return .{};
-        const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
         for (links[first..end]) |link| {
             try self.markNavDirty(link.level_a, link.cell_a.x, link.cell_a.y);
             try self.markNavDirty(link.level_b, link.cell_b.x, link.cell_b.y);
         }
+        const unslotted = self.graph.assignLinkEndpointSlots(links[0..end], first, .cursor);
         self.nav_links_processed = end;
         return .{ .processed = end - first, .deferred = links.len - end, .unslotted = unslotted };
     }

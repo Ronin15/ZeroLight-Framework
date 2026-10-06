@@ -34,6 +34,32 @@ before/after repetitions of adjacent builds, medians):
 Every delta is within max(3%, run-to-run noise). Debug and ReleaseFast
 `zig build test` pass, and `zig build verify` passes.
 
+Review follow-up (2026-10-05), each item with a test:
+- **Event reservation:** a demo test (ramp on an already-walkable cell, tight
+  `capacity_limit`) proves the `hasPendingNavLinks` term makes the preflight
+  fail before any mutation.
+- **Cursor across fallback:** links deferred in the same step as an edge-cap
+  fallback or full relabel stay on the cursor. The next step counts the
+  unslotted endpoint once, and the graph matches a full rebuild.
+- **Mark before assign:** `markNewNavLinksDirty` now marks first and assigns
+  slots afterwards. A failed mark therefore leaves the slot table, counts, and
+  cursor untouched, so nothing is double-counted or warned twice.
+- **Unbuilt graph:** `linkSlotGeometry` returns `.unresolved` when the graph is
+  not valid.
+- **Link storage is a load-time capacity** (CLAUDE.md budgets/capacities rule):
+  - `WorldSystem.reserveLevelLinks` sets a limit, and the demo sizes it as
+    authored links + world chunks × K.
+  - The memory gate and the build's `link_edges` reservation both use
+    `levelLinkLimit`.
+  - `addLevelLink` refuses links past the limit, and the ramp dig refuses
+    first (counted in `dig_ramp_refused_link_slots`).
+  - A FailingAllocator test covers the world, graph, and system.
+- **Admission:** admission replays the assignment rule, so a cell that is an
+  existing but unslotted endpoint is refused.
+- **Bench:** `nav-update-links` rebuilds a fresh zero-link world and runs a full
+  nav build (the load path) before each timed batch, so every batch measures
+  fresh slot assignment.
+
 **Owner decision: a new 64E, not 65B bullets.** 65B moves *large*
 patches/relabels onto the background lane. This defect is in the patch
 *algorithm* (slot geometry, endpoint admission, and which chunks a new link

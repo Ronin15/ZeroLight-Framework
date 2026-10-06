@@ -566,6 +566,13 @@ pub const NavGraph = struct {
 
         self.edge_slack = default_edge_slack;
         try self.buildAbstractGraphs(world);
+        // Reserve the global link edges for every link the world can ever hold (its reserved
+        // limit, which the memory gate above admitted), so runtime links never grow them.
+        if (world) |world_system| {
+            const link_limit = world_system.levelLinkLimit();
+            try self.link_edges.ensureTotalCapacity(self.allocator, link_limit);
+            try self.link_edge_refs.ensureTotalCapacity(self.allocator, 2 * link_limit);
+        }
         try self.rebuildLinkEdges(world);
 
         // Pre-reserve each slot's edge buffer and compaction cursor so a patch — serial OR
@@ -1249,6 +1256,9 @@ pub const NavGraph = struct {
     // The slot geometry a link producer needs to predict assignment (see
     // interiorLinkSlotsAvailable). Valid after any full build.
     pub fn linkSlotGeometry(self: *const NavGraph) NavLinkSlotGeometry {
+        // An unbuilt graph has no slot geometry: report the sentinel so a producer fails loud
+        // (UnresolvedNavLinkGeometry) instead of predicting against default dimensions.
+        if (!self.valid()) return .unresolved;
         return .{ .chunk_tiles = self.chunk_tiles, .width = @intCast(self.width), .height = @intCast(self.height) };
     }
 
@@ -1286,16 +1296,17 @@ pub const NavGraph = struct {
     // the sorted (level, cell) index that lets abstractCorridor find incident links in
     // O(log(link_count)) rather than scanning the full link_edges slice per portal expansion.
     //
-    // Allocation: reserves to the WORLD's own link capacity (one edge and up to two refs per
-    // world link), so this grows only on the cold step where the world's link storage itself
-    // grew; a link added within the world's reservation allocates nothing here.
+    // Allocation: the full build reserves both arrays to the world's reserved link limit
+    // (`WorldSystem.levelLinkLimit`, the same count the nav memory gate admits), so for a
+    // reserved world the ensure below is a no-op and a runtime link never grows them. Only an
+    // unreserved authoring world (links added without `reserveLevelLinks`) grows here.
     fn rebuildLinkEdges(self: *NavGraph, world: ?*const WorldSystem) !void {
         self.link_edges.clearRetainingCapacity();
         self.link_edge_refs.clearRetainingCapacity();
         const world_system = world orelse return;
-        const link_capacity = world_system.levelLinkCapacity();
-        try self.link_edges.ensureTotalCapacity(self.allocator, link_capacity);
-        try self.link_edge_refs.ensureTotalCapacity(self.allocator, 2 * link_capacity);
+        const link_count = world_system.levelLinks().len;
+        try self.link_edges.ensureTotalCapacity(self.allocator, link_count);
+        try self.link_edge_refs.ensureTotalCapacity(self.allocator, 2 * link_count);
         for (world_system.levelLinks()) |link| {
             if (@as(usize, link.level_a) >= self.levels.items.len) continue;
             if (@as(usize, link.level_b) >= self.levels.items.len) continue;
@@ -1755,12 +1766,14 @@ pub const NavLinkSlotGeometry = struct {
 };
 
 // Producer-side admission check for a NEW link endpoint at `cell`: true when `cell` is a
-// perimeter (or out-of-grid) cell, when it is already an interior endpoint of some link in
-// `links` (deduped by cell across levels, as the slot table is), or when its nav chunk holds
-// fewer than nav_interior_link_slots_per_chunk distinct interior endpoint cells over `links`.
-// Counts over the whole link set (including links the incremental cursor has not reached yet),
-// so a refusal agrees with the assignment the cursor will make. O(links), allocation-free, cold
-// (once per dig attempt). Pure: no logging.
+// perimeter (or out-of-grid) cell, when it already HOLDS one of its chunk's interior slots, or
+// when its nav chunk still has a free interior slot. It replays the shared assignment rule
+// (assignLinkEndpointSlots: link order, endpoint a then b, deduped by cell across levels): the
+// first nav_interior_link_slots_per_chunk distinct interior endpoint cells of the chunk are
+// exactly the slotted ones. So a cell that is an existing but UNSLOTTED endpoint (past the cap)
+// is refused like any new cell, and an accepted link is never inert. Counts over the whole link
+// set (including links the incremental cursor has not reached yet), so a refusal agrees with the
+// assignment the cursor will make. O(links), allocation-free, cold (once per dig attempt). Pure.
 pub fn interiorLinkSlotsAvailable(links: []const LevelLink, cell: CellCoord, geometry: NavLinkSlotGeometry) bool {
     std.debug.assert(geometry.isResolved());
     const ct: usize = geometry.chunk_tiles;
@@ -1768,23 +1781,26 @@ pub fn interiorLinkSlotsAvailable(links: []const LevelLink, cell: CellCoord, geo
     if (isPerimeterLocal(cell.x % ct, cell.y % ct, ct)) return true;
     const chunk_x = cell.x / ct;
     const chunk_y = cell.y / ct;
-    var seen: [nav_interior_link_slots_per_chunk]CellCoord = undefined;
-    var seen_count: usize = 0;
-    for (links) |link| {
+    var slotted: [nav_interior_link_slots_per_chunk]CellCoord = undefined;
+    var slotted_count: usize = 0;
+    outer: for (links) |link| {
         for ([2]CellCoord{ link.cell_a, link.cell_b }) |endpoint| {
+            if (slotted_count == slotted.len) break :outer;
             if (endpoint.x >= geometry.width or endpoint.y >= geometry.height) continue;
             if (endpoint.x / ct != chunk_x or endpoint.y / ct != chunk_y) continue;
             if (isPerimeterLocal(endpoint.x % ct, endpoint.y % ct, ct)) continue;
-            if (endpoint.x == cell.x and endpoint.y == cell.y) return true;
-            const already_seen = for (seen[0..seen_count]) |prior| {
+            const already_slotted = for (slotted[0..slotted_count]) |prior| {
                 if (prior.x == endpoint.x and prior.y == endpoint.y) break true;
             } else false;
-            if (already_seen or seen_count == seen.len) continue;
-            seen[seen_count] = endpoint;
-            seen_count += 1;
+            if (already_slotted) continue;
+            slotted[slotted_count] = endpoint;
+            slotted_count += 1;
         }
     }
-    return seen_count < nav_interior_link_slots_per_chunk;
+    for (slotted[0..slotted_count]) |held| {
+        if (held.x == cell.x and held.y == cell.y) return true;
+    }
+    return slotted_count < nav_interior_link_slots_per_chunk;
 }
 
 // Orders a level's portal node indices by chunk-local component label (then cell index
@@ -1822,6 +1838,8 @@ const WorldTilesetMeta = @import("../../../assets/world_tileset_meta.zig").World
 const RangeOutputStream = @import("../../simulation.zig").RangeOutputStream;
 const PathRequest = @import("../../simulation.zig").PathRequest;
 const nav_new_links_per_step_max = types.nav_new_links_per_step_max;
+const budgetForCapacity = @import("nav_memory.zig").budgetForCapacity;
+const NavGridError = types.NavGridError;
 
 // Normalized abstract edge identity for parity comparison: stable across the two
 // independent builds' portal-node numbering because it keys on (level, cell) endpoints.
@@ -2579,13 +2597,15 @@ test "runtime link patch touches a constant chunk set independent of world size"
 }
 
 test "incremental runtime link assignment is allocation-free after warmup" {
-    // Warms one link reaction (an interior and a perimeter link through the cursor) so the
-    // dirty buffers and patch scratch reach their steady capacity, then installs a
-    // FailingAllocator on both the graph and the system and folds one more interior and one
-    // more perimeter link through the REAL 3-worker threaded chunk patch (forced multi-range),
-    // then again through the serial path. Both runs allocate zero times and match a full
-    // rebuild. The world owns link growth: it is pre-reserved for every link this test adds, so
-    // the graph's link edges (reserved to the world's link capacity) never grow either.
+    // The world's level-link storage is reserved at load (reserveLevelLinks) for every link
+    // this test adds, and the full build reserves the graph's link edges to that same limit
+    // (the count the memory gate admits). After one warm link reaction (an interior and a
+    // perimeter link through the cursor) brings the dirty buffers and patch scratch to their
+    // steady capacity, a FailingAllocator is installed on the WORLD, the graph, and the system,
+    // and one more interior and one more perimeter link are added and folded through the REAL
+    // 3-worker threaded chunk patch (forced multi-range), then again through the serial path.
+    // Every step allocates zero times (world link storage, link edges, dirty buffers, patch
+    // scratch) and matches a full rebuild.
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
@@ -2594,7 +2614,7 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     defer meta.deinit();
     var world = try initTwoLevelOpenWorld(&meta, 512);
     defer world.deinit();
-    try world.ensureLevelLinkCapacity(6);
+    try world.reserveLevelLinks(6);
 
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 3, .items_per_range = 1 });
     defer threads.deinit();
@@ -2607,6 +2627,9 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
     system.nav_thread_adaptive = false;
     system.nav_thread_items_per_range = 1;
+    // The build reserved the link edges for the world's whole link limit up front.
+    try std.testing.expect(system.graph.link_edges.capacity >= world.levelLinkLimit());
+    try std.testing.expect(system.graph.link_edge_refs.capacity >= 2 * world.levelLinkLimit());
 
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
@@ -2616,10 +2639,13 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     _ = try reactOneStep(&system, &frame, &data, &world, &threads);
 
     const original = system.allocator;
+    const world_original = world.allocator;
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     system.allocator = failing.allocator();
     system.graph.allocator = failing.allocator();
+    world.allocator = failing.allocator();
     defer {
+        world.allocator = world_original;
         system.graph.allocator = original;
         system.allocator = original;
     }
@@ -2640,9 +2666,204 @@ test "incremental runtime link assignment is allocation-free after warmup" {
     try std.testing.expect(system.graph.last_patch_batch.ran_inline);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 
+    // The reservation is a hard limit: a seventh link is refused, never grown.
+    try std.testing.expectError(error.LevelLinkLimitReached, world.addLevelLink(rampLink(10, 10)));
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    world.allocator = world_original;
     system.graph.allocator = original;
     system.allocator = original;
     try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+}
+
+test "nav memory gate admits the world's reserved link limit, not just its current link count" {
+    // The gate and the build's link-edge reservation measure the same thing
+    // (WorldSystem.levelLinkLimit): a world reserving room for many runtime links is charged
+    // for them at build even while it holds none, so the gate can never admit a build whose
+    // reservation then exceeds max_nav_memory_bytes.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var unreserved = try initTwoLevelOpenWorld(&meta, 384);
+    defer unreserved.deinit();
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(abstractCapacity());
+    // A ceiling that admits exactly the zero-link world (12x12 cells, 2 levels).
+    const zero_link_bytes = budgetForCapacity(system.capacity, 2, 0).requiredBytes(12, 12);
+    system.capacity.max_nav_memory_bytes = zero_link_bytes;
+    try system.rebuildStaticNavGridWithWorld(&data, &unreserved, 384, 384, 32, null);
+
+    var reserved = try initTwoLevelOpenWorld(&meta, 384);
+    defer reserved.deinit();
+    try reserved.reserveLevelLinks(4096);
+    try std.testing.expectEqual(@as(usize, 0), reserved.levelLinks().len);
+    var gated = PathfindingSystem.init(std.testing.allocator);
+    defer gated.deinit();
+    try gated.reserve(abstractCapacity());
+    gated.capacity.max_nav_memory_bytes = zero_link_bytes;
+    try std.testing.expectError(NavGridError.NavWorldTooLarge, gated.rebuildStaticNavGridWithWorld(&data, &reserved, 384, 384, 32, null));
+}
+
+test "interiorLinkSlotsAvailable refuses a cell that is an existing but unslotted endpoint" {
+    // Nine distinct interior endpoints in chunk (0,0): the first K (link order) hold the slots,
+    // the ninth is an existing link endpoint that stays unslotted (inert). A new ramp at that
+    // ninth cell must be refused like any new cell, or the accepted link would be inert too.
+    const k = nav_interior_link_slots_per_chunk;
+    const geometry = NavLinkSlotGeometry{ .chunk_tiles = 8, .width = 16, .height = 16 };
+    var links: [k + 1]LevelLink = undefined;
+    for (&links, 0..) |*link, i| link.* = rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6));
+    const ninth = links[k].cell_a;
+    try std.testing.expect(!interiorLinkSlotsAvailable(&links, ninth, geometry));
+    // A slotted existing endpoint still admits.
+    try std.testing.expect(interiorLinkSlotsAvailable(&links, links[0].cell_a, geometry));
+    try std.testing.expect(interiorLinkSlotsAvailable(&links, links[k - 1].cell_a, geometry));
+
+    // Same answer the shared assignment rule gives: the graph leaves that cell unslotted.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var world = try initTwoLevelOpenWorld(&meta, 512);
+    defer world.deinit();
+    for (links) |link| try world.addLevelLink(link);
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+    try std.testing.expectEqual(@as(usize, 1), system.graph.full_build_link_endpoints_unslotted);
+    const ninth_index: u32 = @intCast(system.graph.grid(1).?.indexForCell(.{ .x = ninth.x, .y = ninth.y }).?);
+    try std.testing.expect(system.graph.portalIndex(1, ninth_index) == null);
+    try std.testing.expectEqual(system.graph.linkSlotGeometry(), geometry);
+}
+
+test "linkSlotGeometry is unresolved on an unbuilt graph" {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try std.testing.expect(!system.graph.valid());
+    try std.testing.expect(!system.graph.linkSlotGeometry().isResolved());
+    try std.testing.expectEqual(NavLinkSlotGeometry.unresolved, system.graph.linkSlotGeometry());
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    try system.reserve(abstractCapacity());
+    try system.rebuildStaticNavGrid(&data, 384, 384, 32);
+    try std.testing.expectEqual(NavLinkSlotGeometry{ .chunk_tiles = 4, .width = 12, .height = 12 }, system.graph.linkSlotGeometry());
+}
+
+test "a failed link mark assigns, counts, and warns nothing; the retry does it exactly once" {
+    // Success-path-only side effects: markNewNavLinksDirty runs its fallible dirty marks BEFORE
+    // the infallible slot assignment, so a failed mark leaves the slot table, the unslotted
+    // count, and the cursor untouched, and the retry assigns and counts each endpoint once.
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var meta = try loadTestWorldMeta(std.testing.allocator);
+    defer meta.deinit();
+    var capacity = abstractCapacity();
+    capacity.nav_chunk_tiles = 8;
+    var world = try initTwoLevelOpenWorld(&meta, 512);
+    defer world.deinit();
+
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+
+    // Fill chunk (0,0)'s K interior slots through the cursor.
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+    _ = try reactOneStep(&system, &frame, &data, &world, null);
+    try std.testing.expect(!system.hasPendingNavLinks(&world));
+
+    // Next batch: a ninth interior cell in the full chunk (0,0) (unslotted) and an interior
+    // cell of chunk (1,1) (would take that chunk's first slot).
+    try world.addLevelLink(rampLink(3, 2));
+    try world.addLevelLink(rampLink(9, 9));
+    const chunk11: u32 = @intCast(system.graph.chunkOf(system.graph.grid(0).?.indexForCell(.{ .x = 9, .y = 9 }).?));
+    const cursor_before = system.nav_links_processed;
+
+    // Make the first dirty mark fail: the dirty buffer is full and the allocator refuses growth.
+    system.clearNavDirty();
+    while (system.nav_dirty_edits.items.len < system.nav_dirty_edits.capacity) {
+        system.nav_dirty_edits.appendAssumeCapacity(.{ .level = 0, .x = 0, .y = 0 });
+    }
+    const original = system.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    system.allocator = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, system.markNewNavLinksDirty(&world));
+    system.allocator = original;
+    try std.testing.expectEqual(cursor_before, system.nav_links_processed);
+    try std.testing.expectEqual(@as(u32, 0), system.graph.chunk_link_count.items[chunk11]);
+
+    // Retry: assigns chunk (1,1)'s slot and counts the unslotted endpoint exactly once.
+    system.clearNavDirty();
+    const retry = try system.markNewNavLinksDirty(&world);
+    try std.testing.expectEqual(@as(usize, 2), retry.processed);
+    try std.testing.expectEqual(@as(usize, 1), retry.unslotted);
+    try std.testing.expectEqual(@as(u32, 1), system.graph.chunk_link_count.items[chunk11]);
+    _ = try system.applyBufferedNavUpdates(&data, &world, null);
+    try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+}
+
+test "links deferred past the per-step budget across a full relabel or edge-cap fallback stay on the cursor" {
+    // A full relabel or edge-cap fallback rebuilds the abstract graph from the WHOLE link set,
+    // including links the cursor deferred this step. The cursor must stay put, so the next
+    // step still visits the deferred links: parity holds and their unslotted endpoint is
+    // counted exactly once, by the cursor, on the step that folds it.
+    const Fallback = enum { edge_cap_fallback, full_relabel };
+    for ([_]Fallback{ .edge_cap_fallback, .full_relabel }) |fallback| {
+        var data = DataSystem.init(std.testing.allocator);
+        defer data.deinit();
+        var meta = try loadTestWorldMeta(std.testing.allocator);
+        defer meta.deinit();
+        var capacity = abstractCapacity();
+        capacity.nav_chunk_tiles = 8;
+        var world = try initTwoLevelOpenWorld(&meta, 512);
+        defer world.deinit();
+
+        var system = PathfindingSystem.init(std.testing.allocator);
+        defer system.deinit();
+        try system.reserve(capacity);
+        try system.rebuildStaticNavGridWithWorld(&data, &world, 512, 512, 32, null);
+        switch (fallback) {
+            // Every chunk's edge window overflows on the first patch.
+            .edge_cap_fallback => for (system.graph.chunk_edge_cap.items) |*cap| {
+                cap.* = 0;
+            },
+            // Two affected levels exceed a threshold of 1.
+            .full_relabel => system.capacity.nav_full_relabel_level_threshold = 1,
+        }
+
+        // Ten links in one step: K fill chunk (0,0)'s interior slots; link 8 is a ninth distinct
+        // interior cell there (unslotted); link 9 is interior to chunk (1,1).
+        comptime std.debug.assert(nav_interior_link_slots_per_chunk == nav_new_links_per_step_max);
+        for (0..nav_interior_link_slots_per_chunk) |i| try world.addLevelLink(rampLink(@intCast(1 + i % 6), @intCast(1 + i / 6)));
+        try world.addLevelLink(rampLink(3, 2));
+        try world.addLevelLink(rampLink(9, 9));
+
+        var frame = SimulationFrame.init(std.testing.allocator);
+        defer frame.deinit();
+        const step1 = try reactOneStep(&system, &frame, &data, &world, null);
+        try std.testing.expectEqual(@as(usize, 1), step1.version_bumps);
+        switch (fallback) {
+            .edge_cap_fallback => try std.testing.expectEqual(@as(usize, 1), step1.edge_cap_fallback),
+            .full_relabel => try std.testing.expectEqual(@as(usize, 1), step1.full_relabel),
+        }
+        try std.testing.expectEqual(@as(usize, 2), step1.links_deferred);
+        try std.testing.expectEqual(@as(usize, 0), step1.link_endpoints_unslotted);
+        // The fallback assigned the whole link set but left the cursor on the deferred links.
+        try std.testing.expectEqual(nav_new_links_per_step_max, system.nav_links_processed);
+
+        const step2 = try reactOneStep(&system, &frame, &data, &world, null);
+        try std.testing.expectEqual(@as(usize, 0), step2.links_deferred);
+        try std.testing.expectEqual(@as(usize, 1), step2.link_endpoints_unslotted);
+        try std.testing.expect(!system.hasPendingNavLinks(&world));
+        try expectLinkPatchMatchesFullRebuild(&system, &data, &world, 512, capacity);
+    }
 }
 
 test "interiorLinkSlotsAvailable admits perimeter and known cells and refuses a ninth distinct interior cell" {

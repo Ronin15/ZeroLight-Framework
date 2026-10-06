@@ -89,8 +89,9 @@ pub const DigController = struct {
     /// init and after every full nav build. Defaults to the unresolved sentinel: a ramp dig
     /// with it unresolved returns `error.UnresolvedNavLinkGeometry` before any mutate.
     nav_link_geometry: NavLinkSlotGeometry = .unresolved,
-    /// Telemetry: ramp digs refused because the faced cell's nav chunk had no free interior
-    /// link slot (perf metric `dig_ramp_refused_link_slots`).
+    /// Telemetry: ramp digs refused for lack of a link slot: the faced cell's nav chunk had
+    /// no free interior link slot, or the world's reserved level-link limit was reached
+    /// (perf metric `dig_ramp_refused_link_slots`).
     ramp_refused_link_slots: u64 = 0,
 
     pub fn init(config: DigConfig) DigController {
@@ -152,9 +153,13 @@ pub const DigController = struct {
             // Runtime check (not a Debug-only assert), matching UnresolvedDigTiles above.
             if (!self.nav_link_geometry.isResolved()) return error.UnresolvedNavLinkGeometry;
             // Refuse a ramp whose new interior endpoint would find its nav chunk's fixed link
-            // slots full: the link would be inert to NPC pathing. Same no-mutate early return
-            // as the existing-link no-op; the player re-presses to dig elsewhere.
-            if (!interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry)) {
+            // slots full (the link would be inert to NPC pathing), or the world's reserved
+            // level-link limit is reached (the link would have to grow storage on the hot
+            // path). Same no-mutate early return as the existing-link no-op; the player
+            // re-presses to dig elsewhere.
+            if (!world.hasLevelLinkRoom() or
+                !interiorLinkSlotsAvailable(world.levelLinks(), cell, self.nav_link_geometry))
+            {
                 self.ramp_refused_link_slots += 1;
                 return;
             }
@@ -786,6 +791,34 @@ test "a ninth interior ramp in one nav chunk is refused" {
     try std.testing.expectEqual(dig.ramp_tile, tw.world.denseTile(floor, 7, 3));
     try std.testing.expectEqual(@as(usize, k + 1), tw.world.levelLinks().len);
     try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
+}
+
+test "a ramp dig past the world's reserved level-link limit is refused without growing storage" {
+    var tw = try TestWorld.init(.right, 1);
+    defer tw.deinit();
+    var dig = try testDigController(&tw.meta);
+    // Reserved at load with no room for a runtime link.
+    try tw.world.reserveLevelLinks(0);
+
+    const floor = tw.world.denseFloorLayerForLevel(1).?;
+    const before = tw.world.denseTile(floor, 4, 3);
+    const original = tw.world.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    tw.world.allocator = failing.allocator();
+    defer tw.world.allocator = original;
+
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    try frame.reserveStreams(4, 8, 8, 8, 8, 8);
+    frame.beginStep();
+    frame.dig_intent = .ramp;
+    try dig.process(&tw.world, &tw.data, tw.player, &frame);
+
+    try std.testing.expectEqual(before, tw.world.denseTile(floor, 4, 3));
+    try std.testing.expectEqual(@as(usize, 0), tw.world.levelLinks().len);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(u64, 1), dig.ramp_refused_link_slots);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "a ramp dig with unresolved nav link geometry fails before mutating the world" {

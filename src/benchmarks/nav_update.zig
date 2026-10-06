@@ -675,9 +675,13 @@ pub fn linkItemCounts(profile: suite.Profile) []const usize {
 
 // Same world shape as the tile-edit fixture (256x256 tiles, 32 px cells, default 16-tile nav
 // chunks) with an open grass level 1 under the surface, so every ramp link joins two open levels.
+// The tileset meta is loaded once; the world itself is rebuilt fresh (zero links) before every
+// timed batch, see resetLinkWorld.
 const LinksFixture = struct {
     // Stored at build time — see Fixture's matching field for why.
     allocator: std.mem.Allocator,
+    meta: world_tileset_meta.WorldTilesetMeta,
+    grass: TileId,
     data: DataSystem,
     world: WorldSystem,
     system: PathfindingSystem,
@@ -686,6 +690,7 @@ const LinksFixture = struct {
         self.system.deinit();
         self.world.deinit();
         self.data.deinit();
+        self.meta.deinit();
         self.* = undefined;
     }
 };
@@ -703,38 +708,61 @@ fn sharedLinksFixture(allocator: std.mem.Allocator, io: std.Io) !*LinksFixture {
     return &links_fixture.?;
 }
 
+// A fresh two-level world with ZERO links whose link storage is reserved (at load, like the
+// demo) for the largest batch, so the timed loop never grows it.
+fn buildLinkWorld(allocator: std.mem.Allocator, meta: *const world_tileset_meta.WorldTilesetMeta, grass: TileId) !WorldSystem {
+    var world = try WorldSystem.initDemoFromMeta(allocator, meta, world_bounds, world_bounds);
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    _ = try world.addDenseLayer(1, 0, .floor, grass);
+    try world.reserveLevelLinks(link_counts[link_counts.len - 1]);
+    return world;
+}
+
 fn buildLinksFixture(allocator: std.mem.Allocator, io: std.Io, participant_count: usize) !LinksFixture {
     var data = DataSystem.init(allocator);
     errdefer data.deinit();
 
     const asset_store = AssetStore.init(allocator, io, "assets");
     var meta = try world_tileset_meta.load(allocator, asset_store, manifest.spriteSpec(.world_tileset).metadata_path.?);
-    defer meta.deinit();
+    errdefer meta.deinit();
     const grass = try requireTile(&meta, "grass");
 
-    var world = try WorldSystem.initDemoFromMeta(allocator, &meta, world_bounds, world_bounds);
+    var world = try buildLinkWorld(allocator, &meta, grass);
     errdefer world.deinit();
-    _ = try world.addLevel(0);
-    _ = try world.addDenseLayer(1, 0, .floor, grass);
-    // The world owns link storage; reserve the largest batch so the timed loop never grows it.
-    try world.ensureLevelLinkCapacity(link_counts[link_counts.len - 1]);
 
     var system = PathfindingSystem.init(allocator);
     errdefer system.deinit();
     try system.reserve(.{ .worker_participant_count = @max(@as(usize, 1), participant_count) });
     try system.rebuildStaticNavGridWithWorld(&data, &world, world_bounds, world_bounds, tile_size, null);
 
-    return .{ .allocator = allocator, .data = data, .world = world, .system = system };
+    return .{ .allocator = allocator, .meta = meta, .grass = grass, .data = data, .world = world, .system = system };
 }
 
-// Times one batch: adds `n` ramp links (chunk-center interior cells of the first `n` chunks,
-// row-major, levels 1<->0; untimed), then times the link cursor + buffered incremental apply,
-// exactly the post-commit reaction's link work. Afterwards (untimed) it returns the world and
-// cursor to the zero-link baseline so the per-iteration cost never drifts with an ever-growing
-// link set (links are append-only in production; this reset is bench-only). The interior slot
-// table keeps the same `n` cells, and re-adding the identical links reuses those exact slots, so
-// every iteration assigns, dirties, and patches the same footprint as the first.
+// Untimed per-iteration reset through the production load path: replaces the world with a
+// fresh zero-link world and runs the full nav build over it (which resets the slot table and
+// the link cursor exactly as a load does). Links are append-only in production, so this is the
+// only honest way back to a zero-link baseline; it keeps every timed batch assigning FRESH
+// interior slots and keeps rebuildLinkEdges' O(links) cost from drifting with iteration count.
+// The full build also resets the adaptive stage tuners, so the case's trained tuners are carried
+// across it (the same tuner hand-off runLinksCase does per case).
+fn resetLinkWorld(fixture: *LinksFixture) !void {
+    const fresh = try buildLinkWorld(fixture.allocator, &fixture.meta, fixture.grass);
+    fixture.world.deinit();
+    fixture.world = fresh;
+    const remask_tuner = fixture.system.nav_remask_tuner;
+    const patch_tuner = fixture.system.nav_patch_tuner;
+    try fixture.system.rebuildStaticNavGridWithWorld(&fixture.data, &fixture.world, world_bounds, world_bounds, tile_size, null);
+    fixture.system.nav_remask_tuner = remask_tuner;
+    fixture.system.nav_patch_tuner = patch_tuner;
+}
+
+// Times one batch on a fresh zero-link world: adds `n` ramp links (chunk-center interior cells
+// of the first `n` chunks, row-major, levels 1<->0; untimed), then times the link cursor
+// (fresh slot assignment + both-level dirty marks) and the buffered incremental apply, exactly
+// the post-commit reaction's link work.
 fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, thread_system: ?*ThreadSystem) !u64 {
+    try resetLinkWorld(fixture);
     for (0..n) |i| {
         const x: u16 = @intCast((i % chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
         const y: u16 = @intCast((i / chunks_per_side) * nav_chunk_tiles + nav_chunk_tiles / 2);
@@ -744,10 +772,7 @@ fn timeLinkBatch(fixture: *LinksFixture, io: std.Io, n: usize, thread_system: ?*
     const t0 = suite.nowNs(io);
     _ = try fixture.system.markNewNavLinksDirty(&fixture.world);
     _ = try fixture.system.applyBufferedNavUpdates(&fixture.data, &fixture.world, thread_system);
-    const ns = suite.elapsedNs(t0, suite.nowNs(io));
-    fixture.world.level_links.clearRetainingCapacity();
-    fixture.system.nav_links_processed = 0;
-    return ns;
+    return suite.elapsedNs(t0, suite.nowNs(io));
 }
 
 pub fn runLinksCase(allocator: std.mem.Allocator, io: std.Io, options: suite.Options, case: suite.BenchmarkCase, item_count: usize) !suite.RunStats {

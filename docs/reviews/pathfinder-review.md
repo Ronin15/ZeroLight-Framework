@@ -20,7 +20,7 @@ at each step. Test count grew from the pre-change baseline to 584 passing.
   full rebuild. Every nav chunk now carries a fixed `nav_interior_link_slots_per_chunk` (8)
   interior link slots, and the post-commit link cursor folds new links in on both endpoint
   levels under a fixed per-step budget (`nav_new_links_per_step_max`, deterministic deferral).
-  N1 is also resolved: `link_edges`/`link_edge_refs` reserve to the world's link capacity.
+  N1 is also resolved: `link_edges`/`link_edge_refs` reserve at the full build to the world's reserved link limit (`WorldSystem.reserveLevelLinks`).
 
 The findings below are the original review, retained for reference.
 
