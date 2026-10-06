@@ -79,7 +79,9 @@
 //! (`computePerceptionRange`) — see the serial/threaded parity test.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const stance = @import("../faction.zig").stance;
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
@@ -104,6 +106,7 @@ const SimulationEvents = @import("../simulation.zig").SimulationEvents;
 const SimulationFrame = @import("../simulation.zig").SimulationFrame;
 const WorldStimulus = @import("../simulation.zig").WorldStimulus;
 const stimulusHearingScore = @import("../simulation.zig").stimulusHearingScore;
+const perception_events_per_observer_max = @import("../simulation.zig").perception_events_per_observer_max;
 const spatial_index_mod = @import("spatial_index.zig");
 const SpatialIndexView = spatial_index_mod.SpatialIndexView;
 const NeighborVisitResult = spatial_index_mod.NeighborVisitResult;
@@ -497,6 +500,10 @@ pub const PerceptionSystem = struct {
     event_ranges: PerceptionEventRangeSlotList = .empty,
     range_stats: PerceptionRangeStatsSlotList = .empty,
     range_take_counts: std.ArrayList(usize) = .empty,
+    /// Once-only flag for the merge-cap drop warn. The pipeline's derived share makes a
+    /// drop impossible by construction; the cap and `dropped_events` stay as the
+    /// shared-frame safety net.
+    dropped_events_warned: bool = false,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(perception_adaptive_tuner_config),
     // Per-level LOS-blocked bitmap cache, indexed directly by level (see
     // `LevelBlockedSlot`). Sized/reused across steps (never deinit between
@@ -560,7 +567,7 @@ pub const PerceptionSystem = struct {
         try self.prepareRangeStats(ranges);
         try self.range_take_counts.ensureTotalCapacity(self.allocator, ranges);
         if (self.event_ranges.items.len > 0) {
-            try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * 2);
+            try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * perception_events_per_observer_max);
         }
     }
 
@@ -1040,7 +1047,7 @@ pub const PerceptionSystem = struct {
             // Worst case: an identity swap emits two events for one row, so
             // this exact reserve can never overflow (unlike collision's
             // broadphase pair estimate) — no grow-and-replay dance needed.
-            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * 2);
+            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * perception_events_per_observer_max);
         }
     }
 
@@ -1115,6 +1122,13 @@ pub const PerceptionSystem = struct {
         }
         events.finishWrite();
         events.stats.dropped += dropped;
+        if (dropped > 0 and !self.dropped_events_warned) {
+            self.dropped_events_warned = true;
+            if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+                "perception: {d} events dropped past the per-step share of {d}",
+                .{ dropped, max_events_per_step },
+            );
+        }
 
         return .{ .perceived = perceived, .lost = lost, .dropped = dropped };
     }
@@ -3052,6 +3066,14 @@ test "PerceptionSystem enforces its own per-step event cap and records the drop 
     try testing.expectEqual(@as(usize, 1), stats.dropped_events);
     try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
     try testing.expectEqual(@as(usize, 1), events.stats.dropped);
+    try testing.expect(sys.dropped_events_warned);
+
+    // The flag is once-only: a later capped step never clears it.
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), data.movementBodySliceConst(), spatial_sys.view(), &world, &data, &events, .{
+        .max_events_per_step = 1,
+    });
+    try testing.expect(sys.dropped_events_warned);
 }
 
 test "multi-range serial/threaded cap=1 keeps the same survivor under identity-swap + acquire" {

@@ -103,20 +103,7 @@ const DemoPopulationCapacity = struct {
     contact_capacity: usize,
     intent_capacity: usize,
     collision_trigger_capacity: usize,
-    perception_event_reserve: usize,
-    affect_event_reserve: usize,
 };
-
-/// `demoArchetypeForIndex`'s fixed 8-slot cycle carries exactly 3 "full
-/// cognition" archetypes (timid/aggressive/curious -- the only ones that
-/// attach `AiPerception` + `AiAffect`; cohere reads the shared spatial index
-/// directly and needs neither). Rounds `mover_count` up to a whole cycle so
-/// this stays a safe upper bound for any population, not an exact count tied
-/// to one remainder.
-fn demoCognitionAgentCount(mover_count: usize) usize {
-    const whole_cycles = (mover_count + demo_archetype_cycle_len - 1) / demo_archetype_cycle_len;
-    return whole_cycles * demo_cognition_archetypes_per_cycle;
-}
 
 fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // Matches the historical 24/32 == 0.75 surface/total split.
@@ -139,14 +126,9 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
     // The per-step `frame.events` bound is not derived here: it is the exhaustive
     // `EventProducerId` table (`simulation.zig`), summed by
-    // `SimulationPipeline.eventCapacitySum()`. This demo only supplies the per-producer
-    // inputs: the perception/affect shares below (2 events per cognition agent: an
-    // identity swap emits lost + perceived; 1 per drive, 4 drives) for the
-    // `demoArchetypeForIndex` subset that carries `AiPerception`/`AiAffect` (see
-    // `demoCognitionAgentCount`), and `demo_structural_headroom`.
-    const cognition_agents = demoCognitionAgentCount(mover_count);
-    const perception_event_reserve = cognition_agents * 2;
-    const affect_event_reserve = cognition_agents * 4;
+    // `SimulationPipeline.eventCapacitySum()`. The perception/affect shares derive from
+    // committed `AiPerception`/`AiAffect` rows inside the pipeline; this demo only
+    // supplies `demo_structural_headroom`.
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -154,8 +136,6 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
         .contact_capacity = contact_capacity,
         .intent_capacity = intent_capacity,
         .collision_trigger_capacity = collision_trigger_capacity,
-        .perception_event_reserve = perception_event_reserve,
-        .affect_event_reserve = affect_event_reserve,
     };
 }
 
@@ -464,11 +444,6 @@ pub const GameDemoState = struct {
             .navigation_world = &world,
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
-            // The `demoArchetypeForIndex` cognition subset (timid/aggressive/curious)
-            // carries `AiPerception` (see `demoCognitionAgentCount`).
-            .perception_max_events_per_step = pop_cap.perception_event_reserve,
-            // Same cognition subset also carries `AiAffect`.
-            .affect_max_events_per_step = pop_cap.affect_event_reserve,
             .structural_headroom = demo_structural_headroom,
         });
         errdefer pipeline.deinit();
@@ -1045,8 +1020,8 @@ const demo_archetype_cycle_len: usize = ai_archetypes.archetype_count;
 /// cognition), 4 aggressive (high aggression/pursue, full cognition), 5 curious
 /// (high curiosity/investigate, full cognition), 6 cohesive (cohere from the
 /// shared spatial index, no cognition components), 7 pursuer_strong. Slots 3/4/5
-/// are the `demoCognitionAgentCount` subset that attaches `AiPerception` +
-/// `AiAffect`. Bundles are data-driven from `assets/ai/archetypes.json`.
+/// attach `AiPerception` + `AiAffect`; the pipeline derives the event shares from
+/// committed rows. Bundles are data-driven from `assets/ai/archetypes.json`.
 const demo_slot_ids: [demo_archetype_cycle_len]AiArchetypeId = .{
     .wanderer,
     .pursuer,
@@ -1061,10 +1036,6 @@ const demo_slot_ids: [demo_archetype_cycle_len]AiArchetypeId = .{
 comptime {
     std.debug.assert(demo_slot_ids.len == 8);
 }
-/// Count of cycle slots that attach `AiPerception` + `AiAffect` (timid,
-/// aggressive, curious) — kept in sync with `demo_slot_ids`' cognition subset
-/// by `demoCognitionAgentCount`'s doc comment; update both together.
-const demo_cognition_archetypes_per_cycle: usize = 3;
 
 /// Resolves the data-driven bundle for the demo's cyclic personality slot.
 fn demoArchetypeForIndex(catalog: *const AiArchetypeCatalog, index: usize) DemoArchetype {

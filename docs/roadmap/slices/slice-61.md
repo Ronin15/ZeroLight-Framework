@@ -77,10 +77,13 @@ live in the controller.
   (`data_system/types.zig:601,634-652`), `combineDrive` lerp-to-baseline
   (`systems/affect.zig:483-492`), `above_threshold_mask: u8` (8-drive headroom).
   The Emergent AI Track Overview runbook ("How to add a new feeling") governs
-  adding a drive. The demo's `affect_event_reserve = cognition_agents * 4`
-  hard-codes "4 drives" (`game_demo_state.zig:150-158`), and `AffectSystem`
-  caps crossings at `max_events_per_step` (`affect.zig:413`); the demo's
-  `capacity_limit` test pins the literal 293 (`game_demo_state.zig:2156`).
+  adding a drive. `AffectSystem` caps crossings at `max_events_per_step`
+  (`affect.zig:413`); the pipeline passes the derived share
+  `affect_events_per_row_max × AiAffect rows` (`simulation.zig`, Slice 72 C4),
+  where `affect_events_per_row_max` is
+  `@typeInfo(AiAffectDrive).@"enum".field_names.len`, so a new drive widens the
+  share automatically. The demo's `capacity_limit` test pins a literal
+  (`game_demo_state.zig:2156`).
 - Contact, trigger, and intent capacity: `estimateContactCapacity(mover_count +
   obstacle_count + 1)` and the trigger estimate (`game_demo_state.zig:127-135`)
   feed `reserveStreams` and `.contact_capacity`.
@@ -331,14 +334,11 @@ enqueues a frustration impulse (below). The node is untouched.
   appraisal signal: `need` decays toward its baseline. A forager authors a high
   baseline, so `need` regrows after relief. Agents with baseline 0 never feel
   `need`. Threshold edges come from the existing Schmitt path.
-- **Affect event reserve.** A fifth drive adds threshold crossings, so the
-  demo's `affect_event_reserve` multiplier becomes
-  `@typeInfo(AiAffectDrive).@"enum".field_names.len` (5) instead of the literal
-  4 (`game_demo_state.zig:150-158`), and the comment loses "4 drives". The
-  reserve test's hard-coded worst case (`:2056`) is updated deliberately to the
-  new literal. Without this, `AffectSystem`'s `max_events_per_step` cap
-  (`affect.zig:413`) would silently and deterministically truncate the fifth
-  drive's crossings.
+- **Affect event share.** A fifth drive needs no capacity edit: the pipeline's
+  share is `affect_events_per_row_max × AiAffect rows` (Slice 72 C4), and the
+  constant becomes 5 automatically. Only the demo's `capacity_limit` literal test
+  (`game_demo_state.zig:2156`) is re-pinned deliberately (+12 at the default 32
+  movers).
 - `AffectImpulse = { entity: EntityId, drive: AiAffectDrive, delta: f32 }`
   (scalar only). The exhaustive `AffectImpulseProducer = enum { harvest }` has
   a matching `maxAffectImpulsesPerStep(.harvest) = action_intent_live_capacity`.
@@ -518,7 +518,7 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
 - [ ] `ActionKind.harvest`; `HarvestController` inserted before destructible in Slice 56's claim order using 56's `ActionClaimSet`; destructible parity tests are unchanged.
 - [ ] Slice 57 transfer wiring: `PipelineResource.inventory_transfers`, the `StepState` queue instance, and `inventory_update` phase 0 via `applyTransferBatch`; a two-sided batch with insufficient funds still applies nothing (57's test, now through the pipeline).
 - [ ] `HarvestController.process`, steps 1–8 above (grants via `TransferBatch.grant` + `tryAppend` with `canAccept` preflight), plus the regrowth sweep with the `u64`-widened cursor and `stepAfter`/`stepReached`.
-- [ ] `AiAffectDrive.need` end to end via the runbook: columns, validation, archetype keys, debug bar, table row; `affect_event_reserve` multiplier derived from the drive count, and the reserve test's literal updated.
+- [ ] `AiAffectDrive.need` end to end via the runbook: columns, validation, archetype keys, debug bar, table row; the affect share widens automatically through `affect_events_per_row_max` (Slice 72 C4); the demo `capacity_limit` literal is re-pinned.
 - [ ] `AffectImpulse` substrate in `AffectSystem`; per-producer budgets; `reactToPostCommitAffectImpulses` drain at the commit seam; `FailingAllocator` proof.
 - [ ] `AiBehavior.forage`, `gain_forage`, the `Signals` fields, the weight column, `resolveGoal`, `coastableBehavior(.forage) = false`; generalised `findNearestMarker`; `RowForage` gather; `.harvest` arm in `ai_action_select`.
 - [ ] Archetypes:

@@ -56,6 +56,14 @@ pub const EventProducerId = enum {
     nav_reaction,
 };
 
+/// Most perception events one observer emits per step: an identity swap emits
+/// `entity_lost` + `entity_perceived`.
+pub const perception_events_per_observer_max: usize = 2;
+
+/// Most `affect_threshold_crossed` events one `AiAffect` row emits per step: one per
+/// drive, so a new drive widens the share automatically.
+pub const affect_events_per_row_max: usize = @typeInfo(AiAffectDrive).@"enum".field_names.len;
+
 pub const EventBudgetInputs = struct {
     perception_max_events_per_step: usize = 0,
     affect_max_events_per_step: usize = 0,

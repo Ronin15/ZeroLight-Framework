@@ -2,7 +2,72 @@
 
 ## Slice 72: Live Capacity Sizing Pass
 
-**Status: in progress — Batch A landed (A1–A4); Batches M and B–K not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+**Status: in progress — Batches A (A1–A4), B (B1) and C (C1–C4) landed; Batches M and D–K not started.** No gate. Each batch lands and is benchmarked on its own, in batch-table order. An item is checked off only together with its tests and its bench record. The work listed under "Owned by other slices" is not part of this slice's completion. This slice only lands the cross-edits those owners need.
+
+**Batch B + C bench record (2026-10-06).** `zig build -Doptimize=ReleaseFast bench -- --group <name>`, 5 interleaved before/after repetitions (odd reps before first, even reps after first). Before = `0e6a74e` (the commit preceding B1), after = B1–C4 together, both built from exported trees. Medians of each case's mean; run spread = the larger of the before/after (max − min) / median. Groups: the union of the B and C gates (`perception`, `ai-affect`, `collision`, `collision-sparse`, `steering`, `scope`, `spatial_index`, `ai`, `ai-memory`, `movement`), every case at every item count (240 cases) gated against max(3%, spread). The table lists the serial baseline and the production `thread-adaptive-tuned-range` row, all within the gate. **Two forced-scheduler control rows breached formally:** `perception` 4096 `thread-fixed-2` (130.07 us → 198.48 us, +52.6% vs 35.8% spread) and `steering` 512 `thread-fixed-auto` (55.55 us → 72.03 us, +29.7% vs 26.1% spread). Six extra interleaved diagnostic pairs of each show scheduler bimodality on both sides, not a regression: perception before {129, 194, 134, 206, 190, 131} us vs after {194, 130, 132, 131, 130, 138} us; steering before median 66.1 us vs after 64.4 us. Neither code path changes on those benches (perception: one constant of equal value plus a once-only drop-warn branch in the merge; steering: the statics pre-pass runs only on invalidation steps). The `perception` and `ai-affect` fixtures run the systems standalone at their default 512-event cap, so they now print C4's once-per-system drop warn; their workload columns are unchanged. Memory: C1 moves ≈0.28 MiB of first-step collision growth to init at 2053 bodies; C2 drops ≈0.12 MiB of idle obstacle scratch; C3's tier-command slot 0 costs population × 472 B (≈0.92 MiB at 2053, 17 KiB for the shipped 37-body demo; no demo init change otherwise); C4 leaves the shipped `capacity_limit` at 293. The seam's fast path (8 store-length loads, a `deriveCapacity` copy, 5 compares per step) has no isolating bench group; no gated group drives `SimulationPipeline`.
+
+| group | case | items | before (median mean) | after (median mean) | delta | run spread | ok |
+|---|---|---|---|---|---|---|---|
+| `perception` | serial-direct | 1024 | 61.98 us | 62.29 us | +0.5% | 11.8% | ok |
+| `perception` | thread-adaptive-tuned-range | 1024 | 61.90 us | 60.86 us | -1.7% | 3.7% | ok |
+| `perception` | serial-direct | 4096 | 284.80 us | 285.50 us | +0.2% | 3.5% | ok |
+| `perception` | thread-adaptive-tuned-range | 4096 | 280.43 us | 281.61 us | +0.4% | 54.0% | ok |
+| `perception` | serial-direct | 10000 | 711.00 us | 716.11 us | +0.7% | 3.4% | ok |
+| `perception` | thread-adaptive-tuned-range | 10000 | 224.78 us | 304.19 us | +35.3% | 195.3% | ok |
+| `ai-affect` | serial-direct | 1024 | 10.96 us | 11.38 us | +3.8% | 13.7% | ok |
+| `ai-affect` | thread-adaptive-tuned-range | 1024 | 11.07 us | 11.19 us | +1.1% | 8.7% | ok |
+| `ai-affect` | serial-direct | 4096 | 45.63 us | 45.66 us | +0.1% | 11.4% | ok |
+| `ai-affect` | thread-adaptive-tuned-range | 4096 | 45.26 us | 45.02 us | -0.5% | 2.0% | ok |
+| `ai-affect` | serial-direct | 10000 | 111.98 us | 112.67 us | +0.6% | 25.9% | ok |
+| `ai-affect` | thread-adaptive-tuned-range | 10000 | 112.31 us | 113.19 us | +0.8% | 4.9% | ok |
+| `collision` | serial-direct | 1024 | 21.23 us | 19.44 us | -8.4% | 28.7% | ok |
+| `collision` | thread-adaptive-tuned-range | 1024 | 20.71 us | 20.59 us | -0.6% | 16.5% | ok |
+| `collision` | serial-direct | 4096 | 123.60 us | 122.77 us | -0.7% | 16.7% | ok |
+| `collision` | thread-adaptive-tuned-range | 4096 | 132.54 us | 131.30 us | -0.9% | 2.5% | ok |
+| `collision` | serial-direct | 10000 | 790.79 us | 787.48 us | -0.4% | 4.0% | ok |
+| `collision` | thread-adaptive-tuned-range | 10000 | 390.54 us | 389.52 us | -0.3% | 30.6% | ok |
+| `collision-sparse` | serial-direct | 1024 | 7.35 us | 6.77 us | -7.9% | 17.7% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 1024 | 7.20 us | 7.21 us | +0.1% | 11.7% | ok |
+| `collision-sparse` | serial-direct | 4096 | 34.04 us | 34.08 us | +0.1% | 14.8% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 4096 | 36.16 us | 35.51 us | -1.8% | 13.2% | ok |
+| `collision-sparse` | serial-direct | 10000 | 188.78 us | 186.79 us | -1.1% | 4.3% | ok |
+| `collision-sparse` | thread-adaptive-tuned-range | 10000 | 203.06 us | 202.19 us | -0.4% | 18.1% | ok |
+| `steering` | serial-direct | 128 | 23.94 us | 24.14 us | +0.8% | 9.9% | ok |
+| `steering` | thread-adaptive-tuned-range | 128 | 23.88 us | 24.15 us | +1.1% | 21.4% | ok |
+| `steering` | serial-direct | 512 | 101.37 us | 100.71 us | -0.7% | 19.4% | ok |
+| `steering` | thread-adaptive-tuned-range | 512 | 100.38 us | 100.95 us | +0.6% | 7.7% | ok |
+| `steering` | serial-direct | 1024 | 229.60 us | 245.86 us | +7.1% | 26.2% | ok |
+| `steering` | thread-adaptive-tuned-range | 1024 | 235.72 us | 241.04 us | +2.3% | 13.9% | ok |
+| `scope` | serial-direct | 1024 | 24.18 us | 23.94 us | -1.0% | 15.0% | ok |
+| `scope` | thread-adaptive-tuned-range | 1024 | 25.05 us | 25.09 us | +0.2% | 6.1% | ok |
+| `scope` | serial-direct | 4096 | 102.77 us | 102.36 us | -0.4% | 4.7% | ok |
+| `scope` | thread-adaptive-tuned-range | 4096 | 106.80 us | 108.79 us | +1.9% | 9.1% | ok |
+| `scope` | serial-direct | 10000 | 299.30 us | 293.79 us | -1.8% | 2.7% | ok |
+| `scope` | thread-adaptive-tuned-range | 10000 | 302.10 us | 303.98 us | +0.6% | 1.5% | ok |
+| `spatial_index` | serial-direct | 1024 | 10.40 us | 10.19 us | -2.0% | 19.8% | ok |
+| `spatial_index` | thread-adaptive-tuned-range | 1024 | 11.19 us | 11.47 us | +2.5% | 7.2% | ok |
+| `spatial_index` | serial-direct | 4096 | 47.79 us | 48.23 us | +0.9% | 6.3% | ok |
+| `spatial_index` | thread-adaptive-tuned-range | 4096 | 53.87 us | 53.65 us | -0.4% | 10.4% | ok |
+| `spatial_index` | serial-direct | 10000 | 157.87 us | 156.74 us | -0.7% | 11.0% | ok |
+| `spatial_index` | thread-adaptive-tuned-range | 10000 | 167.27 us | 167.30 us | +0.0% | 1.8% | ok |
+| `ai` | serial-direct | 1024 | 250.29 us | 231.69 us | -7.4% | 26.6% | ok |
+| `ai` | thread-adaptive-tuned-range | 1024 | 220.86 us | 218.47 us | -1.1% | 2.3% | ok |
+| `ai` | serial-direct | 4096 | 1.06 ms | 1.06 ms | +0.0% | 1.9% | ok |
+| `ai` | thread-adaptive-tuned-range | 4096 | 504.19 us | 536.83 us | +6.5% | 94.2% | ok |
+| `ai` | serial-direct | 10000 | 2.63 ms | 2.62 ms | -0.4% | 17.5% | ok |
+| `ai` | thread-adaptive-tuned-range | 10000 | 821.89 us | 1.21 ms | +47.2% | 50.6% | ok |
+| `ai-memory` | serial-direct | 1024 | 5.78 us | 5.80 us | +0.3% | 23.4% | ok |
+| `ai-memory` | thread-adaptive-tuned-range | 1024 | 5.82 us | 5.77 us | -0.9% | 4.1% | ok |
+| `ai-memory` | serial-direct | 4096 | 23.48 us | 23.37 us | -0.5% | 3.2% | ok |
+| `ai-memory` | thread-adaptive-tuned-range | 4096 | 23.61 us | 23.95 us | +1.4% | 52.2% | ok |
+| `ai-memory` | serial-direct | 10000 | 58.60 us | 58.42 us | -0.3% | 24.6% | ok |
+| `ai-memory` | thread-adaptive-tuned-range | 10000 | 58.35 us | 58.46 us | +0.2% | 7.6% | ok |
+| `movement` | serial-direct | 1024 | 222 ns | 223 ns | +0.5% | 6.8% | ok |
+| `movement` | thread-adaptive-tuned-range | 1024 | 425 ns | 412 ns | -3.1% | 28.0% | ok |
+| `movement` | serial-direct | 4096 | 864 ns | 866 ns | +0.2% | 1.3% | ok |
+| `movement` | thread-adaptive-tuned-range | 4096 | 1.50 us | 1.53 us | +2.0% | 20.9% | ok |
+| `movement` | serial-direct | 10000 | 2.06 us | 2.06 us | +0.0% | 13.6% | ok |
+| `movement` | thread-adaptive-tuned-range | 10000 | 3.52 us | 3.64 us | +3.4% | 28.8% | ok |
 
 **C3 accepted behavior shift (R2, 2026-10-06).** Moving the pathfinding grow to the population seam makes the pre-E2 goal-keyed cache wipe happen at the commit seam, before the next step's `steering_update` read, where it used to happen inside that step's `pathfinding_update`. The result is a deterministic one-step shift in path availability, only on steps where steering rows outgrow the pathfinding pools. E2's preserving resize removes the wipe. The demo's first-step floor→population growth stays in-stage until E6, as before.
 
@@ -160,7 +225,7 @@ Out of scope (each item has a named owner):
     2. `ensureEventAppendCapacity` returns `EventCapacityExceeded` through `Engine.update`, and the app exits.
     3. Other gathers grow in the middle of a stage.
   - The "sum init caps" model used by 62/56B/61 is correct only while every create source is counted.
-- **Change:** add `pub fn syncPopulationCapacity(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem) !void`.
+- **Change:** add `pub fn syncPopulationCapacity(self: *SimulationPipeline, frame: *SimulationFrame, data: *const DataSystem, world: *const WorldSystem) !PopulationSyncStats` (landed with `world`, so `raiseAgentBudget` charges the live reserved link limit).
   - **Call site.** `GameDemoState.applyStructuralCommandsAndPostCommitEvents` calls it right after `applyStructuralCommandsWithExtraEvents` and before `reactToPostCommitNavEvents`, so the post-commit reactions see grown capacities.
   - **Fast path.** Four compares, then return:
     - movement-body rows ≤ `movement_body_capacity`;
@@ -775,7 +840,7 @@ Out of scope (each item has a named owner):
     - re-reserving a smaller budget lowers the logical limits while the grow-only physical capacity stays;
     - the wraparound tests at `scratch.zig:276`, `:299` are unchanged.
   - Bench: `pathfinding`, `pathfinding-hard-fallback`, `pathfinding-hard-fallback-budget`, `pathfinding-escalated-detour`.
-- [ ] **B1 · Production event bound** (§B1).
+- [x] **B1 · Production event bound** (§B1).
   - Tests:
     - `game_demo_state.zig:2156` pins `demo.simulation_frame.events.capacity_limit` after init as a literal, re-pinned by hand;
     - a test walks every `EventProducerId` at comptime and asserts a nonzero budget under the demo config;
@@ -786,15 +851,15 @@ Out of scope (each item has a named owner):
     - in `slice-56.md:85, 487-489, 584`, `slice-59.md:51, 302-303, 437`, `slice-61.md:80`, `slice-63.md:228-232, 322` and `slice-69b.md:204`, each "`event_reserve` adds X" becomes "a new `EventProducerId` arm with budget X", and each literal update becomes a re-pin of `capacity_limit`;
     - `slice-64b.md:257` adds `structural_headroom` as config and excluded.
   - Bench: `perception`, `ai-affect` (no change expected).
-- [ ] **C1 · `CollisionSystem.reserve`** (§C1).
+- [x] **C1 · `CollisionSystem.reserve`** (§C1).
   - Tests: on a minimal 4-body fixture, serial `reserve` then `updateSerial` under `FailingAllocator` allocates zero times. The existing warm-up tests are unchanged.
   - Bench: `collision`, `collision-sparse`.
-- [ ] **C2 · Steering statics sized to the static count** (§C2).
+- [x] **C2 · Steering statics sized to the static count** (§C2).
   - Tests:
     - 3 dynamic responders, 1 static, then `reserve(…, 1)`: the first update under `FailingAllocator` allocates nothing;
     - `steering.zig:2319` drops its warm-up step.
   - Bench: `steering`.
-- [ ] **C3 · `syncPopulationCapacity`** (§C3), including the `reserveRows` and `reserveWindow` split, `growForAgentCount`, and `raiseAgentBudget`.
+- [x] **C3 · `syncPopulationCapacity`** (§C3), including the `reserveRows` and `reserveWindow` split, `growForAgentCount`, and `raiseAgentBudget`.
   - Tests in `simulation_pipeline.zig`, on `testMinimalMultiLevelWorld`:
     - **Growth proof:** build with `movement_body_capacity = 4` and warm one step. Create 8 AI movers through structural commands, commit, and sync. Install `std.testing.FailingAllocator` on the pipeline, frame-stream, data and pathfinding allocators. Run a step where all 12 bodies cross dug holes. Expect zero allocations, `events.stats.dropped == 0`, and every landing carved.
     - Sync at an unchanged population allocates nothing (FailingAllocator), and the spatial window is not re-memset (its pointer and contents are unchanged).
@@ -805,7 +870,7 @@ Out of scope (each item has a named owner):
     - `slice-56b.md:232` and `slice-61.md:177, 502` get the same sentence;
     - `slice-64b.md:257` reclassifies `movement_body_capacity` as "excluded — derived capacity".
   - Bench: `scope`, `spatial_index`, `collision`, `steering`, `ai`, `ai-memory`, `ai-affect`, `perception`, `movement`.
-- [ ] **C4 · Derived perception and affect shares** (§C4).
+- [x] **C4 · Derived perception and affect shares** (§C4).
   - Tests:
     - a default-config pipeline with 2 perception observers that acquire in one step publishes 2 `entity_perceived` events, and AiMemory refreshes both;
     - 3 AiPerception agents in a 1×1 world give a derived share of 6, and an identity swap for all 3 drops 0;

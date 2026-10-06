@@ -64,6 +64,8 @@ const SimulationFrame = @import("simulation.zig").SimulationFrame;
 const EventBudgetInputs = @import("simulation.zig").EventBudgetInputs;
 const EventProducerId = @import("simulation.zig").EventProducerId;
 const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
+const perception_events_per_observer_max = @import("simulation.zig").perception_events_per_observer_max;
+const affect_events_per_row_max = @import("simulation.zig").affect_events_per_row_max;
 const ActionIntent = @import("simulation.zig").ActionIntent;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const WorldStimulus = @import("simulation.zig").WorldStimulus;
@@ -388,17 +390,6 @@ pub const SimulationPipelineConfig = struct {
     /// When set, the one-time static nav build fans mask/abstract work across levels.
     nav_build_thread_system: ?*ThreadSystem = null,
     dig: DigConfig = .{},
-    /// This state's reserved share of `frame.events`'s `capacity_limit` (see
-    /// `SimulationFrame.reserveStreams`), passed through as
-    /// `PerceptionConfig.max_events_per_step`. Sized by the caller against its
-    /// own event-capacity budget, same as `contact_capacity`;
-    /// defaults to 0.
-    perception_max_events_per_step: usize = 0,
-    /// This state's reserved share of `frame.events`'s `capacity_limit`,
-    /// passed through as `AffectConfig.max_events_per_step`. Sized by the
-    /// caller against its own event-capacity budget, same as
-    /// `perception_max_events_per_step`; defaults to 0.
-    affect_max_events_per_step: usize = 0,
     /// Structural-commit events beyond one tier change per body: dig/create bursts
     /// and destroys. A create costs `1 + templateComponentCount` events.
     structural_headroom: usize = 0,
@@ -633,15 +624,6 @@ pub const PopulationSyncStats = struct {
     }
 };
 
-fn eventBudgetInputs(config: SimulationPipelineConfig) EventBudgetInputs {
-    return .{
-        .perception_max_events_per_step = config.perception_max_events_per_step,
-        .affect_max_events_per_step = config.affect_max_events_per_step,
-        .movement_body_capacity = config.movement_body_capacity,
-        .structural_headroom = config.structural_headroom,
-    };
-}
-
 /// Fixed-step simulation owner for one gameplay state instance.
 /// This owns reusable systems and concrete stage order; it is not a global
 /// scheduler, registry, or callback-driven dependency graph.
@@ -689,9 +671,13 @@ pub const SimulationPipeline = struct {
     population_capacity_grows: u64 = 0,
     /// Once-only flag for the first-growth log.
     population_growth_logged: bool = false,
-    /// See `SimulationPipelineConfig.perception_max_events_per_step`.
+    /// This pipeline's share of `frame.events`' `capacity_limit` for perception,
+    /// passed through as `PerceptionConfig.max_events_per_step`. Derived share
+    /// (`perception_events_per_observer_max` x tracked `AiPerception` rows), exact at
+    /// init and grown only at the population seam, so the merge cap never truncates.
     perception_max_events_per_step: usize,
-    /// See `SimulationPipelineConfig.affect_max_events_per_step`.
+    /// Affect's derived share (`affect_events_per_row_max` x tracked `AiAffect` rows),
+    /// passed through as `AffectConfig.max_events_per_step`; grown only at the seam.
     affect_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.structural_headroom`.
     structural_headroom: usize,
@@ -761,10 +747,7 @@ pub const SimulationPipeline = struct {
         errdefer dig.deinit();
         // The ramp dig predicts nav interior link-slot assignment from the built graph.
         dig.nav_link_geometry = pathfinding.graph.linkSlotGeometry();
-        var population_config = config;
-        population_config.movement_body_capacity = population;
-        const event_budgets = eventBudgetInputs(population_config);
-        try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, event_budgets));
+        try dig.reservePlaneScratch(allocator, maxEventsPerStep(.plane_traversal, .{ .movement_body_capacity = population }));
         try ai.reserve(population);
         try perception.reserve(population);
         try ai_memory.reserve(population);
@@ -788,8 +771,8 @@ pub const SimulationPipeline = struct {
             .nav_cell_size = config.nav_cell_size,
             .movement_body_capacity = population,
             .responder_capacity = rows.collision_responses,
-            .perception_max_events_per_step = config.perception_max_events_per_step,
-            .affect_max_events_per_step = config.affect_max_events_per_step,
+            .perception_max_events_per_step = perception_events_per_observer_max * rows.ai_perceptions,
+            .affect_max_events_per_step = affect_events_per_row_max * rows.ai_affects,
             .structural_headroom = config.structural_headroom,
             .sensory = SensoryBus.init(config.stimuli),
         };
@@ -824,12 +807,12 @@ pub const SimulationPipeline = struct {
     }
 
     pub fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
-        return eventBudgetInputs(.{
+        return .{
             .perception_max_events_per_step = self.perception_max_events_per_step,
             .affect_max_events_per_step = self.affect_max_events_per_step,
             .movement_body_capacity = self.movement_body_capacity,
             .structural_headroom = self.structural_headroom,
-        });
+        };
     }
 
     /// Population growth seam (Slice 72 C3). Main thread, `merge_outputs`, right after
@@ -850,6 +833,8 @@ pub const SimulationPipeline = struct {
         const population = rows.population();
         if (population <= self.movement_body_capacity and
             rows.collision_responses <= self.responder_capacity and
+            rows.ai_perceptions * perception_events_per_observer_max <= self.perception_max_events_per_step and
+            rows.ai_affects * affect_events_per_row_max <= self.affect_max_events_per_step and
             self.pathfinding.coversAgentCount(rows.steering_agents))
         {
             return .{};
@@ -872,9 +857,21 @@ pub const SimulationPipeline = struct {
         const body = if (population > old_body) grownPopulationCapacity(population) else old_body;
         const responders_grew = rows.collision_responses > old_responders;
         const responders = if (responders_grew) grownPopulationCapacity(rows.collision_responses) else old_responders;
+        const old_perception_share = self.perception_max_events_per_step;
+        const old_affect_share = self.affect_max_events_per_step;
+        const perception_share = if (rows.ai_perceptions * perception_events_per_observer_max > old_perception_share)
+            perception_events_per_observer_max * grownPopulationCapacity(rows.ai_perceptions)
+        else
+            old_perception_share;
+        const affect_share = if (rows.ai_affects * affect_events_per_row_max > old_affect_share)
+            affect_events_per_row_max * grownPopulationCapacity(rows.ai_affects)
+        else
+            old_affect_share;
         errdefer {
             self.movement_body_capacity = old_body;
             self.responder_capacity = old_responders;
+            self.perception_max_events_per_step = old_perception_share;
+            self.affect_max_events_per_step = old_affect_share;
         }
 
         const body_grew = body != old_body;
@@ -891,8 +888,11 @@ pub const SimulationPipeline = struct {
 
         self.movement_body_capacity = body;
         self.responder_capacity = responders;
+        const shares_grew = perception_share != old_perception_share or affect_share != old_affect_share;
+        self.perception_max_events_per_step = perception_share;
+        self.affect_max_events_per_step = affect_share;
 
-        if (body_grew) {
+        if (body_grew or shares_grew) {
             // The event bound now includes the grown plane-traversal and structural arms.
             const range_count = self.eventCapacitySum();
             const contact_capacity = CollisionSystem.estimateContactCapacity(body);
@@ -917,7 +917,7 @@ pub const SimulationPipeline = struct {
             try self.pathfinding.growForAgentCount(rows.steering_agents);
         }
 
-        if (body_grew or responders_grew) {
+        if (body_grew or responders_grew or shares_grew) {
             stats.grew = true;
             self.population_capacity_grows += 1;
             if (!self.population_growth_logged) {
@@ -1787,8 +1787,6 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
         .contact_capacity = 8,
         .dig = dig_config,
         .movement_body_capacity = 8,
-        .perception_max_events_per_step = 4,
-        .affect_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -1862,8 +1860,6 @@ test "eventCapacitySum equals capacity_limit after reserve" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
         .movement_body_capacity = 8,
         .structural_headroom = 4,
-        .perception_max_events_per_step = 4,
-        .affect_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -1878,9 +1874,9 @@ test "eventCapacitySum equals capacity_limit after reserve" {
     try frame.reserveStreams(4, 0, 4, 4, 4, 4);
     try pipeline.reserve(&frame, 8);
 
-    // dig 1 + perception 4 + affect 4 + plane (8 + 1) + action_react 64 +
-    // structural (8 + 4) + nav 1.
-    try std.testing.expectEqual(@as(usize, 95), pipeline.eventCapacitySum());
+    // dig 1 + perception 0 + affect 0 (no AiPerception/AiAffect rows) + plane (8 + 1) +
+    // action_react 64 + structural (8 + 4) + nav 1.
+    try std.testing.expectEqual(@as(usize, 87), pipeline.eventCapacitySum());
     try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 
@@ -2257,8 +2253,6 @@ test "pipeline fear selects flee before movement, not only a positive drive" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
-        .affect_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -2329,7 +2323,6 @@ test "pipeline perception acquire refreshes memory last_known the same step" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -3067,68 +3060,85 @@ test "pipeline dual-list perception: think observer acquires off-phase halo host
     try std.testing.expectEqual(EntityId.invalid, hostile_perception.nearest_threat);
 }
 
-test "pipeline perception events truncate instead of throwing when the shared event capacity is tight" {
+const share_test_pathfinding: PathfindingCapacity = .{
+    .max_frame_requests = 2,
+    .max_pending_requests = 2,
+    .max_cached_results = 4,
+    .max_group_fields = 1,
+    .worker_participant_count = 1,
+    .max_solved_requests_per_step = 2,
+    .max_fallback_requests_per_step = 2,
+};
+
+fn addShareTestAgent(data: *DataSystem, x: f32, faction: Faction, observer: bool) !EntityId {
+    const entity = try data.createEntity();
+    try data.setMovementBody(entity, .{ .position = .{ .x = x, .y = 0 }, .previous_position = .{ .x = x, .y = 0 }, .velocity = .{}, .speed = 0 });
+    try data.setAiAgent(entity, .{ .active_behavior = .wander, .gain_pursue = 0 });
+    try data.setFaction(entity, faction);
+    if (observer) {
+        try data.setAiPerception(entity, .{});
+        try data.setAiMemory(entity, .{});
+    }
+    return entity;
+}
+
+fn moveShareTestAgent(data: *DataSystem, entity: EntityId, x: f32) void {
+    const body = data.movementBodyPtr(entity).?;
+    body.previous_x.* = x;
+    body.position_x.* = x;
+    body.previous_y.* = 0;
+    body.position_y.* = 0;
+}
+
+fn shareTestWorld() !WorldSystem {
+    var world = WorldSystem{
+        .allocator = std.testing.allocator,
+        .width = 64,
+        .height = 1,
+        .tile_size = 32,
+        .chunk_size_tiles = 64,
+    };
+    errdefer world.deinit();
+    _ = try world.addLevel(0);
+    return world;
+}
+
+fn countPerceptionEvents(frame: *const SimulationFrame) struct { perceived: usize, lost: usize } {
+    var perceived: usize = 0;
+    var lost: usize = 0;
+    for (frame.events.mergedItems()) |event| switch (event.payload) {
+        .entity_perceived => perceived += 1,
+        .entity_lost => lost += 1,
+        else => {},
+    };
+    return .{ .perceived = perceived, .lost = lost };
+}
+
+test "default-config pipeline publishes every perception acquisition and refreshes memory" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
 
     var data = DataSystem.init(std.testing.allocator);
     defer data.deinit();
     var player = try Player.spawn(&data);
+    // Two observer/hostile pairs, each observer nearest its own hostile.
+    const observer_a = try addShareTestAgent(&data, 0, .player, true);
+    const hostile_a = try addShareTestAgent(&data, 10, .hostile, false);
+    const observer_b = try addShareTestAgent(&data, 300, .player, true);
+    const hostile_b = try addShareTestAgent(&data, 310, .hostile, false);
 
-    // Two observer/hostile pairs. Each observer is closer to its own hostile
-    // than to the other pair's, so nearest-threat selection locks each onto
-    // its own target; both newly perceive their hostile this step, so
-    // perception emits two events.
-    const observer_a = try data.createEntity();
-    try data.setMovementBody(observer_a, .{ .position = .{ .x = 0, .y = 0 }, .previous_position = .{ .x = 0, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(observer_a, .player);
-    try data.setAiPerception(observer_a, .{});
-    const hostile_a = try data.createEntity();
-    try data.setMovementBody(hostile_a, .{ .position = .{ .x = 10, .y = 0 }, .previous_position = .{ .x = 10, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_a, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(hostile_a, .hostile);
-
-    const observer_b = try data.createEntity();
-    try data.setMovementBody(observer_b, .{ .position = .{ .x = 100, .y = 0 }, .previous_position = .{ .x = 100, .y = 0 }, .velocity = .{ .x = 10, .y = 0 }, .speed = 20 });
-    try data.setAiAgent(observer_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(observer_b, .player);
-    try data.setAiPerception(observer_b, .{});
-    const hostile_b = try data.createEntity();
-    try data.setMovementBody(hostile_b, .{ .position = .{ .x = 110, .y = 0 }, .previous_position = .{ .x = 110, .y = 0 }, .velocity = .{}, .speed = 0 });
-    try data.setAiAgent(hostile_b, .{ .active_behavior = .wander, .gain_pursue = 0 });
-    try data.setFaction(hostile_b, .hostile);
-
-    var world = WorldSystem{
-        .allocator = std.testing.allocator,
-        .width = 8,
-        .height = 1,
-        .tile_size = 32,
-        .chunk_size_tiles = 8,
-    };
+    var world = try shareTestWorld();
     defer world.deinit();
-    _ = try world.addLevel(0);
     var frame = SimulationFrame.init(std.testing.allocator);
     defer frame.deinit();
-    // Real per-step event budget of 1 — tighter than the two events this
-    // step's perceptions produce.
-    try frame.reserveStreams(4, 1, 4, 4, 4, 4);
-    try frame.reservePathRequests(2, 2);
     var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
     defer threads.deinit();
-    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
-        .contact_capacity = 4,
-        .pathfinding = .{
-            .max_frame_requests = 2,
-            .max_pending_requests = 2,
-            .max_cached_results = 4,
-            .max_group_fields = 1,
-            .worker_participant_count = 1,
-            .max_solved_requests_per_step = 2,
-            .max_fallback_requests_per_step = 2,
-        },
-        .perception_max_events_per_step = 1,
-    });
+    // Production order: init derives the shares, then the frame takes the bound.
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
     defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 4), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(4, 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 5);
 
     frame.beginStep();
     const stats = try pipeline.update(.{
@@ -3138,13 +3148,157 @@ test "pipeline perception events truncate instead of throwing when the shared ev
         .player = &player,
         .thread_system = &threads,
         .delta_seconds = 0.016,
-        .bounds_width = 800,
+        .bounds_width = 2048,
         .bounds_height = 450,
     });
 
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.perceived_events + stats.perception.lost_events);
-    try std.testing.expectEqual(@as(usize, 1), stats.perception.dropped_events);
-    try std.testing.expectEqual(@as(usize, 1), frame.events.mergedItems().len);
+    try std.testing.expectEqual(@as(usize, 2), countPerceptionEvents(&frame).perceived);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+    try std.testing.expect(data.aiMemoryConst(observer_a).?.last_known_target.eql(hostile_a));
+    try std.testing.expect(data.aiMemoryConst(observer_b).?.last_known_target.eql(hostile_b));
+}
+
+test "derived perception share covers an identity swap for every observer" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var near: [3]EntityId = undefined;
+    var far: [3]EntityId = undefined;
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        _ = try addShareTestAgent(&data, base, .player, true);
+        near[index] = try addShareTestAgent(&data, base + 20, .hostile, false);
+        far[index] = try addShareTestAgent(&data, base + 60, .hostile, false);
+    }
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 6), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(4, 0, 10, 10, 10, 10);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 10);
+
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+    };
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    try std.testing.expectEqual(@as(usize, 3), countPerceptionEvents(&frame).perceived);
+
+    // The far hostile steps in front of the near one: every observer swaps identity
+    // (lost + perceived) in one step.
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        moveShareTestAgent(&data, far[index], base + 8);
+    }
+    frame.beginStep();
+    const stats = try pipeline.update(context);
+    const counts = countPerceptionEvents(&frame);
+    try std.testing.expectEqual(@as(usize, 3), counts.perceived);
+    try std.testing.expectEqual(@as(usize, 3), counts.lost);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
+}
+
+test "derived affect share is the drive count times AiAffect rows" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    for (0..2) |index| {
+        const entity = try addShareTestAgent(&data, @floatFromInt(index * 300), .player, false);
+        try data.setAiAffect(entity, .{});
+    }
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{ .pathfinding = share_test_pathfinding });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 2 * affect_events_per_row_max), pipeline.affect_max_events_per_step);
+    try std.testing.expectEqual(@as(usize, 0), pipeline.perception_max_events_per_step);
+}
+
+test "perception share grows at the seam so newly created observers never truncate" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var observers: [7]EntityId = undefined;
+    for (0..3) |index| {
+        const base: f32 = @floatFromInt(index * 300);
+        observers[index] = try addShareTestAgent(&data, base, .player, true);
+        _ = try addShareTestAgent(&data, base + 10, .hostile, false);
+    }
+
+    var world = try shareTestWorld();
+    defer world.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 2048, 450, .{
+        .pathfinding = share_test_pathfinding,
+        .structural_headroom = 64,
+    });
+    defer pipeline.deinit();
+    try std.testing.expectEqual(@as(usize, 6), pipeline.perception_max_events_per_step);
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 7, 7, 7, 7 + 64);
+    try frame.reservePathRequests(2, 2);
+    try pipeline.reserve(&frame, 7);
+
+    // Four observer + hostile pairs created through structural commands.
+    var commands: [8]StructuralCommand = undefined;
+    for (0..4) |index| {
+        const base: f32 = @floatFromInt((index + 3) * 300);
+        commands[index * 2] = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = base, .y = 0 }, .previous_position = .{ .x = base, .y = 0 }, .velocity = .{}, .speed = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+            .faction = .player,
+            .ai_perception = .{},
+            .ai_memory = .{},
+        } };
+        commands[index * 2 + 1] = .{ .create_entity = .{
+            .movement_body = .{ .position = .{ .x = base + 10, .y = 0 }, .previous_position = .{ .x = base + 10, .y = 0 }, .velocity = .{}, .speed = 0 },
+            .ai_agent = .{ .active_behavior = .wander, .gain_pursue = 0 },
+            .faction = .hostile,
+        } };
+    }
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    const sync = try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world);
+    try std.testing.expect(sync.grew);
+    try std.testing.expectEqual(@as(usize, 7), data.populationRowCounts().ai_perceptions);
+    try std.testing.expectEqual(perception_events_per_observer_max * grownPopulationCapacity(7), pipeline.perception_max_events_per_step);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.perception_max_events_per_step);
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
+
+    // Every observer acquires in the same step: 7 events, none truncated.
+    frame.beginStep();
+    const stats = try pipeline.update(.{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 2048,
+        .bounds_height = 450,
+    });
+    try std.testing.expectEqual(@as(usize, 7), countPerceptionEvents(&frame).perceived);
+    try std.testing.expectEqual(@as(usize, 0), stats.perception.dropped_events);
+    try std.testing.expectEqual(@as(usize, 0), frame.events.stats.dropped);
 }
 
 test "pipeline commits the dig stage's world edit before the tile gate reads walkability in the same step" {
@@ -3789,7 +3943,6 @@ test "pipeline commits the dig stage's stimulus before perception reads it in th
         .contact_capacity = 4,
         .dig = dig_config,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -3860,7 +4013,6 @@ test "pipeline promotes deferred impacts before perception on the following step
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -3957,7 +4109,6 @@ test "pipeline defers player collision impacts until the next step" {
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .movement_body_capacity = 8,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -4050,7 +4201,6 @@ test "head-on player impact enqueues even after collision response zeroes approa
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 8,
         .movement_body_capacity = 8,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -4129,7 +4279,6 @@ test "pipeline emits player footstep stimulus before perception in the same step
     var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
         .contact_capacity = 4,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 4,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,
@@ -4845,7 +4994,6 @@ test "sticky dig linger reaches every stagger phase within the linger window" {
         .contact_capacity = 4,
         .dig = dig_config,
         .movement_body_capacity = 4,
-        .perception_max_events_per_step = 8,
         .pathfinding = .{
             .max_frame_requests = 2,
             .max_pending_requests = 2,

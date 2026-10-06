@@ -58,7 +58,9 @@
 //! system's already-independent output.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = @import("../../core/math.zig");
+const logging = @import("../../core/logging.zig");
 const simd = @import("../../core/simd.zig");
 const AdaptiveWorkTuner = @import("../../app/thread_system.zig").AdaptiveWorkTuner;
 const BatchSelection = @import("../../app/thread_system.zig").BatchSelection;
@@ -78,6 +80,7 @@ const ai_affect_threshold_hysteresis = @import("../data_system.zig").ai_affect_t
 const movement_range_alignment_items = @import("../data_system.zig").movement_range_alignment_items;
 const SimulationEvent = @import("../simulation.zig").SimulationEvent;
 const SimulationEvents = @import("../simulation.zig").SimulationEvents;
+const affect_events_per_row_max = @import("../simulation.zig").affect_events_per_row_max;
 
 pub const affect_range_alignment_items: usize = movement_range_alignment_items;
 
@@ -204,6 +207,10 @@ pub const AffectSystem = struct {
     // per-step cap, so merged order and cap membership are partition-independent.
     // Reserved to the same worst case as the range buffers combined.
     merge_scratch: std.ArrayList(SimulationEvent) = .empty,
+    /// Once-only flag for the merge-cap drop warn. The pipeline's derived share makes a
+    /// drop impossible by construction; the cap and `dropped_events` stay as the
+    /// shared-frame safety net.
+    dropped_events_warned: bool = false,
     compute_tuner: AdaptiveWorkTuner = AdaptiveWorkTuner.init(.{}),
 
     /// Sizes gather rows and per-range event scratch for `pop` agents, including
@@ -215,7 +222,7 @@ pub const AffectSystem = struct {
         try self.rows.ensureTotalCapacity(self.allocator, cap);
         const ranges = std.math.divCeil(usize, cap, affect_range_alignment_items) catch 1;
         try self.prepareEventRangeBuffers(ranges, affect_range_alignment_items, cap);
-        try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * 4);
+        try self.event_ranges.items[0].buffer.events.ensureTotalCapacity(self.allocator, cap * affect_events_per_row_max);
     }
 
     pub fn init(allocator: std.mem.Allocator) AffectSystem {
@@ -378,11 +385,11 @@ pub const AffectSystem = struct {
             const range_len = rangeLenForIndex(item_count, items_per_range, range_index);
             // Worst case: all four drives cross a threshold for the same row
             // in the same step, so this exact reserve can never overflow.
-            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * 4);
+            try slot.buffer.events.ensureTotalCapacity(self.allocator, range_len * affect_events_per_row_max);
         }
         // Holds every range's crossings at once for the canonical sort; the same
         // all-drives-cross-every-row worst case as the range buffers combined.
-        try self.merge_scratch.ensureTotalCapacity(self.allocator, item_count * 4);
+        try self.merge_scratch.ensureTotalCapacity(self.allocator, item_count * affect_events_per_row_max);
     }
 
     /// Serial merge after the parallel/serial compute pass: sums each range's
@@ -422,6 +429,13 @@ pub const AffectSystem = struct {
         writer.finish();
         events.finishWrite();
         events.stats.dropped += dropped;
+        if (dropped > 0 and !self.dropped_events_warned) {
+            self.dropped_events_warned = true;
+            if (comptime logging.enabled(.warn) and !builtin.is_test) logging.game.warn(
+                "affect: {d} threshold crossings dropped past the per-step share of {d}",
+                .{ dropped, max_events_per_step },
+            );
+        }
 
         return .{ .crossed = crossed, .dropped = dropped };
     }
@@ -1352,4 +1366,10 @@ test "a tight event capacity forces a graceful drop instead of a throw" {
     try testing.expectEqual(@as(usize, 1), events.mergedItems().len);
     // All 4 drives cross for both entities (8 real events); capped to 1.
     try testing.expectEqual(@as(usize, 7), events.stats.dropped);
+    try testing.expect(sys.dropped_events_warned);
+
+    // The flag is once-only: a later step never clears it.
+    events.clearRetainingCapacity();
+    _ = try sys.updateSerial(data.aiAgentSliceConst(), &data, &events, .{ .max_events_per_step = 1 });
+    try testing.expect(sys.dropped_events_warned);
 }
