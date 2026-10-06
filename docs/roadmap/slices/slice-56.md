@@ -82,8 +82,10 @@ game-over flow.
 - `AudioController` (`src/game/audio_controller.zig`). `collision_sfx` is the
   only SFX asset (`src/assets/manifest.zig:14-18`). `ParticleSystem.emitBurst`
   (`systems/particle.zig:341`).
-- Demo capacity derivation: `structural_reserve` / `event_reserve`
-  (`src/game/game_demo_state.zig:139,159`).
+- Event and structural bounds: the exhaustive `EventProducerId` table
+  (`src/game/simulation.zig:45-70`), summed by `SimulationPipeline.eventCapacitySum()`, and
+  the demo's `demo_structural_headroom` (`SimulationPipelineConfig.structural_headroom`)
+  (Slice 72 B1).
 
 ### Architecture notes
 
@@ -484,9 +486,10 @@ applied at `apply_ai_movement_intents` (Slice 68B; distinct from Slice 61's
 | Event budget `.combat_resolve` | `combat_max_hits_per_step + combat_max_kills_per_step` | At most 1 hit per intent and 1 kill per hit |
 | Structural headroom | `+ combat_max_kills_per_step` destroys | At most 1 kill per hit |
 
-The demo's `deriveDemoPopulationCapacity` adds `combat_max_kills_per_step` to
-`structural_reserve` and `combat_max_hits_per_step + combat_max_kills_per_step`
-to `event_reserve`.
+The `.combat_resolve` arm is summed into the frame event bound by
+`SimulationPipeline.eventCapacitySum()` (Slice 72 B1). The demo adds
+`combat_max_kills_per_step` to `demo_structural_headroom` (one `entity_destroyed` per
+kill) and re-pins its `capacity_limit` literal test by hand.
 
 **FailingAllocator proofs.**
 
@@ -581,8 +584,9 @@ to `event_reserve`.
       `strings.format`; 67E's comptime table validation passes.
       Otherwise 67E migrates it.
 - [ ] `AudioController.queueCombat`, wired in `GameDemoState.update`.
-- [ ] Demo `structural_reserve` / `event_reserve` terms from the named combat
-      caps.
+- [ ] `EventProducerId.combat_resolve` arm with budget `combat_max_hits_per_step +
+      combat_max_kills_per_step`; `combat_max_kills_per_step` added to `demo_structural_headroom`;
+      demo `capacity_limit` literal re-pinned.
 - [ ] (If 55 landed) Test: a coasting `idle_far` timid row with
       `gain_flee > 0`, hit by a visible attacker, decides on its next sense
       tick.

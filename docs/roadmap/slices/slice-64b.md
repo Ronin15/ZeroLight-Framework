@@ -254,7 +254,7 @@ same change):
 | `movement`, `collision`, `collision_response`, `spatial_index`, `ai_memory`, `affect` | excluded | per-step scratch + tuners |
 | `destructible` | excluded | no fields |
 | `audio_controller` | excluded | presentation (never feeds simulation) |
-| `nav_cell_size`, `movement_body_capacity`, `perception_max_events_per_step`, `affect_max_events_per_step` | excluded | config |
+| `nav_cell_size`, `structural_headroom`, `movement_body_capacity`, `perception_max_events_per_step`, `affect_max_events_per_step` | excluded | config |
 | `action_intents_dropped_step` | excluded | telemetry, reset each update |
 | `seed` (49) | excluded | `seed.root` is in `"header"` |
 | `ai_intent_seed` (49) | excluded | derived from `seed` |

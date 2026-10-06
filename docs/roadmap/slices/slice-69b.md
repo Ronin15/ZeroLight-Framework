@@ -201,8 +201,9 @@ pub const EnvironmentModifierLookup = struct {
   - so the budget is **19**, or 20 once Slice 69C's `time_skipped` tag exists;
   - a multi-day jump flips at most every region once, so the budget is a true
     worst case.
-- `deriveDemoPopulationCapacity.event_reserve` and `SimulationPipeline.reserve`
-  pick the new value up through Slice 59's existing paths.
+- `SimulationPipeline.eventCapacitySum()` picks the new budget up through the exhaustive
+  `EventProducerId` switch (Slice 72 B1); the demo's `capacity_limit` literal test is
+  re-pinned.
 
 **Presentation.** The player's region drives every presentation reaction; none
 of it feeds the simulation.

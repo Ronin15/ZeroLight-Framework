@@ -79,8 +79,8 @@ live in the controller.
   The Emergent AI Track Overview runbook ("How to add a new feeling") governs
   adding a drive. The demo's `affect_event_reserve = cognition_agents * 4`
   hard-codes "4 drives" (`game_demo_state.zig:150-158`), and `AffectSystem`
-  caps crossings at `max_events_per_step` (`affect.zig:413`); the reserve test
-  pins the literal worst case 283 (`game_demo_state.zig:2056-2057`).
+  caps crossings at `max_events_per_step` (`affect.zig:413`); the demo's
+  `capacity_limit` test pins the literal 293 (`game_demo_state.zig:2156`).
 - Contact, trigger, and intent capacity: `estimateContactCapacity(mover_count +
   obstacle_count + 1)` and the trigger estimate (`game_demo_state.zig:127-135`)
   feed `reserveStreams` and `.contact_capacity`.

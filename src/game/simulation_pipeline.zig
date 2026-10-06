@@ -393,6 +393,9 @@ pub const SimulationPipelineConfig = struct {
     /// caller against its own event-capacity budget, same as
     /// `perception_max_events_per_step`; defaults to 0.
     affect_max_events_per_step: usize = 0,
+    /// Structural-commit events beyond one tier change per body: dig/create bursts
+    /// and destroys. A create costs `1 + templateComponentCount` events.
+    structural_headroom: usize = 0,
     stimuli: StimulusConfig = .{},
 };
 
@@ -609,6 +612,7 @@ fn eventBudgetInputs(config: SimulationPipelineConfig) EventBudgetInputs {
         .perception_max_events_per_step = config.perception_max_events_per_step,
         .affect_max_events_per_step = config.affect_max_events_per_step,
         .movement_body_capacity = config.movement_body_capacity,
+        .structural_headroom = config.structural_headroom,
     };
 }
 
@@ -655,6 +659,8 @@ pub const SimulationPipeline = struct {
     perception_max_events_per_step: usize,
     /// See `SimulationPipelineConfig.affect_max_events_per_step`.
     affect_max_events_per_step: usize,
+    /// See `SimulationPipelineConfig.structural_headroom`.
+    structural_headroom: usize,
     /// Deferred impacts, sticky linger, and the hearing scratch. Survives `beginStep`.
     sensory: SensoryBus,
     /// Rising-edge latch for `Action.interact` (one press per fixed step).
@@ -696,8 +702,7 @@ pub const SimulationPipeline = struct {
         else
             .{};
         try spatial_index.reserve(config.movement_body_capacity, spatial_geometry);
-        // No reserve method: PerceptionSystem lazily ensureTotalCapacity's its
-        // gather buffers on first use, same as AiSystem.
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var perception = PerceptionSystem.init(allocator);
         errdefer perception.deinit();
         // Pays every level's first-ever `level_blocked` cache build once here,
@@ -707,12 +712,10 @@ pub const SimulationPipeline = struct {
         if (config.navigation_world) |world| {
             try perception.prebuildLevelCaches(world);
         }
-        // No reserve method: AiMemorySystem lazily ensureTotalCapacity's its
-        // gather buffer on first use, same as PerceptionSystem/AiSystem.
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var ai_memory = AiMemorySystem.init(allocator);
         errdefer ai_memory.deinit();
-        // No reserve method: AffectSystem lazily ensureTotalCapacity's its
-        // gather buffer on first use, same as AiMemorySystem/PerceptionSystem.
+        // Reserved below to `movement_body_capacity` (`reserve`), alongside `AiSystem`.
         var affect = AffectSystem.init(allocator);
         errdefer affect.deinit();
         var dig = DigController.init(config.dig);
@@ -745,24 +748,20 @@ pub const SimulationPipeline = struct {
             .movement_body_capacity = config.movement_body_capacity,
             .perception_max_events_per_step = config.perception_max_events_per_step,
             .affect_max_events_per_step = config.affect_max_events_per_step,
+            .structural_headroom = config.structural_headroom,
             .sensory = SensoryBus.init(config.stimuli),
         };
     }
 
-    /// Releases owned processor/controller state. Borrowed gameplay data and
-    /// frame storage stay owned by the gameplay state.
-    /// Tops up frame events to the sum of producer budgets and reserves cognition
-    /// gather scratch for `pop`. Does not lower an existing higher event limit.
+    /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`) and
+    /// reserves cognition gather scratch for `pop`. Does not lower an existing higher
+    /// event limit. The production entry: state init calls it after `reserveStreams`.
     pub fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
         try self.ai.reserve(pop);
         try self.perception.reserve(pop);
         try self.ai_memory.reserve(pop);
         try self.affect.reserve(pop);
-        const budgets = self.eventBudgets();
-        var sum: usize = 0;
-        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
-            sum += maxEventsPerStep(producer, budgets);
-        }
+        const sum = self.eventCapacitySum();
         try frame.events.reserve(sum, sum);
         if (frame.events.capacity_limit) |limit| {
             if (limit < sum) frame.events.setCapacityLimit(sum);
@@ -771,14 +770,28 @@ pub const SimulationPipeline = struct {
         }
     }
 
-    fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
+    /// The per-step `frame.events` bound: the exhaustive sum of `maxEventsPerStep`
+    /// over every `EventProducerId` under this pipeline's budgets.
+    pub fn eventCapacitySum(self: *const SimulationPipeline) usize {
+        const budgets = self.eventBudgets();
+        var sum: usize = 0;
+        inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+            sum += maxEventsPerStep(producer, budgets);
+        }
+        return sum;
+    }
+
+    pub fn eventBudgets(self: *const SimulationPipeline) EventBudgetInputs {
         return eventBudgetInputs(.{
             .perception_max_events_per_step = self.perception_max_events_per_step,
             .affect_max_events_per_step = self.affect_max_events_per_step,
             .movement_body_capacity = self.movement_body_capacity,
+            .structural_headroom = self.structural_headroom,
         });
     }
 
+    /// Releases owned processor/controller state. Borrowed gameplay data and
+    /// frame storage stay owned by the gameplay state.
     pub fn deinit(self: *SimulationPipeline) void {
         self.dig.deinit();
         self.affect.deinit();
@@ -1700,6 +1713,36 @@ test "pipeline update after reserve allocates nothing on frame streams with dig,
     try std.testing.expectEqual(@as(?u16, 1), data.worldLevelConst(npc));
     try std.testing.expect(frame.contacts.mergedItems().len > 0);
     try std.testing.expect(frame.stimuli.mergedItems().len > 0);
+}
+
+test "eventCapacitySum equals capacity_limit after reserve" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 8,
+        .structural_headroom = 4,
+        .perception_max_events_per_step = 4,
+        .affect_max_events_per_step = 4,
+        .pathfinding = .{
+            .max_frame_requests = 2,
+            .max_pending_requests = 2,
+            .max_cached_results = 4,
+            .max_group_fields = 1,
+            .worker_participant_count = 1,
+            .max_solved_requests_per_step = 2,
+            .max_fallback_requests_per_step = 2,
+        },
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(4, 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 8);
+
+    // dig 1 + perception 4 + affect 4 + plane (8 + 1) + action_react 64 +
+    // structural (8 + 4) + nav 1.
+    try std.testing.expectEqual(@as(usize, 95), pipeline.eventCapacitySum());
+    try std.testing.expectEqual(@as(?usize, pipeline.eventCapacitySum()), frame.events.capacity_limit);
 }
 
 test "pipeline resamples AI wander direction across fixed steps" {

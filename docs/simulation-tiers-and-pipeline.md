@@ -346,6 +346,12 @@ data insufficient to derive one) falls back to a whole-level nav dirty mark.
 required events for data needed to keep downstream state correct; use
 diagnostic events only for optional observability.
 
+**Per-step bound (Slice 72).** `capacity_limit` is the exhaustive sum of
+`maxEventsPerStep` over every `EventProducerId` (`SimulationPipeline.eventCapacitySum()`),
+set by `SimulationPipeline.reserve` at state init. A new producer adds one arm. A
+required-append failure means a producer exceeded its declared budget, which is a bug, not
+a capacity condition.
+
 Events are for low-volume notable changes and transitions, not high-volume
 per-frame per-entity data. Dense per-step results — for example AI separation,
 or perception/memory/affect state — belong in component columns or transient

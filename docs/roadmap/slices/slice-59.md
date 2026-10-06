@@ -48,7 +48,8 @@ clock (the seed root is already in the Slice 49 header).
   this slice adds a read to.
 - `src/game/simulation.zig:48-70` defines `EventProducerId` and the exhaustive
   `maxEventsPerStep`. `:153-164` is the scalar-only `SimulationEventPayload` union.
-  `game_demo_state.zig:156-159` sums the per-step `event_reserve`.
+  `SimulationPipeline.eventCapacitySum()` sums every arm into the per-step `capacity_limit`
+  (Slice 72 B1).
 - `src/game/systems/perception.zig:274-299` defines `PerceptionGatherRow`, which
   carries `vision_range`, `hearing_range` and `level` per observer. `computeOneAgent`
   (`:1494-1611`) uses them for the spatial scan radius, the player range check and the
@@ -299,8 +300,9 @@ time or weather. The game knows nothing about GPU layouts.
 - `EventProducerId.environment_update` has the fixed budget
   `k_environment_max_events_per_step = 5` (one per kind). A time jump that crosses
   several days still emits one `day_started` carrying the new value.
-  `deriveDemoPopulationCapacity`'s `event_reserve` adds this constant.
-  `SimulationPipeline.reserve` picks it up through the exhaustive switch.
+  The new arm is the only edit: `SimulationPipeline.eventCapacitySum()` (used by `reserve`
+  and the demo's shared `range_count`) picks it up through the exhaustive switch, and the
+  demo's `capacity_limit` literal test is re-pinned.
 
 **Weather particles (existing particle system, extended, not forked).**
 
@@ -434,7 +436,7 @@ time or weather. The game knows nothing about GPU layouts.
 - [ ] `src/game/simulation.zig`: `EnvironmentTransitionEvent` payload,
       `EventProducerId.environment_update` with budget 5, `EventStats` counter and perf
       metric, and `SimulationEvents.appendRequiredBatch` (one range, one
-      `finishWrite`). `deriveDemoPopulationCapacity.event_reserve` += 5.
+      `finishWrite`). Demo `capacity_limit` literal test re-pinned (+5).
 - [ ] `src/game/environment_controller.zig`: `init` / `resync` / `step` /
       `emitWeatherParticles` / `modifierLookup` / snapshot accessors.
 - [ ] `simulation_pipeline.zig`: `PipelineResource.environment`,

@@ -45,6 +45,9 @@ const nav_interior_link_slots_per_chunk = @import("systems/pathfinding.zig").nav
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
+const SimulationEvent = @import("simulation.zig").SimulationEvent;
+const EventProducerId = @import("simulation.zig").EventProducerId;
+const maxEventsPerStep = @import("simulation.zig").maxEventsPerStep;
 const stimulus_live_capacity = @import("simulation.zig").stimulus_live_capacity;
 const action_intent_live_capacity = @import("simulation.zig").action_intent_live_capacity;
 const SimulationPhase = @import("simulation.zig").SimulationPhase;
@@ -99,8 +102,6 @@ const DemoPopulationCapacity = struct {
     contact_capacity: usize,
     intent_capacity: usize,
     collision_trigger_capacity: usize,
-    structural_reserve: usize,
-    event_reserve: usize,
     perception_event_reserve: usize,
     affect_event_reserve: usize,
 };
@@ -135,30 +136,16 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     // trigger count is bounded by contact count — collision_response's own domain
     // knowledge, not a second independent ratio for this demo to guess).
     const collision_trigger_capacity = estimateTriggerCapacity(contact_capacity);
-    // Tier policy can emit one set_simulation_tier per mover, plus fixed headroom for
-    // dig/create bursts and Slice 45 destructible destroys (bounded by action-intent
-    // live capacity — fixed, not map-scaled).
-    const structural_reserve = mover_count + 16 + action_intent_live_capacity;
-    // Per-step `frame.events` capacity_limit. Every plane-traversal fall/mining event and
-    // every structural-commit event shares this one budget for the step (cleared only at
-    // `beginStep`), so it must cover the worst case of all of them landing in the same
-    // step, not just the largest single source: `applyNpcPlaneTraversal` walks every AI
-    // agent and can emit up to `mover_count` fall events, plus the player's own
-    // plane-traversal fall (1) and dig-mining event (1), plus up to `structural_reserve`
-    // structural-commit events (tier changes / create / destroy), plus the post-commit
-    // nav-invalidation headroom (1) already tracked separately by
-    // `applyStructuralCommandsAndPostCommitEvents`. Plus perception's
-    // `entity_perceived`/`entity_lost` pair (at most 2 per cognition agent per step: an
-    // identity swap emits both) and affect's `affect_threshold_crossed` (at most 1 per
-    // drive per step, 4 drives, per cognition agent) for the `demoArchetypeForIndex`
-    // subset that now carries `AiPerception`/`AiAffect` — see
-    // `demoCognitionAgentCount`/`perception_max_events_per_step`/
-    // `affect_max_events_per_step` below. Plus fixed `action_intent_live_capacity`
-    // headroom for `destructible_destroyed` domain events (Slice 45).
+    // The per-step `frame.events` bound is not derived here: it is the exhaustive
+    // `EventProducerId` table (`simulation.zig`), summed by
+    // `SimulationPipeline.eventCapacitySum()`. This demo only supplies the per-producer
+    // inputs: the perception/affect shares below (2 events per cognition agent: an
+    // identity swap emits lost + perceived; 1 per drive, 4 drives) for the
+    // `demoArchetypeForIndex` subset that carries `AiPerception`/`AiAffect` (see
+    // `demoCognitionAgentCount`), and `demo_structural_headroom`.
     const cognition_agents = demoCognitionAgentCount(mover_count);
     const perception_event_reserve = cognition_agents * 2;
     const affect_event_reserve = cognition_agents * 4;
-    const event_reserve = mover_count + 1 + 1 + structural_reserve + 1 + perception_event_reserve + affect_event_reserve + action_intent_live_capacity;
     return .{
         .mover_count = mover_count,
         .surface_movers = surface_movers,
@@ -166,12 +153,14 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
         .contact_capacity = contact_capacity,
         .intent_capacity = intent_capacity,
         .collision_trigger_capacity = collision_trigger_capacity,
-        .structural_reserve = structural_reserve,
-        .event_reserve = event_reserve,
         .perception_event_reserve = perception_event_reserve,
         .affect_event_reserve = affect_event_reserve,
     };
 }
+
+/// Structural-commit events beyond one tier change per body: 16 dig/create burst
+/// events plus one `entity_destroyed` per destructible action intent (Slice 45).
+const demo_structural_headroom: usize = 16 + action_intent_live_capacity;
 
 /// Per-step audio bound for demo tests: movers can emit collision SFX alongside
 /// ambient music, listener, and the player jet loop. Not scaled 1:1 with mover count —
@@ -443,16 +432,6 @@ pub const GameDemoState = struct {
         }, world_render_overscan_chunks);
         var simulation_frame = SimulationFrame.init(allocator);
         errdefer simulation_frame.deinit();
-        // Last arg sizes the structural-command stream: the per-step LOD tier policy
-        // can emit up to one set_simulation_tier per movement body when many cross a
-        // band at once, plus headroom for dig/create bursts — keeps the commit seam
-        // allocation-free on churn frames. The event-capacity arg (`pop_cap.event_reserve`)
-        // covers every source that shares that one per-step budget; see
-        // DemoPopulationCapacity's doc comment. The range_count arg (first) is shared
-        // across every one of these streams and each `appendRequired`-style call
-        // consumes one range, so it must cover the largest per-step range consumer —
-        // events (`pop_cap.event_reserve`), not a flat constant unrelated to that budget.
-        try simulation_frame.reserveStreams(pop_cap.event_reserve, pop_cap.event_reserve, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.structural_reserve);
         try simulation_frame.reservePathRequests(16, pop_cap.mover_count);
         // Multi-producer sensory bus (dig, footstep, promoted impacts): warm to the
         // fixed live ceiling so optional emitters stay allocation-free after init.
@@ -485,14 +464,21 @@ pub const GameDemoState = struct {
             .nav_build_thread_system = nav_build_thread_system,
             .dig = dig_config,
             // The `demoArchetypeForIndex` cognition subset (timid/aggressive/curious)
-            // carries `AiPerception`; sized against `pop_cap.event_reserve`'s own
-            // `perception_event_reserve` term (see `demoCognitionAgentCount`).
+            // carries `AiPerception` (see `demoCognitionAgentCount`).
             .perception_max_events_per_step = pop_cap.perception_event_reserve,
-            // Same cognition subset also carries `AiAffect`; sized against
-            // `pop_cap.event_reserve`'s `affect_event_reserve` term.
+            // Same cognition subset also carries `AiAffect`.
             .affect_max_events_per_step = pop_cap.affect_event_reserve,
+            .structural_headroom = demo_structural_headroom,
         });
         errdefer pipeline.deinit();
+        // The shared `range_count` equals the event bound: one range per required append
+        // is the worst case. The last arg sizes the structural-command stream: one
+        // `set_simulation_tier` per movement body plus the burst/destroy headroom, so the
+        // commit seam stays allocation-free on churn frames. The event value capacity and
+        // limit are set by `pipeline.reserve` below.
+        try simulation_frame.reserveStreams(pipeline.eventCapacitySum(), 0, pop_cap.intent_capacity, pop_cap.contact_capacity, pop_cap.collision_trigger_capacity, pop_cap.intent_capacity + demo_structural_headroom);
+        // Raises `frame.events.capacity_limit` to the exhaustive producer sum.
+        try pipeline.reserve(&simulation_frame, pop_cap.intent_capacity);
 
         var state = GameDemoState{
             .allocator = allocator,
@@ -704,7 +690,7 @@ pub const GameDemoState = struct {
         const may_invalidate_navigation = SimulationPipeline.structuralCommandsMayInvalidateNavigation(&self.data, &self.simulation_frame) or
             SimulationPipeline.pendingEventsMayInvalidateNavigation(&self.simulation_frame) or
             self.pipeline.hasPendingNavLinks(&self.world);
-        const extra_event_count: usize = if (may_invalidate_navigation) 1 else 0;
+        const extra_event_count: usize = if (may_invalidate_navigation) maxEventsPerStep(.nav_reaction, .{}) else 0;
         const stats = try self.simulation_frame.applyStructuralCommandsWithExtraEvents(&self.data, extra_event_count);
         self.last_nav_update_stats = try self.pipeline.reactToPostCommitNavEvents(&self.simulation_frame, &self.data, &self.world, thread_system);
         try self.pipeline.reactToPostCommitPerceptionEvents(&self.simulation_frame, &self.world);
@@ -2153,58 +2139,60 @@ test "demo structural static obstacle change emits one navigation invalidation e
     try std.testing.expectEqual(@as(usize, 1), demo.simulation_frame.events.stats.nav_region_invalidated);
 }
 
-test "demo event capacity covers every NPC falling plus player fall, mining, structural, and nav events in one step" {
+test "demo event bound is the pinned exhaustive producer sum" {
+    var demo = try initDemoForTest(std.testing.allocator);
+    defer demo.deinit();
+
+    // Hand-pinned, not re-derived: a formula drift on either side must fail here.
+    // 37 movement bodies (player + 32 movers + 4 obstacles), 12 cognition agents:
+    // dig 1 + perception 24 + affect 48 + plane (37 + 1) + action_react 64 +
+    // structural (37 + 80) + nav 1 = 293.
+    const pinned_event_bound: usize = 293;
+    try std.testing.expectEqual(@as(?usize, pinned_event_bound), demo.simulation_frame.events.capacity_limit);
+    try std.testing.expectEqual(pinned_event_bound, demo.pipeline.eventCapacitySum());
+}
+
+test "every event producer has a nonzero budget under the demo config" {
+    var demo = try initDemoForTest(std.testing.allocator);
+    defer demo.deinit();
+
+    const budgets = demo.pipeline.eventBudgets();
+    inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+        try std.testing.expect(maxEventsPerStep(producer, budgets) > 0);
+    }
+}
+
+test "every producer budget fits the demo event bound allocation-free in one step" {
     var demo = try initDemoForTest(std.testing.allocator);
     defer demo.deinit();
 
     demo.simulation_frame.beginStep();
-    // Shares one `frame.events` capacity_limit across every source that can land in
-    // the same step: `applyNpcPlaneTraversal` walks every AI agent and can emit up
-    // to `default_demo_mover_count` fall events, plus the player's own plane-traversal
-    // fall (1) and dig-mining event (1), plus up to the derived structural reserve
-    // structural-commit events (tier + fixed dig/create + action_intent_live_capacity
-    // destructible destroys), plus the post-commit nav-invalidation headroom (1),
-    // plus the `demoArchetypeForIndex` cognition subset's worst-case perception
-    // (2/agent) and affect (4/agent) events, plus action_intent_live_capacity for
-    // destructible_destroyed domain events (Slice 45).
-    //
-    // The 283 below is a hard-coded expectation, not re-derived from
-    // deriveDemoPopulationCapacity: re-deriving it here would make this assertion pass
-    // trivially even if that formula drifted, since both sides would drift together.
-    // A literal catches that.
-    const worst_case_event_count: usize = 283;
-    try std.testing.expectEqual(worst_case_event_count, deriveDemoPopulationCapacity(default_demo_mover_count).event_reserve);
-
     const original_events_allocator = demo.simulation_frame.events.stream.allocator;
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
     demo.simulation_frame.events.stream.allocator = failing_allocator.allocator();
     defer demo.simulation_frame.events.stream.allocator = original_events_allocator;
 
-    var appended: usize = 0;
-    while (appended < worst_case_event_count) : (appended += 1) {
-        try demo.simulation_frame.events.appendRequired(.{
-            .stage = .structural_commit,
-            .payload = .{ .world_tile_changed = .{
-                .level = 0,
-                .x = 0,
-                .y = 0,
-                .old_tile_id = 0,
-                .new_tile_id = 1,
-            } },
-        });
-    }
-    try std.testing.expectEqual(worst_case_event_count, demo.simulation_frame.events.mergedItems().len);
-
-    try std.testing.expectError(error.EventCapacityExceeded, demo.simulation_frame.events.appendRequired(.{
+    // Every producer fills its declared budget in one step, one range per event (the
+    // worst range shape). A real step that saturates all producers at once is not
+    // constructible, so the fill is synthetic.
+    const event: SimulationEvent = .{
         .stage = .structural_commit,
-        .payload = .{ .world_tile_changed = .{
-            .level = 0,
-            .x = 0,
-            .y = 0,
-            .old_tile_id = 0,
-            .new_tile_id = 1,
-        } },
-    }));
+        .payload = .{ .world_tile_changed = .{ .level = 0, .x = 0, .y = 0, .old_tile_id = 0, .new_tile_id = 1 } },
+    };
+    const budgets = demo.pipeline.eventBudgets();
+    var appended: usize = 0;
+    inline for (comptime std.meta.tags(EventProducerId)) |producer| {
+        for (0..maxEventsPerStep(producer, budgets)) |_| {
+            try demo.simulation_frame.events.appendRequired(event);
+            appended += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), failing_allocator.allocations);
+    try std.testing.expectEqual(@as(usize, 0), demo.simulation_frame.events.stats.dropped);
+    try std.testing.expectEqual(@as(usize, 293), appended);
+    try std.testing.expectEqual(appended, demo.simulation_frame.events.mergedItems().len);
+    try std.testing.expectError(error.EventCapacityExceeded, demo.simulation_frame.events.appendRequired(event));
 }
 
 test "demo preflights navigation invalidation event before structural mutation" {

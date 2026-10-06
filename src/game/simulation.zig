@@ -42,21 +42,27 @@ pub const SimulationEventStage = enum {
     domain_reaction,
 };
 
-/// Stages that append to `frame.events` during `update`. The switch in
-/// `maxEventsPerStep` is exhaustive, so a new producer does not compile until
-/// it has a fixed budget.
+/// Producers that append to `frame.events` within one fixed step: stages during
+/// `update`, the structural commit (`.structural_commit`), and the post-commit nav
+/// reaction (`.nav_reaction`). The switch in `maxEventsPerStep` is exhaustive, so a
+/// new producer does not compile until it has a fixed budget.
 pub const EventProducerId = enum {
     dig_world_edit,
     perception_update,
     affect_update,
     plane_traversal,
     action_react,
+    structural_commit,
+    nav_reaction,
 };
 
 pub const EventBudgetInputs = struct {
     perception_max_events_per_step: usize = 0,
     affect_max_events_per_step: usize = 0,
     movement_body_capacity: usize = 0,
+    /// Structural-commit events beyond one tier change per body (dig/create bursts,
+    /// destroys). See `SimulationPipelineConfig.structural_headroom`.
+    structural_headroom: usize = 0,
 };
 
 pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) usize {
@@ -66,6 +72,10 @@ pub fn maxEventsPerStep(producer: EventProducerId, budgets: EventBudgetInputs) u
         .affect_update => budgets.affect_max_events_per_step,
         .plane_traversal => budgets.movement_body_capacity + 1,
         .action_react => action_intent_live_capacity,
+        // One `set_simulation_tier` per body plus the burst/destroy headroom.
+        .structural_commit => budgets.movement_body_capacity + budgets.structural_headroom,
+        // The single post-commit `nav_region_invalidated`.
+        .nav_reaction => 1,
     };
 }
 

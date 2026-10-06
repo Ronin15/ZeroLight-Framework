@@ -225,11 +225,12 @@ adds, clamps to `[-100, 100]`, narrows, and recomputes the 16-entry
 consumers are stats and the Slice 67B event-log feed. Perception holds
 no stance cache, so no post-commit cache reaction is needed.
 
-**Reserves.** `deriveDemoPopulationCapacity` adds, as named terms: ≤ 12
+**Reserves.** The demo's `demo_structural_headroom` adds, as named terms: ≤ 12
 `adjust_faction_standing` commands plus ≤ `maxEventsPerStep(.action_react) +
-maxEventsPerStep(.combat_resolve)` `set_social_ledger` commands to
-`structural_reserve`, and ≤ 12 `faction_stance_changed` events to
-`event_reserve`. The reserve test's literal worst case is updated deliberately.
+maxEventsPerStep(.combat_resolve)` `set_social_ledger` commands (one `component_changed`
+event each at commit). `faction_stance_changed` gets its own `EventProducerId` arm (its
+producing stage) with budget 12, summed by `SimulationPipeline.eventCapacitySum()`. The
+demo's `capacity_limit` literal test is re-pinned deliberately.
 
 **Stage contract**
 
@@ -319,7 +320,9 @@ impulses 128 per step. None scale with world or population.
   - auto-close on an invalid session, decided in the fixed `update` through a queued pop.
 - [ ] `SocialController` + `StageId.social_react` (after `inventory_update`, before `tier_policy`) + contract + `runStage` arm; delta table above; `.social` impulse producer. Raise `@setEvalBranchQuota` at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
 - [ ] Combat rows wired to Slice 56's `combat_events`.
-- [ ] Reserves: standing commands, ledger commands, and `faction_stance_changed` events added to the demo's `structural_reserve` / `event_reserve`; reserve test literal updated.
+- [ ] Reserves: standing and ledger commands added to `demo_structural_headroom`; an
+  `EventProducerId` arm with budget 12 for `faction_stance_changed`; demo `capacity_limit`
+  literal re-pinned.
 - [ ] Bench group `social-react` (one `BenchmarkGroup` in `src/benchmarks/social.zig`, default items 128 events, registered in `runner.zig`). Re-run `--group perception` and `--group ai` for the relations-table indirection.
 - [ ] Docs:
   - `architecture.md` (relations, ledger, merchant, `SocialController`);
