@@ -65,10 +65,14 @@ open until that residual is closed.
   resources), and one `runStage` arm. The comptime stage-order checks are the
   dependency gate. Do not add a scheduler beside the pipeline. The planned
   merged order is Table T4.
-- Every new work budget or capacity cap is a fixed constant. A world, level
-  count, cell count, portal count, or dense-band count that does not fit is
-  refused or deferred. Do not size a cap to one map, and do not replace a cap
-  with a window computed from that world's level or band counts.
+- Budgets, capacities, and thresholds follow CLAUDE.md's three-way rule.
+  Per-step/per-query **work budgets** are fixed counts, never scaled to world,
+  level, cell, portal, or band counts; work that does not fit is deferred
+  deterministically. **Capacities** are sized from the loaded world and content
+  at init/load and reserved up front (allocation-free hot path, proven by
+  `FailingAllocator`); fixed caps only for format/index limits or as loud
+  load-time safety ceilings. **Thresholds** derive from the cost of the
+  operation they gate, not the whole world.
 - Do not promote threaded stage overlap, nav-remask cost changes, render-collect
   scan changes, or persistence beyond Slice 46's written stable-ID boundary
   into a checklist until those behaviors are confirmed in the live modules.

@@ -84,13 +84,17 @@ free-function `EntityId` equality helper (use `EntityId.eql`), and a no-op `catc
 check, so a camelCase fn-pointer field that should match the snake_case production vtables
 (`state.zig`, `audio.zig`, `cache.zig`) is a review-only catch.
 
-**Fixed work budgets** — any per-query/per-frame budget (search node caps, solve ceilings,
-and similar) must be a fixed constant. Flag a budget/capacity constant derived from or scaled
-to world size, map size, cell count, portal count, or other measured "current scale" — this
-is a load-bearing, explicitly tested invariant in several modules (e.g. the pathfinder's
-abstract A* node budget, `nav_graph.zig`'s incremental-dig chunk-patch tests). A chronically
-insufficient fixed budget should be fixed via graceful degradation or an algorithmic change,
-not a bigger number sized to one map.
+**Budgets vs capacities vs thresholds** (CLAUDE.md three-way rule) — flag any per-step /
+per-query **work budget** (search node caps, solves/links/spawns per step) derived from or
+scaled to world size, map size, cell count, portal count, or other measured "current scale";
+this is a load-bearing, explicitly tested invariant (e.g. the pathfinder's abstract A* node
+budget, `nav_graph.zig`'s incremental-dig chunk-patch tests), and a chronically insufficient
+budget is fixed via graceful degradation or an algorithmic change, not a bigger number. Also
+flag the opposite: a data-structure **capacity** hard-coded as a fixed working size where it
+should be sized from the loaded world/content at init/load (fixed caps are fine only for
+format/index limits or loud load-time safety ceilings), and **thresholds** derived from whole-
+world size instead of the cost of the gated operation. Capacity growth on the hot path is
+still a High finding.
 
 **`std.MultiArrayList` hot paths** — flag `rows.items(.field)` called inside a loop instead of
 caching `rows.slice()` once per stage/function (rebuilds slice pointers per call; measured

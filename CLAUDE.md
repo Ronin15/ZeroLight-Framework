@@ -87,20 +87,29 @@ boundaries just to make a local change easier.
   missed optimization. Avoid per-frame string lookups, hash-map dispatch,
   broad dynamic dispatch, formatted logging, and resource churn unless the
   cost is measured, bounded, and isolated.
-- **Per-query/per-frame work budgets (search node caps, solve ceilings, and
-  similar) must be fixed constants — never derived from or scaled to world
-  size, map size, cell count, portal count, or any other measured "current
-  scale."** Worlds vary in size; a budget that scales with it means
-  correctness/performance silently depends on which map happens to be loaded.
-  This is a load-bearing, explicitly tested invariant in several modules (grep
-  for `independent of` and `regardless of world size` before touching a
-  budget/capacity constant — e.g. `src/game/systems/pathfinding/`'s abstract
-  A* node budget and `nav_graph.zig`'s incremental-dig chunk-patch tests). When
-  a fixed budget is chronically insufficient for a hard case, the fix is
-  graceful degradation (deterministic deferral / a bounded retry ladder that
-  gives up cleanly) or an algorithmic change that keeps the SAME fixed budget
-  sufficient — never a bigger number picked because one particular map needed
-  it.
+- **Budgets, capacities, and thresholds are three different things.**
+  - **Per-step / per-query work budgets** (search node caps, solves per step,
+    links/spawns folded per step, and similar) **are fixed counts — never
+    derived from or scaled to world size, map size, cell count, portal count,
+    or any other measured "current scale."** Frame time is constant whatever
+    map is loaded; a budget that scales with the world makes big maps slower
+    per frame and makes behavior map-dependent. Use counts, not milliseconds
+    (time budgets are nondeterministic). This is a load-bearing, explicitly
+    tested invariant (grep `independent of` / `regardless of world size` —
+    e.g. the pathfinder's abstract A* node budget and `nav_graph.zig`'s
+    incremental-dig chunk-patch tests). When a fixed budget is chronically
+    insufficient, fix it with graceful degradation (deterministic deferral /
+    a bounded retry ladder) or an algorithmic change — never a bigger number
+    picked for one map.
+  - **Data-structure capacities** (nav arrays, chunk tables, entity/component
+    pools, node/anchor stores) **are sized from the loaded world and content at
+    init/load**, reserved up front, and never grown on the hot path (the
+    allocation-free + `FailingAllocator` rule still applies). Use a fixed cap
+    only where a format or index width forces one (e.g. `u16` indices) or as
+    a safety ceiling that fails loudly at load — not as the working size.
+  - **Heuristic thresholds** (e.g. "build a group flow field above N agents")
+    derive from the cost of the operation they gate (its own bounded region or
+    input), never from the whole world's size.
 - Threaded writes into a shared buffer must be partitioned (disjoint
   per-worker/per-range slots) and reserved before dispatch, never after or
   during. Allocators are explicit fields set at `init`, never a global reached

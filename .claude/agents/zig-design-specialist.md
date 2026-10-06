@@ -80,11 +80,14 @@ the game layer needs. Game states never call SDL_GPU directly.
   reorders a `SimulationPipeline` stage, name its `PipelineResource` read/write tag(s) for
   `stageContract()` and its `stage_order` position — `zig build check` comptime-fails a stage
   reading a resource no earlier stage writes, so leaving this out is not a valid deferral.
-- **Fixed work budgets**: any per-query/per-frame budget (search node caps, solve ceilings,
-  and similar) is a fixed constant — never derived from or scaled to world/map size, cell
-  count, portal count, or other "current scale." State the budget explicitly and, when a hard
-  case can exceed it, name the graceful-degradation path (deterministic deferral / bounded
-  retry ladder) rather than a bigger number sized to one scenario.
+- **Budgets vs capacities vs thresholds** (CLAUDE.md three-way rule): per-step/per-query
+  **work budgets** (search node caps, solves/links/spawns per step) are fixed counts — never
+  derived from world/map size, cell count, portal count, or other "current scale"; state the
+  budget and, when a hard case can exceed it, name the graceful-degradation path
+  (deterministic deferral / bounded retry ladder). **Capacities** of data structures are sized
+  from the loaded world/content at init/load and reserved up front (state the sizing formula
+  and the `FailingAllocator` proof); use a fixed cap only for a format/index limit or a loud
+  load-time safety ceiling. **Thresholds** derive from the cost of the gated operation.
 - **Deferred / main-thread boundary** for structural entity/component changes, state
   transitions, SDL/GPU calls, asset loading, save/load streaming, renderer resource
   ownership. The main thread is not a dumping ground — any subsystem that scales with
