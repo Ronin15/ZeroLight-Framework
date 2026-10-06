@@ -266,7 +266,7 @@ Out of scope (each item has a named owner):
       - `structural_commands`: new_cap + `structural_headroom` (B1).
   - **Event limit.** Then `self.reserve(frame, new_cap)` raises the event limit. That also re-runs every reserve the other slices attach to it: 64E `reserveNavDirty`, 68A `reserveAiRowMap`, 56B's projectile bitset.
   - **Pathfinding.** It calls a new `pathfinding.growForAgentCount(steering_rows)`. This is the grow half of `adjustCapacityForAgentCount` (`system.zig:315-337`), moved to the seam. Shrink stays in `beginUpdate` with its hysteresis, and `beginUpdate`'s grow remains the safety net. If `steering_rows > capacity.max_agent_budget`, `raiseAgentBudget(grown)` re-runs `nav_memory.budgetForCapacity(...).check`:
-    - if admitted, the ceiling rises;
+    - if admitted, the ceiling rises. A raise never moves the group-field threshold (71B.1): `groupFieldThreshold` clamps to the ceiling frozen at reserve;
     - if refused, the old ceiling stays, `agent_budget_raise_refused` is counted with one warn, and the pending backpressure (K2) applies. That gate is the loud platform-memory ceiling.
 - **Benefit:**
   - removes a ReleaseFast corruption path and a crash caused by capacity;
@@ -772,7 +772,7 @@ Out of scope (each item has a named owner):
 | world-data-world-02, gameplay-systems-31, pathfinding-26 | level-link pool refusal (`world_system.zig:302-308, 1557-1619`; `dig_controller.zig:151-166`; `nav_graph.zig:569-576, 1299-1346`) | 64E "Capacity-audit follow-up … level links grow at the dig commit seam" | K6 adds the extra comment sites and callers to that item's text |
 | pathfinding-17 | nav dirty buffers (`system.zig:110-127, 268-280`) | 64E "nav dirty buffers are load-time capacities"; 65B "Load-time capacities" (fence window) | B1 makes `SimulationPipeline.reserve` production; C3 re-runs it on growth; K6 records the B1 prerequisite in 64E |
 | pathfinding-29 | `nav_grid.zig:105-129` per-call map | 65B "Load-time capacities" | none |
-| pathfinding-34 | `types.zig:97-100` 4096 ceiling; demo `:223` | 71B "71B.1 capacity-audit follow-up" | C3's `raiseAgentBudget` composes; K6 notes it in 71B |
+| pathfinding-34 | `types.zig:97-100` 4096 ceiling; demo `:223` | 71B "71B.1 capacity-audit follow-up" (**landed 2026-10-06**: content-sized initial ceiling; threshold clamps to the ceiling frozen at reserve) | C3's `raiseAgentBudget` composes; K6 notes it in 71B |
 | gameplay-systems-09 | `perception.zig:458-469, 857-889` `pending_dirty` | 64B "B3 perception cache bound" | none |
 | gameplay-systems-17 | `arbitration.zig:24-25` `behavior_count` | 61 AI forage bullet | none |
 | gameplay-systems-25 (band half) | spatial window zoom band | 60 spatial-index dense window item | D2 cross-edit |

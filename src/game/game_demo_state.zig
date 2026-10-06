@@ -42,6 +42,8 @@ const NavUpdateStats = @import("systems/pathfinding.zig").NavUpdateStats;
 const PathfindingCapacity = @import("systems/pathfinding.zig").PathfindingCapacity;
 const autoSizedMaxNavMemoryBytes = @import("systems/pathfinding.zig").autoSizedMaxNavMemoryBytes;
 const nav_interior_link_slots_per_chunk = @import("systems/pathfinding.zig").nav_interior_link_slots_per_chunk;
+const default_min_group_field_agents = @import("systems/pathfinding.zig").default_min_group_field_agents;
+const PathfindingSystem = @import("systems/pathfinding.zig").PathfindingSystem;
 const DigIntent = @import("simulation.zig").DigIntent;
 const NavInvalidationReason = @import("simulation.zig").NavInvalidationReason;
 const SimulationFrame = @import("simulation.zig").SimulationFrame;
@@ -193,10 +195,23 @@ fn demoLevelLinkLimit(world: *const WorldSystem) usize {
     return world.levelLinks().len + world_chunks * nav_interior_link_slots_per_chunk;
 }
 
-fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_count: usize) PathfindingCapacity {
+/// The demo's shared-flow-field threshold (see `proceduralPathfindingCapacity`'s
+/// `min_group_field_agents` comment for the measured evidence behind 2000).
+const demo_min_group_field_agents: usize = 2000;
+
+/// The demo's initial pathfinding agent ceiling, content-sized from the loaded population:
+/// every steering agent (the intent capacity), floored at the group-field threshold so the
+/// threshold is never clamped below its pin. An initial ceiling only: the population seam
+/// raises it (`PathfindingSystem.raiseAgentBudget`) when `max_nav_memory_bytes` admits the
+/// raise, and the threshold stays on the value frozen at reserve.
+fn demoAgentBudget(population: DemoPopulationCapacity, min_group_field_agents: usize) usize {
+    return @max(population.intent_capacity, min_group_field_agents);
+}
+
+fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_count: usize, population: DemoPopulationCapacity) PathfindingCapacity {
     var cap: PathfindingCapacity = .{
         .max_group_fields = 4,
-        .max_agent_budget = 4096,
+        .max_agent_budget = demoAgentBudget(population, demo_min_group_field_agents),
         .worker_participant_count = worker_participant_count,
         // MEASURED, not assumed (a live perf capture on this exact demo, after the
         // portal-consolidation and group-field hardening fixes below were both already
@@ -221,7 +236,7 @@ fn proceduralPathfindingCapacity(worker_participant_count: usize, level_link_cou
         // population this demo produces while staying a real, considered ceiling (not
         // "disabled") for when a battle-scale crowd feature exists; revisit with a fresh
         // measurement, not a guess, once that feature is built.
-        .min_group_field_agents = 2000,
+        .min_group_field_agents = demo_min_group_field_agents,
         // group_field_rebuild_min_steps is intentionally left at its default: the safe
         // value is an internal relationship between group_field_build_budget and this
         // throttle (both pathfinding-owned), not a demo-specific judgment call — see
@@ -345,7 +360,7 @@ pub const GameDemoState = struct {
             thread_system.participantSlotCount(),
             // The nav memory gate admits the world's reserved link limit (initWithWorld
             // reserves exactly this before the nav build).
-            proceduralPathfindingCapacity(thread_system.participantSlotCount(), demoLevelLinkLimit(&world)),
+            proceduralPathfindingCapacity(thread_system.participantSlotCount(), demoLevelLinkLimit(&world), deriveDemoPopulationCapacity(battle_scale_demo_mover_count)),
             thread_system,
             battle_scale_demo_mover_count,
             asset_store,
@@ -439,10 +454,12 @@ pub const GameDemoState = struct {
             // automatically, and the group-field threshold is the fixed default
             // (never derived from world size). Only the hard ceiling is fixed, so
             // a battle grows and quiets shrinks without bumping knobs. At this demo's
-            // small scale capacity settles low and the group path stays dormant.
+            // small scale capacity settles low and the group path stays dormant. The
+            // agent ceiling is an initial, content-sized value the population seam raises
+            // (`raiseAgentBudget`), gated by `max_nav_memory_bytes`.
             .pathfinding = pathfinding_override orelse .{
                 .max_group_fields = 4,
-                .max_agent_budget = 4096,
+                .max_agent_budget = demoAgentBudget(pop_cap, default_min_group_field_agents),
                 // Configured threaded participant count; A* scratch is sized for it in
                 // the nav build so the first threaded solve does no lazy allocation.
                 .worker_participant_count = worker_participant_count,
@@ -1311,13 +1328,44 @@ test "GameDemoState owns test_squares via its own allocator field, not DataSyste
 }
 
 test "proceduralPathfindingCapacity reserves the shared flow-field for a future battle-scale crowd" {
-    const capacity = proceduralPathfindingCapacity(1, 0);
+    const population = deriveDemoPopulationCapacity(battle_scale_demo_mover_count);
+    const capacity = proceduralPathfindingCapacity(1, 0, population);
     // Pinned so high the demo's pursuit pack can never cross it: a live capture measured
     // the shared flood building constantly but never once being sampled at this demo's
     // scale — pending-request dedup and the goal-keyed result cache already serve every
     // requester in a goal-change burst off one solve, for free, regardless of population
     // — see the field's doc comment for the measured evidence.
     try std.testing.expectEqual(@as(usize, 2000), capacity.min_group_field_agents);
+    // The initial agent ceiling is content-sized from the loaded population, floored at the
+    // threshold pin; no fixed 4096.
+    try std.testing.expectEqual(@max(population.intent_capacity, @as(usize, 2000)), capacity.max_agent_budget);
+}
+
+test "proceduralPathfindingCapacity at battle scale keeps the group-field threshold at its pin" {
+    // Reserve only, no nav build: the threshold reads the ceiling frozen at reserve.
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(proceduralPathfindingCapacity(1, 0, deriveDemoPopulationCapacity(battle_scale_demo_mover_count)));
+    try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
+}
+
+test "proceduralPathfindingCapacity for a tiny population never clamps the threshold below its pin" {
+    const capacity = proceduralPathfindingCapacity(1, 0, deriveDemoPopulationCapacity(8));
+    try std.testing.expectEqual(@as(usize, 2000), capacity.max_agent_budget);
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(capacity);
+    try std.testing.expectEqual(@as(usize, 2000), system.groupFieldThreshold());
+}
+
+test "content-sized agent ceiling never needs more nav memory than the retired fixed 4096" {
+    const population = deriveDemoPopulationCapacity(battle_scale_demo_mover_count);
+    const capacity = proceduralPathfindingCapacity(1, 0, population);
+    var fixed = capacity;
+    fixed.max_agent_budget = 4096;
+    const after = autoSizedMaxNavMemoryBytes(capacity, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, 0);
+    const before = autoSizedMaxNavMemoryBytes(fixed, procedural_dense_layer_count, procedural_world_width_tiles, procedural_world_height_tiles, 0);
+    try std.testing.expect(after <= before);
 }
 
 test "demo spawns atlas-backed moving actors" {

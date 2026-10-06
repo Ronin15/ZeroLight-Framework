@@ -3,8 +3,14 @@
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: [Slice 62](slice-62.md), [Slice 71A](slice-71a.md) (71B.3 only; 71B.1 ungated, 71B.2 bench-gated) · Track: [VoidLight port](../tracks/voidlight-port.md)
 
 **Status: in progress.** Landed 2026-10-05: 71B.1's first item (the fixed
-group-field threshold) and the 71B.1 steering level gate. The rest of 71B.1,
-71B.2, and 71B.3 are not started. It has three parts with different gates:
+group-field threshold) and the 71B.1 steering level gate. 71B.1 capacity-audit
+follow-up landed 2026-10-06: the demo's `max_agent_budget` is content-sized
+(2053 at battle scale, was 4096) and the threshold clamp uses the ceiling
+frozen at reserve. Nav-memory requirement for the procedural capacity
+(`budgetForCapacity(...).requiredBytes`, 0 links): 512,998,432 B → 362,372,128
+B; `autoSizedMaxNavMemoryBytes` rounds both to 536,870,912 B (the same power
+of two). The rest of 71B.1 (static-collider rows, steering migration), 71B.2,
+and 71B.3 are not started. It has three parts with different gates:
 
 - **71B.1, fixed group-field threshold + shared static-collider rows +
   steering migration + steering level gate.** No gate. It needs only live
@@ -191,8 +197,14 @@ Goal:
   to `max_agent_budget`, so the `@max` keeps a small population from pulling
   the threshold down through a capacity. `default_max_agent_budget = 4096`
   stays only as the library default for bare callers (benches, tests), and
-  its doc comment says so. The elastic grow/shrink policy and the
-  `dropped_requests` path are unchanged.
+  its doc comment says so. The elastic grow/shrink policy, Slice 72 C3's seam
+  raise (`raiseAgentBudget`, which composes with this content-sized initial
+  ceiling) and the `dropped_requests` path are unchanged. The threshold clamp
+  uses the ceiling frozen at reserve (`group_field_threshold_ceiling`), so a
+  seam raise never moves the group-field policy: without it a configuration
+  whose budget is below `min_group_field_agents` changed its threshold when
+  the memory gate admitted a raise (budget 8 → threshold 8; raised to 48 →
+  threshold 48), making behavior follow capacity history.
 - **Unpinned bench fixtures** (`pathfinding.zig` near `:406/:509/:617/:767/:902`)
   move from the derived value to 1024 (clamped by their budget). Record each
   affected `pathfinding*` group before and after. Where a case's purpose
@@ -555,8 +567,18 @@ Narrowphase, contact merge, and response are unchanged.
       `pathfinding-query` 256/1024: 5.28/20.91 us → 5.04/21.27 us;
       `pathfinding-escalated-detour` 1: 14.91 us → 14.52 us. All are within
       noise, as expected for an unchanged code path.)
-- [ ] **71B.1 capacity-audit follow-up (ungated; lands on its own like the
-      threshold item).** The literal `default_min_group_field_agents = 1024`
+- [x] **71B.1 capacity-audit follow-up (ungated; lands on its own like the
+      threshold item).** Landed 2026-10-06. Beyond the text below:
+      `PathfindingSystem.group_field_threshold_ceiling` is frozen at
+      `reserve` and `groupFieldThreshold` clamps to it, so a C3 seam raise
+      never moves the threshold (test "a seam raise never moves the
+      group-field threshold"); a nav-memory test pins
+      `autoSizedMaxNavMemoryBytes(content-sized) <= autoSizedMaxNavMemoryBytes(4096)`.
+      The no-change spot check (`pathfinding-shared-goal`,
+      `pathfinding-group-field-detour`, 5 interleaved ReleaseFast reps) is
+      within noise: shared-goal 1024 serial 22.39 → 22.30 us, tuned 22.03 →
+      21.89 us; group-field-detour 24 serial 471 → 480 ns (spread 32%), tuned
+      454 → 449 ns. The literal `default_min_group_field_agents = 1024`
       stays; only its `types.zig` comment is rewritten around the gated
       operation's cost (no world-size citation). `proceduralPathfindingCapacity`
       gains the population and sets `max_agent_budget =
@@ -728,7 +750,7 @@ Narrowphase, contact merge, and response are unchanged.
   budget code paths, `default_cells_per_group_agent` and
   `group_field_threshold_floor` no longer exist, and the "independent of
   world size" test passes.
-- [ ] 71B.1 capacity-audit follow-up: no pathfinding threshold or capacity
+- [x] 71B.1 capacity-audit follow-up: no pathfinding threshold or capacity
   default cites world size, the group-field default stays the literal 1024,
   the demo's `max_agent_budget` is `@max(intent_capacity,
   min_group_field_agents)`, and the default-demo `groupFieldThreshold()` is

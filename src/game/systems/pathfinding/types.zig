@@ -96,16 +96,17 @@ pub const default_group_field_build_budget: usize = 8192;
 // still process up to that many cells regardless of this total.
 pub const default_group_field_max_cells: usize = 131072;
 // Group-field threshold: same-goal sharers required in one step before a shared flow field
-// builds. A flow-field build is O(cells), so it earns its cost only for large shared-goal
-// crowds. A FIXED per-query policy constant: never derived from world size, cell count, or
+// builds. The gated cost: a shared field floods up to group_field_max_cells cells at
+// group_field_build_budget cells per step, so it earns that cost only for a large same-goal
+// crowd. A FIXED per-query policy constant: never derived from world size, cell count, or
 // population (PathfindingSystem.groupFieldThreshold only clamps it to
-// [1, max(min_capacity_floor, max_agent_budget)] so it never demands more sharers than can
-// exist). 1024 is the value the retired cellCount / 256 derivation landed on for the 512x512
-// demo grid.
+// [1, max(min_capacity_floor, max_agent_budget)], with the ceiling frozen at reserve, so it
+// never demands more sharers than the configured ceiling admits).
 pub const default_min_group_field_agents: usize = 1024;
-// Hard ceiling on the elastically-derived per-step/memory capacity. The only fixed
-// capacity number; requests beyond it follow the existing dropped_requests path.
-// Caps worst-case resident memory so a safe-point resize can never OOM.
+// Library default initial elastic agent ceiling for bare callers (benches, tests). The demo
+// derives its own from content. The population seam raises it (raiseAgentBudget) when the
+// nav-memory gate admits the raise. Requests past a refused ceiling follow the pending
+// backpressure / dropped_requests path.
 pub const default_max_agent_budget: usize = 4096;
 // Smallest agent count the per-step caps are derived for. The derived capacity
 // tracks the live crowd down to this floor (so a tiny demo settles tiny), but never
@@ -496,10 +497,13 @@ pub const PathfindingCapacity = struct {
     group_field_max_cells: usize = default_group_field_max_cells,
     // Fixed per-query group-field threshold (same-goal sharers per step before a shared field
     // builds); never derived from world size. groupFieldThreshold clamps it to
-    // [1, max(min_capacity_floor, max_agent_budget)].
+    // [1, max(min_capacity_floor, max_agent_budget)], using the ceiling frozen at reserve.
     min_group_field_agents: usize = default_min_group_field_agents,
-    // Elastic capacity ceiling (the only fixed capacity number). Live capacity
-    // tracks the agent count up to this, then requests follow dropped_requests.
+    // Initial elastic agent ceiling. Live capacity tracks the agent count up to it; the
+    // population seam raises it (raiseAgentBudget) when the nav-memory gate admits the
+    // raise. Library default for bare callers (benches, tests); the demo derives its own
+    // from content. Requests past a refused ceiling follow the pending backpressure /
+    // dropped_requests path.
     max_agent_budget: usize = default_max_agent_budget,
     // Steps the agent count must stay below half capacity before pools shrink.
     capacity_shrink_window: u32 = default_capacity_shrink_window,

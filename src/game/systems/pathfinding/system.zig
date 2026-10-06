@@ -63,6 +63,7 @@ const resizeFilledArrayList = types.resizeFilledArrayList;
 const no_parent = types.no_parent;
 const no_cell = types.no_cell;
 const min_capacity_floor = types.min_capacity_floor;
+const default_max_agent_budget = types.default_max_agent_budget;
 const cached_results_per_agent = types.cached_results_per_agent;
 const default_max_solves_per_frame = types.default_max_solves_per_frame;
 const deriveCapacity = types.deriveCapacity;
@@ -172,6 +173,10 @@ pub const PathfindingSystem = struct {
     agent_budget_raise_refused_at: usize = 0,
     /// Once-only flag for the refused-raise warn.
     agent_budget_raise_warned: bool = false,
+    /// Upper clamp for `groupFieldThreshold`: the configured agent ceiling, frozen at
+    /// `reserve` (floored at `min_capacity_floor`), so a seam raise (`raiseAgentBudget`)
+    /// never moves a per-query policy. Behavior follows configuration, not capacity history.
+    group_field_threshold_ceiling: usize = default_max_agent_budget,
 
     const SolvedPath = struct {
         key: PathQueryKey,
@@ -227,16 +232,17 @@ pub const PathfindingSystem = struct {
     }
 
     // The fixed per-query group-field threshold (see default_min_group_field_agents), never
-    // derived from world size. Clamped to [1, population ceiling]: the ceiling is
-    // max_agent_budget (the hard cap), NOT live max_pending_requests, so a small live crowd
-    // never pulls the threshold down, and the threshold never demands more sharers than can
-    // ever exist. A pin of 0 clamps to 1.
+    // derived from world size. Clamped to [1, group_field_threshold_ceiling]: the configured
+    // max_agent_budget frozen at reserve, NOT live max_pending_requests (a small live crowd
+    // never pulls the threshold down) and NOT the live ceiling a seam raise lifts (capacity
+    // history never moves the policy). The threshold never demands more sharers than the
+    // configured ceiling admits. A pin of 0 clamps to 1.
     pub fn groupFieldThreshold(self: *const PathfindingSystem) usize {
-        const ceiling = @max(min_capacity_floor, self.capacity.max_agent_budget);
-        return std.math.clamp(self.capacity.min_group_field_agents, 1, ceiling);
+        return std.math.clamp(self.capacity.min_group_field_agents, 1, self.group_field_threshold_ceiling);
     }
 
     pub fn reserve(self: *PathfindingSystem, capacity: PathfindingCapacity) !void {
+        self.group_field_threshold_ceiling = @max(min_capacity_floor, capacity.max_agent_budget);
         // Reserve modestly for the floor agent count, not the full ceiling, so the
         // elastic path can later grow and shrink. The ceiling/ratio/window knobs are
         // retained in self.capacity; per-step caps are derived and grown on demand.
@@ -342,6 +348,7 @@ pub const PathfindingSystem = struct {
     /// raised ceiling (same `budgetForCapacity` the build gate uses, charged against the
     /// live reserved link limit). A refusal keeps the old ceiling, is counted, warns once,
     /// and is final for that ceiling (see `coversAgentCount`). Main thread, population seam.
+    /// Never writes `group_field_threshold_ceiling`: a raise lifts capacity, not policy.
     pub fn raiseAgentBudget(self: *PathfindingSystem, requested: usize, link_count: usize) bool {
         const budget = self.agentBudget();
         if (requested <= budget) return true;
@@ -4895,6 +4902,19 @@ test "group-field threshold is capped by the population ceiling" {
     defer capped.deinit();
     try capped.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
     try std.testing.expectEqual(@as(usize, 8), capped.groupFieldThreshold());
+}
+
+test "a seam raise never moves the group-field threshold" {
+    // Below min_group_field_agents the threshold clamps to the configured ceiling (8). A
+    // gate-admitted raise lifts the live agent ceiling, but the threshold stays on the
+    // ceiling frozen at reserve, so group-field policy never follows capacity history.
+    var system = PathfindingSystem.init(std.testing.allocator);
+    defer system.deinit();
+    try system.reserve(.{ .max_group_fields = 2, .worker_participant_count = 1, .max_agent_budget = 8 });
+    try std.testing.expectEqual(@as(usize, 8), system.groupFieldThreshold());
+    try std.testing.expect(system.raiseAgentBudget(48, 0));
+    try std.testing.expectEqual(@as(usize, 48), system.agentBudget());
+    try std.testing.expectEqual(@as(usize, 8), system.groupFieldThreshold());
 }
 
 test "group-field threshold pin is clamped" {
