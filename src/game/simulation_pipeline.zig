@@ -19,6 +19,7 @@ const hotStoreCapacity = @import("data_system.zig").hotStoreCapacity;
 const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const EntityId = @import("data_system.zig").EntityId;
+const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
 const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
 const MovementBodySlice = @import("data_system.zig").MovementBodySlice;
@@ -665,7 +666,8 @@ pub const SimulationPipeline = struct {
     /// Tracked logical population capacity: every population-sized pipeline capacity is
     /// reserved to it. Grown only by `syncPopulationCapacity` at the commit seam.
     movement_body_capacity: usize,
-    /// Tracked collision-response rows the steering static snapshot was sized against.
+    /// Tracked collision-response capacity; the steering static-obstacle snapshot is
+    /// reserved to it (statics are a subset of responders).
     responder_capacity: usize,
     /// Telemetry: population seam growths (perf metric `population_capacity_grows`).
     population_capacity_grows: u64 = 0,
@@ -706,7 +708,9 @@ pub const SimulationPipeline = struct {
         errdefer ai.deinit();
         var steering = SteeringSystem.init(allocator);
         errdefer steering.deinit();
-        try steering.reserveForCapacity(population, SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
+        // Statics are a subset of collision responders, so the responder count bounds
+        // the obstacle snapshot, including later dynamic->static mobility flips.
+        try steering.reserveForCapacity(population, rows.collision_responses);
         var pathfinding = PathfindingSystem.init(allocator);
         errdefer pathfinding.deinit();
         try pathfinding.reserve(config.pathfinding);
@@ -839,13 +843,12 @@ pub const SimulationPipeline = struct {
         {
             return .{};
         }
-        return self.growPopulationCapacity(frame, data, world, rows);
+        return self.growPopulationCapacity(frame, world, rows);
     }
 
     fn growPopulationCapacity(
         self: *SimulationPipeline,
         frame: *SimulationFrame,
-        data: *const DataSystem,
         world: *const WorldSystem,
         rows: PopulationRowCounts,
     ) !PopulationSyncStats {
@@ -882,9 +885,10 @@ pub const SimulationPipeline = struct {
             try self.collision_response.reserveForContacts(CollisionSystem.estimateContactCapacity(body));
             try self.dig.ensurePlaneScratchReserve(body + 1);
         }
-        // A statics count of 0 is a no-op for the grow-only obstacle ensures.
-        const statics = if (responders_grew) SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()) else 0;
-        try self.steering.reserveForCapacity(body, statics);
+        // The obstacle snapshot is reserved to the responder capacity, not the live
+        // statics: statics are a subset of responders, so statics committed within the
+        // responder headroom (or a dynamic->static mobility flip) never grow it in-stage.
+        try self.steering.reserveForCapacity(body, responders);
 
         self.movement_body_capacity = body;
         self.responder_capacity = responders;
@@ -5572,4 +5576,81 @@ test "population sync raises the pathfinding agent budget when the nav-memory ga
     try std.testing.expectEqual(@as(usize, 16), pipeline.pathfinding.effective_agent_capacity);
     try std.testing.expectEqual(@as(u64, 0), pipeline.pathfinding.agent_budget_raise_refused);
     try std.testing.expect(pipeline.pathfinding.coversAgentCount(12));
+}
+
+fn responderTemplate(index: usize, mobility: CollisionResponseMobility) StructuralCommand {
+    // 64 px apart on one row, so no two responders overlap (no contacts).
+    const position = math.Vec2{ .x = @as(f32, @floatFromInt(index)) * 64, .y = 0 };
+    return .{ .create_entity = .{
+        .movement_body = .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 },
+        .collision_bounds = .{ .size = .{ .x = 16, .y = 16 } },
+        .collision_response = .{ .mode = .solid, .mobility = mobility, .restitution = 0 },
+    } };
+}
+
+test "statics committed within the responder headroom never grow the steering snapshot in-stage" {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var player = try Player.spawn(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 0 });
+    defer threads.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 4096, 64, .{
+        .movement_body_capacity = 4,
+        .structural_headroom = 128,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4 + 128);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 4096,
+        .bounds_height = 64,
+    };
+
+    // First growth: 12 dynamic responders and 1 static.
+    var commands: [20]StructuralCommand = undefined;
+    for (commands[0..12], 0..) |*command, index| command.* = responderTemplate(index, .dynamic);
+    commands[12] = responderTemplate(12, .static);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, commands[0..13]);
+    try std.testing.expect((try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    frame.beginStep();
+    _ = try pipeline.update(context);
+    const responder_capacity = pipeline.responder_capacity;
+    try std.testing.expectEqual(grownPopulationCapacity(13), responder_capacity);
+
+    // 20 more statics: 21 statics, past any physical slack of a snapshot reserved to
+    // the 1 static seen at the growth, yet 33 responders stay within the capacity.
+    for (&commands, 0..) |*command, index| command.* = responderTemplate(13 + index, .static);
+    frame.beginStep();
+    try writeStructuralCommands(&frame, &commands);
+    try std.testing.expect(!(try commitAndSyncLikeDemo(&pipeline, &frame, &data, &world)).grew);
+    try std.testing.expectEqual(responder_capacity, pipeline.responder_capacity);
+    try std.testing.expectEqual(@as(usize, 21), SteeringSystem.countStaticObstacles(data.collisionResponseSliceConst()));
+
+    // The post-commit reaction invalidated the static snapshot; the rebuild this step
+    // must fit the seam's reservation.
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(&pipeline, &frame, &data, &threads, failing.allocator());
+    const result = pipeline.update(context);
+    swap.restore(&pipeline, &frame, &data, &threads);
+    _ = try result;
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.steering.static_snapshot_grown_total);
+    try std.testing.expectEqual(@as(usize, 21), pipeline.steering.obstacleSnapshotSliceConst().min_x.len);
 }

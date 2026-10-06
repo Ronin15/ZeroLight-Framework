@@ -152,8 +152,10 @@ pub const SteeringSystem = struct {
     obstacle_spatial_cell_size: f32 = 0,
     /// Telemetry: static-obstacle rebuilds whose static count exceeded the reserved
     /// snapshot, so the rebuild grew in-stage (diagnostics only; never gates behavior).
-    /// The pipeline reserves to the counted statics at init and at the population seam,
-    /// so the only remaining cause is a dynamic->static mobility flip on an existing row.
+    /// The pipeline reserves the snapshot to its tracked collision-responder capacity at
+    /// init and at the population seam. Statics are a subset of responders, so that
+    /// bounds statics committed within the responder headroom and dynamic->static
+    /// mobility flips alike; a nonzero count under the pipeline means a missed reserve.
     static_snapshot_grown_total: u64 = 0,
     /// Once-only flag for the in-stage growth warn.
     static_snapshot_grow_warned: bool = false,
