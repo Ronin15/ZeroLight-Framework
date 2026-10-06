@@ -156,8 +156,9 @@ alignment)` (every batch shape aligns its range size up to the alignment), so
 one capacity-seam reserve covers every partition the tuner can pick and a
 retune never allocates in-stage — there are no per-range buffers to warm. Only
 a pass whose output count per item is data-dependent (the collision
-broadphase's pairs) keeps per-range slots, reserved at the seam to a
-partition-independent per-range bound, with overflow handled by
+broadphase's pairs) keeps per-range slots, reserved at the seam to the
+per-item bound times the most items each range index can cover under any
+partition (never clamped to the total), with overflow handled by a counted
 grow-and-replay. Reference: `simulation_scope.zig`'s gathers and tier policy,
 `spatial_index.zig`'s gather, `collision.zig`'s narrowphase (Slice 72 C5).
 

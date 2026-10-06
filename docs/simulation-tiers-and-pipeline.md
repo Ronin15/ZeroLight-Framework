@@ -389,8 +389,10 @@ Commit behavior:
   collision-response intents and trigger pairs) are reserved in
   `SimulationPipeline.reserve`, which the seam re-runs, to the collision pair bound
   (`CollisionSystem.estimateContactCapacity`: 4 candidate pairs per body of capacity,
-  the bound the collision stores use). A step past it grows them on the main thread
-  with identical output and is counted (`collision_pair_bound_exceeded`).
+  the bound the collision stores use; each broadphase range slot holds 4 pairs per
+  item it can cover). A step past it, in total or inside one range, grows them on
+  the main thread with identical output and is counted once
+  (`collision_pair_bound_exceeded`).
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.

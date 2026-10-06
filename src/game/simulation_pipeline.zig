@@ -951,7 +951,11 @@ pub const SimulationPipeline = struct {
             affect_events_per_row_max * grownPopulationCapacity(rows.ai_affects)
         else
             old_affect_share;
+        // `collision.reserve` raises its declared pair bound; a later failure (the contact
+        // streams in `reserve`) must not leave it declaring streams that were never sized.
+        const old_pair_bound = self.collision.reserved_pair_bound;
         errdefer {
+            self.collision.reserved_pair_bound = old_pair_bound;
             self.movement_body_capacity = old_body;
             self.responder_capacity = old_responders;
             self.perception_max_events_per_step = old_perception_share;
@@ -6402,6 +6406,48 @@ test "population sync at an unchanged population allocates nothing and never re-
     swap.restore(.{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads });
     try std.testing.expect(!(try unchanged).grew);
     try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "a population growth that fails after the collision reserve restores the declared pair bound" {
+    // The response allocator fails, so growth errors in `reserveContactStreams`, after
+    // `collision.reserve(body)` succeeded. The tracked capacity and the collision's
+    // declared pair bound both roll back to the old capacity's, so overflow telemetry
+    // keeps matching the streams actually reserved; the retry then raises both.
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 64, 64, .{
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try pipeline.reserve(&frame, 4);
+    const old_pair_bound = pipeline.collision.reserved_pair_bound;
+    try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(4), old_pair_bound);
+
+    for (0..30) |index| {
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = .{ .x = @floatFromInt(index), .y = 0 } });
+        try data.setAiAgent(entity, .{ .active_behavior = .wander });
+    }
+
+    const response_allocator = pipeline.collision_response.allocator;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    pipeline.collision_response.allocator = failing.allocator();
+    const failed = pipeline.syncPopulationCapacity(&frame, &data, &world);
+    pipeline.collision_response.allocator = response_allocator;
+    try std.testing.expectError(error.OutOfMemory, failed);
+    try std.testing.expectEqual(@as(usize, 4), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(old_pair_bound, pipeline.collision.reserved_pair_bound);
+
+    const grown = try pipeline.syncPopulationCapacity(&frame, &data, &world);
+    try std.testing.expect(grown.grew);
+    try std.testing.expectEqual(grownPopulationCapacity(30), pipeline.movement_body_capacity);
+    try std.testing.expectEqual(CollisionSystem.estimateContactCapacity(pipeline.movement_body_capacity), pipeline.collision.reserved_pair_bound);
 }
 
 test "population sync raises the pathfinding agent budget when the nav-memory gate admits it" {
