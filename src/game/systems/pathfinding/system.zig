@@ -1349,8 +1349,12 @@ pub const PathfindingSystem = struct {
     fn prepareRequestKeys(self: *PathfindingSystem, requests: []const PathRequest, stats: *PathfindingStats) void {
         self.prepared_requests.clearRetainingCapacity();
         if (!self.graph.valid()) return;
-        const capacity = self.prepared_requests.capacity;
-        const limit = @min(requests.len, capacity);
+        // Intake gates on the LOGICAL per-step cap, never prepared_requests' physical .capacity:
+        // ensureTotalCapacity rounds up and shrink hysteresis keeps slack, so a physical gate would
+        // make the accepted set depend on allocation history. applyDerivedCapacity reserves
+        // prepared_requests to at least max_frame_requests in the same call that sets it.
+        const limit = @min(requests.len, self.capacity.max_frame_requests);
+        std.debug.assert(self.prepared_requests.capacity >= limit);
         stats.dropped_requests += requests.len - limit;
         // Reject (drop, never clamp) an out-of-range level: the query path
         // (statusForWorld -> NavGraph.grid) already rejects the same condition as
@@ -4507,6 +4511,107 @@ test "pathfinding capacity shrink preserves surviving pending keys/tiers and cou
     for (survivor_count..pending_count) |i| {
         try std.testing.expectEqual(PathStatus.missing, system.statusForWorld(0, .{ .x = 8, .y = 8 }, 0, goals[i], .default, null).status);
     }
+}
+
+/// Submits `count` same-goal requests (one shared goal key) from `requesters`, starts laid
+/// out on a 15-wide grid of distinct cells, with the fallback budget at 0 so the accepted
+/// request stays pending (observable) instead of solving this step.
+fn submitSharedGoalBurst(system: *PathfindingSystem, requesters: []const EntityId, count: usize, agent_count: usize) !PathfindingStats {
+    var stream = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer stream.deinit();
+    try stream.reserve(count, count);
+    for (requesters[0..count], 0..) |entity, i| {
+        const start = math.Vec2{
+            .x = 8.0 + @as(f32, @floatFromInt(i % 15)) * 32.0,
+            .y = 8.0 + @as(f32, @floatFromInt(i / 15)) * 32.0,
+        };
+        try appendPathRequest(&stream, .{ .entity = entity, .start = start, .goal = .{ .x = 480, .y = 480 } });
+    }
+    return system.updateSerial(&stream, agent_count, .{ .max_fallback_requests_per_step = 0 });
+}
+
+fn updateEmpty(system: *PathfindingSystem, agent_count: usize) !void {
+    var empty = RangeOutputStream(PathRequest).init(std.testing.allocator);
+    defer empty.deinit();
+    _ = try system.updateSerial(&empty, agent_count, .{});
+}
+
+/// A system grown 8 -> 40 agents on a `side` x `side` world with a 2-step shrink window.
+fn intakeTestSystem(data: *const DataSystem, side: f32) !PathfindingSystem {
+    var system = PathfindingSystem.init(std.testing.allocator);
+    errdefer system.deinit();
+    var capacity = baselineCapacity();
+    capacity.max_agent_budget = 256;
+    capacity.capacity_shrink_window = 2;
+    try system.reserve(capacity);
+    try system.rebuildStaticNavGrid(data, side, side, 32);
+    return system;
+}
+
+test "pathfinding intake drops past the logical frame cap regardless of capacity history" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var requesters: [45]EntityId = undefined;
+    for (0..requesters.len) |i| {
+        requesters[i] = try addNavBody(&data, .{ .x = @floatFromInt((i % 15) * 32), .y = @floatFromInt((i / 15) * 32) }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    // A: grown directly 8 -> 40, then given extra physical slack on the intake list.
+    var direct = try intakeTestSystem(&data, 512);
+    defer direct.deinit();
+    try updateEmpty(&direct, 40);
+    try direct.prepared_requests.ensureTotalCapacity(std.testing.allocator, 160);
+
+    // B: grown 8 -> 128, then shrunk to 40 after the 2-step low-load window.
+    var history = try intakeTestSystem(&data, 512);
+    defer history.deinit();
+    try updateEmpty(&history, 128);
+    try std.testing.expectEqual(@as(usize, 128), history.capacity.max_frame_requests);
+    try updateEmpty(&history, 40);
+    try updateEmpty(&history, 40);
+
+    // Same logical cap, physical capacity above it on both (by different histories).
+    inline for (.{ &direct, &history }) |system| {
+        try std.testing.expectEqual(@as(usize, 40), system.capacity.max_frame_requests);
+        try std.testing.expect(system.prepared_requests.capacity > 45);
+    }
+
+    const direct_stats = try submitSharedGoalBurst(&direct, &requesters, requesters.len, 40);
+    const history_stats = try submitSharedGoalBurst(&history, &requesters, requesters.len, 40);
+    inline for (.{ direct_stats, history_stats }) |stats| {
+        try std.testing.expectEqual(@as(usize, 5), stats.dropped_requests);
+        try std.testing.expectEqual(@as(usize, 1), stats.accepted_requests);
+        try std.testing.expectEqual(@as(usize, 39), stats.duplicate_requests);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct.pending.items.len);
+    try std.testing.expectEqual(@as(usize, 1), history.pending.items.len);
+    try std.testing.expectEqual(requesters[0], direct.pending.items[0].entity);
+    try std.testing.expectEqual(direct.pending.items[0].entity, history.pending.items[0].entity);
+}
+
+test "pathfinding intake drop count is independent of world size" {
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    var requesters: [45]EntityId = undefined;
+    for (0..requesters.len) |i| {
+        requesters[i] = try addNavBody(&data, .{ .x = @floatFromInt((i % 15) * 32), .y = @floatFromInt((i / 15) * 32) }, .{ .x = 8, .y = 8 }, false);
+    }
+
+    // One 16-cell nav chunk (16x16 cells) vs four (32x32 cells), same 8 -> 40 history.
+    var small = try intakeTestSystem(&data, 512);
+    defer small.deinit();
+    var large = try intakeTestSystem(&data, 1024);
+    defer large.deinit();
+    try std.testing.expectEqual(@as(usize, 16 * 16), small.graph.cellCount());
+    try std.testing.expectEqual(@as(usize, 32 * 32), large.graph.cellCount());
+    try updateEmpty(&small, 40);
+    try updateEmpty(&large, 40);
+
+    const small_stats = try submitSharedGoalBurst(&small, &requesters, requesters.len, 40);
+    const large_stats = try submitSharedGoalBurst(&large, &requesters, requesters.len, 40);
+    try std.testing.expectEqual(@as(usize, 5), small_stats.dropped_requests);
+    try std.testing.expectEqual(small_stats.dropped_requests, large_stats.dropped_requests);
+    try std.testing.expectEqual(small_stats.accepted_requests, large_stats.accepted_requests);
 }
 
 test "group-field threshold is independent of world size" {

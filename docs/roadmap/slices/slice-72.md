@@ -721,7 +721,7 @@ Out of scope (each item has a named owner):
   - Bench: `render-prep`, `render-game-prep` (no regression).
 - [ ] **A3 · Logical intake limit** (§A3).
   - Tests in `system.zig`:
-    - grow to 64 agents, then shrink to 40 (physical > logical); submitting `max_frame_requests + 5` requests drops exactly 5;
+    - grow 8 → 40 agents directly (plus forced physical slack on `prepared_requests`), and separately grow 8 → 128 then hold 40 agents for `capacity_shrink_window` steps so it shrinks to logical 40 (physical > logical on both; "grow to 64, shrink to 40" is unreachable: a shrink needs `agent_count * 2 < current`, and the target is `deriveCapacity(agent_count)`); submitting `max_frame_requests + 5` same-goal requests drops exactly 5 on both, and both accept the same request;
     - the same request stream on a 1-chunk and a 4-chunk minimal world gives an equal `dropped_requests`, independent of world size.
   - Bench: `pathfinding`, `pathfinding-drain`.
 - [ ] **A4 · Logical search limits** (§A4).
@@ -941,8 +941,8 @@ Out of scope (each item has a named owner):
     - the Events section names the producer table as the bound;
     - Structural Commands and Post-Commit Reactions add the sync step;
     - the Slice 45 consumer paragraph describes the inverted resolve.
-  - `docs/rendering-assets-shaders.md`: `drawSprite` growth and its counter; GPU growth without an idle (after H4).
-  - `docs/coding-standards.md` Allocator discipline gets the rule: "behavior gates compare stored logical limits, never `.capacity`".
+  - `docs/rendering-assets-shaders.md`: `drawSprite` growth and its counter (landed with A2); GPU growth without an idle (after H4).
+  - `docs/coding-standards.md` Allocator discipline gets the rule: "behavior gates compare stored logical limits, never `.capacity`" (coding-standards rule landed with A3).
   - Add the Slice 72 row to the roadmap index's Open Frontier table, plus a Suggested Order entry ("72 — any time; Batch A first").
 
 ### Acceptance checks

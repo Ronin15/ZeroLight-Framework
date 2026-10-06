@@ -82,6 +82,16 @@ allocator to fail on the next allocation, and assert the push completes — not
 just the reserve-fails cleanup branch, since split sizing can silently desync
 from the push count across a future edit.
 
+Behavior gates compare stored **logical** limits, never a container's physical
+`.capacity`. `ArrayList.ensureTotalCapacity` rounds up (`growCapacity(n) = n +
+n/2 + cache_line/@sizeOf(T)` in std 0.17), `MultiArrayList.resize` rounds too,
+and shrink hysteresis keeps slack. A gate on `.capacity` therefore makes
+refusal, drops, truncation, spills or query reach depend on allocation history.
+Store the limit beside the reserve, assign it only after the reserve succeeds,
+gate on it, and `std.debug.assert(list.capacity >= limit)`. A `.capacity` read
+that only chooses between `appendAssumeCapacity` and a growing `append`, with
+the same result either way, is not a behavior gate.
+
 The same ReleaseFast safety-strip applies to `unreachable`, `catch unreachable`,
 and `orelse unreachable` (including `.?`, which is `orelse unreachable`): in the
 shipped binary a reached `unreachable` is undefined behavior, not a panic. All
