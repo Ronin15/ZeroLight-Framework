@@ -915,6 +915,46 @@ pub fn resizeArrayList(comptime T: type, list: *std.ArrayList(T), allocator: std
     list.clearRetainingCapacity();
 }
 
+/// Two-phase resize of one list inside a multi-list failure-atomic reserve.
+/// `prepare` makes room for `capacity` without touching the list's contents or freeing
+/// its storage: a grow reserves in place (`ensureTotalCapacity` keeps the old buffer on
+/// OOM), a shrink allocates the smaller replacement on the side. Once every list of the
+/// reserve has prepared, `commit` swaps a pending replacement in (freeing the old buffer)
+/// and cannot fail; `abort` (an `errdefer` after `prepare`) frees an uncommitted
+/// replacement. So an OOM anywhere leaves every list at its prior storage, never below
+/// the logical limit its owner still admits writes against.
+pub fn ListResize(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        replacement: ?std.ArrayList(T) = null,
+
+        pub fn prepare(self: *Self, list: *std.ArrayList(T), allocator: std.mem.Allocator, capacity: usize) !void {
+            std.debug.assert(self.replacement == null);
+            if (shouldShrinkCapacity(list.capacity, capacity)) {
+                var replacement: std.ArrayList(T) = .empty;
+                try replacement.ensureTotalCapacity(allocator, capacity);
+                self.replacement = replacement;
+                return;
+            }
+            try list.ensureTotalCapacity(allocator, capacity);
+        }
+
+        pub fn abort(self: *Self, allocator: std.mem.Allocator) void {
+            if (self.replacement) |*replacement| replacement.deinit(allocator);
+            self.replacement = null;
+        }
+
+        /// Infallible: swaps a prepared shrink replacement in (contents are not carried
+        /// over; the owner rebuilds the list). A grow was already applied in place.
+        pub fn commit(self: *Self, list: *std.ArrayList(T), allocator: std.mem.Allocator) void {
+            const replacement = self.replacement orelse return;
+            list.deinit(allocator);
+            list.* = replacement;
+            self.replacement = null;
+        }
+    };
+}
+
 // Like resizeArrayList but for a pool sized to exactly `capacity` and memset to a
 // fill value (the disjoint worker path/stitched stripes). Shrinking frees memory;
 // failure-atomic the same way.

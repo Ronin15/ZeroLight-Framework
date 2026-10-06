@@ -15,8 +15,7 @@ const PathQueryKey = types.PathQueryKey;
 const StitchedCell = types.StitchedCell;
 const PathResult = types.PathResult;
 const PathfindingStats = types.PathfindingStats;
-const setLen = types.setLen;
-const shouldShrinkCapacity = types.shouldShrinkCapacity;
+const ListResize = types.ListResize;
 const hashPathKey = types.hashPathKey;
 const keysEqual = types.keysEqual;
 const emptyKey = types.emptyKey;
@@ -58,17 +57,18 @@ fn ProbeTable(comptime Payload: type) type {
             self.* = undefined;
         }
 
+        // Failure-atomic: the only fallible step is the slot reservation, which never
+        // frees the old table first (a shrink allocates its replacement on the side), so
+        // an OOM leaves the table, its entries and `logical_capacity` untouched.
         fn reserve(self: *Self, allocator: std.mem.Allocator, capacity: usize) !void {
             const physical = capacity *| 2;
-            // Free the backing on a shrink so an elastic down-resize releases memory; the
-            // probe positions depend on capacity, so a resized table is always rebuilt.
-            if (shouldShrinkCapacity(self.slots.capacity, physical)) self.slots.shrinkAndFree(allocator, 0);
-            try setLen(&self.slots, allocator, physical);
-            // Zeroed immediately after growing (not deferred to clear() below): setLen
-            // leaves new slots' `occupied` uninitialized, and a later fallible step added
-            // to this function in the future could otherwise leave that memory exposed to
-            // a recoverable-OOM caller. Harmless no-op today since nothing fallible follows.
-            for (self.slots.items) |*slot| slot.occupied = false;
+            // A shrink frees the old backing (after the replacement exists) so an elastic
+            // down-resize releases memory; probe positions depend on capacity, so a
+            // resized table is always rebuilt.
+            var slots_resize: ListResize(Slot) = .{};
+            try slots_resize.prepare(&self.slots, allocator, physical);
+            slots_resize.commit(&self.slots, allocator);
+            self.slots.items.len = physical;
             self.logical_capacity = capacity;
             self.clear();
         }
@@ -291,35 +291,49 @@ pub const ResultCache = struct {
         };
     }
 
+    // Failure-atomic: every list is prepared (grown in place, or a shrink's smaller
+    // replacement allocated on the side) before any is committed, so an OOM leaves the
+    // cache — entries, strides and `logical_capacity` — exactly as it was.
     pub fn reserve(self: *ResultCache, allocator: std.mem.Allocator, capacity: usize, path_stride: usize, stitched_stride: usize) !void {
-        // Totals computed from locals; strides are committed to self only after all
-        // allocations succeed so a mid-reserve OOM never leaves mismatched strides.
         const physical = capacity *| 2;
         const total_cells = capacity *| path_stride;
         const total_stitched = capacity *| stitched_stride;
-        // Free the backing on a shrink so an elastic down-resize releases memory; slot
-        // probe positions and per-entry strides depend on capacity, so a resized cache
-        // is always rebuilt (the goal-keyed entries re-solve on next request).
-        if (shouldShrinkCapacity(self.slots.capacity, physical)) self.slots.shrinkAndFree(allocator, 0);
-        if (shouldShrinkCapacity(self.payloads.capacity, capacity)) self.payloads.shrinkAndFree(allocator, 0);
-        if (shouldShrinkCapacity(self.path_cells.capacity, total_cells)) self.path_cells.shrinkAndFree(allocator, 0);
-        if (shouldShrinkCapacity(self.stitched.capacity, total_stitched)) self.stitched.shrinkAndFree(allocator, 0);
-        if (shouldShrinkCapacity(self.free_payload_indices.capacity, capacity)) self.free_payload_indices.shrinkAndFree(allocator, 0);
-        if (shouldShrinkCapacity(self.evict_scratch.capacity, capacity)) self.evict_scratch.shrinkAndFree(allocator, 0);
-        try setLen(&self.slots, allocator, physical);
-        // Zeroed immediately (not deferred to clear() below): setLen leaves new slots'
-        // `occupied` uninitialized, and any of the further allocations below can still
-        // fail — a recoverable-OOM caller must never read stale/undefined occupancy off
-        // an abandoned mid-reserve table.
-        for (self.slots.items) |*slot| slot.occupied = false;
-        try setLen(&self.payloads, allocator, capacity);
-        try setLen(&self.path_cells, allocator, total_cells);
+        // A shrink frees the old backing (after its replacement exists) so an elastic
+        // down-resize releases memory; slot probe positions and per-entry strides depend
+        // on capacity, so a resized cache is always rebuilt (the goal-keyed entries
+        // re-solve on next request).
+        var slots_resize: ListResize(ProbeSlot) = .{};
+        try slots_resize.prepare(&self.slots, allocator, physical);
+        errdefer slots_resize.abort(allocator);
+        var payloads_resize: ListResize(SlotPayload) = .{};
+        try payloads_resize.prepare(&self.payloads, allocator, capacity);
+        errdefer payloads_resize.abort(allocator);
+        var path_cells_resize: ListResize(u32) = .{};
+        try path_cells_resize.prepare(&self.path_cells, allocator, total_cells);
+        errdefer path_cells_resize.abort(allocator);
+        var stitched_resize: ListResize(StitchedCell) = .{};
+        try stitched_resize.prepare(&self.stitched, allocator, total_stitched);
+        errdefer stitched_resize.abort(allocator);
+        var free_indices_resize: ListResize(u32) = .{};
+        try free_indices_resize.prepare(&self.free_payload_indices, allocator, capacity);
+        errdefer free_indices_resize.abort(allocator);
+        var evict_scratch_resize: ListResize(PathQueryKey) = .{};
+        try evict_scratch_resize.prepare(&self.evict_scratch, allocator, capacity);
+
+        // Nothing below can fail: commit every list, then rebuild at the new shape.
+        slots_resize.commit(&self.slots, allocator);
+        payloads_resize.commit(&self.payloads, allocator);
+        path_cells_resize.commit(&self.path_cells, allocator);
+        stitched_resize.commit(&self.stitched, allocator);
+        free_indices_resize.commit(&self.free_payload_indices, allocator);
+        evict_scratch_resize.commit(&self.evict_scratch, allocator);
+        self.slots.items.len = physical;
+        self.payloads.items.len = capacity;
+        self.path_cells.items.len = total_cells;
         @memset(self.path_cells.items, no_cell);
-        try setLen(&self.stitched, allocator, total_stitched);
+        self.stitched.items.len = total_stitched;
         @memset(self.stitched.items, .{ .level = 0, .cell = no_cell });
-        try self.free_payload_indices.ensureTotalCapacity(allocator, capacity);
-        try self.evict_scratch.ensureTotalCapacity(allocator, capacity);
-        // All allocations succeeded; safe to commit the new strides and capacity.
+        self.evict_scratch.clearRetainingCapacity();
         self.path_stride = path_stride;
         self.stitched_stride = stitched_stride;
         self.logical_capacity = capacity;
@@ -749,6 +763,92 @@ test "pathfinding fixed-capacity unavailable key set has explicit fixed capacity
     try std.testing.expect(!keys.insert(second_key));
     try std.testing.expect(keys.contains(first_key));
     try std.testing.expect(!keys.contains(second_key));
+}
+
+fn testGoalKey(x: usize) PathQueryKey {
+    var key = emptyKey(1);
+    key.goal.x = @intCast(x);
+    return key;
+}
+
+test "pathfinding key set shrink OOM keeps the table and its entries (FailingAllocator)" {
+    var keys = KeySet{};
+    defer keys.deinit(std.testing.allocator);
+    try keys.reserve(std.testing.allocator, 64);
+    for (0..8) |i| try std.testing.expect(keys.insert(testGoalKey(i)));
+
+    // A shrink to 4 allocates its replacement first; failing that allocation must leave
+    // the old 64-entry table in place (a free-then-reallocate left zero slots behind a
+    // logical limit of 64).
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, keys.reserve(failing.allocator(), 4));
+    try std.testing.expect(failing.has_induced_failure);
+
+    try std.testing.expectEqual(@as(usize, 64), keys.table.logical_capacity);
+    try std.testing.expectEqual(@as(usize, 128), keys.table.slots.items.len);
+    try std.testing.expect(keys.table.slots.capacity >= 2 * keys.table.logical_capacity);
+    for (0..8) |i| try std.testing.expect(keys.contains(testGoalKey(i)));
+    try std.testing.expect(keys.insert(testGoalKey(100)));
+
+    // The same shrink succeeds once memory is available, and actually frees.
+    try keys.reserve(std.testing.allocator, 4);
+    try std.testing.expectEqual(@as(usize, 4), keys.table.logical_capacity);
+    try std.testing.expectEqual(@as(usize, 8), keys.table.slots.items.len);
+    try std.testing.expect(keys.table.slots.capacity < 128);
+}
+
+/// Invariants every `ResultCache` state must hold: physical lists cover the logical limit
+/// at the committed strides, and the free list can hold every payload index.
+fn expectResultCacheConsistent(cache: *const ResultCache) !void {
+    const logical = cache.logical_capacity;
+    try std.testing.expectEqual(2 * logical, cache.slots.items.len);
+    try std.testing.expectEqual(logical, cache.payloads.items.len);
+    try std.testing.expectEqual(logical * cache.path_stride, cache.path_cells.items.len);
+    try std.testing.expectEqual(logical * cache.stitched_stride, cache.stitched.items.len);
+    try std.testing.expect(cache.free_payload_indices.capacity >= logical);
+    try std.testing.expect(cache.evict_scratch.capacity >= logical);
+    try std.testing.expectEqual(logical - cache.len, cache.free_payload_indices.items.len);
+}
+
+test "pathfinding result cache resize OOM at every allocation leaves the cache intact (FailingAllocator)" {
+    // Shrink (16 -> 2) and grow (16 -> 64): each allocation the reserve makes is failed in
+    // turn. The old cache must survive every failure whole: same limit, same strides, same
+    // entry and path cells. The old shrink path freed lists before reallocating, leaving
+    // physical storage below the logical limit the cache still admits writes against.
+    for ([_]usize{ 2, 64 }) |target| {
+        var fail_index: usize = 0;
+        while (true) : (fail_index += 1) {
+            var stats = PathfindingStats{};
+            var cache = ResultCache{};
+            defer cache.deinit(std.testing.allocator);
+            try cache.reserve(std.testing.allocator, 16, 4, 8);
+            const key = testGoalKey(7);
+            cache.put(key, &.{ 3, 4, 5 }, &.{}, 0, 0, &stats);
+
+            var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index, .resize_fail_index = fail_index });
+            cache.reserve(failing.allocator(), target, 4, 8) catch |err| {
+                try std.testing.expectEqual(error.OutOfMemory, err);
+                try std.testing.expectEqual(@as(usize, 16), cache.logical_capacity);
+                try std.testing.expectEqual(@as(usize, 4), cache.path_stride);
+                try std.testing.expectEqual(@as(usize, 8), cache.stitched_stride);
+                try expectResultCacheConsistent(&cache);
+                const slot = cache.slotIndex(key).?;
+                const stored = cache.pathSlice(slot, cache.resultAt(slot).path_len);
+                try std.testing.expectEqualSlices(u32, &.{ 3, 4, 5 }, stored);
+                // Still fully usable at the old limit.
+                for (0..16) |i| cache.put(testGoalKey(100 + i), &.{1}, &.{}, 0, 0, &stats);
+                try expectResultCacheConsistent(&cache);
+                continue;
+            };
+            // Every allocation succeeded: the resize committed at the new shape.
+            try std.testing.expectEqual(target, cache.logical_capacity);
+            try expectResultCacheConsistent(&cache);
+            try std.testing.expect(cache.find(key) == null);
+            break;
+        }
+        // Shrink makes six replacement allocations; a grow makes at most six.
+        try std.testing.expect(fail_index >= 1);
+    }
 }
 
 test "pathfinding result cache keeps probe chains intact after mid-chain removal" {
