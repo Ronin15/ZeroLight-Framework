@@ -903,6 +903,11 @@ Out of scope (each item has a named owner):
     - `slice-61.md:80-84, 334-341, 521`: the multiplier becomes automatic, and only the `capacity_limit` re-pin remains;
     - `slice-64b.md:257`: both shares become "excluded — derived capacity".
   - Bench: `perception`, `ai-affect`.
+- [ ] **C5 · Per-range slots warmed at the seam, not on the first threaded step** (found by the C3 multi-worker growth proof, `ebeb3c7`).
+  - Now: after a C3 growth, `collision`, `scope` and `spatial_index` still allocate their per-range output slots on the first threaded step (the ranges past slot 0 fill on first use), so C3's "allocation-free between seams" holds only for the serial path. Perception's range slots are removed outright by I1 and are not part of this item.
+  - Change: `syncPopulationCapacity` also reserves each system's per-range slots for the maximum range count the tuner can choose at the new capacity (ranges = ceil(capacity / min items per range), bounded by the worker count), so a partition retune never allocates in-stage. Sizes stay pure functions of capacity and worker count.
+  - Tests: the `runPopulationGrowthScenario` 2-worker variant (tuners pinned to a 2-worker split) asserts zero allocations on the first threaded step after growth, under `FailingAllocator` with the world allocator swapped; plus a retune test that moves from 16- to 64-item ranges with zero allocations.
+  - Bench: `collision`, `scope`, `spatial_index` (no-regression gate).
 - [ ] **D1 · Inverted destructible resolve** (§D1).
   - Tests in `destructible_controller.zig`:
     - 300 crates (minimal world, one per cell): a cell interact hits the crate at dense index 299, which fails today;
