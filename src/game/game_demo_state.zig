@@ -114,10 +114,10 @@ fn deriveDemoPopulationCapacity(mover_count: usize) DemoPopulationCapacity {
     const underground_movers = mover_count - surface_movers;
     // Owned by CollisionSystem (this demo has no independent opinion on simultaneous
     // contacts for N bodies — that's collision's own domain knowledge, not a ratio to
-    // guess here). `estimateContactCapacity` is a steady-state WARM heuristic, not a
-    // combinatorial worst-case ceiling: contacts grow via RangeOutputStream.prefix
-    // when a step needs more. SimulationEvents (frame.events) is the stream that can
-    // drop under an explicit capacity_limit — not the contact stream.
+    // guess here). `estimateContactCapacity` is the collision pair bound the collision
+    // stores are reserved to; past it the streams grow on the main thread (counted).
+    // SimulationEvents (frame.events) is the stream that can drop under an explicit
+    // capacity_limit — not the contact stream.
     const contact_capacity = CollisionSystem.estimateContactCapacity(mover_count + obstacle_count + 1);
     // Every steering agent emits one navigation intent per step unconditionally (unlike
     // path REQUESTS, which are sparse/event-driven) — this must cover the full

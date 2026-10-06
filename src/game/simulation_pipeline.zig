@@ -23,6 +23,7 @@ const PopulationRowCounts = @import("data_system.zig").PopulationRowCounts;
 const movement_range_alignment_items = @import("data_system.zig").movement_range_alignment_items;
 const EntityId = @import("data_system.zig").EntityId;
 const CollisionResponseMobility = @import("data_system.zig").CollisionResponseMobility;
+const CollisionResponseMode = @import("data_system.zig").CollisionResponseMode;
 const Faction = @import("data_system.zig").Faction;
 const MovementBodyPtr = @import("data_system.zig").MovementBodyPtr;
 const MovementBodySlice = @import("data_system.zig").MovementBodySlice;
@@ -598,6 +599,7 @@ pub const SimulationPipelineStats = struct {
         perf.recordMetric(.collision_contacts, metric(collision_stats.contact_count));
         perf.recordMetric(.collision_broadphase_simd_groups, metric(collision_stats.broadphase_simd_groups));
         if (collision_stats.used_full_sort) perf.recordMetric(.collision_full_sorts, 1);
+        if (collision_stats.pair_bound_exceeded) perf.recordMetric(.collision_pair_bound_exceeded, 1);
         perf.recordBatch(.collision_broadphase, collision_stats.broadphase_batch);
         perf.recordBatch(.collision_narrowphase, collision_stats.narrowphase_batch);
         perf.recordTiming(.collision_gather, collision_stats.gather_ns);
@@ -753,7 +755,9 @@ pub const SimulationPipeline = struct {
         errdefer collision.deinit();
         var collision_response = CollisionResponseSystem.init(allocator);
         errdefer collision_response.deinit();
-        try collision_response.reserveForContacts(config.contact_capacity);
+        // The response reserves follow the collision pair bound over the population, like
+        // `collision.reserve`; `reserve` sizes the frame's contact streams to the same bound.
+        try collision_response.reserveForContacts(@max(config.contact_capacity, CollisionSystem.estimateContactCapacity(population)));
         try collision.reserve(population);
         var scope = SimulationScopeSystem.init(allocator);
         errdefer scope.deinit();
@@ -816,14 +820,17 @@ pub const SimulationPipeline = struct {
         };
     }
 
-    /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`) and
-    /// reserves cognition gather scratch for `pop`. Does not lower an existing higher
-    /// event limit. The production entry: state init calls it after `reserveStreams`.
+    /// Tops up frame events to the sum of producer budgets (`eventCapacitySum`),
+    /// reserves cognition gather scratch for `pop`, and reserves the contact-dependent
+    /// streams to the collision pair bound over the tracked `movement_body_capacity`
+    /// (`reserveContactStreams`). Does not lower an existing higher event limit. The
+    /// production entry: state init calls it after `reserveStreams`.
     pub fn reserve(self: *SimulationPipeline, frame: *SimulationFrame, pop: usize) !void {
         try self.ai.reserve(pop);
         try self.perception.reserve(pop);
         try self.ai_memory.reserve(pop);
         try self.affect.reserve(pop);
+        try self.reserveContactStreams(frame);
         const sum = self.eventCapacitySum();
         try frame.events.reserve(sum, sum);
         if (frame.events.capacity_limit) |limit| {
@@ -834,6 +841,21 @@ pub const SimulationPipeline = struct {
         // Later slices' reserves attach here (68A, 56B); C3's `growPopulationCapacity`
         // re-runs this whole function on growth, so each stays sized to the grown bounds.
         try self.pathfinding.reserveNavDirty(self.structuralStageEventBound());
+    }
+
+    /// Reserves `frame.contacts`, `frame.collision_triggers` and the response intents and
+    /// trigger pairs to `CollisionSystem.estimateContactCapacity(movement_body_capacity)`,
+    /// the pair bound `collision.reserve` sizes the collision stores to (contacts are a
+    /// subset of candidate pairs, triggers of contacts). Every scene within that bound
+    /// runs `collision_detect` and `collision_respond` allocation-free under every
+    /// partition; past it the main-thread grow paths run, counted by the collision
+    /// system's `pair_bound_overflows`. Grow-only.
+    fn reserveContactStreams(self: *SimulationPipeline, frame: *SimulationFrame) !void {
+        const contact_capacity = CollisionSystem.estimateContactCapacity(self.movement_body_capacity);
+        try CollisionSystem.reserveContactStream(&frame.contacts, self.movement_body_capacity);
+        // Response writes the trigger stream as one range.
+        try frame.collision_triggers.reserve(1, estimateTriggerCapacity(contact_capacity));
+        try self.collision_response.reserveForContacts(contact_capacity);
     }
 
     /// The per-step bound on `.structural_commit`-stage events: the sum of
@@ -941,7 +963,6 @@ pub const SimulationPipeline = struct {
             try self.scope.reserve(body);
             try self.spatial_index.reserveRows(body);
             try self.collision.reserve(body);
-            try self.collision_response.reserveForContacts(CollisionSystem.estimateContactCapacity(body));
             try self.dig.ensurePlaneScratchReserve(body + 1);
         }
         // The obstacle snapshot is reserved to the responder capacity, not the live
@@ -958,15 +979,13 @@ pub const SimulationPipeline = struct {
         if (body_grew or shares_grew) {
             // The event bound now includes the grown plane-traversal and structural arms.
             const range_count = self.eventCapacitySum();
-            const contact_capacity = CollisionSystem.estimateContactCapacity(body);
             try frame.navigation_intents.reserve(range_count, body);
             try frame.intents.reserve(range_count, body);
-            try frame.contacts.reserve(range_count, contact_capacity);
-            try frame.collision_triggers.reserve(range_count, estimateTriggerCapacity(contact_capacity));
             try frame.structural_commands.reserve(range_count, body + self.structural_headroom);
             try frame.reservePathRequests(1, body);
-            // Raises the event limit and re-runs the cognition reserves (and every
-            // reserve later slices attach to `reserve`).
+            // Raises the event limit, re-runs the cognition reserves and the contact
+            // streams + response reserves to the grown pair bound (and every reserve
+            // later slices attach to `reserve`).
             try self.reserve(frame, body);
         }
 
@@ -6218,6 +6237,111 @@ test "population growth scenario is identical on the serial and multi-worker pat
         try std.testing.expectEqual(a[0], b[0]);
         try std.testing.expectEqual(a[1], b[1]);
     }
+}
+
+/// Adds dynamic collision bodies `first..end` of a row-major chain: 21 per row, 10 px
+/// apart, 22 px square, rows 40 px apart. Each body overlaps its next two neighbours in
+/// the row, so a full row of 21 yields 2 * 21 - 3 = 39 contacts.
+fn addContactChainBodies(data: *DataSystem, first: usize, end: usize, mode: CollisionResponseMode) !void {
+    for (first..end) |index| {
+        const column: f32 = @floatFromInt(index % 21);
+        const row: f32 = @floatFromInt(index / 21);
+        const position = math.Vec2{ .x = 20 + column * 10, .y = 20 + row * 40 };
+        const entity = try data.createEntity();
+        try data.setMovementBody(entity, .{ .position = position, .previous_position = position, .velocity = .{}, .speed = 0 });
+        try data.setCollisionBounds(entity, .{ .size = .{ .x = 22, .y = 22 } });
+        try data.setCollisionResponse(entity, .{ .mode = mode, .mobility = .dynamic, .restitution = 0 });
+    }
+}
+
+/// Slice 72 C6: the contact stream, the trigger stream and the response reserves follow
+/// the collision pair bound (4 per body of capacity) through `reserve` and the seam, so a
+/// population that fills its grown capacity at ~2 contacts per body runs
+/// `collision_detect` and `collision_respond` on a real 2-worker partition with every
+/// allocator failing. `mode` picks the response path: `.solid` emits two intents per
+/// contact, `.trigger` one trigger event per contact.
+fn runContactBoundScenario(mode: CollisionResponseMode) !void {
+    var world = try minimalSyncWorld();
+    defer world.deinit();
+    var data = DataSystem.init(std.testing.allocator);
+    defer data.deinit();
+    const player = try Player.spawn(&data);
+    var frame = SimulationFrame.init(std.testing.allocator);
+    defer frame.deinit();
+    var threads = try ThreadSystem.init(std.testing.allocator, std.testing.io, .{ .max_worker_threads = 2 });
+    defer threads.deinit();
+    if (threads.workerThreadCount() == 0) return error.SkipZigTest;
+    var pipeline = try SimulationPipeline.init(std.testing.allocator, &data, 800, 450, .{
+        .contact_capacity = 4,
+        .movement_body_capacity = 4,
+        .pathfinding = sync_test_pathfinding,
+    });
+    defer pipeline.deinit();
+    try frame.reserveStreams(pipeline.eventCapacitySum(), 0, 4, 4, 4, 4);
+    try frame.reservePathRequests(1, 4);
+    try frame.stimuli.reserve(stimulus_live_capacity, stimulus_live_capacity);
+    try frame.reserveActionIntents(action_intent_live_capacity, action_intent_live_capacity);
+    try pipeline.reserve(&frame, 4);
+    var player_state = player;
+    const context: SimulationPipelineUpdateContext = .{
+        .data = &data,
+        .frame = &frame,
+        .world = &world,
+        .player = &player_state,
+        .thread_system = &threads,
+        .delta_seconds = 0.016,
+        .bounds_width = 800,
+        .bounds_height = 450,
+    };
+    // Warm step at the initial population.
+    frame.beginStep();
+    _ = try pipeline.update(context);
+
+    // 31 bodies + the player grow the tracked capacity to 64; 32 more fill it without
+    // another growth. 3 full rows: 117 contacts over 64 bodies.
+    try addContactChainBodies(&data, 0, 31, mode);
+    try std.testing.expect((try pipeline.syncPopulationCapacity(&frame, &data, &world)).grew);
+    try std.testing.expectEqual(@as(usize, 64), pipeline.movement_body_capacity);
+    try addContactChainBodies(&data, 31, 63, mode);
+    try std.testing.expect(!(try pipeline.syncPopulationCapacity(&frame, &data, &world)).grew);
+    const population = data.populationRowCounts().population();
+    try std.testing.expectEqual(@as(usize, 64), population);
+
+    pinPipelineThreadedProfiles(&pipeline, .{ .worker_threads = 2, .items_per_range = 16 });
+    const targets: TestAllocatorSwap.Targets = .{ .pipeline = &pipeline, .frame = &frame, .data = &data, .world = &world, .threads = &threads };
+    frame.beginStep();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    var swap: TestAllocatorSwap = .{};
+    swap.install(targets, .uniform(failing.allocator()));
+    const result = pipeline.update(context);
+    swap.restore(targets);
+    const stats = try result;
+
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(!stats.collision.broadphase_batch.ran_inline);
+    try std.testing.expect(!stats.collision.narrowphase_batch.ran_inline);
+    try std.testing.expectEqual(@as(usize, 3 * (2 * 21 - 3)), stats.collision.contact_count);
+    try std.testing.expect(stats.collision.contact_count > population);
+    try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.contact_count);
+    switch (mode) {
+        .solid, .bounce => try std.testing.expectEqual(2 * stats.collision.contact_count, stats.collision_response.intent_count),
+        .trigger => {
+            try std.testing.expectEqual(stats.collision.contact_count, stats.collision_response.trigger_count);
+            try std.testing.expectEqual(stats.collision.contact_count, frame.collision_triggers.mergedItems().len);
+        },
+    }
+    try std.testing.expect(!stats.collision.pair_bound_exceeded);
+    try std.testing.expectEqual(@as(u64, 0), pipeline.collision.pair_bound_overflows);
+}
+
+test "after population growth, ~2 solid contacts per body on the multi-worker path allocate nothing" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    try runContactBoundScenario(.solid);
+}
+
+test "after population growth, ~2 trigger contacts per body on the multi-worker path allocate nothing" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    try runContactBoundScenario(.trigger);
 }
 
 fn minimalSyncWorld() !WorldSystem {

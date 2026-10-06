@@ -384,7 +384,13 @@ Commit behavior:
   counts against tracked logical capacities, and on growth a geometric
   (`rows + rows/2 + 16`, hot-store aligned) re-reserve of every
   population-sized pipeline capacity, frame stream, the event bound, and the
-  pathfinding elastic pools. It is the only population growth point.
+  pathfinding elastic pools. It is the only population growth point. The
+  contact-dependent capacities (`frame.contacts`, `frame.collision_triggers`, the
+  collision-response intents and trigger pairs) are reserved in
+  `SimulationPipeline.reserve`, which the seam re-runs, to the collision pair bound
+  (`CollisionSystem.estimateContactCapacity`: 4 candidate pairs per body of capacity,
+  the bound the collision stores use). A step past it grows them on the main thread
+  with identical output and is counted (`collision_pair_bound_exceeded`).
 
 This keeps partial structural mutations from leaking when validation or event
 capacity fails.
