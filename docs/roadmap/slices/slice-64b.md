@@ -249,7 +249,7 @@ same change):
 | `ai` | hashed | `AiSystem.hashSimulationState`: `snapped_goal` (x, y), `snapped_goal_initialized`; `allocator`, `rows`, `candidates`, both tuners excluded |
 | `steering` | hashed | `SteeringSystem.hashSimulationState`: `runtime_rows` in list order, every `RuntimeRow` field folded per field (`entity` raw, `f32` NaN-canonical, `bool` fold, `u16`/`u32` raw); all other fields: scratch, derived (`steering_movement_index*`), cache (obstacle snapshot + index, `steering.zig:1911`), tuner |
 | `pathfinding` | normalized | lifecycle, caches, group fields, dirty marks, 64E's `nav_links_processed` cursor, 65B's deferred state, 71B.3's prewarm fields, and the nav graph (B5). Not `cache`: cache warmth changes simulation results (B5 tests) |
-| `perception` | cache | `level_blocked`/`step_counter` (`perception.zig:2576-2793`); rows/candidates/ranges scratch; tuner |
+| `perception` | cache | `level_blocked`/`step_counter` (`perception.zig:2576-2793`), including each level slot's `pending_dirty` list and `full_rebuild_pending` flag (load-reserved and bounded; Checklist "B3 perception cache bound"); rows/candidates/ranges scratch; tuner |
 | `scope` | excluded | `step_count` is hashed in `"header"`; indices/ranges scratch; tuners; `stagger_skips`, `chunk_filtered_entities` telemetry |
 | `movement`, `collision`, `collision_response`, `spatial_index`, `ai_memory`, `affect` | excluded | per-step scratch + tuners |
 | `destructible` | excluded | no fields |
@@ -429,6 +429,43 @@ bytes each, about 80 KiB at 2048).
   - [ ] changing `snapped_goal` changes it; changing one `RuntimeRow` field
         (`prev_dir_x`, `stuck_steps`) changes it;
   - [ ] perturbing `perception.step_counter` or a tuner does not.
+- [ ] **B3 perception cache bound (capacity audit).** The `perception` row's
+      `cache` class depends on the LOS cache being output-transparent, so
+      the cache's maintenance capacity lands with that classification.
+      Today `LevelBlockedSlot.pending_dirty` grows by
+      `ensureTotalCapacity(len + 1)` in `markLevelDirty`
+      (`perception.zig:885-889`, reached from
+      `reactToPostCommitPerceptionEvents` every step) and grows without
+      bound on levels no observer visits.
+  - `prebuildLevelCaches` (load) reserves each level slot's `pending_dirty`
+    to that level's chunk count (`world.chunksX() × world.chunksY()`) and
+    stores it as the slot's logical `pending_dirty_limit`. The gate reads
+    the stored limit, never `pending_dirty.capacity`
+    (`ensureTotalCapacity` may round up). A slot created without a prebuild
+    has limit 0, so its marks go straight to the flag below; its first
+    build is a full rebuild anyway.
+  - `LevelBlockedSlot` gains `full_rebuild_pending: bool`. Below the limit,
+    `markLevelDirty` appends with `appendAssumeCapacity`. At the limit it
+    sets the flag, clears the list, and ignores later marks until the next
+    build. When the flag is set, `ensureLevelBlockedCache` takes the
+    existing full-rebuild branch and then clears the flag.
+  - The limit is a threshold on the gated operation's own region (one
+    level), not a world-wide size or a measured time. Each pending rect's
+    scoped patch can walk one chunk's sparse tiles, so once the pending
+    rects reach the chunk count, one full pass over the level costs no more
+    than the patch.
+  - The class stays `cache`: a full rebuild equals the patched bitmap.
+
+  Tests in `perception.zig`, on a 2-chunk, 2-level world (32×16 tiles,
+  chunk 16):
+  - [ ] with `FailingAllocator` installed right after `prebuildLevelCaches`,
+        marking 3 rects on the unobserved level allocates nothing and sets
+        `full_rebuild_pending`;
+  - [ ] the next observer visit runs a full rebuild, and the bitmap equals
+        `levelBlocksMovement` on every cell (the existing parity helper);
+  - [ ] with 1 pending rect (below the limit of 2), the scoped patch runs
+        and the flag stays clear, so the existing patch-parity tests are
+        unchanged.
 - [ ] **B5.** `PathfindingSystem.normalize` and
       `SimulationPipeline.normalizeDerivedState`. Tests in
       `systems/pathfinding/system.zig` and `simulation_pipeline.zig`:

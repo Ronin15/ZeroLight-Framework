@@ -19,9 +19,10 @@ points pull from spawn tables:
 - Roster tables keep fixed counts, such as VoidLight's 1 merchant + 2 guards
   + 4 villagers.
 
-Spawns happen only outside the sim view, inside the simulated band. Population
-and work are capped by fixed constants, and ambient NPCs despawn far beyond the
-dormant band with hysteresis. Merchants are an ordinary table entry with a
+Spawns happen only outside the sim view, inside the simulated band. Per-step
+work and the transient ambient population are capped by fixed budgets; the
+anchor store and the persistent population are sized from the loaded world.
+Ambient NPCs despawn far beyond the dormant band with hysteresis. Merchants are an ordinary table entry with a
 `persistent` despawn policy. Everything goes through deferred `create_entity` /
 `destroy_entity` commands from one serial pipeline controller stage. Spawn and
 despawn decisions read only committed state and Slice 49's fixed-step sim view,
@@ -71,9 +72,16 @@ never the render window.
   It is stateless across steps; its scratch is rebuilt every step.
 - `src/game/data_system/spawn_origin.zig`: the `SpawnOrigin` component store.
 
-**`SpawnAnchorStore` (fixed inline arrays, allocation-free by construction)**
+**`SpawnAnchorStore` (world-sized, reserved at load, allocation-free after)**
 
-`spawn_anchor_capacity = 256`. Each slot has:
+`spawn_anchor_capacity` is sized from the loaded world: the anchors the load
+path places (Slice 58 worldgen + Slice 69A sockets + demo anchors), or on a
+Slice 46 load the saved slot high-water mark, so `SpawnAnchorId` indices
+round-trip. `SpawnAnchorStore.reserve(capacity)` sizes the slot columns (a
+`std.MultiArrayList(SpawnAnchorSlot)`, the default layout) before the first
+`addAnchor`. The only fixed ceiling is the format one: `SpawnAnchorId.index` is
+`u16`, so a capacity above `maxInt(u16)` fails the load
+(`SpawnAnchorCapacityExceeded`). Each slot has:
 
 - `generations` / `retired_generations: u16`;
 - `level: u16`, `x, y, radius: f32`;
@@ -87,19 +95,42 @@ never the render window.
 
 `SpawnAnchorId{index: u16, generation: u16}` follows the `InterestMarkerId`
 rules. `addAnchor` / `removeAnchor` validate finite position, radius in
-`(0, 1024]`, and capacity. Worlds needing more anchors than the cap are refused
-(`SpawnAnchorCapacityExceeded`), never grown.
+`(0, 1024]`, and the reserved capacity; `addAnchor` past the reserve is refused
+(`SpawnAnchorCapacityExceeded`), never grown. Anchors are placed only at load.
+`finalizeChunkIndex` then builds the band index, and a later `addAnchor` fails
+(`SpawnAnchorStoreFinalized`).
+
+**`SpawnAnchorChunkIndex`** (owned by `SpawnAnchorStore`, built only by
+`finalizeChunkIndex`):
+
+- Anchor slot indices sorted by `(level, chunk_y, chunk_x, slot)`, plus a CSR
+  `row_start: []u32` of length `level_count × chunks_y + 1`. Both are reserved
+  at load from the world (anchor capacity; level and chunk-row counts). This is
+  a named exception to the MAL default (sorted key array plus CSR offsets).
+- The per-step band query walks the rows of levels within
+  `spawn_max_lod_distance / level_distance_chunks` (2) of `region.level` and
+  the chunk rows within `spawn_max_lod_distance` of the region rectangle, with
+  two binary searches per row bounding `chunk_x`. That is at most
+  `5 × (2 · 32 + region chunk height)` rows per pass, a fixed cost independent
+  of world size and anchor count.
+- It runs two passes over those rows (count `B`, then locate the selected
+  positions), so it needs no per-step scratch.
+- Removed anchors stay in the index and are skipped by the slot generation
+  check.
 
 **Slice 49 checksum classification (and the matching Slice 46 save section):**
 `WorldSystem.spawn_anchors` is hashed over **live slots only**, under the same
 rule as `interest_markers`. `SpawnOriginStore` is hashed. The
-`PopulationController` scratch is excluded (rebuilt every step).
+`PopulationController` scratch is excluded (rebuilt every step), and so is the
+`SpawnAnchorChunkIndex` (derived; rebuilt by `finalizeChunkIndex` after a
+Slice 46 load).
 
 **Worldgen anchor placement (Slice 58 spec extension).** This slice extends
 Slice 58's worldgen spec with per-biome `anchors: [{ table, density, max_alive,
 respawn, interval_seconds }]`. They are emitted through 58's candidate path into
-`GeneratedWorld.anchors`, then `spawn_anchors.addAnchor` at load, truncated to
-`spawn_anchor_capacity` by hash rank (fixed, never world-scaled). It ships demo
+`GeneratedWorld.anchors`, then `spawn_anchors.addAnchor` at load, after the store is reserved to the
+generated count. Nothing is truncated; only the `u16` index ceiling refuses,
+loudly. It ships demo
 anchors for non-generated worlds. Slice 58's load-time initial population
 carries no `SpawnOrigin` and is never despawned by `population_update`.
 
@@ -109,10 +140,13 @@ landing)
 `SpawnOrigin = { anchor: SpawnAnchorId, entry: u8, despawn: enum { when_far,
 persistent } }` uses the full component-store pattern plus
 `set_spawn_origin`. Live counts are not stored. Each step the controller
-recomputes `alive[anchor][entry]` into a fixed
-`[spawn_anchor_capacity][max_spawn_table_entries]u8` scratch with one pass over
-the `SpawnOrigin` store. That pass is ≤ `spawn_population_cap` rows, so no
-stale-count or destroyed-event attribution is needed. Stale anchor ids (removed
+recomputes `alive[k][entry]` for only the ≤ `spawn_anchor_evals_per_step`
+anchors selected this step, into a fixed
+`[spawn_anchor_evals_per_step][max_spawn_table_entries]u8` scratch (budget-sized,
+never world-sized), plus the `alive_when_far` / `alive_persistent` totals
+(counted by each row's `despawn`), with one pass over the `SpawnOrigin` store.
+That pass is ≤ `spawn_population_cap + persistent_population_capacity` rows, so
+no stale-count or destroyed-event attribution is needed. Stale anchor ids (removed
 anchor) count toward nothing and despawn as `when_far`.
 
 **Spawn tables (`assets/world/spawn_tables.json` → `SpawnTableCatalog`)**
@@ -163,18 +197,25 @@ reads the sim-view band once as `region = simViewRegion(context)` (Slice 49,
 `.level = player.current_level`). **When `region` is null, the step performs no
 spawns and no despawns** and counts `population_no_sim_view`.
 
-1. Recount `alive` from the `SpawnOrigin` store into the fixed scratch and set
-   `alive_total`. `queued_this_step = 0`.
+1. Select this step's anchors with the band-local cursor (step 3), then
+   recount their `alive` entries and the `alive_when_far` / `alive_persistent`
+   totals from the `SpawnOrigin` store into the fixed scratch.
+   `queued_this_step`, `queued_when_far`, and `queued_persistent` start at 0.
 2. Despawn sweep. It visits `SpawnOrigin` rows starting at
    `@intCast((@as(u64, step) * despawn_checks_per_step) % len)` for
    `despawn_checks_per_step` rows (wrapping; derived cursor, product widened to
    `u64`). A `when_far` row whose chunk `lodDistance` from `region` is greater
    than `despawn_lod_distance` emits `destroy_entity`, up to
    `despawn_destroys_per_step`.
-3. Anchor evaluation. It visits anchor slots starting at
-   `@intCast((@as(u64, step) * spawn_anchor_evals_per_step) % spawn_anchor_capacity)`
-   for `spawn_anchor_evals_per_step` slots (wrapping, widened). An anchor
-   spawns only when all of these hold:
+3. Anchor evaluation, band-local. The `SpawnAnchorChunkIndex` yields the `B`
+   anchors whose chunk lies in the spawn band's chunk rectangle on the band's
+   levels, in index order. It evaluates `spawn_anchor_evals_per_step` of them
+   starting at `@intCast((@as(u64, step) * spawn_anchor_evals_per_step) % B)`
+   (wrapping, widened; `B == 0` evaluates none). A full sweep takes
+   `ceil(B / spawn_anchor_evals_per_step)` steps, set by local anchor density,
+   never by world size or total anchor count. A band change shifts positions
+   by at most the anchors in the rows that entered or left. An anchor spawns
+   only when all of these hold:
    - the slot is live;
    - `stepReached(step, next_eligible_step)` (Slice 56 helper);
    - the `once` policy has `spawned_total == 0`;
@@ -189,9 +230,12 @@ spawns and no despawns** and counts `population_no_sim_view`.
      group size `group_min + boundedU32(spawn_seed, anchor.index, step,
      spawn_group_salt, group_max - group_min + 1)`, then clamped to
      `max_alive - Σalive`.
-   - **Cap gate:** the group proceeds only when
-     `alive_total + queued_this_step + group_size <= spawn_population_cap` and
-     `queued_this_step + group_size <= spawn_creates_per_step`. Otherwise it
+   - **Cap gate:** the group proceeds only when its despawn class has room
+     (`when_far`: `alive_when_far + queued_when_far + group_size <=
+     spawn_population_cap`; `persistent`: `alive_persistent +
+     queued_persistent + group_size <= persistent_population_capacity`) and
+     `queued_this_step + group_size <= spawn_creates_per_step`. Persistent
+     rows never consume the `when_far` budget. Otherwise it
      defers (counted as `spawn_cap_skips` or `spawn_deferred_budget`).
      `comptime assert(max_spawn_group <= spawn_creates_per_step)` guarantees
      every legal group fits an empty per-step budget, so no anchor starves.
@@ -219,8 +263,9 @@ spawns and no despawns** and counts `population_no_sim_view`.
 6. On spawn: append the group's `create_entity` commands. **Only after that
    append succeeds** does the controller set `next_eligible_step = stepAfter(step,
    spawn_interval_steps)` (Slice 56, saturating), `spawned_total +|= 1` (saturating; refill anchors
-   would otherwise overflow `u16`), and `queued_this_step += group_size` in the
-   `WorldSystem` store, the controller's own write. A failed append leaves the
+   would otherwise overflow `u16`), and `queued_this_step` plus the group's
+   class counter (`queued_when_far` or `queued_persistent`) `+= group_size` in
+   the `WorldSystem` store, the controller's own write. A failed append leaves the
    anchor eligible.
 
 **Stage placement.** New `StageId.population_update` at the end of
@@ -234,30 +279,39 @@ stage writes `movement_positions`. The region source is Slice 49's
 `simViewRegion(context)`, the same one `tier_policy` reads. It is a borrowed
 context input, not a `PipelineResource`, so no `simulation_anchor` tag exists.
 
-**Fixed budgets**
+**Budgets and capacities** (budgets are fixed constants; the two capacities are
+sized from the loaded world)
 
 | Constant | Value | Reasoning |
 | --- | --- | --- |
-| `spawn_anchor_capacity` | 256 | Fixed inline world store (≈10 KB); larger worlds refused, never grown |
-| `spawn_population_cap` | 512 | Ambient population ceiling, separate from battle-scale demo movers; DataSystem/pipeline/collision reserves include it |
-| `max_alive_per_anchor` / `max_spawn_table_entries` / `max_spawn_group` | 16 / 16 / 4 | Bounds recount scratch (256×16 u8) and per-eval work; `max_spawn_group <= spawn_creates_per_step` (comptime assert) |
-| `spawn_anchor_evals_per_step` | 8 | Full anchor sweep every 32 steps (~0.53 s) |
+| `spawn_anchor_capacity` | anchors placed at load (`maxInt(u16)` format ceiling) | Capacity: sized from the loaded world (worldgen + sockets + demo, or the saved slot high-water mark) and reserved before placement; only the `SpawnAnchorId.index: u16` ceiling refuses, loudly at load |
+| `spawn_population_cap` | 512 `when_far` rows | Budget: frame-cost ceiling on concurrently simulated transient ambient NPCs, never world- or anchor-scaled (spawns only happen inside the fixed-radius band); overflow defers (`spawn_cap_skips`); persistent rows do not count against it |
+| `persistent_population_capacity` | Σ over loaded anchors of `persistentBound(anchor)` | Capacity: persistent NPCs (settlement merchants) are world content. Roster: Σ counts of `persistent` entries; weighted: `max_alive` when any entry is `persistent`. Computed after load-time anchor placement |
+| `max_alive_per_anchor` / `max_spawn_table_entries` / `max_spawn_group` | 16 / 16 / 4 | Format/validation bounds (`u8` counts, inline table entries); recount scratch `[spawn_anchor_evals_per_step][max_spawn_table_entries]u8`; `max_spawn_group <= spawn_creates_per_step` (comptime assert) |
+| `spawn_anchor_evals_per_step` | 8 | Band-local sweep every `ceil(B / 8)` steps for `B` anchors in the spawn band (density-set, never world-set) |
+| band rows per pass | `≤ 5 × (2 · spawn_max_lod_distance + region chunk height)` | Fixed band-query cost (two binary searches per row), independent of world size and anchor count |
 | `spawn_creates_per_step` | 4 | ≤240 creates/s; bounds structural commit cost |
-| `despawn_checks_per_step` / `despawn_destroys_per_step` | 32 / 8 | Full 512-row sweep every 16 steps |
+| `despawn_checks_per_step` / `despawn_destroys_per_step` | 32 / 8 | Full sweep every `ceil(len / 32)` steps (16 at 512 `when_far` rows); persistent rows are checked and skipped |
 | `spawn_placement_attempts` | 8 | Bounded VoidLight ring search replacement; all-fail defers |
 | `spawn_min_lod_distance` / `spawn_max_lod_distance` | 1 / `locomotion_halo_chunks` (32) | Never in the sim view; spawned NPCs land simulated |
 | `despawn_lod_distance` | `kinematic_halo_chunks + 8` (56) | 24-chunk hysteresis gap vs spawn band; no flapping |
 | `min_spawn_interval_steps` | 60 | Validation floor for anchor intervals |
 
 **Reserves.** At state init, `DataSystem` component stores are reserved for
-`spawn_population_cap` extra rows of every component a spawnable bundle can
+`spawn_population_cap + persistent_population_capacity` extra rows of every
+component a spawnable bundle can
 carry, through a new `DataSystem.reserveComponentRows(mask, rows)` (none exists
 in `data_system/system.zig` today; this slice adds it, with a
 `FailingAllocator` test). The pipeline's `movement_body_capacity`, spatial-index,
-and cognition reserves add the term `spawn_population_cap`, and so does the
+and cognition reserves add the term
+`spawn_population_cap + persistent_population_capacity`, and so does the
 demo's body count feeding contact, trigger, and intent capacity
 (`game_demo_state.zig:127-135`). Structural stream headroom is
 `spawn_creates_per_step + despawn_destroys_per_step`.
+`persistent_population_capacity` is computed after load-time anchor placement,
+before these reserves. Spawned inventories and projectiles need no term here:
+Slice 57's slot arena grows at the structural-commit seam, and Slice 56B's
+projectile pool is sized from its per-step spawn budget.
 
 **Events.** None. Spawns surface as the existing `entity_created` /
 `entity_destroyed` commit events. `SimulationPipelineStats` gains `spawned`,
@@ -285,22 +339,22 @@ anchor precedence, leash, `return_home`); witness-gated or proximity-triggered s
 
 ### Checklist
 
-- [ ] `SpawnAnchorStore` on `WorldSystem` + `SpawnAnchorId`; add, remove, capacity, generation, and level tests; allocation-free signature test (`world_interest.zig` precedent).
+- [ ] `SpawnAnchorStore` on `WorldSystem` + `SpawnAnchorId`: world-sized slot columns reserved to the load-time anchor count (`u16` ceiling → `SpawnAnchorCapacityExceeded`), `finalizeChunkIndex` + `SpawnAnchorChunkIndex` band query; add, remove, capacity, generation, level, add-after-finalize, and band-query tests (the band list equals a brute-force `lodDistance <= spawn_max_lod_distance` filter). `FailingAllocator` proof: `addAnchor` up to the reserve, `finalizeChunkIndex`, and the per-step band query allocate nothing after the load reserve.
 - [ ] `SpawnOrigin` component (one appended tag; full store pattern + `set_spawn_origin`) and `FailingAllocator` proof.
-- [ ] Slice 49 checksum classification + Slice 46 save sections: `spawn_anchors` (live slots only), `SpawnOriginStore`.
+- [ ] Slice 49 checksum classification + Slice 46 save sections: `spawn_anchors` (live slots only), `SpawnOriginStore`; `SpawnAnchorChunkIndex` excluded (derived). The save records the slot high-water mark so the load reserves it before restoring slots and calls `finalizeChunkIndex` after.
 - [ ] `src/game/simulation_seed.zig`: append `SeedDomain.population = 8` (Slice 49 reserved value); `spawn_seed` derived once at pipeline init.
 - [ ] Archetype JSON `body`, `visual`, and `steering` blocks with validation; append `merchant`, `guard`, and `villager` archetypes.
 - [ ] `SpawnTableId` + strict `SpawnTableCatalog` loader with tests for every rejection above.
-- [ ] `PopulationController` steps 1–6 (null sim view → no-op; cap gate; integer placement; counters advanced only after a successful append); `PathfindingSystem.isWorldPointBlocked`; demo anchors (one `wilderness`, one `settlement`).
-- [ ] Worldgen anchor placement (Slice 58 spec extension: per-biome `anchors`, hash-rank truncation to `spawn_anchor_capacity`).
+- [ ] `PopulationController` steps 1–6 (null sim view → no-op; band-local anchor selection; per-class cap gate (`when_far` against `spawn_population_cap`, `persistent` against `persistent_population_capacity`); integer placement; counters advanced only after a successful append); `PathfindingSystem.isWorldPointBlocked`; demo anchors (one `wilderness`, one `settlement`).
+- [ ] Worldgen anchor placement (Slice 58 spec extension: per-biome `anchors`; the store is reserved to the generated count before placement, with no truncation; only the `u16` index ceiling fails the load).
 - [ ] Optionally let Slice 58's biome `spawns` reference a `SpawnTableId`, so one table authors the archetype × faction mix.
 - [ ] Biome filter via Slice 58's `chunkBiome`.
 - [ ] Time filter via the pipeline's current Slice 59 `EnvironmentSnapshot.day_phase`; `population_update` reads `environment`.
 - [ ] Merchant roster entry spawns `Merchant` + `SocialLedger` + Slice 57 stock.
 - [ ] `StageId.population_update` + `PipelineResource.spawn_anchors` + contract + `runStage` arm; stats and perf metrics. Raise `@setEvalBranchQuota` at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
-- [ ] `DataSystem.reserveComponentRows(mask, rows)`; spawn-population reserves at state init, including the `spawn_population_cap` term in contact, trigger, intent, `movement_body_capacity`, and spatial-index reserves; `FailingAllocator` churn proof (spawn to cap → despawn all → respawn to cap allocates nothing after the first fill reserve).
+- [ ] `DataSystem.reserveComponentRows(mask, rows)`; spawn-population reserves at state init for `spawn_population_cap + persistent_population_capacity` rows, including that term in contact, trigger, intent, `movement_body_capacity`, and spatial-index reserves. Test: `persistent_population_capacity` equals the hand sum of `persistentBound` over a fixture's anchors. `FailingAllocator` churn proof (spawn to cap → despawn all → respawn to cap allocates nothing after the state-init reserve).
 - [ ] Bench groups (one `BenchmarkGroup` per workload in `src/benchmarks/population.zig`, sizes in `defaultItemCounts`, registered in `runner.zig`):
-  - `population-anchor-sweep` (256 anchors × 512 population);
+  - `population-anchor-sweep` (4096 world anchors with 256 in the band × 512 population; internal assert that each band pass visits at most the fixed row bound);
   - `population-spawn-burst` (creates at the per-step budget).
 - [ ] Docs:
   - `architecture.md` (anchors, `SpawnOrigin`, controller, spawn/despawn bands, Slice 58's initial population carrying no `SpawnOrigin`);
@@ -329,8 +383,14 @@ anchor precedence, leash, `return_home`); witness-gated or proximity-triggered s
 - [ ] Same seed and step sequence give identical spawn entries, positions, and
   entity templates. A different seed differs.
 - [ ] All-blocked placement defers deterministically with stats.
-- [ ] The population cap is never exceeded, including in roster mode and at
-  `alive_total = spawn_population_cap - 1` with a multi-member group pending.
+- [ ] Neither population limit is exceeded: `when_far` rows never exceed
+  `spawn_population_cap` (including in roster mode and at
+  `alive_when_far = spawn_population_cap - 1` with a multi-member group
+  pending), persistent rows never exceed `persistent_population_capacity`, and
+  live persistent merchants never block `when_far` spawns.
+- [ ] Anchor evaluation is band-local: adding anchors outside the spawn band
+  (any count, including more than 256 in total) leaves the selected anchors and
+  the spawn stream identical over N steps on a minimal fixture.
 - [ ] Cursor math at `step = maxInt(u32)` matches the `u64` reference with no
   overflow; `spawned_total` saturates on a refill anchor.
 - [ ] Steady-state spawn and despawn churn allocates nothing (`FailingAllocator`).

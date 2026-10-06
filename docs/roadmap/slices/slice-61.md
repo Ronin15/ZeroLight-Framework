@@ -153,15 +153,24 @@ A node entity also carries `movement_body` (static, zero speed),
 invalidation with no new nav code. It is mutually exclusive with `destructible`
 (validation error `ResourceNodeAndDestructible`).
 
-- **Fixed live cap.** `resource_node_capacity = 4096` live node rows, a fixed
-  constant independent of world size (Slice 58's
-  `max_worldgen_resource_nodes = 2048` fits, with a comptime assert, leaving
-  room for demo and authored nodes). Every producer (demo placement, Slice 58
-  load, any later runtime create) refuses a node create when
-  `resource_nodes.len + node_creates_queued_this_step >= resource_node_capacity`,
-  counted as `resource_node_creates_refused` (the Slice 57 world-item
-  precedent). The store, the index, and its rebuild scratch reserve to this cap
-  at init, so nothing grows after reserve.
+- **World-sized capacity.** `resource_node_capacity` is sized from the loaded
+  world, never a fixed number.
+  - It is the number of node creates the load path queues: Slice 58
+    `GeneratedNodes.len` + Slice 69A socket nodes + the demo's
+    `placeDemoResourceNodes`, or the node rows of a Slice 46 save.
+  - `GameDemoState.initWithWorld` computes it before the first structural
+    commit and passes it to `HarvestController.reserve(resource_node_capacity)`.
+    The store, the index, and its rebuild scratch reserve to it at load, so
+    nothing grows after reserve.
+  - No runtime node producer exists today (regrowth refills in place;
+    `remove` only destroys). A later runtime producer grows the store, index,
+    and scratch geometrically at the structural-commit seam (main thread);
+    refusal stays only at the `u32` ceiling.
+  - The only fixed ceiling is the format one: index entries carry
+    `dense_row: u32`, so a capacity above `maxInt(u32)` fails the load
+    (`TooManyResourceNodeRows`), and a create that would pass it is refused
+    and counted as `resource_node_creates_refused` (the Slice 57 world-item
+    precedent).
 - **Collider populations.** Nodes carry `collision_bounds` and join the
   collision broadphase as static proxies. The demo's body count used for
   contact, trigger, and intent capacity (`game_demo_state.zig:127-135`) and the
@@ -435,11 +444,13 @@ enqueues a frustration impulse (below). The node is untouched.
 - Causal test: a harvest at step N lowers `need` (drained at step N's commit
   seam) before `ai_decide` reads drives on step N+1.
 
-**Fixed budgets (all constants; none derived from world, map, or node count)**
+**Budgets, thresholds, and the one capacity** (budgets and thresholds are fixed
+constants, never derived from world, map, or node count;
+`resource_node_capacity` is the world-sized capacity)
 
 | Constant | Value | Reasoning |
 | --- | --- | --- |
-| `resource_node_capacity` | 4096 live rows | Fixed store/index/scratch reserve; creates beyond it refused and counted; ≥ Slice 58's 2048 worldgen cap (comptime assert) |
+| `resource_node_capacity` | nodes placed at load (`u32` dense-row ceiling) | Capacity, not a budget: sized from the loaded world (worldgen + sockets + demo, or the save) and reserved at load for store, index, and rebuild scratch; a later runtime producer grows them at the structural-commit seam; refusal (counted) only at the `u32` ceiling |
 | `resource_index_cell_size` | 256 px | Forage radius 256 ⇒ 1 ring (3×3, 9 binary searches); reserve radius 512 ⇒ 2 rings (5×5, 25) |
 | `max_index_query_rings` | 2 | Comptime bound on `ceil(radius / cell)` for every query radius |
 | `forage_node_query_radius` | 256 px | Beyond vision (192), inside marker radius (400): markers are the long-range attractor, nodes the local target |
@@ -487,7 +498,7 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
 ### Checklist
 
 - [ ] `ResourceNode` component (one appended tag) + MAL store + structural/template/capacity/slot wiring + validation; store `FailingAllocator` append proof.
-- [ ] `resource_node_capacity = 4096`: store, index, and rebuild scratch reserved to it at init; producer-side create refusal counted as `resource_node_creates_refused`; comptime assert against Slice 58's `max_worldgen_resource_nodes`.
+- [ ] World-sized `resource_node_capacity` (the load path's node count, computed in `GameDemoState.initWithWorld` before the first commit; `u32` dense-row ceiling): store, index, and rebuild scratch reserved to it at load; refusal only at the `u32` ceiling, counted as `resource_node_creates_refused`. Test: the derived capacity equals the placed count on a minimal fixture. `FailingAllocator` proof: after the load reserve, creating exactly `resource_node_capacity` nodes, committing them, and rebuilding the index allocate nothing.
 - [ ] Collider capacity: add `resource_node_capacity` to the demo body count feeding contact, trigger, and intent capacity (`game_demo_state.zig:127-135`) and to the pipeline's `movement_body_capacity` and spatial-index reserves.
 - [ ] Slice 49 checksum classification + Slice 46 save section: `ResourceNodeStore` hashed; `ResourceNodeIndex` excluded (rebuilt after load).
 - [ ] `src/game/simulation_seed.zig`: append `SeedDomain.harvest = 7` (Slice 49 reserved value); `harvest_seed` derived once at pipeline init.
@@ -519,7 +530,7 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
 - [ ] Bench groups (one `BenchmarkGroup` per workload in `src/benchmarks/harvest.zig`, sizes in `defaultItemCounts`, registered in `runner.zig`):
   - `harvest-forage-query` (2048 agents × 4096 nodes);
   - `harvest-controller` (64 intents);
-  - `harvest-index-rebuild` (4096 nodes, the capacity).
+  - `harvest-index-rebuild` (default items 1024 / 4096 nodes; the fixture reserves its capacity to the item count).
 - [ ] Docs:
   - `architecture.md` (controller list, component, index, impulse substrate);
   - `simulation-tiers-and-pipeline.md` (`action_react` composition and claims, `harvest_completed`, impulses and the commit-seam drain, contract changes);
@@ -596,7 +607,8 @@ as Slice 57 world items, and NPC↔merchant selling of harvested goods (a future
   `WorldResourceManager`.
 - String resource ids and `getHarvestTypeForResource` string chains on spawn.
 - `WorldHarvestInit` counts scaled by biome tile counts (`forestTiles / 40`).
-  Placement belongs to Slice 58 under fixed caps.
+  Placement belongs to Slice 58; this slice sizes its store from what the
+  load places.
 - Per-NPC `NpcNeedData` sidecar fail counters and exponential backoff. The
   `need` drive and frustration impulses replace them.
 - `ResourceChangeEvent` string reason tags.

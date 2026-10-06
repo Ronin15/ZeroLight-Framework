@@ -181,6 +181,8 @@ targets.**
     straddle chunks, or the "features are chunk-local" rule below breaks.
 
 **Fixed caps and budgets.** All are fixed constants, independent of world size.
+None is a working data-structure capacity; the classification and the
+world-sized working capacities follow the table.
 
 | Constant | Value |
 | --- | --- |
@@ -196,13 +198,48 @@ targets.**
 | noise `cell_size` | `4..=256` |
 | `feature_block_cells` | 4 (one jittered feature-or-node candidate per 4×4 block) |
 | `spawn_candidates_per_chunk` | 4 (per level-chunk) |
-| `max_worldgen_resource_nodes` | 2048 (comptime-asserted `<=` Slice 61's fixed `resource_node_capacity`) |
+| `max_worldgen_resource_nodes` | 2048 (Slice 61's world-sized `resource_node_capacity` counts the nodes generation actually places) |
 | `player_spawn_search_radius_cells` | 32 |
 
 - The spawn **population cap** is caller-provided and fixed by game config
   (`battle_scale_demo_mover_count`). It is never derived from world size. A
-  bigger world produces more candidates, not more spawns. The node cap is the
-  same kind of fixed ceiling.
+  bigger world produces more candidates, not more spawns.
+  `max_worldgen_resource_nodes` is the same kind of per-step-cost population
+  budget; the node store itself is a world-sized capacity (Slice 61).
+- **Classification (CLAUDE.md budgets / capacities / thresholds).**
+  - Entity-population budgets: the population cap and
+    `max_worldgen_resource_nodes`. Every spawn and node is a live entity with
+    per-step cost (AI and steering for spawns; a static collision proxy and
+    steering obstacle for nodes, until Slice 71B.2 moves grid statics out of
+    the SAP), so a world-sized count would make per-step work scale with the
+    map. Hash-ranked truncation is the deterministic degradation.
+  - Per-cell / per-query work budgets: `max_noise_octaves`, noise
+    `cell_size`, `player_spawn_search_radius_cells`.
+  - Layout constants: `feature_block_cells` and `spawn_candidates_per_chunk`
+    (per-job slot counts baked into the striped arena).
+  - Inline spec-table ceilings that fail loudly at load: biomes (`BiomeId` is
+    a `u8` with `0xFF` reserved, and Slice 69B copies `[max_worldgen_biomes]u8`
+    lookups by value), and the palette, feature, node, spawn, strata, vein,
+    and yield tables, kept inline so jobs read one flat validated value.
+- **Working capacities are sized from the world at load, never fixed:** the
+  striped arena (`jobs × per-job slots`, `jobs = level_count ×
+  chunk_count`), `chunk_biomes` (surface chunk count), dense layers
+  (`levels × cells`, under the loud `k_max_dense_tile_gpu_bytes` load-time
+  ceiling), sparse feature tiles (the committed feature count, summed from
+  `JobSummary.feature_count`), and the survivor lists (`min(candidates,
+  cap)`). All are load-time allocations; nothing grows after load.
+- **Per-query cost must not read a world-sized sparse count.** Surface
+  features make level 0's sparse count scale with world area.
+  `WorldSystem.levelBlocksMovement` today scans the level's whole sparse list
+  (`sparseTileIndicesForLevel`) and every dense layer of every level, and it
+  runs per cell in a dig's nav remask (`navCellBlockedFromSources`) and per
+  walk sample in `world_gate`. This slice makes it read only the queried
+  cell's chunk list (`sparseTileIndicesForChunk(level,
+  localChunkIndexForCell(x, y))`) and only that level's dense bands (a
+  per-level dense-layer index built by `addDenseLayer`, at most
+  `max_dense_bands_per_level` entries per level, sized from the loaded
+  levels). Each query then costs one chunk's tiles plus one level's bands on
+  any world size.
 
 **Generation, inside `WorldSystem.initProceduralFromSpec`.** It returns
 `GeneratedWorld { world, spawns: GeneratedSpawns, nodes: GeneratedNodes,
@@ -449,6 +486,13 @@ worldgen's job. Slice 61 already wires the `resource` kind
       of the old generator and `hash2`. No new `LoadingState` seed code.
 - [ ] `UniformBlocking` enum column and accessor; nav and perception fast-path
       migration; maintenance in `setDenseTile` / `clearDenseTile`.
+- [ ] (capacity audit) `levelBlocksMovement` per-chunk sparse lookup and
+      per-level dense-band index (Architecture notes). Tests (minimal
+      fixtures): on a 2×1-chunk, 2-level world with sparse blockers in both
+      chunks and two bands per level, every cell's result equals the previous
+      whole-level scan; `world_gate` walk gates and a dig's nav remask give
+      unchanged results; the per-level band index length equals the loaded
+      level count.
 - [ ] Slice 49 classification (`uniform_blocking` via the MAL, `chunk_biomes`
       hashed) and Slice 46 save section for `chunk_biomes`.
 - [ ] `GameDemoState` adopts the generated spawns, nodes (through
@@ -513,6 +557,10 @@ worldgen's job. Slice 61 already wires the `resource` kind
       deterministic count; the same cell index on two levels rolls
       independently. A non-yield tile creates none.
 - [ ] Unit tests stay at 16×16 or smaller with 1 underground level.
+- [ ] (capacity audit) `levelBlocksMovement` reads one chunk's sparse list and
+      one level's dense bands (the parity test passes), and
+      `zig build bench -- --group nav-update-scattered` stays within
+      max(3%, noise) of the pre-change run.
 - [ ] Bench: add and run `zig build bench -- --group worldgen` (new
       `BenchmarkGroup`; `defaultItemCounts` = side lengths 64 / 128 / 256 with
       level counts 4 / 8 / 32 from a fixed per-size table, 256 matching the

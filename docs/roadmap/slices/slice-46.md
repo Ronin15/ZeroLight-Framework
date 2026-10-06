@@ -154,8 +154,18 @@ the background lane has a thread.
     only from the pause menu, so no update is in flight and no structural
     commands are pending.
   - Writes into an Engine-owned buffer. Cold path.
-  - Hard cap `k_max_save_file_bytes = 64 MiB`: a fixed constant, independent
-    of world size; a save over it is refused with `error.SaveTooLarge`.
+  - The buffer is a capacity sized from content, never a fixed working size:
+    `encodedSaveBytes(capture)` (the header plus every section's length, a
+    pure function of store lengths, the entity-slot count, world dimensions,
+    level and dense-layer counts, and sparse/marker/link counts) is computed
+    before any write, and the buffer is reserved once to it with
+    `ensureTotalCapacityPrecise`.
+  - `k_max_save_file_bytes = 64 MiB` is only a loud safety ceiling against
+    untrusted input. A capture whose `encodedSaveBytes` exceeds it is refused
+    with `error.SaveTooLarge` before any write. A load rejects a header whose
+    `payload_bytes` exceeds it, or differs from the file's actual remaining
+    length, before allocating. A pure test proves it never binds for shipped
+    content (Checklist), so it is never the working size.
   - Measured by `zig build bench -- --group save-encode` (and
     `save-decode`).
 - **Streaming on the Slice 51 lane.**
@@ -237,6 +247,16 @@ the background lane has a thread.
       confirm flows. `playtime_steps` from the persisted `step_count`.
 - [ ] Bench groups `save-encode` and `save-decode` (one group per workload,
       `suite.zig` convention) on a mid-size fixture.
+- [ ] Save buffer capacity (CLAUDE.md capacity rule): `encodedSaveBytes`
+      equals the bytes `encode` writes for a hand-built minimal fixture
+      (including an empty store), and with `std.testing.FailingAllocator`
+      installed after the one reserve, `encode` allocates nothing. A load
+      whose `payload_bytes` exceeds `k_max_save_file_bytes` or disagrees with
+      the file length is rejected before any allocation. A pure formula test
+      (no world is built) evaluates the same formula over reserved capacities
+      (`saveSizeBound`) for the production config (`default_world_build_config`
+      256×256×32 with `deriveDemoPopulationCapacity(battle_scale_demo_mover_count)`
+      reserves) and asserts it is at most half the ceiling.
 - [ ] Docs: `docs/architecture.md` records the save/load boundary contract
       (what is persisted, by which stable identifiers, and what is deliberately
       excluded).
@@ -350,6 +370,9 @@ and build fingerprint** (from 64B/64C/64E):
 - [ ] (added by Slice 64) Record the post-load `rebuildStaticNavGridWithWorld` time
       on the 256×256×32 production world in Status (the only nav rebuild a
       save/load cycle performs).
+- [ ] (capacity audit) Record the production `saveSizeBound` and one real
+      save's `encodedSaveBytes` in Status; both are at most half of
+      `k_max_save_file_bytes`.
 
 ### VoidLight reference
 

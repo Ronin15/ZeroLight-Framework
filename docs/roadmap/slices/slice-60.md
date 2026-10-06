@@ -166,6 +166,25 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
   7. structural commit
 - The next step's scope reads the anchor through Slice 49's `sim_view`.
   `initWithWorld` calls `snapTo` so step 1 already has an anchor.
+- **Spatial-index dense window (capacity audit; `src/game/systems/spatial_index.zig`).**
+  `max_dense_window_side_cells`' doc comment defers its sizing to the min-zoom
+  decision this slice makes: zoom levels are integers ≥ 1 and the sim anchor is
+  the zoom-1 view, so the indexed population never spans more than the cognition
+  band around `anchorRect()`. `SpatialIndexSystem.reserve` therefore sizes the
+  window per axis from the loaded config and world, not from fixed constants:
+  - `band_px = (ceilDiv(anchor_extent_px, chunk_px) + 1 + 2 *
+    cognition_halo_chunks) * chunk_px`, with `anchor_extent_px = view_size /
+    zoom_levels[0]` and `chunk_px = chunk_size_tiles * tile_size`;
+  - `window_cells = min(ceil(world_extent_px / cell_size), ceil(band_px /
+    cell_size) + 1)`.
+
+  `DenseWindowGeometry` gains `sim_view_extent` and `world_extent` (set by the
+  pipeline from the rig config and the loaded world), the lookup becomes
+  non-square (`capacity_cells_x` / `_y`), and `max_expected_visible_window_cells`
+  and `max_dense_window_side_cells` are deleted. The clamp-and-skip in
+  `buildEntriesAndRanges` stays as the ReleaseFast guard, now counted
+  (`SpatialIndexStats.dense_window_clamped`, perf metric
+  `spatial_dense_window_clamped`, one `warn` per session).
 
 **Scene composite pass (render-owned).**
 
@@ -326,13 +345,20 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
   (validated `< zoom_level_count`), a schema bump by one with the
   `upgradeVNToVN+1` step this slice adds. The rig reads it at init as its starting
   `zoom_index`; a zoom change writes it back through the store's normal dirty path.
-- Fixed budgets:
-  - `k_max_zoom_levels = 8`
-  - `k_shake_max_offset_px = 8`
-  - grow bucket 256
-  - max dimension 8192
-  - the `world_pixel` texture is fixed by the logical size
-  - Nothing scales with world size.
+- Fixed constants, classified (CLAUDE.md budgets / capacities / thresholds):
+  - `k_max_zoom_levels = 8`: format (the inline `zoom_levels` array;
+    `zoom_index: u8`)
+  - `k_shake_max_offset_px = 8`: presentation tuning amplitude, not a cap
+  - grow bucket 256: rounding of the `.drawable` scene texture, a capacity
+    sized from the drawable (grow-only)
+  - max dimension 8192: format/hardware (the guaranteed GPU texture
+    dimension); larger bypasses with one `warn`
+  - the `world_pixel` texture is a capacity sized from the logical size at
+    `Renderer.init`
+  - the spatial-index dense window is a capacity sized from the anchor extent
+    and the world (Sim-scope anchor above)
+  - Nothing scales with world size except where a capacity is sized from the
+    loaded world.
 - Diagnostics:
   - `render` scope `debug` on scene-target create and grow (cold), one-shot `warn` on
     bypass fallback.
@@ -358,6 +384,15 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
       replay bits 10/11 (Slice 49 table).
 - [ ] `simViewRect()` returns `camera_rig.anchorRect()`. Test: `sim_view` equals
       `anchorRect()` every step and is invariant under zoom index, trauma, and alpha.
+- [ ] (capacity audit) `spatial_index.zig` dense window sized by the band formula
+      (Sim-scope anchor); delete `max_expected_visible_window_cells` and
+      `max_dense_window_side_cells`; `dense_window_clamped` stat, metric and
+      warn-once. Tests (minimal fixtures): the reserved `capacity_cells_x/_y`
+      equal the formula for geometry inputs larger and smaller than the band (no
+      world built); a population filling the band at every zoom index builds
+      with `dense_window_clamped == 0`; a `std.testing.FailingAllocator` proof
+      runs a serial and a real multi-worker build of a band-filling population
+      after `reserve` with zero allocations.
 - [ ] Zoom setting: `VideoSettings.zoom_index: u8` (validated `< zoom_level_count`), a
       schema bump by one with `upgradeVNToVN+1`, and the rig reads it at init.
 - [ ] `game_demo_state.zig`: replace `camera_previous` / `camera_current` /
@@ -455,6 +490,9 @@ body of `simViewRect()`. No second anchor store or `PipelineResource` is added.
       - pixel-perfect smooth scroll in `-Dscene-resolution=world_pixel` with integer fit
       - UI and FPS overlay untinted
       - fade-in on menu → gameplay
+- [ ] (capacity audit) No fixed spatial-index window constant remains (grep), the
+      window is a pure function of the rig config and world extent, and
+      `zig build bench -- --group ai` and `--group perception` stay within noise.
 - [ ] `zig build bench -- --group render-game-prep` shows no CPU regression from the
       draw-list split or rig. (Render-cadence independence of sim scope is Slice 49's
       test "simulation scope region ignores the render visibility window"; this slice

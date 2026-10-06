@@ -110,7 +110,9 @@ Content lives in `assets/items/items.json`:
                { "item": "health_potion", "weight": 20, "min": 1, "max": 1 } ] } ] }
 ```
 
-- Caps: `loot_table_capacity = 256`, `max_loot_entries = 16`.
+- Caps: `loot_table_capacity = 256` (a loud load-time ceiling; rows are
+  reserved to the authored table count, never to 256) and
+  `max_loot_entries = 16` (the inline per-table entry array, a format bound).
 - Rules: `u16` weights greater than 0 (`empty_weight` may be 0), and
   `1 <= min <= max <= the item's max_stack`.
 - `LootTableCatalog.fingerprint() u64` folds `(key, empty_weight, entries)` in
@@ -142,26 +144,30 @@ Content lives in `assets/items/items.json`:
   - Pool and free-list capacity are part of `StructuralCapacityNeeds`:
     preflight reserves, and commit uses `assumeCapacity`. So slot-content
     changes in the stage never allocate.
-  - **Fragmentation bound and fixed cap.** Per-class free lists never
+  - **Fragmentation bound and growable arena.** Per-class free lists never
     coalesce, so under spawn churn with a shifting class mix (Slice 62
     respawns) the arena tail grows to at most Σ_class peak_live(class) ×
-    class_size. That growth is bounded by a fixed
-    `inventory_slot_arena_capacity = 65_536` slots (256 KiB for both columns),
-    never derived from world size or population. Refusal follows the
-    world-item cap precedent (producer-side, counted):
-    - Runtime producers of inventory-bearing creates (Slice 62 spawns) call
-      the pure `DataSystem.inventoryRunAvailable(class, pending_runs) bool`
-      (a free run of the class exists, or the tail has room) before queueing,
-      and count refusals in `inventory_runs_refused`.
-    - Load-time spawns that exceed the cap fail the load with
-      `error.InventorySlotArenaFull`.
-    - Structural preflight returns `error.InventorySlotArenaFull` if a create
-      still needs a tail run past the cap. That is a producer bug, surfaced
-      loudly, never a silent drop or partial apply.
+    class_size. The arena is a runtime-growing store, so it grows at the
+    structural-commit seam instead of carrying a fixed or summed cap:
+    - `DataSystem.reserveInventorySlotArena(initial)` takes a content-derived
+      initial bound passed in by the state (the slot runs its load-time
+      inventory-bearing creates need) and reserves both columns and the
+      per-class free lists at init.
+    - The arena grows geometrically at the structural-commit seam (main
+      thread, in the `StructuralCapacityNeeds` preflight) when free slots fall
+      below one commit's run demand. `slot_run_start` is a `u32` index, not a
+      pointer, so every run survives the realloc. Commit then uses
+      `assumeCapacity`, and slot-content changes in the stage never allocate.
+    - Refusal happens only at the `u32` ceiling: a growth that would put the
+      arena past `maxInt(u32)` slots fails the preflight with
+      `error.InventorySlotArenaTooLarge` (a load fails; a runtime producer's
+      batch is refused and counted in `inventory_runs_refused`). No producer
+      pre-checks headroom below that ceiling, and no later slice adds a term
+      to the initial bound: a new inventory-bearing source is covered by
+      growth at the seam.
 
-    Free-list capacity per class is reserved to
-    `inventory_slot_arena_capacity / class_size` with the arena, so a push on
-    destroy never allocates.
+    Free-list capacity per class grows with the arena (to
+    `arena_len / class_size`), so a push on destroy never allocates.
 - Why pooled runs:
   - VoidLight's 8-inline plus heap-overflow map is a per-entity heap
     structure.
@@ -410,18 +416,20 @@ World-item cap:
 - Audio: `AudioController.queueItems` plays `collision_sfx` (ratio 1.8) for
   player pickups, at most 2 per step.
 
-**Fixed budgets.**
+**Budgets, format bounds, and the one growable store.** Every row is a
+fixed per-step budget or a format/load-time bound except the inventory slot
+arena, which grows at the structural-commit seam.
 
 | Constant | Value | Reason |
 | --- | --- | --- |
-| `max_item_key` / `item_catalog_capacity` | 4095 / 1024 | Direct-index lookup (8 KB table) |
+| `max_item_key` / `item_catalog_capacity` | 4095 / 1024 | Format bound (`key_to_row` direct-index table, 8 KB) / loud load-time ceiling; catalog rows are reserved to the authored entry count, never to 1024 |
 | `max_item_value` | 1_000_000 | Keeps `count * value` and Slice 63 pricing inside `u64` with headroom |
 | `pickup_budget_per_step` | 16 | Overflow re-triggers next step |
 | Loot rolls per kill | 1 | Creates ≤ `combat_max_kills_per_step` per step by construction |
 | `world_item_creates_per_step_max` | `combat_max_kills_per_step` (+1 58, +1 57B) | Comptime-tied to the combat kill cap |
-| `world_item_live_capacity` | 1024 | Refuse creates beyond `cap - creates_per_step_max` |
+| `world_item_live_capacity` | 1024 | Live-population budget, not a content capacity: world items are runtime-produced only, and the cap bounds the serial expiry scan and the trigger-body count per step whatever the world size. Refuse creates beyond `cap - creates_per_step_max` (counted; 68C defers carried drops in its FIFO) |
 | `world_item_expiry_budget_per_step` | 32 | Dense-order deferral |
-| `inventory_slot_arena_capacity` | 65_536 slots | Bounds pooled-run fragmentation; producer-side counted refusal |
+| Inventory slot arena | Content-derived initial bound from the state; geometric growth at the structural-commit seam; `u32` ceiling | Runtime-growing store, not a budget: covers pooled-run fragmentation by growth; refusal only at the `u32` ceiling |
 | `inventory_transfer_capacity` / `max_transfer_item_deltas` | 128 / 4 | Fixed transfer queue; full queue refuses the producer's batch |
 | Structural headroom | `+ world_item_creates_per_step_max` creates `+ pickup_budget_per_step` destroys `+ world_item_expiry_budget_per_step` expiry | Added to the demo's `structural_reserve` through the named constants |
 
@@ -445,10 +453,13 @@ World-item cap:
 1. Store appends after reserve.
 2. Slot-pool run allocation, both fresh-tail and free-list reuse, after the
    `StructuralCapacityNeeds` preflight.
-3. Slot-pool churn: fill to a class mix, destroy, then shift the class mix and
-   refill. The arena tail never exceeds `inventory_slot_arena_capacity`, the
-   counted refusal fires at the cap, and nothing allocates after the first
-   fill.
+3. Slot-pool churn and growth: reserve the arena with a small initial bound,
+   fill to a class mix, destroy, then shift the class mix and refill within
+   the reached arena size. Steady churn allocates nothing. A fill past the
+   current arena grows it only inside the structural-commit preflight (the
+   `FailingAllocator` fails the next allocation after the grow and the commit
+   still completes via `assumeCapacity`), and no allocation happens outside
+   that seam. Runs keep their `slot_run_start` and contents across the grow.
 4. `InventoryController.process` covering use, partial and full pickup
    (including two holders on one item), loot create, and expiry, after frame
    reserve.
@@ -470,8 +481,12 @@ fixed per-step constant or by the fixed `world_item_live_capacity`.
 - [ ] `inventory` / `equipment` / `world_item` components (three appended
       tags): `data_system/inventory.zig` stores and `InventorySlotPool`, full
       component wiring, capacity needs including pool runs and free lists,
-      `inventory_slot_arena_capacity` with `inventoryRunAvailable` and the
-      counted refusal, and destroy cleanup.
+      the growable slot arena (`DataSystem.reserveInventorySlotArena(initial)`
+      with a state-passed content-derived initial bound, geometric growth at
+      the structural-commit seam, refusal only at the `u32` ceiling
+      `InventorySlotArenaTooLarge`, counted in `inventory_runs_refused`), and
+      destroy cleanup. Test: a create past the initial bound succeeds by
+      growth at the seam.
 - [ ] Slice 49 classification (`InventoryStore` logical hash with
       `slot_run_start` / free lists / arena tail excluded; `EquipmentStore`;
       `WorldItemStore`) and the Slice 46 save sections, in the same change.
@@ -513,7 +528,8 @@ fixed per-step constant or by the fixed `world_item_live_capacity`.
       `item = .none` in `captureActionIntent`.
 - [ ] Docs:
       - `docs/architecture.md`: inventory ownership, item catalog, pooled slot
-        runs and their fragmentation cap, the transfer substrate, and the
+        runs and their arena growth at the structural-commit seam, the
+        transfer substrate, and the
         persistence boundary.
       - `docs/simulation-tiers-and-pipeline.md`: stage, events, `.use`
         consumer, transfer phase 0.
@@ -580,7 +596,8 @@ fixed per-step constant or by the fixed `world_item_live_capacity`.
       expiry deferral follows dense order and skips `count == 0` rows.
 - [ ] Pool: free-list reuse returns a run of the same class; destroy clears
       the run; no allocation after preflight (proof 2); the churn test (proof
-      3) holds the arena bound.
+      3) shows steady churn allocation-free and growth only at the
+      structural-commit seam.
 - [ ] Checksum: two inventories with identical contents but different run
       offsets hash equal.
 - [ ] FailingAllocator proofs (1)–(6). Comptime payload-purity tests for both

@@ -299,7 +299,7 @@ new phases; Expiry becomes phase 6.
 | Constant | Value | Reason |
 | --- | --- | --- |
 | `max_carried_drop_stacks_per_victim` | `64 + equip_slot_count + 1` (72) | Largest class plus 7 equip slots plus one coin entry |
-| `pending_drop_capacity` | 512 | Assert `>= max_carried_drop_stacks_per_victim`, so one full victim always fits an empty FIFO. Also 7 full `slots_64` carriers dying in one step. Fixed; never sized to population. Admission (phase 1b) keeps `len ≤ capacity` without ever discarding an entry. |
+| `pending_drop_capacity` | `death_drop_creates_per_step × 16` (512) | Backlog budget, not a content capacity: 16 drain steps (0.27 s) of `death_drop_creates_per_step`, whatever the world or population; sustained overload defers kills (phase 1b) and never grows the FIFO. Assert `>= max_carried_drop_stacks_per_victim`, so one full victim always fits an empty FIFO (also 7 full `slots_64` carriers in one step). Admission keeps `len ≤ capacity` without ever discarding an entry. |
 | `death_drop_creates_per_step` | 32 | Drains a full FIFO in 16 steps (0.27 s) when the world has headroom |
 | `world_item_creates_per_step_max` | `combat_max_kills_per_step + 1 (58) + 1 (57B) + death_drop_creates_per_step` | Assert `< world_item_live_capacity`. 162 with 56B. |
 | Structural headroom | `+ death_drop_creates_per_step` creates | Added to the demo `structural_reserve` through the named constant |

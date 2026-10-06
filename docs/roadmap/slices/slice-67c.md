@@ -220,7 +220,9 @@ behind `Renderer` facades):
 - **Payload-purity test (46).** It now allows exactly two more things: the
   thumbnail section (pixels only) and the header name. Neither holds a path
   or a handle.
-- **`k_max_save_file_bytes` (64 MiB)** bounds header + thumbnail + payload.
+- **Slice 46's save-size bound (`k_max_save_file_bytes`)** covers header +
+  thumbnail + payload; the 57,600-byte thumbnail counts against it. Slice 46
+  owns that bound's value and sizing; 67C does not restate it.
 
 **Save flow (Engine, 46 amended):**
 
@@ -389,7 +391,11 @@ UTF-8 helpers in `src/game/ui/text_edit.zig`):
     this is documented.
 - **Display and measurement.**
   - The display string is `text[0..caret] ++ preedit ++ text[caret..]`, ≤ 192
-    bytes, within 53A's 256-byte label cap. `setText` runs only when
+    bytes, within 53A's 256-byte label cap. 53B's build-time
+    `drawCommandBound()` counts a `text_field` as `max +
+    k_ime_preedit_capacity` glyph quads plus its caret, selection, and
+    preedit-underline rects (a fixed per-field count set at `build()`), never
+    the live display length. `setText` runs only when
     `display_dirty` (cold, per keystroke).
   - Caret, preedit, and selection x offsets come from a new cold 53A API:
     `labels.textOffsetX(id, byte_offset) ?f32`, through `LabelBackend.sub_string_x`
@@ -545,7 +551,8 @@ Engine field):
         `GameDemoState`, and the CPU-only renderer's draw list holds ≥ 1
         `.world` group (so the capture is recorded, not timed out)
 - [ ] `SaveNameDialogState`, replacing 46's save-mode overwrite confirm.
-      Keyboard, gamepad, and pointer tests:
+      Test: `text_field` `drawCommandBound()` is unchanged across insert and
+      compose. Keyboard, gamepad, and pointer tests:
       - default name
       - trim
       - empty → "Save N"

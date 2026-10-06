@@ -167,7 +167,11 @@ header under a bumped `checksum_format_tag`.
 - region coordinates are `i16`;
 - `k_max_region_files = 4096`. Entering a new region beyond the cap is refused:
   the seam acts as a blocked edge, with one `warn`;
-- `RegionImage` size is at most `k_max_save_file_bytes` (64 MiB);
+- the `RegionImage` encode buffer is a capacity sized from the region's
+  content with Slice 46's `encodedSaveBytes` over the region-owned sections,
+  reserved once per swap; `k_max_save_file_bytes` (64 MiB) is only Slice 46's
+  loud safety ceiling (`RegionImageTooLarge` on encode; rejected before
+  allocation on an untrusted read);
 - `region_seam_hysteresis_cells = 1`: the player is placed one cell inside the
   incoming edge, so an immediate swap back needs a new crossing.
 
@@ -217,7 +221,9 @@ header under a bumped `checksum_format_tag`.
       region-folder copy jobs; save `format_version` bump. Slice 49 header and
       checksum fold (`checksum_format_tag` bump). Replay seam split with the
       88-byte v5 header and `reserved3` validation.
-- [ ] Caps and errors. Diagnostics: `info` per swap with the coordinates,
+- [ ] Caps and errors (the `RegionImage` buffer from `encodedSaveBytes`, and a
+      pure `saveSizeBound` test at the game's `RegionWorldConfig` asserting at
+      most half of `k_max_save_file_bytes`). Diagnostics: `info` per swap with the coordinates,
       `generated` or `loaded`, and duration via `loading_build`; `warn` on a
       cap or a blocked entry.
 - [ ] Docs: `docs/architecture.md` (regions, residency, frozen-region rule).

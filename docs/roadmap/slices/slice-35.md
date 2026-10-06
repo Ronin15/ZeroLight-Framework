@@ -38,6 +38,14 @@ Checklist:
       bound as a batched mask.
 - [ ] Leave `max_separation_neighbors` (32) and `max_separation_candidate_checks`
       (128) fixed. Vectorize inside those caps.
+- [ ] Size the packed gather scratch from those fixed per-query budgets, never
+      from population or a warmed high-water mark: per agent, AI separation
+      packs at most `max_separation_neighbors` rows, and steering packs at most
+      `max_agent_candidate_checks` neighbor rows plus
+      `max_obstacle_candidate_checks` obstacle rows. Each worker's range job
+      therefore holds them as comptime-sized inline arrays (one agent at a
+      time, no shared writable scratch, nothing to reserve). Across-agent
+      decide/blend vectorization reads the existing SoA columns in place.
 
 Acceptance checks:
 
@@ -45,8 +53,12 @@ Acceptance checks:
       tests (bit-stable across layouts).
 - [ ] `zig build bench` shows wins at high neighbor/agent counts measured at
       target battle scale, with no regression at low counts.
-- [ ] Gather-into-SoA-scratch buffers are allocation-free after warmup and
-      reserved up front.
+- [ ] The gather scratch is the comptime-sized inline arrays above (a capacity
+      fixed by the per-query budgets, not by population), and a
+      `std.testing.FailingAllocator` proof runs a serial and a real
+      multi-worker AI + steering step after `reserve`, on a minimal fixture
+      whose agents hit the full neighbor and candidate caps, with zero
+      allocations.
 - [ ] `max_separation_neighbors` is still 32 and `max_separation_candidate_checks`
       is still 128 after the restructure.
 - [ ] Only irreducibly scalar loops inside this slice (pathfinding frontier

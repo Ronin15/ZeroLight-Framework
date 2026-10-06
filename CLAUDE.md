@@ -101,15 +101,33 @@ boundaries just to make a local change easier.
     insufficient, fix it with graceful degradation (deterministic deferral /
     a bounded retry ladder) or an algorithmic change — never a bigger number
     picked for one map.
-  - **Data-structure capacities** (nav arrays, chunk tables, entity/component
-    pools, node/anchor stores) **are sized from the loaded world and content at
-    init/load**, reserved up front, and never grown on the hot path (the
-    allocation-free + `FailingAllocator` rule still applies). Use a fixed cap
-    only where a format or index width forces one (e.g. `u16` indices) or as
-    a safety ceiling that fails loudly at load — not as the working size.
+  - **Data-structure capacities are right-sized per world instance**, never
+    one fixed size for every world. Two kinds:
+    - *World-extent data* (tiles, per-chunk nav, chunk tables, per-level
+      data): sized exactly from the loaded world at init/load and never grown
+      — dig/build changes contents, not extent.
+    - *Runtime-growing data* (population, items, particles, nodes, spawned
+      structures, runtime links): start at the world/content-derived size plus
+      headroom, then **grow only at a designated cold point** — the
+      main-thread structural-commit seam, outside threaded stages —
+      geometrically and ahead of need (e.g. at a fill threshold), or use
+      paged/chunked storage that adds pages without moving data where a large
+      realloc would spike a frame.
+    Between growth points hot paths stay allocation-free (the
+    `FailingAllocator` rule still applies and proves exactly that). Capacity
+    must never change behavior: no iteration order, deferral, or result may
+    depend on how much is reserved. Fixed caps only for index/format widths
+    (e.g. `u16`/`u32` indices, save/replay layouts) or a platform memory
+    ceiling, and they fail loudly.
   - **Heuristic thresholds** (e.g. "build a group flow field above N agents")
     derive from the cost of the operation they gate (its own bounded region or
     input), never from the whole world's size.
+  - **Never change a constant just to satisfy this rule.** Default is keep.
+    Changing an existing budget/capacity/threshold needs a stated, concrete
+    performance or efficiency benefit (memory saved, an artificial limit
+    removed, fewer allocations or cache misses, simpler code) weighed against
+    its cost and risk (hot-path cost, layout/format churn, proof/test churn,
+    determinism).
 - Threaded writes into a shared buffer must be partitioned (disjoint
   per-worker/per-range slots) and reserved before dispatch, never after or
   during. Allocators are explicit fields set at `init`, never a global reached

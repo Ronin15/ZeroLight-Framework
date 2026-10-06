@@ -68,10 +68,15 @@ open until that residual is closed.
 - Budgets, capacities, and thresholds follow CLAUDE.md's three-way rule.
   Per-step/per-query **work budgets** are fixed counts, never scaled to world,
   level, cell, portal, or band counts; work that does not fit is deferred
-  deterministically. **Capacities** are sized from the loaded world and content
-  at init/load and reserved up front (allocation-free hot path, proven by
-  `FailingAllocator`); fixed caps only for format/index limits or as loud
-  load-time safety ceilings. **Thresholds** derive from the cost of the
+  deterministically. **Capacities** are right-sized per world instance: world-extent
+  data is sized exactly at load; runtime-growing stores (population, items,
+  particles, nodes) start right-sized plus headroom and grow only at the
+  main-thread structural-commit seam (geometric, ahead of need) or via paged
+  storage — hot paths stay allocation-free between growth points (proven by
+  `FailingAllocator`), and capacity never changes behavior; fixed caps only
+  for index/format widths or a loud platform memory ceiling. Never change a
+  constant just for the rule — a change needs a concrete perf/efficiency
+  benefit. **Thresholds** derive from the cost of the
   operation they gate, not the whole world.
 - Do not promote threaded stage overlap, nav-remask cost changes, render-collect
   scan changes, or persistence beyond Slice 46's written stable-ID boundary
@@ -159,7 +164,7 @@ Use this index to choose the next slice; **implement from that slice's file**
 | [**55**](roadmap/slices/slice-55.md) | Not started | Cognition decision coasting: idle agents decide every 8/32 steps, same-step wake from sensing, new scope-owned `ai_decide_gather` stage on Slice 49's `simViewRegion`; sensing never coasts; no new persistent columns — after 49 |
 | [**56**](roadmap/slices/slice-56.md) | Not started | Health/damage/combat: `health` + `combat_stats`, generic threaded `ai_action_select` emitter (rotating deferral; deferral-age priority from Slice 68A), `ActionClaimSet`, simultaneous `combat_resolve` rolls on `seed.derive(.combat)`, deferred death, damage→affect watermark, `stepAfter`/`stepReached` on `StepIndex`, `attack_held_last` hashed — after 49 |
 | [**56B**](roadmap/slices/slice-56b.md) | Not started | Projectiles and ranged combat: `projectile` component, `projectile_update` stage, collision-trigger hits (one per projectile per step) resolved in `combat_resolve`, fixed live/spawn/hit caps resized through `combat_max_hits_per_step` — after 56 |
-| [**57**](roadmap/slices/slice-57.md) | Not started | Items/inventory/equipment: stable `ItemId` keys, pooled size-class slot runs (fixed arena cap, logical checksum), equipment modifiers, world items + single-winner overlap pickup, loot on `seed.derive(.loot)`, `inventory_update` stage + `TransferBatch`/`canAccept`/`canRemove`/`canRemoveCoins` transfer substrate — after 56 |
+| [**57**](roadmap/slices/slice-57.md) | Not started | Items/inventory/equipment: stable `ItemId` keys, pooled size-class slot runs (arena grows at the structural-commit seam, logical checksum), equipment modifiers, world items + single-winner overlap pickup, loot on `seed.derive(.loot)`, `inventory_update` stage + `TransferBatch`/`canAccept`/`canRemove`/`canRemoveCoins` transfer substrate — after 56 |
 | [**57B**](roadmap/slices/slice-57b.md) | Not started | Inventory/equipment UI on 53B, `drop`/`unequip` kinds, `PendingPlayerActions`, `live_modal_overlay`, toasts, replay format v3 action records — after 53B, 57, 64C |
 | [**58**](roadmap/slices/slice-58.md) | Not started | Seeded data-driven worldgen (`worldgen.json`: biomes, strata, veins, nodes, spawns, resource interest markers), integer noise, golden hashes, load-time only, `uniform_blocking` enum, `chunk_biomes`, dig yields on `seed.derive(.dig_yield)` — after 49, 57, 61 |
 | [**59**](roadmap/slices/slice-59.md) | Not started | Game clock (`WorldSystem.clock.game_ms`), calendar/seasons/day phase, weather on `seed.derive(.environment)`, environment modifiers → perception range + AI speed, weather particles, `environment_transition` events, env → `SceneGrade` (visuals need 60) — after 49 |
@@ -172,7 +177,7 @@ Use this index to choose the next slice; **implement from that slice's file**
 | [**64B**](roadmap/slices/slice-64b.md) | Not started | Checksum v2: NaN-canonical, fixed sections + threaded 64 KiB dense blocks, comptime field classification, `"pipeline_history"`, `normalizeDerivedState` (pathfinding incl. 64E cursor, 65B deferred job, dirty marks, 71B.3 prewarm) as the load-parity reference — saves never normalize the live session; `buildFingerprint()` owner — after 49, 50, 64A; before 46 |
 | [**64C**](roadmap/slices/slice-64c.md) | Not started | `zig build replay` headless runner (`HeadlessSession`), replay v2 80-byte header (`GameSessionDescriptor`, `build_fingerprint`), New Game random seed (`SessionSeedSource`, `-Dsession-seed`) — after 49, 51, 53B, 64B; before 57B |
 | [**64D**](roadmap/slices/slice-64d.md) | Not started — gated on the first sim `atan2` consumer | Deterministic `simd.atan2Float4`, `math.atan2` delegates — after 52D |
-| [**64E**](roadmap/slices/slice-64e.md) | Implemented 2026-10-05 (display-gated manual check open) | Live defect: runtime ramps routable the same step (8 fixed interior link slots per chunk, both-level dirtying, ≤ 8 links/step deferral, dig-time refusal of a ninth interior ramp per chunk), incremental == full parity, `nav-update-links` bench — no prerequisite |
+| [**64E**](roadmap/slices/slice-64e.md) | Landed 2026-10-05 (open: display-gated manual check; capacity-audit follow-ups — nav dirty buffers, level-link growth at the dig commit seam) | Live defect: runtime ramps routable the same step (8 fixed interior link slots per chunk, both-level dirtying, ≤ 8 links/step deferral, dig-time refusal of a ninth interior ramp per chunk), incremental == full parity, `nav-update-links` bench — no prerequisite |
 | [**65**](roadmap/slices/slice-65.md) | Not started (umbrella) | Threading layout cleanup and background-lane heavy consumers: 65A, 65B, 65C |
 | [**65A**](roadmap/slices/slice-65a.md) | Not started | One `thread_shared_record_alignment` (+ `assertThreadSharedRecord`, lint), padded `WorkerRecord`, per-OS lane priority (`src/platform/thread_priority.zig`; terminating fallback ladder), fixed pool `cpu_count − 1` — after 50, 51 |
 | [**65B**](roadmap/slices/slice-65b.md) | Not started | Deferred nav rebuild on the lane (classification, frozen front + fence incl. 64E link cursor, back-graph patch over the processed link prefix, swap at `submit + 30` via the shared cache-reaction helper); saves never persist or disturb it (64B `normalize` abandons the job); Slice 51 frozen-borrow clause; `nav-update-deferred` bench — after 51, 65A, 64E |
@@ -221,22 +226,6 @@ self-hosted perf runner.
 
 Sequencing hints only — **does not replace slice Checklists**. When in doubt,
 follow **Suggested Order** and the open items in the target slice file.
-
-**Next up (owner, 2026-10-05): capacity audit under the three-way budget
-rule.** CLAUDE.md now separates per-step work budgets (stay fixed),
-data-structure capacities (sized from the loaded world/content at init/load),
-and thresholds (from the gated operation's cost). Audit every open slice file
-and `tracks/voidlight-port.md` for constants the old all-fixed rule forced
-fixed — e.g. 61's 4096 resource nodes, 62's 256 spawn anchors / 512 population
-cap, 57's slot arena, 59's 2048 weather particle pool, 53A's label pool,
-56/56B hit/projectile arrays, 68C's drop FIFO, 71B static index sizes, 64E's 8
-interior slots per chunk, and the 1024 group-field threshold (71B). Classify
-each as budget / capacity / threshold (format- or index-bound constants stay
-fixed), then edit each owning slice's Architecture notes and Checklist with
-the sizing formula and `FailingAllocator` proof. Also list live `src/` fixed
-capacities the rule changes, each as a Checklist bullet in its owning slice.
-Run zig-design-specialist (audit) → zig-specialist (apply) → review; remove
-this note when done.
 
 **Locomotion emergence is closed** (archive 26–32, 39, 41, 47, 48; frontier residual 33
 visual only). Multi-source investigate (stimuli + world markers + memory) and

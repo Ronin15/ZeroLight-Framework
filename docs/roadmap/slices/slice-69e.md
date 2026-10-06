@@ -4,8 +4,8 @@
 
 **Status: not started — gated.** Gate: in ReleaseFast, the sum of the median
 weather cost per step exceeds **0.25 ms** (1.5% of the 16.67 ms frame). The
-weather cost is `zig build bench -- --group particles-weather` (2048 items,
-drag + wind) plus `zig build bench -- --group render-game-prep-weather` (full
+weather cost is `zig build bench -- --group particles-weather` (the full derived
+pool, Slice 59's `weather_particle_capacity`; drag + wind) plus `zig build bench -- --group render-game-prep-weather` (full
 pool). The measurement is taken on the machine that records Slice 59's bench
 baseline. Depends on **59** and **60** (`CameraRig`), and on **69B**'s
 region-sampled emission if landed.
@@ -60,15 +60,19 @@ presentation-only and never reads render-time state.
 - Draws come from `k_weather_particle_seed` under salt
   `k_environment_salt_base + 0x500 + i`, part of Slice 49's weather-particle
   exemption.
-- The prefill is bounded by `k_weather_prefill_max_per_step = 1024` and by the
-  2048 pool. Drops are counted.
+- The prefill is bounded by `k_weather_prefill_max_per_step = 1024` and by
+  Slice 59's derived pool capacity (`weather_particle_capacity`, a per-kind
+  `max_emit × lifetime` bound). Zoom levels are ≥ 1, so `area_scale ≤ 1` and
+  `steady_live(K)` never exceeds the zoom-1 per-kind bound that capacity
+  already covers. Drops are counted.
 
 **Fixed budgets.**
 
 - `k_weather_prefill_max_per_step = 1024`: the worst steady-state fill is
   storm 864 / snow 1080 × 3/4 of the area.
 - `k_prefill_attempts = 4`.
-- Pool capacity is unchanged at 2048.
+- Pool capacity is Slice 59's derived `weather_particle_capacity`, unchanged
+  by this slice (area scaling only lowers live counts).
 
 ### Checklist
 

@@ -90,9 +90,11 @@ scaled to world size, map size, cell count, portal count, or other measured "cur
 this is a load-bearing, explicitly tested invariant (e.g. the pathfinder's abstract A* node
 budget, `nav_graph.zig`'s incremental-dig chunk-patch tests), and a chronically insufficient
 budget is fixed via graceful degradation or an algorithmic change, not a bigger number. Also
-flag the opposite: a data-structure **capacity** hard-coded as a fixed working size where it
-should be sized from the loaded world/content at init/load (fixed caps are fine only for
-format/index limits or loud load-time safety ceilings), and **thresholds** derived from whole-
+flag the opposite: a data-structure **capacity** hard-coded as one fixed working size where
+it should be right-sized per world instance (world-extent data sized at load; runtime-growing
+stores grown only at the structural-commit seam or via paged storage; fixed caps only for
+index/format widths or a loud platform ceiling), behavior that depends on reserved capacity,
+growth inside a threaded stage, and any change justified only by rule compliance, and **thresholds** derived from whole-
 world size instead of the cost of the gated operation. Capacity growth on the hot path is
 still a High finding.
 

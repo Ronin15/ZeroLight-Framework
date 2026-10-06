@@ -17,7 +17,8 @@ with a real consumer (69C). Fully specify the three environment and world
 features that have no consumer or measured need yet: scripted weather override
 (69D), a per-zoom weather spawn rect (69E), and worlds larger than one bounded
 `WorldSystem` (69F). Every value stays a pure function of seed, spec and clock.
-Every cap is a fixed constant.
+Every per-step work budget is a fixed constant; data-structure capacities are
+sized from the loaded world and content (CLAUDE.md three-way rule).
 
 **Why six sub-slices.** Each one has its own owner files, dependencies and
 acceptance evidence. The three gated ones must not keep an ungated slice open.

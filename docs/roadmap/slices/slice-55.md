@@ -238,7 +238,11 @@ measured cost, and are comptime-asserted.
   `StructuralCommand`, or archetype JSON changes, and nothing new for Slice 46 to
   serialize.
 - Transient scratch, owned by `SimulationScopeSystem` beside `ai_cognition_indices`:
-  - `ai_decide_indices: std.ArrayList(u32)`, reserved in `reserve(capacity)`.
+  - `ai_decide_indices: std.ArrayList(u32)`, reserved in `reserve(capacity)`
+    with `capacity = SimulationPipelineConfig.movement_body_capacity` (the
+    content-derived movement-body count the state passes at init: movers +
+    obstacles + player). Decide ⊆ think ⊆ halo ⊆ movement bodies, so the
+    list never grows while the population stays inside that reserve.
   - `ai_decide_ranges: IndexRangeSlotList`, reusing the padded `IndexRangeSlot`.
     Each slot is reserved to its exact range length on the main thread before
     dispatch, sized from the same selection the dispatch uses.

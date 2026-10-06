@@ -2,9 +2,13 @@
 
 > [Roadmap index](../../framework-implementation-slices.md) · Depends on: none · Track: [VoidLight port](../tracks/voidlight-port.md)
 
-**Status: implemented (2026-10-05)**, except the display-gated manual
-acceptance check (not run: no display in the implementing session). Every
-code, test, doc, and bench item below is checked. No open prerequisite. This
+**Status: landed (2026-10-05), with open follow-up items to the landed
+work:** the display-gated manual acceptance check (not run: no display in
+the implementing session) and the capacity-audit Checklist items added
+2026-10-06 (nav dirty-buffer capacities; level-link growth at the dig commit
+seam, which replaces the live perimeter-ramp refusal once the load-sized link
+pool is spent). Every other code, test, doc, and bench item below is checked.
+No open prerequisite. This
 was a live gameplay defect (confirmed below), so it landed independently of
 49–64D and **before 46 and 65B**. 65B's lane rebuild runs the same chunk patch
 and inherits this fix (see Checklist additions). It touches
@@ -52,7 +56,9 @@ Review follow-up (2026-10-05), each item with a test:
   - The memory gate and the build's `link_edges` reservation both use
     `levelLinkLimit`.
   - `addLevelLink` refuses links past the limit, and the ramp dig refuses
-    first (counted in `dig_ramp_refused_link_slots`).
+    first (counted in `dig_ramp_refused_link_slots`). This refusal is
+    superseded by the 2026-10-06 link-growth follow-up in the Checklist: a
+    load-sized capacity must not change behavior.
   - A FailingAllocator test covers the world, graph, and system.
 - **Admission:** admission replays the assignment rule, so a cell that is an
   existing but unslotted endpoint is refused.
@@ -257,7 +263,9 @@ term.
 stale unavailable entries, as in `system.zig:4162`'s test, so NPCs that were
 backing off re-request. `nav_version` stays stable (geometry-stable slots).
 No allocation on the steady path: the fixed-stride table is sized at full
-build; the dirty buffers keep their existing reserve contract. The claim is
+build; the dirty buffers are capacities sized from the loaded world and the
+step's event capacity (capacity-audit item in the Checklist), so they do not
+grow on the steady path. The claim is
 proven by the FailingAllocator test in the Checklist, on the real
 multi-worker patch path and the serial one.
 
@@ -365,6 +373,60 @@ multi-worker patch path and the serial one.
         intent at an interior cell. After that step's post-commit reaction,
         `pathfinding.statusForWorld(lower, npc_pos, upper, goal, ...)`
         resolves to `available` within the next 2 steps.
+- [ ] **Capacity audit (2026-10-06): nav dirty buffers are load-time
+      capacities.** They were sized by the wrong quantity: `nav_dirty_levels`
+      to a fixed `@max(nav_full_relabel_level_threshold, 8)` "independent of
+      map size", and `nav_dirty_edits` / `nav_dirty_cell_spans` /
+      `nav_changed_spans` to the agent-derived `max_frame_requests` (floor 8),
+      so a 32-level world or a battle step grew them on the post-commit path.
+  - `nav_dirty_levels` is reserved to `graph.levelCount()` in
+    `rebuildStaticNavGridWithWorld`, beside `affected_levels`. It is deduped,
+    so it holds at most one entry per level.
+  - Every buffered mark comes from one committed `frame.events` record
+    (bounded by its `capacity_limit`; a `component_changed` adds at most two
+    spans) or one new-link endpoint (at most `2 * nav_new_links_per_step_max`
+    per step). `SimulationPipeline.reserve`, after it settles
+    `capacity_limit`, calls `pathfinding.reserveNavDirty(limit)`, which
+    reserves `nav_dirty_edits` to `limit + 2 * nav_new_links_per_step_max`,
+    `nav_dirty_cell_spans` to `2 * limit`, and `nav_changed_spans` to their
+    sum. A later raise of `capacity_limit` by the owning state calls it again
+    (grow-only, init path). `applyDerivedCapacity` stops sizing these four
+    buffers from `max_frame_requests`.
+  - The grow-rather-than-drop fallback stays as the ReleaseFast safety net (a
+    dropped cell leaves the graph stale, and a failed step's marks union into
+    the next step's), now counted (`NavUpdateStats.dirty_buffer_grown`, perf
+    metric `nav_dirty_buffer_grown`) with one `logging.game.warn`.
+  - `default_nav_full_relabel_level_threshold` is unchanged: it is a fixed
+    per-batch level fan-out bound that Slice 65B's classifier also reads, not
+    a capacity. Its doc comment drops the stale "the demo's worlds have very
+    few levels" (the procedural world has 32).
+  - Tests (minimal fixtures): after a build on a 10-level 1×1-tile world,
+    marking every level dirty leaves `nav_dirty_levels.capacity` unchanged;
+    with `std.testing.FailingAllocator` installed on `PathfindingSystem.allocator`
+    and `graph.allocator` after `SimulationPipeline.reserve`, a step whose
+    committed events fill `capacity_limit` with nav-invalidating tile changes
+    plus 8 new links runs `reactToPostCommitNavEvents` (serial, then a real
+    3-worker `ThreadSystem`) with zero allocations and `dirty_buffer_grown ==
+    0`; a direct mark past the reserve grows, counts 1, and the graph still
+    equals a full rebuild.
+- [ ] **Capacity-audit follow-up (2026-10-06) to the landed 64E work:
+      level links grow at the dig commit seam.** Today a perimeter-ramp dig
+      is refused once the load-sized level-link pool is spent
+      (`WorldSystem.addLevelLink` / `ensureLevelLinkCapacity` return
+      `error.LevelLinkLimitReached`), so a capacity changes gameplay.
+      `addLevelLink` grows `level_links`, `link_edges`, `link_edge_refs` at
+      the dig commit seam (main thread, geometric); only the 8-per-chunk
+      interior stride (`nav_interior_link_slots_per_chunk`, a layout bound)
+      refuses. The load-time reservation stays as the initial size, the nav
+      memory gate re-admits after a grow, and `level_link_limit` stops being
+      a refusal bound. FailingAllocator proof for steady state +
+      growth-at-seam (steady link adds within the reached size allocate
+      nothing; a grow happens only at the dig commit seam, and the commit
+      completes when the next allocation after the grow fails); test that a
+      dig past the initial link reservation succeeds (the ramp tile, the
+      link, and a routable path all land, and `dig_ramp_refused_link_slots`
+      stays 0 for a perimeter cell). `docs/architecture.md`'s level-link
+      paragraph is updated in the same change.
 - [x] Docs:
   - `docs/architecture.md` / pathfinding docs: runtime links patch both
     levels, the fixed interior link slots, the per-step link budget, and
@@ -380,6 +442,9 @@ multi-worker patch path and the serial one.
 - [ ] Manual (display, procedural demo): dig a ramp at a non-border cell on
       level 1. NPCs on level 1 path up it within a second, with no
       save/load or restart.
+- [ ] Capacity audit: the dirty-buffer `FailingAllocator` test passes serial
+      and threaded, and `nav-update-scattered` / `nav-update-links` stay
+      within max(3%, noise) of their recorded medians.
 - [x] Bench gate (ReleaseFast, 5 interleaved repetitions, medians, adjacent
       commits):
   - new group `nav-update-links` (`src/benchmarks/nav_update.zig`

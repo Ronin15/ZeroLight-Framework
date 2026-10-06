@@ -219,8 +219,22 @@ primitives.
     `Renderer.k_post_state_command_headroom = k_overlay_command_headroom +
     k_screen_fade_command_headroom` and switches this formula to it (60 lands
     second, so it owns that edit).
-  - **The bound**, recomputed only when dirty, is the sum of per-kind rect
-    counts plus the byte length of every label (glyph quads ≤ UTF-8 bytes):
+  - **Stacked-UI headroom retired.** Every state's reserve covers its own
+    content bound plus the post-state headroom, so
+    `Renderer.k_stacked_state_ui_headroom` (32, a hand-sized guess at
+    stacked menu content) and its `>= 2 × k_overlay_command_headroom`
+    comptime assert are deleted. `render_prep.spriteCommandCapacity` adds
+    `Renderer.k_overlay_command_headroom` and `hud.drawCommandBound()`
+    instead. Engine's overlay top-up then stays inside the high-water by
+    construction, not by `ArrayList` growth slack. Slice 60's planned
+    32 → 40 bump of the deleted constant is void; 60 only switches these
+    reserve sites to `k_post_state_command_headroom`.
+  - **The bound** is a capacity fixed once at `build()`. It never tracks
+    live text, so a longer `setText` cannot grow the reservation on the
+    render path. It is the sum of per-kind rect counts, plus 128 glyph quads
+    (`k_widget_text_capacity`; glyph quads ≤ UTF-8 bytes) per widget with a
+    `label`, plus 8 per widget with a `value_label` (the 8-byte value-text
+    buffer):
     - panel: 1 + 4 border rects
     - slider: 3
     - progress: 2
@@ -325,12 +339,18 @@ primitives.
     (VoidLight HudController's `m_last*Pct` pattern).
   - **Drawing:** the HUD draws after the world in `GameDemoState.render`;
     `render_prep.spriteCommandCapacity` adds `hud.drawCommandBound()`.
-- **Fixed budgets.** All independent of content size. Overflowing content
-  scrolls; capacity never grows.
-  - `k_max_widgets_per_screen = 64` (comptime)
-  - `k_widget_text_capacity = 128` bytes; `setText` truncates on a UTF-8
-    boundary
-  - `k_ui_event_queue_capacity = 16`
+- **Capacities, ceilings, and budgets.** Nothing grows after `build()`;
+  overflowing content scrolls.
+  - Per-screen widget capacity is `W`'s cardinality, sized at comptime from
+    the screen's authored widget enum. `k_max_widgets_per_screen = 64` is a
+    comptime safety ceiling, not the working size: it bounds the per-event
+    focus/hit walk and the draw bound (`parent: u8` alone would allow 255).
+  - `k_widget_text_capacity = 128` bytes is a fixed per-row field width (an
+    inline `[128]u8` column with a `u8` length); `setText` truncates on a
+    UTF-8 boundary.
+  - `k_ui_event_queue_capacity = 16` is a per-frame budget: the ring is
+    drained every `update`, and overflow drops the newest event with a
+    Debug counter.
   - one scroll level
 - **Errors.** `UiBuildError = error{ UiWidgetMissing, UiWidgetDuplicate,
   UiParentOrder, UiParentNotContainer, UiNestedScroll }`, raised by
@@ -356,13 +376,25 @@ primitives.
 - [ ] `ui/draw.zig`: passes, reservation bound, clipped scroll children.
       Tests on a CPU-only renderer (the `ai_debug_overlay.zig:614` fixture
       pattern) assert nondecreasing order, the focus highlight, and clipped
-      rects.
+      rects. The bound is fixed at `build()`: a test sets a 1-byte text, then
+      a 128-byte text and a new slider value, and `drawCommandBound()` is
+      unchanged.
 - [ ] `FailingAllocator` proofs:
       - warmed `UiScreen.render` with nothing dirty
       - `handleAction` + `nextEvent`
       - a dirty layout pass, which also allocates zero
       - overlay top-up after a UI screen's reserve, mirroring renderer.zig's
         "engine overlay top-up …" test
+      - a dirty pass after `setText` lengthens a label to 128 bytes: the
+        reservation does not grow
+- [ ] Retire `Renderer.k_stacked_state_ui_headroom` and its comptime assert;
+      `render_prep.spriteCommandCapacity` adds `k_overlay_command_headroom` +
+      `hud.drawCommandBound()`. Rewrite renderer.zig's "engine overlay top-up
+      after stacked UI fully consumes its headroom stays allocation-free" test
+      to the per-screen reserve rule. `FailingAllocator` proofs on a CPU-only
+      renderer after one warmed frame: (a) a gameplay-only frame plus the
+      Engine overlay top-up; (b) gameplay → `PauseState` →
+      `ConfirmDialogState` plus the top-up. Both allocate zero.
 - [ ] `ui/theme.zig` + `assets/ui/theme.zon` + the `ui_theme_zon` test
       import. Tests: the shipped theme parses; unknown field, bad version, and
       out-of-range color are each rejected.
@@ -409,6 +441,9 @@ primitives.
       outcomes as the pre-migration suites.
 - [ ] Review check: `src/game/ui/` has no string IDs, callbacks, hash lookups,
       `render/gpu/*` imports, or SDL handles.
+- [ ] Review check: `k_stacked_state_ui_headroom` is gone, and every render
+      reserve term is a build-time bound, a load-time capacity, or
+      `k_overlay_command_headroom`, never a live text length.
 
 ### VoidLight reference
 

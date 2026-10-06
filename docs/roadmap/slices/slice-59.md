@@ -321,9 +321,18 @@ time or weather. The game knows nothing about GPU layouts.
 - Not ported from VoidLight: per-frame `vel *= 0.98` (not dt-scaled), trig keyed by row
   index (indices change on swap-remove), and `fast_rand`. Heterogeneity comes from
   ±20% drag jitter drawn at spawn.
-- Second state-owned pool `GameDemoState.weather_particles`, capacity
-  **`k_weather_particle_capacity = 2048`**. That is a fixed constant, independent of
-  world and view size. Weather can never starve debris or gameplay effects.
+- Second state-owned pool `GameDemoState.weather_particles`. Its capacity is sized
+  from the authored emitter table below, not a fixed working size:
+  **`weather_particle_capacity = environment.weatherParticleCapacity(config)`** =
+  Σ over emitting kinds of `max_emit_per_step × (ceil(lifetime_s × 60) + 1)`,
+  computed once at `GameDemoState` init and reserved then (a pure function of the
+  validated config, comptime-evaluable for the defaults). A kind emits at most its
+  `max_emit` per step (the per-kind count uses the kind's summed from/to share, and
+  `floor(share × max_emit + u) ≤ max_emit` for `share ≤ 1`), and a particle lives at
+  most `ceil(lifetime_s × 60) + 1` steps, so the sum bounds live weather particles for
+  any weather sequence and any `game_ms_per_step`: full-pool drops are unreachable for
+  a validated table. Defaults: 10·55 + 16·55 + 3·361 + 2·181 = 2875. It is independent
+  of world and view size. Weather can never starve debris or gameplay effects.
 - Emitter table per kind:
   - rain: a=(0,900), drag 3 (v_t ≈ 300 px/s), life 0.9 s, size 2–3, color
     (0.45,0.6,0.95,0.7→0.5), max 10/step.
@@ -332,7 +341,8 @@ time or weather. The game knows nothing about GPU layouts.
   - wind: a=0, drag 1 (v_t = wind), life 3 s, size 2, tan (0.75,0.68,0.5,0.5), max
     2/step.
   - clear, cloudy and fog emit nothing. Fog is haze.
-  - Worst live count: storm 864, snow 1080. Both are under the 2048 cap.
+  - Steady-state live count at full share: storm 864, snow 1080, each within the
+    derived capacity (2875).
 - `EnvironmentController.emitWeatherParticles(pool, spawn_rect, base_z, exposed) EmitStats`
   runs after `pipeline.update`, before `weather_particles.update`, in
   `GameDemoState.update`:
@@ -439,7 +449,8 @@ time or weather. The game knows nothing about GPU layouts.
 - [ ] `systems/particle.zig`: `drag` column plus `ParticleSpawn.drag`, `air_velocity`
       config, SIMD and scalar kernel, drag validation.
 - [ ] `render_depth.zig`: `WorldDepth.weather = 3`, extend the ordering test.
-- [ ] `game_demo_state.zig`: `weather_particles` pool (2048), emission over
+- [ ] `game_demo_state.zig`: `weather_particles` pool (capacity
+      `weatherParticleCapacity(config)`, 2875 with defaults), emission over
       `simViewRect()` and update in `update`, `syncInterpolatedState` resync of the
       weather pool, `render` grade wiring, lightning → trauma (needs 60).
 - [ ] `render_prep.zig`: `GameplayScene` weather fields, constant-depth weather run
@@ -505,6 +516,10 @@ time or weather. The game knows nothing about GPU layouts.
         `(k_weather_particle_seed, game_ms, snapshot)` and bounded by per-step max and
         pool cap
       - drop counter
+      - `weatherParticleCapacity` equals the formula for the default table (2875)
+        and for a test-local table; with a test-local config whose every season
+        rolls storm (1000‰), a 600-step run peaks at or below the capacity with the
+        drop counter at 0, and likewise for snow
 - [ ] `FailingAllocator` proofs (after init/reserve, exercising the real multi-worker
       `ThreadSystem`):
       - environment stage plus event append
@@ -517,7 +532,7 @@ time or weather. The game knows nothing about GPU layouts.
 - [ ] Bench (one `BenchmarkGroup` per workload, hyphenated names, sizes in
       `defaultItemCounts`, registered in `src/benchmarks/runner.zig`):
       - New group `particles-weather` (`particles.zig` `weather_group`; default items
-        2048, drag plus wind): `zig build bench -- --group particles-weather`. Report
+        = the derived `weather_particle_capacity`, 2875, drag plus wind): `zig build bench -- --group particles-weather`. Report
         against `--group particles`; no unexpected multi-x cost.
       - New group `render-game-prep-weather` (`render_game_prep.zig`
         `weather_group`, full weather pool): `zig build bench -- --group

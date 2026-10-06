@@ -84,10 +84,13 @@ the game layer needs. Game states never call SDL_GPU directly.
   **work budgets** (search node caps, solves/links/spawns per step) are fixed counts — never
   derived from world/map size, cell count, portal count, or other "current scale"; state the
   budget and, when a hard case can exceed it, name the graceful-degradation path
-  (deterministic deferral / bounded retry ladder). **Capacities** of data structures are sized
-  from the loaded world/content at init/load and reserved up front (state the sizing formula
-  and the `FailingAllocator` proof); use a fixed cap only for a format/index limit or a loud
-  load-time safety ceiling. **Thresholds** derive from the cost of the gated operation.
+  (deterministic deferral / bounded retry ladder). **Capacities** are right-sized per world instance
+  (CLAUDE.md): world-extent data sized exactly at load; runtime-growing stores start
+  right-sized + headroom and grow only at the structural-commit seam (geometric, ahead of
+  need) or via paged storage — state the sizing formula, the growth point/policy, and the
+  `FailingAllocator` proof for the steady state; fixed caps only for index/format widths or a
+  loud platform ceiling. Default is keep: justify any change with a concrete perf/efficiency
+  benefit vs. its cost/risk. **Thresholds** derive from the cost of the gated operation.
 - **Deferred / main-thread boundary** for structural entity/component changes, state
   transitions, SDL/GPU calls, asset loading, save/load streaming, renderer resource
   ownership. The main thread is not a dumping ground — any subsystem that scales with

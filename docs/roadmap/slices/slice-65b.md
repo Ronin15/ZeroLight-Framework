@@ -85,10 +85,19 @@ Goal:
   - `patchChunk` `:1344` → `addChunkLinkPortals` `:1485-1492`;
   - `rebuildLinkEdges` `:1257-1297`.
 
-  Links grow at runtime (`dig_controller.digRamp`; `world_system.zig:1508`
-  `addLevelLink`, unbounded `level_links: ArrayList` `:303`).
-  `groupLinkCellRuns` makes one temporary `allocator.alloc` per abstract
-  build (`nav_graph.zig:1207-1208`).
+  Links grow at runtime (`dig_controller.digRamp`;
+  `WorldSystem.addLevelLink`). The world's load-time `reserveLevelLinks`
+  (sized by `GameDemoState` from the authored links plus
+  `nav_interior_link_slots_per_chunk` per world chunk) is only the initial
+  size: per Slice 64E's link-growth follow-up, `level_links`, `link_edges`,
+  and `link_edge_refs` grow geometrically at the dig commit seam (main
+  thread), and only the 8-per-chunk interior stride (a layout bound)
+  refuses. Slice 64E removed `groupLinkCellRuns` and its per-build
+  temporary `allocator.alloc`: interior link endpoints live in the
+  fixed-stride `chunk_link_cells` table (`chunk_count ×
+  nav_interior_link_slots_per_chunk`, sized from the dimensions in
+  `computePortalGeometry`), and the full build reserves `link_edges` /
+  `link_edge_refs` to `levelLinkLimit()` / `2 × levelLinkLimit()`.
 - **Allocation contract.** The graph is allocation-free at steady state.
   Growth happens only in the cold, event-triggered topology blow-up
   (`nav_graph.zig:623-629`). The established `FailingAllocator` pattern swaps
@@ -190,6 +199,24 @@ because of the fence below.
     returns with `stats.deferred_held_batches = 1`. It does not classify,
     apply, or emit an event. The marks stay in the dirty buffers, which
     already grow rather than drop, and are applied at the swap step's seam.
+  - **Fence-window reserve (capacity, sized at load).** The fence holds up
+    to `k = nav_deferred_rebuild_latency_steps` steps of marks (seams
+    `s+1 … s+k`), so the dirty buffers are sized for the window, not for
+    one step. `PathfindingSystem.reserve` sets `nav_dirty_edits` to
+    `max_frame_requests × k`, `nav_dirty_cell_spans` to
+    `2 × max_frame_requests × k`, and the synchronous eviction scratch
+    `nav_changed_spans` to the sum of those two. That scratch consumes the
+    same held marks when the swap step's batch classifies `.synchronous`;
+    today it is reserved to `max_frame_requests` even though one step already
+    needs up to `3 × max_frame_requests`. The nav build reserves
+    `nav_dirty_levels` to the nav level count `L`, replacing the fixed
+    `@max(nav_full_relabel_level_threshold, 8)` ceiling: once marks
+    accumulate across the window, the deduped level set can hold every
+    level. The reserve is a pure function of `PathfindingCapacity`, the
+    fixed latency, and the loaded world. Marks within it never allocate. A
+    step whose marks exceed its per-step share keeps pathfinding's
+    grow-rather-than-drop overflow on the main thread (never a drop, never
+    on the lane).
   - 64E's link-cursor step in `reactToPostCommitNavEvents` is held too: the
     cursor does not advance, `graph.assignLinkEndpointSlots` is not called
     on the frozen front, new links count in `stats.links_deferred`, and
@@ -213,15 +240,40 @@ because of the fence below.
 **Submit (main thread, step `s`, `class == .deferred`, state `.idle`)**
 
 `NavDeferredRebuild.prepare(front, data, world, dirty buffers, thread_system)`
-fills the plan. Every buffer is a plan field, reserved at nav build and grown
-on the main thread before submit:
+fills the plan. Every buffer is a plan field whose capacity is sized from the
+loaded world at nav build (`rebuildStaticNavGridWithWorld`, the same
+load-time call that ends with `back.ensureCapacityLike(front)`), so `prepare`
+never grows a plan buffer on the step path. With `L` = nav level count, `C` =
+nav chunks per level (`chunkCount()`), and `ct` = `chunk_tiles`:
+
+| Plan buffer | Capacity reserved at nav build | Why it bounds the plan |
+| --- | --- | --- |
+| `level_runs` | `L` | one run per affected level |
+| `chunks` | `2 × L × C` | per level, changed ≤ `C` and dirty ≤ `C` (stamp-deduped) |
+| `overlay_entries` | `L × C` | one entry per changed `(level, chunk)` |
+| `overlay_cells` | `L × C × ct²` | one `ct²` stride slot per entry; edge chunks keep the full stride |
+| `eviction_spans` | the fence-window `nav_dirty_edits` + `nav_dirty_cell_spans` reserve (see the fence) | one span per held cell edit or cell span |
+| `links` | `world.levelLinkLimit()`, re-reserved at the dig commit seam (main thread) whenever 64E's link-growth follow-up grows the world's link store | the snapshot is a prefix of the world's link set (64E) |
+
+The only plan growth left is `eviction_spans` after a dirty-buffer overflow
+(a window whose marks exceeded the fence-window reserve, which pathfinding
+grows rather than drops). In that case `prepare` grows it by the same
+overflow on the main thread, never on the lane. A later
+`rebuildStaticNavGridWithWorld` re-reserves every plan buffer from the
+rebuilt world. `prepare` fills the plan in this order:
 
 1. **Static coverage, on the front's `static_blocked` only** (the cache
    queries never read):
    - Whole-level-dirty level 0 calls the new
      `NavGrid.rebuildStaticCoverage(allocator, data)`. It is the
      `markStaticBodies` loop minus `markBlockedRectSimd`, so the front mask
-     is untouched.
+     is untouched. Both functions share one private loop that resolves each
+     static body's bounds through `data.collisionBoundsDenseIndex(entity)`
+     (O(1) through the entity slot). The per-call `std.AutoHashMap` that
+     `markStaticBodies` builds today (`nav_grid.zig:116-120`) is deleted, and
+     `static_blocked` keeps its load-time `cellCount()` length. A level-0
+     whole-level batch therefore allocates nothing after load on either the
+     synchronous or the deferred path.
    - Each cell span calls the existing `refreshStaticCoverageSpan`.
 2. **Changed and dirty chunk runs per affected level**, in ascending level
    order. They use the same rules as `remaskChangedChunks` and
@@ -242,8 +294,8 @@ on the main thread before submit:
      Each range writes only its entries' disjoint stride slots. On the main
      thread, before dispatch, `overlay_entries` is filled and
      `overlay_cells.resize(allocator, overlay_entries.items.len * ct * ct)`
-     runs (within the capacity reserved at nav build after warmup, so it
-     allocates only on the cold high-water path), and the dispatch's
+     runs (within the `L × C × ct²` capacity reserved at nav build, so it
+     never allocates), and the dispatch's
      `item_count` is that same
      `overlay_entries.items.len`, so the reservation and the dispatch are
      sized from one value. The job opens with
@@ -332,9 +384,13 @@ rule enforced structurally: the job cannot reach `parallelFor`.
 - The synchronous callers pass `world.levelLinks()` (or `&.{}` for a null
   world). `patchDirtyChunks` still takes `world` for its threaded remask
   sibling only where `navSpanForTile` needs it.
-- `groupLinkCellRuns`'s temporary `alloc` / `free` becomes a persistent
-  `link_sort_scratch: std.ArrayList(u32)` (scratch role). A full rebuild that
-  fits the prior high-water mark is then allocation-free on either thread.
+- No link-sort scratch is added. Slice 64E already removed
+  `groupLinkCellRuns`'s temporary `alloc` / `free`: endpoints live in the
+  dimension-sized `chunk_link_cells` table, and the full build reserves
+  `link_edges` / `link_edge_refs` to the world's current link capacity
+  (grown at the dig commit seam per 64E's link-growth follow-up). A full rebuild
+  that fits the prior edge-window high-water mark is therefore
+  allocation-free on either thread.
 - **Copy-role table.** `NavGraphFieldRole = enum { owner, copied, scratch }`,
   with one exhaustive comptime role table per type: `NavGraph`, `NavGrid`,
   `NavLevelGraph`. Each table is checked against
@@ -352,7 +408,7 @@ rule enforced structurally: the job cannot reach `parallelFor`.
       `blocked_count`, `blocked`, `components`, `static_blocked`.
     - `NavLevelGraph`: every list except `edge_scratch`.
   - **scratch** (capacity and count ensured, contents not copied):
-    `build_u32_scratch`, `link_sort_scratch`, `patch_scratch`,
+    `build_u32_scratch`, `patch_scratch`,
     `remask_scratch`, `dirty_set`, `dirty_stamp`, `dirty_epoch`,
     `changed_chunks`, `last_patch_batch`, `last_remask_batch`,
     `NavGrid.component_queue`, `NavLevelGraph.edge_scratch`.
@@ -444,7 +500,11 @@ is called through `SimulationPipeline.serviceDeferredNavRebuild` by
 
 - `NavMemoryBudget.requiredBytes` adds the back buffer:
   `static_bytes + abstractGraphBytes(...) + build_scratch_bytes`, plus the
-  overlay worst case, `levels × cells` bytes.
+  load-reserved plan buffers from the Submit table and the fence-window
+  dirty-buffer reserve, so the gate charges exactly what load reserves. The
+  plan terms are `overlay_cells` at `L × C × ct²` bytes (≥ `levels × cells`
+  when edge chunks are partial), `chunks` at `2 × L × C × 4` bytes, and
+  `overlay_entries`, `level_runs`, `links`, and `eviction_spans`.
 - The budget is always counted, because deferral is always on. A world
   admitted before this slice can now fail the default 512 MiB gate only if
   it was already above about 45% of it. The production 256×256×32 config is
@@ -539,8 +599,9 @@ copied at submit") gains one clause:
 ### Checklist
 
 - [ ] Graph-phase refactor in `nav_graph.zig`: functions take `links`
-  instead of `world`, `link_sort_scratch` replaces the temporary
-  `alloc`/`free`, plus the copy-role tables with comptime exhaustiveness.
+  instead of `world` (no link-sort scratch; 64E already removed the
+  temporary `alloc`/`free`), plus the copy-role tables with comptime
+  exhaustiveness.
   - Existing nav tests stay green unchanged, including the
     incremental-matches-full-rebuild and edge-cap tests.
   - New tests:
@@ -565,9 +626,11 @@ copied at submit") gains one clause:
     reaching the chunk threshold each give `.deferred`.
   - `test "deferred overlay derive is identical serial and threaded"`: a
     real 3-worker `ThreadSystem` against `null`.
-  - `test "deferred overlay derive is allocation-free after warmup on a
-    multi-worker pool"`: after one warm `prepare` of the same footprint,
-    install `std.testing.FailingAllocator` on `system.allocator` and
+  - `test "deferred overlay derive is allocation-free after load on a
+    multi-worker pool"`: directly after the load-time
+    `rebuildStaticNavGridWithWorld`, with no warm `prepare` (so the test
+    proves the load-time plan reserve), install
+    `std.testing.FailingAllocator` on `system.allocator` and
     `graph.allocator`, then run `prepare` with a real 3-worker
     `ThreadSystem` and `nav_remask_tuner` forced to multi-range
     (`adaptive = false`, `items_per_range = 1`, so every worker writes
@@ -634,15 +697,17 @@ copied at submit") gains one clause:
   - `test "a failed deferred job surfaces OOM at the due step and re-marks its levels"`:
     no lane; `FailingAllocator` on the back graph's growth during a full
     relabel past high-water.
-  - `test "deferred submit, job, and swap are allocation-free after warmup"`:
+  - `test "deferred submit, job, and swap are allocation-free after load"`:
     `FailingAllocator` on `system.allocator`, `graph.allocator`, and the back
-    graph's allocator, armed after one identical warm cycle. `prepare` runs
+    graph's allocator, armed directly after the load-time nav build. There
+    is no warm cycle: any buffer this path needs that load does not reserve
+    moves into the nav-build reserve. `prepare` runs
     with a real 3-worker `ThreadSystem` (overlay derive multi-range), and the
     lane job runs with no lane (inline at the due step), because
     `FailingAllocator`'s counters are not atomic and the lane job is serial
-    by construction. A tile-edit batch, so level-0 whole-level
-    `rebuildStaticCoverage` (which allocates, like today's
-    `markStaticBodies`) is not exercised.
+    by construction. Run it twice: once with a tile-edit batch, and once
+    with a level-0 whole-level batch (`rebuildStaticCoverage` through the
+    shared dense-index loop, with no per-call map).
 - [ ] Pipeline and state wiring:
   - `SimulationPipeline.reactToPostCommitNavEvents` gains `lane` and passes
     `scope.currentStep()`.
@@ -666,8 +731,36 @@ copied at submit") gains one clause:
   - The per-step `simulationChecksum()` traces and the swap step are
     identical across all four. The slow lane reports
     `background_jobs_completed_inline >= 1`.
-- [ ] `nav_memory.zig`: the back-buffer and overlay terms, updated expected
-  values, and `test "the nav gate counts the deferred back buffer"`.
+- [ ] `nav_memory.zig`: the back-buffer, plan-buffer, and fence-window
+  dirty-reserve terms, updated expected values, and
+  `test "the nav gate counts the deferred back buffer"`.
+- [ ] Load-time capacities (capacity audit):
+  - plan buffers reserved at nav build to the Submit table's formulas;
+  - `PathfindingSystem.reserve` sizes `nav_dirty_edits`,
+    `nav_dirty_cell_spans`, and `nav_changed_spans` for the fence window;
+  - the nav build reserves `nav_dirty_levels` to `L`;
+  - `markStaticBodies` and `rebuildStaticCoverage` share the dense-index
+    loop, with no per-call map.
+
+  Tests in `system.zig` (16×16-tile world, `nav_chunk_tiles = 4`, 2 levels,
+  `max_frame_requests = 2`):
+  - `test "deferred plan buffers are reserved from the loaded world at nav build"`:
+    each plan capacity equals its formula. A 32×32-tile fixture (4× the
+    chunks) scales them 4×, while `nav_deferred_patch_min_changed_chunks`
+    and `nav_deferred_rebuild_latency_steps` stay unchanged: capacities
+    scale with the world, thresholds and budgets do not.
+  - `test "fence-held marks across the whole window are allocation-free"`:
+    `FailingAllocator` on `system.allocator` and `graph.allocator` right
+    after load. Submit a deferred job, then on every seam `s+1 … s+k` mark
+    `max_frame_requests` cell edits, `2 × max_frame_requests` cell spans,
+    and a whole-level mark on each level. Zero allocations, including at
+    `s + k`, where the held batch is classified and applied (synchronously
+    or as the next deferred job).
+  - `test "whole-level static coverage refresh is allocation-free after load"`:
+    `FailingAllocator` right after load. A level-0 whole-level mark through
+    the synchronous path (`markStaticBodies`) and through the deferred path
+    (`rebuildStaticCoverage`) allocates nothing, and on both paths
+    `static_blocked` equals a fresh build's.
 - [ ] Bench: new group `nav-update-deferred` in `src/benchmarks/nav_update.zig`,
   registered in `runner.zig`.
   - Items: changed-chunk counts `{64, 128, 256}` on the existing 256-tile
@@ -727,7 +820,11 @@ copied at submit") gains one clause:
   the lane and never written.
 - [ ] The equivalence tests pass in all three shapes: incremental, full
   relabel, and edge-cap fallback. The four-lane checksum traces are equal.
-- [ ] The `FailingAllocator` proofs pass for submit, the job, and the swap.
+- [ ] The `FailingAllocator` proofs pass for submit, the job, and the swap
+  with no warm cycle (armed right after load), for fence-held marks across
+  the whole window, and for the whole-level static coverage refresh. The
+  plan-buffer capacities equal the load-time formulas and scale with the
+  world, while the latency and the changed-chunk threshold stay fixed.
 - [ ] `normalize discards an in-flight deferred rebuild` passes on all
   three lane shapes. Slice 46's mid-job trace bullet (invisibility + load
   parity) is present in its checklist; 65B lands before 46 in the merged

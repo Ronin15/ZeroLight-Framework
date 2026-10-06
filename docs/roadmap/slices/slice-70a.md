@@ -366,6 +366,10 @@ Functions (pure, headless):
 
 - No new per-frame allocation, and the `FailingAllocator` proofs are kept.
 - The index fill writes into SDL-mapped memory.
+- Batch reservation keeps today's live-count reserve
+  (`spriteCommandCapacity` / `dynamicRecordCapacity`) with geometric
+  high-water growth, the standard practice for a per-frame render batch (the
+  2026-10-06 capacity audit reviewed it and kept it).
 - New errors: `error.PartialQuadSpan` (static append) and
   `createQuadIndexBuffer`'s `error{ SdlError, GpuBufferTooLarge,
   GpuMapMisaligned }`, which propagates out of `Renderer.init`.

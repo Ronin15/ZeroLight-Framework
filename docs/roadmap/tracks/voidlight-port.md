@@ -8,7 +8,8 @@ framework chose ZeroLight as the go-forward base for every game. Slices 49–63
 bring VoidLight's best shipping features (combat, items, harvesting, worldgen,
 time/weather, camera, UI, settings, saves, packaging, CI) onto ZeroLight's
 contracts: determinism (serial == threaded, scalar == SIMD, same seed → same
-checksum), fixed budgets, and allocation-free hot paths. Each slice ends with a
+checksum), fixed budgets, world-sized capacities, and allocation-free hot
+paths. Each slice ends with a
 **VoidLight reference** block listing what to port and what not to. Slices
 64–71 finish the track: cross-machine determinism and replay tooling (64),
 lane-heavy consumers (65), distribution (66), UI/input/text completion (67),
@@ -20,9 +21,19 @@ presentation polish (70), and AI behavior parity (71). Every former
 `thread_local` `random_device`-seeded RNG, no `steady_clock` (or any wall time)
 in gameplay, no completion-order application of path/job results, no
 atomic-sequence conflict resolution, no `-ffast-math`
-(`@setFloatMode(.optimized)`). Never port a world-scaled budget (for example
-VoidLight's `worldW / 200` pathfinding sectors): every cap stays a fixed
-constant, with deterministic deferral when it binds.
+(`@setFloatMode(.optimized)`). Never port a world-scaled work budget (for
+example VoidLight's `worldW / 200` pathfinding sectors): per-step and per-query
+budgets stay fixed counts, with deterministic deferral when they bind.
+Data-structure capacities (anchor and node stores, the projectile live store,
+persistent populations, plan buffers) are sized from the loaded world and
+content at init/load and reserved up front (`FailingAllocator`-proven).
+Stores that grow at runtime (the inventory slot arena, level links, and any
+later runtime node producer) take a content-derived initial size and grow
+geometrically at the main-thread structural-commit seam, refusing only at a
+format/index ceiling. Fixed caps remain for format/index limits, loud
+load-time safety ceilings, and standard fixed pools (the 512-slot text-label
+pool with idle reclaim), and heuristic thresholds derive from the cost of the
+operation they gate (the CLAUDE.md budgets / capacities / thresholds rule).
 
 **Shared contracts later slices rely on (one owner each; never fork them):**
 
@@ -45,6 +56,7 @@ constant, with deterministic deferral when it binds.
 | `StaticColliderIndex` | 71B | steering, collision |
 | `TransferBatch.consume` | 57, added by 68C | — |
 | `StringId` registry | 67E | every later UI slice |
+| `encodedSaveBytes` / `saveSizeBound` (save and region-image buffer sized from content; `k_max_save_file_bytes` is only a loud ceiling on encode and untrusted reads) | 46 | 67C (header + thumbnail + payload bound), 69F (`RegionImage`) |
 
 **Pipeline additions (merged `stage_order`):** `environment_update` (59) at
 index 0; `ai_decide_gather` (55) between `affect_update` and `ai_decide`;
@@ -176,14 +188,22 @@ B2, so the save and the checksum walk the same field set.
 1. `entity_slots`.
 2. One section per `DataSystem` store in declaration order. Later stores
    append here: 56 health/combat_stats, 56B projectile,
-   57 inventory/equipment/world_item plus the slot arena, 61 resource_node,
+   57 inventory/equipment/world_item plus the slot arena (run layout is not
+   persisted; load rebuilds runs from the initial bound and grows the arena at
+   the structural-commit seam, refusing only at the `u32` ceiling with
+   `InventorySlotArenaTooLarge`), 61 resource_node,
    62 spawn_origin, 63 social_ledger/merchant/`FactionRelations`,
    68C `pending_drops` (FIFO order, `head` = 0 on load), 71A ai_post. New
    columns in existing stores (42 `AiAffect.gain_fear_caution`, 68A
    `AiAgent.action_deferrals`, 68B knockback/retaliation fields, 71D
    `AiAgent.gain_trade`) ride in their store's section.
 3. `world_meta`: levels (plus 38 `level_elevation`), 58 `chunk_biomes`, 62
-   `spawn_anchors` (+71A `patrol_route`), and 69D `weather_overrides`.
+   `spawn_anchors` (+71A `patrol_route`), and 69D `weather_overrides`. 62
+   `spawn_anchors` is variable-length: it records the slot high-water mark
+   (`<= maxInt(u16)`) so load reserves the store to it and restores live slots
+   at their original `SpawnAnchorId` indices. `SpawnAnchorChunkIndex` is never
+   saved; `finalizeChunkIndex` rebuilds it after load. No `format_version`
+   renumbering: 62's v11 already carries the section.
 4. `world_dense`, then `world_sparse`, then `world_markers`.
 5. `world_environment` (64 addition (b): `game_ms`, `level_sky_exposed`).
 6. `pipeline_history` (64B / 64 addition (c): interact, sensory, dig, ai,

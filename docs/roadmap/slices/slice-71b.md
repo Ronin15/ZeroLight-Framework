@@ -27,8 +27,8 @@ group-field threshold) and the 71B.1 steering level gate. The rest of 71B.1,
   default for `prewarm_shared_goals` is decided by the A/B capture in
   Acceptance.
 
-Slices 61 and 62 keep adding their fixed caps to the contact, trigger, and
-intent capacity body count, before and after 71B.2. The split removes only
+Slices 61 and 62 keep adding their world-sized capacities to the contact,
+trigger, and intent capacity body count, before and after 71B.2. The split removes only
 static×static pairs, and the dynamic×static contacts those terms warm-size
 still exist.
 
@@ -170,6 +170,29 @@ Goal:
   "0 derives" and "auto-scales with world size". They say "fixed per-query
   threshold; never derived from world size".
 - The demo's 2000 pin is unchanged.
+- **Capacity-audit follow-up (2026-10-06): doc comment only.** The literal
+  `default_min_group_field_agents = 1024` stays. It is a measured per-query
+  policy constant. Only its `types.zig` block comment changes: it drops the
+  "value the retired cellCount / 256 derivation landed on" sentence and
+  states the gated operation instead (a shared flow-field build costs up to
+  `group_field_max_cells` relaxations and earns that cost only for a large
+  same-goal crowd). No value, test, or bench changes.
+- **Capacity-audit follow-up (2026-10-06): `max_agent_budget` is a
+  content-sized capacity.** `PathfindingCapacity.max_agent_budget` is the
+  elastic ceiling for the request queue, result cache, and solve scratch, and
+  the nav memory gate admits that ceiling at load. The demo pins the literal
+  4096 against a 2048-mover battle population.
+  `proceduralPathfindingCapacity` takes the population and sets
+  `max_agent_budget = @max(population.intent_capacity, cap.min_group_field_agents)`
+  (one navigation intent per steering agent per step, the bound
+  `deriveDemoPopulationCapacity` already computes and later slices' spawn
+  terms extend). The threshold never clamps below the measured
+  `min_group_field_agents`: `groupFieldThreshold` (`system.zig:226`) clamps
+  to `max_agent_budget`, so the `@max` keeps a small population from pulling
+  the threshold down through a capacity. `default_max_agent_budget = 4096`
+  stays only as the library default for bare callers (benches, tests), and
+  its doc comment says so. The elastic grow/shrink policy and the
+  `dropped_requests` path are unchanged.
 - **Unpinned bench fixtures** (`pathfinding.zig` near `:406/:509/:617/:767/:902`)
   move from the derived value to 1024 (clamped by their budget). Record each
   affected `pathfinding*` group before and after. Where a case's purpose
@@ -389,11 +412,17 @@ Narrowphase, contact merge, and response are unchanged.
   (`enum { demand, prewarm }`) and
   `prewarm_source: PrewarmSourceId = .none`
   (`{ slot: u16, generation: u16 }`).
-- **Source domain** (fixed, slot-ordered):
-  - interest-marker slots `[0, 128)` of kind `patrol` or `resource`;
-  - then Slice 62 anchor slots `[128, 384)`;
-  - `path_prewarm_source_domain = interest_marker_capacity + spawn_anchor_capacity = 384`
-    (comptime).
+- **Source domain** (slot-ordered, sized at load):
+  - interest-marker slots `[0, interest_marker_capacity)` (128, fixed inline
+    array) of kind `patrol` or `resource`;
+  - then Slice 62 anchor slots
+    `[interest_marker_capacity, interest_marker_capacity + spawn_anchor_capacity)`;
+  - `path_prewarm_source_domain = interest_marker_capacity + spawn_anchor_capacity`
+    is a runtime value computed at load from the loaded anchor capacity
+    (Slice 62's world-sized `spawn_anchor_capacity`) and stored on the
+    pipeline; it is never recomputed per step. The per-step visit budget
+    `path_prewarm_candidates_per_step` stays fixed, so a larger domain only
+    lengthens the sweep period (deterministic deferral).
 - **Merchant positions are excluded permanently**, against the backlog
   draft. Merchants walk: 71A's leash keeps them near home, not stationary. A
   field keyed to a merchant's current cell goes stale as soon as it moves.
@@ -465,7 +494,7 @@ Narrowphase, contact merge, and response are unchanged.
   | Constant | Value | Reason |
   | --- | --- | --- |
   | `path_prewarm_goals_per_step` | 1 | Backlog value; at most one new field per step |
-  | `path_prewarm_candidates_per_step` | 8 | Full sweep of 384 slots every 48 steps (0.8 s) |
+  | `path_prewarm_candidates_per_step` | 8 | Full sweep of `D` source slots every `ceil(D / 8)` steps (384 slots: 48 steps, 0.8 s) |
   | `path_prewarm_band_chunks` | `cognition_halo_chunks` (16) | Prewarm only where agents decide |
   | `PathfindingCapacity.prewarm_shared_goals` | `true` (default) | A runtime policy knob like `min_group_field_agents`; the demo value is set by the A/B acceptance |
 
@@ -526,6 +555,24 @@ Narrowphase, contact merge, and response are unchanged.
       `pathfinding-query` 256/1024: 5.28/20.91 us → 5.04/21.27 us;
       `pathfinding-escalated-detour` 1: 14.91 us → 14.52 us. All are within
       noise, as expected for an unchanged code path.)
+- [ ] **71B.1 capacity-audit follow-up (ungated; lands on its own like the
+      threshold item).** The literal `default_min_group_field_agents = 1024`
+      stays; only its `types.zig` comment is rewritten around the gated
+      operation's cost (no world-size citation). `proceduralPathfindingCapacity`
+      gains the population and sets `max_agent_budget =
+      @max(population.intent_capacity, cap.min_group_field_agents)`; the
+      `default_max_agent_budget` comment names it a library default. Tests:
+      the three existing threshold tests pass unchanged; the demo test
+      "proceduralPathfindingCapacity reserves the shared flow-field for a
+      future battle-scale crowd" asserts `max_agent_budget ==
+      @max(deriveDemoPopulationCapacity(battle_scale_demo_mover_count).intent_capacity,
+      min_group_field_agents)`; a `PathfindingSystem` reserved with the
+      default-demo capacity reports `groupFieldThreshold() == 2000`; a
+      population whose `intent_capacity` is below the pin still reports the
+      pinned threshold (no clamp below `min_group_field_agents`); the
+      existing elastic-ceiling `FailingAllocator` proof (`system.zig`,
+      `effective_agent_capacity` steady state) passes at that ceiling. Record
+      `autoSizedMaxNavMemoryBytes` before and after in Status.
 - [ ] **71B.1** `static_colliders.zig` rows + `version`/`dirty` +
       `ensureBuilt`; `eventInvalidatesStaticColliders` (moved + extended)
       with a table test over every listed event/component and a negative
@@ -681,6 +728,11 @@ Narrowphase, contact merge, and response are unchanged.
   budget code paths, `default_cells_per_group_agent` and
   `group_field_threshold_floor` no longer exist, and the "independent of
   world size" test passes.
+- [ ] 71B.1 capacity-audit follow-up: no pathfinding threshold or capacity
+  default cites world size, the group-field default stays the literal 1024,
+  the demo's `max_agent_budget` is `@max(intent_capacity,
+  min_group_field_agents)`, and the default-demo `groupFieldThreshold()` is
+  2000.
 - [ ] `zig build check` (comptime contracts) and `zig build verify` pass.
 
 ### VoidLight reference

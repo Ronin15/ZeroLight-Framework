@@ -8,7 +8,7 @@ Goal: ranged attackers spawn deterministic projectile entities from the same
 `.attack` intents. Projectiles move with the existing movement integrator, hit
 through the existing collision-trigger stream, and deal damage through
 `CombatController`'s accumulation and rolls. No swept physics; fixed
-live/spawn/hit budgets, and every combat array and reserve is resized from
+spawn/hit/expiry budgets, a content-derived live projectile capacity, and every combat array and reserve is resized from
 Slice 56's named caps.
 
 ### Current foundation (do not rebuild)
@@ -76,9 +76,12 @@ Slice 56's named caps.
     `core/math.normalizeOrDefaultFinite`), or the facing for a target-less
     attack.
   - Velocity is `dir * projectile_speed`, and the cooldown is consumed.
-- A spawn is refused when `projectile store len + spawns queued this step >=
-  projectile_live_capacity`, or when it would exceed
-  `projectile_spawns_per_step`. On refusal the cooldown is not consumed (the
+- A spawn is refused when it would exceed `projectile_spawns_per_step`, or when
+  `projectile store len + spawns queued this step >= projectile_live_capacity`.
+  The second check is a canary: the capacity (Budgets below) is sized from
+  the per-step spawn budget and the longest authored lifetime, which makes it
+  unreachable, so it also counts `projectiles_refused_live_capacity`,
+  which must stay 0. On either refusal the cooldown is not consumed (the
   attack retries), and `projectiles_refused` is incremented.
 
 **New stage `projectile_update`, between `action_react` and `combat_resolve`.**
@@ -98,8 +101,10 @@ at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
     qualifying pair in trigger order wins** (trigger order is the merged,
     deterministic contact order); later pairs for the same projectile that
     step are skipped. A per-step `projectile_hit_this_step` bit (indexed by
-    projectile dense row, fixed `projectile_live_capacity` bitset in
-    `StepState`) enforces it.
+    projectile dense row; a pipeline-owned `std.DynamicBitSetUnmanaged`
+    reserved to `projectile_live_capacity` in `SimulationPipeline.reserve` and
+    cleared at the start of `projectile_update`; per-step scratch, excluded
+    from the checksum and never saved) enforces it.
   - Each accepted pair becomes a `ProjectileHit {projectile, target}` in a
     fixed `[projectile_hits_per_step]ProjectileHit` `StepState` array; the
     append asserts `len < projectile_hits_per_step`. Overflow is deferred
@@ -122,17 +127,41 @@ at `simulation_pipeline.zig:287` if the comptime contract walk needs it.
 - The roll treats the projectile entity as the attacker in `hit_seed`. Killer
   attribution uses `owner`.
 
-**Budgets.**
+**Budgets and the live capacity.**
 
 | Constant | Value |
 | --- | --- |
-| `projectile_live_capacity` | 1024 |
+| `projectile_live_capacity` | content-derived at state init (capacity, not a budget; see below) |
 | `projectile_spawns_per_step` | 32 |
 | `projectile_hits_per_step` | 64 |
 | `projectile_expiry_budget_per_step` | 64 |
 | `combat_max_hits_per_step` | `action_intent_live_capacity + projectile_hits_per_step` (128) |
 | `combat_max_kills_per_step` | `combat_max_hits_per_step` (128) |
 
+- **`projectile_live_capacity` is a content-derived capacity.**
+  `deriveProjectileLiveCapacity` (`combat_controller.zig`) computes it once at
+  state init, after the archetype catalog loads:
+  `projectile_live_capacity = projectile_spawns_per_step ×
+  (max_projectile_lifetime_steps + 1)` (≤ 32 × 241), or 0 when no loaded
+  `CombatStats` is ranged.
+  - `max_projectile_lifetime_steps` is the largest authored
+    `projectile_lifetime_steps` over every loaded ranged `CombatStats`.
+    Validation caps it at 240, so the capacity never exceeds `32 × 241`; no
+    separate ceiling is needed. No population source adds a term: the bound
+    depends only on the fixed spawn budget and loaded lifetimes.
+  - `GameDemoState` passes it through
+    `SimulationPipelineConfig.projectile_live_capacity`. The projectile store,
+    the `projectile_hit_this_step` bitset, `.movement_body_capacity`, and the
+    collision body count reserve from it at init.
+  - Soundness: per-step spawns are at most `projectile_spawns_per_step`, every
+    projectile is destroy-eligible `projectile_lifetime_steps` after its
+    spawn, and `comptime assert(projectile_expiry_budget_per_step >=
+    projectile_spawns_per_step)` drains the eligible backlog at least as fast
+    as spawns refill it. The store therefore holds at most
+    `projectile_spawns_per_step × (L_max + 1)` rows at a step boundary, and the live-capacity
+    refusal is a canary, never the working limit.
+  - The value is a pure function of loaded content and fixed constants, so
+    serial and threaded runs size identically.
 - `EventProducerId.combat_resolve` stays
   `combat_max_hits_per_step + combat_max_kills_per_step` (now 256).
 - **Structural headroom, enumerated** (added to the demo's
@@ -177,6 +206,22 @@ Ammo consumption lands in Slice 68C (`requires_ammo`, `TransferBatch.consume`).
       FailingAllocator store proof. Slice 49 classification (hashed) and Slice
       46 save section.
 - [ ] Spawn path in `CombatController`, including the refusal semantics.
+- [ ] Content-derived `projectile_live_capacity`: `deriveProjectileLiveCapacity`
+      (`projectile_spawns_per_step` × (catalog max ranged
+      `projectile_lifetime_steps` + 1))
+      passed through `SimulationPipelineConfig`; the comptime
+      `projectile_expiry_budget_per_step >= projectile_spawns_per_step` assert;
+      the pipeline-owned `projectile_hit_this_step` bitset reserved to it; the
+      `projectiles_refused_live_capacity` canary counter.
+      - Tests: the derivation equals the hand formula on a minimal catalog,
+        and is 0 with no ranged content; a sustained max-rate fixture
+        (`projectile_spawns_per_step + 1` ranged attackers, cooldown 1, the
+        largest authored lifetime, every shot missing) holds the store at
+        `<= projectile_spawns_per_step × (L_max + 1)` and never trips the
+        canary.
+      - `FailingAllocator` proof: `projectile_update` plus spawns with the
+        store at the derived capacity allocate nothing after the init
+        reserve (store, bitset, structural and event streams).
 - [ ] `projectile_update` stage, tags, contract, `runStage` arm, and
       `pipeline_projectiles` timer; `@setEvalBranchQuota` raised if needed.
 - [ ] One-hit-per-projectile-per-step rule and out-of-world destroy.
@@ -207,8 +252,15 @@ Ammo consumption lands in Slice 68C (`requires_ammo`, `TransferBatch.consume`).
         first in trigger order, and only once.
       - Tile impact, lifetime expiry, and leaving the world
         (`cellContaining == null`) destroy the projectile.
-      - A refusal at the cap keeps the cooldown.
+      - A refusal at `projectile_spawns_per_step` keeps the cooldown, and so
+        does the live-capacity canary when a fixture passes a capacity below
+        the derived value.
 - [ ] A projectile at max speed cannot skip a 12 px collider.
+- [ ] Capacity derivation: `projectile_live_capacity` equals
+      `projectile_spawns_per_step × (max_projectile_lifetime_steps + 1)` for
+      the loaded content, and
+      sustained max-rate fire never increments
+      `projectiles_refused_live_capacity`.
 - [ ] Capacity: a step with 64 accepted melee intents plus 64 projectile hits
       fills the resized `PendingHit` array exactly, with no overrun, under the
       FailingAllocator composite test.

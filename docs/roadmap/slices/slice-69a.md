@@ -70,13 +70,15 @@ new features.
     `rampLinkOtherLevel` (`src/game/world_system.zig:1485-1514,1447-1454`).
 - **Nav memory gate is structural.**
   - `NavMemoryBudget.requiredBytes` sizes per-level static arrays ×
-    `level_count`, and abstract slots as `levels × 4·ct × chunks + 2 ×
-    link_count`, independent of how many cells are open
-    (`systems/pathfinding/nav_memory.zig:92-186`).
-  - `budgetForCapacity` takes `link_count` (`:223-240`).
-    `GameDemoState.initProceduralWithRuntimeAssets` passes
-    `world.levelLinks().len` (`src/game/game_demo_state.zig:349`, sizing at
-    `:242`).
+    `level_count`, and abstract slots as `levels × chunks × (4·ct +
+    nav_interior_link_slots_per_chunk)` plus a `link_edges` term (Slice 64E),
+    independent of how many cells are open
+    (`systems/pathfinding/nav_memory.zig`).
+  - `budgetForCapacity` takes the link count. Since Slice 64E it is
+    `world.levelLinkLimit()`, the load-time link capacity the demo reserves
+    with `reserveLevelLinks(levelLinks().len + world chunks ×
+    nav_interior_link_slots_per_chunk)` (`demoLevelLinkLimit`,
+    `src/game/game_demo_state.zig`).
   - `NavGrid.markWorldObstacles` memsets uniform layers, walks non-uniform
     layers per cell, and marks sparse tiles separately
     (`systems/pathfinding/nav_grid.zig:278-302`).
@@ -316,8 +318,10 @@ installed beside `worldgen.json`:
 - **Nav memory budget check (backlog item).** The gate needs no change:
   - `requiredBytes` already budgets every level as fully portal-capable, so
     caves do not change admission.
-  - Entrances add at most 16 to `link_count`, which already flows into
-    `autoSizedMaxNavMemoryBytes` through `world.levelLinks().len`.
+  - Entrances add at most 16 authored links. They are counted in
+    `levelLinks().len` when the demo reserves `levelLinkLimit()` after
+    generation, so they flow into `autoSizedMaxNavMemoryBytes` through that
+    load-time capacity (Slice 64E).
   - The only content-dependent risk is the measured per-chunk edge window. The
     acceptance soak requires no edge-cap fallback warning at production size.
 
@@ -350,13 +354,13 @@ installed beside `worldgen.json`:
      pick and edge rule) for every non-space cell of every member. Any
      `blocks_movement` tile rejects the site (`sites_rejected_terrain`). The
      cost is at most extent² cells per site.
-  5. **Caps.**
-     - When survivors exceed `max_worldgen_sites`, keep the top by
-       `rng.mix64(site_seed, site_index, 0, site_rank_salt)`, ties broken by
-       `site_index`.
-     - Then walk the survivors in `site_index` order and add up their wall
-       counts. Drop a whole site that would push the total past
-       `max_worldgen_structure_sparse` (`sites_dropped_sparse_cap`).
+  5. **Capacities (no truncation).** Every survivor is placed. One walk over
+     the survivors in `site_index` order sums their member counts and wall
+     counts (walls also per surface chunk, once the footprint CSR below
+     exists). `plan` reserves the `StampRecord` list for the member total, and
+     `finish` reserves `sparse_tiles` and its level-0 per-level and per-chunk
+     index lists for the wall totals before any stamp. Every total is a pure
+     function of seed, spec and dimensions.
   6. Emit `StampRecord { template, origin_x, origin_y, site_index }` in
      `site_index` order, with villages expanded in member order.
   7. **Footprint CSR.** Over surface chunks, compute counts → prefix → the
@@ -393,7 +397,8 @@ installed beside `worldgen.json`:
     the Slice 58 resource cluster markers, under the shared
     `max_worldgen_interest_markers` (Slice 58 addition).
   - `anchor` sockets become authored `GeneratedWorld.anchors` records ahead of
-    Slice 62's biome anchors, under `spawn_anchor_capacity` (256). There is at
+    Slice 62's biome anchors, under the `u16` anchor-index ceiling
+    (`SpawnAnchorId.index`; Slice 62's capacity is world-sized). There is at
     most one anchor socket per template or village (`MultipleAnchorSockets`):
     one settlement roster per village, which is VoidLight's settlement record.
   - Every survivor list is then sorted by (level, y, x), as in Slice 58, so
@@ -466,11 +471,16 @@ installed beside `worldgen.json`:
   `tile_ids[transition16Index(mask, diag)]` when that index is nonzero;
   otherwise it keeps its palette tile.
 
-**Fixed caps (all constants, none derived from world size).**
+**Fixed constants (none derived from world size).** Each row is a per-site or
+per-query work budget, an inline spec-table ceiling that fails loudly at load,
+or a validation range. Placement counts are not capped: the site grid gives one
+candidate per `S × S` cell, so placements, stamp records and wall sparse tiles
+are working capacities sized from the world in Phase 0 (rows marked
+*capacity*).
 
 | Constant | Value | Reasoning |
 | --- | --- | --- |
-| `max_cave_entrances` | 16 | Bounds the `link_count` nav-budget term and the commit loop. |
+| `max_cave_entrances` | 16 | Loud load-time ceiling on the authored `entrances.max`, a content count. It does not size link storage: the demo reserves `levelLinks().len + world chunks × nav_interior_link_slots_per_chunk` after generation (Slice 64E), and entrances are authored links inside that capacity. |
 | cave `cell_size` / `threshold` | `8..=64` / `[0.50, 0.95]` | Blobby pockets, at most about half open. |
 | `max_cave_node_rules` | 4 | Same shape as the surface rules. |
 | `max_structure_templates` / `max_village_layouts` | 32 / 16 | Fixed spec tables. |
@@ -480,8 +490,8 @@ installed beside `worldgen.json`:
 | `max_structure_walls_per_template` | 512 | Half of a 32² template. |
 | `max_structure_rules_per_biome` / `max_village_rules_per_biome` | 4 / 2 | Fixed per-biome tables. |
 | `site_cell_tiles` | `8..=128`, ≥ largest extent + 2 | One placement per site, so there is no overlap rule. |
-| `max_worldgen_sites` | 64 | A fixed site ceiling. A bigger world gives more candidates, not more sites. |
-| `max_worldgen_structure_sparse` | 16384 | Bounds sparse-tile growth from walls. |
+| site placements (*capacity*; was `max_worldgen_sites = 64`) | `ceilDiv(width, S) × ceilDiv(height, S)` | One placement per site cell by construction, so every surviving site is placed and nothing truncates. Sites add only load-time stamping; each per-step effect is budgeted on its own (spawns: the population cap; nodes: `max_worldgen_resource_nodes`; markers: `max_worldgen_interest_markers`; anchors: Slice 62's band-local `spawn_anchor_evals_per_step` and fixed band-query row bound, since `spawn_anchor_capacity` is world-sized). |
+| wall sparse tiles (*capacity*; was `max_worldgen_structure_sparse = 16384`) | Σ walls of the placed sites | Counted in Phase 0 and reserved before stamping. Safe to scale with the world because Slice 58 bounds `levelBlocksMovement` to one chunk's sparse list, so no per-query cost reads the level's wall count. |
 | `max_autotile_sets` | 16 | Fixed metadata parse cap. |
 
 **Generation flow.** These changes are stated against Slice 58's numbered
@@ -520,7 +530,6 @@ these fields:
 - `sites_placed`
 - `sites_rejected_bounds`
 - `sites_rejected_terrain`
-- `sites_dropped_sparse_cap`
 - `socket_spawns_dropped`
 - `socket_nodes_dropped`
 - `socket_markers_dropped`
@@ -546,7 +555,8 @@ spawn anchors and `chunk_biomes` are already classified as hashed and saved
 **Diagnostics.** The `game` scoped logger is used at load only:
 
 - `info` with the `GenerationStats` above;
-- one `warn` per cap that truncated: sites, sparse, and each socket kind.
+- one `warn` per cap that truncated: each socket kind (site placements and
+  wall tiles are capacities and never truncate).
 
 Generation time flows through the existing `loading_build` timing. There is no
 per-cell logging.
@@ -598,10 +608,20 @@ world (Slice 58 precedent). Nothing changes on hot paths.
 - [ ] `worldgen/structures.zig`: the strict `structures.json` loader
       (rows/size match, single-char legend, floor/wall flag rules, socket cell
       rules, `UnconsumedMarkerKind`, `MultipleAnchorSockets`, unknown archetype,
-      node kind or table), Phase 0 selection, caps, `StampRecord` list, the
+      node kind or table), Phase 0 selection, site and wall capacities (no
+      truncation), `StampRecord` list, the
       footprint CSR, and commit stamping. Ship `assets/world/structures.json`
       (`hut`, `ruin`, and `hamlet` as 4 huts plus a `settlement` anchor and a
       berry node) and confirm it installs.
+- [ ] (capacity audit) Site placements and wall sparse tiles are load-time
+      capacities: delete `max_worldgen_sites`, `max_worldgen_structure_sparse`,
+      `site_rank_salt`, and `sites_dropped_sparse_cap`. Tests (16×16 fixture):
+      placed sites equal surviving sites; `StampRecord` capacity equals the
+      Phase 0 member total and `sparse_tiles` capacity equals the pre-stamp
+      length plus the Phase 0 wall total; with `std.testing.FailingAllocator`
+      installed on the world allocator after those reserves, `finish`'s
+      stamping allocates nothing. Lands after Slice 58's per-chunk
+      `levelBlocksMovement`.
 - [ ] `worldgen/caves.zig` + `generate.zig`:
       - cave predicate and cell precedence;
       - cave nodes, with the node rank key level-amended;
@@ -665,9 +685,10 @@ world (Slice 58 precedent). Nothing changes on hot paths.
       - no two placements overlap;
       - no feature, node, ranked spawn or entrance lies inside a stamp AABB;
       - a site over water is rejected and counted;
-      - with more sites than `max_worldgen_sites`, exactly the cap is kept and
-        the kept set is identical across thread counts;
-      - the sparse cap drops whole sites only.
+      - every surviving site is placed, and the placed set is identical
+        across thread counts;
+      - the stamp and wall reserves equal the Phase 0 totals (no growth
+        during stamping).
 - [ ] Socket priority: authored spawns, nodes, markers and anchors are kept
       before ranked candidates. Overflow is dropped in order and counted. A
       village anchor socket becomes a live `SpawnAnchorStore` slot, and its
@@ -720,8 +741,11 @@ world (Slice 58 precedent). Nothing changes on hot paths.
 
 **Do not port:**
 
-- `VILLAGE_DENSITY_DIVISOR` (`area / 8000`) village counts (`:117,805`). They
-  scale with the world; ZeroLight caps at `max_worldgen_sites`.
+- `VILLAGE_DENSITY_DIVISOR` (`area / 8000`) village counts (`:117,805`), a
+  target count chased by retry loops. ZeroLight's site grid gives one
+  deterministic candidate per `S × S` cell, so placements scale with area by
+  construction (a load-time content capacity, not a per-step budget) with no
+  target count or retries.
 - `maxAttempts = targetVillages * 50` retry loops and the
   `default_random_engine` / `uniform_*_distribution` draws (`:800-863`).
 - Trig-based building scatter (`:875-880`).

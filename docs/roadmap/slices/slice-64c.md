@@ -264,8 +264,20 @@ is appended:
   - Unknown flags or a missing file print usage; exit 64.
 - Flow:
   1. Read the file (cold; `std.Io.Dir.cwd().readFileAlloc` with limit
-     `replay_max_file_bytes = 8 MiB` ≥ the 6.9 MB frame bound plus
-     checkpoints and headers).
+     `replay_max_file_bytes`). The limit is a loud refusal ceiling derived
+     from the format, never a literal. `replay.zig` gains the pure
+     `maxEncodedFileBytes(total_frames: u32, min_chunk_frames: u32) usize`:
+     header bytes + end record + `total_frames` × the largest encoded
+     frame + `ceil(total_frames / min_chunk_frames)` chunk records + their
+     checkpoints (`total_frames / replay_checkpoint_interval_steps`, plus
+     one per chunk). `replay_runner.zig` sets the comptime
+     `replay_max_file_bytes = replay.maxEncodedFileBytes(replay_max_total_frames,
+     replay_capture_min_chunk_frames)`, about 7.1 MiB at v2. A slice that
+     grows a frame (57B's action records, 63's record fields) updates the
+     frame-size term in the same change as its version bump, so a valid
+     capture never trips a stale 8 MiB literal. A larger file (possible only
+     with hand-made chunks below the producer minimum) is refused with
+     exit code 3.
   2. `decode`.
   3. `HeadlessSession.init`. The host builds sessions from the header only
      (New Game sessions). A recording captured by a session that was
@@ -383,6 +395,12 @@ pub const SessionSeedSource = struct {
       ParseError!RunnerOptions`, tested for every flag, defaults, unknown
       flag, and missing file. Exit-code mapping is a pure
       `exitCodeFor(outcome) u8`, tested for every outcome.
+      `test "max replay file bytes covers a min-chunk capture"`: a log of
+      `2 × replay_capture_min_chunk_frames + 1` frames, written as
+      `replay_capture_min_chunk_frames`-frame chunks through the shared
+      chunk encoder with a checkpoint on every interval step, encodes to at
+      most `maxEncodedFileBytes(2 × replay_capture_min_chunk_frames + 1,
+      replay_capture_min_chunk_frames)` bytes.
 - [ ] **C5.** `SessionSeedSource`, `AppConfig.fixed_session_seed`,
       `-Dsession-seed`, Engine ownership, `UpdateContext.session_seeds`, and
       the 53B main menu `new_game` button. Tests:
